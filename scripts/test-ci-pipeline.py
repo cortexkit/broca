@@ -40,7 +40,7 @@ elif args[:2] == ['nextest', 'run']:
         sys.exit(100)
     sys.exit(int(os.environ.get('RUN_EXIT', '0')))
 elif args[0] == 'test' and '--list' in args:
-    for binary in ('fixture', 'live', 'live_e2e'):
+    for binary in ('fixture', 'live'):
         print(f'Running tests/{binary}.rs (target/debug/{binary})')
         print('1 test, 0 benchmarks')
 else:
@@ -965,7 +965,7 @@ class ArchiveShards(unittest.TestCase):
             self.assertIn('--success-output', args)
         shard = commands[1]
         self.assertEqual(shard[shard.index('--partition') + 1], 'hash:3/4')
-        self.assertEqual(shard[shard.index('-E') + 1], 'kind(test) and not (binary(=live) or binary(=live_e2e))')
+        self.assertEqual(shard[shard.index('-E') + 1], 'kind(test) and not binary(=live)')
 
     def test_missing_clock_pass_refuses_shard(self):
         result = self.run_mode('run', str(self.archive), '1/4', NO_CLOCK_PASS='1')

@@ -21,6 +21,13 @@ pub struct LiveAnthropicProvider {
 }
 
 impl LiveAnthropicProvider {
+    pub fn with_max_tokens(mut self, max: u32) -> Self {
+        Arc::get_mut(&mut self.inner.frozen)
+            .expect("a newly constructed provider has an exclusive frozen config")
+            .max_output_tokens = max;
+        self
+    }
+
     pub fn new(model_id: impl Into<String>, token: impl Into<String>) -> Self {
         let inner = LiveProvider::new(
             AnthropicMessages,
@@ -28,13 +35,6 @@ impl LiveAnthropicProvider {
             AuthHandle::Bearer(token.into()),
         );
         Self { inner }
-    }
-
-    pub fn with_max_tokens(mut self, max: u32) -> Self {
-        Arc::get_mut(&mut self.inner.frozen)
-            .expect("a newly constructed provider has an exclusive frozen config")
-            .max_output_tokens = max;
-        self
     }
 }
 

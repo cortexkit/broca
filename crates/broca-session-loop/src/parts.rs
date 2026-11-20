@@ -88,6 +88,16 @@ pub struct DecodedParts(Arc<std::sync::Mutex<Entries>>);
 type Entries = HashMap<(Digest, TypeId), Weak<dyn Any + Send + Sync>>;
 
 impl DecodedParts {
+    /// How many entries the cache holds, live or not yet removed.
+    pub fn len(&self) -> usize {
+        self.entries().len()
+    }
+
+    /// Whether the cache holds no entry.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The value held under `key` as a `T` while any holder keeps it, otherwise what `decode`
     /// gives, which later reads then share. Two threads that miss together both decode, and
     /// the second to finish takes the first one's value. `decode` may read other entries.
@@ -110,16 +120,6 @@ impl DecodedParts {
         let entry: Weak<T> = Arc::downgrade(&decoded);
         entries.insert(slot, entry);
         Ok(decoded)
-    }
-
-    /// How many entries the cache holds, live or not yet removed.
-    pub fn len(&self) -> usize {
-        self.entries().len()
-    }
-
-    /// Whether the cache holds no entry.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     fn entries(&self) -> std::sync::MutexGuard<'_, Entries> {

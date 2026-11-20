@@ -85,6 +85,10 @@ pub struct OperationAccess {
 pub struct WalAccessCounter(Arc<Mutex<Vec<OperationAccess>>>);
 
 impl WalAccessCounter {
+    pub fn snapshot(&self) -> Vec<OperationAccess> {
+        self.0.lock().unwrap().clone()
+    }
+
     pub fn operation(&self, name: impl Into<String>) -> WalAccessOperation {
         let mut operations = self.0.lock().unwrap();
         let index = operations.len();
@@ -96,10 +100,6 @@ impl WalAccessCounter {
             counter: self.clone(),
             index,
         }
-    }
-
-    pub fn snapshot(&self) -> Vec<OperationAccess> {
-        self.0.lock().unwrap().clone()
     }
 }
 
@@ -145,6 +145,13 @@ pub fn inherit<F: FnOnce() -> T, T>(work: F) -> impl FnOnce() -> T {
 }
 
 impl WalAccessOperation {
+    pub fn run_future<F: Future>(&self, future: F) -> impl Future<Output = F::Output> + use<F> {
+        MeasuredFuture {
+            operation: self.clone(),
+            future: Box::pin(future),
+        }
+    }
+
     pub fn run<T>(&self, work: impl FnOnce() -> T) -> T {
         with_context(
             Some(Context {
@@ -156,13 +163,6 @@ impl WalAccessOperation {
             }),
             work,
         )
-    }
-
-    pub fn run_future<F: Future>(&self, future: F) -> impl Future<Output = F::Output> + use<F> {
-        MeasuredFuture {
-            operation: self.clone(),
-            future: Box::pin(future),
-        }
     }
 }
 

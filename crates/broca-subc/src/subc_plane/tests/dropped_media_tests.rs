@@ -1,9 +1,6 @@
 use super::*;
-use broca_core::{
-    lease::lease_key_for, wal_writer::WalStore, FileLeaseStore, FileWalStore, LeaseStore, WalHandle,
-};
+use broca_core::tool_media::MediaCapture as _;
 use broca_protocol::{ToolOutput, ToolOutputPart, ToolResult};
-use broca_wal::{DispatchOutcome, WalRecord};
 
 const PNG: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
@@ -17,20 +14,6 @@ fn image(mime: &str, data: &str) -> serde_json::Value {
     json!({"type":"image", "mimeType":mime, "data":data, "width":1, "height":1})
 }
 
-fn result_record(ctx: &BatchCtx, result: ToolResult) -> WalRecord {
-    WalRecord::ToolResult {
-        finished_at_ms: None,
-        tags: None,
-        batch_id: ctx.batch_id.clone(),
-        result: Arc::new(result),
-        hooks: None,
-        reason: None,
-        outcome: DispatchOutcome::Completed,
-        withdraw_elicitation: None,
-        provider_held: None,
-    }
-}
-
 async fn record_reply(raw: serde_json::Value, negotiated: bool) -> ToolResult {
     record_reply_with_capture(raw, negotiated, true).await
 }
@@ -40,23 +23,13 @@ async fn record_reply_with_capture(
     negotiated: bool,
     capture: bool,
 ) -> ToolResult {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = broca_test_support::scratch_root().join(format!(
-        "dropped-media-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::SeqCst)
-    ));
     let mut ctx = ctx();
-    let store = Arc::new(FileWalStore::new(root.join("wal")));
-    let lease = FileLeaseStore::new(root.join("leases"))
-        .acquire(&lease_key_for(&ctx.bind))
-        .unwrap();
-    let (writer, lease) =
-        WalHandle::open_and_spawn_observed(store.clone(), ctx.bind.clone(), lease, None)
-            .await
-            .unwrap();
-    ctx.media_capture = writer.tool_media_capture().filter(|_| capture);
-    assert_eq!(ctx.media_capture.is_some(), capture);
+    // The capture the session loop hands the plane: it holds each captured part until the
+    // call's reply is stored.
+    let media = Arc::new(broca_session_loop::PendingMedia::default());
+    if capture {
+        ctx.media_capture = Some(media.clone());
+    }
 
     let rig = Rig::new(true, true, negotiated, false);
     *rig.reply.lock().unwrap() = raw;
@@ -87,40 +60,90 @@ async fn record_reply_with_capture(
         vec![false],
         "held replies stay off"
     );
-    writer
-        .record(result_record(&ctx, result.clone()))
-        .into_result()
-        .unwrap();
-    writer.sync().await.unwrap();
-    writer.shutdown().await.unwrap();
-    drop(lease);
-
-    let frames = store.read_records(&ctx.bind).unwrap();
-    assert_eq!(frames.len(), 1);
-    let WalRecord::ToolResult { result: stored, .. } = &frames[0].record else {
-        panic!("expected recorded tool result")
-    };
+    // The stored form is the result's serialized bytes; reading them back renders the same
+    // request.
+    let stored: ToolResult = serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();
     assert_eq!(
-        serde_json::to_vec(stored).unwrap(),
+        serde_json::to_vec(&stored).unwrap(),
         serde_json::to_vec(&result).unwrap()
     );
     assert_eq!(
-        crate::content_v1::tests::render_model_request((**stored).clone()),
+        crate::content_v1::tests::render_model_request(stored),
         crate::content_v1::tests::render_model_request(result.clone())
     );
     if !capture {
-        for directory in ["media", "media-durable", "media-ephemeral", "media-uploads"] {
-            assert!(
-                !root.join(directory).exists(),
-                "capture-off tool created {directory}"
-            );
-        }
+        assert!(
+            media
+                .captured_for(&ctx.batch_id, &call.tool_call_id)
+                .is_empty(),
+            "capture-off tool captured media"
+        );
     }
     result
 }
 
 #[tokio::test]
 async fn dropped_tool_media_is_recorded_or_captured_at_dispatch() {
+    let cases = [
+        (
+            json!([{"type":"text","text":"Read image attachment (image/png)."}, image("image/png", PNG)]),
+            format!("Read image attachment (image/png).\n{PNG_NOTICE}"),
+            vec!["image/png"],
+        ),
+        (
+            json!([image("image/png", PNG)]),
+            PNG_NOTICE.into(),
+            vec!["image/png"],
+        ),
+        (
+            json!([image("image/png", PNG), image("image/gif", GIF)]),
+            format!("{PNG_NOTICE}\n{GIF_NOTICE}"),
+            vec!["image/png", "image/gif"],
+        ),
+    ];
+    for (negotiated, capture) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (content, expected, mimes) in &cases {
+            let result =
+                record_reply_with_capture(json!({"content":content}), negotiated, capture).await;
+            assert!(!result.is_error);
+            if capture {
+                let ToolOutput::Parts { parts } = &result.output else {
+                    panic!("images must be captured")
+                };
+                let actual: Vec<_> = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ToolOutputPart::Media { media } => Some(media.mime.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(&actual, mimes);
+                let encoded = serde_json::to_string(&result).unwrap();
+                assert!(
+                    !encoded.contains("not shown"),
+                    "captured media must not have a drop notice"
+                );
+            } else {
+                let text = match &result.output {
+                    ToolOutput::Text { text } => text.to_string(),
+                    ToolOutput::Parts { parts } => parts
+                        .iter()
+                        .map(|part| match part {
+                            ToolOutputPart::Text { text } => text.as_str(),
+                            _ => panic!("capture-off result must be text only"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    other => panic!("unexpected result: {other:?}"),
+                };
+                assert_eq!(&text, expected, "negotiated={negotiated}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropped_tool_media_is_replaced_by_a_notice_or_captured_at_dispatch() {
     let cases = [
         (
             json!([{"type":"text","text":"Read image attachment (image/png)."}, image("image/png", PNG)]),
@@ -346,31 +369,16 @@ async fn tool_result_v1_requires_catalog_declaration_and_upgrades_only_the_reply
 }
 
 #[test]
-fn historical_image_result_is_not_rewritten_on_read_or_render() {
+fn historical_image_result_is_not_rewritten_on_decode_or_render() {
     let fixture =
         include_str!("../../../tests/fixtures/content_v1/stored_old_image.json").trim_end();
     let result: ToolResult = serde_json::from_str(fixture).unwrap();
     assert_eq!(serde_json::to_vec(&result).unwrap(), fixture.as_bytes());
-    let root =
-        broca_test_support::scratch_root().join(format!("historical-media-{}", std::process::id()));
-    let store = FileWalStore::new(root.join("wal"));
-    let ctx = ctx();
-    {
-        let mut wal = store.open(&ctx.bind).unwrap();
-        wal.append(1, &result_record(&ctx, result), true).unwrap();
-    }
-    let before = std::fs::read(store.wal_path(&ctx.bind)).unwrap();
-    let frames = store.read_records(&ctx.bind).unwrap();
-    let WalRecord::ToolResult { result, .. } = &frames[0].record else {
-        panic!("expected historical tool result")
-    };
-    assert_eq!(serde_json::to_vec(result).unwrap(), fixture.as_bytes());
-    let rendered = crate::content_v1::tests::render_model_request((**result).clone());
+    let rendered = crate::content_v1::tests::render_model_request(result);
     let rendered = String::from_utf8(rendered).unwrap();
     assert!(rendered
         .contains("[non-text tool content omitted: type=image mimeType=image/png data≈92 bytes]"));
     assert!(!rendered.contains("this runner does not pass tool images"));
-    assert_eq!(std::fs::read(store.wal_path(&ctx.bind)).unwrap(), before);
 }
 
 #[test]

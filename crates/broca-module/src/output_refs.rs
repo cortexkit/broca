@@ -74,6 +74,14 @@ pub struct MessageOutputRefs {
 }
 
 impl MessageOutputRefs {
+    /// `row` with this message's descriptors: the reply set's on the row, and each call set's on
+    /// the tool-call part with the same `tool_call_id` at its stored position. A display read of this message's row calls
+    /// this; nothing else carries descriptors (llm-runner §9.13: never the default `session.read`
+    /// entry or a stored body).
+    pub fn attach(&self, row: DisplayRow) -> DisplayRow {
+        self.descriptors().attach(row)
+    }
+
     fn descriptors(&self) -> MessageOutputDescriptors {
         MessageOutputDescriptors {
             reply: self.reply.descriptor.clone(),
@@ -83,14 +91,6 @@ impl MessageOutputRefs {
                 .map(|(id, set)| (id.clone(), set.descriptor.clone()))
                 .collect(),
         }
-    }
-
-    /// `row` with this message's descriptors: the reply set's on the row, and each call set's on
-    /// the tool-call part with the same `tool_call_id` at its stored position. A display read of this message's row calls
-    /// this; nothing else carries descriptors (llm-runner §9.13: never the default `session.read`
-    /// entry or a stored body).
-    pub fn attach(&self, row: DisplayRow) -> DisplayRow {
-        self.descriptors().attach(row)
     }
 }
 
@@ -428,61 +428,6 @@ fn view_shows(
         }
         _ => false,
     })
-}
-
-/// The compaction view in effect when the model step that wrote message `ordinal` sent its
-/// request, from the session's whole log: `None` when no view had applied by then.
-///
-/// No record names the ordinal a step wrote, so the step is found by replay. Replaying the first
-/// `k` records gives the transcript's extent; the smallest `k` whose extent passes `ordinal` ends
-/// with the record that added the message (its `ModelStepFinished`, or the batch commit that
-/// adds a tool turn), and the step that wrote it is the last `ModelStepFinished` at or before
-/// that record. A view applies at a step boundary, before the step that first renders it, so
-/// the view in effect is the last `CompactionViewApplied` before that step. Each probe replays a
-/// prefix of the log, so this costs O(log n) replays of up to n records.
-pub fn view_at_writing_step(
-    records: &[broca_wal::WalRecord],
-    ordinal: u64,
-) -> Result<Option<broca_core::compaction_provider::view::CompactionView>, ServeError> {
-    use broca_wal::WalRecord;
-    let extent = |k: usize| -> Result<u64, ServeError> {
-        broca_core::replay::replay(&records[..k])
-            .map(|state| state.extent)
-            .map_err(|error| {
-                ServeError::Open(
-                    format!("replaying the session log for output references: {error}"),
-                    Some(broca_protocol::ErrorClass::Permanent),
-                )
-            })
-    };
-    let (mut low, mut high) = (0usize, records.len());
-    if extent(high)? <= ordinal {
-        return Ok(None);
-    }
-    // Invariant: extent(low) <= ordinal < extent(high).
-    while high - low > 1 {
-        let middle = low + (high - low) / 2;
-        if extent(middle)? > ordinal {
-            high = middle;
-        } else {
-            low = middle;
-        }
-    }
-    let Some(step) = records[..high]
-        .iter()
-        .rposition(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
-    else {
-        return Ok(None);
-    };
-    Ok(records[..step]
-        .iter()
-        .rev()
-        .find_map(|record| match record {
-            WalRecord::CompactionViewApplied { view, .. } => {
-                serde_json::from_str(view.as_json_text()).ok()
-            }
-            _ => None,
-        }))
 }
 
 /// Whether the session's frozen plan names a compaction provider, whose views can leave parts

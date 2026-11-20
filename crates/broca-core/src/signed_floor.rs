@@ -90,12 +90,6 @@ pub struct SignedFloor {
 }
 
 impl SignedFloor {
-    /// A fold that continues after runs it didn't see, which an admission checkpoint proves never
-    /// changed their tool set: no floor yet, and the newest run offered the set `last`.
-    pub fn unchanged(last: Option<String>) -> Self {
-        Self { last, floor: None }
-    }
-
     /// Fold the lineage's next run: `start` is the ordinal of its first input message and
     /// `digest` its [`tool_set_digest`]. A run that differs from the one before it moves the
     /// floor to its start. Runs start in increasing order, so the floor only moves forward; a
@@ -195,57 +189,6 @@ impl From<ToolSetHistory> for Option<ToolSetHistoryV1> {
 impl ToolSetHistory {
     pub fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
-    }
-
-    /// Fold the lineage's next run's [`tool_set_digest`].
-    pub fn observe(&mut self, digest: String) {
-        if let Self::Known(history) = self {
-            history.changed |= history.last.as_ref().is_some_and(|last| *last != digest);
-            history.last = Some(digest);
-        }
-    }
-
-    /// The floor fold a run continues from when this checkpoint, rather than a replay of the
-    /// whole WAL, describes the earlier runs. `None` when the checkpoint can't say: some run
-    /// changed the tool set, so the floor's ordinal needs the whole WAL, or the history is
-    /// unknown.
-    pub fn continued_floor(&self) -> Option<SignedFloor> {
-        match self {
-            Self::Known(history) if !history.changed => {
-                Some(SignedFloor::unchanged(history.last.clone()))
-            }
-            _ => None,
-        }
-    }
-}
-
-/// The floor a lineage's whole WAL folds (`records` from its first record), for a caller that
-/// holds no run's fold, such as an operation served between runs. `None` when no run changed the
-/// tool set, and also when the records don't start at the lineage's first run, which leaves the
-/// earlier runs' tools unknown.
-pub fn floor_of_records(records: &[broca_wal::WalRecord]) -> Result<Option<u64>, String> {
-    Ok(crate::replay(records)
-        .map_err(|error| error.to_string())?
-        .signed_floor
-        .known()
-        .and_then(SignedFloor::floor))
-}
-
-/// The floor a run admitted on a route that binds reasoning to its prefix starts from: `prior`'s
-/// when the state it was admitted from folded every run (a replay of the whole WAL), else the
-/// checkpoint's when it proves no run changed the tool set, else the floor a replay of the whole
-/// WAL finds (`replay_whole_wal`).
-pub fn admission_floor<E>(
-    prior: FloorFold,
-    checkpoint: &ToolSetHistory,
-    replay_whole_wal: impl FnOnce() -> Result<FloorFold, E>,
-) -> Result<FloorFold, E> {
-    if prior.known().is_some() {
-        return Ok(prior);
-    }
-    match checkpoint.continued_floor() {
-        Some(floor) => Ok(FloorFold::Known(floor)),
-        None => replay_whole_wal(),
     }
 }
 
@@ -349,41 +292,5 @@ mod tests {
         // already dropped, so the floor moves on rather than back.
         fold.observe_run(20, a);
         assert_eq!(fold.floor(), Some(20));
-    }
-
-    #[test]
-    fn a_checkpoint_without_the_history_is_unknown_never_unchanged() {
-        #[derive(Serialize, Deserialize)]
-        struct Holder {
-            #[serde(default, skip_serializing_if = "ToolSetHistory::is_unknown")]
-            history: ToolSetHistory,
-        }
-        let absent: Holder = serde_json::from_str("{}").unwrap();
-        assert_eq!(absent.history, ToolSetHistory::Unknown);
-        assert_eq!(absent.history.continued_floor(), None);
-        assert_eq!(serde_json::to_string(&absent).unwrap(), "{}");
-
-        let mut history = ToolSetHistory::Known(ToolSetHistoryV1::default());
-        history.observe("a".into());
-        history.observe("a".into());
-        assert_eq!(
-            history.continued_floor(),
-            Some(SignedFloor::unchanged(Some("a".into())))
-        );
-        let stored = serde_json::to_string(&Holder {
-            history: history.clone(),
-        })
-        .unwrap();
-        assert_eq!(stored, r#"{"history":{"last":"a"}}"#);
-        let read: Holder = serde_json::from_str(&stored).unwrap();
-        assert_eq!(read.history, history);
-
-        history.observe("b".into());
-        history.observe("a".into());
-        assert_eq!(
-            history.continued_floor(),
-            None,
-            "a lineage whose set ever changed needs the whole WAL for the floor's ordinal"
-        );
     }
 }

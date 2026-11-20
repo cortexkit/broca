@@ -1048,16 +1048,3 @@ fn dispatch_outcome(outcome: CallOutcome) -> broca_wal::DispatchOutcome {
         CallOutcome::MaxSteps => broca_wal::DispatchOutcome::MaxSteps,
     }
 }
-
-/// Projects `records`, in seq order, from `control`. Each record's successor is the next one.
-pub fn project_all(
-    control: &mut StoreControl,
-    records: &[(u64, Record)],
-) -> Result<Vec<StoreUnit>, String> {
-    let mut units = Vec::new();
-    for (at, (seq, record)) in records.iter().enumerate() {
-        let next = records.get(at + 1).map(|(_, next)| next);
-        units.extend(control.project(*seq, record, next)?);
-    }
-    Ok(units)
-}

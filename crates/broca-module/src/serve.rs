@@ -25,9 +25,10 @@ use serde::{Deserialize, Serialize};
 use crate::fanout::{Delivery, FromCursor};
 use crate::registry::{LineageKey, OpenError};
 
+pub use cortexkit_role_llm_runner::errors::ReplyTooLargeDetail;
+pub(crate) use cortexkit_role_llm_runner::errors::ReplyTooLargeSubject;
 /// Shared refusal spelling for wire adapters of this management surface.
 pub use cortexkit_role_llm_runner::errors::PRE_USER_UNAVAILABLE;
-pub use cortexkit_role_llm_runner::errors::{ReplyTooLargeDetail, ReplyTooLargeSubject};
 
 /// A `session.read` request: a paged read over the durable assembled transcript.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -499,83 +500,6 @@ pub(crate) fn apply_media_mode(
     Ok(())
 }
 
-/// Fills each message's `tool_calls`, and a tool result delivered as a send's carrier call key,
-/// from the dispatch facts of the tool turns the messages belong to, keyed by the 0-based ordinal
-/// of each turn's assistant message (`broca_core::dispatches_of_turns`). `lineage_id` is the
-/// log's, which a call's derived key names.
-pub fn apply_tool_call_dispatches(
-    response: &mut SessionReadResponse,
-    dispatches: &std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
-    lineage_id: &str,
-) {
-    let calls_of = |message: &broca_protocol::Message| -> Vec<String> {
-        message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                broca_protocol::content::ContentBlock::ToolCall(call) => {
-                    Some(call.tool_call_id.0.clone())
-                }
-                _ => None,
-            })
-            .collect()
-    };
-    for message in &mut response.messages {
-        if let Some(carrier) = message
-            .run
-            .as_ref()
-            .and_then(|run| run.delivery.as_ref())
-            .and_then(|delivery| delivery.tool_call_id.as_ref())
-        {
-            if let Some(dispatch) = message
-                .ordinal
-                .checked_sub(2)
-                .and_then(|ordinal| dispatches.get(&ordinal))
-                .and_then(|calls| calls.iter().find(|call| &call.tool_call_id == carrier))
-            {
-                if let Some(receipt) = &mut message.delivered_as {
-                    receipt.call_key = dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
-                        broca_core::tool_call_key(
-                            Some(lineage_id),
-                            seq,
-                            dispatch.recorded_call_key.as_deref(),
-                        )
-                    });
-                }
-            }
-        }
-        let ids = calls_of(&message.message);
-        if ids.is_empty() {
-            continue;
-        }
-        message.tool_calls = match dispatches.get(&message.ordinal.saturating_sub(1)) {
-            // The step that produced this message holds exactly these calls: report them.
-            Some(found) if found.iter().map(|d| &d.tool_call_id).eq(ids.iter()) => found
-                .iter()
-                .map(|dispatch| {
-                    let mut call = broca_wire::SessionReadToolCall::new(&dispatch.tool_call_id);
-                    call.call_key = dispatch.key_seq.or(dispatch.intent_seq).and_then(|seq| {
-                        broca_core::tool_call_key(
-                            Some(lineage_id),
-                            seq,
-                            dispatch.recorded_call_key.as_deref(),
-                        )
-                    });
-                    call.dispatched_to = dispatch.dispatched_to.clone();
-                    call.indeterminate = dispatch.indeterminate;
-                    call
-                })
-                .collect(),
-            // No recorded step produced this message (an imported one, say): report each
-            // call with no dispatch fact rather than guess one.
-            _ => ids
-                .into_iter()
-                .map(broca_wire::SessionReadToolCall::new)
-                .collect(),
-        };
-    }
-}
-
 /// The creation and completion times of a page's messages, by zero-based ordinal, kept for an
 /// `include_display_facts` read before the page becomes a reply (which serves neither without
 /// the opt-in).
@@ -677,23 +601,6 @@ pub fn apply_display_facts(
                 .collect();
         }
     }
-}
-
-/// The runs whose Rich UI stamps an `include_rich_ui` read of `response` needs: the producing
-/// run of each assistant message that names one, each once, in page order.
-pub fn rich_ui_runs(response: &SessionReadResponse) -> Vec<String> {
-    let mut runs: Vec<String> = Vec::new();
-    for entry in &response.messages {
-        if entry.message.role != broca_protocol::Role::Assistant {
-            continue;
-        }
-        if let Some(run) = &entry.run {
-            if !runs.contains(&run.run_id) {
-                runs.push(run.run_id.clone());
-            }
-        }
-    }
-    runs
 }
 
 /// Stamps each assistant message of `response` with its producing run's Rich UI stamp, from

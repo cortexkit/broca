@@ -1,5 +1,5 @@
 //! LIVE Anthropic reality-conformance spike (feature `live`, local-only, off by
-//! default). Drives the REAL Anthropic Messages API through `run_loop` and asserts the
+//! default). Drives the REAL Anthropic Messages API through the run loop and asserts the
 //! real wire still matches what our normalizer depends on — the drift tripwire a mock
 //! structurally can't be. Behavioral + structural assertions only (model output is
 //! nondeterministic), capture-and-keep, taxonomy-classified skip-vs-fail.

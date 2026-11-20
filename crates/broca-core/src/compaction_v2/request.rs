@@ -103,38 +103,6 @@ pub trait ReadBack {
     ) -> Result<Vec<Message>, String>;
 }
 
-/// A stored prompt that releases nothing, so nothing is ever read back.
-pub struct NothingReleased;
-
-impl ReadBack for NothingReleased {
-    async fn read_back(&self, _: &[Message], _: &[usize]) -> Result<Vec<Message>, String> {
-        Err("a stored message holds released content and nothing can read it back".into())
-    }
-}
-
-/// [`prepare_reading_back`] for a stored prompt that releases nothing.
-pub async fn prepare(
-    state: &tokio::sync::Mutex<State>,
-    runtime: &Runtime,
-    journal: &impl Journal,
-    plane: &dyn Plane,
-    at: At<'_>,
-    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
-    estimate: impl FnMut(&[Message]) -> Result<u64, String>,
-) -> Result<Prepared, String> {
-    prepare_reading_back(
-        state,
-        runtime,
-        journal,
-        plane,
-        at,
-        &NothingReleased,
-        image,
-        estimate,
-    )
-    .await
-}
-
 /// Renders `at.stored` under `view`, first reading back through `read_back` any stored message
 /// whose released content the view sends. `restored` collects what was read back, and a later
 /// render of the same step reuses it. Returns the prompt and the blocks it didn't read.

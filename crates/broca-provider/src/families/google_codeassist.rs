@@ -357,15 +357,6 @@ fn antigravity_max_output_tokens(wire_model_id: &str) -> Option<u32> {
     }
 }
 
-/// The thinking config a Code Assist backend tier id renders with, or `None` when the id is not
-/// one of this family's thinking tiers. This is the family's tier table: on Code Assist a
-/// reasoning level is sent as a different backend model id, and an id is a tier exactly when it
-/// has thinking settings here. The catalog resolver uses it to decide which reasoning variants a
-/// route can render.
-pub fn tier_thinking_config(wire_model_id: &str) -> Option<Value> {
-    antigravity_tier(wire_model_id).map(|tier| tier.thinking_config)
-}
-
 struct CodeAssistTier {
     thinking_config: Value,
     omit_tool_config: bool,

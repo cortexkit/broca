@@ -21,7 +21,6 @@ members = [
     "crates/ck-session-import",
     "crates/ck-import",
     "crates/broca-test-support",
-    "crates/broca-crash-harness",
     "crates/broca-fetch-plan",
     "crates/broca-diagnostics",
     "crates/broca-heap-profile",

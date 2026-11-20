@@ -1323,6 +1323,7 @@ async fn stop_during_post_assistant_keeps_billed_step_and_marks_unavailable() {
     assert_eq!(state.hooks().len(), 1);
     finish(rig, daemon).await;
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn caller_cancel_during_pre_user_discards_send_without_interrupting_run() {
     let (mut rig, daemon, state, plan) = start(

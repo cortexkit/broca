@@ -925,6 +925,15 @@ pub fn key_belongs_to(
 }
 
 impl Candidates {
+    /// Distinct provider accounts; one account may have several credential records.
+    pub fn distinct_accounts(&self) -> usize {
+        self.accounts
+            .iter()
+            .map(|candidate| candidate.account_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
     /// Only keys the runner can read and send with, and that belong to `provider` by routing's
     /// rule (see [`key_belongs_to`]), are eligible. When the vault has no account metadata,
     /// routing identifies the pool account by the public credential id.
@@ -1023,15 +1032,6 @@ impl Candidates {
         self.accounts.iter().any(|candidate| {
             candidate.credential_id == credential_id && candidate.account_id == account_id
         })
-    }
-
-    /// Distinct provider accounts; one account may have several credential records.
-    pub fn distinct_accounts(&self) -> usize {
-        self.accounts
-            .iter()
-            .map(|candidate| candidate.account_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
     }
 }
 

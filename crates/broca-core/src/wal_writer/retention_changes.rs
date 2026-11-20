@@ -31,13 +31,6 @@ impl Changes {
         }
         state.addresses.insert(address.clone());
     }
-
-    pub(super) fn take(&self) -> (Vec<String>, bool) {
-        let mut state = self.state.lock().unwrap();
-        let recovery = std::mem::take(&mut state.recovery);
-        let addresses = state.addresses.drain().map(|s| s.to_string()).collect();
-        (addresses, recovery)
-    }
 }
 
 pub(super) struct ObservedWal {
@@ -399,30 +392,5 @@ mod tests {
             publication_observer: None,
         };
         wal.sync().unwrap();
-    }
-
-    #[test]
-    fn overflow_requests_recovery_without_unbounded_growth() {
-        let changes = Changes::default();
-        for n in 0..=CAPACITY {
-            changes.changed(&Arc::from(format!("{n:016x}")));
-        }
-        let (addresses, recovery) = changes.take();
-        assert_eq!(addresses.len(), CAPACITY);
-        assert!(recovery);
-        assert_eq!(changes.take(), (Vec::new(), false));
-    }
-
-    #[test]
-    #[ignore = "explicit writer hot-path microbenchmark"]
-    fn retention_change_queue_measurement() {
-        let changes = Changes::default();
-        let address = Arc::from("0123456789abcdef");
-        let start = std::time::Instant::now();
-        for _ in 0..1_000_000 {
-            changes.changed(std::hint::black_box(&address));
-        }
-        eprintln!("retention queue: 1000000 hints in {:?}", start.elapsed());
-        assert_eq!(changes.take(), (vec![address.to_string()], false));
     }
 }

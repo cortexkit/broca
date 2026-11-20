@@ -14,7 +14,6 @@
 //! never reports an attempt in flight, so sealing it costs nothing.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use broca_protocol::{ModelAttempt, StepId};
 use broca_wal::WalRecord;
@@ -51,8 +50,6 @@ struct State {
     sealed: bool,
     in_flight: bool,
     handed_over: Option<SealedAttempt>,
-    hooks: std::collections::BTreeMap<HookStage, Vec<WalRecord>>,
-    sealed_hooks: Vec<Vec<WalRecord>>,
     pending_attempts: std::collections::BTreeMap<broca_wal::record::AttemptId, WalRecord>,
 }
 
@@ -76,23 +73,6 @@ pub enum HookStage {
 }
 
 impl ShutdownSeal {
-    /// Enqueue a reservation and install its unsent fallback at the seal's linearization point.
-    pub(crate) fn reserve_billing_attempt(
-        &self,
-        writer: &crate::WalHandle,
-        id: broca_wal::record::AttemptId,
-        reservation: WalRecord,
-        fallback: WalRecord,
-    ) -> Result<bool, crate::WalWriteError> {
-        let mut state = self.inner.state.lock().unwrap();
-        if state.sealed {
-            return Ok(false);
-        }
-        writer.record(reservation).into_result()?;
-        state.pending_attempts.insert(id, fallback);
-        Ok(true)
-    }
-
     /// Mark a durable reservation as possibly sent before granting the transport permission.
     pub(crate) fn start_billing_attempt(
         &self,
@@ -111,6 +91,23 @@ impl ShutdownSeal {
         }
     }
 
+    /// Enqueue a reservation and install its unsent fallback at the seal's linearization point.
+    pub(crate) fn reserve_billing_attempt(
+        &self,
+        writer: &crate::WalHandle,
+        id: broca_wal::record::AttemptId,
+        reservation: WalRecord,
+        fallback: WalRecord,
+    ) -> Result<bool, crate::WalWriteError> {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.sealed {
+            return Ok(false);
+        }
+        writer.record(reservation).into_result()?;
+        state.pending_attempts.insert(id, fallback);
+        Ok(true)
+    }
+
     /// Settlement and fallback removal are indivisible, even when shutdown already tripped.
     pub(crate) fn settle_billing_attempt(
         &self,
@@ -125,78 +122,6 @@ impl ShutdownSeal {
             return Ok(Some(seq));
         }
         Ok(None)
-    }
-
-    /// Deposit or replace the whole-chain fallback under the seal's linearization lock.
-    /// False means the loop has lost to shutdown and must park without further writes.
-    pub fn deposit_hook(&self, stage: HookStage, record: WalRecord) -> bool {
-        self.deposit_hook_records(stage, vec![record])
-    }
-
-    /// When broca stops runaway tool arguments, save the step and the call's error result
-    /// together. Shutdown must not preserve the call while losing the reason it cannot run.
-    pub fn deposit_hook_records(&self, stage: HookStage, records: Vec<WalRecord>) -> bool {
-        let mut state = self.inner.state.lock().unwrap();
-        if state.sealed {
-            return false;
-        }
-        state.hooks.insert(stage, records);
-        true
-    }
-
-    /// Remove the slot and enqueue the final record at one linearization point. No await
-    /// can let shutdown take the fallback between removal and enqueue.
-    pub fn record_hook(
-        &self,
-        stage: &HookStage,
-        writer: &crate::WalHandle,
-        record: WalRecord,
-    ) -> bool {
-        self.record_hook_records(stage, writer, vec![record])
-    }
-
-    /// Enqueue the assistant step, batch start and rejected-call results under the seal
-    /// lock, so shutdown cannot take only the step before its errors reach the writer.
-    pub fn record_hook_records(
-        &self,
-        stage: &HookStage,
-        writer: &crate::WalHandle,
-        records: Vec<WalRecord>,
-    ) -> bool {
-        let mut state = self.inner.state.lock().unwrap();
-        if state.sealed {
-            return false;
-        }
-        state.hooks.remove(stage);
-        let _ = writer.record_group(records);
-        true
-    }
-
-    /// Actor side: after seal_and_collect and before interrupted close-out, persist the
-    /// slots taken by the seal. This barrier must complete before replay reads the WAL.
-    pub async fn record_hook_fallbacks(
-        &self,
-        writer: &crate::WalHandle,
-    ) -> Result<(), crate::WalWriteError> {
-        {
-            let mut state = self.inner.state.lock().unwrap();
-            assert!(
-                state.sealed,
-                "hook fallbacks may only be taken by a sealed actor"
-            );
-            for records in std::mem::take(&mut state.sealed_hooks) {
-                let _ = writer.record_group(records);
-            }
-            for terminal in std::mem::take(&mut state.pending_attempts).into_values() {
-                writer.record(terminal).into_result()?;
-            }
-        }
-        writer.sync_for_seal().await?;
-        Ok(())
-    }
-
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// A seal whose run's sends also move the session's cache clock.
@@ -279,128 +204,5 @@ impl ShutdownSeal {
         state.handed_over = Some(SealedAttempt { step_id, attempt });
         drop(state);
         self.inner.changed.notify_waiters();
-    }
-
-    /// Seal side: trip the signal, then wait at most `bound` for the in-flight attempt's
-    /// record. Returns `None` at once when no attempt was in flight, and `None` after `bound`
-    /// when the transport never handed one over (the record is then lost; the seal goes on).
-    ///
-    /// THE CALLER MUST THEN ABORT THE RUN TASK. Once tripped, the transport keeps its stream open
-    /// and silent on purpose, so the run loop can't pick a terminal of its own; nothing else ever
-    /// wakes it. Tripping this without aborting the run leaves that run parked forever. The only
-    /// caller today is the actor's shutdown seal, which aborts immediately after this returns.
-    pub async fn seal_and_collect(&self, bound: Duration) -> Option<SealedAttempt> {
-        {
-            let mut state = self.inner.state.lock().unwrap();
-            state.sealed = true;
-            state.sealed_hooks = std::mem::take(&mut state.hooks).into_values().collect();
-        }
-        self.inner.tripped.cancel();
-        let deadline = tokio::time::Instant::now() + bound;
-        loop {
-            // Register for the wakeup BEFORE reading the state, so a hand-over that lands
-            // between the read and the wait is not missed.
-            let changed = self.inner.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            {
-                let mut state = self.inner.state.lock().unwrap();
-                if let Some(sealed) = state.handed_over.take() {
-                    return Some(sealed);
-                }
-                if !state.in_flight {
-                    return None;
-                }
-            }
-            if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                return None;
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use broca_protocol::AttemptOutcome;
-
-    fn attempt() -> ModelAttempt {
-        ModelAttempt {
-            content_progress: Default::default(),
-            attempt: 0,
-            request_body_len: 1,
-            request_body_sha256: "aa".into(),
-            http_status: Some(200),
-            content_type: None,
-            response_body_len: 0,
-            response_body_sha256: "bb".into(),
-            response_body_cap: None,
-            outcome: AttemptOutcome::SealedInFlight,
-            ts_ms: 0,
-            sent_at_ms: None,
-            transport: None,
-            websocket_request: None,
-            cache_evidence: None,
-            websocket_close_code: None,
-            input_transformations: None,
-            input_transformations_unmeasured: false,
-            credential_refresh: None,
-            served_account_ref: None,
-            account_observation: Default::default(),
-        }
-    }
-
-    #[tokio::test]
-    async fn nothing_in_flight_returns_at_once_and_blocks_later_attempts() {
-        let seal = ShutdownSeal::new();
-        assert_eq!(
-            futures::poll!(Box::pin(seal.seal_and_collect(Duration::from_secs(5)))),
-            std::task::Poll::Ready(None)
-        );
-        assert!(!seal.begin_attempt(), "no attempt may start after the seal");
-    }
-
-    #[tokio::test]
-    async fn an_in_flight_attempt_is_handed_over() {
-        let seal = ShutdownSeal::new();
-        assert!(seal.begin_attempt());
-        let transport = seal.clone();
-        tokio::spawn(async move {
-            transport.tripped().await;
-            transport.hand_over(StepId(3), attempt());
-        });
-        let sealed = seal.seal_and_collect(Duration::from_secs(5)).await;
-        assert_eq!(
-            sealed,
-            Some(SealedAttempt {
-                step_id: StepId(3),
-                attempt: attempt()
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn an_attempt_that_ends_on_its_own_hands_nothing_over() {
-        let seal = ShutdownSeal::new();
-        assert!(seal.begin_attempt());
-        let transport = seal.clone();
-        tokio::spawn(async move {
-            transport.tripped().await;
-            transport.end_attempt();
-        });
-        assert_eq!(seal.seal_and_collect(Duration::from_secs(5)).await, None);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_transport_that_ignores_the_seal_costs_at_most_the_bound() {
-        let seal = ShutdownSeal::new();
-        assert!(seal.begin_attempt());
-        let collect = seal.seal_and_collect(Duration::from_millis(300));
-        tokio::pin!(collect);
-        assert!(futures::poll!(&mut collect).is_pending());
-        tokio::time::advance(Duration::from_millis(299)).await;
-        assert!(futures::poll!(&mut collect).is_pending());
-        tokio::time::advance(Duration::from_millis(1)).await;
-        assert_eq!(futures::poll!(&mut collect), std::task::Poll::Ready(None));
     }
 }

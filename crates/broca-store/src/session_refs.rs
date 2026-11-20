@@ -24,7 +24,7 @@ mod backfill;
 mod batches;
 mod census;
 mod write;
-pub use batches::MigrationWriteStats;
+pub(crate) use batches::MigrationWriteStats;
 pub use census::{census, migrate, CensusCounts};
 pub(crate) use write::insert;
 #[cfg(test)]
@@ -241,20 +241,6 @@ impl SessionInventory {
         Ok(SessionRefs { sessions, complete })
     }
 
-    /// Roots independently present in the bind inventory, with the same completeness proof as
-    /// named lookups. A conversion may use them to prove a source filename's old-root identity.
-    pub fn project_roots(&self) -> Result<(Vec<String>, bool), StoreError> {
-        self.read_inventory(|conn| {
-            let mut query = conn.prepare(
-                "SELECT DISTINCT project_root FROM agent_data_session_ref ORDER BY project_root",
-            )?;
-            let roots = query
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(roots)
-        })
-    }
-
     fn read_inventory<T>(
         &self,
         select: impl FnOnce(&Connection) -> Result<T, StoreError>,
@@ -276,10 +262,6 @@ impl SessionInventory {
 }
 
 impl SqliteStore {
-    pub fn session_ref_project_roots(&self) -> Result<(Vec<String>, bool), StoreError> {
-        SessionInventory::shared(&self.conn).project_roots()
-    }
-
     pub fn session_refs<'a>(
         &self,
         refs: impl Iterator<Item = &'a str>,

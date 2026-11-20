@@ -237,15 +237,6 @@ fn bedrock_started_without_message_stop_is_truncation() {
     );
 }
 
-fn recorded_bedrock_event_stream() -> Vec<u8> {
-    let mut stream = recorded_bedrock_event_stream_through_message_stop();
-    stream.extend(event_stream_message(
-        "metadata",
-        &json!({"usage": {"inputTokens": 12, "outputTokens": 8, "totalTokens": 20, "cacheReadInputTokens": 5, "cacheWriteInputTokens": 7}, "metrics": {"latencyMs": 42}}),
-    ));
-    stream
-}
-
 fn recorded_bedrock_event_stream_through_message_stop() -> Vec<u8> {
     let events = [
         ("messageStart", json!({"role": "assistant"})),
@@ -328,4 +319,13 @@ fn crc32(bytes: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+fn recorded_bedrock_event_stream() -> Vec<u8> {
+    let mut stream = recorded_bedrock_event_stream_through_message_stop();
+    stream.extend(event_stream_message(
+        "metadata",
+        &json!({"usage": {"inputTokens": 12, "outputTokens": 8, "totalTokens": 20, "cacheReadInputTokens": 5, "cacheWriteInputTokens": 7}, "metrics": {"latencyMs": 42}}),
+    ));
+    stream
 }

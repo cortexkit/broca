@@ -21,19 +21,7 @@ pub struct Transcript {
     pub signed_floor: Option<u64>,
 }
 
-impl Transcript {
-    pub fn newest_step_fill(&self) -> Option<(&str, u64)> {
-        self.newest_step_fill
-            .as_ref()
-            .map(|(mid, fill)| (mid.as_str(), *fill))
-    }
-
-    /// The id of the entry the signed floor names. A transcript built by replaying every run
-    /// holds that entry among its entries; one that didn't has no floor to name.
-    pub fn floor_entry(&self) -> Option<&str> {
-        super::host::floor_entry(self.signed_floor, &self.entries)
-    }
-}
+impl Transcript {}
 
 pub fn project(records: &[FramedRecord], lineage: &str) -> Result<Transcript, String> {
     let raw: Vec<_> = records.iter().map(|frame| frame.record.clone()).collect();
@@ -59,39 +47,6 @@ pub fn project(records: &[FramedRecord], lineage: &str) -> Result<Transcript, St
     )?;
     transcript.signed_floor = signed_floor;
     Ok(transcript)
-}
-
-pub fn tail(
-    seed: &crate::ProjectionSeed,
-    records: &[FramedRecord],
-    lineage: &str,
-) -> Result<Transcript, String> {
-    let head = seed
-        .admission_checkpoint
-        .head
-        .as_ref()
-        .ok_or("compaction tail has no cached head")?;
-    let continuation = head
-        .compaction_metadata
-        .clone()
-        .ok_or("compaction tail has no metadata checkpoint")?;
-    let replay =
-        crate::replay::replay_projection_tail(seed, records).map_err(|error| error.to_string())?;
-    let times = crate::message_times::mode3_written_times(
-        records.iter().map(|frame| &frame.record),
-        crate::placement::Placement::new(seed.prefix_len),
-        head.queued_times().clone(),
-        head.mode3_times.clone().unwrap_or_default(),
-    )?
-    .times;
-    finish(
-        records,
-        lineage,
-        seed.prefix_len,
-        continuation,
-        replay.messages,
-        times,
-    )
 }
 
 fn finish(

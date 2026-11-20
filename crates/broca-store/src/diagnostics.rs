@@ -213,62 +213,6 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_core::{RunIndex, RunIndexState};
-    use broca_protocol::{BindIdentity, ModelHandle, RunFinishReason, Usage};
-    use broca_wal::{FramedRecord, WalRecord};
-
-    #[test]
-    fn diagnostics_terminal_writers_preserve_identical_attribution_in_both_orders() {
-        for actor_first in [true, false] {
-            let store = SqliteStore::open_in_memory().unwrap();
-            store.enable_bus_events("diagnostics_test").unwrap();
-            let session = BindIdentity::new("/project", "test", "diagnostics");
-            let start = crate::conformance::run_started(
-                1,
-                "run",
-                &session,
-                "PRIVATE PROMPT",
-                ModelHandle::new("openai", "model"),
-            );
-            let finish = FramedRecord {seq:2,fence:1,record:WalRecord::RunFinished {
-                interrupt_reason:None,reason:RunFinishReason::Error,ts_ms:Some(2000),usage:Usage::default(),retries_used:0,
-                error:Some(serde_json::from_value(serde_json::json!({"class":"permanent","message":"PRIVATE PROVIDER TEXT","provider_code":"request_invalid"})).unwrap()),
-            }};
-            store
-                .project_bus_events(&session, "epoch", std::slice::from_ref(&start), 3000)
-                .unwrap();
-            let mut attribution = RunIndexAttribution::default();
-            attribution.observe(&start.record);
-            attribution.observe(&finish.record);
-            let publish_actor = || {
-                store
-                    .index_run_attributed("run", RunIndexState::Error, None, None, 0, &attribution)
-                    .unwrap()
-            };
-            let publish_projector = || {
-                store
-                    .project_bus_events(&session, "epoch", &[start.clone(), finish.clone()], 3000)
-                    .unwrap()
-            };
-            if actor_first {
-                publish_actor();
-                publish_projector();
-            } else {
-                publish_projector();
-                publish_actor();
-            }
-            store
-                .index_run_terminal("run", RunIndexState::Error, None, None, 0)
-                .unwrap();
-            let evidence = store.diagnostic_evidence(0, 3000).unwrap();
-            assert_eq!(evidence.errors.len(), 1);
-            let row = &evidence.errors[0];
-            assert_eq!(row.at_ms, Some(2000));
-            assert_eq!(row.provider.as_deref(), Some("openai"));
-            assert_eq!(row.class.as_deref(), Some("permanent"));
-            assert_eq!(row.code.as_deref(), Some("request_invalid"));
-        }
-    }
 
     #[test]
     fn diagnostics_index_plans_and_250k_index_build() {

@@ -1,19 +1,7 @@
 //! Repetition guidance reconstructed from raw tool results without changing durable history.
 
-use crate::tool_repetition::{result_bytes, RepetitionFold, RepetitionObserver};
-use broca_protocol::{ContentBlock, Message, ToolCall, ToolOutput, ToolResult};
-
-pub mod store_guidance;
-
-/// Whether folding `prompt` with a single observer produces guidance for any tool result.
-pub(crate) fn repetition_guidance_fires(prompt: &[Message]) -> bool {
-    let mut fold = RepetitionFold::default();
-    prompt.iter().any(|message| {
-        fold.push(message)
-            .iter()
-            .any(|(_, verdict)| verdict.guidance().is_some())
-    })
-}
+use crate::tool_repetition::{RepetitionFold, RepetitionObserver};
+use broca_protocol::{ContentBlock, Message, ToolOutput, ToolResult};
 
 pub(crate) fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
     const LABEL: &str = "Tool repetition guidance: ";
@@ -32,28 +20,6 @@ pub(crate) fn append_repetition_guidance(result: &mut ToolResult, guidance: &str
             let text = format!("{value}{suffix}");
             result.output = ToolOutput::Text { text: text.into() };
         }
-    }
-}
-
-fn attach_repetition_guidance_to_result(
-    observer: &mut RepetitionObserver,
-    call: &ToolCall,
-    result: &mut ToolResult,
-) {
-    let bytes = result_bytes(&result.output);
-    let verdict = observer.observe(call, bytes.as_ref(), result.is_error);
-    if let Some(guidance) = verdict.guidance() {
-        append_repetition_guidance(result, &guidance);
-    }
-}
-
-pub(crate) fn attach_repetition_guidance<'a>(
-    observer: &mut RepetitionObserver,
-    calls: impl Iterator<Item = &'a ToolCall>,
-    results: &mut [ToolResult],
-) {
-    for (call, result) in calls.zip(results) {
-        attach_repetition_guidance_to_result(observer, call, result);
     }
 }
 

@@ -1,11 +1,11 @@
 //! Shared harness for the provider-family + error-mode e2e suite.
 //!
 //! It exercises the FULL provider stack — render → SSE/normalize → error classify —
-//! driving the REAL `run_loop` against a mock LLM server (aimock), with a
+//! driving the real session loop against a mock LLM server (aimock), with a
 //! deterministic in-process `StubToolPlane` for tool results. NO subc, NO AFT: the
 //! variable under test is the PROVIDER response shape, and subc/AFT are
 //! provider-agnostic, so booting them would add cost+flake with zero value for this
-//! axis. (The whole-spine proof lives in the cortexkit-e2e M1/M2 tests.)
+//! axis. (Runs through the real daemon and tool modules are the cortexkit-e2e repository's tests.)
 //!
 //! Each test writes an aimock fixture file (the scripted LLM responses), boots
 //! aimock on an ephemeral port, points a `LiveProvider<Family>` at it via base_url,
@@ -20,10 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use broca_core::{
-    run_loop, AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunRequest, RunSummary,
-    StubToolPlane,
-};
+use broca_core::{OutputEvent, RunRequest, StubToolPlane};
 use broca_protocol::{
     caller::ControlUnit,
     content::{ContentBlock, Message, Role, ToolOutput},
@@ -234,7 +231,7 @@ impl RunSpec {
 
 /// The result of a family e2e run: the run summary + the full ordered event stream.
 pub struct RunOutcome {
-    pub summary: RunSummary,
+    pub summary: crate::live_common::SessionLoopEnd,
     pub events: Vec<OutputEvent>,
     #[cfg(feature = "test-harness")]
     pub retry_waits: Vec<Duration>,
@@ -385,8 +382,6 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
     }
 
     let dir = mock.dir.clone();
-    let store = FileLeaseStore::new(dir.join("leases"));
-    let wal = FileWalStore::new(dir.join("wal"));
 
     // A per-run session id (derived from the unique temp dir name) so parallel runs
     // never share a lease key — the lease is keyed on the session, not just the dir.
@@ -396,7 +391,7 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
         .unwrap_or("family-e2e")
         .to_string();
     let policy_allowed = spec.tools.iter().map(|t| t.name.clone()).collect();
-    let req = RunRequest {
+    let mut req = RunRequest {
         account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
@@ -451,9 +446,7 @@ pub async fn run_family_e2e<F: WireFamily + 'static>(
         }
         v
     });
-    let summary = run_loop(req, &provider, &plane, &store, &AllowAll, &wal, &tx)
-        .await
-        .expect("run_loop should not fail at the lease/WAL level");
+    let summary = crate::live_common::run_on_session_loop(&mut req, &provider, &plane, &tx).await;
     drop(tx);
     let events = collector.await.unwrap();
 

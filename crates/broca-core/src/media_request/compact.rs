@@ -23,6 +23,11 @@ pub(crate) struct References {
 }
 
 impl References {
+    /// Every reference, in the order first captured.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &MediaRef> {
+        self.refs.iter()
+    }
+
     pub(crate) fn get(&self, id: RefId) -> &MediaRef {
         &self.refs[id.0 as usize]
     }
@@ -57,11 +62,6 @@ impl References {
         self.refs.push(reference.clone());
         self.by_digest.insert(at, id);
         id
-    }
-
-    /// Every reference, in the order first captured.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &MediaRef> {
-        self.refs.iter()
     }
 
     /// The heap the table holds (see `media_request::held`).

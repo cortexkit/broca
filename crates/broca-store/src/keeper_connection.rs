@@ -49,7 +49,3 @@ pub(crate) fn open(
     super::restrict_to_owner(path);
     Ok(conn)
 }
-
-pub(crate) fn metadata_error(path: &Path, owner: &str, error: rusqlite::Error) -> KeeperOpenError {
-    KeeperOpenError(format!("{owner} cannot read {}: {error}", path.display()))
-}

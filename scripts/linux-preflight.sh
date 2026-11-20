@@ -20,7 +20,6 @@ printf 'integration selection (fixture families stay in CI/Mac):\n%s\n' "$portab
 features=(
   -F broca-provider/live
   -F broca-provider/test-harness
-  -F broca-provider/portable-power-loss
   -F broca-catalog/live
   -F broca-module-serve/test-clock
 )
@@ -44,7 +43,7 @@ unit_rc=0
 cargo test --locked --workspace --lib --bins --no-fail-fast "${features[@]}" --quiet -- --exact "${unit_skips[@]}" --test-threads 16 --show-output 2>&1 | tee "$scratch/units" || unit_rc=$?
 python3 scripts/preflight-test-report.py units "$scratch/units"
 [[ "$unit_rc" -eq 0 ]] || exit "$unit_rc"
-cargo nextest list --locked --workspace "${features[@]}" -E 'kind(test) and not (binary(=live) or binary(=live_e2e))' -T json > "$scratch/full.json"
+cargo nextest list --locked --workspace "${features[@]}" -E 'kind(test) and not binary(=live)' -T json > "$scratch/full.json"
 cargo nextest list --locked --workspace "${features[@]}" -E "$portable_integration_filter" -T json > "$scratch/selected.json"
 python3 scripts/preflight-test-report.py inventory "$scratch/full.json" "$scratch/selected.json"
 integration_rc=0

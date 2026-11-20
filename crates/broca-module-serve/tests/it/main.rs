@@ -60,7 +60,6 @@ mod head_import_serve;
 mod input_token_cap;
 mod launch_nonce_e2e;
 mod llm_runner_role;
-mod media_portable;
 mod meta_prompt_cache_key_render;
 mod output_refs;
 #[cfg(unix)]

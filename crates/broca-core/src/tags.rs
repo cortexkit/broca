@@ -40,9 +40,16 @@ pub enum LineageTags {
 }
 
 impl LineageTags {
-    /// The state of an empty lineage.
-    pub const fn unstarted() -> Self {
-        LineageTags::Unstarted { floor: 1 }
+    /// The highest number the stored ledger handed out on this lineage, or a deleted
+    /// predecessor's: 0 when it handed out none. Under the computed rules, the floor kept at
+    /// the switch.
+    pub fn ledger_high(self) -> u64 {
+        match self {
+            LineageTags::Unstarted { floor } => floor.saturating_sub(1),
+            LineageTags::On { next } => next.saturating_sub(1),
+            LineageTags::Off => 0,
+            LineageTags::Computed { floor } => floor,
+        }
     }
 
     /// Fold one record, in WAL order.
@@ -81,36 +88,9 @@ impl LineageTags {
         }
     }
 
-    /// The highest number the stored ledger handed out on this lineage, or a deleted
-    /// predecessor's: 0 when it handed out none. Under the computed rules, the floor kept at
-    /// the switch.
-    pub fn ledger_high(self) -> u64 {
-        match self {
-            LineageTags::Unstarted { floor } => floor.saturating_sub(1),
-            LineageTags::On { next } => next.saturating_sub(1),
-            LineageTags::Off => 0,
-            LineageTags::Computed { floor } => floor,
-        }
-    }
-
-    /// The tag the next part of this lineage gets, if the lineage is (or will be) tagged.
-    pub fn next(self) -> Option<u64> {
-        match self {
-            LineageTags::Unstarted { floor } => Some(floor),
-            LineageTags::On { next } => Some(next),
-            LineageTags::Off | LineageTags::Computed { .. } => None,
-        }
-    }
-
-    /// Raise an unstarted lineage's first tag to at least `floor` (a deleted predecessor's
-    /// next tag). A started lineage already counts from its own records.
-    pub fn with_floor(self, floor: u64) -> Self {
-        match self {
-            LineageTags::Unstarted { floor: own } => LineageTags::Unstarted {
-                floor: own.max(floor),
-            },
-            other => other,
-        }
+    /// The state of an empty lineage.
+    pub const fn unstarted() -> Self {
+        LineageTags::Unstarted { floor: 1 }
     }
 }
 
@@ -183,17 +163,6 @@ impl TagSeed {
         }
     }
 
-    /// The seed after a prefix whose last message is `last` and whose highest number is
-    /// `high`: what a store that keeps only per-row tags can tell without reading every row.
-    pub fn after_last(last: Option<&broca_protocol::Message>) -> Self {
-        Self {
-            high: last
-                .and_then(broca_protocol::Message::part_tags)
-                .map_or(0, PartTags::high),
-            rules: last.and_then(Self::rules_of),
-        }
-    }
-
     fn rules_of(message: &broca_protocol::Message) -> Option<broca_protocol::tags::ComputedRules> {
         let computed = message.part_tags()?.computed?;
         Some(broca_protocol::tags::ComputedRules {
@@ -260,23 +229,6 @@ impl TagNumbering {
         if let Some(rules) = config.computed_tags {
             self.high = self.high.max(rules.checkpoint);
         }
-    }
-
-    /// The highest number shown so far.
-    pub fn high(&self) -> u64 {
-        self.high
-    }
-
-    /// Forget resident positions, not assigned tag numbers, after releasing compacted history.
-    pub(crate) fn released(&mut self, held: usize) {
-        self.numbered = held;
-    }
-
-    /// Continue numbering after `high` when the prompt this numbering was built from holds only
-    /// part of a transcript whose highest number is `high`.
-    pub(crate) fn continue_after(&mut self, high: u64) {
-        self.high = self.high.max(high);
-        self.seed_high = self.seed_high.max(high);
     }
 
     /// Number `message` as the next message after everything numbered so far, without
@@ -392,15 +344,6 @@ impl TagNumbering {
     }
 }
 
-/// Fold a complete WAL from its origin.
-pub fn lineage_tags<'a>(records: impl IntoIterator<Item = &'a WalRecord>) -> LineageTags {
-    let mut tags = LineageTags::unstarted();
-    for record in records {
-        tags.fold(record);
-    }
-    tags
-}
-
 /// The number of parts in each message `record` carries, in record order, when it is a record
 /// whose parts get tags; `None` for every other record.
 pub(crate) fn tag_shape(record: &WalRecord) -> Option<Vec<usize>> {
@@ -506,97 +449,7 @@ pub fn attach_parts(message: &mut broca_protocol::Message, tags: Option<PartTags
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_protocol::content::{ContentBlock, Message, Role, ToolOutput, ToolResult};
-    use broca_protocol::{BatchId, ToolCallId};
-    use broca_wal::record::DispatchOutcome;
-
-    fn result(id: &str) -> WalRecord {
-        WalRecord::ToolResult {
-            finished_at_ms: None,
-            tags: None,
-            batch_id: BatchId("b".into()),
-            result: Arc::new(ToolResult {
-                tool_call_id: ToolCallId(id.into()),
-                output: ToolOutput::Text { text: "r".into() },
-                is_error: false,
-            }),
-            outcome: DispatchOutcome::Completed,
-            hooks: None,
-            reason: None,
-            withdraw_elicitation: None,
-            provider_held: None,
-        }
-    }
-
-    fn two_block_steer() -> WalRecord {
-        steer(2)
-    }
-
-    fn steer(blocks: usize) -> WalRecord {
-        WalRecord::Steered {
-            message_marks: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            retention: None,
-            ts_ms: None,
-            send_id: None,
-            request_identity_digest: None,
-            delivery: None,
-            title: None,
-            input: Arc::new(vec![Message::new(
-                Role::User,
-                (0..blocks)
-                    .map(|i| ContentBlock::Text {
-                        text: format!("{i}").into(),
-                    })
-                    .collect(),
-            )]),
-            hooks: None,
-        }
-    }
-
-    /// A first episode with one single-block user message, written without tags.
-    fn run_started() -> WalRecord {
-        let mut record = crate::replay::projection_boundary_tests::run_started(1, "r").record;
-        if let WalRecord::RunStarted { input, .. } = &mut record {
-            *input = Arc::new(vec![Message::new(
-                Role::User,
-                vec![ContentBlock::Text { text: "hi".into() }],
-            )]);
-        }
-        record
-    }
-
-    /// A first episode frozen under the computed rules, rendering tags, with one user text.
-    fn computed_run_started(checkpoint: u64) -> WalRecord {
-        let mut record = run_started();
-        if let WalRecord::RunStarted { config, .. } = &mut record {
-            config.render_tags = true;
-            config.computed_tags = Some(broca_wal::ComputedTagRules { checkpoint });
-        }
-        record
-    }
-
-    /// The switch from the stored ledger: the first run under the computed rules keeps the
-    /// ledger's high-water as the lineage's floor, and from then on nothing is stamped.
-    #[test]
-    fn the_switch_keeps_the_ledger_high_water_and_stops_stamping() {
-        let mut state = LineageTags::On { next: 10 };
-        assert_eq!(state.ledger_high(), 9);
-        let mut started = computed_run_started(9);
-        assert_eq!(stamp(&mut state, &mut started), None);
-        assert!(started.runner_tags().is_empty());
-        assert_eq!(state, LineageTags::Computed { floor: 9 });
-        let mut res = result("a");
-        assert_eq!(stamp(&mut state, &mut res), None);
-        assert!(res.runner_tags().is_empty());
-        // A later run under the computed rules keeps the floor.
-        state.fold(&computed_run_started(12));
-        assert_eq!(state, LineageTags::Computed { floor: 9 });
-        assert_eq!(LineageTags::unstarted().ledger_high(), 0);
-        assert_eq!(LineageTags::Off.ledger_high(), 0);
-    }
+    use broca_protocol::content::{ContentBlock, Role};
 
     fn user(text: &str) -> broca_protocol::Message {
         broca_protocol::Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
@@ -612,38 +465,6 @@ mod tests {
             .iter()
             .flat_map(|message| message.part_tags().unwrap().parts.clone())
             .collect()
-    }
-
-    /// A Setup checkpoint anchors numbering at its cut: the cut message and every later one are
-    /// numbered after the checkpoint, earlier ones keep theirs.
-    #[test]
-    fn a_setup_checkpoint_renumbers_from_its_cut() {
-        let mut prompt = vec![user("a"), user("b"), user("c")];
-        let mut numbering = TagNumbering::new(TagSeed::default(), 0);
-        numbering.rules = Some(RENDER);
-        numbering.number_new(&mut prompt).unwrap();
-        assert_eq!(numbers(&prompt), vec![Some(1), Some(2), Some(3)]);
-        let checkpoint = broca_wal::SetupTagCheckpoint {
-            tag_checkpoint: 500,
-            cut: "m1".into(),
-        };
-        assert!(numbering
-            .anchor_setup(&mut prompt, 0, &[], "s", &checkpoint)
-            .unwrap());
-        assert_eq!(numbers(&prompt), vec![Some(1), Some(501), Some(502)]);
-        assert_eq!(numbering.high(), 502);
-        prompt.push(user("d"));
-        numbering.number_new(&mut prompt).unwrap();
-        assert_eq!(numbers(&prompt)[3], Some(503));
-        // A cut outside this stretch of the transcript cannot anchor numbering.
-        let gone = broca_wal::SetupTagCheckpoint {
-            tag_checkpoint: 900,
-            cut: "m40".into(),
-        };
-        assert!(!numbering
-            .anchor_setup(&mut prompt, 0, &[], "s", &gone)
-            .unwrap());
-        assert_eq!(numbers(&prompt)[3], Some(503));
     }
 
     /// An in-effect marker carrying a checkpoint for the session wins over the Setup
@@ -674,50 +495,6 @@ mod tests {
             .anchor_setup(&mut prompt, 0, &reverted, "s", &checkpoint)
             .unwrap());
         assert_eq!(numbers(&prompt), vec![Some(501), Some(502), Some(503)]);
-    }
-
-    /// A WAL cut right after the Setup record, before any request rendered a number, replays to
-    /// the anchored numbers, and so does every later read: the anchor is the recorded Setup
-    /// checkpoint, never memory.
-    #[test]
-    fn a_crash_after_setup_replays_the_anchored_numbers() {
-        let setup = WalRecord::CompactionMessage {
-            provider: "provider".into(),
-            kind: broca_wal::CompactionMessageKind::Setup,
-            compaction_id: "head".into(),
-            version: 1,
-            range: broca_wal::CompactionRange { from: 0, to: 0 },
-            replacement: Arc::new(Vec::new()),
-            sha256: broca_wal::compaction_replacement_sha256(&[]).unwrap(),
-            request_id: None,
-            cursor: None,
-            call_when: None,
-            stability: None,
-            ceiling: None,
-            tag_checkpoint: Some(broca_wal::SetupTagCheckpoint {
-                tag_checkpoint: 500,
-                cut: "m0".into(),
-            }),
-            ride_wait_ms: None,
-            view_features: None,
-            view_due: None,
-        };
-        let records = vec![
-            computed_run_started(0),
-            WalRecord::StepStarted {
-                step_id: broca_protocol::StepId(0),
-            },
-            setup,
-        ];
-        // The checkpoint is must-understand: a build that cannot read it refuses the frame.
-        assert!(records[2]
-            .required_features()
-            .contains(&broca_wal::framing::RUNNER_TAGS_V2_FEATURE));
-        let replayed = crate::replay::replay(&records).unwrap();
-        assert_eq!(numbers(&replayed.prompt), vec![Some(501)]);
-        // Before the Setup answer was durable the same run numbers from the session start.
-        let unanchored = crate::replay::replay(&records[..2]).unwrap();
-        assert_eq!(numbers(&unanchored.prompt), vec![Some(1)]);
     }
 
     /// A run cleans the model's text exactly when it renders tags under the computed rules,
@@ -752,228 +529,5 @@ mod tests {
             None,
             "the stored ledger never cleans"
         );
-    }
-
-    #[test]
-    fn an_untagged_first_episode_keeps_the_lineage_untagged() {
-        let mut state = LineageTags::unstarted();
-        let started = run_started();
-        state.fold(&started);
-        assert_eq!(state, LineageTags::Off);
-        let mut later = result("a");
-        assert_eq!(stamp(&mut state, &mut later), None);
-        assert!(later.runner_tags().is_empty());
-    }
-
-    #[test]
-    fn stamping_counts_parts_in_wal_order_from_the_floor() {
-        let mut state = LineageTags::unstarted().with_floor(40);
-        let mut started = run_started();
-        let assigned = stamp(&mut state, &mut started).expect("first episode is tagged");
-        assert_eq!(assigned, vec![MessageTags::new(vec![40])]);
-        let mut two = steer(2);
-        assert_eq!(
-            stamp(&mut state, &mut two),
-            Some(vec![MessageTags::new(vec![41, 42])])
-        );
-        let mut res = result("a");
-        stamp(&mut state, &mut res);
-        assert_eq!(res.runner_tags(), &[MessageTags::new(vec![43])]);
-        assert_eq!(state, LineageTags::On { next: 44 });
-
-        // Folding the written records gives the writer's own next tag back.
-        let folded = lineage_tags([&started, &two, &res]);
-        assert_eq!(folded, LineageTags::On { next: 44 });
-    }
-
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = broca_test_support::scratch_root()
-            .join(format!("broca-tags-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    /// Every tag in `store`'s WAL for `session`, in WAL order.
-    fn wal_tags(store: &crate::FileWalStore, session: &broca_protocol::BindIdentity) -> Vec<u64> {
-        use crate::WalStore;
-        store
-            .read_records(session)
-            .unwrap()
-            .iter()
-            .flat_map(|frame| frame.record.runner_tags().to_vec())
-            .flat_map(|tags| tags.parts)
-            .collect()
-    }
-
-    /// Open a writer on an existing WAL the way admission does: fold the lineage's tag state
-    /// from its records and seed the writer with it.
-    fn reopen(
-        store: &crate::FileWalStore,
-        session: &broca_protocol::BindIdentity,
-    ) -> crate::WalHandle {
-        use crate::WalStore;
-        let records = store.read_records(session).unwrap();
-        let checkpoint = crate::AdmissionCheckpointV1::from_frames(&records).unwrap();
-        let writer = crate::WalHandle::spawn(store.open(session).unwrap(), 1).unwrap();
-        assert_eq!(
-            writer.lineage_tags(),
-            None,
-            "a non-empty WAL starts unknown"
-        );
-        writer.seed_lineage_tags(checkpoint.tags);
-        writer
-    }
-
-    fn strictly_increasing(tags: &[u64]) -> bool {
-        tags.windows(2).all(|pair| pair[0] < pair[1])
-    }
-
-    /// Tags keep counting, never repeating, across a restart (a new writer over the same WAL,
-    /// seeded from its records), a resumed episode, and an agent-data move (the WAL's bytes
-    /// copied to another root and continued there).
-    #[tokio::test]
-    async fn tags_are_strictly_increasing_across_restart_resume_and_a_moved_session() {
-        use crate::WalStore;
-        let session = broca_protocol::BindIdentity::new("/tmp/p", "h", "tags");
-        let store = crate::FileWalStore::new(scratch("origin"));
-
-        let writer = crate::WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap();
-        assert_eq!(writer.lineage_tags(), Some(LineageTags::unstarted()));
-        let (_, input) = writer.record_tagged(run_started());
-        assert_eq!(input, Some(vec![MessageTags::new(vec![1])]));
-        writer.record(two_block_steer());
-        writer.record(result("a"));
-        writer.shutdown().await.unwrap();
-        assert_eq!(wal_tags(&store, &session), vec![1, 2, 3, 4]);
-
-        // A restart: a fresh writer over the same WAL.
-        let writer = reopen(&store, &session);
-        assert_eq!(writer.lineage_tags(), Some(LineageTags::On { next: 5 }));
-        writer.record(result("b"));
-        writer.shutdown().await.unwrap();
-
-        // A resume of the episode after a crash, through another restart.
-        let writer = reopen(&store, &session);
-        writer.record(result("c"));
-        writer.record(two_block_steer());
-        writer.shutdown().await.unwrap();
-        let before_move = wal_tags(&store, &session);
-        assert_eq!(before_move, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-
-        // An agent-data move: the WAL's bytes, as they are, under another root.
-        let moved = crate::FileWalStore::new(scratch("moved"));
-        let destination = moved.wal_path(&session);
-        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        std::fs::copy(store.wal_path(&session), &destination).unwrap();
-        let writer = reopen(&moved, &session);
-        writer.record(result("d"));
-        writer.shutdown().await.unwrap();
-        let after_move = wal_tags(&moved, &session);
-        assert_eq!(&after_move[..before_move.len()], before_move.as_slice());
-        assert_eq!(after_move.last(), Some(&9));
-        assert!(strictly_increasing(&after_move), "{after_move:?}");
-        assert!(moved.read_records(&session).unwrap().len() > 1);
-    }
-
-    /// A writer reopened over a non-empty WAL knows nothing of its lineage's tags until an
-    /// admission seeds it. It refuses a record with parts rather than write it untagged, and
-    /// its next barrier fails, so nothing can claim the record durable.
-    #[tokio::test]
-    async fn an_unseeded_writer_refuses_a_record_with_parts() {
-        use crate::WalStore;
-        let session = broca_protocol::BindIdentity::new("/tmp/p", "h", "unseeded");
-        let store = crate::FileWalStore::new(scratch("unseeded"));
-        let writer = crate::WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap();
-        writer.record(run_started());
-        writer.shutdown().await.unwrap();
-
-        let writer = crate::WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap();
-        assert_eq!(writer.lineage_tags(), None);
-        // A record without parts is written as before.
-        assert!(matches!(
-            writer.record(WalRecord::TurnFinished {
-                step_id: broca_protocol::StepId(1)
-            }),
-            crate::RecordOutcome::Accepted(_)
-        ));
-        assert!(matches!(
-            writer.record(result("a")),
-            crate::RecordOutcome::Refused(_)
-        ));
-        assert!(writer.is_poisoned());
-        assert!(writer.sync().await.is_err());
-        assert!(!store
-            .read_records(&session)
-            .unwrap()
-            .iter()
-            .any(|frame| matches!(frame.record, WalRecord::ToolResult { .. })));
-    }
-
-    /// A lineage whose first episode was written without tags (by a build before tags) stays
-    /// untagged: later records keep their exact, ungated bytes.
-    #[tokio::test]
-    async fn a_lineage_started_untagged_is_never_tagged() {
-        use crate::WalStore;
-        let session = broca_protocol::BindIdentity::new("/tmp/p", "h", "untagged");
-        let store = crate::FileWalStore::new(scratch("untagged"));
-        {
-            let mut wal = store.open(&session).unwrap();
-            wal.append(1, &run_started(), true).unwrap();
-        }
-        let writer = reopen(&store, &session);
-        assert_eq!(writer.lineage_tags(), Some(LineageTags::Off));
-        writer.record(result("a"));
-        writer.shutdown().await.unwrap();
-        assert!(wal_tags(&store, &session).is_empty());
-        let plain = store.read_records(&session).unwrap();
-        assert!(plain.iter().all(|frame| !frame
-            .record
-            .required_features()
-            .contains(&broca_wal::framing::RUNNER_TAGS_FEATURE)));
-    }
-
-    /// A lineage created at an address whose previous lineage retention deleted starts past
-    /// every tag the deleted one used, as its tombstone recorded.
-    #[tokio::test]
-    async fn a_lineage_after_retention_deletion_never_reuses_a_tag() {
-        use crate::WalStore;
-        let session = broca_protocol::BindIdentity::new("/tmp/p", "h", "deleted");
-        let store = crate::FileWalStore::new(scratch("deleted"));
-        let writer = crate::WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap();
-        writer.record(run_started());
-        writer.record(result("a"));
-        writer.shutdown().await.unwrap();
-        let deleted = wal_tags(&store, &session);
-        let next = lineage_tags(
-            store
-                .read_records(&session)
-                .unwrap()
-                .iter()
-                .map(|frame| &frame.record),
-        )
-        .next()
-        .unwrap();
-
-        // Retention moves the WAL away and leaves a tombstone naming the next tag.
-        std::fs::remove_file(store.wal_path(&session)).unwrap();
-        let stone = store.tombstone_path(&session, "deleted-lineage");
-        std::fs::create_dir_all(stone.parent().unwrap()).unwrap();
-        std::fs::write(
-            &stone,
-            serde_json::json!({"lineage_id":"deleted-lineage","expired_at_ms":1,"seq":1,"next_tag":next})
-                .to_string(),
-        )
-        .unwrap();
-        assert_eq!(store.retired_tag_floor(&session).unwrap(), next);
-
-        let writer = crate::WalHandle::spawn(store.open(&session).unwrap(), 1).unwrap();
-        writer.seed_lineage_tags(Some(
-            LineageTags::unstarted().with_floor(store.retired_tag_floor(&session).unwrap()),
-        ));
-        writer.record(run_started());
-        writer.shutdown().await.unwrap();
-        let fresh = wal_tags(&store, &session);
-        assert_eq!(fresh, vec![next]);
-        assert!(deleted.iter().all(|tag| *tag < fresh[0]));
     }
 }

@@ -56,15 +56,6 @@ impl CredentialHosts {
         }
     }
 
-    /// These hosts, reachable over plain `http` too. Tests only.
-    #[cfg(test)]
-    pub(crate) fn over_plain_http(self) -> Self {
-        Self {
-            plain_http: true,
-            ..self
-        }
-    }
-
     /// Whether a request over plain `http` may carry the credential to `host`: only when it
     /// goes to the local machine.
     fn plain_http_allowed(&self, host: &str) -> bool {

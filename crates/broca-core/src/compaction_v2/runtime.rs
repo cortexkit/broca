@@ -478,19 +478,6 @@ impl Runtime {
         );
     }
 
-    /// [`Self::entry_speaks_for`], reading the provider's catalog through `plane` and keeping the
-    /// answer when no Setup has told this runtime yet.
-    pub async fn entry_speaks_for_or_read(&self, plane: &dyn Plane) -> bool {
-        if let Some(declared) = self.entry_speaks_for() {
-            return declared;
-        }
-        let declared = tokio::time::timeout(CALL_DEADLINE, plane.provides_entry_speaks_for())
-            .await
-            .unwrap_or(false);
-        self.learn_entry_speaks_for(declared);
-        self.entry_speaks_for().unwrap_or(declared)
-    }
-
     /// A failed Setup without an applied view is retried before the next send,
     /// not repeatedly within the turn that must already end as unavailable.
     pub async fn begin_send(&self, has_applied_view: bool) {
@@ -498,12 +485,6 @@ impl Runtime {
         if !lane.ready && !has_applied_view {
             lane.setup_due = true;
         }
-    }
-
-    pub async fn require_setup(&self) {
-        let mut lane = self.lane.lock().await;
-        lane.ready = false;
-        lane.setup_due = true;
     }
 
     /// Whether the provider's accepted Setup listed `cache_expired` as a cause broca detects.

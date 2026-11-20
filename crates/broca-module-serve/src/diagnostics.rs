@@ -43,19 +43,6 @@ pub fn install_decided(
     let _ = ROOT.set((RootSource::Boot(decision), config));
 }
 
-/// Boot can inject its selected reader without changing the diagnostic service.
-/// The legacy installer retains its existing read-only connection behavior.
-/// Configure a concrete SqliteStore with the boot WalConfig before erasing its
-/// type; the config here also gates recovery-manifest diagnostics.
-pub fn install_with_reader(
-    root: PathBuf,
-    reader: std::sync::Arc<dyn broca_store::diagnostics::DiagnosticEvidenceReader>,
-    config: broca_wal::WalConfig,
-) {
-    install(root, config);
-    let _ = READER.set(reader);
-}
-
 pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(), ErrorBody> {
     if let SendScope::Stamped(stamp) = scope {
         if stamp.scope.flow_id.is_some() {

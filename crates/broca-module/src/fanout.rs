@@ -102,13 +102,7 @@ impl ResumeCursorProof {
             let incarnation: [u8; 32] = Sha256::digest(text.as_bytes()).into();
             return incarnation == self.incarnation && digest == self.digest;
         }
-        let Some((lineage, identity)) = cursor.frame_identity() else {
-            return false;
-        };
-        let incarnation: [u8; 32] = Sha256::digest(lineage.to_string().as_bytes()).into();
-        incarnation == self.incarnation
-            && identity.seq == cursor.wal_seq
-            && identity.digest == self.digest
+        false
     }
 }
 
@@ -194,7 +188,7 @@ pub(crate) const DISPLAY_RING_CAPACITY: usize = 256;
 /// The live display stream's sender, handed to a run's output drain.
 #[path = "display_replay.rs"]
 mod display_replay;
-pub use display_replay::DisplaySender;
+pub(crate) use display_replay::DisplaySender;
 
 /// Successful subscriber deliveries by lane, and successful wire encodes, since boot.
 ///

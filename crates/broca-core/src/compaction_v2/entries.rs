@@ -169,73 +169,6 @@ pub fn gate_speaks_for(entries: &mut [Entry], declared: bool) {
     }
 }
 
-/// Recover attribution from admission records, not the current plan or the run
-/// that happened to carry the send. Records are joined by submission identity.
-pub fn delivered_from_records<'a>(
-    records: impl IntoIterator<Item = &'a broca_wal::WalRecord>,
-    mut target: impl FnMut(
-        &broca_protocol::RunId,
-        Option<broca_protocol::StepId>,
-        &broca_protocol::ToolCallId,
-    ) -> Option<(String, String)>,
-) -> Deliveries {
-    use broca_protocol::{BindPrincipal, DeliveryMode};
-    use broca_wal::WalRecord;
-    let mut origins: HashMap<String, (Option<BindPrincipal>, Option<String>)> = HashMap::new();
-    let mut deliveries = Deliveries::new();
-    let mut step = None;
-    for record in records {
-        match record {
-            WalRecord::RunStarted { .. } => step = None,
-            WalRecord::ModelStepFinished { step_id, .. } => step = Some(*step_id),
-            WalRecord::DeliveryOrdered {
-                submission_id,
-                order,
-                sent_by,
-            } => {
-                let origin = origins.entry(submission_id.0.clone()).or_default();
-                origin.0 = sent_by.clone();
-                origin.1 = order.template.as_ref().map(|template| template.id.clone());
-            }
-            WalRecord::Queued {
-                submission_id,
-                sent_by,
-                principal,
-                ..
-            } => {
-                let origin = origins.entry(submission_id.0.clone()).or_default();
-                if origin.0.is_none() {
-                    origin.0 = sent_by.clone().or_else(|| principal.clone());
-                }
-            }
-            WalRecord::SendDelivered {
-                submission_id,
-                ride,
-                mode: DeliveryMode::ToolResult,
-                tool_call_id: Some(call),
-                appended_text: Some(text),
-                run_id,
-                ..
-            } => {
-                let Some(identity) = target(run_id, step, call) else {
-                    continue;
-                };
-                let (principal, template) =
-                    origins.get(&submission_id.0).cloned().unwrap_or_default();
-                let sender = delivery_sender(principal.as_ref(), DeliveryMode::ToolResult)
-                    .expect("tool-result delivery has a sender");
-                let text = text.strip_prefix("\n\n").unwrap_or(text);
-                let mut delivered = Delivered::new(sender, text);
-                attach_ride_envelope(&mut delivered, ride.as_ref());
-                delivered.template = template;
-                deliveries.entry(identity).or_default().push(delivered);
-            }
-            _ => {}
-        }
-    }
-    deliveries
-}
-
 /// Map the full stored transcript, including result-only messages as empty entries.
 /// `facts` is positional and already contains backward-only timestamp fallbacks.
 pub fn project(
@@ -417,28 +350,6 @@ pub fn project_completion(
         true
     });
     crate::message_times::completed_at(message.role, at, final_tools)
-}
-
-/// Project completion from already-folded host stamps and native source positions,
-/// excluding supplied assistant input without reading another record or a clock.
-pub fn completion_times(
-    messages: &[Message],
-    first: u64,
-    times: &std::collections::BTreeMap<u64, u64>,
-    native_assistants: &std::collections::BTreeSet<u64>,
-) -> Vec<Option<u64>> {
-    messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let position = first + index as u64;
-            let at = native_assistants
-                .contains(&position)
-                .then(|| times.get(&position).copied())
-                .flatten();
-            project_completion(message, messages.get(index + 1), at)
-        })
-        .collect()
 }
 
 pub(super) fn neutral_reply(text: &str, accepts_empty_text: bool) -> String {

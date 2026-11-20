@@ -3,11 +3,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use broca_core::{ExportCursor, ExportIndex, SessionRefIndex};
-use broca_protocol::{BindIdentity, BindPrincipal, RunId};
+use broca_core::SessionRefIndex;
+use broca_protocol::{BindIdentity, BindPrincipal};
 use broca_store::{
     session_address::{InventoryUnavailable, ScopeReservation, SessionAddressError},
-    ExportStore, SessionInventory, SqliteStore,
+    SessionInventory, SqliteStore,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -100,113 +100,6 @@ fn reservation() -> ScopeReservation {
         },
         scope_ref: "fixture-scope".into(),
     }
-}
-
-#[test]
-fn standalone_export_reads_legacy_fixture_without_changing_schema_or_rows() {
-    let fixture = Fixture::new();
-    let before = fixture.snapshot();
-    let export = ExportStore::open(&fixture.0).unwrap();
-    let page = export.read_export_page(None, 1).unwrap();
-    assert_eq!(page.facts.len(), 1);
-    assert_eq!(page.facts[0].export_seq, 1);
-    assert_eq!(
-        page.facts[0].segment.as_session().unwrap().run_id.0,
-        "fixture-run"
-    );
-    assert_eq!(export.high_water(), 2);
-    assert_eq!(page.high_water, 2);
-    assert_eq!(export.source_instance_id(), page.source_instance_id);
-    assert_eq!(export.source_epoch(), page.source_epoch);
-    let next = export.read_export_page(page.next.clone(), 1).unwrap();
-    assert_eq!(next.facts.len(), 1);
-    assert_eq!(next.facts[0].export_seq, 2);
-    assert!(export
-        .read_export_page(next.next, 1)
-        .unwrap()
-        .facts
-        .is_empty());
-    let stale = ExportCursor {
-        source_instance_id: "another-source".into(),
-        source_epoch: page.source_epoch,
-        export_seq: 0,
-    };
-    assert!(matches!(
-        export.read_export_page(Some(stale), 1),
-        Err(broca_core::ExportError::EpochChanged { high_water: 2, .. })
-    ));
-    assert!(export
-        .is_imported_run(&known(), &RunId("fixture-imported".into()))
-        .unwrap());
-    assert!(!export
-        .is_imported_run(&known(), &RunId("local-run".into()))
-        .unwrap());
-    drop(export);
-    assert_eq!(fixture.snapshot(), before);
-    let legacy = SqliteStore::open_read_only(&fixture.0).unwrap();
-    assert_eq!(legacy.read_export_page(None, 1).unwrap(), page);
-}
-
-#[test]
-fn standalone_export_appends_imported_floor_and_system_one_facts_in_legacy_tables() {
-    let fixture = Fixture::new();
-    let export = ExportStore::open(&fixture.0).unwrap();
-    export
-        .record_imported_runs(&known(), "new-cut", &[RunId("another-imported".into())])
-        .unwrap();
-    export
-        .record_imported_runs(&known(), "new-cut", &[RunId("another-imported".into())])
-        .unwrap();
-    let legacy = SqliteStore::open_read_only(&fixture.0).unwrap();
-    assert!(legacy
-        .is_imported_run(&known(), &RunId("another-imported".into()))
-        .unwrap());
-    assert!(legacy
-        .is_imported_run(&known(), &RunId("fixture-imported".into()))
-        .unwrap());
-    assert_eq!(
-        fixture
-            .conn()
-            .query_row("SELECT COUNT(*) FROM export_imported_runs", [], |row| row
-                .get::<_, i64>(
-                0
-            ))
-            .unwrap(),
-        2
-    );
-    let fact = broca_core::system_one_fact::SystemOneFact {
-        fact_id: "fixture-system-one".into(),
-        batch_id: "fixture-batch".into(),
-        item_index: 0,
-        provider: "fixture-provider".into(),
-        model: "fixture-model".into(),
-        auth_selection: None,
-        account_ref: None,
-        run_id: None,
-        flow_id: None,
-        charge_basis: broca_core::ChargeBasis::Unknown,
-        charge_basis_mapping_version: 1,
-        charge_basis_overrides: String::new(),
-        usage: broca_core::system_one_fact::SystemOneUsage {
-            input_tokens: Some(11),
-            output_tokens: Some(3),
-        },
-        occurred_at_ms: 1234,
-    };
-    assert!(export.emit_system_one_fact(&fact).unwrap());
-    assert!(!export.emit_system_one_fact(&fact).unwrap());
-    let mut collision = fact.clone();
-    collision.occurred_at_ms += 1;
-    assert!(export.emit_system_one_fact(&collision).is_err());
-    assert_eq!(export.high_water(), 3);
-    assert_eq!(
-        legacy.read_export_page(None, 100).unwrap(),
-        export.read_export_page(None, 100).unwrap()
-    );
-    drop(export);
-    let reopened = ExportStore::open(&fixture.0).unwrap();
-    assert_eq!(reopened.high_water(), 3);
-    assert_eq!(reopened.read_export_page(None, 100).unwrap().facts.len(), 3);
 }
 
 #[test]
@@ -347,37 +240,26 @@ fn standalone_inventory_does_not_turn_incomplete_discovery_or_gaps_into_absence(
 fn standalone_opens_refuse_missing_databases_and_each_required_table_by_name() {
     let fixture = Fixture::new();
     let missing = fixture.0.with_file_name("missing.db");
-    assert!(ExportStore::open(&missing)
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("missing.db"));
     assert!(SessionInventory::open(&missing)
         .err()
         .unwrap()
         .to_string()
         .contains("missing.db"));
     assert!(!missing.exists());
-    for (owner, tables) in [
-        (
-            "ExportStore",
-            vec!["export_meta", "export_facts", "export_imported_runs"],
-        ),
-        (
-            "SessionInventory",
-            vec![
-                "agent_data_session_ref",
-                "agent_data_session_ref_v2",
-                "session_scope_reservation",
-                "agent_data_projection",
-                "agent_data_census",
-                "agent_data_census_inflight",
-                "agent_data_census_unreadable",
-                "agent_data_census_done",
-                "agent_data_pending_session",
-            ],
-        ),
-    ] {
+    for (owner, tables) in [(
+        "SessionInventory",
+        vec![
+            "agent_data_session_ref",
+            "agent_data_session_ref_v2",
+            "session_scope_reservation",
+            "agent_data_projection",
+            "agent_data_census",
+            "agent_data_census_inflight",
+            "agent_data_census_unreadable",
+            "agent_data_census_done",
+            "agent_data_pending_session",
+        ],
+    )] {
         for table in tables {
             let fixture = Fixture::new();
             fixture
@@ -385,14 +267,10 @@ fn standalone_opens_refuse_missing_databases_and_each_required_table_by_name() {
                 .execute_batch(&format!("DROP TABLE {table}"))
                 .unwrap();
             let before = fixture.snapshot();
-            let error = if owner == "ExportStore" {
-                ExportStore::open(&fixture.0).err().unwrap().to_string()
-            } else {
-                SessionInventory::open(&fixture.0)
-                    .err()
-                    .unwrap()
-                    .to_string()
-            };
+            let error = SessionInventory::open(&fixture.0)
+                .err()
+                .unwrap()
+                .to_string();
             assert!(error.contains(owner) && error.contains(table), "{error}");
             assert_eq!(fixture.snapshot(), before);
         }

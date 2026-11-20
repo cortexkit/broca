@@ -1109,43 +1109,6 @@ impl VaultClient {
         decode_status_reply(&decode_reply_json(&reply)?)
     }
 
-    /// Report a wire-auth failure for a handle so the vault can invalidate a dead credential
-    /// (marks it `needs_reauth`) instead of serving it again every run. Only a 401/403
-    /// actually invalidates vault-side; other statuses are accepted-but-noop (a 5xx/429 is a
-    /// provider hiccup, not a dead credential — so the caller should report ONLY on a genuine
-    /// auth failure, not all errors). FIRE-AND-FORGET: the success reply is unit `{}`; this
-    /// returns once the report is sent. The vault rate-limits reports on a handle, so a
-    /// caller must NOT retry-storm it.
-    /// NEVER SENT IN PRODUCTION. Zero invocations across the whole daemon log, against 1668
-    /// `credential.get` round-trips over the same route in the same window -- so the sibling
-    /// surface is proven continuously and this one is proven by nothing. It fires only when a
-    /// run reaches a terminal carrying a wire 401/403, and no production run has.
-    ///
-    /// That makes its correctness an opinion rather than a fact: the request shape here is
-    /// hand-written against a reading of claustrum's contract, and no receiver has ever
-    /// accepted or refused these bytes. A field-name drift on either side would be invisible
-    /// until the first genuine dead credential, which is exactly the moment the report matters.
-    /// ASTRO found precisely this on their side -- the one surface no receiver had accepted was
-    /// the one carrying a wrong field name for weeks, which is the same fact twice rather than
-    /// a coincidence.
-    ///
-    /// So do not read a green test near this as verification: a local test proves the encoder
-    /// matches this struct, and this struct is the thing in doubt. Only real bytes crossing to
-    /// claustrum settle it.
-    pub async fn report_auth_failure(
-        &self,
-        handle: &str,
-        provider_status: u16,
-        record_version: u64,
-    ) -> Result<(), VaultError> {
-        self.report_auth_failure_at(
-            VaultAddress::Handle(handle),
-            provider_status,
-            record_version,
-        )
-        .await
-    }
-
     /// As [`Self::report_auth_failure`], for either address form. The `record_version` CAS is
     /// the same on both. A credential-id address is refused locally when this process has no
     /// consumer identity, exactly as on [`Self::get_scoped`].

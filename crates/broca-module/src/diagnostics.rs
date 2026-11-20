@@ -118,26 +118,6 @@ struct Fences {
 }
 static FENCES: LazyLock<Mutex<Fences>> = LazyLock::new(Mutex::default);
 
-pub fn retention_fenced(session: &broca_protocol::BindIdentity, kind: &str, at_ms: u64) {
-    let Ok(mut fences) = FENCES.lock() else {
-        return;
-    };
-    let session = broca_core::session_addr(session);
-    let key = (session.clone(), kind.to_owned());
-    if fences.rows.len() >= CAP && !fences.rows.contains_key(&key) {
-        fences.overflow = true;
-        return;
-    }
-    let at_ms = i64::try_from(at_ms).unwrap_or(i64::MAX);
-    let row = fences.rows.entry(key).or_insert_with(|| Fence {
-        session,
-        kind: kind.to_owned(),
-        first_ms: at_ms,
-        last_ms: at_ms,
-    });
-    row.last_ms = at_ms;
-}
-
 pub fn retention_deleted(session: &broca_protocol::BindIdentity) {
     if let Ok(mut fences) = FENCES.lock() {
         let address = broca_core::session_addr(session);

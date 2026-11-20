@@ -678,41 +678,6 @@ struct Attach<R> {
     live_replay: Option<oneshot::Receiver<LiveReplay>>,
 }
 
-/// What a catch-up delivers.
-pub(crate) struct Replay {
-    /// The units after the attach point that subscribers see.
-    pub(crate) units: Vec<ControlEvent>,
-    /// Whether a resume cursor names a unit of the record it names, as the session holds it.
-    pub(crate) cursor_valid: bool,
-}
-
-/// Projects `log` through `head` for an attach from `from`, and checks a resume cursor against
-/// the record it names before notice visibility filters any unit.
-pub(crate) fn replay(
-    log: LogFrom,
-    from: AttachFrom,
-    head: u64,
-    identity: &CursorIdentity,
-) -> Result<Replay, String> {
-    replay_with_labels(log, from, head, identity, Default::default())
-}
-
-fn replay_with_labels(
-    log: LogFrom,
-    from: AttachFrom,
-    head: u64,
-    identity: &CursorIdentity,
-    labels: crate::store_awaits::Labels,
-) -> Result<Replay, String> {
-    let mut replayer = Replayer::new(&log.checkpoint, from, head, identity, labels);
-    let mut units = replayer.feed(log.records)?;
-    units.extend(replayer.finish()?);
-    Ok(Replay {
-        units,
-        cursor_valid: replayer.cursor_valid(),
-    })
-}
-
 /// A replay of a session's records for an attach from `from`, fed in order a chunk at a time:
 /// it keeps the projection, the resume cursor's check and the record whose successor the next
 /// chunk brings, so a long catch-up never holds more than one chunk of records.
@@ -945,66 +910,6 @@ pub async fn measure_seed<B: SessionBackend>(
     let head = session.next_seq().saturating_sub(1);
     let projection = seed(session, head, &CursorIdentity::of(session)).await?;
     Ok((projection.control.held_bytes(), projection.last))
-}
-
-/// The cursor of the first unit of `session`'s open log, which a subscriber that followed the
-/// session up to its last seal holds. `None` when the open log yields no unit yet. For the
-/// `session-convert subscribe-cost` measure (crate `broca-session-convert`, which converts WAL
-/// logs into the new storage); a subscription never calls it.
-#[doc(hidden)]
-pub async fn open_log_first_cursor<B: SessionBackend>(
-    session: &Session<B>,
-) -> Result<Option<broca_wire::CursorWire>, String> {
-    let head = session.next_seq().saturating_sub(1);
-    let identity = CursorIdentity::of(session);
-    let log = session
-        .from_log_holding(head + 1, head)
-        .await
-        .map_err(|error| format!("the session's records can't be read: {error:?}"))?;
-    let mut control = StoreControl::at_checkpoint(
-        &log.checkpoint.conversation,
-        &log.checkpoint.operational,
-        log.checkpoint.covers_through,
-    );
-    for (at, (seq, record)) in log.records.iter().enumerate() {
-        let next = log.records.get(at + 1).map(|(_, next)| next);
-        if let Some(unit) = control.project(*seq, record, next)?.into_iter().next() {
-            let cursor = identity.cursor(&unit, identity.key.digest(record));
-            return Ok(Some(cursor.into()));
-        }
-    }
-    Ok(None)
-}
-
-/// A subscriber's catch-up from the resume cursor `cursor` through the session's last seq, as
-/// its task runs it: the read from the checkpoint of the log holding the cursor, the projection
-/// and the resume check. Returns how many units it delivers. For the `session-convert
-/// subscribe-cost` measure (crate `broca-session-convert`); a subscription runs the same steps
-/// in its own task.
-#[doc(hidden)]
-pub async fn catch_up_from<B: SessionBackend>(
-    session: &Session<B>,
-    cursor: &broca_wire::CursorWire,
-) -> Result<usize, String> {
-    let head = session.next_seq().saturating_sub(1);
-    let proof = crate::fanout::ResumeCursorProof::new(
-        cursor.incarnation.as_deref().unwrap_or_default(),
-        cursor.digest.as_deref().unwrap_or_default(),
-    )
-    .ok_or("the cursor carries no well-formed identity")?;
-    let from = AttachFrom::Cursor(FromCursor::Resume {
-        cursor: Cursor::new(cursor.wal_seq, cursor.sub_index),
-        proof,
-    });
-    let log = session
-        .from_log_holding(cursor.wal_seq.min(head + 1), head)
-        .await
-        .map_err(|error| format!("the session's records can't be read: {error:?}"))?;
-    let replayed = replay(log, from, head, &CursorIdentity::of(session))?;
-    if !replayed.cursor_valid {
-        return Err("cursor_expired".into());
-    }
-    Ok(replayed.units.len())
 }
 
 /// Records a catch-up reads and projects at a time, so one attaching far back in a long session

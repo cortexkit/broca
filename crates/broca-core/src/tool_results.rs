@@ -101,11 +101,6 @@ pub fn not_dispatched_result(tool_call_id: &ToolCallId) -> ToolResult {
     }
 }
 
-/// A provider-held call has a known owner, so crash close-out must not claim an unknown outcome.
-pub fn provider_held_interrupted_result(tool_call_id: &ToolCallId) -> ToolResult {
-    provider_held_close_result(tool_call_id, broca_protocol::RunFinishReason::Interrupted).0
-}
-
 /// Close a provider's known obligation without pretending that its outcome is unknown.
 pub fn provider_held_close_result(
     tool_call_id: &ToolCallId,

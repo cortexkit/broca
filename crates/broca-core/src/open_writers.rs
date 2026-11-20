@@ -122,6 +122,13 @@ impl WriterContext {
 }
 
 impl OpenWriter {
+    pub(crate) fn unlink(self) -> Result<(PathBuf, BindIdentity), WalError> {
+        // No directory sync is needed after unlink. A resurrected marker costs a
+        // redundant successor; the durable close still forbids this writer from appending.
+        fs_ops::remove_file(&self.marker).map_err(WalError::Io)?;
+        Ok((self.marker, self.identity))
+    }
+
     pub(crate) fn close<'a>(
         &self,
         wal: &'a mut dyn Wal,
@@ -133,13 +140,6 @@ impl OpenWriter {
         };
         let (seq, synced) = append_barrier(wal, fence, &record, now)?;
         Ok((seq, record, synced))
-    }
-
-    pub(crate) fn unlink(self) -> Result<(PathBuf, BindIdentity), WalError> {
-        // No directory sync is needed after unlink. A resurrected marker costs a
-        // redundant successor; the durable close still forbids this writer from appending.
-        fs_ops::remove_file(&self.marker).map_err(WalError::Io)?;
-        Ok((self.marker, self.identity))
     }
 }
 

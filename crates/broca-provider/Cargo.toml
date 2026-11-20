@@ -21,7 +21,6 @@ test-harness = []
 test-loopback-credentials = []
 # Exhaustive in-process power-loss matrix. Linux preflight runs libtest on 16 cores;
 # native release lanes leave this feature off.
-portable-power-loss = ["live", "test-harness"]
 # The (A) cross-process bench fixture (arm3 producer). OFF by default so the
 # production provider binary carries neither the bench code nor broca-replay.
 bench = ["dep:broca-replay", "dep:subc-protocol", "dep:subc-transport"]
@@ -85,12 +84,16 @@ tokio-tungstenite = { workspace = true, optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [dev-dependencies]
+# Tests that drive a provider through whole runs use the session loop production runs, on a
+# session kept in memory (tests/session_loop_rig.rs).
 broca-session-loop = { path = "../broca-session-loop" }
 broca-session-store = { path = "../broca-session-store" }
+tokio-util.workspace = true
 proptest = { version = "1.11", default-features = false, features = ["std"] }
 broca-wal-reader = { path = "../broca-wal-reader" }
 broca-module-serve = { path = "../broca-module-serve" }
-broca-crash-harness = { path = "../broca-crash-harness" }
+# The session-loop test rig projects a run's records into control units with serve's projection.
+broca-module = { path = "../broca-module" }
 # The shared Claude OAuth wire vectors (`vectors::VECTORS_JSON`) the persona tests are pinned to.
 cortexkit-anthropic-policy = { workspace = true, features = ["test-vectors"] }
 # Shared ChatGPT/Codex golden vectors used by the transport tests.
@@ -100,9 +103,9 @@ broca-owner-only = { workspace = true, features = ["test-support"] }
 broca-test-support = { path = "../broca-test-support" }
 # The #1b frozen-config-resume gate drives the real loop + truncates the WAL.
 broca-wal = { path = "../broca-wal" }
-# The family e2e harness drives the real run_loop (broca-core) against a mock LLM
-# server (aimock) over the live transport, with a deterministic StubToolPlane. The transport reset
-# test freezes the clock to prove relative resets use the injected value.
+# The family e2e harness drives the session loop against a mock LLM server (aimock) over the live
+# transport, with broca-core's deterministic StubToolPlane. The transport reset test freezes the
+# clock to prove relative resets use the injected value.
 broca-core = { path = "../broca-core", features = ["test-clock"] }
 # Test providers implement broca-core's async `Provider` trait without the `live` feature.
 async-trait.workspace = true

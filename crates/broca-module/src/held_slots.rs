@@ -107,17 +107,6 @@ impl HeldSlots {
         rx
     }
 
-    /// Whether any held call of `session` has a slot here: a delivery deposited and not yet
-    /// taken, or a batch waiting. A move of the session into the new storage refuses while one
-    /// does.
-    pub fn holds_session(&self, session: &BindIdentity) -> bool {
-        self.slots
-            .lock()
-            .expect("held slots")
-            .keys()
-            .any(|(held, _)| held == session)
-    }
-
     /// How many slots this process holds, for tests that check nothing is left behind.
     pub fn len(&self) -> usize {
         self.slots.lock().expect("held slots").len()
@@ -320,11 +309,6 @@ impl SlotDelivery {
             mapper,
             timeout: Self::DEFAULT_TIMEOUT,
         }
-    }
-
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
     }
 }
 

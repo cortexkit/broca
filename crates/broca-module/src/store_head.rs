@@ -155,25 +155,6 @@ pub struct HeadFacts {
     pub resume_not_before_ms: Option<u64>,
 }
 
-/// The resume time today's log `framed` recorded for its latest pause, when that pause was for
-/// an account limit. [`head_reply`] shows it only while the run is still paused for one, so
-/// the last pause is the one that counts.
-pub fn account_limit_resume_of(framed: &[broca_wal::FramedRecord]) -> Option<u64> {
-    framed.iter().rev().find_map(|frame| match &frame.record {
-        broca_wal::WalRecord::RunPaused {
-            reason,
-            account_limit,
-            ..
-        } => Some(
-            account_limit
-                .as_ref()
-                .filter(|_| *reason == broca_protocol::PauseReason::AccountLimit)
-                .map(|pause| pause.resume_not_before_ms),
-        ),
-        _ => None,
-    })?
-}
-
 /// The `session.head` reply `facts` give, as today's head assembles it, without what each
 /// storage or the serving module adds: the incarnation and history version, the subscribe
 /// cursor, the input profile, the cache clock and the caller's sender grants.

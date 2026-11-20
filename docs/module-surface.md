@@ -3318,8 +3318,7 @@ header and requires this order:
 3. Separately pass Magic Context's own consumer-ACK drain check for advance notices.
    This is an MC-owned operational check, not a broca API. Obtain its command or
    dashboard procedure from the MC operator before attempting this rollback.
-   Broca's inbound `compaction_bus.acked` and JetStream publish receipts are not that
-   check. Do not proceed while the MC-owned check is unavailable or nonzero.
+   Broca's JetStream publish receipts are not that check. Do not proceed while the MC-owned check is unavailable or nonzero.
 4. Only then roll the Magic Context reader back. A rollback reader that itself
    tolerates the new header does not need this compatibility drain.
 

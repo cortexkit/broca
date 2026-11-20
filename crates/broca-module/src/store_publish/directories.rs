@@ -72,10 +72,6 @@ impl PublicationDirs {
         self.ensure_paths(state_root, store, &["logs", "objects", "heads"])
     }
 
-    pub fn ensure_parent(&mut self, state_root: &Path, parent: &Path) -> io::Result<()> {
-        self.ensure_paths(state_root, parent, &[""])
-    }
-
     fn ensure_paths(
         &mut self,
         state_root: &Path,

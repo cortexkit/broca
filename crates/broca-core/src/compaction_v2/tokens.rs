@@ -35,9 +35,6 @@ struct Cached {
 }
 
 impl Counts {
-    pub fn tokenizer_time(&self) -> std::time::Duration {
-        self.tokenizer_time
-    }
     pub fn family_id(&self) -> Option<&str> {
         self.facts.as_ref().map(|facts| facts.id.as_str())
     }
@@ -219,25 +216,6 @@ impl Counts {
                 None
             };
         }
-    }
-
-    pub fn page(&mut self, page: &mut ReadPage) {
-        self.annotate(&mut page.entries);
-        let has_count = has_counts(&page.entries);
-        page.token_family = has_count.then(|| {
-            self.facts
-                .as_ref()
-                .expect("counts have a family")
-                .id
-                .clone()
-        });
-        page.token_family_exact = has_count.then(|| {
-            self.facts
-                .as_ref()
-                .expect("counts have a family")
-                .family
-                .exact
-        });
     }
 
     pub fn finish_page(
@@ -448,11 +426,12 @@ fn file_count(file: &FileMedia, rule: image::Rule) -> Option<u64> {
 mod tests {
     use super::*;
     use broca_protocol::Message;
-    use cortexkit_role_compaction::{
-        part::{Delivered, Part, ToolPart, Transport},
-        read::{Head, ReadRequest},
-    };
     use serde_json::json;
+
+    use {
+        cortexkit_role_compaction::part::Part, cortexkit_role_compaction::part::ToolPart,
+        cortexkit_role_compaction::part::Transport,
+    };
 
     fn configure(counts: &mut Counts, model: &str) {
         configure_render(counts, model, json!({"family_id": "openai_chat"}));
@@ -498,10 +477,6 @@ mod tests {
         )
     }
 
-    fn page(entries: Vec<Entry>) -> ReadPage {
-        ReadPage::new(entries, Head::new())
-    }
-
     fn expected(text: &str) -> u64 {
         count(Family::O200k, text).unwrap()
     }
@@ -539,84 +514,6 @@ mod tests {
             )
         );
         assert!(!single.exact);
-    }
-
-    #[test]
-    fn projected_parts_count_render_inputs_and_running_tool_inputs_are_stable() {
-        let mut counts = Counts::default();
-        configure(&mut counts, "gpt-4o");
-        let mut tool = ToolPart::new("call", "bad:name", json!({"a": 1}), ToolStatus::Running);
-        let mut running = page(vec![
-            text(),
-            entry("tool", Role::Assistant, PartBody::Tool(tool.clone())),
-        ]);
-        counts.page(&mut running);
-        assert_eq!(running.token_family.as_deref(), Some("o200k/1"));
-        assert_eq!(running.token_family_exact, Some(false));
-        assert_eq!(
-            running.entries[0].parts[0].tokens,
-            Some(PartTokens::count(expected("§7§ hello world")))
-        );
-        assert_eq!(running.entries[1].parts[0].tokens, None);
-        let cached_input = counts
-            .parts
-            .get(&("tool".into(), "0".into(), "o200k/1".into()))
-            .unwrap()
-            .input
-            .unwrap();
-        assert_eq!(cached_input, expected("bad_name_pO2PUf{\"a\":1}"));
-        tool.status = ToolStatus::Completed;
-        tool.output = Some("result".into());
-        tool.set_delivered(vec![Delivered::new("mc", "notice text")]);
-        let mut completed = page(vec![entry("tool", Role::Assistant, PartBody::Tool(tool))]);
-        let digest = completed.entries[0].digest.clone();
-        counts.page(&mut completed);
-        assert_eq!(
-            completed.entries[0].parts[0].tokens,
-            Some(PartTokens::tool(
-                cached_input,
-                expected("§7§ result\n\nnotice text")
-            ))
-        );
-        assert_eq!(
-            completed.entries[0].digest, digest,
-            "counts do not affect transcript checksums"
-        );
-        let first = completed.clone();
-        counts.page(&mut completed);
-        assert_eq!(completed, first);
-    }
-
-    #[test]
-    fn images_use_known_dimensions_and_missing_media_stays_absent() {
-        let mut counts = Counts::default();
-        configure(&mut counts, "gpt-4o");
-        let mut image = FileMedia::new("image/png", Transport::Reference);
-        image.width = Some(640);
-        image.height = Some(480);
-        let mut read = page(vec![entry(
-            "image",
-            Role::User,
-            PartBody::File(image.clone()),
-        )]);
-        counts.page(&mut read);
-        assert_eq!(
-            read.entries[0].parts[0].tokens,
-            Some(PartTokens::count(image::tokens(
-                image::rule_for("gpt-4o", image::Api::OpenAi),
-                image::Size {
-                    width: 640,
-                    height: 480
-                },
-                None
-            )))
-        );
-        image.width = None;
-        let mut unknown = page(vec![entry("unknown", Role::User, PartBody::File(image))]);
-        counts.page(&mut unknown);
-        assert!(unknown.entries[0].parts[0].tokens.is_none());
-        assert!(unknown.token_family.is_none());
-        assert!(unknown.token_family_exact.is_none());
     }
 
     #[test]
@@ -680,87 +577,6 @@ mod tests {
         assert_eq!(
             counts.facts.as_ref().unwrap().system.unwrap().count,
             expected("system instructions") + expected(schema_text)
-        );
-    }
-
-    #[test]
-    fn compact_pages_preserve_counts_and_family_switches_recount() {
-        use cortexkit_role_compaction::read::{Detail, Select};
-        let mut counts = Counts::default();
-        configure(&mut counts, "gpt-4o");
-        let request = ReadRequest::new(
-            Select::After {
-                after_ordinal: None,
-                limit: None,
-            },
-            Detail::Compact,
-        );
-        let compact = counts.finish_page(page(vec![text()]), &request);
-        assert!(compact.entries[0].parts[0].tokens.is_some());
-        assert_eq!(compact.token_family.as_deref(), Some("o200k/1"));
-        configure(&mut counts, "claude-opus-5");
-        assert!(
-            counts.parts.is_empty(),
-            "model changes invalidate the count cache"
-        );
-        let mut next = page(vec![text()]);
-        counts.page(&mut next);
-        let family = family_for_model("claude-opus-5");
-        assert_eq!(next.token_family, Some(family.family.token_family()));
-        assert_eq!(
-            next.entries[0].parts[0].tokens,
-            count(family.family, "§7§ hello world").map(PartTokens::count)
-        );
-        let mut unknown = page(vec![entry(
-            "reasoning",
-            Role::Assistant,
-            PartBody::Reasoning {
-                text: Some("thought".into()),
-                text_bytes: Some(7),
-            },
-        )]);
-        counts.page(&mut unknown);
-        assert!(unknown.entries[0].parts[0].tokens.is_none());
-        assert!(unknown.token_family.is_none());
-    }
-
-    #[test]
-    fn image_rule_changes_change_the_opaque_family_even_with_the_same_text_tokenizer() {
-        assert_eq!(
-            family_for_model("gpt-4o").family,
-            family_for_model("gpt-5.2").family
-        );
-        assert_ne!(
-            token_family_id("gpt-4o", image::Api::OpenAi),
-            token_family_id("gpt-5.2", image::Api::OpenAi)
-        );
-        assert!(token_family_id("gemini-3-pro", image::Api::Google).contains("+img:fixed-"));
-        assert_eq!(
-            token_family_id("claude-opus-5", image::Api::Other),
-            "claude-v5/1"
-        );
-        let mut counts = Counts::default();
-        configure(&mut counts, "gpt-4o");
-        let mut file = FileMedia::new("image/png", Transport::Reference);
-        file.width = Some(4000);
-        file.height = Some(3000);
-        let original = entry("image", Role::User, PartBody::File(file));
-        let mut first = page(vec![original.clone()]);
-        counts.page(&mut first);
-        configure(&mut counts, "gpt-5.2");
-        let mut next = page(vec![original]);
-        counts.page(&mut next);
-        assert_ne!(next.token_family, first.token_family);
-        assert_eq!(
-            next.entries[0].parts[0].tokens,
-            Some(PartTokens::count(image::tokens(
-                image::rule_for("gpt-5.2", image::Api::OpenAi),
-                image::Size {
-                    width: 4000,
-                    height: 3000
-                },
-                None
-            )))
         );
     }
 

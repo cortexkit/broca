@@ -87,45 +87,6 @@ fn backup_classes_change_never_moves_existing_live_sessions() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[tokio::test]
-async fn durable_live_readers_find_session() {
-    let (root, session, record) = fixture("durable-reader");
-    let store = FileWalStore::new(root.join("wal"));
-    store
-        .open_with_class(&session, None, Some("head"))
-        .unwrap()
-        .append(1, &record, true)
-        .unwrap();
-    let store = Arc::new(FileWalStore::new(root.join("wal")).with_backup_classes(vec![]));
-    let address = session_addr(&session);
-    assert_eq!(
-        store.resolve_live_path(&session).unwrap(),
-        Some(store.durable_wal_path(&session))
-    );
-    assert_eq!(store.read_records(&session).unwrap()[0].record, record);
-    assert_eq!(
-        store.read_address_records(&address).unwrap()[0].record,
-        record
-    );
-    assert_eq!(store.wal_present(&session), Some(true));
-    // Durable WALs expose the same native file identity as other live WALs.
-    assert_eq!(
-        store.file_identity(&session).unwrap().is_some(),
-        cfg!(any(unix, windows))
-    );
-    assert!(store.lineage_exists(&session, None).unwrap());
-    assert!(store.addresses().unwrap().contains(&address));
-    assert!(store.move_addresses().unwrap().0.contains(&address));
-    assert!(store.bytes_for_move(&session).unwrap().is_some());
-    let range = store
-        .read_records_range_for_authorization(&session, 0, None, None)
-        .unwrap();
-    assert!(
-        matches!(range.records(), broca_wal::WalRangeRecords::Complete(records) if records[0].record == record)
-    );
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 #[cfg(any(unix, windows))]
 #[test]
 fn native_file_identity_distinguishes_aliases_from_equal_bytes() {
@@ -144,16 +105,6 @@ fn native_file_identity_distinguishes_aliases_from_equal_bytes() {
         Err(WalError::Io(error)) if error.kind() == io::ErrorKind::NotFound
     ));
     std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn missing_native_identity_never_establishes_aliasing() {
-    assert!(!same_native_file_identity(None, None));
-    assert!(!same_native_file_identity(Some((1, 2)), None));
-    assert!(!same_native_file_identity(None, Some((1, 2))));
-    assert!(!same_native_file_identity(Some((1, 2)), Some((2, 2))));
-    assert!(!same_native_file_identity(Some((1, 2)), Some((1, 3))));
-    assert!(same_native_file_identity(Some((1, 2)), Some((1, 2))));
 }
 
 #[cfg(any(unix, windows))]

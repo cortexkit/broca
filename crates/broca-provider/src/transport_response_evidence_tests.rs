@@ -456,60 +456,6 @@ async fn synthetic_http_refusal_keeps_reported_usage_and_missing_header_unknown(
     assert_eq!(hook.finished.lock().unwrap()[0].1.http_status, Some(400));
 }
 
-#[tokio::test]
-async fn synthetic_warm_response_evidence_reaches_existing_envelope_without_legacy_changes() {
-    use broca_core::WalStore;
-    let server = ScriptedServer::start(vec![ScriptResponse::Http {
-        status: 200, headers: vec![("request-id", "synthetic-warm-id")],
-        body: br#"{"model":"reported-model","stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":1,"cache_creation_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":7},"service_tier":"future-tier","speed":"future-speed","unknown":false}}"#,
-    }]).await;
-    let root = attempt_scratch("warm-response-evidence");
-    let (writer, store) = warm_writer(&root).await;
-    let journal = Arc::new(broca_core::cache_warm::WarmJournal::new(
-        writer.clone(),
-        broca_core::ShutdownSeal::new(),
-        warm_template(),
-        "base".into(),
-        None,
-    ));
-    let sent = super::super::send_warm(
-        &build_provider_http_client(),
-        &Clock::default(),
-        warm_request(server.url.clone(), false),
-        WireFamilyId::AnthropicMessages,
-        None,
-        Some(journal),
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(sent.usage.cache_write_tokens, Some(12));
-    Arc::try_unwrap(writer)
-        .ok()
-        .expect("journal releases writer")
-        .shutdown()
-        .await
-        .unwrap();
-    let frames = store.read_records(&attempt_session()).unwrap();
-    let envelope = frames
-        .iter()
-        .find_map(|frame| match &frame.record {
-            broca_wal::WalRecord::CacheWarmed { envelope, .. } => envelope.as_ref(),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(envelope.http_status, Some(200));
-    assert_eq!(
-        envelope.vendor_request_id.as_deref(),
-        Some("synthetic-warm-id")
-    );
-    assert_eq!(envelope.service_tier_used.as_deref(), Some("future-tier"));
-    assert_eq!(envelope.speed_used.as_deref(), Some("future-speed"));
-    assert_eq!(envelope.cache_write_5m_tokens, Some(5));
-    assert_eq!(envelope.cache_write_1h_tokens, Some(7));
-    assert_eq!(envelope.finish_reason, Some(FinishReason::Stop));
-    assert_eq!(envelope.usage_raw.as_ref().unwrap()["unknown"], false);
-}
 
 #[tokio::test]
 async fn synthetic_response_evidence_refresh_witness_is_sticky_but_served_account_is_retained() {

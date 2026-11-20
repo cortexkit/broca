@@ -570,14 +570,6 @@ impl MoveSessionGuard {
             .iter()
             .any(|retired| &retired.key == key && retired.tenure.is_some())
     }
-
-    /// How many closed actors handed their session lease to this guard.
-    pub fn handed_tenures(&self) -> usize {
-        self.retired
-            .iter()
-            .filter(|retired| retired.tenure.is_some())
-            .count()
-    }
 }
 
 /// How a move holds an open session actor while it works on that session.
@@ -636,36 +628,6 @@ pub enum BindOwnership {
     Unreadable(String),
 }
 
-/// One `session.read` snapshot: the page, plus what the same snapshot says beyond it.
-pub struct RouteReadPage {
-    /// Durable WAL sequence covered by the same page snapshot.
-    pub at_seq: u64,
-    pub head_facts: broca_core::head::HeadProjection,
-    /// Log-only media metadata validated alongside this read page.
-    pub head_facts_complete: bool,
-    pub page: broca_core::SessionReadPage,
-    /// Projection commits only complete tool turns. Any open batch therefore remains in the
-    /// WAL records after the snapshot's watermark, which supply this batch's call states.
-    pub open_batch: Option<broca_wire::OpenBatchView>,
-    /// The tool list of the latest episode, when asked for.
-    pub tools: Option<SessionReadTools>,
-    /// The dispatch facts of every tool turn the snapshot's WAL tail commits, by ordinal. A
-    /// turn already in the materialized prefix is not among them.
-    pub dispatches: std::collections::BTreeMap<u64, Vec<broca_core::ToolCallDispatch>>,
-    /// `Some` attests that returned tool outputs were inspected or need no envelope overlay.
-    /// Even an empty map then avoids a separate historical native-output backfill.
-    pub native_tool_outputs: Option<broca_core::display_facts::NativeToolOutputs>,
-    /// When the newest timestamped record of the snapshot's WAL tail was written, in
-    /// milliseconds since the Unix epoch.
-    pub newest_record_ms: Option<u64>,
-    /// For retained lineages, the durable activity timestamp that sets expiry. Maintenance
-    /// records do not advance it. Retained content is WAL-only, so its tail holds the policy.
-    pub retention_activity_ms: Option<u64>,
-    /// The session's newest caller title: the newest one in the snapshot's WAL tail, else the
-    /// one the store's materialized prefix holds. `None` when no send recorded one.
-    pub last_title: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotCounts {
     pub open: usize,
@@ -693,6 +655,212 @@ pub struct RegistryHandle {
 }
 
 impl LineageRegistry {
+    /// Route the send with its admission-only caller affinity and its informational title.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_submission_with_affinity(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        request: broca_protocol::request::SubmissionRequest,
+        kind: crate::executor::RunKind,
+        send_key: crate::actor::SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+        plan: Option<crate::actor::SendPlan>,
+        conversation_key: Option<String>,
+        title: Option<String>,
+        stop_sequences_named: bool,
+    ) -> Result<crate::actor::SendOutcome, OpenError> {
+        self.route_submission_with_retention(
+            key,
+            run_id,
+            request,
+            kind,
+            send_key,
+            skip_materialization,
+            delivery,
+            plan,
+            conversation_key,
+            title,
+            None,
+            stop_sequences_named,
+        )
+        .await
+    }
+
+    /// Route a send with its delivery mode and the fetch plan it carried, which the serve layer
+    /// already parsed and, for a session with no episode, admitted into a manifest.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_submission_with_plan(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        request: broca_protocol::request::SubmissionRequest,
+        kind: crate::executor::RunKind,
+        send_key: crate::actor::SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+        plan: Option<crate::actor::SendPlan>,
+    ) -> Result<crate::actor::SendOutcome, OpenError> {
+        self.route_submission_with_affinity(
+            key,
+            run_id,
+            request,
+            kind,
+            send_key,
+            skip_materialization,
+            delivery,
+            plan,
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Route a send with its delivery mode: queue it behind an active run (the default), steer
+    /// it into the running turn, or interrupt that turn with it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_submission_with_delivery(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        request: broca_protocol::request::SubmissionRequest,
+        kind: crate::executor::RunKind,
+        send_key: crate::actor::SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+    ) -> Result<crate::actor::SendOutcome, OpenError> {
+        self.route_submission_with_plan(
+            key,
+            run_id,
+            request,
+            kind,
+            send_key,
+            skip_materialization,
+            delivery,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_submission_with_class(
+        &self,
+        key: &LineageKey,
+        run_id: RunId,
+        request: broca_protocol::request::SubmissionRequest,
+        kind: crate::executor::RunKind,
+        send_key: crate::actor::SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+        plan: Option<crate::actor::SendPlan>,
+        conversation_key: Option<String>,
+        title: Option<String>,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        stop_sequences_named: bool,
+    ) -> Result<crate::actor::SendOutcome, OpenError> {
+        self.route_submission_with_order(
+            key,
+            run_id,
+            request,
+            kind,
+            send_key,
+            skip_materialization,
+            delivery,
+            plan,
+            conversation_key,
+            title,
+            retention,
+            session_class,
+            stop_sequences_named,
+            None,
+        )
+        .await
+    }
+
+    /// Prevent opening absent actors and pause existing actors, in contract ref
+    /// order. The returned guard remains held through the durable cut completion.
+    /// This is the inspection mode: no actor closes and the guard takes no tenure.
+    pub async fn lock_move_sessions(
+        &self,
+        sessions: &[LineageKey],
+        reject_open: bool,
+    ) -> Result<MoveSessionGuard, OpenError> {
+        self.lock_move_sessions_with_mode(sessions, reject_open, CutLockMode::Inspect)
+            .await
+    }
+
+    /// Send a submission with its optional retention. Reject invalid bounds before creating
+    /// a WAL; then check the lineage's current policy under its lease to exclude racing sends.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_submission_with_retention(
+        &self,
+        key: &LineageKey,
+        run_id: RunId,
+        request: broca_protocol::request::SubmissionRequest,
+        kind: crate::executor::RunKind,
+        send_key: crate::actor::SendKey,
+        skip_materialization: bool,
+        delivery: broca_protocol::Delivery,
+        plan: Option<crate::actor::SendPlan>,
+        conversation_key: Option<String>,
+        title: Option<String>,
+        retention: Option<u64>,
+        stop_sequences_named: bool,
+    ) -> Result<crate::actor::SendOutcome, OpenError> {
+        self.route_submission_with_class(
+            key,
+            run_id,
+            request,
+            kind,
+            send_key,
+            skip_materialization,
+            delivery,
+            plan,
+            conversation_key,
+            title,
+            retention,
+            None,
+            stop_sequences_named,
+        )
+        .await
+    }
+
+    /// Route a send with its non-durable materialization policy. Command retries preserve the
+    /// policy; recovery from WAL alone safely defaults to materialization.
+    pub async fn route_submission_with_materialization(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+        request: broca_protocol::request::SubmissionRequest,
+        kind: crate::executor::RunKind,
+        send_key: crate::actor::SendKey,
+        skip_materialization: bool,
+    ) -> Result<crate::actor::SendOutcome, OpenError> {
+        self.route_submission_with_delivery(
+            key,
+            run_id,
+            request,
+            kind,
+            send_key,
+            skip_materialization,
+            broca_protocol::Delivery::Queue,
+        )
+        .await
+    }
+
+    /// Route a `run.cancel` to the lineage (same reopen-retry discipline as `send`).
+    pub async fn route_cancel(
+        &self,
+        key: &LineageKey,
+        run_id: broca_protocol::RunId,
+    ) -> Result<crate::actor::CancelOutcome, OpenError> {
+        self.route_cancel_at(key, run_id, broca_wal::record::RunCancelAt::Now)
+            .await
+    }
+
     /// Supply the durable identity inventory before accepting routed session binds.
     pub fn set_session_address_inventory(&self, inventory: Arc<broca_store::SqliteStore>) {
         self.set_session_address_resolver(inventory);
@@ -983,18 +1151,6 @@ impl LineageRegistry {
         gate.lock_owned().await
     }
 
-    /// Prevent opening absent actors and pause existing actors, in contract ref
-    /// order. The returned guard remains held through the durable cut completion.
-    /// This is the inspection mode: no actor closes and the guard takes no tenure.
-    pub async fn lock_move_sessions(
-        &self,
-        sessions: &[LineageKey],
-        reject_open: bool,
-    ) -> Result<MoveSessionGuard, OpenError> {
-        self.lock_move_sessions_with_mode(sessions, reject_open, CutLockMode::Inspect)
-            .await
-    }
-
     /// Like [`Self::lock_move_sessions`], choosing how open actors are held. In
     /// [`CutLockMode::Mutate`] the guard may receive closed actors' session leases.
     pub async fn lock_move_sessions_with_mode(
@@ -1166,7 +1322,7 @@ impl LineageRegistry {
     /// `run_index`, the outbox the run-event publisher writes.
     pub fn new_with_run_index(
         opener: Arc<dyn LineageOpener>,
-        run_index: Option<Arc<dyn broca_core::MaterializedStore>>,
+        run_index: Option<Arc<dyn broca_core::RunEventBodies>>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -1284,28 +1440,6 @@ impl LineageRegistry {
         }
     }
 
-    /// Wake a ceiling-held queue after a durable view/notice or model-window change. The
-    /// caller records the new estimate first; the actor then reads it before draining. A
-    /// provider announcement alone is not proof that the session can render a smaller request.
-    pub async fn route_compaction_changed(&self, key: &LineageKey) -> Result<(), OpenError> {
-        loop {
-            self.check_move(key, true)?;
-            self.check_expired(key, None).await?;
-            let handle = self.actor_for(key).await?;
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            if handle
-                .send(crate::actor::LineageCmd::CompactionChanged { reply })
-                .await
-                .is_ok()
-            {
-                return receive
-                    .await
-                    .map_err(|_| OpenError::Open("compaction queue wake interrupted".into()))?
-                    .map_err(OpenError::Open);
-            }
-        }
-    }
-
     /// The compaction-runner wire adapter uses `bind` before acknowledging its
     /// route, then the same session-bound entry point for all three operations.
     pub async fn route_compaction_v2(
@@ -1334,24 +1468,6 @@ impl LineageRegistry {
         Err(Refusal::compaction_not_permitted(
             broca_core::compaction_v2::protocol::wire::not_permitted_reasons::SESSION_NOT_HELD,
         ))
-    }
-
-    pub async fn route_compaction_ready(
-        &self,
-        key: &LineageKey,
-        ready: broca_core::compaction_provider::notice::ViewReady,
-    ) -> Result<bool, String> {
-        self.check_move(key, true).map_err(|e| e.to_string())?;
-        self.check_expired(key, None)
-            .await
-            .map_err(|e| e.to_string())?;
-        let handle = self.actor_for(key).await.map_err(|e| e.to_string())?;
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        handle
-            .send(crate::actor::LineageCmd::ApplyCompaction { ready, reply })
-            .await
-            .map_err(|_| "compaction actor closed")?;
-        receive.await.map_err(|_| "compaction actor closed")?
     }
 
     /// Install the admitter for sends carrying a fetch plan. Set once, before serving; only the
@@ -1855,240 +1971,6 @@ impl LineageRegistry {
         }
     }
 
-    /// Route an already-concrete run request. Internal callers use this compatibility helper;
-    /// a concrete `RunRequest` always represents an explicit tool surface.
-    pub async fn route_send(
-        &self,
-        key: &LineageKey,
-        req: broca_core::RunRequest,
-        kind: crate::executor::RunKind,
-    ) -> Result<crate::actor::SendOutcome, OpenError> {
-        let run_id = req.run_id.clone();
-        // Internal callers provide a stable explicit run id and use this helper's retry semantics.
-        self.route_submission_with_class(
-            key,
-            run_id,
-            req.to_submission(),
-            kind,
-            crate::actor::SendKey::RunId,
-            false,
-            broca_protocol::Delivery::Queue,
-            None,
-            None,
-            req.title.clone(),
-            req.retention,
-            req.session_class.clone(),
-            false,
-        )
-        .await
-    }
-
-    /// Route a `session.send` payload while preserving whether its tool surface was omitted.
-    /// A `Reopen` reply (the actor was closing) or a closed channel retries through the
-    /// registry, so a send racing a close never lands on a draining actor.
-    pub async fn route_submission(
-        &self,
-        key: &LineageKey,
-        run_id: broca_protocol::RunId,
-        request: broca_protocol::request::SubmissionRequest,
-        kind: crate::executor::RunKind,
-        idempotency_keyed: bool,
-    ) -> Result<crate::actor::SendOutcome, OpenError> {
-        self.route_submission_with_materialization(
-            key,
-            run_id,
-            request,
-            kind,
-            crate::actor::SendKey::from_keyed(idempotency_keyed),
-            false,
-        )
-        .await
-    }
-
-    /// Route a send with its non-durable materialization policy. Command retries preserve the
-    /// policy; recovery from WAL alone safely defaults to materialization.
-    pub async fn route_submission_with_materialization(
-        &self,
-        key: &LineageKey,
-        run_id: broca_protocol::RunId,
-        request: broca_protocol::request::SubmissionRequest,
-        kind: crate::executor::RunKind,
-        send_key: crate::actor::SendKey,
-        skip_materialization: bool,
-    ) -> Result<crate::actor::SendOutcome, OpenError> {
-        self.route_submission_with_delivery(
-            key,
-            run_id,
-            request,
-            kind,
-            send_key,
-            skip_materialization,
-            broca_protocol::Delivery::Queue,
-        )
-        .await
-    }
-
-    /// Route a send with its delivery mode: queue it behind an active run (the default), steer
-    /// it into the running turn, or interrupt that turn with it.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route_submission_with_delivery(
-        &self,
-        key: &LineageKey,
-        run_id: broca_protocol::RunId,
-        request: broca_protocol::request::SubmissionRequest,
-        kind: crate::executor::RunKind,
-        send_key: crate::actor::SendKey,
-        skip_materialization: bool,
-        delivery: broca_protocol::Delivery,
-    ) -> Result<crate::actor::SendOutcome, OpenError> {
-        self.route_submission_with_plan(
-            key,
-            run_id,
-            request,
-            kind,
-            send_key,
-            skip_materialization,
-            delivery,
-            None,
-        )
-        .await
-    }
-
-    /// Route a send with its delivery mode and the fetch plan it carried, which the serve layer
-    /// already parsed and, for a session with no episode, admitted into a manifest.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route_submission_with_plan(
-        &self,
-        key: &LineageKey,
-        run_id: broca_protocol::RunId,
-        request: broca_protocol::request::SubmissionRequest,
-        kind: crate::executor::RunKind,
-        send_key: crate::actor::SendKey,
-        skip_materialization: bool,
-        delivery: broca_protocol::Delivery,
-        plan: Option<crate::actor::SendPlan>,
-    ) -> Result<crate::actor::SendOutcome, OpenError> {
-        self.route_submission_with_affinity(
-            key,
-            run_id,
-            request,
-            kind,
-            send_key,
-            skip_materialization,
-            delivery,
-            plan,
-            None,
-            None,
-            false,
-        )
-        .await
-    }
-
-    /// Route the send with its admission-only caller affinity and its informational title.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route_submission_with_affinity(
-        &self,
-        key: &LineageKey,
-        run_id: broca_protocol::RunId,
-        request: broca_protocol::request::SubmissionRequest,
-        kind: crate::executor::RunKind,
-        send_key: crate::actor::SendKey,
-        skip_materialization: bool,
-        delivery: broca_protocol::Delivery,
-        plan: Option<crate::actor::SendPlan>,
-        conversation_key: Option<String>,
-        title: Option<String>,
-        stop_sequences_named: bool,
-    ) -> Result<crate::actor::SendOutcome, OpenError> {
-        self.route_submission_with_retention(
-            key,
-            run_id,
-            request,
-            kind,
-            send_key,
-            skip_materialization,
-            delivery,
-            plan,
-            conversation_key,
-            title,
-            None,
-            stop_sequences_named,
-        )
-        .await
-    }
-
-    /// Send a submission with its optional retention. Reject invalid bounds before creating
-    /// a WAL; then check the lineage's current policy under its lease to exclude racing sends.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route_submission_with_retention(
-        &self,
-        key: &LineageKey,
-        run_id: RunId,
-        request: broca_protocol::request::SubmissionRequest,
-        kind: crate::executor::RunKind,
-        send_key: crate::actor::SendKey,
-        skip_materialization: bool,
-        delivery: broca_protocol::Delivery,
-        plan: Option<crate::actor::SendPlan>,
-        conversation_key: Option<String>,
-        title: Option<String>,
-        retention: Option<u64>,
-        stop_sequences_named: bool,
-    ) -> Result<crate::actor::SendOutcome, OpenError> {
-        self.route_submission_with_class(
-            key,
-            run_id,
-            request,
-            kind,
-            send_key,
-            skip_materialization,
-            delivery,
-            plan,
-            conversation_key,
-            title,
-            retention,
-            None,
-            stop_sequences_named,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn route_submission_with_class(
-        &self,
-        key: &LineageKey,
-        run_id: RunId,
-        request: broca_protocol::request::SubmissionRequest,
-        kind: crate::executor::RunKind,
-        send_key: crate::actor::SendKey,
-        skip_materialization: bool,
-        delivery: broca_protocol::Delivery,
-        plan: Option<crate::actor::SendPlan>,
-        conversation_key: Option<String>,
-        title: Option<String>,
-        retention: Option<u64>,
-        session_class: Option<String>,
-        stop_sequences_named: bool,
-    ) -> Result<crate::actor::SendOutcome, OpenError> {
-        self.route_submission_with_order(
-            key,
-            run_id,
-            request,
-            kind,
-            send_key,
-            skip_materialization,
-            delivery,
-            plan,
-            conversation_key,
-            title,
-            retention,
-            session_class,
-            stop_sequences_named,
-            None,
-        )
-        .await
-    }
-
     /// [`Self::route_submission_with_class`] for a send that may use the `delivery_order` group:
     /// `order` is its ordered list, dedupe key and expiry, or `None` for an ordinary send.
     #[allow(clippy::too_many_arguments)]
@@ -2297,16 +2179,6 @@ impl LineageRegistry {
                 Ok(other) => return Ok(other),
             }
         }
-    }
-
-    /// Route a `run.cancel` to the lineage (same reopen-retry discipline as `send`).
-    pub async fn route_cancel(
-        &self,
-        key: &LineageKey,
-        run_id: broca_protocol::RunId,
-    ) -> Result<crate::actor::CancelOutcome, OpenError> {
-        self.route_cancel_at(key, run_id, broca_wal::record::RunCancelAt::Now)
-            .await
     }
 
     pub async fn route_cancel_at(
@@ -2889,21 +2761,6 @@ impl LineageRegistry {
         self.inner.shutdown_report.lock().unwrap().clone()
     }
 
-    pub fn seal_failures(&self) -> Vec<SealFailure> {
-        self.inner.seal_state.lock().unwrap().failures.clone()
-    }
-
-    pub fn recovery_debt(&self) -> Vec<SealFailure> {
-        self.inner
-            .seal_state
-            .lock()
-            .unwrap()
-            .recovery_debt
-            .values()
-            .cloned()
-            .collect()
-    }
-
     /// The gauge the System One batch service raises for each batch call it runs, so health
     /// and the stop's grace see batches beside session runs.
     pub fn batches_in_flight_gauge(&self) -> Arc<AtomicUsize> {
@@ -3223,23 +3080,6 @@ impl CloseToken {
         {
             let mut slots = self.inner.slots.lock().unwrap();
             slots.remove(&self.key);
-        }
-        let _ = self.done.send(());
-    }
-
-    /// The close ABORTED (pending work or a subscriber raced in): restore `Open{gen}` so
-    /// the actor keeps serving, and wake the waiters (they re-route and find it Open).
-    pub fn abort(mut self, handle: ActorHandle) {
-        self.resolved = true;
-        {
-            let mut slots = self.inner.slots.lock().unwrap();
-            slots.insert(
-                self.key.clone(),
-                Entry::Open {
-                    gen: handle.gen,
-                    handle,
-                },
-            );
         }
         let _ = self.done.send(());
     }
@@ -3881,7 +3721,7 @@ struct Inner {
     /// new storage when it exists nowhere yet.
     store_eligible: Mutex<HashMap<LineageKey, StoreCreation>>,
     opener: Arc<dyn LineageOpener>,
-    run_index: Option<Arc<dyn broca_core::MaterializedStore>>,
+    run_index: Option<Arc<dyn broca_core::RunEventBodies>>,
     stopping: tokio_util::sync::CancellationToken,
     seal: tokio_util::sync::CancellationToken,
     seal_state: Mutex<SealState>,

@@ -207,7 +207,7 @@ elif args[:2] == ["nextest", "run"]:
 elif "--list" in args and "--doc" in args:
     print("unrecognised doctest inventory" if os.environ.get("BAD_DOC") else "0 tests, 0 benchmarks")
 elif "--list" in args:
-    for name in ("fixture", "live", "live_e2e"):
+    for name in ("fixture", "live"):
         print(f"Running tests/{name}.rs (target/debug/{name})")
         print("1 test, 0 benchmarks")
 ''')

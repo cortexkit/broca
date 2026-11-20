@@ -67,10 +67,6 @@ impl FileWalStore {
             session,
         )
     }
-
-    pub fn move_read_count(&self) -> u64 {
-        self.move_reads.load(Ordering::Relaxed)
-    }
 }
 
 pub(super) struct AdmissionWal {
@@ -86,23 +82,6 @@ pub(super) struct AdmissionWal {
 }
 
 impl AdmissionWal {
-    pub(super) fn new(
-        wal: FileWal,
-        address: String,
-        state_root: PathBuf,
-        index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
-        legacy_fence: (PathBuf, [String; 2]),
-    ) -> Self {
-        Self {
-            wal,
-            address,
-            state_root,
-            index,
-            placement: None,
-            legacy_fence,
-        }
-    }
-
     pub(super) fn with_placement(
         mut self,
         ordinary: PathBuf,
@@ -185,6 +164,23 @@ impl AdmissionWal {
             }
         }
         Ok(admission)
+    }
+
+    pub(super) fn new(
+        wal: FileWal,
+        address: String,
+        state_root: PathBuf,
+        index: Arc<Mutex<Option<Arc<dyn SessionRefIndex>>>>,
+        legacy_fence: (PathBuf, [String; 2]),
+    ) -> Self {
+        Self {
+            wal,
+            address,
+            state_root,
+            index,
+            placement: None,
+            legacy_fence,
+        }
     }
 }
 

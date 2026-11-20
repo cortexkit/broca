@@ -1,13 +1,11 @@
 use super::*;
 use crate::families::{openai_responses_chatgpt_frozen_config, OpenAiResponsesChatgpt};
-use broca_core::{
-    lease::FileLeaseStore, run_loop, AllowAll, FileWalStore, RunRequest, StubToolPlane, WalStore,
-};
+use broca_core::{RunRequest, StubToolPlane};
 use broca_protocol::{
     content::{ContentBlock, Message, Role},
     BindIdentity, ModelHandle, RunFinishReason, RunId, StopCondition,
 };
-use broca_wal::WalRecord;
+use broca_session_store::record::Record;
 use futures::SinkExt;
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1045,7 +1043,7 @@ async fn codex_tool_run(
     replies: Vec<Vec<Value>>,
     expected_creates: usize,
     expected_handshakes: usize,
-) -> Vec<WalRecord> {
+) -> Vec<Record> {
     let mock = Mock::start(replies, false, false).await;
     let provider = codex_provider(&mock);
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -1056,7 +1054,6 @@ async fn codex_tool_run(
     ));
     let bind = BindIdentity::new(dir.join("project"), "websocket", "turn");
     let request = tool_run_request(&bind);
-    let wal = FileWalStore::new(dir.join("wal"));
     let count = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&count);
     let plane = StubToolPlane::new().with_tool("lookup", move |_| {
@@ -1065,27 +1062,14 @@ async fn codex_tool_run(
             text: "found".into(),
         })
     });
-    let (tx, mut rx) = mpsc::channel(256);
-    let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = tokio::time::timeout(
+    let run = tokio::time::timeout(
         Duration::from_secs(10),
-        run_loop(
-            request,
-            &provider,
-            &plane,
-            &FileLeaseStore::new(dir.join("lease")),
-            &AllowAll,
-            &wal,
-            &tx,
-        ),
+        crate::session_loop_rig::run_once(request, &provider, &plane),
     )
     .await
-    .unwrap()
     .unwrap();
-    drop(tx);
-    collect.await.unwrap();
-    assert_eq!(result.reason, RunFinishReason::Completed);
-    assert_eq!(result.steps, 2);
+    assert_eq!(run.finished.reason, RunFinishReason::Completed);
+    assert_eq!(run.steps, 2);
     assert_eq!(
         count.load(Ordering::Relaxed),
         1,
@@ -1101,11 +1085,11 @@ async fn codex_tool_run(
     );
     provider.client.chatgpt_connections().retire_session(&bind);
     mock.wait_closes(expected_handshakes).await;
-    let records = wal.read_records(&bind).unwrap();
+    let records = run.records;
     assert_eq!(
         records
             .iter()
-            .filter(|frame| matches!(frame.record, WalRecord::ToolResult { .. }))
+            .filter(|record| matches!(record, Record::ToolReply(_)))
             .count(),
         1
     );
@@ -1131,7 +1115,7 @@ async fn codex_tool_run(
             .iter()
             .any(|item| item["type"] == "function_call_output"));
     }
-    records.into_iter().map(|frame| frame.record).collect()
+    records
 }
 
 #[tokio::test]
@@ -1140,7 +1124,7 @@ async fn codex_continuation_tool_turn_uses_canonical_output_and_dispatches_once(
     assert_eq!(
         records
             .iter()
-            .filter(|record| matches!(record, WalRecord::ModelStepFinished { .. }))
+            .filter(|record| matches!(record, Record::StepEnd(_)))
             .count(),
         2
     );
@@ -1199,21 +1183,20 @@ async fn codex_previous_response_miss(status: Option<u16>) {
     let second_step: Vec<_> = records
         .iter()
         .filter_map(|record| match record {
-            WalRecord::ModelAttemptFinished {
-                step_id,
-                attempt,
-                request_body_len,
-                request_body_sha256,
-                websocket_request,
-                outcome,
-                ..
-            } if *step_id == StepId(2) => Some((
-                attempt,
-                request_body_len,
-                request_body_sha256,
-                websocket_request.as_ref().unwrap(),
-                outcome,
-            )),
+            Record::Attempt(attempt) if attempt.step_id == 2 => {
+                let telemetry = attempt.telemetry.as_ref().expect("websocket telemetry").parse();
+                let websocket: broca_protocol::provider::WebSocketRequestDigest =
+                    serde_json::from_value(telemetry["websocket_request"].clone()).unwrap();
+                let outcome: AttemptOutcome =
+                    serde_json::from_value(Value::String(attempt.outcome.clone())).unwrap();
+                Some((
+                    attempt.attempt,
+                    attempt.request_body_len,
+                    attempt.request_body_sha256,
+                    websocket,
+                    outcome,
+                ))
+            }
             _ => None,
         })
         .collect();
@@ -1222,12 +1205,12 @@ async fn codex_previous_response_miss(status: Option<u16>) {
         2,
         "cache miss recovery must be an accounted retry"
     );
-    assert_eq!(*second_step[0].0, 0);
-    assert_eq!(*second_step[1].0, 1);
+    assert_eq!(second_step[0].0, 0);
+    assert_eq!(second_step[1].0, 1);
     assert_eq!(second_step[0].1, second_step[1].1);
     assert_eq!(second_step[0].2, second_step[1].2);
-    assert_eq!(*second_step[0].4, AttemptOutcome::ChunkError);
-    assert_eq!(*second_step[1].4, AttemptOutcome::Complete);
+    assert_eq!(second_step[0].4, AttemptOutcome::ChunkError);
+    assert_eq!(second_step[1].4, AttemptOutcome::Complete);
     assert!(second_step[0].3.codex.as_ref().unwrap().continuation);
     assert!(!second_step[1].3.codex.as_ref().unwrap().continuation);
     assert_eq!(
@@ -1784,12 +1767,7 @@ async fn websocket_attempt_durably_records_transport_and_preserves_body_digest()
     let http_events = step(&provider, 2, &options).await;
     let ws = attempts(&ws_events)[0];
     let http = attempts(&http_events)[0];
-    let record = WalRecord::model_attempt_finished(StepId(1), ws.clone());
-    let json = serde_json::to_value(record).unwrap();
-    assert_eq!(
-        json["transport"], "websocket",
-        "the transport must survive the WAL conversion"
-    );
+    assert_eq!(ws.transport.as_deref(), Some("websocket"));
     assert_eq!(http.transport.as_deref(), Some("https"));
     assert_eq!(ws.request_body_sha256, http.request_body_sha256);
     assert_eq!(ws.request_body_len, http.request_body_len);
@@ -1873,40 +1851,30 @@ async fn websocket_full_tool_turn_completes_and_closes_on_run_end() {
     let dir = broca_test_support::scratch_root().join("ws-tool-turn");
     let bind = BindIdentity::new(dir.join("project"), "websocket", "turn");
     let request = tool_run_request(&bind);
-    let wal = FileWalStore::new(dir.join("wal"));
-    let (tx, mut rx) = mpsc::channel(256);
-    let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = tokio::time::timeout(
+    let run = tokio::time::timeout(
         Duration::from_secs(10),
-        run_loop(
+        crate::session_loop_rig::run_once(
             request,
             &provider,
             &StubToolPlane::new().with_canned_text("lookup", "found"),
-            &FileLeaseStore::new(dir.join("lease")),
-            &AllowAll,
-            &wal,
-            &tx,
         ),
     )
     .await
-    .unwrap()
     .unwrap();
-    drop(tx);
-    collect.await.unwrap();
-    assert_eq!(result.reason, RunFinishReason::Completed);
-    assert_eq!(result.steps, 2);
+    assert_eq!(run.finished.reason, RunFinishReason::Completed);
+    assert_eq!(run.steps, 2);
     mock.wait_closes(1).await;
-    let records = wal.read_records(&bind).unwrap();
+    let records = run.records;
     assert_eq!(
         records
             .iter()
-            .filter(|frame| matches!(frame.record, WalRecord::ModelStepFinished { .. }))
+            .filter(|record| matches!(record, Record::StepEnd(_)))
             .count(),
         2
     );
     assert!(records
         .iter()
-        .any(|frame| matches!(frame.record, WalRecord::ToolResult { .. })));
+        .any(|record| matches!(record, Record::ToolReply(_))));
     let seen = mock.observed.lock().unwrap();
     assert_eq!(seen.requests.len(), 2);
     let second: Value = serde_json::from_slice(&seen.requests[1]).unwrap();
@@ -2109,27 +2077,6 @@ async fn websocket_failure_after_send_retries_on_a_new_socket_not_https() {
     );
 }
 
-#[tokio::test]
-async fn websocket_shutdown_seal_closes_socket_and_hands_over_attempt() {
-    let mock = Mock::start(vec![vec![]], false, false).await;
-    let provider = provider(&mock);
-    let seal = ShutdownSeal::new();
-    let rx = provider
-        .step_with_shutdown_seal(
-            StepId(1),
-            Arc::new(opts()),
-            CancellationToken::new(),
-            None,
-            seal.clone(),
-        )
-        .await;
-    mock.wait_request().await;
-    let collected = seal.seal_and_collect(Duration::from_secs(5)).await.unwrap();
-    assert_eq!(collected.attempt.transport.as_deref(), Some("websocket"));
-    assert_eq!(collected.attempt.outcome, AttemptOutcome::SealedInFlight);
-    mock.wait_closes(1).await;
-    drop(rx);
-}
 
 #[tokio::test]
 async fn websocket_turn_state_is_sticky_metadata_without_changing_canonical_body() {
@@ -2411,7 +2358,7 @@ async fn websocket_upgrade_auth_refusal_rereads_and_recovers_without_https() {
     }
 }
 
-async fn paused_run(provider: &impl Provider, label: &str) -> Vec<broca_wal::FramedRecord> {
+async fn paused_run(provider: &impl Provider, label: &str) -> Vec<Record> {
     let dir = broca_test_support::scratch_root().join(label);
     let bind = BindIdentity::new(dir.join("project"), "websocket-auth", label);
     let request = RunRequest {
@@ -2458,31 +2405,25 @@ async fn paused_run(provider: &impl Provider, label: &str) -> Vec<broca_wal::Fra
         structured_output: None,
     head_turn: false,
     };
-    let wal = FileWalStore::new(dir.join("wal"));
-    let (tx, mut rx) = mpsc::channel(256);
-    let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = tokio::time::timeout(
+    let run = tokio::time::timeout(
         Duration::from_secs(10),
-        run_loop(
-            request,
-            provider,
-            &StubToolPlane::new(),
-            &FileLeaseStore::new(dir.join("lease")),
-            &AllowAll,
-            &wal,
-            &tx,
-        ),
+        crate::session_loop_rig::run_once(request, provider, &StubToolPlane::new()),
     )
     .await
-    .unwrap()
     .unwrap();
-    drop(tx);
-    collect.await.unwrap();
     assert!(
-        result.paused.is_some(),
+        run.finished.paused.is_some(),
         "auth failures must durably pause the run"
     );
-    wal.read_records(&bind).unwrap()
+    run.records
+}
+
+/// The error the run's `Pause` record carries, as the provider layer wrote it.
+fn pause_error(record: &Record) -> Option<Value> {
+    match record {
+        Record::Pause(pause) => pause.error.as_ref().map(|error| error.parse()),
+        _ => None,
+    }
 }
 
 #[tokio::test]
@@ -2501,7 +2442,10 @@ async fn websocket_account_mismatch_pauses_before_any_socket_send() {
         .with_account_refs(Some("account".into()), Some("account".into()))
         .with_credential_refresher(refresh);
     let records = paused_run(&provider, "ws-account-mismatch").await;
-    assert!(records.iter().any(|frame| matches!(&frame.record, WalRecord::RunPaused { error: Some(error), .. } if error.provider_code.as_deref() == Some("account_changed"))));
+    assert!(records
+        .iter()
+        .filter_map(pause_error)
+        .any(|error| error["provider_code"] == "account_changed"));
     let seen = mock.observed.lock().unwrap();
     assert_eq!(seen.handshakes, 0);
     assert!(seen.requests.is_empty());
@@ -2521,7 +2465,10 @@ async fn websocket_upgrade_auth_refusal_without_a_fresh_token_pauses() {
         .with_credential_refresher(refresh.clone());
     let records = paused_run(&provider, "ws-unrecoverable-auth").await;
     assert_eq!(refresh.rereads.load(Ordering::SeqCst), 1);
-    assert!(records.iter().any(|frame| matches!(&frame.record, WalRecord::RunPaused { error: Some(error), .. } if error.status == Some(401))));
+    assert!(records
+        .iter()
+        .filter_map(pause_error)
+        .any(|error| error["status"] == 401));
     let seen = mock.observed.lock().unwrap();
     assert_eq!(seen.handshakes, 1);
     assert!(seen.requests.is_empty());
@@ -3020,109 +2967,6 @@ fn tool_run_request(bind: &BindIdentity) -> RunRequest {
     }
 }
 
-#[tokio::test]
-async fn websocket_retried_tool_step_dispatches_only_the_successful_completion() {
-    let partial = tool_events()[..2].to_vec();
-    let mock =
-        Mock::start_gated(vec![partial.clone(), partial, tool_events(), text_events()]).await;
-    let mut provider = provider(&mock);
-    virtual_attempts(&mut provider, &[105, 533, 1, 1]);
-    let dir = broca_test_support::scratch_root().join("ws-retried-tool-turn");
-    let bind = BindIdentity::new(dir.join("project"), "websocket", "retried-turn");
-    let wal = FileWalStore::new(dir.join("wal"));
-    let (tx, mut rx) = mpsc::channel(256);
-    let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let plane = StubToolPlane::new().with_canned_text("lookup", "found");
-    let lease = FileLeaseStore::new(dir.join("lease"));
-    let run = run_loop(
-        tool_run_request(&bind),
-        &provider,
-        &plane,
-        &lease,
-        &AllowAll,
-        &wal,
-        &tx,
-    );
-    let release = async {
-        for n in 1..=2 {
-            mock.wait_held_cut(n).await;
-            let records = wal.read_records(&bind).unwrap();
-            assert!(
-                plane.log().is_empty(),
-                "failed model output cannot dispatch a tool"
-            );
-            assert!(!records.iter().any(|frame| matches!(
-                frame.record,
-                WalRecord::ModelStepFinished { .. } | WalRecord::ToolResult { .. }
-            )));
-            mock.cut_gates.add_permits(1);
-        }
-    };
-    let (result, _) = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
-        tokio::join!(run, release)
-    })
-    .await
-    .unwrap();
-    assert_eq!(result.unwrap().reason, RunFinishReason::Completed);
-    assert_eq!(
-        plane.exec_count(&broca_protocol::ToolCallId("call1".into())),
-        1
-    );
-    assert_eq!(
-        plane
-            .log()
-            .iter()
-            .filter(|event| matches!(
-                event,
-                broca_core::StubEvent::Dispatched(_) | broca_core::StubEvent::Fenced(_)
-            ))
-            .count(),
-        1
-    );
-    drop(tx);
-    collect.await.unwrap();
-    let records = wal.read_records(&bind).unwrap();
-    assert_eq!(
-        records
-            .iter()
-            .filter(|frame| matches!(frame.record, WalRecord::ToolResult { .. }))
-            .count(),
-        1
-    );
-    assert_eq!(
-        records
-            .iter()
-            .filter(|frame| matches!(frame.record, WalRecord::ModelStepFinished { .. }))
-            .count(),
-        2
-    );
-    let recorded: Vec<_> = records
-        .iter()
-        .filter_map(|frame| match &frame.record {
-            WalRecord::ModelAttemptFinished {
-                request_body_sha256,
-                transport,
-                outcome,
-                ..
-            } => Some((request_body_sha256, transport, outcome)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(recorded.len(), 4);
-    assert!(recorded[..3]
-        .iter()
-        .all(|attempt| attempt.0 == recorded[0].0));
-    // Two cuts do not switch transport (Codex switches only after five retries), so the
-    // completing retry is the third socket send.
-    assert_eq!(recorded[2].1.as_deref(), Some("websocket"));
-    assert_eq!(*recorded[2].2, AttemptOutcome::Complete);
-    let seen = mock.observed.lock().unwrap();
-    assert_eq!(seen.requests.len(), 4);
-    assert!(seen.requests[..3]
-        .iter()
-        .all(|request| request == &seen.requests[0]));
-    assert!(seen.http_bodies.is_empty());
-}
 
 #[tokio::test]
 async fn websocket_reused_failure_reports_age_and_time_since_completion() {
@@ -3726,53 +3570,39 @@ async fn codex_cancel_during_a_long_retry_after_wait_ends_the_run_cancelled() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let bind = BindIdentity::new(dir.join("project"), "websocket", "cancel-during-wait");
-    let wal = FileWalStore::new(dir.join("wal"));
-    let lease = FileLeaseStore::new(dir.join("lease"));
     let plane = StubToolPlane::new();
-    let cancel = CancellationToken::new();
-    let control = broca_core::RunControl {
-        cancel: Some(cancel.clone()),
-        ..Default::default()
-    };
+    let mut session = crate::session_loop_rig::RigSession::new(&bind).await;
+    let cancel = session.cancel.clone();
     let (tx, mut rx) = mpsc::channel(256);
     let collect = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let canceller = async {
-        // The refusal and its attempt record come first; the cancel then lands in the wait.
-        broca_test_support::wait_until("the refused upgrade is recorded", || async {
+        // The refusal comes first; the cancel then lands in the server's 469 s wait.
+        broca_test_support::wait_until("the upgrade is refused", || async {
             let refused = mock.observed.lock().unwrap().handshakes >= 1;
-            let recorded = wal.read_records(&bind).is_ok_and(|records| {
-                records
-                    .iter()
-                    .any(|frame| matches!(frame.record, WalRecord::ModelAttemptFinished { .. }))
-            });
-            if refused && recorded {
+            if refused {
                 Ok(())
             } else {
-                Err(format!("refused={refused} recorded={recorded}"))
+                Err("no refused upgrade yet".to_string())
             }
         })
         .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         cancel.cancel();
         Instant::now()
     };
-    let run = broca_core::run_loop_with_control(
-        tool_run_request(&bind),
-        &provider,
-        &plane,
-        &lease,
-        &AllowAll,
-        &wal,
-        None,
-        control,
-        &tx,
-    );
-    let (summary, cancelled_at) = tokio::time::timeout(Duration::from_secs(30), async {
+    let mut request = tool_run_request(&bind);
+    let run = session.run(&mut request, &provider, &plane, &tx);
+    let (run, cancelled_at) = tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(run, canceller)
     })
     .await
     .expect("the cancelled run ends without waiting out the server's time");
+    assert!(run
+        .records
+        .iter()
+        .any(|record| matches!(record, Record::Attempt(_))));
     assert!(cancelled_at.elapsed() < Duration::from_secs(5));
-    assert_eq!(summary.unwrap().reason, RunFinishReason::Cancelled);
+    assert_eq!(run.finished.reason, RunFinishReason::Cancelled);
     drop(tx);
     collect.await.unwrap();
     let seen = mock.observed.lock().unwrap();

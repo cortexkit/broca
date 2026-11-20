@@ -4,7 +4,6 @@ mod aft_harness {
 }
 include!("direct_carrier_tests.rs");
 include!("route_close_followup_tests.rs");
-include!("call_keepalive_tests.rs");
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
@@ -17,7 +16,6 @@ use tokio::sync::Notify;
 
 use super::*;
 
-mod outage_wait_tests;
 #[cfg(not(feature = "test-attachments"))]
 mod release_tool_capture_tests;
 #[cfg(feature = "test-attachments")]
@@ -4669,5 +4667,30 @@ mod renamed_scope_owner {
             .await
             .unwrap();
         assert!(read.owner_configured);
+    }
+}
+
+/// Answers the plane's route open, as the module end of an in-process connection, and returns
+/// the request that follows it with whether the open offered call keepalive.
+mod call_keepalive {
+    use crate::connection::InProcessModuleEnd;
+
+    pub(super) async fn bound_request(
+        module: &mut InProcessModuleEnd,
+    ) -> (subc_protocol::Frame, bool) {
+        let bind = module.next_request().await;
+        let raw: serde_json::Value = serde_json::from_slice(&bind.body).unwrap();
+        assert_eq!(raw["op"], "route.open");
+        let keepalive = raw["consumer_capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "call-keepalive/v1"));
+        let answer = subc_control::ClientControlResponse::RouteOpen {
+            route_channel: 7,
+            route_epoch: 1,
+            request_window: None,
+            watch_window: None,
+        };
+        assert!(module.reply(&bind, serde_json::to_vec(&answer).unwrap()));
+        (module.next_request().await, keepalive)
     }
 }

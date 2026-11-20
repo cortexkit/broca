@@ -1,5 +1,5 @@
 use broca_protocol::{ErrorClass, ModelAttempt, ProviderError, StepId};
-use broca_wal::{AccountLimitPause, AuthSelection, WalRecord};
+use broca_wal::{AccountLimitPause, AuthSelection};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static STALE_RESETS: AtomicU64 = AtomicU64::new(0);
@@ -209,27 +209,6 @@ pub(crate) fn resume_floor(
         .checked_sub(paused_at_ms)
         .ok_or(TimingRefusal::Stale)?;
     Ok(floor)
-}
-
-pub fn attempt_record(step: StepId, attempt: ModelAttempt, enabled: bool) -> WalRecord {
-    let disposition = enabled
-        .then(|| {
-            attempt
-                .account_observation
-                .limit
-                .as_ref()
-                .map(|limit| limit.disposition)
-        })
-        .flatten();
-    let mut record = WalRecord::model_attempt_finished(step, attempt);
-    if let WalRecord::ModelAttemptFinished {
-        account_limit_disposition,
-        ..
-    } = &mut record
-    {
-        *account_limit_disposition = disposition;
-    }
-    record
 }
 
 /// Only source-classified attempt evidence can authorize a timed account pause.

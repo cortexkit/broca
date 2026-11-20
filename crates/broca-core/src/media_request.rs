@@ -20,78 +20,11 @@ use compact::{MessageCopy, RefId, References};
 
 mod compact;
 pub mod held;
-mod initialization;
 mod seed;
-mod wal_events;
-pub use initialization::{initialize_media_checkpoint, InitializedMedia};
-pub use wal_events::{WalMediaEvents, WalMediaEventsError};
 
-impl seed::MediaCheckpoint {
-    /// Restore the authenticated compaction state without replaying media admissions;
-    /// their occurrence IDs and transcript placement are already restored.
-    pub(crate) fn restore_authenticated_compaction(
-        &mut self,
-        authenticated: crate::admission::AuthenticatedCompaction,
-    ) {
-        self.session.compaction = authenticated.into_state();
-    }
-
-    pub(crate) fn prepare_content_free_continuation(&mut self) {
-        // Without a replacement view, the saved media references and empty text slots
-        // suffice to recompute selection as the tail grows. A MediaChange::Show announces
-        // newly visible media at position zero; the selected index instead needs its
-        // full-fold position among all visible media.
-        if !self.session.restored_view {
-            self.session.restored_selection = None;
-            self.session.restored_covered = None;
-        }
-    }
-
-    /// A qualified media-free prefix has no captures or held media. Retain its current
-    /// profile and absolute placement when the first capture arrives in a later suffix.
-    pub(crate) fn after_media_free_prefix(
-        placement: crate::placement::Placement,
-        seq: u64,
-        frames: &[broca_wal::FramedRecord],
-    ) -> Result<Self, String> {
-        let mut checkpoint = Self::empty_at(placement, seq);
-        let mut profile = None;
-        for frame in frames {
-            let frozen = match &frame.record {
-                WalRecord::RunStarted { config, .. } => Some(&config.frozen_render_config),
-                WalRecord::RunConfigRefrozen {
-                    frozen_render_config,
-                    ..
-                } => Some(frozen_render_config),
-                _ => None,
-            };
-            if let Some(media) = frozen.and_then(|v| v.get("media")).filter(|v| !v.is_null()) {
-                if profile.as_ref() != Some(media) {
-                    profile = Some(media.clone());
-                    checkpoint.history.push(seed::MediaHistory::Profile {
-                        media: media.clone(),
-                        selected: Vec::new(),
-                    });
-                }
-            }
-            if matches!(
-                frame.record,
-                WalRecord::ModelAttemptFinished { .. } | WalRecord::ModelStepFinished { .. }
-            ) && !matches!(
-                checkpoint.history.last(),
-                Some(seed::MediaHistory::Boundary)
-            ) {
-                checkpoint.history.push(seed::MediaHistory::Boundary);
-            }
-        }
-        // Decoding preserves the last profile so later profiles can be compared with it.
-        Self::decode(&checkpoint.encode())
-    }
-}
-pub use seed::count_seed_fallback;
-pub use seed::{
-    seed_fallback_count, DurableMediaSeed, MediaCheckpoint, MediaHistory, MediaSeedFold,
-};
+impl seed::MediaCheckpoint {}
+pub use seed::DurableMediaSeed;
+pub use seed::{MediaCheckpoint, MediaHistory};
 
 /// A capture occurrence, not a digest. Two admissions of identical bytes have different ids
 /// and can have different protection lifetimes.
@@ -308,45 +241,50 @@ pub struct SessionMedia {
 }
 
 impl SessionMedia {
-    pub fn new(store: impl MediaBytes + 'static) -> Self {
-        Self::metadata(Some(std::sync::Arc::new(store)))
-    }
-
-    /// Resolve no files until preparation actually requires an eligible native object.
-    /// Historical references hidden by compaction or aging need no store on disk.
-    pub fn read_only(state_root: &std::path::Path, class: MediaStoreClass) -> Self {
-        let mut session = Self::metadata(None);
-        session.read_only = Some((state_root.to_owned(), class));
-        session
-    }
-
-    fn metadata(store: Option<std::sync::Arc<dyn MediaBytes>>) -> Self {
-        Self {
-            store,
-            read_only: None,
-            placement: Placement::default(),
-            records: 0,
-            boundary: 0,
-            last_step: None,
-            feed: Feed::Nothing,
-            refs: References::default(),
-            captures: Vec::new(),
-            sources: Vec::new(),
-            positions: Vec::new(),
-            tools: HashMap::new(),
-            pending: Vec::new(),
-            steers: Vec::new(),
-            protected: Vec::new(),
-            changes: Vec::new(),
-            skeleton: BTreeMap::new(),
-            held_messages: HashMap::new(),
-            compaction: Default::default(),
-            batch_order: HashMap::new(),
-            replacements: Vec::new(),
-            restored_selection: None,
-            restored_covered: None,
-            restored_view: false,
+    fn index_replacements(&mut self) {
+        use crate::compaction_provider::view::ViewRange;
+        if self.restored_selection.is_some() {
+            return;
         }
+        self.replacements.clear();
+        if let Some(applied) = &self.compaction.view {
+            for range in &applied.view.ranges {
+                if let ViewRange::Replace { from, to, bytes } = range {
+                    if let Ok(messages) = serde_json::from_str::<Vec<Message>>(bytes) {
+                        for message in messages {
+                            let refs: Vec<_> = crate::compaction::media_refs(&message.content)
+                                .cloned()
+                                .collect();
+                            if !refs.is_empty() {
+                                self.replacements.push((refs, *from, *to));
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(applied) = &self.compaction.applied {
+            for message in applied.replacement.iter() {
+                let refs: Vec<_> = crate::compaction::media_refs(&message.content)
+                    .cloned()
+                    .collect();
+                if !refs.is_empty() {
+                    self.replacements
+                        .push((refs, applied.range.from, applied.range.to));
+                }
+            }
+        }
+    }
+
+    /// The engine is fed a record. An engine fed only events until now gives its compaction
+    /// state every reference it captured, which is what that state would hold had the
+    /// events added them as they came.
+    fn feed_records(&mut self) {
+        if self.feed == Feed::Events {
+            for reference in self.refs.iter() {
+                self.compaction.captured.insert(reference);
+            }
+        }
+        self.feed = Feed::Records;
     }
 
     /// Fold in durable WAL order, including records with no media. The positional placement
@@ -442,6 +380,39 @@ impl SessionMedia {
                 .push(MediaChange::View(self.selected_bindings()));
         }
         Ok(())
+    }
+
+    pub fn new(store: impl MediaBytes + 'static) -> Self {
+        Self::metadata(Some(std::sync::Arc::new(store)))
+    }
+
+    fn metadata(store: Option<std::sync::Arc<dyn MediaBytes>>) -> Self {
+        Self {
+            store,
+            read_only: None,
+            placement: Placement::default(),
+            records: 0,
+            boundary: 0,
+            last_step: None,
+            feed: Feed::Nothing,
+            refs: References::default(),
+            captures: Vec::new(),
+            sources: Vec::new(),
+            positions: Vec::new(),
+            tools: HashMap::new(),
+            pending: Vec::new(),
+            steers: Vec::new(),
+            protected: Vec::new(),
+            changes: Vec::new(),
+            skeleton: BTreeMap::new(),
+            held_messages: HashMap::new(),
+            compaction: Default::default(),
+            batch_order: HashMap::new(),
+            replacements: Vec::new(),
+            restored_selection: None,
+            restored_covered: None,
+            restored_view: false,
+        }
     }
 
     /// Apply one content-free event: the second entry point beside [`Self::fold`], for a
@@ -553,18 +524,6 @@ impl SessionMedia {
                 self.compaction.captured.insert(reference);
             }
         }
-    }
-
-    /// The engine is fed a record. An engine fed only events until now gives its compaction
-    /// state every reference it captured, which is what that state would hold had the
-    /// events added them as they came.
-    fn feed_records(&mut self) {
-        if self.feed == Feed::Events {
-            for reference in self.refs.iter() {
-                self.compaction.captured.insert(reference);
-            }
-        }
-        self.feed = Feed::Records;
     }
 
     /// Remember each planned call's position in the batch: its result takes that position
@@ -765,40 +724,6 @@ impl SessionMedia {
             .collect()
     }
 
-    fn index_replacements(&mut self) {
-        use crate::compaction_provider::view::ViewRange;
-        if self.restored_selection.is_some() {
-            return;
-        }
-        self.replacements.clear();
-        if let Some(applied) = &self.compaction.view {
-            for range in &applied.view.ranges {
-                if let ViewRange::Replace { from, to, bytes } = range {
-                    if let Ok(messages) = serde_json::from_str::<Vec<Message>>(bytes) {
-                        for message in messages {
-                            let refs: Vec<_> = crate::compaction::media_refs(&message.content)
-                                .cloned()
-                                .collect();
-                            if !refs.is_empty() {
-                                self.replacements.push((refs, *from, *to));
-                            }
-                        }
-                    }
-                }
-            }
-        } else if let Some(applied) = &self.compaction.applied {
-            for message in applied.replacement.iter() {
-                let refs: Vec<_> = crate::compaction::media_refs(&message.content)
-                    .cloned()
-                    .collect();
-                if !refs.is_empty() {
-                    self.replacements
-                        .push((refs, applied.range.from, applied.range.to));
-                }
-            }
-        }
-    }
-
     /// Drain after each folded record. The final in-progress step must be aged after its
     /// latest compaction selection, before preparing its request, even if no attempt finished.
     pub fn take_changes(&mut self) -> Vec<MediaChange> {
@@ -830,6 +755,7 @@ impl SessionMedia {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             entries
         }
+
         let captures: Vec<_> = self
             .captures
             .iter()

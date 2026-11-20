@@ -37,6 +37,34 @@ pub struct AttemptSpend<'a> {
 }
 
 impl AttemptSpend<'_> {
+    /// The spend facts the usage export stores for the attempt, as its writer computes them.
+    pub fn segments(
+        &self,
+        source_instance_id: &str,
+        resolver: &dyn ChargeBasisResolver,
+    ) -> Vec<SpendSegment> {
+        struct Resolver<'a>(&'a dyn ChargeBasisResolver);
+        impl ChargeBasisResolver for Resolver<'_> {
+            fn resolve_charge_basis(
+                &self,
+                provider_id: &str,
+                method: &str,
+            ) -> (broca_core::ChargeBasis, u32) {
+                self.0.resolve_charge_basis(provider_id, method)
+            }
+
+            fn charge_basis_overrides(&self) -> String {
+                self.0.charge_basis_overrides()
+            }
+        }
+        compute_segments_for_run(
+            &self.records(),
+            &RunId(self.run_id.to_owned()),
+            source_instance_id,
+            &Resolver(resolver),
+        )
+    }
+
     /// The records of a one-step run that made this attempt's model call: its start, its step and
     /// its end, in today's form.
     pub fn records(&self) -> Vec<FramedRecord> {
@@ -110,34 +138,6 @@ impl AttemptSpend<'_> {
             retries_used: 0,
         };
         vec![frame(1, started), frame(2, step), frame(3, finished)]
-    }
-
-    /// The spend facts the usage export stores for the attempt, as its writer computes them.
-    pub fn segments(
-        &self,
-        source_instance_id: &str,
-        resolver: &dyn ChargeBasisResolver,
-    ) -> Vec<SpendSegment> {
-        struct Resolver<'a>(&'a dyn ChargeBasisResolver);
-        impl ChargeBasisResolver for Resolver<'_> {
-            fn resolve_charge_basis(
-                &self,
-                provider_id: &str,
-                method: &str,
-            ) -> (broca_core::ChargeBasis, u32) {
-                self.0.resolve_charge_basis(provider_id, method)
-            }
-
-            fn charge_basis_overrides(&self) -> String {
-                self.0.charge_basis_overrides()
-            }
-        }
-        compute_segments_for_run(
-            &self.records(),
-            &RunId(self.run_id.to_owned()),
-            source_instance_id,
-            &Resolver(resolver),
-        )
     }
 }
 

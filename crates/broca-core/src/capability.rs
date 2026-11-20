@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_protocol::{ApprovalResponse, Tool, ToolCall, ToolCallId};
+use broca_protocol::{ApprovalResponse, Tool, ToolCall};
 
 /// Default cap on a single tool call's serialized input (oversized-payload guard).
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
@@ -61,16 +61,6 @@ pub struct ToolManifest {
 }
 
 impl ToolManifest {
-    /// Resolve the manifest ONCE: `requested ∩ harness-policy` (the harness
-    /// policy is the set of tool names the harness permits for this run).
-    pub fn resolve(requested: Vec<Tool>, policy_allowed: &HashSet<String>) -> Self {
-        let tools = requested
-            .into_iter()
-            .filter(|t| policy_allowed.contains(&t.name))
-            .collect();
-        Self::from_tools(tools)
-    }
-
     /// Build a manifest from an already-resolved owned tool set, such as the authoritative
     /// `run_config.tools` on resume. The tools need no additional policy filtering.
     pub fn from_tools(tools: Vec<Tool>) -> Self {
@@ -233,14 +223,6 @@ impl ToolManifest {
         ))
     }
 
-    /// Return one declaration per name in the name-index HashMap's iteration order.
-    pub fn tools(&self) -> Vec<Tool> {
-        self.name_to_index
-            .values()
-            .map(|index| self.tools[*index].clone())
-            .collect()
-    }
-
     pub fn get(&self, name: &str) -> Option<&Tool> {
         self.name_to_index
             .get(name)
@@ -302,53 +284,6 @@ impl ApprovalPolicy for AllowAll {
         ApprovalResponse::Allow {
             tool_call_id: call.tool_call_id.clone(),
         }
-    }
-}
-
-/// Headless / no-human-present default — DENY every call (the safe choice when no
-/// one is available to approve).
-pub struct DenyAll {
-    pub reason: String,
-}
-
-impl Default for DenyAll {
-    fn default() -> Self {
-        Self {
-            reason: "denied: no human present (headless default-deny)".into(),
-        }
-    }
-}
-
-#[async_trait]
-impl ApprovalPolicy for DenyAll {
-    async fn decide(&self, call: &ToolCall) -> ApprovalResponse {
-        ApprovalResponse::Deny {
-            tool_call_id: call.tool_call_id.clone(),
-            reason: self.reason.clone(),
-        }
-    }
-}
-
-/// A scripted policy for tests: per-tool_call_id decisions, defaulting to allow.
-pub struct ScriptedApproval {
-    decisions: HashMap<ToolCallId, ApprovalResponse>,
-}
-
-impl ScriptedApproval {
-    pub fn new(decisions: HashMap<ToolCallId, ApprovalResponse>) -> Self {
-        Self { decisions }
-    }
-}
-
-#[async_trait]
-impl ApprovalPolicy for ScriptedApproval {
-    async fn decide(&self, call: &ToolCall) -> ApprovalResponse {
-        self.decisions
-            .get(&call.tool_call_id)
-            .cloned()
-            .unwrap_or(ApprovalResponse::Allow {
-                tool_call_id: call.tool_call_id.clone(),
-            })
     }
 }
 

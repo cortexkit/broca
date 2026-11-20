@@ -16,7 +16,6 @@
 //! from the deleted lineage's, which retention deletion records on its tombstone beside the tag
 //! floor. Restoring an older copy of a session's WAL by hand is not detected.
 
-use crate::compaction_provider::message::{CompactionMessage, Range};
 use broca_protocol::{ContentBlock, Message, Role, Usage};
 use broca_wal::{
     CompactionMessageKind, CompactionRange, CompactionStabilityRank, CompactionStrip,
@@ -25,19 +24,17 @@ use broca_wal::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     sync::Arc,
 };
 
 pub use broca_wal::MAX_REPLACEMENT_BYTES;
 mod media;
-mod released;
 pub use media::CapturedMedia;
 mod stored;
-pub(crate) use released::{ReleasedHistory, ReleasedMessages, ReleasedNeeds};
+pub use runtime::CompactionConfig;
 pub use runtime::{
-    apply_idle_view, CompactionConfig, CompactionPlane, CompactionUnavailable, CompactionViews,
-    ProviderCapabilities, ViewReadyInbox,
+    CompactionPlane, CompactionUnavailable, CompactionViews, ProviderCapabilities, ViewReadyInbox,
 };
 pub(crate) use stored::{OriginalMessages, StoredTranscript};
 pub(crate) mod runtime;
@@ -47,8 +44,6 @@ pub mod view;
 
 /// End-to-end route budget, including route open and retries, for a Setup call.
 pub const COMPACTION_CALL_BUDGET_MS: u64 = 2_000;
-/// Two bytes per token deliberately overcounts typical text/JSON's unmeasured input.
-pub const ESTIMATE_BYTES_PER_TOKEN: u64 = 2;
 
 /// Absent checkpoint field means not captured; `None` and `Captures` precede Setup; `State`
 /// carries everything needed to continue without consulting the provider or the old WAL.
@@ -130,19 +125,7 @@ pub struct AppliedCompaction {
 fn unknown_thinking_boundary() -> u64 {
     u64::MAX
 }
-impl AppliedCompaction {
-    pub fn wire(&self) -> CompactionMessage {
-        CompactionMessage::new(
-            &self.compaction_id,
-            self.version,
-            Range::new(self.range.from, self.range.to),
-            self.replacement
-                .iter()
-                .map(|m| serde_json::to_value(m).expect("native message JSON"))
-                .collect(),
-        )
-    }
-}
+impl AppliedCompaction {}
 
 /// A wait the removed synchronous client opened. Recovery still seals one left open by a crash,
 /// without calling any provider (see `runtime::seal_recorded_wait`).
@@ -233,64 +216,12 @@ pub struct CompactionState {
     pub current_service_tier: Option<String>,
 }
 impl CompactionState {
-    /// Send admission uses the last durable request estimate plus the new native messages,
-    /// as closing notices do. It does not call the compaction provider or mutate the session.
-    /// A window override is checked afresh rather than reusing a previous terminal's detail.
-    pub fn send_ceiling(
-        &self,
-        input: &[Message],
-        window: Option<u64>,
-        model: &broca_protocol::ModelHandle,
-    ) -> Option<broca_protocol::ContextCeilingDetail> {
-        if window.is_none()
-            && self
-                .history
-                .current_model
-                .as_ref()
-                .is_some_and(|current| current != model)
-        {
-            return None;
-        }
-        let announced = self.announced.as_ref()?;
-        let window = window.or(announced.window)?;
-        let bytes: usize = input
-            .iter()
-            .filter(|m| m.role != Role::System)
-            .map(|m| serde_json::to_vec(m).map_or(0, |b| b.len()))
-            .sum();
-        let size = announced
-            .est_tokens?
-            .saturating_add(estimate_tokens(bytes, None));
-        match view::before_send(view::ceiling_policy(self).as_ref(), size, Some(window)) {
-            view::BeforeSend::Send => None,
-            view::BeforeSend::Refuse(detail) => Some(detail),
-            view::BeforeSend::Pause => Some(broca_protocol::ContextCeilingDetail::new(
-                window,
-                size,
-                crate::compaction_provider::ceiling::context_ceiling_causes::VIEW_TIMEOUT,
-            )),
-        }
-    }
     pub fn capture_thinking_boundary(&mut self, record: &WalRecord, prefix_len: u64) {
         if matches!(record, WalRecord::CompactionMessage { .. }) {
             if let Some(applied) = &mut self.applied {
                 applied.thinking_prefix_len = prefix_len;
             }
         }
-    }
-
-    pub fn thinking_boundary_complete(&self) -> bool {
-        self.applied
-            .as_ref()
-            .is_none_or(|applied| applied.thinking_prefix_len != u64::MAX)
-    }
-
-    /// The version of the view the session renders now, for notices.
-    pub fn applied_view_version(&self, lineage_id: &str) -> Option<u64> {
-        self.view
-            .as_ref()
-            .filter(|applied| applied.view.lineage_id == lineage_id)
-            .map(|applied| applied.view.view_version)
     }
 
     pub fn fold(&mut self, record: &WalRecord) {
@@ -544,24 +475,6 @@ impl CompactionHistory {
             _ => {}
         }
     }
-    pub fn usage(&self) -> Option<Usage> {
-        self.previous_native_usage
-    }
-}
-
-/// Use the measured full occupancy, not just billed fresh tokens. The shared helper treats
-/// absent cache splits as included in fresh input; only absent fresh input makes fill unknown.
-/// A display estimate may fall back to byte conversion, but unknown measured input never
-/// authorizes sending at a wait cap after a completed model step.
-pub fn request_estimate(bytes: usize, history: &CompactionHistory) -> (u64, Option<u64>) {
-    let measured = history.usage().and_then(|usage| usage.fill_tokens());
-    // Without the old body length, the whole current body bounds bytes added since it.
-    let previous = measured.map(|input| (input, history.previous_request_bytes.unwrap_or(0)));
-    let estimate = estimate_tokens(bytes, previous);
-    let first_request =
-        history.previous_native_usage.is_none() && history.current_request_bytes.is_none();
-    let reliable = (first_request || measured.is_some()).then_some(estimate);
-    (estimate, reliable)
 }
 
 pub fn has_compaction(manifest: &broca_wal::PlanManifest) -> bool {
@@ -572,29 +485,6 @@ pub fn has_compaction(manifest: &broca_wal::PlanManifest) -> bool {
                 .is_some_and(|item| !item.is_null())
         })
 }
-
-/// Check Setup's initial CompactionMessage against broca's message schema and the transcript
-/// it is rendered over, and return its messages. `None` when it cannot be rendered, which
-/// Setup treats as a failed call (compaction-provider/v1 §4).
-pub fn validate_initial(initial: &CompactionMessage, raw: &[Message]) -> Option<Vec<Message>> {
-    if serde_json::to_vec(&initial.replacement)
-        .map_or(true, |bytes| bytes.len() > MAX_REPLACEMENT_BYTES)
-    {
-        return None;
-    }
-    // Range inversion is the role's message-on-its-own rule.
-    initial.check().ok()?;
-    if initial.range.to > raw.len() as u64 {
-        return None;
-    }
-    let messages = native_replacement(initial, raw).ok()?;
-    structural_conversation(initial, &messages, raw).ok()?;
-    Some(messages)
-}
-
-/// Why broca's schema or conversation rules refuse a replacement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Structural;
 
 fn keys(value: &Value, allowed: &[&str]) -> bool {
     value
@@ -669,36 +559,6 @@ fn encoded(message: &Message) -> Value {
     #[cfg(test)]
     carried_encoding_tests::note_encoded();
     serde_json::to_value(message).expect("native JSON")
-}
-fn tool_ids(message: &Message) -> impl Iterator<Item = &str> {
-    message.content.iter().filter_map(|block| match block {
-        ContentBlock::ToolCall(call) => Some(call.tool_call_id.0.as_str()),
-        ContentBlock::ToolResult(result) => Some(result.tool_call_id.0.as_str()),
-        _ => None,
-    })
-}
-
-fn native_replacement(
-    compaction: &CompactionMessage,
-    raw: &[Message],
-) -> Result<Vec<Message>, Structural> {
-    let bad = Structural;
-    let end = usize::try_from(compaction.range.to)
-        .ok()
-        .filter(|end| *end <= raw.len());
-    let start = usize::try_from(compaction.range.from).ok();
-    // Out-of-bounds is fenced later; don't mislabel it as structural just for indexing.
-    let carried = CarriedMessages::new(
-        start
-            .zip(end)
-            .and_then(|(start, end)| raw.get(start..end))
-            .unwrap_or_default(),
-    );
-    let mut messages = Vec::with_capacity(compaction.replacement.len());
-    for value in &compaction.replacement {
-        messages.push(native_message(value, &carried).ok_or(bad)?);
-    }
-    Ok(messages)
 }
 
 /// The transcript messages a replacement stands in for, each encoded once so that judging every
@@ -804,114 +664,6 @@ pub(crate) fn is_signed(block: &ContentBlock) -> bool {
             | ContentBlock::TextWithState { .. }
     )
 }
-fn structural_conversation(
-    compaction: &CompactionMessage,
-    messages: &[Message],
-    raw: &[Message],
-) -> Result<(), Structural> {
-    let bad = Structural;
-    let end = usize::try_from(compaction.range.to)
-        .ok()
-        .filter(|end| *end <= raw.len());
-    if let Some(end) = end {
-        // A raw call before `to` must have its result before `to`, even when a provider
-        // copied the call into the replacement. Otherwise the cut separates its owner range.
-        let mut pending = HashMap::<&str, usize>::new();
-        for message in &raw[..end] {
-            for block in &message.content {
-                match block {
-                    ContentBlock::ToolCall(call) => {
-                        *pending.entry(call.tool_call_id.0.as_str()).or_default() += 1;
-                    }
-                    ContentBlock::ToolResult(result) => {
-                        consume_result(&mut pending, result.tool_call_id.0.as_str());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if !pending.is_empty() {
-            return Err(bad);
-        }
-        let outside: HashSet<_> = raw
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| (*i as u64) < compaction.range.from || *i >= end)
-            .flat_map(|(_, m)| tool_ids(m))
-            .collect();
-        if messages
-            .iter()
-            .flat_map(tool_ids)
-            .any(|id| outside.contains(id))
-        {
-            return Err(bad);
-        }
-        conversation(messages.iter().chain(&raw[end..])).map_err(|_| bad)?;
-    } else {
-        // Range is not usable yet; still validate the replacement on its own.
-        conversation(messages.iter()).map_err(|_| bad)?;
-    }
-    Ok(())
-}
-
-/// Why a history breaks broca's conversation rules.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Conversation {
-    /// A tool call without its result, or a result without its call.
-    ToolPairSplit,
-    /// A message in a role the place it stands does not allow.
-    RoleOrder,
-}
-
-pub(crate) fn conversation<'a>(
-    messages: impl Iterator<Item = &'a Message>,
-) -> Result<(), Conversation> {
-    let mut pending = HashMap::<&str, usize>::new();
-    for message in messages {
-        if !pending.is_empty() && message.role != Role::Tool {
-            return Err(Conversation::ToolPairSplit);
-        }
-        if message.role == Role::System {
-            continue;
-        }
-        for block in &message.content {
-            match block {
-                ContentBlock::ToolCall(call) => {
-                    if message.role != Role::Assistant {
-                        return Err(Conversation::RoleOrder);
-                    }
-                    *pending.entry(call.tool_call_id.0.as_str()).or_default() += 1;
-                }
-                ContentBlock::ToolResult(result) => {
-                    if message.role != Role::Tool {
-                        return Err(Conversation::RoleOrder);
-                    }
-                    if !consume_result(&mut pending, result.tool_call_id.0.as_str()) {
-                        return Err(Conversation::ToolPairSplit);
-                    }
-                }
-                _ if message.role == Role::Tool => return Err(Conversation::RoleOrder),
-                _ => {}
-            }
-        }
-    }
-    if pending.is_empty() {
-        Ok(())
-    } else {
-        Err(Conversation::ToolPairSplit)
-    }
-}
-
-fn consume_result<'a>(pending: &mut HashMap<&'a str, usize>, id: &'a str) -> bool {
-    let Some(count) = pending.get_mut(id) else {
-        return false;
-    };
-    *count -= 1;
-    if *count == 0 {
-        pending.remove(id);
-    }
-    true
-}
 
 /// Slice only the fully stamped, guidance-folded prompt. Replacement messages retain their
 /// applied bytes and have no positional ordinal; raw tail ordinals are never restamped.
@@ -1013,80 +765,6 @@ fn retained_episodes(
         .collect()
 }
 
-/// One boundary's rendered model input and its exact wire size. Only an accepted view can
-/// change this input during a ceiling wait; notices and wait records do not change it.
-#[derive(Default)]
-pub(crate) struct BoundaryRequest {
-    options: Option<broca_protocol::CallOptions>,
-    view_version: Option<u64>,
-    pub(crate) bytes: usize,
-}
-
-impl BoundaryRequest {
-    pub(crate) fn refresh_checked(
-        &mut self,
-        opts: &broca_protocol::CallOptions,
-        state: &CompactionState,
-        systems: &[usize],
-        render: impl FnOnce(
-            &broca_protocol::CallOptions,
-        ) -> Result<Vec<u8>, Box<broca_protocol::ProviderError>>,
-    ) -> Result<(), String> {
-        let mut failure = None;
-        self.refresh(opts, state, systems, |options| match render(options) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                failure = Some(error);
-                Vec::new()
-            }
-        })
-        .map_err(|error| error.to_string())?;
-        if let Some(error) = failure {
-            self.options = None;
-            return Err(error.message);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn refresh(
-        &mut self,
-        opts: &broca_protocol::CallOptions,
-        state: &CompactionState,
-        systems: &[usize],
-        render: impl FnOnce(&broca_protocol::CallOptions) -> Vec<u8>,
-    ) -> Result<(), view::ViewNotRenderable> {
-        let version = state.view.as_ref().map(|view| view.view.view_version);
-        if self.options.is_some() && self.view_version == version {
-            return Ok(());
-        }
-        let options = model_options_indexed(opts, state, systems)?;
-        self.bytes = render(&options).len();
-        self.options = Some(options);
-        self.view_version = version;
-        Ok(())
-    }
-
-    pub(crate) fn into_options(self) -> broca_protocol::CallOptions {
-        self.options.expect("boundary request was rendered")
-    }
-}
-
-pub fn estimate_tokens(rendered_bytes: usize, previous: Option<(u64, usize)>) -> u64 {
-    let convert = |bytes: usize| (bytes as u64).div_ceil(ESTIMATE_BYTES_PER_TOKEN);
-    previous.map_or_else(
-        || convert(rendered_bytes),
-        |(input, bytes)| {
-            if rendered_bytes < bytes {
-                // A new view can shrink the request. Scale the measured input down with its
-                // rendered size instead of keeping the old request's token count as a floor.
-                (u128::from(input) * rendered_bytes as u128).div_ceil(bytes as u128) as u64
-            } else {
-                input.saturating_add(convert(rendered_bytes.saturating_sub(bytes)))
-            }
-        },
-    )
-}
-
 pub type CompactionItem = (
     String,
     Option<String>,
@@ -1121,13 +799,8 @@ pub fn item(manifest: &broca_wal::PlanManifest) -> Result<Option<CompactionItem>
 #[cfg(test)]
 mod tests;
 
-pub(crate) fn now() -> u64 {
-    crate::run::epoch_millis().unwrap_or(0)
-}
-
 #[cfg(test)]
 mod carried_encoding_tests {
-    use super::*;
 
     thread_local! {
         /// Messages encoded to JSON values on this thread by `encoded`.
@@ -1136,71 +809,5 @@ mod carried_encoding_tests {
 
     pub(super) fn note_encoded() {
         ENCODED.with(|cell| cell.set(cell.get() + 1));
-    }
-
-    pub(super) fn measure<T>(run: impl FnOnce() -> T) -> (T, usize) {
-        ENCODED.with(|cell| cell.set(0));
-        let result = run();
-        (result, ENCODED.with(std::cell::Cell::get))
-    }
-
-    fn text(role: Role, text: String) -> Message {
-        Message::new(role, vec![ContentBlock::Text { text: text.into() }])
-    }
-
-    /// Judging a replacement against the range it replaces encodes each carried message once and
-    /// each replacement message once. Encoding both sides for every comparison made a large
-    /// replacement over a large range allocate a JSON value tree per pair while a step waited.
-    #[test]
-    fn replacement_validation_encodes_each_message_once() {
-        const CARRIED: usize = 20;
-        const REPLACEMENT: usize = 10;
-        let raw: Vec<Message> = (0..CARRIED)
-            .map(|index| {
-                let role = if index % 2 == 0 {
-                    Role::User
-                } else {
-                    Role::Assistant
-                };
-                text(role, format!("carried {index}"))
-            })
-            .collect();
-        // Provider-authored summaries: none is a copy of a carried message, so each one is
-        // compared against the whole range.
-        let replacement: Vec<Value> = (0..REPLACEMENT)
-            .map(|index| {
-                serde_json::to_value(text(Role::User, format!("summary {index}"))).unwrap()
-            })
-            .collect();
-        let message = CompactionMessage::new("c", 1, Range::new(0, CARRIED as u64), replacement);
-
-        ENCODED.with(|cell| cell.set(0));
-        let messages = native_replacement(&message, &raw).expect("summaries are valid");
-        let encodings = ENCODED.with(std::cell::Cell::get);
-
-        assert_eq!(messages.len(), REPLACEMENT);
-        assert_eq!(
-            encodings,
-            CARRIED + REPLACEMENT,
-            "each carried and each replacement message is encoded exactly once"
-        );
-    }
-
-    /// A replacement message identical to a carried one is recognized as carried, so it may keep
-    /// the model origin it had in the transcript.
-    #[test]
-    fn a_carried_copy_keeps_its_model_origin() {
-        let mut carried = text(Role::Assistant, "kept".into());
-        carried.origin = Some(broca_protocol::request::ModelHandle {
-            provider_module_id: "provider".into(),
-            model_id: "model".into(),
-        });
-        let raw = vec![text(Role::User, "ask".into()), carried.clone()];
-        let copy = serde_json::to_value(&carried).unwrap();
-        let message = CompactionMessage::new("c", 1, Range::new(0, 2), vec![copy]);
-
-        let messages = native_replacement(&message, &raw).expect("a carried copy is valid");
-
-        assert_eq!(messages, vec![carried]);
     }
 }

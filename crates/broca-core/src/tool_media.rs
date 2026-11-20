@@ -35,39 +35,17 @@ impl std::fmt::Debug for ToolMediaCapture {
 }
 
 impl ToolMediaCapture {
-    /// View images are durable prompt content, not the output of a tool call.
-    /// Register them without adding a synthetic tool result to the capture index.
-    pub fn capture_view_image(&self, bytes: &[u8], mime: &str) -> Result<MediaRef, String> {
-        let reference = crate::media_validation::validate_media(bytes, mime)
-            .map_err(|reason| format!("compaction image refused: {reason:?}"))?;
-        let mut state = self
-            .0
+    pub fn captured_for(&self, batch_id: &BatchId, call_id: &ToolCallId) -> Vec<MediaRef> {
+        self.0
             .lock()
-            .map_err(|_| "compaction media capture lock poisoned")?;
-        if state.manifest.is_none() {
-            state.manifest = Some(
+            .ok()
+            .and_then(|state| {
                 state
-                    .uploads
-                    .session_media_store(&state.identity)
-                    .and_then(|store| store.session(&state.identity))
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        state
-            .manifest
-            .as_mut()
-            .expect("manifest opened above")
-            .register_and_append(&reference, bytes, || Ok(()))
-            .map_err(|error| error.to_string())?;
-        Ok(reference)
-    }
-    pub fn new(uploads: Uploads, identity: BindIdentity) -> Self {
-        Self(Arc::new(Mutex::new(CaptureState {
-            uploads,
-            identity,
-            manifest: None,
-            captured: HashMap::new(),
-        })))
+                    .captured
+                    .get(&(batch_id.clone(), call_id.clone()))
+                    .cloned()
+            })
+            .unwrap_or_default()
     }
 
     /// Complete publication and manifest barriers before exposing a reference to
@@ -122,17 +100,13 @@ impl ToolMediaCapture {
         }))
     }
 
-    pub fn captured_for(&self, batch_id: &BatchId, call_id: &ToolCallId) -> Vec<MediaRef> {
-        self.0
-            .lock()
-            .ok()
-            .and_then(|state| {
-                state
-                    .captured
-                    .get(&(batch_id.clone(), call_id.clone()))
-                    .cloned()
-            })
-            .unwrap_or_default()
+    pub fn new(uploads: Uploads, identity: BindIdentity) -> Self {
+        Self(Arc::new(Mutex::new(CaptureState {
+            uploads,
+            identity,
+            manifest: None,
+            captured: HashMap::new(),
+        })))
     }
 }
 

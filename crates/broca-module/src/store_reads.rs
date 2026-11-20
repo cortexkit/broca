@@ -638,6 +638,12 @@ impl ViewCache {
 }
 
 impl<V: CachedBytes> ViewCache<V> {
+    /// How many views are kept, and their estimated bytes.
+    pub fn usage(&self) -> (usize, u64) {
+        let inner = self.inner.lock().unwrap();
+        (inner.entries.len(), inner.bytes)
+    }
+
     pub fn new(max_entries: usize, max_bytes: u64) -> Self {
         Self {
             inner: Mutex::new(CacheInner::default()),
@@ -730,12 +736,6 @@ impl<V: CachedBytes> ViewCache<V> {
             );
         }
         Ok(view)
-    }
-
-    /// How many views are kept, and their estimated bytes.
-    pub fn usage(&self) -> (usize, u64) {
-        let inner = self.inner.lock().unwrap();
-        (inner.entries.len(), inner.bytes)
     }
 
     /// What the cache holds, with its caps: the bytes it counts against its byte cap (each view's

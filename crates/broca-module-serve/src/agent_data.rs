@@ -101,39 +101,6 @@ pub struct AgentDataService {
     op_counts: [AtomicU64; 10],
 }
 impl AgentDataService {
-    pub fn new(
-        root: PathBuf,
-        registry: LineageRegistry,
-        wal: Arc<FileWalStore>,
-        index: Arc<broca_store::SqliteStore>,
-        door: Arc<dyn SessionDoor>,
-    ) -> Self {
-        wal.set_session_ref_index(index.clone());
-        let driver = Arc::new(Driver {
-            registry: registry.clone(),
-            root: root.clone(),
-            wal: wal.clone(),
-            index: index.clone(),
-            door,
-        });
-        let inventory_readiness = registry.set_session_inventory_readiness(Arc::new(
-            crate::session_inventory::SessionInventory::new(root.clone(), index.clone()),
-        ));
-        Self {
-            cuts: CutStore::new(&root),
-            artifacts: FileCutArtifacts::new(
-                root.clone(),
-                registry,
-                wal.clone(),
-                index.clone(),
-                driver,
-            ),
-            wal,
-            inventory_readiness,
-            op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
-        }
-    }
-
     /// Construct with operational capabilities from one store. Boot must publish
     /// and reconcile its WAL-derived rows before calling `reconcile_boot`.
     /// Inventory repair uses the registry's shared, signalled readiness task.
@@ -170,6 +137,40 @@ impl AgentDataService {
             op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
+
+    pub fn new(
+        root: PathBuf,
+        registry: LineageRegistry,
+        wal: Arc<FileWalStore>,
+        index: Arc<broca_store::SqliteStore>,
+        door: Arc<dyn SessionDoor>,
+    ) -> Self {
+        wal.set_session_ref_index(index.clone());
+        let driver = Arc::new(Driver {
+            registry: registry.clone(),
+            root: root.clone(),
+            wal: wal.clone(),
+            index: index.clone(),
+            door,
+        });
+        let inventory_readiness = registry.set_session_inventory_readiness(Arc::new(
+            crate::session_inventory::SessionInventory::new(root.clone(), index.clone()),
+        ));
+        Self {
+            cuts: CutStore::new(&root),
+            artifacts: FileCutArtifacts::new(
+                root.clone(),
+                registry,
+                wal.clone(),
+                index.clone(),
+                driver,
+            ),
+            wal,
+            inventory_readiness,
+            op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
     pub async fn reconcile_boot(&self) -> Result<(), ErrorBody> {
         broca_store::session_refs::cleanup_legacy_inventory(
             self.wal.root().parent().unwrap_or(self.wal.root()),

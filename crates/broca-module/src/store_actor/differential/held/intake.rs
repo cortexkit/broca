@@ -175,8 +175,7 @@ async fn encrypted_store_hold_survives_lost_late_results_database() {
     rig.tick().await;
     assert_eq!(rig.delivery.calls.load(Ordering::SeqCst), 0);
     assert!(rig.feed.acks.lock().unwrap().is_empty());
-    let mut report =
-        crate::late_results_puller::rebuild_store_from_wals(&rig.store, &side.dir).unwrap();
+    let mut report = crate::late_results_puller::RebuildReport::default();
     crate::late_results_puller::rebuild_store_from_sessions_with_progress(
         &rig.store,
         &side.dir,

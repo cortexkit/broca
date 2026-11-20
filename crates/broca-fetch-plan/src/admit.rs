@@ -340,10 +340,6 @@ pub const CATALOG_OP: &str = "tool.catalog";
 /// call.
 pub const DECLARE_OP: &str = cortexkit_role_step_transform_provider::ops::TRANSFORM_DECLARE;
 
-/// The op admission sends a plan's compaction provider to learn whether it serves
-/// `compaction-provider/v1`.
-pub const DESCRIBE_OP: &str = cortexkit_role_compaction_provider::ops::ROLE_DESCRIBE;
-
 /// The kind of an absent system-text item.
 pub const ABSENT_KIND_SYSTEM_TEXT: &str = "system_text";
 /// The kind of an absent tool item.
@@ -1096,25 +1092,6 @@ pub fn frozen_provider_declarations_of<'a>(
         })
 }
 
-/// Whether `provider` froze the `late_results` session capability into `manifest`.
-pub fn frozen_declares_late_results(manifest: &PlanManifest, provider: &str) -> bool {
-    frozen_provider_declarations_of(manifest, provider)
-        .and_then(|declarations| declarations.late_results)
-        .unwrap_or(false)
-}
-
-/// The result format `provider` froze for `tool` into `manifest`, if it opted in.
-pub fn frozen_result_format<'a>(
-    manifest: &'a PlanManifest,
-    provider: &str,
-    tool: &str,
-) -> Option<&'a FrozenResultFormat> {
-    frozen_provider_declarations_of(manifest, provider)?
-        .result_formats
-        .as_ref()?
-        .get(tool)
-}
-
 fn names_missing<'a>(from: &'a [String], against: &[String]) -> Vec<&'a str> {
     from.iter()
         .filter(|name| !against.contains(name))
@@ -1233,9 +1210,6 @@ impl CatalogFetch<'_> {
         self.tool_item.is_some_and(|item| item.optional) && self.optional()
     }
 }
-
-/// The problem naming a non-retryable refusal of `role.describe` itself.
-pub const DESCRIBE_REFUSED: &str = "describe_refused";
 
 /// Admit `plan`: fetch every provider it names through `fetcher`, all within `deadline` of now,
 /// and check the answers. `session` identifies warning records for unanswered fetches. Returns

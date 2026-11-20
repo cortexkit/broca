@@ -61,11 +61,7 @@ pub enum SessionLogState {
     ForkedStub,
 }
 
-impl SessionLogState {
-    pub fn missing_history(self) -> bool {
-        matches!(self, Self::Missing | Self::ForkedStub)
-    }
-}
+impl SessionLogState {}
 
 impl SqliteStore {
     pub fn session_log_state(
@@ -361,23 +357,6 @@ pub(crate) fn evidence(
     })
 }
 
-pub(crate) fn recorded_run_ids(
-    conn: &Connection,
-    session: &BindIdentity,
-) -> Result<std::collections::BTreeSet<String>, EvidenceError> {
-    let mut query = conn.prepare(&format!("SELECT run_id FROM run_index INDEXED BY {} WHERE json_valid(session) AND json_extract(session,'$.project_root')=?1 AND json_extract(session,'$.harness')=?2 AND json_extract(session,'$.session')=?3", indexes::RUNS))?;
-    let rows = query.query_map(
-        params![
-            session.project_root.to_string_lossy(),
-            session.harness,
-            session.session
-        ],
-        |row| row.get(0),
-    )?;
-    let ids = rows.collect::<rusqlite::Result<_>>()?;
-    Ok(ids)
-}
-
 /// Seek past the previous value instead of visiting every duplicate entry.
 /// A DISTINCT query may still visit every duplicate entry rather than skip it.
 fn distinct_lineages(
@@ -471,6 +450,3 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, EvidenceError> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod cost_tests;

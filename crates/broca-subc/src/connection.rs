@@ -969,10 +969,256 @@ pub struct SubcConnection {
 }
 
 impl SubcConnection {
+    /// Open the classifier role under a daemon-held work scope. The selector is resolved by
+    /// the daemon, not trusted as caller-supplied attribution by the classifier.
+    pub async fn route_open_classifier_scoped_within(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: subc_protocol::scope::ScopeSelector,
+        retry: RouteOpenRetry,
+    ) -> ConnResult<RouteHandle> {
+        self.retry_open_through_gate(GateTarget::management_surface(module_id), retry, || {
+            self.route_open_target(
+                RouteTarget::ManagementSurface {
+                    module_id: module_id.to_owned(),
+                },
+                identity,
+                Some(scope.clone()),
+                Some(classifier_role_versions()),
+            )
+        })
+        .await
+    }
+
+    /// Preserve the exact argument bytes rather than parsing and reserializing them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tool_call_raw_with_preset(
+        &self,
+        route: &RouteHandle,
+        name: &str,
+        args_jcs: &str,
+        tool_call_id: Option<&str>,
+        deadline: Duration,
+        preset: Option<&str>,
+        call_key: Option<&str>,
+    ) -> ConnResult<serde_json::Value> {
+        let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key, None)?;
+        self.send_tool_call_body(route, deadline, name, body).await
+    }
+
+    /// Send ONE unary request on `route_channel` with caller-encoded JSON bytes and await the
+    /// terminal response (interim Push frames drained). Unlike [`tool_call`], which wraps the
+    /// args in the `{name, arguments}` tool envelope, this sends `body` AS-IS — for a route
+    /// whose handler expects a different top-level shape. Returns the raw response body bytes,
+    /// or a typed Error → `Rejected`.
+    ///
+    /// The `deadline` bounds silence per received frame (it resets on interim Push frames),
+    /// not total wall time. It is caller-supplied so a route whose handler legitimately runs
+    /// longer than the standard [`RESPONSE_TIMEOUT`] can say so. Ordinary callers pass
+    /// `RESPONSE_TIMEOUT`.
+    ///
+    /// [`tool_call`]: SubcConnection::tool_call
+    pub async fn route_unary_bytes(
+        &self,
+        route: &RouteHandle,
+        body: Vec<u8>,
+        deadline: Duration,
+    ) -> ConnResult<Vec<u8>> {
+        let corr = self.next_corr();
+        let (runtime, _registration, mut rx) =
+            self.register_route(route, (route.channel, route.epoch, corr))?;
+        let frame = Frame::build(
+            FrameType::Request,
+            data_flags(),
+            route.channel,
+            route.epoch,
+            corr,
+            body,
+        )
+        .map_err(|e| ConnError::Transport(e.to_string()))?;
+        async {
+            self.send(&runtime, frame).await?;
+            let terminal = self
+                .await_terminal_deadline(&runtime, &mut rx, deadline)
+                .await?;
+            match terminal.header.ty {
+                FrameType::Response => Ok(terminal.body),
+                FrameType::Error => Err(ConnError::Rejected(decode_error_body(&terminal.body))),
+                ty => Err(ConnError::Protocol(format!(
+                    "unexpected unary response frame {ty:?}"
+                ))),
+            }
+        }
+        .await
+    }
+
+    /// Native integration probes need to declare the same paired result formats as a held
+    /// tool-plane caller. This opener is absent from release builds and grants no identity.
+    #[cfg(debug_assertions)]
+    pub async fn route_open_tool_provider_held_v1_for_tests(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
+    ) -> ConnResult<RouteHandle> {
+        self.route_open_target_with_capabilities(
+            RouteTarget::ToolProvider {
+                module_id: module_id.into(),
+            },
+            identity,
+            scope,
+            Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            Some(vec![
+                cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
+                cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
+            ]),
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-route-close")]
+    pub fn fail_next_goodbye_for_test(&self) {
+        self.shared
+            .current
+            .lock()
+            .unwrap()
+            .runtime
+            .fail_next_goodbye
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Send a JSON request body on a bound route channel and await its single terminal
+    /// Response/Error. The management-surface analogue of `tool_call` (which is tool-shaped):
+    /// this is the generic `{method, params}` request/response the session.* command ops
+    /// (send/status/cancel/retract) ride. Returns the decoded Response JSON, or `Rejected`
+    /// for a typed Error frame.
+    pub async fn route_request(
+        &self,
+        route: &RouteHandle,
+        body: Vec<u8>,
+    ) -> ConnResult<serde_json::Value> {
+        let body = self.route_request_raw(route, body).await?;
+        serde_json::from_slice(&body)
+            .map_err(|e| ConnError::Protocol(format!("decode route response: {e}")))
+    }
+
+    /// Ask the supervisor to run one module `health.check` probe and return its in-memory
+    /// dependency report.
+    pub async fn supervisor_health_probe(
+        &self,
+        module_id: &str,
+    ) -> ConnResult<ModuleHealthSnapshot> {
+        let body = serde_json::to_vec(&ClientControlRequest::SupervisorHealthProbe {
+            module_id: module_id.to_string(),
+        })
+        .map_err(|error| ConnError::Transport(error.to_string()))?;
+        let frame = self.control_rpc(body).await?;
+        match serde_json::from_slice::<ClientControlResponse>(&frame.body) {
+            Ok(ClientControlResponse::SupervisorHealthProbe {
+                module_id,
+                status,
+                detail,
+                metrics,
+            }) => Ok(ModuleHealthSnapshot {
+                module_id,
+                status,
+                detail,
+                metrics,
+            }),
+            Ok(other) => Err(ConnError::Protocol(format!(
+                "unexpected supervisor.health_probe reply: {other:?}"
+            ))),
+            Err(error) => Err(ConnError::Protocol(format!(
+                "decode supervisor.health_probe: {error}"
+            ))),
+        }
+    }
+
+    async fn control_rpc_deadline(&self, body: Vec<u8>, deadline: Duration) -> ConnResult<Frame> {
+        let corr = self.next_corr();
+        let (runtime, _registration, mut rx) = self.register_control((0, 0, corr), false)?;
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body)
+            .map_err(|e| ConnError::Transport(e.to_string()))?;
+        self.send(&runtime, frame).await?;
+        self.await_terminal_deadline(&runtime, &mut rx, deadline)
+            .await
+    }
+
+    /// Channel-0 control RPC: send Request, await the terminal Response/Error.
+    async fn control_rpc(&self, body: Vec<u8>) -> ConnResult<Frame> {
+        self.control_rpc_deadline(body, RESPONSE_TIMEOUT).await
+    }
+
     /// Record client attempt starts, independently of when the daemon receives their frames.
     #[cfg(feature = "test-clock")]
     pub fn record_route_open_attempts_for_test(&mut self, starts: Arc<Mutex<Vec<time::Instant>>>) {
         self.route_open_attempts = Some(starts);
+    }
+
+    /// The supervisor's own record of one module, for failure diagnostics: every module's
+    /// `supervisor.list` entry (state, spawn generation, last exit, restart budget), the
+    /// module's retained stderr (`supervisor.stderr_tail`) and its terminal exit history
+    /// (`supervisor.terminals`). This is the daemon's account of why a module reads `failed`,
+    /// and it is there even when the module wrote no log of its own; a `spawn_generation` of 0
+    /// says no process of it ever started. Each part holds the raw reply or the error text, so a
+    /// daemon that lacks one op still answers the others.
+    pub async fn supervisor_module_report(&self, module_id: &str) -> serde_json::Value {
+        let requests = [
+            ("supervisor.list", ClientControlRequest::SupervisorList {}),
+            (
+                "supervisor.stderr_tail",
+                ClientControlRequest::SupervisorStderrTail {
+                    module_id: module_id.to_string(),
+                    max_lines: Some(200),
+                    max_bytes: None,
+                },
+            ),
+            (
+                "supervisor.terminals",
+                ClientControlRequest::SupervisorTerminals {
+                    module_id: module_id.to_string(),
+                },
+            ),
+        ];
+        let mut report = serde_json::Map::new();
+        for (op, request) in requests {
+            let answer = match serde_json::to_vec(&request) {
+                Ok(body) => match self.control_rpc(body).await {
+                    Ok(frame) => serde_json::from_slice(&frame.body).unwrap_or_else(|error| {
+                        serde_json::Value::String(format!("undecodable reply: {error}"))
+                    }),
+                    Err(error) => serde_json::Value::String(error.to_string()),
+                },
+                Err(error) => serde_json::Value::String(format!("encode {op}: {error}")),
+            };
+            report.insert(op.to_string(), answer);
+        }
+        serde_json::Value::Object(report)
+    }
+
+    /// Open a known v1 provider with the ordinary tool-module identity. Callers with a
+    /// session's compaction-provider context use the shared policy opener instead.
+    pub async fn route_open_tool_provider_v1(
+        &self,
+        module_id: &str,
+        identity: &BindIdentity,
+        scope: Option<subc_protocol::scope::ScopeSelector>,
+    ) -> ConnResult<RouteHandle> {
+        self.route_open_tool_provider_with_policy(
+            module_id,
+            identity,
+            scope,
+            ToolProviderRoutePolicy {
+                declares_role: true,
+                session_identity: false,
+                aft_harness: None,
+            },
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -1305,21 +1551,6 @@ impl SubcConnection {
         request_liveness_probe(&self.shared, runtime);
     }
 
-    /// Channel-0 control RPC: send Request, await the terminal Response/Error.
-    async fn control_rpc(&self, body: Vec<u8>) -> ConnResult<Frame> {
-        self.control_rpc_deadline(body, RESPONSE_TIMEOUT).await
-    }
-
-    async fn control_rpc_deadline(&self, body: Vec<u8>, deadline: Duration) -> ConnResult<Frame> {
-        let corr = self.next_corr();
-        let (runtime, _registration, mut rx) = self.register_control((0, 0, corr), false)?;
-        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body)
-            .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send(&runtime, frame).await?;
-        self.await_terminal_deadline(&runtime, &mut rx, deadline)
-            .await
-    }
-
     async fn route_open_rpc(&self, body: Vec<u8>) -> ConnResult<(Frame, ConnToken)> {
         self.route_open_rpc_deadline(body, ROUTE_OPEN_ATTEMPT_TIMEOUT)
             .await
@@ -1424,79 +1655,6 @@ impl SubcConnection {
             .cloned()
     }
 
-    /// Ask the supervisor to run one module `health.check` probe and return its in-memory
-    /// dependency report.
-    pub async fn supervisor_health_probe(
-        &self,
-        module_id: &str,
-    ) -> ConnResult<ModuleHealthSnapshot> {
-        let body = serde_json::to_vec(&ClientControlRequest::SupervisorHealthProbe {
-            module_id: module_id.to_string(),
-        })
-        .map_err(|error| ConnError::Transport(error.to_string()))?;
-        let frame = self.control_rpc(body).await?;
-        match serde_json::from_slice::<ClientControlResponse>(&frame.body) {
-            Ok(ClientControlResponse::SupervisorHealthProbe {
-                module_id,
-                status,
-                detail,
-                metrics,
-            }) => Ok(ModuleHealthSnapshot {
-                module_id,
-                status,
-                detail,
-                metrics,
-            }),
-            Ok(other) => Err(ConnError::Protocol(format!(
-                "unexpected supervisor.health_probe reply: {other:?}"
-            ))),
-            Err(error) => Err(ConnError::Protocol(format!(
-                "decode supervisor.health_probe: {error}"
-            ))),
-        }
-    }
-
-    /// The supervisor's own record of one module, for failure diagnostics: every module's
-    /// `supervisor.list` entry (state, spawn generation, last exit, restart budget), the
-    /// module's retained stderr (`supervisor.stderr_tail`) and its terminal exit history
-    /// (`supervisor.terminals`). This is the daemon's account of why a module reads `failed`,
-    /// and it is there even when the module wrote no log of its own; a `spawn_generation` of 0
-    /// says no process of it ever started. Each part holds the raw reply or the error text, so a
-    /// daemon that lacks one op still answers the others.
-    pub async fn supervisor_module_report(&self, module_id: &str) -> serde_json::Value {
-        let requests = [
-            ("supervisor.list", ClientControlRequest::SupervisorList {}),
-            (
-                "supervisor.stderr_tail",
-                ClientControlRequest::SupervisorStderrTail {
-                    module_id: module_id.to_string(),
-                    max_lines: Some(200),
-                    max_bytes: None,
-                },
-            ),
-            (
-                "supervisor.terminals",
-                ClientControlRequest::SupervisorTerminals {
-                    module_id: module_id.to_string(),
-                },
-            ),
-        ];
-        let mut report = serde_json::Map::new();
-        for (op, request) in requests {
-            let answer = match serde_json::to_vec(&request) {
-                Ok(body) => match self.control_rpc(body).await {
-                    Ok(frame) => serde_json::from_slice(&frame.body).unwrap_or_else(|error| {
-                        serde_json::Value::String(format!("undecodable reply: {error}"))
-                    }),
-                    Err(error) => serde_json::Value::String(error.to_string()),
-                },
-                Err(error) => serde_json::Value::String(format!("encode {op}: {error}")),
-            };
-            report.insert(op.to_string(), answer);
-        }
-        serde_json::Value::Object(report)
-    }
-
     /// `route.open` to a tool provider. Subsequent tool calls use the returned handle.
     ///
     /// Retries a temporary refusal under [`RouteOpenRetry::default_patience`]; use
@@ -1597,27 +1755,6 @@ impl SubcConnection {
         Ok(handle)
     }
 
-    /// Open a known v1 provider with the ordinary tool-module identity. Callers with a
-    /// session's compaction-provider context use the shared policy opener instead.
-    pub async fn route_open_tool_provider_v1(
-        &self,
-        module_id: &str,
-        identity: &BindIdentity,
-        scope: Option<subc_protocol::scope::ScopeSelector>,
-    ) -> ConnResult<RouteHandle> {
-        self.route_open_tool_provider_with_policy(
-            module_id,
-            identity,
-            scope,
-            ToolProviderRoutePolicy {
-                declares_role: true,
-                session_identity: false,
-                aft_harness: None,
-            },
-        )
-        .await
-    }
-
     pub(crate) async fn route_open_tool_provider_with_policy(
         &self,
         module_id: &str,
@@ -1652,33 +1789,6 @@ impl SubcConnection {
             ticket.report(&outcome);
         }
         outcome
-    }
-
-    /// Native integration probes need to declare the same paired result formats as a held
-    /// tool-plane caller. This opener is absent from release builds and grants no identity.
-    #[cfg(debug_assertions)]
-    pub async fn route_open_tool_provider_held_v1_for_tests(
-        &self,
-        module_id: &str,
-        identity: &BindIdentity,
-        scope: Option<subc_protocol::scope::ScopeSelector>,
-    ) -> ConnResult<RouteHandle> {
-        self.route_open_target_with_capabilities(
-            RouteTarget::ToolProvider {
-                module_id: module_id.into(),
-            },
-            identity,
-            scope,
-            Some(std::collections::BTreeMap::from([(
-                "tool-provider".into(),
-                "v1".into(),
-            )])),
-            Some(vec![
-                cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
-                cortexkit_role_tool_provider::HELD_REPLY_V1.into(),
-            ]),
-        )
-        .await
     }
 
     /// Open a module-level role using the same bind translation and retry machinery
@@ -1798,28 +1908,6 @@ impl SubcConnection {
             classifier_role_versions(),
             retry,
         )
-        .await
-    }
-
-    /// Open the classifier role under a daemon-held work scope. The selector is resolved by
-    /// the daemon, not trusted as caller-supplied attribution by the classifier.
-    pub async fn route_open_classifier_scoped_within(
-        &self,
-        module_id: &str,
-        identity: &BindIdentity,
-        scope: subc_protocol::scope::ScopeSelector,
-        retry: RouteOpenRetry,
-    ) -> ConnResult<RouteHandle> {
-        self.retry_open_through_gate(GateTarget::management_surface(module_id), retry, || {
-            self.route_open_target(
-                RouteTarget::ManagementSurface {
-                    module_id: module_id.to_owned(),
-                },
-                identity,
-                Some(scope.clone()),
-                Some(classifier_role_versions()),
-            )
-        })
         .await
     }
 
@@ -2256,21 +2344,6 @@ impl SubcConnection {
         .await
     }
 
-    /// Send a JSON request body on a bound route channel and await its single terminal
-    /// Response/Error. The management-surface analogue of `tool_call` (which is tool-shaped):
-    /// this is the generic `{method, params}` request/response the session.* command ops
-    /// (send/status/cancel/retract) ride. Returns the decoded Response JSON, or `Rejected`
-    /// for a typed Error frame.
-    pub async fn route_request(
-        &self,
-        route: &RouteHandle,
-        body: Vec<u8>,
-    ) -> ConnResult<serde_json::Value> {
-        let body = self.route_request_raw(route, body).await?;
-        serde_json::from_slice(&body)
-            .map_err(|e| ConnError::Protocol(format!("decode route response: {e}")))
-    }
-
     /// Open a SUBSCRIBE stream on a bound route channel: send the subscribe request body,
     /// then return a [`SubscribeStream`] that yields each `StreamData` frame until the
     /// `StreamEnd` terminates it. Unlike `route_request` (one terminal), a subscribe holds
@@ -2326,63 +2399,6 @@ impl SubcConnection {
     pub async fn route_close(&self, route: &RouteHandle) -> ConnResult<()> {
         let prepared = prepare_goodbye(&self.shared, *route)?;
         finish_goodbye(prepared, *route).await
-    }
-
-    #[cfg(feature = "test-route-close")]
-    pub fn fail_next_goodbye_for_test(&self) {
-        self.shared
-            .current
-            .lock()
-            .unwrap()
-            .runtime
-            .fail_next_goodbye
-            .store(true, Ordering::Relaxed);
-    }
-
-    /// Send ONE unary request on `route_channel` with caller-encoded JSON bytes and await the
-    /// terminal response (interim Push frames drained). Unlike [`tool_call`], which wraps the
-    /// args in the `{name, arguments}` tool envelope, this sends `body` AS-IS — for a route
-    /// whose handler expects a different top-level shape. Returns the raw response body bytes,
-    /// or a typed Error → `Rejected`.
-    ///
-    /// The `deadline` bounds silence per received frame (it resets on interim Push frames),
-    /// not total wall time. It is caller-supplied so a route whose handler legitimately runs
-    /// longer than the standard [`RESPONSE_TIMEOUT`] can say so. Ordinary callers pass
-    /// `RESPONSE_TIMEOUT`.
-    ///
-    /// [`tool_call`]: SubcConnection::tool_call
-    pub async fn route_unary_bytes(
-        &self,
-        route: &RouteHandle,
-        body: Vec<u8>,
-        deadline: Duration,
-    ) -> ConnResult<Vec<u8>> {
-        let corr = self.next_corr();
-        let (runtime, _registration, mut rx) =
-            self.register_route(route, (route.channel, route.epoch, corr))?;
-        let frame = Frame::build(
-            FrameType::Request,
-            data_flags(),
-            route.channel,
-            route.epoch,
-            corr,
-            body,
-        )
-        .map_err(|e| ConnError::Transport(e.to_string()))?;
-        async {
-            self.send(&runtime, frame).await?;
-            let terminal = self
-                .await_terminal_deadline(&runtime, &mut rx, deadline)
-                .await?;
-            match terminal.header.ty {
-                FrameType::Response => Ok(terminal.body),
-                FrameType::Error => Err(ConnError::Rejected(decode_error_body(&terminal.body))),
-                ty => Err(ConnError::Protocol(format!(
-                    "unexpected unary response frame {ty:?}"
-                ))),
-            }
-        }
-        .await
     }
 
     /// Like [`Self::route_unary_bytes`], except that an Error frame ending the request comes back
@@ -2495,22 +2511,6 @@ impl SubcConnection {
             output_refs: None,
         })
         .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send_tool_call_body(route, deadline, name, body).await
-    }
-
-    /// Preserve the exact argument bytes rather than parsing and reserializing them.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn tool_call_raw_with_preset(
-        &self,
-        route: &RouteHandle,
-        name: &str,
-        args_jcs: &str,
-        tool_call_id: Option<&str>,
-        deadline: Duration,
-        preset: Option<&str>,
-        call_key: Option<&str>,
-    ) -> ConnResult<serde_json::Value> {
-        let body = Self::raw_tool_call_body(name, args_jcs, tool_call_id, preset, call_key, None)?;
         self.send_tool_call_body(route, deadline, name, body).await
     }
 

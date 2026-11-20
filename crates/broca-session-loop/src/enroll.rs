@@ -317,17 +317,6 @@ pub fn last_prompt_tokens(
         .as_u64()
 }
 
-/// Whether `run_id` is the run that moved the session onto the current compaction contract.
-pub fn is_enrolling_run(
-    operations: &broca_session_store::fold::operations::Operations,
-    run_id: &str,
-) -> bool {
-    operations
-        .enrolled
-        .as_ref()
-        .is_some_and(|enrolled| enrolled.run_id == run_id)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

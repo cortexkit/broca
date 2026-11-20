@@ -31,14 +31,6 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    // As with WAL creation, non-Unix durability covers file contents, not the directory
-    // entry. A lost rename falls back to the intact archive; subsequent appends can be
-    // lost. This inherited platform exposure is bounded by the archived transcript.
-    Ok(())
-}
-
 /// What permits publishing a restored archive member as a session's live log.
 ///
 /// Restoring writes a new live file, so it needs the same single-writer authority as

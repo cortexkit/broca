@@ -30,9 +30,9 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use broca_core::OutputEvent;
 #[cfg(feature = "live")]
-use broca_core::{run_loop, AllowAll, FileLeaseStore, FileWalStore, RunRequest, StubToolPlane};
-use broca_core::{OutputEvent, RunSummary};
+use broca_core::{RunRequest, StubToolPlane};
 use broca_protocol::NormalizedEvent;
 use broca_protocol::{
     caller::{ControlUnit, RunFinishReason},
@@ -244,8 +244,14 @@ pub enum LiveResult {
     Ran(LiveOutcome),
 }
 
+/// How a live run ended: its reason and its whole usage.
+pub struct LiveSummary {
+    pub reason: RunFinishReason,
+    pub usage: broca_protocol::Usage,
+}
+
 pub struct LiveOutcome {
-    pub summary: RunSummary,
+    pub summary: LiveSummary,
     pub events: Vec<OutputEvent>,
     pub capture: Capture,
     /// The run's full input (seed history + this run's opening user prompt) — the
@@ -303,7 +309,7 @@ impl LiveSpec {
     }
 }
 
-/// Drive `run_loop` against a REAL provider (family + frozen + auth), capturing the
+/// Drive the run loop against a REAL provider (family + frozen + auth), capturing the
 /// response, and classify the result by the error taxonomy (provider-side → Skip,
 /// our-side → return the outcome for loud assertions). The caller resolves auth +
 /// frozen config (per-family) and passes them in; the rig owns capture + classify.
@@ -332,8 +338,6 @@ pub async fn run_live<F: WireFamily + 'static>(
         scenario
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    let store = FileLeaseStore::new(dir.join("leases"));
-    let wal = FileWalStore::new(dir.join("wal"));
 
     let policy_allowed = spec.tools.iter().map(|t| t.name.clone()).collect();
     // The run input is the seed history (a prior provider's conversation, empty for a
@@ -351,7 +355,7 @@ pub async fn run_live<F: WireFamily + 'static>(
         tags: Default::default(),
     });
     let req_input = input.clone();
-    let req = RunRequest {
+    let mut req = RunRequest {
         account_route: None,
         route_decision_id: None,
         input_written_at_ms: None,
@@ -396,10 +400,12 @@ pub async fn run_live<F: WireFamily + 'static>(
         }
         v
     });
-    let summary = run_loop(req, &provider, &plane, &store, &AllowAll, &wal, &tx)
-        .await
-        .expect("run_loop should not fail at the lease/WAL level");
+    let end = run_on_session_loop(&mut req, &provider, &plane, &tx).await;
     drop(tx);
+    let summary = LiveSummary {
+        reason: end.reason,
+        usage: end.usage,
+    };
     let events = collector.await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -430,6 +436,33 @@ pub async fn run_live<F: WireFamily + 'static>(
         capture,
         input: req_input,
     })
+}
+
+/// How a run on [`run_on_session_loop`] ended.
+pub struct SessionLoopEnd {
+    pub reason: RunFinishReason,
+    pub usage: broca_protocol::Usage,
+    pub retries_used: u32,
+    /// The model steps the run completed.
+    pub steps: u64,
+}
+
+/// Runs `req` as the first run of a new session through the session loop production runs, with
+/// `provider` and `plane`, sending its output events to `out`.
+pub async fn run_on_session_loop<P: broca_core::Provider>(
+    req: &mut RunRequest,
+    provider: &P,
+    plane: &StubToolPlane,
+    out: &mpsc::Sender<OutputEvent>,
+) -> SessionLoopEnd {
+    let mut session = crate::session_loop_rig::RigSession::new(&req.session).await;
+    let run = session.run(req, provider, plane, out).await;
+    SessionLoopEnd {
+        reason: run.finished.reason,
+        usage: run.finished.usage.unwrap_or_default(),
+        retries_used: run.finished.retries_used,
+        steps: run.steps,
+    }
 }
 
 /// Map a provider error to a skip reason when it's a provider-side condition, else

@@ -127,6 +127,23 @@ pub struct SseDecoder {
 }
 
 impl SseDecoder {
+    /// Number of complete SSE records that carried no non-empty `data:` payload but did
+    /// carry at least one comment line (a line starting `:`), such as `: keepalive`.
+    ///
+    /// A comment record proves the peer is alive and still framing records, but carries no
+    /// content, so it is counted apart from [`Self::data_records`]. xAI sends ONLY these,
+    /// every 15 seconds, while a model reasons without streaming the reasoning; the SSE
+    /// specification recommends exactly this shape as a keepalive.
+    ///
+    /// Blank records and records whose only field is an empty `data:` (or `event:`/`id:`/
+    /// `retry:` with no data) are counted in neither total. No provider we have captured
+    /// uses those shapes as a keepalive, and admitting them would let a peer extend a
+    /// stream's life on framing slack alone; the comment is the one keepalive shape seen on
+    /// the wire and named by the specification.
+    pub fn comment_records(&self) -> u64 {
+        self.comment_records
+    }
+
     pub(crate) fn for_content_family(family: crate::content_progress::ContentFamily) -> Self {
         Self {
             content: crate::content_progress::ContentObserver::new(family),
@@ -345,23 +362,6 @@ impl SseDecoder {
     /// `[DONE]` counts because it is a non-empty data payload that the normalizer consumes.
     pub fn data_records(&self) -> u64 {
         self.data_records
-    }
-
-    /// Number of complete SSE records that carried no non-empty `data:` payload but did
-    /// carry at least one comment line (a line starting `:`), such as `: keepalive`.
-    ///
-    /// A comment record proves the peer is alive and still framing records, but carries no
-    /// content, so it is counted apart from [`Self::data_records`]. xAI sends ONLY these,
-    /// every 15 seconds, while a model reasons without streaming the reasoning; the SSE
-    /// specification recommends exactly this shape as a keepalive.
-    ///
-    /// Blank records and records whose only field is an empty `data:` (or `event:`/`id:`/
-    /// `retry:` with no data) are counted in neither total. No provider we have captured
-    /// uses those shapes as a keepalive, and admitting them would let a peer extend a
-    /// stream's life on framing slack alone; the comment is the one keepalive shape seen on
-    /// the wire and named by the specification.
-    pub fn comment_records(&self) -> u64 {
-        self.comment_records
     }
 
     /// Number of comment-only keepalive records since the last data event.

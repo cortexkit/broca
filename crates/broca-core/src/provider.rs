@@ -669,17 +669,6 @@ pub struct StubProvider {
 }
 
 impl StubProvider {
-    /// `scripts[i]` is the event sequence the provider streams for step i.
-    pub fn new(scripts: Vec<Vec<NormalizedEvent>>) -> Self {
-        Self {
-            scripts: Arc::new(Mutex::new(scripts.into())),
-            calls: Arc::new(Mutex::new(Vec::new())),
-            refusal_fallback: None,
-            route: Arc::new(Mutex::new(crate::refusal_fallback::StepRoute::Source)),
-            routes: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
     /// Act as an episode that froze `model` (with `context_limit`) as its refusal fallback.
     pub fn with_refusal_fallback(
         mut self,
@@ -695,9 +684,15 @@ impl StubProvider {
         self.calls.lock().unwrap().clone()
     }
 
-    /// The route each call was sent on, in invocation order.
-    pub fn routes(&self) -> Vec<crate::refusal_fallback::StepRoute> {
-        self.routes.lock().unwrap().clone()
+    /// `scripts[i]` is the event sequence the provider streams for step i.
+    pub fn new(scripts: Vec<Vec<NormalizedEvent>>) -> Self {
+        Self {
+            scripts: Arc::new(Mutex::new(scripts.into())),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            refusal_fallback: None,
+            route: Arc::new(Mutex::new(crate::refusal_fallback::StepRoute::Source)),
+            routes: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 

@@ -12,6 +12,19 @@ pub struct RoutingRecord {
 }
 
 impl SystemOneStore {
+    /// The idle batches of `role` whose routing outcome is still owed. Read by the classifier's
+    /// recovery tests; recovery itself must claim each batch before changing its outbox.
+    pub fn pending_routing_batches(&self, role: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT batch_id FROM batch WHERE role=?1 AND state='idle' AND routing_pending=1",
+        )?;
+        let rows = statement.query_map([role], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Whether `batch_id` is claimed and running. Read by the classifier's routed-batch tests,
+    /// which watch a batch's state from outside the service.
     pub fn routing_batch_running(&self, role: &str, batch_id: &str) -> Result<bool> {
         Ok(self
             .lock()
@@ -86,16 +99,6 @@ impl SystemOneStore {
              WHERE role=?1 AND batch_id=?2 AND owner=?3 AND state='running' AND routing_choice IS NOT NULL",
             rusqlite::params![role, batch_id, owner, runs, pending],
         )? != 0)
-    }
-
-    /// Idle rows only: recovery must claim each batch before changing its outbox.
-    pub fn pending_routing_batches(&self, role: &str) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT batch_id FROM batch WHERE role=?1 AND state='idle' AND routing_pending=1",
-        )?;
-        let rows = statement.query_map([role], |row| row.get(0))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Include expired routed rows even when they have no outstanding RPCs, so

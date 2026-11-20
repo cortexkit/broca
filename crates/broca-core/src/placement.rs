@@ -74,6 +74,10 @@ impl Default for Placement {
 }
 
 impl Placement {
+    pub fn held_tool_result_ordinal(&self) -> Option<u64> {
+        self.assistant_held.then_some(self.next.saturating_add(1))
+    }
+
     /// Rehydrate an index seed with the episode's independently verified frozen
     /// config. Budget message text is deliberately absent from serialized seeds.
     pub fn from_index_seed(mut seed: Self, budget_config: Option<BudgetConfig>) -> Self {
@@ -111,10 +115,6 @@ impl Placement {
 
     pub fn held_assistant_ordinal(&self) -> Option<u64> {
         self.assistant_held.then_some(self.next)
-    }
-
-    pub fn held_tool_result_ordinal(&self) -> Option<u64> {
-        self.assistant_held.then_some(self.next.saturating_add(1))
     }
 
     pub fn budget(&self) -> &BudgetReplayStateV1 {
@@ -321,7 +321,7 @@ impl Placement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay::{deferred_tests, projection_boundary_tests};
+
     use broca_protocol::{content::Message, ContentBlock, Role, StepId};
 
     fn user() -> Message {
@@ -331,32 +331,6 @@ mod tests {
                 text: "steer".into(),
             }],
         )
-    }
-
-    #[test]
-    fn input_and_assistant_use_absolute_ordinals() {
-        let mut placement = Placement::new(40);
-        let mut start = projection_boundary_tests::run_started(1, "run").record;
-        if let WalRecord::RunStarted { input, .. } = &mut start {
-            *input = vec![user()].into();
-        }
-        assert_eq!(
-            placement.observe(&start).unwrap(),
-            vec![PlacementAction::Append {
-                first: 40,
-                count: 1,
-                kind: AppendKind::Input,
-            }]
-        );
-        let step = deferred_tests::batch(&[]).remove(1);
-        assert_eq!(
-            placement.observe(&step).unwrap(),
-            vec![PlacementAction::Append {
-                first: 41,
-                count: 1,
-                kind: AppendKind::Assistant,
-            }]
-        );
     }
 
     #[test]
@@ -394,138 +368,5 @@ mod tests {
             .observe(&WalRecord::StepStarted { step_id: StepId(2) })
             .unwrap()
             .is_empty());
-    }
-
-    #[test]
-    fn batch_waits_for_all_terminals_and_commits_once() {
-        let mut placement = Placement::new(10);
-        for record in deferred_tests::batch(&["a", "b"]) {
-            placement.observe(&record).unwrap();
-        }
-        // An unfinished batch marker cannot place either the assistant or its results.
-        let finish = deferred_tests::finished().remove(0);
-        assert!(placement.observe(&finish).unwrap().is_empty());
-        placement
-            .observe(&deferred_tests::terminal("b", None))
-            .unwrap();
-        assert!(placement.observe(&finish).unwrap().is_empty());
-        placement
-            .observe(&deferred_tests::terminal("a", None))
-            .unwrap();
-        assert_eq!(
-            placement.observe(&finish).unwrap(),
-            vec![PlacementAction::Append {
-                first: 10,
-                count: 2,
-                kind: AppendKind::ToolTurn
-            }]
-        );
-        assert!(placement.observe(&finish).unwrap().is_empty());
-    }
-
-    #[test]
-    fn duplicate_call_ids_need_a_terminal_for_each_planned_position() {
-        let mut placement = Placement::new(0);
-        for record in deferred_tests::batch(&["a", "a"]) {
-            placement.observe(&record).unwrap();
-        }
-        let finish = deferred_tests::finished().remove(0);
-        placement
-            .observe(&deferred_tests::terminal("a", None))
-            .unwrap();
-        assert!(placement.observe(&finish).unwrap().is_empty());
-        placement
-            .observe(&deferred_tests::terminal("a", None))
-            .unwrap();
-        assert_eq!(
-            placement.observe(&finish).unwrap(),
-            vec![PlacementAction::Append {
-                first: 0,
-                count: 2,
-                kind: AppendKind::ToolTurn,
-            }]
-        );
-    }
-
-    #[test]
-    fn interrupted_zero_step_import_rewinds_but_fork_does_not() {
-        for origin_kind in [SeedOriginKind::Import, SeedOriginKind::Fork] {
-            let mut placement = Placement::new(9);
-            let mut start = projection_boundary_tests::run_started(1, "seed").record;
-            if let WalRecord::RunStarted { origin, input, .. } = &mut start {
-                *origin = RunOrigin::SeededFrom {
-                    origin_kind,
-                    source_ref: "source".into(),
-                    origin_device_pseudonym: None,
-                    base_seq: None,
-                };
-                *input = vec![user(), user()].into();
-            }
-            placement.observe(&start).unwrap();
-            let mut finish = deferred_tests::finished().remove(2);
-            if let WalRecord::RunFinished { reason, .. } = &mut finish {
-                *reason = RunFinishReason::Interrupted;
-            }
-            let actions = placement.observe(&finish).unwrap();
-            if origin_kind == SeedOriginKind::Import {
-                assert_eq!(actions, vec![PlacementAction::Truncate { to: 9 }]);
-                assert_eq!(placement.next_ordinal(), 9);
-            } else {
-                assert!(actions.is_empty());
-                assert_eq!(placement.next_ordinal(), 11);
-            }
-        }
-    }
-
-    #[test]
-    fn seeded_finalize_places_answer_without_a_tool_turn() {
-        let budget = BudgetConfig {
-            max_input_tokens: None,
-            nudges: vec![],
-            finalize_at_tool_calls: 0,
-            finalize_text: "finish".into(),
-        };
-        let mut placement = Placement::seeded(
-            20,
-            Some(RunId("r".into())),
-            Some(budget),
-            BudgetReplayStateV1::default(),
-            0,
-        );
-        let firing = WalRecord::BudgetFired {
-            tags: None,
-            run_id: RunId("r".into()),
-            kind: broca_protocol::request::BudgetKind::Finalize,
-            threshold: 0,
-            ordinal: 20,
-            caller_text: Some("finish".into()),
-        };
-        assert_eq!(
-            placement.observe(&firing).unwrap(),
-            vec![PlacementAction::Append {
-                first: 20,
-                count: 1,
-                kind: AppendKind::Budget
-            }]
-        );
-        assert!(placement.budget().finalize_pending);
-        let step = deferred_tests::batch(&["ignored-call"]).remove(1);
-        assert_eq!(
-            placement.observe(&step).unwrap(),
-            vec![PlacementAction::Append {
-                first: 21,
-                count: 1,
-                kind: AppendKind::Finalize
-            }]
-        );
-        assert!(!placement.budget().finalize_pending);
-        let mut wrong = firing;
-        if let WalRecord::BudgetFired { ordinal, .. } = &mut wrong {
-            *ordinal = 99;
-        }
-        assert!(placement
-            .observe(&wrong)
-            .unwrap_err()
-            .contains("ordinal 99"));
     }
 }

@@ -44,14 +44,6 @@ impl Default for Clock {
 }
 
 impl Clock {
-    #[cfg(feature = "test-clock")]
-    pub(crate) fn test_root(&self) -> Option<std::path::PathBuf> {
-        self.inner
-            .control
-            .as_ref()?
-            .parent()
-            .map(std::path::Path::to_path_buf)
-    }
     /// Construct the daemon's clock. The module owns its lifetime and injects
     /// clones into writers, actors and the sweep.
     pub fn for_state_root(root: impl AsRef<std::path::Path>) -> std::io::Result<Self> {

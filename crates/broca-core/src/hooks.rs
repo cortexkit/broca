@@ -206,17 +206,6 @@ impl HookPlan {
             .is_empty()
     }
 
-    pub(super) fn second_validation(&self) -> Self {
-        let mut plan = self.clone();
-        for item in &mut plan.items {
-            for sub in &mut item.subscriptions {
-                if sub.phase == Some(Phase::Validate) {
-                    sub.on_unavailable = OnUnavailable::Refuse;
-                }
-            }
-        }
-        plan
-    }
     pub fn approves(&self) -> bool {
         self.items.iter().any(|item| {
             item.subscriptions

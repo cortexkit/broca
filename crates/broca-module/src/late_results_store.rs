@@ -129,13 +129,6 @@ pub enum RegistrationState {
 }
 
 impl RegistrationState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RegistrationState::Registered => "registered",
-            RegistrationState::Settled => "settled",
-        }
-    }
-
     fn from_str(value: &str) -> Self {
         match value {
             "settled" => RegistrationState::Settled,
@@ -158,6 +151,35 @@ pub struct LateResultsStore {
 }
 
 impl LateResultsStore {
+    /// Retention retires a whole lineage, including receipts whose registrations were already
+    /// pruned. Feed positions and ack debt belong to the module, not to the deleted session.
+    pub fn remove_lineage(&self, lineage: &str) -> Result<(), String> {
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])
+            .map_err(|error| error.to_string())?;
+        let has_withdrawals: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='held_withdrawals')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if has_withdrawals {
+            transaction.execute("DELETE FROM held_withdrawals WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'", [lineage]).map_err(|error| error.to_string())?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM receipts WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'",
+                [lineage],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     /// Publish completeness only after all rebuilt rows have committed with synchronous FULL.
     /// A crash before the directory sync may leave the fence present, which safely repeats
     /// the rebuild; it must never publish a partial scan as complete.
@@ -880,35 +902,6 @@ impl LateResultsStore {
                 )
                 .map_err(|error| error.to_string())?;
         }
-        transaction.commit().map_err(|error| error.to_string())
-    }
-
-    /// Retention retires a whole lineage, including receipts whose registrations were already
-    /// pruned. Feed positions and ack debt belong to the module, not to the deleted session.
-    pub fn remove_lineage(&self, lineage: &str) -> Result<(), String> {
-        let mut connection = self.lock()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute("DELETE FROM registrations WHERE lineage = ?1", [lineage])
-            .map_err(|error| error.to_string())?;
-        let has_withdrawals: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='held_withdrawals')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if has_withdrawals {
-            transaction.execute("DELETE FROM held_withdrawals WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'", [lineage]).map_err(|error| error.to_string())?;
-        }
-        transaction
-            .execute(
-                "DELETE FROM receipts WHERE substr(call_key, 1, length(?1) + 1) = ?1 || ':'",
-                [lineage],
-            )
-            .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())
     }
 }

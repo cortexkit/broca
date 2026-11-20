@@ -149,39 +149,6 @@ pub(crate) fn sign_in_move_routed(
         })
 }
 
-/// Retires the recovery registration of an installed session (see [`register_candidate`]) once
-/// its published state leaves recovery nothing to do, so a boot doesn't open it to find that
-/// out. Conversion installs every old session this way; registered and left, each converted
-/// session was opened at the next boot (29,840 at one restart). The installer must still keep
-/// actors off the session, so no run can have registered it since the install did. A session
-/// whose state can't be read keeps its registration. Returns whether it was retired.
-pub async fn retire_settled_install(
-    root: &Path,
-    addr: &SessionAddr,
-    deployment: &DeploymentKey,
-) -> Result<bool, String> {
-    let backend = LocalBackend::new(root);
-    let Some((head, _)) = backend
-        .read_stored_head(addr)
-        .map_err(|error| format!("read head: {error:?}"))?
-    else {
-        return Ok(false);
-    };
-    let triple = broca_session_store::head::stored_triple(&head)
-        .map_err(|error| format!("decode head identity: {error:?}"))?;
-    let view = match Session::view(backend, addr.clone(), &triple, deployment).await {
-        Ok(view) => view,
-        Err(_) => return Ok(false),
-    };
-    // Billing is taken to run: a session that still owes it stays registered either way.
-    if needs_recovery(&view.operations, true, None) {
-        return Ok(false);
-    }
-    super::recovery_index::remove(root, addr)
-        .map_err(|error| format!("retire recovery: {error}"))?;
-    Ok(true)
-}
-
 /// Only missing coverage or durable-head warming may enumerate all stored heads. Keep the
 /// inventory lazy so a complete worker-root index never pays for its idle session count.
 pub(crate) fn candidate_addresses(

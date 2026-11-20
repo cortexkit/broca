@@ -32,7 +32,7 @@ pub mod display_facts;
 pub mod durability_counters;
 pub mod fresh_start;
 pub mod head;
-pub use head::{is_mode3_log, mode3_log_from_wal};
+pub use head::is_mode3_log;
 pub mod held_calls;
 pub mod hooks;
 pub mod import;
@@ -46,7 +46,6 @@ pub mod media_uploads;
 pub mod media_validation;
 pub mod message_id;
 pub mod message_times;
-pub mod notice_keys;
 pub use message_id::{message_mid, position_of_mid};
 pub mod output_events;
 pub mod output_reservation;
@@ -54,12 +53,9 @@ pub mod placement;
 pub mod projection;
 mod projection_health;
 pub mod projection_plan;
-#[cfg(test)]
-mod projection_plan_tests;
 pub mod provider;
 pub mod provider_errors;
 pub mod queue;
-pub mod recovery_close_out;
 pub mod refusal_fallback;
 pub mod render;
 pub mod repetition;
@@ -77,7 +73,6 @@ pub mod run;
 pub mod scope_admission;
 pub mod shutdown_seal;
 pub mod signed_floor;
-pub mod steer;
 pub mod step_usage;
 pub mod stop_conditions;
 pub mod structured_output;
@@ -88,77 +83,68 @@ pub mod tool_media;
 pub mod tool_plane;
 pub mod tool_repetition;
 pub mod tool_results;
-pub mod wal_fold;
 pub mod wal_writer;
 
 pub use admission::{
-    decode_admission_checkpoint, digest_client_message_id, encode_admission_checkpoint,
-    send_identity_difference, send_identity_difference_with_conversation_key, send_identity_digest,
-    send_identity_digest_with_conversation_key, submission_difference,
-    submission_identity_difference, submission_identity_digest, AdmissionCheckpointV1,
-    BudgetReplayStateV1, EpisodeDisposition, FirstEpisodeV1, LastEpisodeV1, SessionOwnershipV1,
-    BUDGET_REPLAY_STATE_VERSION,
+    digest_client_message_id, send_identity_difference_with_conversation_key,
+    send_identity_digest_with_conversation_key, submission_difference, submission_identity_digest,
+    BudgetReplayStateV1, FirstEpisodeV1, SessionOwnershipV1, BUDGET_REPLAY_STATE_VERSION,
+};
+
+pub use admission::{
+    send_identity_digest, AdmissionCheckpointV1, EpisodeDisposition, LastEpisodeV1,
 };
 pub use billing::{
-    charge_basis_overrides_digest, compute_run_billing, compute_segments, compute_segments_for_run,
-    imported_run_ids, ChargeBasis, ChargeBasisResolver, ModelShare, RunBilling, SpendSegment,
-    TimestampPrecision, NO_CHARGE_BASIS_OVERRIDES, USAGE_POLICY_VERSION,
+    charge_basis_overrides_digest, compute_segments_for_run, imported_run_ids, ChargeBasis,
+    ChargeBasisResolver, ModelShare, SpendSegment, NO_CHARGE_BASIS_OVERRIDES,
 };
-pub use capability::{
-    AllowAll, ApprovalPolicy, CapabilityViolation, DenyAll, ScriptedApproval, ToolManifest,
-};
+pub use billing::{compute_run_billing, RunBilling, TimestampPrecision, USAGE_POLICY_VERSION};
+pub use capability::CapabilityViolation;
+pub use capability::{AllowAll, ApprovalPolicy, ToolManifest};
 pub use clock::Clock;
+pub use compaction::CompactionState;
 pub use compaction::{
-    CompactionCheckpoint, CompactionPlane, CompactionState, CompactionUnavailable, CompactionViews,
+    CompactionCheckpoint, CompactionPlane, CompactionUnavailable, CompactionViews,
     ProviderCapabilities, ViewReadyInbox, MAX_REPLACEMENT_BYTES,
 };
 pub use context::{
-    call_key, catch_up_usage_exports, dispatches_of_turns, effective_context,
-    emit_lineage_usage_exports, read_session_page, read_session_page_owned,
-    read_session_page_owned_with_dispatches, record_time_ms, replay_transcript,
-    resume_state_from_store, select_held_episodes, tool_call_dispatches, tool_call_key,
-    AdmissionStoreSnapshot, ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage,
-    HeldEpisode, HeldPrefix, HeldRowsRequest, ImportedRunExclusions, MaterializedStore,
-    MissingExportRun, Persister, RecoveryDiscovery, RunIndex, RunIndexAttribution, RunIndexRow,
-    RunIndexState, SessionInventory, SessionReadLineageState, SessionReadMessage, SessionReadPage,
-    SessionReadReason, SessionReadStateKind, SessionRefResolver, SessionRefs, SessionStore,
-    StorePageRow, StorePageSnapshot, StorePrefix, TagLocation, ToolCallDispatch, WithdrawalRun,
-    SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
+    emit_lineage_usage_exports, replay_transcript, ExportCursor, ExportError, ExportFact,
+    ExportIndex, ExportPage, ImportedRunExclusions, MissingExportRun, RecoveryDiscovery,
+    RunEventBodies, RunIndex, RunIndexAttribution, RunIndexRow, RunIndexState, SessionInventory,
+    SessionReadLineageState, SessionReadMessage, SessionReadPage, SessionReadReason,
+    SessionReadStateKind, SessionRefResolver, SessionRefs, TagLocation, ToolCallDispatch,
+    WithdrawalRun, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{
-    read_session_model_page, ModelEntry, ModelPage, ModelPageError, ModelPageRequest, ReadView,
+    AdmissionStoreSnapshot, HeldEpisode, HeldPrefix, HeldRowsRequest, MaterializedStore, Persister,
+    SessionStore, StorePageRow, StorePageSnapshot, StorePrefix,
 };
+pub use context::{ModelEntry, ReadView};
 pub use hooks::{HookPlane, HookUnavailable, STEP_TRANSFORM_HOOK_CAP};
 pub use import::{
-    check_import_retry, run_import, run_import_with_store, ImportError, ImportOrigin,
-    ImportOutcome, ImportRequest, IMPORT_MAX_MESSAGES, IMPORT_MAX_SERIALIZED_BYTES,
+    ImportError, ImportOrigin, ImportOutcome, ImportRequest, IMPORT_MAX_MESSAGES,
+    IMPORT_MAX_SERIALIZED_BYTES,
 };
 pub use lease::{lease_key_for, FileLeaseStore, LeaseError, LeaseHandle, LeaseStore};
-pub use projection::{
-    advance_control_projection_state, classify_control_unit, last_control_cursor_through,
-    project_control, project_control_with_mids, project_control_with_state, ControlClass,
-    ControlProjectionState, Cursor, PlacedControlUnit,
-};
+pub use projection::ControlProjectionState;
+pub use projection::Cursor;
 pub use provider::{Provider, StubProvider};
-pub use queue::{
-    insert_in_drain_order, pending_submissions, retract_decision, PendingSubmission,
-    RetractDecision,
-};
-pub use render::{
-    canonical_request_bytes, request_digest, request_digest_hex, CANONICAL_RENDERER_VERSION,
+pub use queue::pending_submissions;
+pub use queue::{insert_in_drain_order, PendingSubmission};
+pub use render::CANONICAL_RENDERER_VERSION;
+pub use render::{canonical_request_bytes, request_digest, request_digest_hex};
+pub use replay::{
+    deferred_call_obligations, reconcile_run_state, replay, LateApprovalView, OpenCallState,
+    ReconciledRunState, ReplayError,
 };
 pub use replay::{
-    budget_replay_seed_is_valid, deferred_call_obligations, held_call_facts,
-    latest_projection_boundary, reconcile_run_state, replay, replay_projection_tail,
-    DeferredCallObligations, DeferredCallProjection, HeldCallFacts, LateApprovalView,
-    OpenCallState, OpenToolBatch, OwedWithdrawal, PendingTurn, PreparedCall, ProjectedDeferredCall,
-    ProjectionDelta, ProjectionSeed, ReconciledRunState, ReplayError, ReplayResolution,
+    DeferredCallObligations, DeferredCallProjection, OpenToolBatch, OwedWithdrawal, PendingTurn,
+    PreparedCall, ProjectedDeferredCall, ProjectionDelta, ProjectionSeed, ReplayResolution,
     ReplayState,
 };
-pub use resume::{
-    close_out_open_batch, close_out_pending_turn, resume_started_record, DeferredCloseKind,
-};
-pub use retention::{is_retention_lineage, LineageRetention};
+pub use resume::DeferredCloseKind;
+pub use retention::is_retention_lineage;
+pub use retention::LineageRetention;
 pub use scope_admission::{
     decide_scope, AdoptionRefusal, OwnerMismatch, ScopeDecision, ScopeRefusal,
 };
@@ -168,38 +154,38 @@ pub use account_report::AccountReporter;
 pub use broca_wal::{AccountDecision, AuthSelection, RunConfig, VaultReadOp, VaultRequest};
 // Re-exported so resume APIs can name the run id recovered for the last episode.
 pub use broca_protocol::RunId;
+pub use cache_warm::RecordedRequestError;
 pub use cache_warm::{
-    CacheClock, CacheClockReading, RecordedRequest, RecordedRequestError, SentRequest, WarmFailure,
-    WarmSent,
+    CacheClock, CacheClockReading, RecordedRequest, SentRequest, WarmFailure, WarmSent,
 };
 pub use input_transformations::{
     input_transformations_reported, input_transformations_unmeasured_attempts,
 };
 pub use output_events::OutputEvent;
 pub use run::{
-    load_prior_wal_snapshot, read_prior_run_config, recover_prior_run_config, run_loop,
-    run_loop_append_episode, run_loop_append_episode_with_control, run_loop_on_writer,
-    run_loop_on_writer_admitted, run_loop_on_writer_admitted_with_prior_snapshot,
-    run_loop_resume_after_auth, run_loop_resume_after_auth_with_control, run_loop_under_lease,
-    run_loop_with_control, run_loop_with_store, AccountSelectionRefusal, PriorWalSnapshot,
-    RoutingUnavailable, RoutingUnavailableReason, RunControl, RunError, RunRequest, RunSummary,
+    AccountSelectionRefusal, RoutingUnavailable, RunControl, RunError, RunRequest, RunSummary,
     StartMode,
 };
-pub use shutdown_seal::{SealedAttempt, ShutdownSeal};
-pub use steer::{OrderedAcceptance, SteerInbox};
+pub use run::{PriorWalSnapshot, RoutingUnavailableReason};
+pub use shutdown_seal::SealedAttempt;
+pub use shutdown_seal::ShutdownSeal;
 pub use step_usage::RunUsageProjection;
-pub use stub_plane::{StubEvent, StubReply, StubToolPlane};
+pub use stub_plane::StubEvent;
+pub use stub_plane::{StubReply, StubToolPlane};
 pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
-pub use tool_results::{no_dispatch_result, not_dispatched_result, outcome_unknown_result};
+pub use tool_results::outcome_unknown_result;
+pub use tool_results::{no_dispatch_result, not_dispatched_result};
+pub use wal_writer::ProjectionAdmission;
 pub use wal_writer::{
-    agent_session_ref, is_session_storage_refusal, session_addr, session_storage_refusal,
-    FileWalStore, ObservedRecord, ReadOnlyWalReader, RecordObserver, RecordOutcome,
-    SessionRefIndex, WalHandle, WalOpenError, WalStore, WalWriteError, WAL_MANIFEST_FILENAME,
+    agent_session_ref, session_addr, FileWalStore, ReadOnlyWalReader, RecordObserver,
+    SessionRefIndex, WalHandle, WalStore,
 };
 pub use wal_writer::{
-    session_projection_incomplete, ProjectionAdmission, ProjectionRepair,
-    SESSION_PROJECTION_INCOMPLETE,
+    session_projection_incomplete, ProjectionRepair, SESSION_PROJECTION_INCOMPLETE,
+};
+pub use wal_writer::{
+    session_storage_refusal, ObservedRecord, RecordOutcome, WalWriteError, WAL_MANIFEST_FILENAME,
 };
 
 pub mod account_limit_pause;

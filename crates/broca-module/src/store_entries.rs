@@ -469,22 +469,6 @@ fn cursor(entry: &Entry) -> Cursor {
     Cursor::new(entry.ordinal, &entry.mid, &entry.digest)
 }
 
-/// The raw `session.history` entries of a `session.read` page, as `session.history` serves them,
-/// apart from each message's id, which the reader sets. `None` in place of an entry with no
-/// written time, which the raw form refuses (`history_unrepresentable`). Lets a check build the
-/// raw form from either storage's page with the same code the op serves it with.
-pub fn raw_history_entries(page: broca_core::SessionReadPage) -> Vec<Option<serde_json::Value>> {
-    crate::serve::session_read_response(page, None)
-        .messages
-        .iter()
-        .map(|entry| {
-            entry
-                .written_at
-                .map(|written_at| crate::history::raw_entry(entry, written_at))
-        })
-        .collect()
-}
-
 /// What `session.history` reads about a session kept in the new storage besides its pages,
 /// which today's storage answers from `session.head` and from the WAL form of a message id.
 #[derive(Debug, Clone, PartialEq)]

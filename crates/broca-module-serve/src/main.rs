@@ -423,7 +423,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     );
     wal_store.set_session_ref_index(index.clone());
     wal_store.set_served_history(index.clone());
-    broca_core::WalStore::bind_recovery_projection(wal_store.as_ref(), None, index.clone());
     let run_index = Some(index);
     // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
     // file is no longer opened; it is left on disk untouched rather than deleted.
@@ -709,7 +708,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let vault_auditor = executor_impl.vault_auditor();
     let store_reader = run_index
         .clone()
-        .map(|store| store as Arc<dyn broca_core::MaterializedStore>);
+        .map(|store| store as Arc<dyn broca_core::RunEventBodies>);
     let retention = Arc::new(
         broca_module::retention::RetentionService::new(&state_root, lease_store.clone())
             .map_err(|error| ServeIoError(format!("retention clock: {error}")))?,

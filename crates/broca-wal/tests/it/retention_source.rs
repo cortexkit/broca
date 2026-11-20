@@ -1,4 +1,4 @@
-//! Retention writes are limited to the core run loop and session actor.
+//! Retention-clock writes are limited to the session actor's queued sends.
 //! Real-daemon tests independently verify that session.send admits valid retention policies.
 
 use super::compaction_source::{close_brace, is_cfg_test_module_file, sources, tokens};
@@ -62,7 +62,7 @@ fn writes(source: &str) -> Vec<String> {
 }
 
 #[test]
-fn retention_writes_are_limited_to_the_core_and_actor() {
+fn retention_writes_are_limited_to_the_session_actor() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(root.join("crates")).unwrap() {
@@ -87,11 +87,6 @@ fn retention_writes_are_limited_to_the_core_and_actor() {
         }
     }
     let expected = std::collections::BTreeMap::from([
-        (
-            // Where a new episode's `RunStarted` is built.
-            "crates/broca-core/src/fresh_start.rs".to_owned(),
-            vec!["RunStarted.retention".to_owned()],
-        ),
         // The session store's actor queues sends with the retention-clock timestamp: a plain
         // queued send and one with an ordered `delivery` list.
         (
@@ -109,8 +104,10 @@ fn retention_writes_are_limited_to_the_core_and_actor() {
 #[test]
 fn retention_source_scan_detects_planted_writes_not_patterns_or_test_items() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let live = std::fs::read_to_string(root.join("crates/broca-core/src/run.rs")).unwrap();
-    assert!(live.contains("WalRecord::RunStarted {"));
+    // A real writer's source, so the planted writes sit among the code the scan must skip.
+    let live = std::fs::read_to_string(root.join("crates/broca-module/src/store_actor/ordered.rs"))
+        .unwrap();
+    assert_eq!(writes(&live), ["Queued.ts_ms"]);
     for variant in ["RunStarted", "Queued", "Steered"] {
         for member in ["retention", "ts_ms"] {
             if variant == "RunStarted" && member == "ts_ms" {

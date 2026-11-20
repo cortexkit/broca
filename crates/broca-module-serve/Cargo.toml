@@ -104,7 +104,6 @@ signal-hook = "0.4"
 [dev-dependencies]
 ck-session-import = { path = "../ck-session-import" }
 broca-store = { path = "../broca-store" }
-broca-crash-harness = { path = "../broca-crash-harness" }
 broca-subc = { path = "../broca-subc", features = ["test-clock", "test-refusals"] }
 cortexkit-llm-tools = { workspace = true, features = ["test-vectors"] }
 broca-catalog = { path = "../broca-catalog", features = ["test-support"] }
@@ -143,8 +142,9 @@ cortexkit-role-classifier-conformance = { workspace = true }
 cortexkit-role-classifier = { workspace = true, features = ["test-vectors"] }
 subc-client-rs = { workspace = true }
 tokio-tungstenite.workspace = true
-# The native-search-probe example decodes a gzip or deflate response it records raw. Same
-# backend tungstenite already builds, so the lockfile gains no new crate.
+# Tests and the live probe of the Clairic decision model (examples/clairic-live-probe.rs) use it
+# for gzip and zlib bodies and CRC checksums. Same backend tungstenite already builds, so the
+# lockfile gains no new crate.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 # The launch-nonce tests fstat descriptor 3 to tell whether the nonce pipe is still there. Going

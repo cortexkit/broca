@@ -14,7 +14,6 @@ pub mod diagnostics;
 pub mod entries;
 pub mod fold;
 pub mod host;
-pub mod journal;
 pub mod metadata;
 pub mod projection;
 pub mod read;

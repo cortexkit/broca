@@ -10,16 +10,9 @@ use serde_json::json;
 use std::path::PathBuf;
 
 mod checkpoint_compat_tests;
-mod event_parity_tests;
 #[cfg(feature = "test-attachments")]
 mod live_tests;
 mod render_tests;
-#[cfg(feature = "test-attachments")]
-mod reservation_aging_tests;
-#[cfg(feature = "test-attachments")]
-mod seed_repair_tests;
-#[cfg(feature = "test-attachments")]
-mod transport_failure_tests;
 
 struct Fixture {
     root: PathBuf,

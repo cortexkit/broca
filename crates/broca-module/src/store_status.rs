@@ -213,6 +213,16 @@ fn settled_bytes(key: &SettledKey, facts: &RunFacts) -> usize {
 type SettledKey = (String, [u8; 16], u64, String);
 
 impl SettledRuns {
+    /// How many runs' facts are kept.
+    pub fn len(&self) -> usize {
+        self.inner.lock().map_or(0, |inner| inner.facts.len())
+    }
+
+    /// Whether no run's facts are kept.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// How many finished runs a module keeps the facts of.
     pub const CAPACITY: usize = 4096;
 
@@ -281,11 +291,6 @@ impl SettledRuns {
         }
     }
 
-    /// How many runs' facts are kept.
-    pub fn len(&self) -> usize {
-        self.inner.lock().map_or(0, |inner| inner.facts.len())
-    }
-
     /// What the cache holds, estimated by walking it when asked (see
     /// `broca_session_store::held`), with its caps: the bytes it counts against its byte cap,
     /// and those with the table's spare buckets and the order's spare room.
@@ -316,10 +321,6 @@ impl SettledRuns {
             estimated_bytes: (inner.bytes + spare + admissions) as u64,
             ..Default::default()
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 

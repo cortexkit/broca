@@ -13,8 +13,9 @@ them. Start with `CONTRIBUTING.md` and the public contracts under `docs/`.
   (`runon: "windows"`), or a test that runs only on Linux (`runon: "linux,4c,12gb"`). A remote Linux
   job can't change files git tracks, so edit tracked files locally, and name any file a remote job
   regenerates in `return_paths`.
-- Never run the native kill-conformance, real-daemon or crash-harness release lanes yourself. The
-  integrating agent runs them once per merged batch. List the native tests your change needs.
+- Never run the native release suites yourself (`.cortexkit/scripts/native-release-suites.sh`:
+  the tests that need the real daemon, process kills or nats-server). The head that merges your
+  work runs them once per merged batch. List the native tests your change needs.
 - **One exception the head may make:** when this machine is overloaded, the head's brief may move
   your builds and tests to the Linux build server. Follow the brief then, without asking. Commit
   through a server attestation:
@@ -58,8 +59,8 @@ Report each command, its pass and fail counts, and every failing test name.
 - Updating a test your intended change breaks, keeping what the test checks.
 - Regenerating a golden or fixture when the new output differs only by the cause you state.
 - Mechanical compile fixes outside your fence: a new field initialised to `None` in another
-  test's literal, a new trait method forwarded through every wrapper (the crash harness's
-  included), or a match arm for a new record type handled explicitly and covered by a test.
+  test's literal, a new trait method forwarded through every wrapper, or a match arm for a new
+  record type handled explicitly and covered by a test.
 - Adding a new log feature name to every pinned feature list, kept sorted.
 - Test-only seams behind the existing features (`test-clock`, `test-attachments`,
   `fs-override`, `writer-id-faults`), never reachable from a shipping build.

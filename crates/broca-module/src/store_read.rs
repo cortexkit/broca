@@ -152,40 +152,6 @@ pub async fn served_compaction_entries_by_tag<B: SessionBackend>(
     Ok(held_back(session, entries))
 }
 
-/// The zero-based ordinals of every assistant message of `session` whose entry facts say its run
-/// cleans replies (`EntryFacts::clean_reply`): the messages every read serves cleaned of tag
-/// notation (`crate::store_exposure::served_message`). Reads the whole transcript, a page at a
-/// time; for the converter's checks, which compare whole sessions.
-pub async fn clean_reply_ordinals<B: SessionBackend>(
-    session: &Session<B>,
-) -> Result<std::collections::BTreeSet<u64>, SessionError> {
-    const PAGE: usize = 256;
-    let len = transcript_len(session);
-    let mut ordinals = std::collections::BTreeSet::new();
-    let mut from = 1;
-    while from <= len {
-        let entries = served_entries(session, from, PAGE).await?;
-        let Some(last) = entries.last().map(|entry| entry.ordinal) else {
-            break;
-        };
-        ordinals.extend(
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry.message.role == Role::Assistant
-                        && entry
-                            .state
-                            .facts
-                            .as_ref()
-                            .is_some_and(|facts| facts.clean_reply)
-                })
-                .map(|entry| entry.ordinal - 1),
-        );
-        from = last + 1;
-    }
-    Ok(ordinals)
-}
-
 /// `entries` with the results of a batch that hasn't closed held back, and the turn they answer
 /// served as still running (see [`results_await_close`]).
 fn held_back<B: SessionBackend>(
@@ -502,14 +468,6 @@ pub async fn serve_view<B: SessionBackend>(
     finish(answer, req)
 }
 
-/// Repeated reads of one unchanged session, sharing its control-stream head. The borrowed
-/// session keeps the records its loader retained; sealed history may still read storage.
-pub struct ViewReader<'a, B: SessionBackend> {
-    session: &'a Session<B>,
-    parts: &'a dyn Parts,
-    stream_head: ViewHead,
-}
-
 /// An immutable stored position and its control-stream head share one cache lifetime.
 pub struct StoredView<B: SessionBackend> {
     view: Box<broca_session_store::session::SessionView<B>>,
@@ -569,38 +527,6 @@ impl ViewHead {
                 Some(broca_protocol::ErrorClass::Permanent),
             )
         })
-    }
-}
-
-impl<'a, B: SessionBackend> ViewReader<'a, B> {
-    /// Projects the same head as [`serve_view`] once, before walking the session's pages.
-    /// The session must remain unchanged for the lifetime of the reader.
-    pub async fn new(
-        session: &'a Session<B>,
-        parts: &'a dyn Parts,
-    ) -> Result<Self, crate::serve::ServeError> {
-        let stream_head = ViewHead::new(session).await;
-        stream_head.get()?;
-        Ok(Self {
-            session,
-            parts,
-            stream_head,
-        })
-    }
-
-    /// The real page builder and reply finishing used by [`serve_view`], with the shared head.
-    pub async fn read(
-        &self,
-        req: &crate::serve::SessionReadRequest,
-    ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
-        let answer = page(
-            self.session,
-            self.parts,
-            &crate::store_reads::PageRequest::of(req),
-            Some(self.stream_head.get()?),
-        )
-        .await?;
-        finish(answer, req)
     }
 }
 

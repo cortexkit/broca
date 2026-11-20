@@ -16,16 +16,12 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-mod aimock_real_aft;
 mod call_keepalive_latency_real_daemon;
 mod compaction_routes;
 mod consent_ops;
-mod dogfood;
 mod hook_routes;
 mod multi_module_spine;
-mod resume_spine;
 mod scope_outbound_real_daemon;
 mod session_door;
 mod subc_guard;
 mod tool_call_cancel_real_daemon;
-mod tool_fault_spine;

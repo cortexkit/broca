@@ -86,6 +86,34 @@ pub struct MediaAging {
 }
 
 impl MediaAging {
+    /// Rebuild from durable records, without hydrating historical requests or writing an
+    /// aging record. Compaction changes re-select reference metadata; unchanged steps fold
+    /// only their new media. The caller supplies the current episode's frozen profile, not
+    /// today's catalog. A changed recorded profile reselects metadata under its new costs;
+    /// another episode with the same profile keeps the aging prefix.
+    pub fn replay_wal(
+        profile: &MediaProfile,
+        session: &mut SessionMedia,
+        records: &[broca_wal::WalRecord],
+    ) -> Result<Self, String> {
+        let mut state = Self::default();
+        let mut step_open = false;
+        let mut active = profile.clone();
+        for record in records {
+            state.fold_wal_record(&mut active, session, record)?;
+            match record {
+                broca_wal::WalRecord::RunStarted { .. } => step_open = false,
+                broca_wal::WalRecord::StepStarted { .. } => step_open = true,
+                broca_wal::WalRecord::ModelStepFinished { .. } => step_open = false,
+                _ => {}
+            }
+        }
+        if step_open {
+            state.apply(&active, AgingEvent::Boundary);
+        }
+        Ok(state)
+    }
+
     /// What the aging state holds: its inline size and [`MediaAging::held_parts`].
     pub fn held_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
@@ -199,34 +227,6 @@ impl MediaAging {
                 }
             }
         }
-    }
-
-    /// Rebuild from durable records, without hydrating historical requests or writing an
-    /// aging record. Compaction changes re-select reference metadata; unchanged steps fold
-    /// only their new media. The caller supplies the current episode's frozen profile, not
-    /// today's catalog. A changed recorded profile reselects metadata under its new costs;
-    /// another episode with the same profile keeps the aging prefix.
-    pub fn replay_wal(
-        profile: &MediaProfile,
-        session: &mut SessionMedia,
-        records: &[broca_wal::WalRecord],
-    ) -> Result<Self, String> {
-        let mut state = Self::default();
-        let mut step_open = false;
-        let mut active = profile.clone();
-        for record in records {
-            state.fold_wal_record(&mut active, session, record)?;
-            match record {
-                broca_wal::WalRecord::RunStarted { .. } => step_open = false,
-                broca_wal::WalRecord::StepStarted { .. } => step_open = true,
-                broca_wal::WalRecord::ModelStepFinished { .. } => step_open = false,
-                _ => {}
-            }
-        }
-        if step_open {
-            state.apply(&active, AgingEvent::Boundary);
-        }
-        Ok(state)
     }
 
     /// The incremental equivalent of replay, used by a live session after each durable tail.
@@ -515,15 +515,6 @@ pub struct PreparedBundle {
 }
 
 impl PreparedBundle {
-    /// Add these tokens to the non-media estimate; do not feed inline base64 through a
-    /// bytes-per-token heuristic. This total follows the frozen family's media rules.
-    pub fn estimated_media_tokens(&self, profile: &MediaProfile) -> u64 {
-        self.media
-            .iter()
-            .map(|media| profile.media_tokens(&media.reference))
-            .sum()
-    }
-
     pub fn encoded_media_bytes(&self) -> u64 {
         self.media.iter().map(PreparedMedia::encoded_bytes).sum()
     }

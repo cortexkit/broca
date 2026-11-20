@@ -17,10 +17,9 @@ use tokio::sync::mpsc;
 
 #[path = "executor_fork.rs"]
 mod fork;
-pub use fork::{
-    fork_admission_id, fork_conversation_key, ForkCallJob, ForkCallOutcome, ForkCallRefusal,
-    ForkReleaseJob, ForkStepSpend,
-};
+pub use fork::fork_admission_id;
+pub(crate) use fork::fork_conversation_key;
+pub use fork::{ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, ForkStepSpend};
 
 /// Which start mode a run uses (the coordinator decides; the executor obeys).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

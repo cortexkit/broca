@@ -114,11 +114,6 @@ impl Settings {
         }
     }
 
-    /// What converting the document from older shapes changed, one line per key.
-    pub fn conversion_notes(&self) -> &[String] {
-        &self.notes
-    }
-
     /// The document as plain JSON text.
     pub fn text(&self) -> &str {
         &self.text

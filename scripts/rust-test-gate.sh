@@ -53,10 +53,9 @@ cargo_feature_args=(
 # the folded live suite of a crate (tests/live/main.rs); more than one crate may have one.
 excluded_live_binaries=(
   live
-  live_e2e
 )
 
-readonly nextest_filter='kind(test) and not (binary(=live) or binary(=live_e2e))'
+readonly nextest_filter='kind(test) and not binary(=live)'
 
 nextest_profile="${NEXTEST_PROFILE:-}"
 if [[ -z "$nextest_profile" && "${CI:-}" == "true" ]]; then

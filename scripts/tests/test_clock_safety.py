@@ -87,7 +87,7 @@ elif args[0] == "test" and "--list" in args:
     if "--doc" in args:
         print("0 tests, 0 benchmarks")
     else:
-        for target, count in (("tests/it/main.rs", 1), ("tests/live/main.rs", 0), ("tests/live_e2e.rs", 0)):
+        for target, count in (("tests/it/main.rs", 1), ("tests/live/main.rs", 0)):
             print("Running " + target + " (fixture)")
             print(str(count) + " tests, 0 benchmarks")
 elif args[0] == "test":

@@ -16,11 +16,8 @@ use super::credential::CredentialSource;
 use super::openai_decisions::{OpenAiDecisions, CREDENTIAL_ID, MODEL};
 use super::*;
 
-const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 const PREDICATE: &str =
     r#"{"model":"gpt-6-luna","answers":[{"name":"q","type":"predicate","probability":0.10}]}"#;
-const ALL_ANSWERS: &str = r#"{"model":"gpt-6-luna","answers":[{"name":"a_predicate","type":"predicate","probability":0.10},{"name":"b_choice","type":"choice","choice":"b","confidence":8.00e-1,"probabilities":[{"value":"a","probability":1e-3},{"value":"b","probability":0.999}]},{"name":"c_score","type":"score","score":1.00,"confidence":0.90,"probabilities":[{"value":0,"label":"0","probability":0.10},{"value":1,"label":"1","probability":9e-1}]}],"usage":{"input_tokens":1000000,"output_tokens":12,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}}"#;
-
 #[derive(Default)]
 struct Stub {
     responses: Mutex<VecDeque<(u16, String, Option<String>)>>,
@@ -153,16 +150,6 @@ fn simple() -> Value {
 
 fn params() -> String {
     json!({"batch_id":"openai-batch", "model":OPENAI_DECISIONS, "questions":simple()["questions"], "items":[{"state":"evidence"}]}).to_string()
-}
-
-async fn admitted(service: &Arc<SystemOne>, params: String) -> String {
-    service
-        .clone()
-        .spawn_call(params, scope())
-        .await
-        .unwrap_or_else(|error| panic!("{}", String::from_utf8_lossy(&error)))
-        .get()
-        .to_owned()
 }
 
 fn answered(reply: ProviderReply) -> String {
@@ -590,3 +577,17 @@ fn openai_uses_boot_url_and_row_based_vault_addressing() {
         Some("apikey:openai")
     );
 }
+
+const ALL_ANSWERS: &str = r#"{"model":"gpt-6-luna","answers":[{"name":"a_predicate","type":"predicate","probability":0.10},{"name":"b_choice","type":"choice","choice":"b","confidence":8.00e-1,"probabilities":[{"value":"a","probability":1e-3},{"value":"b","probability":0.999}]},{"name":"c_score","type":"score","score":1.00,"confidence":0.90,"probabilities":[{"value":0,"label":"0","probability":0.10},{"value":1,"label":"1","probability":9e-1}]}],"usage":{"input_tokens":1000000,"output_tokens":12,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}}}"#;
+
+async fn admitted(service: &Arc<SystemOne>, params: String) -> String {
+    service
+        .clone()
+        .spawn_call(params, scope())
+        .await
+        .unwrap_or_else(|error| panic!("{}", String::from_utf8_lossy(&error)))
+        .get()
+        .to_owned()
+}
+
+const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";

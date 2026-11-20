@@ -19,7 +19,8 @@ use cortexkit_role_compaction::{
 };
 
 mod release;
-pub use release::{releasable, released_but_read};
+pub use release::releasable;
+pub use release::released_but_read;
 
 /// Why a render refuses a part whose block left memory: the caller reads it back first
 /// ([`released_but_read`]), so reaching this is a bug, and a refusal is safer than a request
@@ -74,18 +75,6 @@ pub fn finish(
     let opts = options(boundary, prompt);
     let globals = super::systems::frozen(true, config, manifest)?;
     Ok(super::systems::view(&opts, &globals)?.unwrap_or(opts))
-}
-
-/// Images are captured into the runner's media store before provider rendering.
-/// Keeping capture at the host boundary also makes resumed requests use the same
-/// content-addressed reference, rather than a second encoding of the view's data.
-pub fn prompt(
-    stored: &[Message],
-    entries: &[Entry],
-    edits: &[Edit],
-    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
-) -> Result<Vec<Message>, String> {
-    prompt_with_rides(stored, entries, &Default::default(), edits, image)
 }
 
 pub fn prompt_with_rides(
@@ -626,14 +615,6 @@ fn render_entry(
     }
     message.cache_prefix_blocks = remap_cache_prefix(original, &kept_indices);
     Ok((message, results, held))
-}
-
-/// Keep episode boundaries in native coordinates while translating explicit
-/// marker indices to the rendered prompt. Inserted messages inherit neither.
-/// Unnumbered sessions still render tool-result deliveries separately from the
-/// stored output. Messages without a delivery remain exact native copies.
-pub fn deliveries_only(stored: &[Message], entries: &[Entry]) -> Result<Vec<Message>, String> {
-    deliveries_only_with_rides(stored, entries, &Default::default())
 }
 
 pub fn deliveries_only_with_rides(

@@ -44,7 +44,6 @@ pub mod compaction;
 pub mod durable;
 pub mod enroll;
 pub mod entries;
-pub mod inverse;
 pub mod media;
 pub mod media_index;
 pub mod output;

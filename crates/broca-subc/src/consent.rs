@@ -905,30 +905,6 @@ mod tests {
         assert!(client.answers(u64::MAX).await.is_err());
     }
 
-    #[test]
-    fn consent_call_key_bound_at_max_wal_seq() {
-        use broca_wal::Wal;
-        let path = broca_test_support::scratch_root().join("consent-key-bound.wal");
-        let mut wal = broca_wal::FileWal::open(&path).unwrap();
-        wal.append(
-            1,
-            &WalRecord::StepStarted {
-                step_id: broca_protocol::StepId(1),
-            },
-            true,
-        )
-        .unwrap();
-        let lineage = wal.lineage_id().expect("durable lineage");
-        for (seq, length) in [(0, 38), (u64::MAX, 57)] {
-            let key = broca_core::call_key(lineage, seq);
-            assert_eq!(key.len(), length);
-            assert!(key.bytes().all(|b| b.is_ascii_graphic()));
-            let params = held_request(&key, &prepared(), 1).unwrap();
-            assert_eq!(params["requester_ref"], key);
-            assert_eq!(params["dedup_key"], key);
-        }
-    }
-
     #[tokio::test]
     async fn consent_request_body_has_no_identity_keys() {
         let params = held_request(&key(), &prepared(), 1).unwrap();
@@ -1069,25 +1045,6 @@ mod tests {
             serde_json::to_vec(&json!({"result":reply.unwrap()})).unwrap(),
             wire("upstream/consent-requester-v1/report-execution-reply.json")
         );
-    }
-
-    #[tokio::test]
-    async fn consent_binding_mismatch_from_transport_is_unavailable() {
-        let (client, mut module) = client();
-        let mut reply = fixture("upstream/consent-requester-v2/cerebellum-ref-get-reply.json");
-        reply["result"]["state"] = json!("answered");
-        reply["result"]["answered_choice_id"] = json!("approve");
-        reply["result"]["requester_ref"] = json!(key());
-        reply["result"]["binding"] = broca_core::consent::binding(&prepared());
-        reply["result"]["binding"]["args_hash"] = json!("different");
-        let (record, ()) = tokio::join!(client.get("el_1"), async {
-            let request = module.next_request().await;
-            assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
-        });
-        let record = serde_json::to_value(record.unwrap()).unwrap();
-        let error = broca_core::consent::answer(&record, &key(), &prepared()).unwrap_err();
-        assert_eq!(error.code, "consent_binding_mismatch");
-        assert!(!error.retryable);
     }
 
     #[tokio::test]

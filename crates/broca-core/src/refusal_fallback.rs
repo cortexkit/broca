@@ -41,24 +41,12 @@ pub struct RefusalReplayState {
     pub refused_steps: std::collections::BTreeSet<broca_protocol::StepId>,
 }
 
-/// Bind legacy refusal metadata to its projection watermark. An older writer may
-/// advance the other columns without clearing a column it does not know about.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RefusalReplayCheckpoint {
-    pub at_seq: u64,
-    pub state: RefusalReplayState,
-}
-
 static UNRECORDED_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Prior reconstructions that required complete WAL replay because a legacy prefix
 /// did not record refusal state. Recorded empty schedules do not increment this counter.
 pub fn refusal_schedule_unrecorded_replays() -> u64 {
     UNRECORDED_REPLAYS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub(crate) fn note_unrecorded_replay() {
-    UNRECORDED_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// How a committed step ended, as the schedule needs it.
@@ -171,48 +159,6 @@ pub fn route(schedule: Option<&RefusalFallbackSchedule>, eligible: bool) -> Step
     }
 }
 
-pub(crate) struct StepRouting {
-    pub route: StepRoute,
-    pub reason: broca_wal::StepRouteReason,
-    pub fallback_fits: bool,
-    pub skipped_for_context: bool,
-}
-
-/// The cache-expiry proof given to compaction and the model send must agree on the serving route.
-/// A scheduled fallback is skipped when the measured prompt already fills its window, even when
-/// resuming a refused step.
-pub(crate) fn decide_step_route(
-    schedule: Option<&RefusalFallbackSchedule>,
-    eligible: bool,
-    resent: bool,
-    context_limit: Option<u64>,
-    previous_usage: Option<broca_protocol::Usage>,
-) -> StepRouting {
-    let fallback_fits = match (
-        context_limit,
-        previous_usage.and_then(|usage| usage.fill_tokens()),
-    ) {
-        (Some(limit), Some(fill)) => fill < limit,
-        _ => true,
-    };
-    let scheduled = eligible && (resent || route(schedule, true) == StepRoute::Fallback);
-    let route = if scheduled && fallback_fits {
-        StepRoute::Fallback
-    } else {
-        StepRoute::Source
-    };
-    StepRouting {
-        route,
-        reason: if route == StepRoute::Fallback && resent {
-            broca_wal::StepRouteReason::Refusal
-        } else {
-            broca_wal::StepRouteReason::Schedule
-        },
-        fallback_fits,
-        skipped_for_context: scheduled && !fallback_fits,
-    }
-}
-
 /// What a durable step records about how it was served: the client-side fallback route's
 /// model, if the step was routed there; the model a server-side fallback served the response
 /// with; the step's usage; and each model's iterations when the provider split it.
@@ -302,16 +248,6 @@ impl<'a> StepServing<'a> {
             })
             .collect()
     }
-}
-
-/// The model a step record's usage is reported and billed under (`StepServing::model`).
-/// `None` for a record that carries no step usage.
-pub fn usage_model<'a>(
-    episode_model: &'a ModelHandle,
-    episode_variant: Option<&'a str>,
-    record: &'a WalRecord,
-) -> Option<(&'a str, &'a str, Option<&'a str>)> {
-    StepServing::of_record(record).map(|serving| serving.model(episode_model, episode_variant))
 }
 
 /// Usage entries for a durable step record (`StepServing::usage_by_model`).
@@ -509,38 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn step_routing_preserves_refusal_reason_and_context_skip() {
-        let schedule = refuse(None);
-        let usage = Some(broca_protocol::Usage {
-            input_tokens: Some(1_000),
-            ..Default::default()
-        });
-        for resent in [false, true] {
-            let selected = decide_step_route(Some(&schedule), true, resent, Some(1_001), usage);
-            assert_eq!(selected.route, StepRoute::Fallback);
-            assert_eq!(
-                selected.reason,
-                if resent {
-                    broca_wal::StepRouteReason::Refusal
-                } else {
-                    broca_wal::StepRouteReason::Schedule
-                }
-            );
-            assert!(selected.fallback_fits);
-            assert!(!selected.skipped_for_context);
-
-            let skipped = decide_step_route(Some(&schedule), true, resent, Some(1_000), usage);
-            assert_eq!(skipped.route, StepRoute::Source);
-            assert_eq!(skipped.reason, broca_wal::StepRouteReason::Schedule);
-            assert!(!skipped.fallback_fits);
-            assert!(skipped.skipped_for_context);
-        }
-        let ineligible = decide_step_route(Some(&schedule), false, true, Some(1_000), usage);
-        assert_eq!(ineligible.route, StepRoute::Source);
-        assert!(!ineligible.skipped_for_context);
-    }
-
-    #[test]
     fn a_model_change_or_a_day_idle_clears_the_schedule_at_admission() {
         let schedule = refuse(None);
         let other = ModelHandle::new("anthropic", "claude-fable-5-1");
@@ -575,43 +479,5 @@ mod tests {
             on_episode_admitted(Some(untimed.clone()), &source(), Some(u64::MAX)),
             Some(untimed)
         );
-    }
-
-    #[test]
-    fn usage_goes_to_the_model_that_answered() {
-        let episode = source();
-        let step = |extra: serde_json::Value| -> WalRecord {
-            let mut value = serde_json::json!({"type":"model_step_finished","step_id":1,
-                "assistant_message":{"message_id":"m","content":[]},"usage":{},"retries_used":0});
-            value
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            serde_json::from_value(value).unwrap()
-        };
-        let plain = step(serde_json::json!({}));
-        assert_eq!(
-            usage_model(&episode, Some("deep"), &plain),
-            Some(("anthropic", "claude-opus-5-5", Some("deep")))
-        );
-        let routed = step(serde_json::json!({"route":{"model":fallback(),"reason":"schedule"}}));
-        assert_eq!(
-            usage_model(&episode, Some("deep"), &routed),
-            Some(("anthropic", "claude-opus-4-8", None))
-        );
-        let served = step(serde_json::json!({"served_model":"claude-opus-4-8"}));
-        assert_eq!(
-            usage_model(&episode, Some("deep"), &served),
-            Some(("anthropic", "claude-opus-4-8", None))
-        );
-        let refused: WalRecord =
-            serde_json::from_value(serde_json::json!({"type":"model_step_refused",
-            "step_id":1,"usage":{},"discarded_blocks":0,"schedule":refuse(None)}))
-            .unwrap();
-        assert_eq!(
-            usage_model(&episode, Some("deep"), &refused),
-            Some(("anthropic", "claude-opus-5-5", Some("deep")))
-        );
-        assert_eq!(usage_model(&episode, None, &WalRecord::Unknown), None);
     }
 }

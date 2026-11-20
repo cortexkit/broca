@@ -342,6 +342,12 @@ struct RouteKey {
 }
 
 impl RouteKey {
+    fn same_target(&self, other: &Self) -> bool {
+        self.session == other.session
+            && self.scope == other.scope
+            && self.module_id == other.module_id
+    }
+
     fn with_handle(mut self, handle: RouteHandle) -> Self {
         self.shape = RouteShape {
             tool_result_v1: handle.reads_tool_result,
@@ -351,12 +357,6 @@ impl RouteKey {
         };
         self.held_reply_v1 = handle.reads_held_reply;
         self
-    }
-
-    fn same_target(&self, other: &Self) -> bool {
-        self.session == other.session
-            && self.scope == other.scope
-            && self.module_id == other.module_id
     }
 }
 
@@ -887,6 +887,327 @@ struct ProviderHeldSupport {
 }
 
 impl SubcToolPlane {
+    /// Discover a standalone preset's tools on its tool route. Without a preset, preserve
+    /// registration-based discovery, which does not require a provider catalog RPC.
+    pub async fn tools_from_catalog_for_bind(
+        &self,
+        bind: &BindIdentity,
+        bind_timeout: Duration,
+    ) -> Result<Vec<broca_protocol::request::Tool>, ToolPlaneError> {
+        let Some(item) = &self.direct_tool_item else {
+            return self.tools_from_catalog().await;
+        };
+        self.warm_bind(bind, bind_timeout).await?;
+        let (route, _) = self
+            .ensure_route(bind, None, &item.provider, &ToolOpenGuard::default())
+            .await?;
+        let request = broca_fetch_plan::admit::tool_catalog_request(Some(item));
+        let arguments = serde_json::to_value(request)
+            .map_err(|error| ToolPlaneError::Unavailable(error.to_string()))?;
+        let answer = self
+            .conn
+            .tool_call(
+                &route,
+                broca_fetch_plan::CATALOG_OP,
+                &arguments,
+                None,
+                broca_fetch_plan::ADMISSION_DEADLINE,
+                item.preset.as_deref(),
+            )
+            .await
+            .map_err(conn_to_plane)?;
+        let catalog = broca_fetch_plan::admit::decode_tool_catalog(&item.provider, answer)
+            .map_err(|error| {
+                ToolPlaneError::Unavailable(format!(
+                    "read {} tool.catalog: {error:?}",
+                    item.provider
+                ))
+            })?;
+        *self.direct_schema_pins.lock().unwrap() = catalog.schema_pins;
+        Ok(catalog.tools)
+    }
+
+    fn remove_session_module_batch_routes(&self, bind: &BindIdentity, module_id: &str) {
+        let session = Self::session_key(bind);
+        let mut batches = self.batch_routes.lock().unwrap();
+        batches.retain(|(owner, _), routes| {
+            if owner == &session {
+                routes.retain(|_, route| route.module() != Some(module_id));
+            }
+            !routes.is_empty()
+        });
+    }
+
+    async fn ensure_default_route_for_lifecycle(
+        &self,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        lifecycle: &CancellationToken,
+        retry_deadline: Option<Instant>,
+    ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
+        let module_id = self.default_module_id.as_deref().ok_or_else(|| {
+            RouteEnsureError::Plane(ToolPlaneError::Unavailable(
+                "no default tool module configured".to_string(),
+            ))
+        })?;
+        self.ensure_route_for_lifecycle_inner(
+            bind,
+            scope,
+            module_id,
+            lifecycle,
+            retry_deadline,
+            &ToolOpenGuard::default(),
+            DEFAULT_ROUTE_OPEN_PATIENCE,
+        )
+        .await
+    }
+
+    /// Build the loop's tool set from what the target module ACTUALLY registers in
+    /// subc's catalog — so a harness discovers its tools from the live manifest
+    /// rather than hand-authoring schemas that can drift from it.
+    ///
+    /// Two deliberate mappings, because the subc manifest and the loop's `Tool`
+    /// describe different axes:
+    ///  - the subc manifest `Tool` carries an OPTIONAL human `description`; it is
+    ///    taken verbatim when the module declares one and left empty otherwise. A
+    ///    caller that needs richer prompt descriptions still supplies its own tool
+    ///    list (the caller list is authoritative over catalog discovery).
+    ///  - subc's `execution_mode` is the SIDE-EFFECT class (pure/mutating/
+    ///    unfenceable, used for durability fencing), NOT the loop's batch-scheduling
+    ///    class (`ExecutionMode::Parallel`/`Sequential`). They don't translate, so
+    ///    every catalog tool maps to the loop's default `Parallel` scheduling; the
+    ///    side-effect class lives on the subc/AFT side, not in the `RunRequest`.
+    pub async fn tools_from_catalog(
+        &self,
+    ) -> Result<Vec<broca_protocol::request::Tool>, ToolPlaneError> {
+        use broca_protocol::request::{ExecutionMode, Tool};
+        let module_id = self.default_module_id.as_deref().ok_or_else(|| {
+            ToolPlaneError::Unavailable("no default tool module configured".to_string())
+        })?;
+        let catalog = self.conn.catalog_list().await.map_err(conn_to_plane)?;
+        let entry = crate::provider_catalog::find_module(&catalog, module_id).ok_or_else(|| {
+            ToolPlaneError::Unavailable(format!("module '{}' not found in subc catalog", module_id))
+        })?;
+        let tools = entry
+            .roles
+            .iter()
+            .filter_map(|r| match r {
+                ProviderRole::ToolProvider { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| Tool {
+                name: t.name.clone(),
+                // The subc manifest now carries an optional human description; take it
+                // when the module declares one (modules that don't still yield empty —
+                // a caller-supplied tool list remains the authoritative prompt surface).
+                description: t.description.clone().unwrap_or_default(),
+                input_schema: t.schema.clone(),
+                module: Some(module_id.to_owned()),
+                execution_mode: ExecutionMode::Parallel,
+                reply: None,
+            })
+            .collect();
+        Ok(tools)
+    }
+
+    /// The cached unscoped route channel for `bind` to `module_id`.
+    pub fn cached_route_channel_for_module(
+        &self,
+        bind: &BindIdentity,
+        module_id: &str,
+    ) -> Option<u16> {
+        self.cached_route_channel_for_scope(bind, None, module_id)
+    }
+
+    /// Warm a route on behalf of the generation represented by `lifecycle`, under `scope`: the
+    /// scope the run the warm serves was admitted under, `None` for an unscoped run. The warmed
+    /// route is cached under that scope, so only a run admitted under it uses the route.
+    ///
+    /// Callers that detach the returned work must capture the token before spawning. Reusing this
+    /// exact token for both checks prevents an old task from minting a new generation after close.
+    pub async fn warm_bind_for_lifecycle(
+        &self,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        timeout: Duration,
+        lifecycle: CancellationToken,
+    ) -> Result<(), ToolPlaneError> {
+        let deadline = Instant::now() + timeout;
+        let mut attempt = 0u32;
+        loop {
+            if lifecycle.is_cancelled() {
+                return Err(ToolPlaneError::Unavailable(
+                    "session closed during warm_bind".into(),
+                ));
+            }
+            attempt += 1;
+            let e = match self
+                .ensure_default_route_for_lifecycle(bind, scope, &lifecycle, Some(deadline))
+                .await
+            {
+                Ok(_) => return Ok(()),
+                // A scope refusal is already final: the route open has already held as long as
+                // the scope hold allows, so retrying here would only hold again.
+                Err(RouteEnsureError::Plane(error @ ToolPlaneError::ScopeRefused { .. })) => {
+                    return Err(error)
+                }
+                Err(RouteEnsureError::Connection(error)) => {
+                    if matches!(
+                        &error,
+                        ConnError::Rejected(message)
+                            if !is_retryable_route_open(message.code())
+                    ) {
+                        return Err(conn_to_plane(error));
+                    }
+                    conn_to_plane(error)
+                }
+                Err(error) => error.into_plane(),
+            };
+            if Instant::now() >= deadline {
+                return Err(ToolPlaneError::Unavailable(format!(
+                    "route.bind did not succeed within {:?} ({attempt} attempts): {e}",
+                    timeout
+                )));
+            }
+            // Exponential backoff, capped. A flat retry interval turns a
+            // DETERMINISTIC rejection (e.g. the tool module refusing the bind
+            // identity) into a route.open storm against the daemon for the whole
+            // timeout window; backing off caps a 30s window at ~8 attempts while
+            // still retrying fast enough to absorb the transient case this warm
+            // exists for (the tool module's slow first-configure).
+            tokio::select! {
+                _ = lifecycle.cancelled() => {
+                    return Err(ToolPlaneError::Unavailable(
+                        "session closed during warm_bind".into(),
+                    ));
+                }
+                _ = sleep(warm_bind_backoff(attempt)) => {}
+            }
+        }
+    }
+
+    /// Override only this runner plane's wait in the test process, not the remote daemon.
+    /// The setter and its storage are compiled out of release builds.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn with_reply_fallback_for_test(mut self, fallback_ms: u64) -> Self {
+        self.reply_fallback_ms = fallback_ms;
+        self
+    }
+
+    /// Select a standalone caller's default provider preset. Other providers keep their own
+    /// frozen plan presets; the selection never becomes a process-wide default.
+    pub fn with_direct_tool_preset(mut self, preset: impl Into<String>) -> Self {
+        self.direct_schema_pins.get_mut().unwrap().clear();
+        self.direct_tool_item =
+            self.default_module_id
+                .as_ref()
+                .map(|provider| broca_fetch_plan::plan::Item {
+                    provider: provider.clone(),
+                    preset: Some(preset.into()),
+                    params: Default::default(),
+                    optional: false,
+                    output_refs: false,
+                });
+        self
+    }
+
+    /// Forget the cached route for `bind` so the NEXT dispatch re-opens a fresh channel.
+    /// Called when a route is learned-dead — a transport/protocol dispatch failure (the
+    /// channel may be reset/closed) or a GOODBYE for the route. WITHOUT this, the plane
+    /// would keep dispatching to a stale dead channel forever. (Public so a GOODBYE handler
+    /// can invalidate explicitly; the dispatch path invalidates on a transport error.)
+    pub fn invalidate_route(&self, bind: &BindIdentity) {
+        if let Some(module_id) = self.default_module_id.as_deref() {
+            run_transport::invalidate(module_id);
+            // This entry point is for an externally observed route teardown, so the daemon has
+            // already released the channel and no second GOODBYE should be sent. Frozen decisions
+            // targeting that dead module are removed from only this session's inner batch maps.
+            self.remove_session_module_batch_routes(bind, module_id);
+            // Drop the session's routes to this module under every scope: the teardown names
+            // the session and module, not a scope.
+            let session = Self::session_key(bind);
+            self.routes
+                .lock()
+                .unwrap()
+                .retain(|key, _| !(key.session == session && key.module_id == module_id));
+        }
+        self.clear_catalog_memo();
+    }
+
+    /// The cached route channel for `bind`, or `None` if no route is cached (so a test can
+    /// observe a route being opened, invalidated, and re-opened).
+    pub fn cached_route_channel(&self, bind: &BindIdentity) -> Option<u16> {
+        let module_id = self.default_module_id.as_deref()?;
+        self.cached_route_channel_for_module(bind, module_id)
+    }
+
+    /// Open (and cache) the route for `bind` ahead of the run, retrying until
+    /// `timeout` elapses. The first `route.open` triggers AFT's `configure`, which
+    /// cold-starts its index/callgraph (and can load a semantic model) — on a large
+    /// project root that can exceed subc's internal per-bind timeout, surfacing as a
+    /// rejected `route.open`. Warming the bind here (with retry) absorbs that cold
+    /// start BEFORE the timed model loop, so a slow first-configure never looks like
+    /// a loop stall. On a warm/tiny root this returns on the first try in
+    /// milliseconds.
+    pub async fn warm_bind(
+        &self,
+        bind: &BindIdentity,
+        timeout: Duration,
+    ) -> Result<(), ToolPlaneError> {
+        let lifecycle = self.capture_session_lifecycle_token(bind);
+        self.warm_bind_for_lifecycle(bind, None, timeout, lifecycle)
+            .await
+    }
+
+    /// Whether the route cached for `bind` under `scope` to `module_id` is still open; `None`
+    /// when none is cached. Lets a test wait until the connection has seen the daemon close it.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn test_cached_route_is_open(
+        &self,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        module_id: &str,
+    ) -> Option<bool> {
+        let key = Self::route_key(bind, scope, module_id);
+        let routes = self.routes.lock().unwrap();
+        let handle = routes
+            .iter()
+            .filter(|(candidate, _)| candidate.same_target(&key))
+            .max_by_key(|(_, route)| route.last_used)?
+            .1
+            .handle;
+        Some(self.conn.route_is_open(&handle))
+    }
+
+    /// The cached route channel for `bind` to `module_id` opened under `scope` (`None` for an
+    /// unscoped route), or `None` if no such route is cached.
+    pub fn cached_route_channel_for_scope(
+        &self,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
+        module_id: &str,
+    ) -> Option<u16> {
+        let key = Self::route_key(bind, scope, module_id);
+        self.routes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(candidate, _)| candidate.same_target(&key))
+            .max_by_key(|(_, route)| route.last_used)
+            .map(|(_, route)| route.handle.channel)
+    }
+
+    /// Shorten the scope hold, so a test can run a hold past its bound in seconds.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn with_scope_sync_hold_for_test(mut self, hold: Duration) -> Self {
+        self.scope_sync_hold = hold;
+        self
+    }
+
     /// Install the intake and the waiting lifecycle. The declarations a batch routes and
     /// decodes by come from that batch's frozen plan manifest (`ToolManifest`), so installing
     /// this pair is all a tool plane needs: it never consults a live catalog.
@@ -1093,36 +1414,6 @@ impl SubcToolPlane {
         Self::with_connection(conn, module_id)
     }
 
-    /// Route a standalone Direct caller's tool calls under an owner's carrier grant.
-    /// The selector (including its private proof) lives only in this plane. Constructing a
-    /// separate plane keeps its cached routes from mixing with ordinary unscoped routes.
-    pub fn new_with_direct_carrier_scope(
-        conn: SubcConnection,
-        module_id: impl Into<String>,
-        selector: ScopeSelector,
-    ) -> Self {
-        let mut plane = Self::new(conn, module_id);
-        plane.direct_carrier_scope = Some(selector);
-        plane
-    }
-
-    /// Select a standalone caller's default provider preset. Other providers keep their own
-    /// frozen plan presets; the selection never becomes a process-wide default.
-    pub fn with_direct_tool_preset(mut self, preset: impl Into<String>) -> Self {
-        self.direct_schema_pins.get_mut().unwrap().clear();
-        self.direct_tool_item =
-            self.default_module_id
-                .as_ref()
-                .map(|provider| broca_fetch_plan::plan::Item {
-                    provider: provider.clone(),
-                    preset: Some(preset.into()),
-                    params: Default::default(),
-                    optional: false,
-                    output_refs: false,
-                });
-        self
-    }
-
     fn with_connection(conn: Arc<dyn ToolPlaneConnection>, module_id: impl Into<String>) -> Self {
         std::sync::LazyLock::force(&crate::tool_result_diagnostics::TOOL_RESULT_JSON_DUMPS);
         let module_id = module_id.into();
@@ -1172,35 +1463,6 @@ impl SubcToolPlane {
         *self.describer.lock().unwrap() = Some(describer);
     }
 
-    /// Whether the route cached for `bind` under `scope` to `module_id` is still open; `None`
-    /// when none is cached. Lets a test wait until the connection has seen the daemon close it.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn test_cached_route_is_open(
-        &self,
-        bind: &BindIdentity,
-        scope: Option<&SessionScope>,
-        module_id: &str,
-    ) -> Option<bool> {
-        let key = Self::route_key(bind, scope, module_id);
-        let routes = self.routes.lock().unwrap();
-        let handle = routes
-            .iter()
-            .filter(|(candidate, _)| candidate.same_target(&key))
-            .max_by_key(|(_, route)| route.last_used)?
-            .1
-            .handle;
-        Some(self.conn.route_is_open(&handle))
-    }
-
-    /// Shorten the scope hold, so a test can run a hold past its bound in seconds.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn with_scope_sync_hold_for_test(mut self, hold: Duration) -> Self {
-        self.scope_sync_hold = hold;
-        self
-    }
-
     /// Capture the lifecycle token for the actor generation that currently owns `bind`.
     /// Detached work must capture this before it is spawned so a late first poll cannot attach
     /// itself to a newer generation after the original session closes.
@@ -1212,12 +1474,6 @@ impl SubcToolPlane {
             .entry(session)
             .or_default()
             .clone()
-    }
-
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn test_mint_lifecycle_token_uncancelled(&self, bind: &BindIdentity) -> bool {
-        !self.capture_session_lifecycle_token(bind).is_cancelled()
     }
 
     fn frozen_preset(&self, ctx: &BatchCtx, module_id: &str) -> Option<String> {
@@ -1232,15 +1488,6 @@ impl SubcToolPlane {
                     .filter(|item| item.provider == module_id)
                     .and_then(|item| item.preset.clone())
             })
-    }
-
-    /// Override only this runner plane's wait in the test process, not the remote daemon.
-    /// The setter and its storage are compiled out of release builds.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn with_reply_fallback_for_test(mut self, fallback_ms: u64) -> Self {
-        self.reply_fallback_ms = fallback_ms;
-        self
     }
 
     fn reply_fallback_ms(&self) -> u64 {
@@ -1344,180 +1591,6 @@ impl SubcToolPlane {
 
     fn clear_catalog_memo(&self) {
         self.catalog_memo.lock().unwrap().take();
-    }
-
-    /// Open (and cache) the route for `bind` ahead of the run, retrying until
-    /// `timeout` elapses. The first `route.open` triggers AFT's `configure`, which
-    /// cold-starts its index/callgraph (and can load a semantic model) — on a large
-    /// project root that can exceed subc's internal per-bind timeout, surfacing as a
-    /// rejected `route.open`. Warming the bind here (with retry) absorbs that cold
-    /// start BEFORE the timed model loop, so a slow first-configure never looks like
-    /// a loop stall. On a warm/tiny root this returns on the first try in
-    /// milliseconds.
-    pub async fn warm_bind(
-        &self,
-        bind: &BindIdentity,
-        timeout: Duration,
-    ) -> Result<(), ToolPlaneError> {
-        let lifecycle = self.capture_session_lifecycle_token(bind);
-        self.warm_bind_for_lifecycle(bind, None, timeout, lifecycle)
-            .await
-    }
-
-    /// Warm a route on behalf of the generation represented by `lifecycle`, under `scope`: the
-    /// scope the run the warm serves was admitted under, `None` for an unscoped run. The warmed
-    /// route is cached under that scope, so only a run admitted under it uses the route.
-    ///
-    /// Callers that detach the returned work must capture the token before spawning. Reusing this
-    /// exact token for both checks prevents an old task from minting a new generation after close.
-    pub async fn warm_bind_for_lifecycle(
-        &self,
-        bind: &BindIdentity,
-        scope: Option<&SessionScope>,
-        timeout: Duration,
-        lifecycle: CancellationToken,
-    ) -> Result<(), ToolPlaneError> {
-        let deadline = Instant::now() + timeout;
-        let mut attempt = 0u32;
-        loop {
-            if lifecycle.is_cancelled() {
-                return Err(ToolPlaneError::Unavailable(
-                    "session closed during warm_bind".into(),
-                ));
-            }
-            attempt += 1;
-            let e = match self
-                .ensure_default_route_for_lifecycle(bind, scope, &lifecycle, Some(deadline))
-                .await
-            {
-                Ok(_) => return Ok(()),
-                // A scope refusal is already final: the route open has already held as long as
-                // the scope hold allows, so retrying here would only hold again.
-                Err(RouteEnsureError::Plane(error @ ToolPlaneError::ScopeRefused { .. })) => {
-                    return Err(error)
-                }
-                Err(RouteEnsureError::Connection(error)) => {
-                    if matches!(
-                        &error,
-                        ConnError::Rejected(message)
-                            if !is_retryable_route_open(message.code())
-                    ) {
-                        return Err(conn_to_plane(error));
-                    }
-                    conn_to_plane(error)
-                }
-                Err(error) => error.into_plane(),
-            };
-            if Instant::now() >= deadline {
-                return Err(ToolPlaneError::Unavailable(format!(
-                    "route.bind did not succeed within {:?} ({attempt} attempts): {e}",
-                    timeout
-                )));
-            }
-            // Exponential backoff, capped. A flat retry interval turns a
-            // DETERMINISTIC rejection (e.g. the tool module refusing the bind
-            // identity) into a route.open storm against the daemon for the whole
-            // timeout window; backing off caps a 30s window at ~8 attempts while
-            // still retrying fast enough to absorb the transient case this warm
-            // exists for (the tool module's slow first-configure).
-            tokio::select! {
-                _ = lifecycle.cancelled() => {
-                    return Err(ToolPlaneError::Unavailable(
-                        "session closed during warm_bind".into(),
-                    ));
-                }
-                _ = sleep(warm_bind_backoff(attempt)) => {}
-            }
-        }
-    }
-
-    /// Discover a standalone preset's tools on its tool route. Without a preset, preserve
-    /// registration-based discovery, which does not require a provider catalog RPC.
-    pub async fn tools_from_catalog_for_bind(
-        &self,
-        bind: &BindIdentity,
-        bind_timeout: Duration,
-    ) -> Result<Vec<broca_protocol::request::Tool>, ToolPlaneError> {
-        let Some(item) = &self.direct_tool_item else {
-            return self.tools_from_catalog().await;
-        };
-        self.warm_bind(bind, bind_timeout).await?;
-        let (route, _) = self
-            .ensure_route(bind, None, &item.provider, &ToolOpenGuard::default())
-            .await?;
-        let request = broca_fetch_plan::admit::tool_catalog_request(Some(item));
-        let arguments = serde_json::to_value(request)
-            .map_err(|error| ToolPlaneError::Unavailable(error.to_string()))?;
-        let answer = self
-            .conn
-            .tool_call(
-                &route,
-                broca_fetch_plan::CATALOG_OP,
-                &arguments,
-                None,
-                broca_fetch_plan::ADMISSION_DEADLINE,
-                item.preset.as_deref(),
-            )
-            .await
-            .map_err(conn_to_plane)?;
-        let catalog = broca_fetch_plan::admit::decode_tool_catalog(&item.provider, answer)
-            .map_err(|error| {
-                ToolPlaneError::Unavailable(format!(
-                    "read {} tool.catalog: {error:?}",
-                    item.provider
-                ))
-            })?;
-        *self.direct_schema_pins.lock().unwrap() = catalog.schema_pins;
-        Ok(catalog.tools)
-    }
-
-    /// Build the loop's tool set from what the target module ACTUALLY registers in
-    /// subc's catalog — so a harness discovers its tools from the live manifest
-    /// rather than hand-authoring schemas that can drift from it.
-    ///
-    /// Two deliberate mappings, because the subc manifest and the loop's `Tool`
-    /// describe different axes:
-    ///  - the subc manifest `Tool` carries an OPTIONAL human `description`; it is
-    ///    taken verbatim when the module declares one and left empty otherwise. A
-    ///    caller that needs richer prompt descriptions still supplies its own tool
-    ///    list (the caller list is authoritative over catalog discovery).
-    ///  - subc's `execution_mode` is the SIDE-EFFECT class (pure/mutating/
-    ///    unfenceable, used for durability fencing), NOT the loop's batch-scheduling
-    ///    class (`ExecutionMode::Parallel`/`Sequential`). They don't translate, so
-    ///    every catalog tool maps to the loop's default `Parallel` scheduling; the
-    ///    side-effect class lives on the subc/AFT side, not in the `RunRequest`.
-    pub async fn tools_from_catalog(
-        &self,
-    ) -> Result<Vec<broca_protocol::request::Tool>, ToolPlaneError> {
-        use broca_protocol::request::{ExecutionMode, Tool};
-        let module_id = self.default_module_id.as_deref().ok_or_else(|| {
-            ToolPlaneError::Unavailable("no default tool module configured".to_string())
-        })?;
-        let catalog = self.conn.catalog_list().await.map_err(conn_to_plane)?;
-        let entry = crate::provider_catalog::find_module(&catalog, module_id).ok_or_else(|| {
-            ToolPlaneError::Unavailable(format!("module '{}' not found in subc catalog", module_id))
-        })?;
-        let tools = entry
-            .roles
-            .iter()
-            .filter_map(|r| match r {
-                ProviderRole::ToolProvider { tools, .. } => Some(tools),
-                _ => None,
-            })
-            .flatten()
-            .map(|t| Tool {
-                name: t.name.clone(),
-                // The subc manifest now carries an optional human description; take it
-                // when the module declares one (modules that don't still yield empty —
-                // a caller-supplied tool list remains the authoritative prompt surface).
-                description: t.description.clone().unwrap_or_default(),
-                input_schema: t.schema.clone(),
-                module: Some(module_id.to_owned()),
-                execution_mode: ExecutionMode::Parallel,
-                reply: None,
-            })
-            .collect();
-        Ok(tools)
     }
 
     fn session_key(bind: &BindIdentity) -> SessionKey {
@@ -2374,17 +2447,6 @@ impl SubcToolPlane {
         }
     }
 
-    fn remove_session_module_batch_routes(&self, bind: &BindIdentity, module_id: &str) {
-        let session = Self::session_key(bind);
-        let mut batches = self.batch_routes.lock().unwrap();
-        batches.retain(|(owner, _), routes| {
-            if owner == &session {
-                routes.retain(|_, route| route.module() != Some(module_id));
-            }
-            !routes.is_empty()
-        });
-    }
-
     fn route_is_current(&self, key: &RouteKey, handle: RouteHandle, sem: &Arc<Semaphore>) -> bool {
         let routes = self.routes.lock().unwrap();
         route_matches(&routes, key, handle, sem)
@@ -2913,53 +2975,6 @@ impl SubcToolPlane {
         Ok((cached.handle, cached.sem))
     }
 
-    async fn ensure_default_route_for_lifecycle(
-        &self,
-        bind: &BindIdentity,
-        scope: Option<&SessionScope>,
-        lifecycle: &CancellationToken,
-        retry_deadline: Option<Instant>,
-    ) -> Result<(RouteHandle, Arc<Semaphore>), RouteEnsureError> {
-        let module_id = self.default_module_id.as_deref().ok_or_else(|| {
-            RouteEnsureError::Plane(ToolPlaneError::Unavailable(
-                "no default tool module configured".to_string(),
-            ))
-        })?;
-        self.ensure_route_for_lifecycle_inner(
-            bind,
-            scope,
-            module_id,
-            lifecycle,
-            retry_deadline,
-            &ToolOpenGuard::default(),
-            DEFAULT_ROUTE_OPEN_PATIENCE,
-        )
-        .await
-    }
-
-    /// Forget the cached route for `bind` so the NEXT dispatch re-opens a fresh channel.
-    /// Called when a route is learned-dead — a transport/protocol dispatch failure (the
-    /// channel may be reset/closed) or a GOODBYE for the route. WITHOUT this, the plane
-    /// would keep dispatching to a stale dead channel forever. (Public so a GOODBYE handler
-    /// can invalidate explicitly; the dispatch path invalidates on a transport error.)
-    pub fn invalidate_route(&self, bind: &BindIdentity) {
-        if let Some(module_id) = self.default_module_id.as_deref() {
-            run_transport::invalidate(module_id);
-            // This entry point is for an externally observed route teardown, so the daemon has
-            // already released the channel and no second GOODBYE should be sent. Frozen decisions
-            // targeting that dead module are removed from only this session's inner batch maps.
-            self.remove_session_module_batch_routes(bind, module_id);
-            // Drop the session's routes to this module under every scope: the teardown names
-            // the session and module, not a scope.
-            let session = Self::session_key(bind);
-            self.routes
-                .lock()
-                .unwrap()
-                .retain(|key, _| !(key.session == session && key.module_id == module_id));
-        }
-        self.clear_catalog_memo();
-    }
-
     fn invalidate_route_for_module(
         &self,
         bind: &BindIdentity,
@@ -2994,40 +3009,6 @@ impl SubcToolPlane {
         } else {
             None
         }
-    }
-
-    /// The cached route channel for `bind`, or `None` if no route is cached (so a test can
-    /// observe a route being opened, invalidated, and re-opened).
-    pub fn cached_route_channel(&self, bind: &BindIdentity) -> Option<u16> {
-        let module_id = self.default_module_id.as_deref()?;
-        self.cached_route_channel_for_module(bind, module_id)
-    }
-
-    /// The cached unscoped route channel for `bind` to `module_id`.
-    pub fn cached_route_channel_for_module(
-        &self,
-        bind: &BindIdentity,
-        module_id: &str,
-    ) -> Option<u16> {
-        self.cached_route_channel_for_scope(bind, None, module_id)
-    }
-
-    /// The cached route channel for `bind` to `module_id` opened under `scope` (`None` for an
-    /// unscoped route), or `None` if no such route is cached.
-    pub fn cached_route_channel_for_scope(
-        &self,
-        bind: &BindIdentity,
-        scope: Option<&SessionScope>,
-        module_id: &str,
-    ) -> Option<u16> {
-        let key = Self::route_key(bind, scope, module_id);
-        self.routes
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(candidate, _)| candidate.same_target(&key))
-            .max_by_key(|(_, route)| route.last_used)
-            .map(|(_, route)| route.handle.channel)
     }
 
     /// Close all of a session's module routes: send route GOODBYE for each cached channel so

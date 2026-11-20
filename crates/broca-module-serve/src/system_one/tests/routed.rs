@@ -550,13 +550,6 @@ fn answered(tokens: Option<u64>) -> String {
     }
     body.to_string()
 }
-async fn call(rig: &RoutedRig, params: &str) -> Result<Box<serde_json::value::RawValue>, Value> {
-    rig.service
-        .clone()
-        .spawn_call(params.into(), test_scope())
-        .await
-        .map_err(|body| serde_json::from_slice(&body).unwrap())
-}
 
 async fn wait_for(label: &'static str, ready: impl Fn() -> bool) {
     broca_test_support::event_timeout(
@@ -2870,3 +2863,11 @@ mod exits;
 
 #[path = "routed/refusals.rs"]
 mod refusals;
+
+async fn call(rig: &RoutedRig, params: &str) -> Result<Box<serde_json::value::RawValue>, Value> {
+    rig.service
+        .clone()
+        .spawn_call(params.into(), test_scope())
+        .await
+        .map_err(|body| serde_json::from_slice(&body).unwrap())
+}

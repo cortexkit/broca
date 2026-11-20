@@ -393,9 +393,9 @@ setup; CI splits that work across jobs with separate 15–90 minute budgets.
 The nextest CI profile and its per-test/resource-group limits are unchanged.
 
 The existing Mac-only `.cortexkit/scripts/native-release-suites.sh` is an
-**additional release gate**, not a job in either workflow. Only the integrating
-agent runs its real-daemon, conformance/kill and crash-harness lanes, once per
-merged batch. Do not launch it from `prepush.sh`, duplicate it on this Mac, or
+**additional release gate**, not a job in either workflow. Only the maintainer who
+merges a batch runs it (its real-daemon tests and the conformance suite with real process
+kills), once per merged batch. Do not launch it from `prepush.sh`, duplicate it on this Mac, or
 claim that a portable preflight replaces it. The macOS operator placement-restart
 suite is also native-only and reported NOT RUN by Linux's `script-suites.sh`;
 the integrating Mac gate runs it. Neither is silently counted as Linux coverage.

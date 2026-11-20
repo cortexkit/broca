@@ -22,11 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
-/// D, the writer sync deadline: dirty data waits at most this long for a
-/// barrier before the loop syncs it on its own.
-pub const SYNC_DEADLINE: Duration = Duration::from_secs(10);
+use std::time::Instant;
 
 /// The same deadline in milliseconds, the unit of the monotonic source below.
 pub const SYNC_DEADLINE_MS: u64 = 10_000;
@@ -53,22 +49,7 @@ pub struct DurabilitySnapshot {
     pub disconnect: u64,
 }
 
-impl DurabilitySnapshot {
-    /// The total fsyncs across every cause.
-    pub fn total(self) -> u64 {
-        self.barrier + self.deadline + self.shutdown + self.disconnect
-    }
-
-    /// The total for one cause.
-    pub fn get(self, cause: FsyncCause) -> u64 {
-        match cause {
-            FsyncCause::Barrier => self.barrier,
-            FsyncCause::Deadline => self.deadline,
-            FsyncCause::Shutdown => self.shutdown,
-            FsyncCause::Disconnect => self.disconnect,
-        }
-    }
-}
+impl DurabilitySnapshot {}
 
 fn cause_index(cause: FsyncCause) -> usize {
     match cause {

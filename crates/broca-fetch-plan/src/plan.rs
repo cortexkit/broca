@@ -24,8 +24,6 @@ use crate::refusal::Refusal;
 /// `prefrontal` after). Its system-text item may never be optional, regardless of the role
 /// preset.
 pub const PERSONA_PROVIDER: &str = "prefrontal-core";
-/// Legacy persona preset spelling. Persona identity is determined by provider, not preset.
-pub const PERSONA_PRESET: &str = "persona";
 
 /// `session.send` members a send carrying a plan must not carry: the plan replaces them.
 pub const MEMBERS_REPLACED_BY_PLAN: &[&str] = &["tools", "system", "context_management"];

@@ -15,7 +15,7 @@ use broca_wal::migration;
 use crate::registry::store_move::MoveRefusal;
 
 mod directories;
-pub use directories::PublicationDirs;
+pub(crate) use directories::PublicationDirs;
 
 fn unavailable(what: &str, error: impl std::fmt::Display) -> MoveRefusal {
     MoveRefusal::new("unavailable", format!("{what}: {error}"))

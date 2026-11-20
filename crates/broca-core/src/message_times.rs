@@ -4,28 +4,6 @@ use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
 use broca_wal::WalRecord;
 use std::collections::BTreeMap;
 
-pub fn written_times<'a>(
-    records: impl IntoIterator<Item = &'a WalRecord>,
-    placement: Placement,
-) -> Result<BTreeMap<u64, u64>, String> {
-    written_times_with_queued(records, placement, BTreeMap::new())
-}
-
-pub fn written_times_with_queued<'a>(
-    records: impl IntoIterator<Item = &'a WalRecord>,
-    placement: Placement,
-    queued: BTreeMap<String, u64>,
-) -> Result<BTreeMap<u64, u64>, String> {
-    fold(
-        records,
-        placement,
-        queued,
-        false,
-        MessageTimeSeed::default(),
-    )
-    .map(|fold| fold.times)
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MessageTimeSeed {
     pub last_record_ms: Option<u64>,
@@ -311,124 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn admission_attempt_and_tool_times_follow_shared_placement() {
-        let mut start = legacy_start();
-        if let WalRecord::RunStarted { ts_ms, .. } = &mut start {
-            *ts_ms = Some(10);
-        }
-        let values = [
-            json!({"type":"step_started","step_id":1}),
-            json!({"type":"model_attempt_finished","step_id":1,"attempt":0,"outcome":"complete","ts_ms":12,
-                "request_body_len":0,"request_body_sha256":"a","response_body_len":0,"response_body_sha256":"b"}),
-            json!({"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"a","content":[
-                {"type":"tool_call","tool_call_id":"call","tool_name":"work","input":{}}
-            ]},"usage":{},"retries_used":0}),
-            json!({"type":"tool_batch_started","batch_id":"b","step_id":1,"planned_calls":["call"]}),
-            json!({"type":"steered","ts_ms":13,"input":[{"role":"user","content":[{"type":"text","text":"steer"}]}]}),
-            json!({"type":"tool_result","finished_at_ms":14,"batch_id":"b","result":{
-                "tool_call_id":"call","output":{"kind":"text","text":"done"},"is_error":false},"outcome":"completed"}),
-            json!({"type":"tool_batch_finished","batch_id":"b"}),
-            json!({"type":"turn_finished","step_id":1}),
-            json!({"type":"step_started","step_id":2}),
-            json!({"type":"model_step_finished","written_at_ms":15,"step_id":2,"assistant_message":{
-                "message_id":"last","content":[{"type":"text","text":"done"}]},"usage":{},"retries_used":0}),
-        ];
-        let records: Vec<WalRecord> = std::iter::once(start)
-            .chain(
-                values
-                    .into_iter()
-                    .map(|value| serde_json::from_value(value).unwrap()),
-            )
-            .collect();
-        let times = written_times(&records, Placement::default()).unwrap();
-        assert_eq!(
-            times,
-            BTreeMap::from([(0, 10), (1, 12), (2, 14), (3, 13), (4, 15)])
-        );
-        let mut untimed = records.clone();
-        if let WalRecord::ToolResult { finished_at_ms, .. } = &mut untimed[6] {
-            *finished_at_ms = None;
-        }
-        let times = written_times(&untimed, Placement::default()).unwrap();
-        assert!(
-            !times.contains_key(&2),
-            "legacy tool results have no replacement clock"
-        );
-        assert_eq!(times.get(&1), Some(&12));
-        assert_eq!(times.get(&3), Some(&13));
-    }
-
-    #[test]
-    fn unrecorded_times_and_failed_attempts_stay_absent() {
-        let mut records = [legacy_start(), serde_json::from_value(json!({"type":"model_attempt_finished","step_id":1,
-            "attempt":0,"outcome":"http_error","ts_ms":99,"request_body_len":0,"request_body_sha256":"a",
-            "response_body_len":0,"response_body_sha256":"b"})).unwrap(),
-            serde_json::from_value(json!({"type":"model_step_finished","step_id":1,"assistant_message":{
-                "message_id":"last","content":[]},"usage":{},"retries_used":0})).unwrap()];
-        assert!(written_times(&records, Placement::default())
-            .unwrap()
-            .is_empty());
-        if let WalRecord::ModelAttemptFinished { outcome, .. } = &mut records[1] {
-            *outcome = broca_protocol::AttemptOutcome::ToolArgsTrailingGarbage;
-        }
-        assert_eq!(
-            written_times(&records, Placement::default())
-                .unwrap()
-                .get(&1),
-            Some(&99)
-        );
-    }
-
-    #[test]
-    fn mode3_approval_closure_and_budget_use_their_recorded_times() {
-        let mut start = legacy_start();
-        if let WalRecord::RunStarted { ts_ms, config, .. } = &mut start {
-            *ts_ms = Some(10);
-            config.budget = Some(broca_protocol::request::BudgetConfig {
-                max_input_tokens: None,
-                nudges: vec![broca_protocol::request::BudgetNudge {
-                    at_tool_calls: 1,
-                    text: "budget".into(),
-                }],
-                finalize_at_tool_calls: 9,
-                finalize_text: "finish".into(),
-            });
-        }
-        let values = [
-            json!({"type":"step_started","step_id":1}),
-            json!({"type":"model_step_finished","written_at_ms":12,"step_id":1,"assistant_message":{"message_id":"a","content":[{"type":"tool_call","tool_call_id":"call","tool_name":"edit","input":{"n":1}},{"type":"tool_call","tool_call_id":"sent","tool_name":"work","input":{}}]},"usage":{},"retries_used":0}),
-            json!({"type":"tool_batch_started","batch_id":"b","step_id":1,"planned_calls":["call","sent"]}),
-            serde_json::to_value(crate::replay::deferred_tests::prepared("call", "b")).unwrap(),
-            json!({"type":"tool_dispatch_intent","batch_id":"b","tool_call_id":"sent","tool_name":"work","args":{},"dispatched_at_ms":14}),
-            json!({"type":"tool_result","batch_id":"b","finished_at_ms":15,"result":{"tool_call_id":"sent","output":{"kind":"text","text":"done"},"is_error":false},"outcome":"completed"}),
-            json!({"type":"approval_recorded","closed_at_ms":18,"call_key":"key","call_id":"call","decision":"declined","closing_result":{"tool_call_id":"call","output":{"kind":"denied","reason":"no"},"is_error":true}}),
-            json!({"type":"tool_batch_finished","batch_id":"b"}),
-            json!({"type":"turn_finished","step_id":1}),
-            json!({"type":"budget_fired","run_id":"run-7","kind":"nudge","threshold":1,"ordinal":3,"caller_text":"budget"}),
-        ];
-        let records: Vec<WalRecord> = std::iter::once(start)
-            .chain(
-                values
-                    .into_iter()
-                    .map(|value| serde_json::from_value(value).unwrap()),
-            )
-            .collect();
-        let fixed = mode3_written_times(
-            &records,
-            Placement::default(),
-            BTreeMap::new(),
-            MessageTimeSeed::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            fixed.times,
-            BTreeMap::from([(0, 10), (1, 12), (2, 18), (3, 18)])
-        );
-        let legacy = written_times(&records, Placement::default()).unwrap();
-        assert!(!legacy.contains_key(&2) && !legacy.contains_key(&3));
-    }
-
-    #[test]
     fn mode3_untimed_prefix_stays_zero_after_a_timed_append() {
         let mut records = vec![legacy_start()];
         let before = mode3_written_times(
@@ -456,33 +316,6 @@ mod tests {
         assert_eq!(
             completed_at(broca_protocol::Role::Assistant, Some(99), true),
             Some(99)
-        );
-    }
-
-    #[test]
-    fn recorded_queue_admission_survives_a_projection_watermark() {
-        let queued: WalRecord = serde_json::from_value(json!({"type":"queued","submission_id":"q","ts_ms":123,
-            "request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[],"policy_allowed":[],
-                "tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}})).unwrap();
-        let mut head = crate::head::HeadProjection::default();
-        head.observe(&queued);
-        let mut start = legacy_start();
-        if let WalRecord::RunStarted {
-            submission_id,
-            ts_ms,
-            ..
-        } = &mut start
-        {
-            *submission_id = Some(broca_protocol::SubmissionId("q".into()));
-            *ts_ms = Some(999);
-        }
-        let times =
-            written_times_with_queued([&start], Placement::new(2), head.queued_times().clone())
-                .unwrap();
-        assert_eq!(times, BTreeMap::from([(2, 123)]));
-        assert_eq!(
-            written_times([&queued, &start], Placement::default()).unwrap(),
-            BTreeMap::from([(0, 123)])
         );
     }
 }

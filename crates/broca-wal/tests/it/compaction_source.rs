@@ -406,14 +406,11 @@ fn only_cfg_test_module_files_are_excluded_from_source_scans() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // These out-of-line test modules include direct, #[path], and inherited declarations.
     for test_file in [
-        "crates/broca-core/src/wal_fold/tests.rs",
-        "crates/broca-core/src/retention/tests.rs",
-        "crates/broca-core/src/run/hook_tests.rs",
+        "crates/broca-core/src/consent/tests.rs",
+        "crates/broca-core/src/media_provenance_tests.rs",
+        "crates/broca-core/src/compaction/ceiling_tests.rs",
         "crates/broca-module/src/fork_answer_tests.rs",
         "crates/broca-module/src/phase_metrics_tests.rs",
-        "crates/broca-core/src/run/consent_fourth_audit_tests.rs",
-        "crates/broca-core/src/run/consent_runtime_tests.rs",
-        "crates/broca-core/src/run/consent_audit_tests.rs",
     ] {
         assert!(
             is_cfg_test_module_file(&root.join(test_file)),

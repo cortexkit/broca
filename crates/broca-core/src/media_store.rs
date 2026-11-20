@@ -12,9 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod lifecycle;
-pub use lifecycle::{
-    preview_sweep, session_media_digests, spawn_startup_sweep, sweep, SweepReport,
-};
+pub use lifecycle::SweepReport;
+pub use lifecycle::{session_media_digests, spawn_startup_sweep};
 
 /// Stores deduplicate only within a WAL durability class, never across classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,81 +111,6 @@ impl ReadOnlyMediaStore {
 }
 
 impl MediaStore {
-    /// Startup must have created the state root. This also pays creation barriers
-    /// when a store is opened independently of the serving process.
-    pub fn open(state_root: &Path, class: MediaStoreClass) -> io::Result<Self> {
-        let root = state_root.join(class.directory());
-        for child in ["objects", "refs"] {
-            broca_wal::migration::durable_dir(state_root, &root.join(child))?;
-        }
-        Ok(Self { root })
-    }
-
-    /// The session actor must retain its lease for this handle's lifetime. A
-    /// maintenance sweep uses the exclusive store lock and skips leased sessions.
-    pub fn session(&self, identity: &BindIdentity) -> io::Result<MediaManifest> {
-        let registration_lock = self.lock()?;
-        registration_lock.lock_shared()?;
-        // The WAL may not exist yet. Persist the identity so maintenance can
-        // still check its writer lease before reclaiming an uncommitted capture.
-        let address = crate::wal_writer::session_addr(identity);
-        let identity_path = self.root.join("identities").join(address);
-        broca_wal::migration::atomic_json(self.root.parent().unwrap(), &identity_path, identity)?;
-        let path = self
-            .root
-            .join("refs")
-            .join(crate::wal_writer::session_addr(identity));
-        let file = broca_owner_only::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&path)?;
-        Ok(MediaManifest {
-            store: self.clone(),
-            path,
-            file,
-            refs_synced: false,
-        })
-    }
-
-    fn lock(&self) -> io::Result<File> {
-        broca_owner_only::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(self.root.join("store.lock"))
-    }
-
-    /// Maintenance holds this lock across both manifest reconciliation and object
-    /// deletion, so a registration cannot race either half of a sweep.
-    pub fn with_exclusive_lock<T>(&self, action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-        let lock = self.lock()?;
-        lock.lock()?;
-        action()
-    }
-
-    /// Read afresh for each render, failing closed with the offending digest.
-    pub fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
-        if !valid_digest(&reference.sha256) {
-            return Err(MediaReadError::Corrupt(reference.sha256.clone()));
-        }
-        let path = self.root.join("objects").join(&reference.sha256);
-        let bytes = fs::read(&path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                MediaReadError::Missing(reference.sha256.clone())
-            } else {
-                MediaReadError::Io {
-                    digest: reference.sha256.clone(),
-                    source: error,
-                }
-            }
-        })?;
-        if !matches_bytes(reference, &bytes) {
-            return Err(MediaReadError::Corrupt(reference.sha256.clone()));
-        }
-        Ok(bytes)
-    }
-
     fn publish(
         &self,
         reference: &MediaRef,
@@ -227,6 +151,73 @@ impl MediaStore {
         }
         result
     }
+
+    /// The session actor must retain its lease for this handle's lifetime. A
+    /// maintenance sweep uses the exclusive store lock and skips leased sessions.
+    pub fn session(&self, identity: &BindIdentity) -> io::Result<MediaManifest> {
+        let registration_lock = self.lock()?;
+        registration_lock.lock_shared()?;
+        // The WAL may not exist yet. Persist the identity so maintenance can
+        // still check its writer lease before reclaiming an uncommitted capture.
+        let address = crate::wal_writer::session_addr(identity);
+        let identity_path = self.root.join("identities").join(address);
+        broca_wal::migration::atomic_json(self.root.parent().unwrap(), &identity_path, identity)?;
+        let path = self
+            .root
+            .join("refs")
+            .join(crate::wal_writer::session_addr(identity));
+        let file = broca_owner_only::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)?;
+        Ok(MediaManifest {
+            store: self.clone(),
+            path,
+            file,
+            refs_synced: false,
+        })
+    }
+
+    /// Startup must have created the state root. This also pays creation barriers
+    /// when a store is opened independently of the serving process.
+    pub fn open(state_root: &Path, class: MediaStoreClass) -> io::Result<Self> {
+        let root = state_root.join(class.directory());
+        for child in ["objects", "refs"] {
+            broca_wal::migration::durable_dir(state_root, &root.join(child))?;
+        }
+        Ok(Self { root })
+    }
+
+    fn lock(&self) -> io::Result<File> {
+        broca_owner_only::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(self.root.join("store.lock"))
+    }
+
+    /// Read afresh for each render, failing closed with the offending digest.
+    pub fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
+        if !valid_digest(&reference.sha256) {
+            return Err(MediaReadError::Corrupt(reference.sha256.clone()));
+        }
+        let path = self.root.join("objects").join(&reference.sha256);
+        let bytes = fs::read(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                MediaReadError::Missing(reference.sha256.clone())
+            } else {
+                MediaReadError::Io {
+                    digest: reference.sha256.clone(),
+                    source: error,
+                }
+            }
+        })?;
+        if !matches_bytes(reference, &bytes) {
+            return Err(MediaReadError::Corrupt(reference.sha256.clone()));
+        }
+        Ok(bytes)
+    }
 }
 
 /// One append-only digest manifest, addressed by the full bind triple.
@@ -238,18 +229,6 @@ pub struct MediaManifest {
 }
 
 impl MediaManifest {
-    /// The callback is the only WAL-write seam: it is never entered on a failed
-    /// storage barrier. Keep the session lease until its WAL is durable. A failed
-    /// callback may leave an extra manifest entry; the WAL remains authoritative.
-    pub fn register_and_append<T>(
-        &mut self,
-        reference: &MediaRef,
-        bytes: &[u8],
-        append: impl FnOnce() -> io::Result<T>,
-    ) -> io::Result<T> {
-        self.register_with(reference, bytes, append, &mut RealSteps)
-    }
-
     fn register_with<T>(
         &mut self,
         reference: &MediaRef,
@@ -283,6 +262,18 @@ impl MediaManifest {
         let result = append()?;
         steps.reached(Step::WalAppended)?;
         Ok(result)
+    }
+
+    /// The callback is the only WAL-write seam: it is never entered on a failed
+    /// storage barrier. Keep the session lease until its WAL is durable. A failed
+    /// callback may leave an extra manifest entry; the WAL remains authoritative.
+    pub fn register_and_append<T>(
+        &mut self,
+        reference: &MediaRef,
+        bytes: &[u8],
+        append: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.register_with(reference, bytes, append, &mut RealSteps)
     }
 }
 
@@ -355,6 +346,20 @@ fn matches_bytes(reference: &MediaRef, bytes: &[u8]) -> bool {
         && format!("{:x}", Sha256::digest(bytes)) == reference.sha256
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    ObjectFileSynced,
+    ObjectPublished,
+    ManifestSynced,
+    RefsSynced,
+    WalAppended,
+    WalDirectorySynced,
+}
+
+// A failed write can leave part of a digest at EOF. Never join a retry to that
+// prefix: only complete newline-terminated entries are append-only records.
+// The next manifest fsync makes both this tail repair and the new entry durable.
+
 // A failed write can leave part of a digest at EOF. Never join a retry to that
 // prefix: only complete newline-terminated entries are append-only records.
 // The next manifest fsync makes both this tail repair and the new entry durable.
@@ -379,16 +384,6 @@ fn recover_torn_tail(file: &mut File, path: &Path) -> io::Result<()> {
         repair.sync_all()?;
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Step {
-    ObjectFileSynced,
-    ObjectPublished,
-    ManifestSynced,
-    RefsSynced,
-    WalAppended,
-    WalDirectorySynced,
 }
 
 trait StorageSteps {

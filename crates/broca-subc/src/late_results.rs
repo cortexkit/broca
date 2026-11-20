@@ -274,12 +274,6 @@ impl LateResultsFeed {
         &self.module
     }
 
-    /// Give the feed its own reply budget, so a test does not wait the production one.
-    pub fn with_reply_timeout(mut self, reply_timeout: Duration) -> Self {
-        self.reply_timeout = reply_timeout;
-        self
-    }
-
     /// Pull the entries after `since`; `None` reads from the start of this incarnation.
     pub async fn pull(
         &self,

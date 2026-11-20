@@ -6,8 +6,9 @@
 //! every earlier message byte-identical at the same position. Moving a `cache_control` marker is
 //! the one allowed difference, so markers are removed before comparing.
 //!
-//! These tests run the REAL run loop (repetition guidance, budget messages, replay of earlier
-//! episodes, system-prompt de-duplication) and render each request it sends with the Anthropic
+//! These tests run the session loop production runs (repetition guidance, budget messages, earlier
+//! episodes read back from the stored session, system-prompt de-duplication) and render each
+//! request it sends with the Anthropic
 //! renderer (thinking echo, cross-model strip, tool id and name aliasing, empty-turn omission,
 //! cache markers), then compare consecutive requests.
 
@@ -15,10 +16,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use broca_core::{
-    provider::Provider, run_loop, run_loop_append_episode, AllowAll, FileLeaseStore, FileWalStore,
-    RunRequest, StubReply, StubToolPlane, WalStore,
-};
+use broca_core::{provider::Provider, AllowAll, RunRequest, StubReply, StubToolPlane};
 use broca_protocol::{
     content::{AssistantMessage, ContentBlock, Message, Role, ToolCall},
     provider::{NormalizedEvent, ProviderControl},
@@ -28,7 +26,6 @@ use broca_protocol::{
     },
     FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage,
 };
-use broca_wal::WalRecord;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -41,9 +38,6 @@ use crate::wire::{CacheClass, CachePolicy, CacheTtl, FrozenRenderConfig, MarkerS
 struct SequenceProvider {
     scripts: Arc<Mutex<VecDeque<Vec<NormalizedEvent>>>>,
     sent: Arc<Mutex<Vec<CallOptions>>>,
-    /// The render config each run freezes, when a test rebuilds requests offline from the WAL,
-    /// which reads it back; the trait's default otherwise.
-    frozen: Option<Value>,
 }
 
 impl SequenceProvider {
@@ -51,14 +45,7 @@ impl SequenceProvider {
         Self {
             scripts: Arc::new(Mutex::new(scripts.into())),
             sent: Arc::new(Mutex::new(Vec::new())),
-            frozen: None,
         }
-    }
-
-    /// Freezes `frozen` into every run it serves.
-    fn freezing(mut self, frozen: &FrozenRenderConfig) -> Self {
-        self.frozen = Some(serde_json::to_value(frozen).unwrap());
-        self
     }
 }
 
@@ -77,10 +64,7 @@ impl Provider for SequenceProvider {
     }
 
     fn render_config_blob(&self) -> Value {
-        match &self.frozen {
-            Some(frozen) => frozen.clone(),
-            None => json!({ "render_config": "stateless" }),
-        }
+        json!({ "render_config": "stateless" })
     }
 }
 
@@ -215,28 +199,113 @@ fn failing_plane() -> StubToolPlane {
     StubToolPlane::new().with_tool(TOOL, |_| StubReply::ExecError("file not found".into()))
 }
 
+/// One test's stored session and its parts, kept between that test's episodes.
+type Held = (
+    broca_session_store::session::Session<&'static broca_session_store::backend::MemoryBackend>,
+    broca_session_loop::parts::MemoryParts,
+);
+
+/// The stored session of each test, by the test's directory: a later [`drive`] on the same
+/// directory continues it, as a later send to one session does.
+static SESSIONS: Mutex<Vec<(std::path::PathBuf, Held)>> = Mutex::new(Vec::new());
+
+/// Runs `req` as the next episode of the session kept for `dir` (created on its first episode),
+/// through the session loop production runs.
 async fn drive(
     dir: &std::path::Path,
-    req: RunRequest,
+    mut req: RunRequest,
     provider: &SequenceProvider,
     plane: &StubToolPlane,
-    append: bool,
-) {
-    let lease = FileLeaseStore::new(dir.join("lease"));
-    let wal = FileWalStore::new(dir.join("wal"));
+) -> Result<(), broca_core::RunError> {
+    let held = {
+        let mut sessions = SESSIONS.lock().unwrap();
+        let index = sessions.iter().position(|(held_dir, _)| held_dir == dir);
+        index.map(|index| sessions.remove(index).1)
+    };
+    let (mut session, mut parts) = match held {
+        Some(held) => held,
+        None => {
+            let backend: &'static broca_session_store::backend::MemoryBackend =
+                Box::leak(Box::default());
+            let session = broca_session_store::session::Session::create(
+                backend,
+                broca_session_store::backend::SessionAddr("0123456789abcdef".into()),
+                broca_session_store::head::SessionTriple {
+                    project_root: dir.display().to_string(),
+                    harness: req.session.harness.clone(),
+                    session: req.session.session.clone(),
+                },
+                &broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+                false,
+            )
+            .await
+            .expect("the session is created");
+            (session, Default::default())
+        }
+    };
+    let result = run_episode(&mut session, &mut parts, &mut req, provider, plane).await;
+    SESSIONS
+        .lock()
+        .unwrap()
+        .push((dir.to_path_buf(), (session, parts)));
+    result
+}
+
+async fn run_episode(
+    session: &mut broca_session_store::session::Session<
+        &'static broca_session_store::backend::MemoryBackend,
+    >,
+    parts: &mut broca_session_loop::parts::MemoryParts,
+    req: &mut RunRequest,
+    provider: &SequenceProvider,
+    plane: &StubToolPlane,
+) -> Result<(), broca_core::RunError> {
+    use broca_session_loop::writer::Writer as _;
+    let admission = broca_session_loop::admit::admission(
+        req,
+        &broca_core::RunControl::default(),
+        provider,
+        session.operations(),
+        Some(1),
+    )?;
     let (tx, mut rx) = mpsc::channel(512);
     let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    if append {
-        run_loop_append_episode(req, provider, plane, &lease, &AllowAll, &wal, None, &tx)
-            .await
-            .expect("appended episode runs");
-    } else {
-        run_loop(req, provider, plane, &lease, &AllowAll, &wal, &tx)
-            .await
-            .expect("first episode runs");
-    }
+    let seams = broca_session_loop::Seams {
+        person_steers: None,
+        provider,
+        tools: plane,
+        bind: req.session.clone(),
+        out: Some(&tx),
+        cancel: Default::default(),
+        stop: Default::default(),
+        held: None,
+        approval: &AllowAll,
+        hook_plane: None,
+        now_ms: &|| 1,
+        session_address: None,
+        compaction_plane: None,
+        compaction_session: None,
+        compaction_changes: false,
+        keep_warm: None,
+        account_reports: None,
+        max_same_account_wait: Default::default(),
+        auth_selection: None,
+        step_progress: None,
+        model_call_ready: None,
+        pause_for_auth_at_start: None,
+        account_continue: None,
+    };
+    // A refusal the loop finds before sending (a changed system prompt) is the episode's answer;
+    // any other loop error is a broken test.
+    let ran = match broca_session_loop::run(session, parts, admission, &seams).await {
+        Ok(_) => Ok(()),
+        Err(broca_session_loop::LoopError::Refused(refused)) => Err(refused),
+        Err(other) => panic!("the episode runs: {other:?}"),
+    };
+    drop(seams);
     drop(tx);
     collector.await.unwrap();
+    ran
 }
 
 /// The OAuth Anthropic config with cache markers on, so marker placement is exercised too.
@@ -345,9 +414,9 @@ async fn a_multi_episode_session_renders_append_only() {
         request(&dir, "e1", model, user("read a twice")),
         &provider,
         &plane,
-        false,
     )
-    .await;
+    .await
+    .unwrap();
     let mut marked = user("continue");
     marked.cache_prefix_blocks = Some(1);
     let mut second = request(&dir, "e2", model, marked);
@@ -360,15 +429,15 @@ async fn a_multi_episode_session_renders_append_only() {
         finalize_at_tool_calls: 99,
         finalize_text: "finalize".into(),
     });
-    drive(&dir, second, &provider, &plane, true).await;
+    drive(&dir, second, &provider, &plane).await.unwrap();
     drive(
         &dir,
         request(&dir, "e3", model, user("thanks")),
         &provider,
         &plane,
-        true,
     )
-    .await;
+    .await
+    .unwrap();
 
     let sent = provider.sent.lock().unwrap().clone();
     assert_eq!(sent.len(), 7, "every scripted step was requested");
@@ -434,25 +503,25 @@ async fn a_model_round_trip_renders_append_only() {
         request(&dir, "a", model_a, user("one")),
         &provider,
         &plane,
-        false,
     )
-    .await;
+    .await
+    .unwrap();
     drive(
         &dir,
         request(&dir, "b", model_b, user("two")),
         &provider,
         &plane,
-        true,
     )
-    .await;
+    .await
+    .unwrap();
     drive(
         &dir,
         request(&dir, "c", model_a, user("three")),
         &provider,
         &plane,
-        true,
     )
-    .await;
+    .await
+    .unwrap();
 
     let sent = provider.sent.lock().unwrap().clone();
     assert_eq!(sent.len(), 6);
@@ -513,13 +582,13 @@ async fn a_later_episode_with_another_tool_sends_no_earlier_signed_thinking() {
         request(&dir, "t1", model, user("one")),
         &provider,
         &plane,
-        false,
     )
-    .await;
+    .await
+    .unwrap();
     let mut second = request(&dir, "t2", model, user("two"));
     second.tools.push(tool("grep"));
     second.policy_allowed.insert("grep".into());
-    drive(&dir, second, &provider, &plane, true).await;
+    drive(&dir, second, &provider, &plane).await.unwrap();
 
     let sent = provider.sent.lock().unwrap().clone();
     let bodies = render_all(&sent);
@@ -560,16 +629,20 @@ async fn a_changed_description_drops_earlier_thinking_and_an_unchanged_set_keeps
         request(&dir, "a", model, user("one")),
         &provider,
         &plane,
-        false,
     )
-    .await;
+    .await
+    .unwrap();
     let refreshed = |run: &str, text: &str| {
         let mut next = request(&dir, run, model, user(text));
         next.tools[0].description = "read a file, skipping binary content".into();
         next
     };
-    drive(&dir, refreshed("b", "two"), &provider, &plane, true).await;
-    drive(&dir, refreshed("c", "three"), &provider, &plane, true).await;
+    drive(&dir, refreshed("b", "two"), &provider, &plane)
+        .await
+        .unwrap();
+    drive(&dir, refreshed("c", "three"), &provider, &plane)
+        .await
+        .unwrap();
 
     let bodies = render_all(&provider.sent.lock().unwrap());
     assert_eq!(bodies.len(), 5);
@@ -601,11 +674,11 @@ async fn reordered_tools_keep_earlier_signed_thinking() {
     let mut first = request(&dir, "t1", model, user("one"));
     first.tools.push(tool("grep"));
     first.policy_allowed.insert("grep".into());
-    drive(&dir, first, &provider, &plane, false).await;
+    drive(&dir, first, &provider, &plane).await.unwrap();
     let mut second = request(&dir, "t2", model, user("two"));
     second.tools.insert(0, tool("grep"));
     second.policy_allowed.insert("grep".into());
-    drive(&dir, second, &provider, &plane, true).await;
+    drive(&dir, second, &provider, &plane).await.unwrap();
 
     let bodies = render_all(&provider.sent.lock().unwrap());
     assert_eq!(
@@ -614,106 +687,6 @@ async fn reordered_tools_keep_earlier_signed_thinking() {
         "the request lists the tools in the order declared"
     );
     assert!(sends_signature(&bodies, 1, "sig-t1"));
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// The floor comes from the runs' start records, so a run resumed after a crash and a request
-/// rebuilt offline from the WAL (cache-dump's render) send exactly the bytes the live run sent
-/// after its tools changed.
-#[tokio::test]
-async fn a_resumed_run_and_an_offline_rebuild_send_the_live_bytes_after_a_tool_change() {
-    let dir = scratch("broca-anthropic-tools-changed-resume");
-    let model = "claude-opus-4-8";
-    let frozen = frozen_with_markers(model);
-    let b_steps = || vec![tool_step("b1", json!({"p": "b"})), text_step("b2", "two")];
-    let mut steps = vec![tool_step("a1", json!({"p": "a"})), text_step("a2", "one")];
-    steps.extend(b_steps());
-    let provider = SequenceProvider::new(steps).freezing(&frozen);
-    let plane = failing_plane();
-    drive(
-        &dir,
-        request(&dir, "a", model, user("one")),
-        &provider,
-        &plane,
-        false,
-    )
-    .await;
-    let refreshed = || {
-        let mut next = request(&dir, "b", model, user("two"));
-        next.tools[0].description = "read a file, skipping binary content".into();
-        next
-    };
-    drive(&dir, refreshed(), &provider, &plane, true).await;
-    let live = render_all(&provider.sent.lock().unwrap());
-    assert_eq!(live.len(), 4);
-    assert!(sends_signature(&live, 1, "sig-a1"));
-    assert!(!sends_signature(&live, 2, "sig-a1") && !sends_signature(&live, 3, "sig-a1"));
-
-    let request_b = refreshed();
-    let wal = FileWalStore::new(dir.join("wal"));
-    let records: Vec<WalRecord> = WalStore::read_records(&wal, &request_b.session)
-        .unwrap()
-        .into_iter()
-        .map(|framed| framed.record)
-        .collect();
-    let b_start = records
-        .iter()
-        .position(
-            |record| matches!(record, WalRecord::RunStarted { run_id, .. } if run_id.0 == "b"),
-        )
-        .expect("run b started");
-    let WalRecord::RunStarted { config, .. } = &records[b_start] else {
-        unreachable!()
-    };
-
-    // Offline: each of run b's steps rebuilt from the records through its `step_started`.
-    for (step, live_body) in [(1, &live[2]), (2, &live[3])] {
-        let through = b_start
-            + records[b_start..]
-                .iter()
-                .position(|record| {
-                    matches!(record, WalRecord::StepStarted { step_id } if step_id.0 == step)
-                })
-                .expect("the step started");
-        let (_, opts, _) =
-            broca_module_serve::wal_render::render_step(&records[..=through], config, "b", step)
-                .expect("the step renders offline");
-        let mut body = build_request_body(&frozen, &opts);
-        strip_cache_control(&mut body);
-        assert_eq!(&body, live_body, "offline rebuild of step {step}");
-    }
-
-    // Resume: a crash right after run b's start, resumed from a copy of the log through it.
-    let resume_dir = dir.join("resume");
-    let resume_wal = FileWalStore::new(resume_dir.join("wal"));
-    std::fs::create_dir_all(resume_wal.wal_path(&request_b.session).parent().unwrap()).unwrap();
-    {
-        let mut log = broca_wal::FileWal::open(resume_wal.wal_path(&request_b.session))
-            .unwrap()
-            .with_feature_floor(resume_wal.feature_floor_path());
-        for record in &records[..=b_start] {
-            broca_wal::Wal::append(&mut log, 1, record, true).unwrap();
-        }
-    }
-    let resumed_provider = SequenceProvider::new(b_steps()).freezing(&frozen);
-    let lease = FileLeaseStore::new(resume_dir.join("lease"));
-    let (tx, mut rx) = mpsc::channel(512);
-    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    run_loop(
-        request_b,
-        &resumed_provider,
-        &plane,
-        &lease,
-        &AllowAll,
-        &resume_wal,
-        &tx,
-    )
-    .await
-    .expect("run b resumes");
-    drop(tx);
-    collector.await.unwrap();
-    let resumed = render_all(&resumed_provider.sent.lock().unwrap());
-    assert_eq!(resumed, live[2..], "a resumed run b sends the live bytes");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -732,9 +705,9 @@ async fn a_later_episode_cannot_add_a_second_system_message() {
         request(&dir, "s1", model, user("one")),
         &provider,
         &plane,
-        false,
     )
-    .await;
+    .await
+    .unwrap();
 
     let mut second = request(&dir, "s2", model, user("two"));
     second.input.insert(
@@ -746,16 +719,7 @@ async fn a_later_episode_cannot_add_a_second_system_message() {
             }],
         ),
     );
-    let lease = FileLeaseStore::new(dir.join("lease"));
-    let wal = FileWalStore::new(dir.join("wal"));
-    let (tx, mut rx) = mpsc::channel(512);
-    let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let result = run_loop_append_episode(
-        second, &provider, &plane, &lease, &AllowAll, &wal, None, &tx,
-    )
-    .await;
-    drop(tx);
-    collector.await.unwrap();
+    let result = drive(&dir, second, &provider, &plane).await;
 
     assert!(
         matches!(result, Err(broca_core::RunError::SystemPromptChanged)),

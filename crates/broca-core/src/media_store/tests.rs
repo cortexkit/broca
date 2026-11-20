@@ -338,22 +338,6 @@ fn manifests_use_the_full_triple_and_classes_have_separate_objects() {
 }
 
 #[test]
-fn registration_holds_shared_store_lock_through_wal_append() {
-    let (_, store, mut manifest) = fixture();
-    manifest
-        .register_and_append(&reference(), BYTES, || {
-            let contender = store.lock()?;
-            assert!(
-                contender.try_lock().is_err(),
-                "a sweep cannot enter during registration"
-            );
-            Ok(())
-        })
-        .unwrap();
-    store.with_exclusive_lock(|| Ok(())).unwrap();
-}
-
-#[test]
 fn partial_manifest_write_cannot_swallow_a_later_registration() {
     let (_, store, mut manifest) = fixture();
     let reference = reference();

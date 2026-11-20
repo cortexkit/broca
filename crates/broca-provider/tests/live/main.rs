@@ -11,6 +11,10 @@
 
 #[path = "../live_common/mod.rs"]
 mod live_common;
+// The rig is shared with the library's unit tests, which use parts this binary doesn't.
+#[allow(dead_code)]
+#[path = "../session_loop_rig.rs"]
+mod session_loop_rig;
 
 mod anthropic_live;
 mod bedrock_live;

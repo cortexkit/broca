@@ -66,6 +66,18 @@ struct BillingConfig {
 }
 
 impl ChargeBasisTable {
+    /// How many local override rows are in effect.
+    pub fn override_row_count(&self) -> usize {
+        self.overrides.len()
+    }
+
+    /// `"none"` when no local override rows are in effect, otherwise their digest (64
+    /// lowercase hex characters). This is the value every fact carries as
+    /// `charge_basis_overrides`.
+    pub fn overrides_digest(&self) -> &str {
+        &self.overrides_digest
+    }
+
     /// Return a table with no provider rows.  Resolution still returns Unknown,
     /// which is useful for callers that deliberately disable shipped defaults.
     pub fn empty() -> Self {
@@ -126,18 +138,6 @@ impl ChargeBasisTable {
     /// The shipped version, carried with every resolution including Unknown.
     pub fn version(&self) -> u32 {
         self.version
-    }
-
-    /// `"none"` when no local override rows are in effect, otherwise their digest (64
-    /// lowercase hex characters). This is the value every fact carries as
-    /// `charge_basis_overrides`.
-    pub fn overrides_digest(&self) -> &str {
-        &self.overrides_digest
-    }
-
-    /// How many local override rows are in effect.
-    pub fn override_row_count(&self) -> usize {
-        self.overrides.len()
     }
 
     /// One startup warning describing the local override rows, or None when there are none.
@@ -426,107 +426,17 @@ mod tests {
         }
     }
 
-    /// One run on `provider` authenticated with `credential_id`, finished, as WAL records.
-    fn one_run(provider: &str, credential_id: &str) -> Vec<broca_wal::FramedRecord> {
-        let framed = |seq, record| broca_wal::FramedRecord {
-            seq,
-            fence: 1,
-            record,
-        };
-        vec![
-            framed(
-                1,
-                broca_wal::WalRecord::RunStarted {
-                    message_marks: None,
-                    sent_by: None,
-                    written_at_ms: None,
-                    tags: None,
-                    session_class: None,
-                    retention: None,
-                    hooks: None,
-                    title: None,
-                    on_restart: None,
-                    keep_warm: None,
-                    compaction_plan_version: None,
-                    marker_order_version: None,
-                    manifest: None,
-                    scope: None,
-                    send_id: None,
-                    request_identity_digest: None,
-                    project_id: None,
-                    principal: None,
-                    run_id: broca_protocol::RunId("run".into()),
-                    session: broca_protocol::BindIdentity::new("/tmp/project", "harness", "s"),
-                    ts_ms: Some(100),
-                    config: Box::new(broca_wal::RunConfig {
-                        account_route: None,
-                        global_system: None,
-                        route_decision_id: None,
-                        served_provider: None,
-                        account_limit_pause: false,
-                        turn_directives_v1: None,
-                        render_tags: false,
-                        computed_tags: None,
-                        model: broca_protocol::request::ModelHandle::new(provider, "model"),
-                        tools: Vec::new().into(),
-                        tool_choice: Default::default(),
-                        generation: Default::default(),
-                        response_format: Default::default(),
-                        provider_options: Value::Null,
-                        cache_tiers: Value::Null,
-                        context_epoch: 0,
-                        renderer_version: 1,
-                        frozen_render_config: Value::Null,
-                        auth_selection: Some(broca_core::AuthSelection {
-                            billing_vault_facts: None,
-                            auth_method: None,
-                            credential_id: credential_id.into(),
-                            account_ref: None,
-                            resolved_credential_id: None,
-                            vault_request: None,
-                            account_decision: None,
-                        }),
-                        tools_were_omitted: false,
-                        budget: None,
-                        context_limit: None,
-                        work_class: None,
-                        variant: None,
-                        service_tier: None,
-                        stop_when: Vec::new(),
-                        context_management: None,
-                    }),
-                    input: Vec::new().into(),
-                    origin: broca_wal::RunOrigin::Fresh,
-                    submission_id: None,
-                },
-            ),
-            framed(
-                2,
-                broca_wal::WalRecord::RunFinished {
-                    interrupt_reason: None,
-                    ts_ms: Some(200),
-                    reason: broca_protocol::caller::RunFinishReason::Completed,
-                    usage: broca_protocol::Usage::default(),
-                    error: None,
-                    retries_used: 0,
-                },
-            ),
-        ]
-    }
-
-    /// The single fact the real resolver stamps for one run.
+    /// What a spend fact records for one run on `credential_id`: the basis and version the
+    /// table resolves for the credential's sign-in method, and the table's override digest.
     fn fact(table: &ChargeBasisTable, provider: &str, credential_id: &str) -> SpendFact {
-        let segments =
-            broca_core::compute_segments(&one_run(provider, credential_id), "test", table);
-        assert_eq!(segments.len(), 1);
-        let segment = &segments[0];
+        let method = credential_id.split(':').next().unwrap_or("");
+        let (basis, version) = table.resolve_charge_basis(provider, method);
         SpendFact {
-            basis: segment.charge_basis,
-            version: segment.charge_basis_mapping_version,
-            overrides: segment.charge_basis_overrides.clone(),
+            basis,
+            version,
+            overrides: Some(table.charge_basis_overrides()),
         }
     }
-
     #[derive(Debug, PartialEq)]
     struct SpendFact {
         basis: ChargeBasis,

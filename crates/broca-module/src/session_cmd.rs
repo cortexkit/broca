@@ -38,15 +38,6 @@ pub enum SendKey {
 }
 
 impl SendKey {
-    /// Map the older boolean form: `true` means the caller chose a stable run id.
-    pub fn from_keyed(idempotency_keyed: bool) -> Self {
-        if idempotency_keyed {
-            Self::RunId
-        } else {
-            Self::Minted
-        }
-    }
-
     /// Whether a retry can repeat this send's run id, and so must be deduplicated.
     pub fn is_keyed(&self) -> bool {
         !matches!(self, Self::Minted)

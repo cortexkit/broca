@@ -19,41 +19,6 @@ struct Skeleton {
 }
 
 impl Skeleton {
-    fn capture(message: &Message) -> Self {
-        let mut slots = Vec::new();
-        for (block, value) in message.content.iter().enumerate() {
-            match value {
-                ContentBlock::Media(reference) => slots.push(Slot {
-                    block,
-                    part: None,
-                    call: None,
-                    reference: reference.clone(),
-                }),
-                ContentBlock::ToolResult(result) => {
-                    if let ToolOutput::Parts { parts } = &result.output {
-                        for (part, value) in parts.iter().enumerate() {
-                            if let ToolOutputPart::Media { media } = value {
-                                slots.push(Slot {
-                                    block,
-                                    part: Some(part),
-                                    call: Some(result.tool_call_id.clone()),
-                                    reference: media.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Self {
-            ordinal: message.ordinal,
-            role: message.role,
-            blocks: message.content.len(),
-            slots,
-        }
-    }
-
     fn restore(&self) -> Message {
         let mut message = Message::new(
             self.role,
@@ -90,6 +55,41 @@ impl Skeleton {
             }
         }
         message
+    }
+
+    fn capture(message: &Message) -> Self {
+        let mut slots = Vec::new();
+        for (block, value) in message.content.iter().enumerate() {
+            match value {
+                ContentBlock::Media(reference) => slots.push(Slot {
+                    block,
+                    part: None,
+                    call: None,
+                    reference: reference.clone(),
+                }),
+                ContentBlock::ToolResult(result) => {
+                    if let ToolOutput::Parts { parts } = &result.output {
+                        for (part, value) in parts.iter().enumerate() {
+                            if let ToolOutputPart::Media { media } = value {
+                                slots.push(Slot {
+                                    block,
+                                    part: Some(part),
+                                    call: Some(result.tool_call_id.clone()),
+                                    reference: media.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            ordinal: message.ordinal,
+            role: message.role,
+            blocks: message.content.len(),
+            slots,
+        }
     }
 }
 
@@ -220,7 +220,6 @@ pub struct MediaCheckpoint {
     pub step_open: bool,
     pub history: Vec<MediaHistory>,
     pub(crate) session: SessionMedia,
-    profile: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -255,16 +254,17 @@ impl MediaCheckpoint {
             step_open: false,
             history: Vec::new(),
             session: SessionMedia::metadata(None),
-            profile: None,
         }
     }
 
-    pub fn empty_at(placement: Placement, at_seq: u64) -> Self {
-        let mut checkpoint = Self::empty();
-        checkpoint.at_seq = at_seq;
-        checkpoint.session.records = at_seq;
-        checkpoint.session.placement = placement;
-        checkpoint
+    pub fn into_session(
+        mut self,
+        store: impl MediaBytes + 'static,
+        budget: Option<broca_protocol::request::BudgetConfig>,
+    ) -> (SessionMedia, Vec<MediaHistory>, bool, u64) {
+        self.session.store = Some(std::sync::Arc::new(store));
+        self.session.placement = Placement::from_index_seed(self.session.placement, budget);
+        (self.session, self.history, self.step_open, self.at_seq)
     }
 
     pub fn decode(value: &serde_json::Value) -> Result<Self, String> {
@@ -328,16 +328,11 @@ impl MediaCheckpoint {
         {
             return Err("media_seed_undecodable: invalid capture positions".into());
         }
-        let profile = wire.history.iter().rev().find_map(|event| match event {
-            MediaHistory::Profile { media, .. } => Some(media.clone()),
-            _ => None,
-        });
         Ok(Self {
             at_seq: wire.at_seq,
             step_open: wire.step_open,
             history: wire.history,
             session: wire.index.restore(None),
-            profile,
         })
     }
 
@@ -352,109 +347,6 @@ impl MediaCheckpoint {
         };
         wire.sha256 = digest(&wire);
         serde_json::to_value(wire).expect("media metadata serializes")
-    }
-
-    pub fn resume_budget(&mut self, budget: Option<broca_protocol::request::BudgetConfig>) {
-        self.session.placement = Placement::from_index_seed(self.session.placement.clone(), budget);
-    }
-
-    pub fn fold(&mut self, seq: u64, record: &WalRecord) -> Result<(), String> {
-        self.session.fold(record)?;
-        let frozen = match record {
-            WalRecord::RunStarted { config, .. } => Some(&config.frozen_render_config),
-            WalRecord::RunConfigRefrozen {
-                frozen_render_config,
-                ..
-            } => Some(frozen_render_config),
-            _ => None,
-        };
-        if let Some(media) = frozen
-            .and_then(|frozen| frozen.get("media"))
-            .filter(|media| !media.is_null())
-            .filter(|media| self.profile.as_ref() != Some(*media))
-        {
-            self.profile = Some(media.clone());
-            self.history.push(MediaHistory::Profile {
-                media: media.clone(),
-                selected: self.session.selected_bindings(),
-            });
-        }
-        let changes = self.session.take_changes();
-        if !changes.is_empty() {
-            self.history.push(MediaHistory::Changes(changes));
-        }
-        match record {
-            WalRecord::RunStarted { .. } => self.step_open = false,
-            WalRecord::StepStarted { .. } => self.step_open = true,
-            WalRecord::ModelAttemptFinished { .. } | WalRecord::ModelStepFinished { .. } => {
-                if !matches!(self.history.last(), Some(MediaHistory::Boundary)) {
-                    self.history.push(MediaHistory::Boundary);
-                }
-                if matches!(record, WalRecord::ModelStepFinished { .. }) {
-                    self.step_open = false;
-                }
-            }
-            _ => {}
-        }
-        self.at_seq = seq;
-        Ok(())
-    }
-
-    pub fn into_session(
-        mut self,
-        store: impl MediaBytes + 'static,
-        budget: Option<broca_protocol::request::BudgetConfig>,
-    ) -> (SessionMedia, Vec<MediaHistory>, bool, u64) {
-        self.session.store = Some(std::sync::Arc::new(store));
-        self.session.placement = Placement::from_index_seed(self.session.placement, budget);
-        (self.session, self.history, self.step_open, self.at_seq)
-    }
-}
-
-/// A session's media checkpoint folded record by record from its first record, with the seed
-/// today's admission gives a run at any point (see `initialize_media_checkpoint`): the whole
-/// fold once any record captured media, and before that only the position and placement, as
-/// `WalHandle::empty_media_checkpoint` gives a session that never captured any.
-#[derive(Debug, Clone)]
-pub struct MediaSeedFold {
-    checkpoint: MediaCheckpoint,
-    captured: bool,
-}
-
-impl Default for MediaSeedFold {
-    fn default() -> Self {
-        Self {
-            checkpoint: MediaCheckpoint::empty(),
-            captured: false,
-        }
-    }
-}
-
-impl MediaSeedFold {
-    /// Folds the record at `seq`, the one after the last folded.
-    pub fn fold(&mut self, seq: u64, record: &WalRecord) -> Result<(), String> {
-        if seq != self.checkpoint.at_seq + 1 {
-            return Err(format!(
-                "media fold expected record {} and got record {seq}",
-                self.checkpoint.at_seq + 1
-            ));
-        }
-        self.captured |= crate::compaction::CapturedMedia::captures_any(record);
-        self.checkpoint.fold(seq, record)
-    }
-
-    /// The seq of the last record folded.
-    pub fn at_seq(&self) -> u64 {
-        self.checkpoint.at_seq
-    }
-
-    /// The checkpoint a run renders from, through the last record folded.
-    pub fn seed(&self) -> MediaCheckpoint {
-        if self.captured {
-            self.checkpoint.clone()
-        } else {
-            MediaCheckpoint::empty_at(self.checkpoint.session.placement.clone(), self.at_seq())
-        }
     }
 }
 
@@ -488,44 +380,5 @@ impl<'de> Deserialize<'de> for DurableMediaSeed {
             Ok(seed) => Self::Ready(Box::new(seed)),
             Err(_) => Self::Unreadable(value),
         })
-    }
-}
-
-static SEED_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub fn seed_fallback_count() -> u64 {
-    SEED_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Record a named repair when a media reader cannot trust its stored checkpoint.
-pub fn count_seed_fallback(reason: &str) {
-    SEED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tracing::warn!(reason, "media checkpoint requires full durable replay");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn restored_view_coverage_wins_over_later_setup_metadata() {
-        let mut checkpoint = MediaCheckpoint::empty();
-        checkpoint.session.restored_selection = Some(Vec::new());
-        checkpoint.session.restored_covered = Some(2);
-        checkpoint.session.restored_view = true;
-        let setup: WalRecord = serde_json::from_value(serde_json::json!({
-            "type":"compaction_message", "provider":"compactor", "kind":"setup",
-            "compaction_id":"later-setup", "version":1, "range":{"from":0,"to":9},
-            "replacement":[], "sha256":"fixture"
-        }))
-        .unwrap();
-        checkpoint.fold(1, &setup).unwrap();
-        let encoded = checkpoint.encode();
-        assert_eq!(
-            encoded["index"]["covered"], 2,
-            "an applied view still takes precedence over Setup"
-        );
-        let restored = MediaCheckpoint::decode(&encoded).unwrap();
-        assert_eq!(restored.session.covered(), Some(2));
     }
 }

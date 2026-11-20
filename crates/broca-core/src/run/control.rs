@@ -7,28 +7,10 @@ use tokio_util::sync::CancellationToken;
 
 use broca_protocol::ProviderError;
 
-#[cfg(test)]
-use super::held_prompt;
-#[cfg(all(test, feature = "test-clock"))]
-use super::ApprovalWaitProbe;
-use super::ProviderHeldCloseOut;
-use crate::clock::epoch_millis;
-
 /// Cooperative run controls. Optional controls default to "off"; ordinary control-payload
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
 pub struct RunControl {
-    /// Historical replay fixtures need the retired v1 writer to generate durable
-    /// record prefixes at each simulated crash point. Production cannot enable it.
-    #[cfg(test)]
-    pub(crate) legacy_compaction_fixture: bool,
-    /// A compaction ride tells the compaction provider that the prompt cache is already lost,
-    /// so held compaction work can land in a rebuild that costs nothing extra. Tests of what a
-    /// ride delivers need one on a fresh step, where production has no proven cause to ride
-    /// for, so they stand in for the cache clock with this flag: it makes the step's cache count
-    /// as proven expired.
-    #[cfg(test)]
-    pub(crate) compaction_cache_proven_expired: bool,
     /// Session-owned v2 state shared with compaction-runner pushed-view calls.
     pub compaction_session: Option<Arc<crate::compaction_v2::session::Session>>,
     /// Receives durable entry changes without putting v2 notices in the WAL.
@@ -45,19 +27,9 @@ pub struct RunControl {
     /// account choice names the credential the session last ran on there (`warm_credential`),
     /// so routing can keep it on the account whose prompt cache already holds its prefix.
     pub moved_here: bool,
-    #[cfg(test)]
-    pub(crate) held_prompt_probe: Option<Arc<held_prompt::Probe>>,
-    #[cfg(test)]
-    pub(crate) view_release_probe: Option<Arc<held_prompt::ReleaseProbe>>,
-    #[cfg(test)]
-    pub(crate) retain_full_prompt: bool,
     /// Installed by the late-result runtime to rejoin durable waiting slots without re-dispatch.
     /// Absent by default: a reader or a caller retry cannot drive a provider-held run.
     pub provider_held_lifecycle: Option<Arc<dyn crate::tool_plane::ProviderHeldLifecycle>>,
-    /// Batch-owned close-out state, retained if cancellation arrives after dispatch returns
-    /// but before the run records its pause.
-    #[doc(hidden)]
-    pub provider_held_close_out: Arc<std::sync::Mutex<ProviderHeldCloseOut>>,
     /// Cheap actor-owned status; never a durability or cancellation input.
     pub step_progress: Option<crate::provider::LiveStepProgress>,
     /// A count of the steers carrying the person's own messages into this run, kept by the
@@ -66,8 +38,6 @@ pub struct RunControl {
     /// read the person's message; the call's final result arrives later as a notice. Only calls
     /// whose provider declared it can do this are asked. `None` asks nothing.
     pub person_steers: Option<crate::tool_plane::PersonSteers>,
-    #[cfg(all(test, feature = "test-clock"))]
-    pub(crate) approval_wait_probe: Option<Arc<ApprovalWaitProbe>>,
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
     /// `RunFinished` and `RunPaused` timestamps. Unset uses the system clock.
     pub clock: Option<crate::Clock>,
@@ -78,8 +48,7 @@ pub struct RunControl {
     pub max_same_account_wait: crate::SameAccountWait,
     /// Immediate cancellation: abort the model stream and stop dispatch, closing the batch
     /// under the existing at-most-once rules before finishing `Cancelled`. `None` disables
-    /// this signal. Boundary cancellation uses the shared `steer` inbox instead, so it can
-    /// forbid the next StepStarted without aborting this step's model or tool work.
+    /// this signal.
     pub cancel: Option<CancellationToken>,
     /// Per-model-call timeout (the provider watchdog). Normal expiry closes Interrupted
     /// and releases the lease after writer shutdown. On a `broca-state/2` root (a staging
@@ -143,15 +112,6 @@ pub struct RunControl {
     /// work in flight, this only refuses to start more. `None` means nothing asks this run to
     /// stop.
     pub stop_requested: Option<CancellationToken>,
-    /// Where the session's lineage actor hands this run the messages a caller steers into it
-    /// (`session.send` with `delivery: steer`). The loop appends them to the prompt at its next
-    /// step boundary, and closes the inbox before it writes a terminal. `None` means nothing can
-    /// steer this run, and the loop behaves exactly as without it.
-    pub steer: Option<std::sync::Arc<crate::SteerInbox>>,
-    /// The actor's admission snapshot head before it exposes this run's live inbox.
-    /// Replay owns steers at or below this boundary; the inbox owns later steers.
-    /// Keep the original boundary when initialization reloads newer WAL state.
-    pub live_steer_after_seq: Option<u64>,
     /// The frozen plan manifest of a session admitted with a fetch plan. A fresh episode
     /// records it on its `RunStarted`: the first episode freezes it there, and every later one
     /// repeats it so the episodes left after a WAL fold still carry it. A `RunStarted` carrying
@@ -202,29 +162,11 @@ pub struct RunControl {
     pub test_compaction: Option<crate::compaction::test_control::Config>,
 }
 
-impl RunControl {
-    pub(crate) fn now_ms(&self) -> Option<u64> {
-        self.clock
-            .as_ref()
-            .map_or_else(epoch_millis, |clock| Some(clock.now_ms()))
-    }
-
-    /// Stop accepting steered messages: the run writes no further step. Called before every
-    /// terminal or pause record, so no `Steered` record can follow the episode's end.
-    pub(super) fn close_steers(&self) {
-        if let Some(inbox) = &self.steer {
-            inbox.close();
-        }
-    }
-}
+impl RunControl {}
 
 impl Default for RunControl {
     fn default() -> Self {
         Self {
-            #[cfg(test)]
-            legacy_compaction_fixture: false,
-            #[cfg(test)]
-            compaction_cache_proven_expired: false,
             compaction_session: None,
             compaction_changes: None,
             new_log_compaction_plan_version: None,
@@ -232,18 +174,9 @@ impl Default for RunControl {
             display_message_marks: None,
             conversation_key: None,
             moved_here: false,
-            #[cfg(test)]
-            held_prompt_probe: None,
-            #[cfg(test)]
-            view_release_probe: None,
-            #[cfg(test)]
-            retain_full_prompt: false,
             provider_held_lifecycle: None,
-            provider_held_close_out: Default::default(),
             step_progress: None,
             person_steers: None,
-            #[cfg(all(test, feature = "test-clock"))]
-            approval_wait_probe: None,
             clock: None,
             account_limit_pause: false,
             max_same_account_wait: crate::SameAccountWait::default(),
@@ -264,8 +197,6 @@ impl Default for RunControl {
             tools_were_omitted: false,
             shutdown_seal: None,
             stop_requested: None,
-            steer: None,
-            live_steer_after_seq: None,
             manifest: None,
             manifest_system_override: false,
             applies_refresh: None,

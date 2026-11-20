@@ -76,14 +76,6 @@ impl Default for StubToolPlane {
 }
 
 impl StubToolPlane {
-    pub fn new() -> Self {
-        Self {
-            handlers: HashMap::new(),
-            state: Mutex::new(State::default()),
-            dispatch_target: None,
-        }
-    }
-
     /// Register a handler for `tool_name`.
     pub fn with_tool<F>(mut self, tool_name: &str, handler: F) -> Self
     where
@@ -104,37 +96,12 @@ impl StubToolPlane {
         })
     }
 
-    /// Report `module` as the module every call is dispatched to.
-    pub fn with_dispatch_target(mut self, module: &str) -> Self {
-        self.dispatch_target = Some(module.to_owned());
-        self
-    }
-
-    /// Make the next `batch_started` fail with `error`, as a real plane does when it cannot
-    /// prepare the batch's routes.
-    pub fn fail_next_batch_start(&self, error: ToolPlaneError) {
-        self.state.lock().unwrap().batch_start_error = Some(error);
-    }
-
-    /// The scope each batch's context carried, in batch order.
-    pub fn batch_scopes(&self) -> Vec<Option<broca_protocol::SessionScope>> {
-        self.state.lock().unwrap().batch_scopes.clone()
-    }
-
-    /// The lifecycle log (cloned).
-    pub fn log(&self) -> Vec<StubEvent> {
-        self.state.lock().unwrap().log.clone()
-    }
-
-    /// How many times a given tool_call_id ACTUALLY executed (fence asserts == 1).
-    pub fn exec_count(&self, id: &ToolCallId) -> u32 {
-        self.state
-            .lock()
-            .unwrap()
-            .exec_count
-            .get(id)
-            .copied()
-            .unwrap_or(0)
+    pub fn new() -> Self {
+        Self {
+            handlers: HashMap::new(),
+            state: Mutex::new(State::default()),
+            dispatch_target: None,
+        }
     }
 }
 
@@ -247,52 +214,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fence_prevents_double_execution() {
-        let plane = StubToolPlane::new().with_canned_text("get_time", "12:00");
-        let c = ctx();
-        let tc = call("toolu_1", "get_time");
-
-        let r1 = completed(plane.dispatch(&c, &tc).await);
-        let r2 = completed(plane.dispatch(&c, &tc).await); // repeated id
-
-        assert_eq!(r1, r2);
-        assert_eq!(
-            plane.exec_count(&ToolCallId("toolu_1".into())),
-            1,
-            "fenced: executed once"
-        );
-        assert_eq!(
-            plane.log(),
-            vec![
-                StubEvent::Dispatched(ToolCallId("toolu_1".into())),
-                StubEvent::Fenced(ToolCallId("toolu_1".into())),
-            ]
-        );
-    }
-
-    #[tokio::test]
     async fn unknown_tool_is_error_result_not_plane_error() {
         let plane = StubToolPlane::new();
         let r = completed(plane.dispatch(&ctx(), &call("t1", "nope")).await);
         assert!(r.is_error);
         assert!(matches!(r.output, ToolOutput::Error { .. }));
-    }
-
-    #[tokio::test]
-    async fn plane_unavailable_is_not_sent() {
-        let plane = StubToolPlane::new()
-            .with_tool("flaky", |_| StubReply::PlaneUnavailable("subc down".into()));
-        let out = plane.dispatch(&ctx(), &call("t1", "flaky")).await;
-        assert!(matches!(out, DispatchResult::NotSent { .. }));
-    }
-
-    #[tokio::test]
-    async fn outcome_unknown_is_ambiguous() {
-        let plane = StubToolPlane::new().with_tool("edit", |_| {
-            StubReply::OutcomeUnknown("reset after send".into())
-        });
-        let out = plane.dispatch(&ctx(), &call("t1", "edit")).await;
-        assert!(matches!(out, DispatchResult::SentButOutcomeUnknown { .. }));
     }
 
     fn completed(d: DispatchResult) -> ToolResult {

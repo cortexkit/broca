@@ -277,12 +277,8 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 name = "broca-bench"
 version = "0.4.81"
 dependencies = [
- "broca-core",
  "broca-protocol",
  "broca-replay",
- "broca-store",
- "broca-wal",
- "rusqlite",
  "serde",
  "serde_json",
  "subc-protocol 0.37.5",
@@ -328,7 +324,6 @@ version = "0.4.81"
 dependencies = [
  "async-trait",
  "base64",
- "broca-crash-harness",
  "broca-diagnostics",
  "broca-owner-only",
  "broca-protocol",
@@ -351,22 +346,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "broca-crash-harness"
-version = "0.4.81"
-dependencies = [
- "async-trait",
- "broca-core",
- "broca-protocol",
- "broca-store",
- "broca-test-support",
- "broca-wal",
- "cortexkit-role-llm-runner 0.8.65",
- "serde_json",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -418,7 +397,6 @@ dependencies = [
  "async-trait",
  "base64",
  "broca-core",
- "broca-crash-harness",
  "broca-diagnostics",
  "broca-fetch-plan",
  "broca-owner-only",
@@ -459,7 +437,6 @@ dependencies = [
  "base64",
  "broca-catalog",
  "broca-core",
- "broca-crash-harness",
  "broca-diagnostics",
  "broca-fetch-plan",
  "broca-heap-profile",
@@ -556,8 +533,8 @@ dependencies = [
  "base64",
  "broca-ck",
  "broca-core",
- "broca-crash-harness",
  "broca-diagnostics",
+ "broca-module",
  "broca-module-serve",
  "broca-owner-only",
  "broca-protocol",
@@ -625,7 +602,6 @@ version = "0.4.81"
 dependencies = [
  "async-trait",
  "broca-core",
- "broca-crash-harness",
  "broca-protocol",
  "broca-provider",
  "broca-session-store",
@@ -674,7 +650,6 @@ version = "0.4.81"
 dependencies = [
  "async-trait",
  "broca-core",
- "broca-crash-harness",
  "broca-owner-only",
  "broca-protocol",
  "broca-test-support",

@@ -111,7 +111,6 @@ supervisor can respawn it.
 | `broca-store` | Materialized store, export index and store maintenance. |
 | `ck-session-import`, `ck-import` | Readers for other harnesses' logs and the import CLI. |
 | `broca-bench`, `broca-replay`, `broca-test-support` | Benchmarks, replay fixtures and test support. |
-| `broca-crash-harness` | Crash-cut testing and recovery invariant checks. |
 
 ## Invariants
 

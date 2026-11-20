@@ -19,6 +19,10 @@ mod family_e2e;
 #[path = "../live_common/mod.rs"]
 mod live_common;
 mod render_golden_support;
+// The rig is shared with the library's unit tests, which use parts this binary doesn't.
+#[allow(dead_code)]
+#[path = "../session_loop_rig.rs"]
+mod session_loop_rig;
 
 #[cfg(feature = "live")]
 mod aimock_guard;
@@ -29,11 +33,9 @@ mod anthropic_cross_model_reasoning;
 mod anthropic_decode;
 #[cfg(feature = "live")]
 mod anthropic_e2e;
-mod anthropic_encode;
 mod anthropic_family_golden;
 mod anthropic_render_golden;
 mod anthropic_tool_id_alias;
-mod attempt_records;
 mod base_url_override;
 mod bedrock_converse_golden;
 #[cfg(feature = "live")]
@@ -42,13 +44,11 @@ mod bedrock_reasoning;
 mod bedrock_tool_id_alias;
 mod cache_marker_render_view;
 mod cache_policy_serde;
-mod cache_warm_e2e;
 mod claude_oauth_wire_vectors;
 mod conformance_report_is_not_vacuous;
 mod empty_assistant_turn_content;
 mod empty_text_drop;
 mod frozen_config_excludes_raw;
-mod frozen_config_resume;
 #[cfg(feature = "live")]
 mod gemini_e2e;
 mod gemini_media_render;
@@ -82,7 +82,6 @@ mod renderer_version_reproduction;
 mod responses_cache_write_usage;
 mod ride_placement_render;
 mod runner_tags_render;
-mod service_tier_used;
 #[cfg(feature = "live")]
 mod stream_errors_e2e;
 mod structured_output_render;
@@ -99,9 +98,6 @@ mod compaction_thinking;
 mod hooks_render_golden;
 
 mod turn_system;
-
-#[cfg(feature = "live")]
-mod turn_system_delivery;
 
 #[cfg(feature = "live")]
 mod turn_system_reader_compat;

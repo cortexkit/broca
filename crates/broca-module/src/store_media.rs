@@ -171,6 +171,20 @@ const NO_READER: &str = "the session's media objects can't be read apart from it
                          media can't be rendered";
 
 impl SessionIndex {
+    /// The saved form of the index as it stands, with where its media are stored.
+    pub fn stored(&self) -> Option<StoredMediaIndex> {
+        let objects: Vec<(String, MediaObject)> = locked(&self.objects)
+            .iter()
+            .map(|(digest, object)| (digest.text(), object.clone()))
+            .collect();
+        self.index().map(|index| to_stored(&index, &objects))
+    }
+
+    /// The index as it stands, once the session captured a medium.
+    pub fn index(&self) -> Option<Arc<MediaIndex>> {
+        self.slot().index.clone()
+    }
+
     /// The index of `session`, which the actor got with nothing appended since; its bytes are
     /// read over `reader` when there is one.
     pub fn new<B: SessionBackend, R: SessionBackend + Send + Sync + 'static>(
@@ -208,11 +222,6 @@ impl SessionIndex {
     /// Why the index can't be had, once it can't.
     pub fn broken(&self) -> Option<String> {
         self.slot().broken.clone()
-    }
-
-    /// Stops the index for good, naming why.
-    pub fn stop(&self, reason: String) {
-        self.slot().broken.get_or_insert(reason);
     }
 
     /// The index `history` builds, which the media fold handed over for `session`'s records
@@ -556,20 +565,6 @@ impl SessionIndex {
             slot: Arc::clone(&self.slot),
             unreadable: self.unreadable.clone(),
         }
-    }
-
-    /// The index as it stands, once the session captured a medium.
-    pub fn index(&self) -> Option<Arc<MediaIndex>> {
-        self.slot().index.clone()
-    }
-
-    /// The saved form of the index as it stands, with where its media are stored.
-    pub fn stored(&self) -> Option<StoredMediaIndex> {
-        let objects: Vec<(String, MediaObject)> = locked(&self.objects)
-            .iter()
-            .map(|(digest, object)| (digest.text(), object.clone()))
-            .collect();
-        self.index().map(|index| to_stored(&index, &objects))
     }
 }
 

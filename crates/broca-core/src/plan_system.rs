@@ -5,17 +5,6 @@ use broca_protocol::{
     CallOptions,
 };
 
-pub(crate) fn frozen_text(
-    enabled: bool,
-    manifest: Option<&broca_wal::PlanManifest>,
-) -> Option<&str> {
-    if enabled {
-        manifest.map(|manifest| manifest.system_text.as_str())
-    } else {
-        None
-    }
-}
-
 /// The system text a run's provider view carries in place of the session's original system
 /// message, when the run is to show its plan's: a view of the request only, never a rewrite of
 /// the transcript. Both run loops apply it once a refresh applied.
@@ -70,21 +59,6 @@ pub fn view(opts: &CallOptions, durable: &[Message], text: &str) -> Option<CallO
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn legacy_metadata_difference_does_not_enable_an_override() {
-        let manifest = serde_json::from_value::<broca_wal::PlanManifest>(serde_json::json!({
-            "plan":"{}", "plan_identity":"legacy", "composition_digest":"c", "fetches":[],
-            "tools":[], "system_text":"metadata text", "system_digest":"s", "join_version":1, "role_versions":{}
-        })).unwrap();
-        let control = crate::RunControl::default();
-        assert!(!control.manifest_system_override);
-        assert_eq!(
-            frozen_text(control.manifest_system_override, Some(&manifest)),
-            None
-        );
-        assert_eq!(frozen_text(true, Some(&manifest)), Some("metadata text"));
-    }
 
     fn message(role: Role, text: &str) -> Message {
         Message::new(role, vec![ContentBlock::Text { text: text.into() }])

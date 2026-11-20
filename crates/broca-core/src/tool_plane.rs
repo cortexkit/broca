@@ -394,6 +394,12 @@ pub struct ToolOpenGuard {
     pub deadline: Option<tokio::time::Instant>,
 }
 impl ToolOpenGuard {
+    /// The same guard ending at the absolute `deadline` (the run's step deadline).
+    pub fn with_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
     pub fn new(
         cancel: Option<&tokio_util::sync::CancellationToken>,
         stop: Option<&tokio_util::sync::CancellationToken>,
@@ -408,11 +414,6 @@ impl ToolOpenGuard {
     /// The same guard, with the count of the person's steers its calls hand back on.
     pub fn with_person_steers(mut self, person: Option<PersonSteers>) -> Self {
         self.person = person;
-        self
-    }
-    /// The same guard ending at the absolute `deadline` (the run's step deadline).
-    pub fn with_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
-        self.deadline = deadline;
         self
     }
     /// The send-boundary signals matching this guard: the same tokens and deadline, for

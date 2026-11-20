@@ -14,7 +14,7 @@ use broca_protocol::BindIdentity;
 pub const MAX_RETENTION_SECONDS: u64 = 2_592_000;
 pub const SWEEP_INTERVAL_MS: u64 = 300_000;
 
-pub use cortexkit_role_llm_runner::errors::RetentionInvalidDetail as InvalidRetention;
+pub(crate) use cortexkit_role_llm_runner::errors::RetentionInvalidDetail as InvalidRetention;
 pub use cortexkit_role_llm_runner::errors::{ExpiredDetail, EXPIRED};
 
 pub fn validate_retention(

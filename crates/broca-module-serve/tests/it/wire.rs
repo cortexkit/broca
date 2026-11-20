@@ -20,8 +20,7 @@ use address_inventory::test_registry;
 
 use async_trait::async_trait;
 use broca_core::{
-    ChargeBasis, FileLeaseStore, FileWalStore, MaterializedStore, OutputEvent, Provider,
-    StubProvider, StubToolPlane,
+    ChargeBasis, FileLeaseStore, FileWalStore, OutputEvent, Provider, StubProvider, StubToolPlane,
 };
 use broca_module::executor::RunExecutor;
 use broca_module::serve::{
@@ -213,7 +212,6 @@ async fn registry_and_wal_inner(
         .with_store_runtime(runtime.clone())
         .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1)));
     let _wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
-    let _store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
     broca_store::session_refs::migrate(
         &dir.join("store.db"),
         &broca_core::ReadOnlyWalReader::new(dir),
@@ -257,7 +255,6 @@ async fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_st
         .with_store_runtime(runtime)
         .with_charge_basis_resolver(resolver);
     let _wal_reader: Arc<dyn broca_core::WalStore> = wal;
-    let _store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
     broca_store::session_refs::migrate(
         &dir.join("store.db"),
         &broca_core::ReadOnlyWalReader::new(dir),
@@ -1148,8 +1145,6 @@ async fn separator_collision_bind_is_rejected_before_any_durable_state() {
     );
     let counts = registry.slot_counts();
     assert_eq!((counts.open, counts.opening, counts.closing), (0, 0, 0));
-    let store = broca_store::SqliteStore::open(dir.join("store.db")).unwrap();
-    assert!(store.read_admission_snapshot(&invalid).unwrap().is_none());
     let lease_root = dir.join("leases");
     assert!(
         !lease_root.exists() || std::fs::read_dir(&lease_root).unwrap().next().is_none(),
@@ -1888,7 +1883,6 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // `enabled: false` with every counter at zero; `enabled` is what separates that from an
         // enabled publisher that has simply had nothing to send.
         "bus_events",
-        "compaction_bus",
         // Process-local lifetime operation counts. The isolated operation_counters target proves
         // their zero and non-zero readings; this test keeps their presence in the total key set.
         "stream_chunks",
@@ -2206,17 +2200,6 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
     assert_eq!(metrics["vault"], serde_json::json!("disconnected"));
     assert_eq!(metrics["projection_failures"], serde_json::json!(0));
     assert_eq!(metrics["projection_behind_sessions"], serde_json::json!(0));
-    assert_eq!(
-        metrics["compaction_bus"],
-        serde_json::json!({
-            "attached": false,
-            "consumed": 0,
-            "acked": 0,
-            "dropped_unknown_session": 0,
-            "last_error": null,
-        }),
-        "a bus-off daemon has no compaction attachment, deliveries, or bus error"
-    );
     assert_eq!(
         metrics["bus_events"],
         serde_json::json!({
@@ -2967,14 +2950,11 @@ async fn pipelined_requests_for_one_session_reach_the_handler_in_wire_order() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A one-shot send writes no store projection, then public `session.read` returns its complete
-/// transcript through the existing WAL fallback.
+/// A one-shot send's public `session.read` returns its complete transcript.
 #[tokio::test]
 async fn read_route_manifest_and_page_roundtrip() {
     let dir = tmpdir("read");
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
     let exec = Arc::new(CoreExec {
         reply_text: "one-shot answer".into(),
     });
@@ -2983,8 +2963,6 @@ async fn read_route_manifest_and_page_roundtrip() {
             .with_store_runtime(store_exec::store_runtime(&dir, exec).await)
             .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
     );
-    let _wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
-    let _store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
     let reg = Arc::new(test_registry(LineageRegistry::new(opener)));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
@@ -3073,15 +3051,6 @@ async fn read_route_manifest_and_page_roundtrip() {
     let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
     let run_id = v["result"]["run_id"].as_str().unwrap().to_string();
     wait_for_completed_run(&mut creader, &mut cwriter, 7, &run_id, 100).await;
-
-    let prefix = store
-        .read_prefix_with_watermark(&session)
-        .expect("inspect materialized store");
-    assert_eq!(prefix.watermark_seq, 0, "one-shot run writes no store row");
-    assert!(
-        prefix.prefix.is_empty(),
-        "one-shot transcript is not stored"
-    );
 
     write_req(
         &mut cwriter,
@@ -4597,8 +4566,6 @@ async fn session_send_invalid_on_restart_matches_golden_and_writes_nothing() {
 async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_serve_path() {
     let dir = tmpdir("tool-reply");
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
-    let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
     let exec = Arc::new(CoreExec {
         reply_text: "researched".into(),
     });
@@ -4608,8 +4575,6 @@ async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_ser
             .with_store_runtime(runtime.clone())
             .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
     );
-    let _wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
-    let _store_reader: Arc<dyn broca_core::MaterializedStore> = store.clone();
     let reg = Arc::new(test_registry(LineageRegistry::new(opener)));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);

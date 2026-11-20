@@ -367,11 +367,6 @@ impl Service {
         } = self;
         let _ = METRICS.set(store.bus_metrics_arc());
         if !config.enabled {
-            // Off is recorded, so turning events on again begins a new period instead of
-            // turning everything written meanwhile into events.
-            if let Err(error) = store.end_bus_event_period() {
-                tracing::warn!(target: "bus", %error, "could not record that run events are off");
-            }
             return None;
         }
         ENABLED.store(true, Ordering::Relaxed);

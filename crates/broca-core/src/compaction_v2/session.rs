@@ -10,34 +10,6 @@ pub trait Changes: Send + Sync {
     async fn changed(&self) -> Result<(), String>;
 }
 
-pub struct BoundChanges {
-    pub session: std::sync::Arc<Session>,
-    pub writer: std::sync::Arc<crate::WalHandle>,
-    pub wal: std::sync::Arc<dyn crate::WalStore>,
-    pub bind: BindIdentity,
-    pub scope: Option<broca_protocol::SessionScope>,
-    pub plane: Option<std::sync::Arc<dyn crate::CompactionPlane>>,
-}
-
-#[async_trait::async_trait]
-impl Changes for BoundChanges {
-    async fn changed(&self) -> Result<(), String> {
-        super::host::notice(
-            &self.session,
-            &self.writer,
-            Some(self.wal.as_ref()),
-            &self.bind,
-            self.scope.as_ref(),
-            self.plane.as_deref(),
-            // A pushed view arrives outside a run, without the run's cache declaration. When
-            // this notice is the one that sets the provider up, its Setup lists no
-            // `cache_expired`, and rides never claim it until the next Setup.
-            None,
-        )
-        .await
-    }
-}
-
 #[derive(Default)]
 pub struct Session {
     pub state: tokio::sync::Mutex<State>,
@@ -69,27 +41,6 @@ impl Session {
     }
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(std::sync::atomic::Ordering::Acquire)
-    }
-    pub async fn initialize(
-        &self,
-        session: &BindIdentity,
-        records: &[FramedRecord],
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().await;
-        if !self.initialized.load(std::sync::atomic::Ordering::Acquire) {
-            *state = if records
-                .iter()
-                .any(|frame| matches!(frame.record, WalRecord::RunStarted { .. }))
-            {
-                load(session, records)?
-            } else {
-                State::default()
-            };
-            self.runtime.restore_marker(state.marker_version());
-            self.initialized
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        fold::validate_identity(&state, session)
     }
     /// The actor reloads at its serialized admission point, before spawning a
     /// run. Never replace this state from a stale snapshot while that run is active.

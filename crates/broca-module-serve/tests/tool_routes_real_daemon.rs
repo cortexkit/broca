@@ -113,6 +113,44 @@ impl Drop for Fixture {
     }
 }
 impl Fixture {
+    async fn settled(&self, bind: &BindIdentity) {
+        broca_test_support::wait_until("the run settles", || async {
+            if self.registry.route_status(bind).await.unwrap()
+                == broca_module::actor::LineageStatus::Idle
+            {
+                Ok(())
+            } else {
+                Err("run still active".into())
+            }
+        })
+        .await;
+    }
+
+    /// Runs one turn on `bind`'s session, kept `retention` seconds after it ends when given.
+    async fn run(&self, bind: &BindIdentity, retention: Option<u64>) {
+        let request = serde_json::from_value(json!({
+            "model": broca_protocol::request::ModelHandle::new("fake", "fake"),
+            "input": [json!({"role":"user", "content":[{"type":"text", "text":"finish"}]})], "tools": []
+        })).unwrap();
+        self.registry
+            .route_submission_with_retention(
+                bind,
+                RunId("worker".into()),
+                request,
+                RunKind::FreshOrResume,
+                broca_module::actor::SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                retention,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
     async fn start(tag: &str, fail_goodbye: bool) -> Option<Self> {
         let rig = common::Rig::start_with_modules(tag, vec![]).await?;
         let connection = rig.connect().await;
@@ -169,43 +207,7 @@ impl Fixture {
     fn bind(&self, name: &str) -> BindIdentity {
         BindIdentity::new(&self.rig.dir, "alfonso", name)
     }
-    /// Runs one turn on `bind`'s session, kept `retention` seconds after it ends when given.
-    async fn run(&self, bind: &BindIdentity, retention: Option<u64>) {
-        let request = serde_json::from_value(json!({
-            "model": broca_protocol::request::ModelHandle::new("fake", "fake"),
-            "input": [json!({"role":"user", "content":[{"type":"text", "text":"finish"}]})], "tools": []
-        })).unwrap();
-        self.registry
-            .route_submission_with_retention(
-                bind,
-                RunId("worker".into()),
-                request,
-                RunKind::FreshOrResume,
-                broca_module::actor::SendKey::Minted,
-                false,
-                broca_protocol::Delivery::Queue,
-                None,
-                None,
-                None,
-                retention,
-                false,
-            )
-            .await
-            .unwrap();
-    }
 
-    async fn settled(&self, bind: &BindIdentity) {
-        broca_test_support::wait_until("the run settles", || async {
-            if self.registry.route_status(bind).await.unwrap()
-                == broca_module::actor::LineageStatus::Idle
-            {
-                Ok(())
-            } else {
-                Err("run still active".into())
-            }
-        })
-        .await;
-    }
     async fn wait_closed(&self) {
         tokio::time::timeout(
             Duration::from_secs(36),

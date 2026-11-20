@@ -3,44 +3,6 @@ use broca_core::{ReadOnlyWalReader, WalStore};
 use broca_protocol::ModelHandle;
 use std::sync::Arc;
 
-#[test]
-fn project_roots_are_distinct_and_require_the_same_complete_inventory_snapshot() {
-    let root = broca_test_support::scratch_root().join("inventory-project-roots");
-    std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("run-index.db");
-    let store = SqliteStore::open(&path).unwrap();
-    for bind in [
-        BindIdentity::new("/old", "runner", "a"),
-        BindIdentity::new("/old", "broca", "b"),
-        BindIdentity::new("/new", "broca", "c"),
-    ] {
-        store
-            .record_session(&broca_core::session_addr(&bind), &bind)
-            .unwrap();
-    }
-    assert_eq!(
-        store.session_ref_project_roots().unwrap(),
-        (vec!["/new".into(), "/old".into()], false)
-    );
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "INSERT OR REPLACE INTO agent_data_projection VALUES(1,1);
-        INSERT OR IGNORE INTO agent_data_census_done VALUES(1);
-        UPDATE agent_data_census SET covered=1;",
-    )
-    .unwrap();
-    assert_eq!(
-        store.session_ref_project_roots().unwrap(),
-        (vec!["/new".into(), "/old".into()], true)
-    );
-    conn.execute("DELETE FROM agent_data_census_done", [])
-        .unwrap();
-    assert!(!store.session_ref_project_roots().unwrap().1);
-    drop(conn);
-    drop(store);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 fn started(session: &BindIdentity, retained: bool) -> broca_wal::WalRecord {
     let mut record = crate::conformance::run_started(
         1,
@@ -783,46 +745,6 @@ fn census_repairs_legacy_imports_and_reads_existing_candidates_only_as_metadata(
         .unwrap()
         .sessions
         .contains_key(&reference));
-}
-
-#[tokio::test]
-async fn provider_free_import_registers_ref_before_acknowledgment() {
-    use broca_core::{ImportOrigin, ImportRequest, WalHandle};
-    let root = broca_test_support::scratch_root()
-        .join(format!("session-ref-import-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
-    let store = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
-    migrate(&root.join("run-index.db"), &ReadOnlyWalReader::new(&root)).unwrap();
-    wal.set_session_ref_index(store.clone());
-    let session = BindIdentity::new("/project/import", "broca", "imported");
-    let writer = WalHandle::spawn(wal.open(&session).unwrap(), 1).unwrap();
-    let broca_wal::WalRecord::RunStarted { input, .. } = started(&session, false) else {
-        unreachable!()
-    };
-    broca_core::run_import(
-        ImportRequest {
-            project_id: None,
-            principal: None,
-            run_id: broca_protocol::RunId("import-run".into()),
-            session: session.clone(),
-            messages: input.to_vec(),
-            origin: ImportOrigin {
-                source_ref: "fixture:source".into(),
-            },
-        },
-        &writer,
-        &wal,
-    )
-    .await
-    .unwrap();
-    let reference = agent_session_ref(&session);
-    let found = store
-        .session_refs([reference.as_str()].into_iter())
-        .unwrap();
-    assert!(found.complete);
-    assert_eq!(found.sessions[&reference].1, session);
-    writer.shutdown().await.unwrap();
 }
 
 #[cfg(unix)]

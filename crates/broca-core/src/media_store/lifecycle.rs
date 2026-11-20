@@ -44,18 +44,6 @@ fn spawn_sweep(action: impl FnOnce() + Send + 'static) -> io::Result<std::thread
         .spawn(action)
 }
 
-/// Call only from store-maintenance (or the detached startup task), never from
-/// the run loop. Busy stores are retried by a later maintenance invocation.
-pub fn sweep(state_root: &Path) -> io::Result<SweepReport> {
-    sweep_until(state_root, None, true)
-}
-
-/// Compute the same collection plan without creating files, bumping lease epochs
-/// or changing manifests and objects. Locks protect the observed snapshot only.
-pub fn preview_sweep(state_root: &Path) -> io::Result<SweepReport> {
-    sweep_until(state_root, None, false)
-}
-
 fn budget(deadline: Option<Instant>) -> io::Result<()> {
     if deadline.is_some_and(|end| Instant::now() >= end) {
         return Err(io::Error::new(
@@ -560,94 +548,7 @@ fn session_lease(
     }
 }
 
-impl MediaStore {
-    /// The caller holds the session lease. Repeat WAL directory barriers even
-    /// when recovery finds the file absent; a previous unlink may not be durable.
-    /// Archive folds deliberately never call this: their WAL still exists.
-    pub fn remove_session_after_wal_removal(&self, session: &BindIdentity) -> io::Result<()> {
-        self.remove_session_with(session, &mut RealSteps)
-    }
-
-    fn remove_session_with(
-        &self,
-        session: &BindIdentity,
-        steps: &mut impl StorageSteps,
-    ) -> io::Result<()> {
-        let lock = self.lock()?;
-        lock.lock_shared()?;
-        let state_root = self.root.parent().unwrap();
-        let address = session_addr(session);
-        // No media, no scan: when there is nothing to unlink, skip both the
-        // WAL existence checks and the WAL directory barrier. The barrier only
-        // orders the WAL unlink before dropping media entries. It is repeated
-        // even when the WAL file is already absent because a previous unlink
-        // may not yet be durable. With no refs, identities, or swept entry
-        // there is nothing to drop, so this call can skip the checks and the
-        // barrier.
-        if !self.root.join("refs").join(&address).try_exists()?
-            && !self.root.join("identities").join(&address).try_exists()?
-            && !self.root.join("swept").join(&address).try_exists()?
-        {
-            return Ok(());
-        }
-        let wal = FileWalStore::new(state_root.join("wal"));
-        // A `.deleting` file is only ever created in the ephemeral tree as
-        // `{address}.{lineage}.deleting` (`FileWalStore::deleting_path` and
-        // retention's `deleting`), and its tombstone is written first. The
-        // caller holds the session lease, and `delete_expired` finishes every
-        // incomplete tombstone for this address before starting a new deletion,
-        // so no other lineage's `.deleting` can appear meanwhile. Checking the
-        // exact path for each tombstone-known lineage is therefore enough. Never
-        // list a whole WAL tree here: a deletion's cost must not grow with the
-        // number of sessions on disk.
-        if has_deleting_for_address(&wal, &address)?
-            || wal
-                .media_store_class(&address)
-                .map_err(io::Error::other)?
-                .is_some()
-        {
-            return Err(invalid(format!(
-                "cannot drop media manifest while WAL {address} exists"
-            )));
-        }
-        sync_wal_directories_with(state_root, steps)?;
-        for directory in ["refs", "identities", "swept"] {
-            migration::unlink(&self.root.join(directory).join(&address))?;
-        }
-        Ok(())
-    }
-}
-
-/// Exact `.deleting` checks for the tombstone-known lineages of one address.
-/// A `.deleting` file implies its tombstone was written first (the tombstone
-/// precedes the rename in `RetentionService::complete`), so enumerating the
-/// tiny per-address `expired` directory finds every production candidate
-/// without listing any WAL tree. A tombstoneless `.deleting` cannot occur in
-/// production; the once-per-sweep WAL scan in `inventory` still protects that
-/// case for collection.
-fn has_deleting_for_address(wal: &FileWalStore, address: &str) -> io::Result<bool> {
-    let expired = wal.ephemeral_root().join(format!("{address}.expired"));
-    let entries = match fs::read_dir(&expired) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    for entry in entries {
-        let name = entry?.file_name();
-        let lineage = name.to_string_lossy();
-        if lineage.ends_with(".tmp") {
-            continue;
-        }
-        if wal
-            .ephemeral_root()
-            .join(format!("{address}.{lineage}.deleting"))
-            .try_exists()?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
+impl MediaStore {}
 
 #[cfg(test)]
 mod tests;

@@ -25,10 +25,6 @@ impl RunUsageProjection {
         }
     }
 
-    pub fn run_id(&self) -> &RunId {
-        &self.run_id
-    }
-
     pub fn observe(&mut self, record: &WalRecord) {
         match record {
             WalRecord::RunStarted { run_id, config, .. } => {

@@ -35,11 +35,6 @@ impl CallAnchor {
 }
 
 impl CallAnchors {
-    /// The step's call copies, in the assistant message's order.
-    pub fn slots(&self) -> &[CallAnchor] {
-        &self.slots
-    }
-
     /// Takes in the record at `seq`: a run, step or turn boundary resets the copies, and a
     /// record about a call anchors the copy it answers. Returns that copy's index and its
     /// state after the record, or `None` for a record about no copy.
@@ -159,6 +154,11 @@ impl CallAnchors {
         }
         slot.terminal |= terminal;
         Some((index, slot.clone()))
+    }
+
+    /// The step's call copies, in the assistant message's order.
+    pub fn slots(&self) -> &[CallAnchor] {
+        &self.slots
     }
 }
 

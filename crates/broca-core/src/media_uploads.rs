@@ -102,23 +102,15 @@ pub struct Uploads {
 }
 
 impl Uploads {
-    /// Read a committed upload without changing staging, stores or WALs. Ownership,
-    /// expiry and the committed hash are checked again at the send boundary.
-    pub fn read_committed(
+    pub fn append(
         &self,
         identity: &BindIdentity,
         id: &str,
+        offset: u64,
+        bytes: &[u8],
         now: u64,
-    ) -> Result<(String, Vec<u8>), UploadError> {
-        let _lock = self.lock()?;
-        let meta = self.load(identity, id, now)?;
-        if !meta.committed {
-            return Err(UploadError::new("upload_not_committed", id));
-        }
-        let bytes = fs::read(self.data_path(id))?;
-        wire::verify_commit(meta.bytes, &meta.sha256, &bytes)
-            .map_err(|code| UploadError::new(code, id))?;
-        Ok((meta.mime, bytes))
+    ) -> Result<wire::UploadAppendReply, UploadError> {
+        self.append_inner(identity, id, offset, bytes, now, true)
     }
 
     /// Publication chooses the store alongside the already selected WAL durability class.
@@ -155,6 +147,26 @@ impl Uploads {
             .ok_or_else(|| io::Error::other("session WAL has no media store class"))?;
         self.media_store(class)
     }
+
+    /// Read a committed upload without changing staging, stores or WALs. Ownership,
+    /// expiry and the committed hash are checked again at the send boundary.
+    pub fn read_committed(
+        &self,
+        identity: &BindIdentity,
+        id: &str,
+        now: u64,
+    ) -> Result<(String, Vec<u8>), UploadError> {
+        let _lock = self.lock()?;
+        let meta = self.load(identity, id, now)?;
+        if !meta.committed {
+            return Err(UploadError::new("upload_not_committed", id));
+        }
+        let bytes = fs::read(self.data_path(id))?;
+        wire::verify_commit(meta.bytes, &meta.sha256, &bytes)
+            .map_err(|code| UploadError::new(code, id))?;
+        Ok((meta.mime, bytes))
+    }
+
     /// Startup creates the lock and directories. Opening for a refused operation
     /// must not create even an empty staging file.
     pub fn at(state_root: &Path) -> Self {
@@ -195,23 +207,6 @@ impl Uploads {
             entries.push((id, meta));
         }
         Ok(entries)
-    }
-
-    fn staged_files(&self) -> Result<Vec<String>, UploadError> {
-        let mut files = Vec::new();
-        for entry in fs::read_dir(self.root.join("objects"))? {
-            let entry = entry?;
-            let id = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| io::Error::other("invalid upload filename"))?;
-            if !valid_id(&id) || !entry.file_type()?.is_file() {
-                return Err(io::Error::other("invalid upload object").into());
-            }
-            File::open(entry.path())?;
-            files.push(id);
-        }
-        Ok(files)
     }
 
     fn load(&self, identity: &BindIdentity, id: &str, now: u64) -> Result<Metadata, UploadError> {
@@ -306,17 +301,6 @@ impl Uploads {
         broca_wal::migration::sync_dir(&self.root.join("objects"))?;
         self.save(&id, &meta)?;
         Ok(wire::UploadBeginReply::new(id))
-    }
-
-    pub fn append(
-        &self,
-        identity: &BindIdentity,
-        id: &str,
-        offset: u64,
-        bytes: &[u8],
-        now: u64,
-    ) -> Result<wire::UploadAppendReply, UploadError> {
-        self.append_inner(identity, id, offset, bytes, now, true)
     }
 
     /// Unlike `append`, reject an earlier chunk even if its bytes match. The refusal returns
@@ -421,53 +405,6 @@ impl Uploads {
             }
             Err(error) => Err(error),
         }
-    }
-
-    /// Only maintenance reclaims staging, and it validates the entire inventory
-    /// before removing anything. Sends currently refuse every upload reference,
-    /// so no session history depends on the staged bytes being reclaimed here.
-    pub fn sweep(&self, now: u64, write: bool) -> Result<usize, UploadError> {
-        if !self.root.exists() {
-            return Ok(0);
-        }
-        let _lock = self.lock()?;
-        let entries = self.inventory()?;
-        let files: std::collections::HashSet<_> = self.staged_files()?.into_iter().collect();
-        let live: std::collections::HashSet<_> = entries
-            .iter()
-            .filter(|(_, meta)| !meta.gone)
-            .map(|(id, _)| id.as_str())
-            .collect();
-        for (id, meta) in &entries {
-            if !meta.gone && !files.contains(id) {
-                return Err(io::Error::other(format!("missing upload body {id}")).into());
-            }
-        }
-        let orphans: Vec<_> = files
-            .into_iter()
-            .filter(|id| !live.contains(id.as_str()))
-            .collect();
-        let expired: Vec<_> = entries
-            .into_iter()
-            .filter(|(_, meta)| !meta.gone && now >= meta.expires)
-            .collect();
-        let count = expired.len() + orphans.len();
-        if write {
-            for id in orphans {
-                fs::remove_file(self.data_path(&id))?;
-            }
-            for (id, mut meta) in expired {
-                meta.gone = true;
-                self.save(&id, &meta)?;
-                match fs::remove_file(self.data_path(&id)) {
-                    Ok(()) => (),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            broca_wal::migration::sync_dir(&self.root.join("objects"))?;
-        }
-        Ok(count)
     }
 }
 

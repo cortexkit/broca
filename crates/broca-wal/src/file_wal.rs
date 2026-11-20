@@ -116,10 +116,9 @@ pub struct WalByteAnchor {
 /// not carried out of the decoder. That is correct for readers, because discarding a
 /// torn tail is what every WAL reader does — but an inference of the form "this file
 /// contains no record of kind X" CANNOT rest on it, since the tear may have removed
-/// the very record that would disprove it. `crates/broca-core/src/wal_fold.rs` needs
-/// exactly that guarantee for its pre-schema age inference and walks the framing
-/// itself rather than trusting this variant. Two readers, independently, read the
-/// name as whole-file validity before that was noticed.
+/// the very record that would disprove it: such a reader must walk the framing itself
+/// rather than trust this variant. Two readers, independently, read the name as
+/// whole-file validity before that was noticed.
 ///
 /// `Complete` covers the requested range of an opened, unarchived WAL, not records
 /// outside the requested sequence bounds. `Partial` is reserved for a source that
@@ -7012,96 +7011,6 @@ mod windows_acl_tests {
     #[test]
     fn windows_manifest_wal_refused_before_replay() {
         refuses_before_replay(true);
-    }
-}
-
-#[cfg(all(test, unix, feature = "fs-override"))]
-mod legacy_owned_io_tests {
-    use super::*;
-    use std::sync::Arc;
-    mod trace {
-        use crate as wal_api;
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../broca-crash-harness/src/io_trace_backend.rs"
-        ));
-    }
-
-    #[test]
-    fn prototype_owned_legacy_open_keeps_master_io() {
-        let root = broca_test_support::scratch_root().join(format!(
-            "prototype-owned-legacy-io-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = root.join("wal/log");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            crate::framing::encode(
-                1,
-                1,
-                &WalRecord::StepStarted {
-                    step_id: broca_protocol::StepId(1),
-                },
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let session = broca_protocol::BindIdentity::new("/legacy-project", "harness", "owned-io");
-        let tenure = crate::writer_tenure::WalLeaseDomain::new(root.join("leases"))
-            .mint_for_test(&session, 1)
-            .unwrap();
-        let fs = Arc::new(trace::IoTraceFs::new(
-            &root,
-            Arc::new(crate::fs_ops::RealFs),
-        ));
-        crate::fs_ops::with_fs_ops(fs.clone(), || {
-            drop(OwnedWriterWal::open(&path, &session, "legacy-owned-ref", tenure).unwrap());
-        });
-        let attempts = fs.attempts();
-        println!("master prototype-owned trace: {attempts:?}");
-        let expected: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/legacy-owned-master-io.json"
-        ))
-        .unwrap();
-        assert_eq!(
-            serde_json::to_value(attempts).unwrap(),
-            expected["attempts"],
-            "prototype legacy owned open must keep its independently measured master I/O"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn unconfigured_legacy_handle_cannot_be_promoted_after_open() {
-        let root = broca_test_support::scratch_root()
-            .join(format!("legacy-promotion-{}", std::process::id()));
-        let path = root.join("wal/log");
-        let wal = FileWal::open(&path).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let trace = Arc::new(trace::IoTraceFs::new(
-            &root,
-            Arc::new(crate::fs_ops::RealFs),
-        ));
-        let result =
-            crate::fs_ops::with_fs_ops(trace.clone(), || wal.with_wal_config(WalConfig::OVERHAUL));
-        match result {
-            Ok(_) => panic!("an unconfigured legacy handle must not become an overhaul writer"),
-            Err(error) => assert!(
-                error.to_string().contains("boot"),
-                "typed refusal must explain boot configuration: {error}"
-            ),
-        }
-        assert!(
-            trace.attempts().is_empty(),
-            "promotion refusal must not run recovery again"
-        );
-        assert_eq!(std::fs::read(path).unwrap(), before);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

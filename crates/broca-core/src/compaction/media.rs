@@ -22,9 +22,6 @@ impl CapturedMedia {
             })
     }
 
-    pub(crate) fn by_digest(&self, sha256: &str) -> Option<&MediaRef> {
-        self.0.get(sha256)?.first()
-    }
     /// Detect capture-bearing records before allocating an index. Most records, including
     /// every record in a media-free session, need no capture collection at all.
     pub(crate) fn captures_any(record: &WalRecord) -> bool {
@@ -64,12 +61,6 @@ impl CapturedMedia {
                 references.reserve_exact(1);
             }
             references.push(reference.clone());
-        }
-    }
-
-    pub(crate) fn extend(&mut self, other: Self) {
-        for reference in other.0.values().flatten() {
-            self.insert(reference);
         }
     }
 
@@ -141,22 +132,4 @@ pub(crate) fn enforce_by(messages: &mut [Message], captured: impl Fn(&MediaRef) 
             _ => {}
         }
     }
-}
-
-#[test]
-fn capture_index_is_deduplicated_and_metadata_only_at_twenty_thousand_messages() {
-    let mut captured = CapturedMedia::default();
-    for i in 0..20_000 {
-        let mut reference = super::tests::image();
-        reference.sha256 = format!("{i:064x}");
-        captured.insert(&reference);
-        captured.insert(&reference);
-    }
-    assert_eq!(captured.0.len(), 20_000);
-    let bytes = serde_json::to_vec(&captured).unwrap();
-    assert!(bytes.len() < 6 * 1024 * 1024);
-    println!(
-        "20,000 unique image captures: {} serialized metadata bytes",
-        bytes.len()
-    );
 }

@@ -1,6 +1,4 @@
 use super::*;
-use broca_core::AdmissionCheckpointV1;
-use broca_wal::FramedRecord;
 mod surrogate;
 use surrogate::SurrogateAdmissionCheckpoint;
 
@@ -52,38 +50,4 @@ fn surrogate_0_3_284_envelope_ignores_seed_with_current_render_parity() {
     assert_eq!(decoded.at_seq, legacy.at_seq);
     assert_eq!(decoded.compaction, legacy.compaction);
     assert_eq!(decoded.last_episode, legacy.last_episode);
-}
-
-#[test]
-fn media_free_checkpoint_field_order_matches_surrogate_0_3_284_schema() {
-    let mut input = Message::new(
-        Role::User,
-        vec![ContentBlock::Text {
-            text: "legacy text-only checkpoint".into(),
-        }],
-    );
-    input.ordinal = Some(0);
-    let records = [start(&[input]), step(1)];
-    let frames: Vec<_> = records
-        .into_iter()
-        .enumerate()
-        .map(|(index, record)| FramedRecord {
-            seq: index as u64 + 1,
-            fence: 1,
-            record,
-        })
-        .collect();
-    let mut checkpoint = AdmissionCheckpointV1::from_frames(&frames).unwrap();
-    let bytes = serde_json::to_vec(&checkpoint).unwrap();
-    let legacy: SurrogateAdmissionCheckpoint = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(checkpoint.has_model_attempt, Some(false));
-    // The old decoder ignores the additive summaries. Its known fields must still serialize
-    // in exactly their old order after removing only the members it does not know.
-    checkpoint.has_model_attempt = None;
-    assert!(!checkpoint.tool_set_history.is_unknown());
-    checkpoint.tool_set_history = broca_core::signed_floor::ToolSetHistory::Unknown;
-    assert_eq!(
-        serde_json::to_vec(&checkpoint).unwrap(),
-        serde_json::to_vec(&legacy).unwrap()
-    );
 }

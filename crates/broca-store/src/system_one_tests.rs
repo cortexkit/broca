@@ -382,7 +382,7 @@ fn paid_outcome_and_outbox_survive_reopen_and_publish_only_once() {
     assert!(!export.emit_system_one_fact(&pending[0].fact).unwrap());
     let page = export.read_export_page(None, 100).unwrap();
     assert_eq!(page.facts.len(), 1);
-    assert_eq!(export.export_high_water(), 1);
+    assert_eq!(page.high_water, 1);
     store.acknowledge_fact(&pending[0].fact.fact_id).unwrap();
     assert!(store.pending_facts().unwrap().is_empty());
     let record = resumed(

@@ -224,6 +224,14 @@ pub struct VaultHandles {
 }
 
 impl VaultHandles {
+    /// The credential ids the map carries (for a secret-free startup diagnostic). Never
+    /// exposes the handle values.
+    pub fn credential_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self.handles.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Load and parse the handle file at `path`. Errors never include the file contents, so a
     /// malformed secrets file cannot echo a handle. Unix files must be regular, non-symlink
     /// files with no group or world access.
@@ -253,14 +261,6 @@ impl VaultHandles {
         self.handles
             .get(&credential_id.to_id_string())
             .map(String::as_str)
-    }
-
-    /// The credential ids the map carries (for a secret-free startup diagnostic). Never
-    /// exposes the handle values.
-    pub fn credential_ids(&self) -> Vec<&str> {
-        let mut ids: Vec<&str> = self.handles.keys().map(String::as_str).collect();
-        ids.sort_unstable();
-        ids
     }
 }
 

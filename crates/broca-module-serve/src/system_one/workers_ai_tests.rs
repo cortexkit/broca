@@ -357,41 +357,6 @@ async fn refused(rig: &Rig, params: String) -> Value {
     }
 }
 
-fn items(reply: &str) -> Vec<Value> {
-    serde_json::from_str::<Value>(reply).unwrap()["items"]
-        .as_array()
-        .unwrap()
-        .clone()
-}
-
-/// The exact text of item `i`'s answers.
-fn answers_text(reply: &str, i: usize) -> String {
-    #[derive(serde::Deserialize)]
-    struct Raw<'a> {
-        #[serde(borrow)]
-        items: Vec<RawItem<'a>>,
-    }
-    #[derive(serde::Deserialize)]
-    struct RawItem<'a> {
-        #[serde(borrow, default)]
-        answers: Option<&'a RawValue>,
-    }
-    let raw: Raw<'_> = serde_json::from_str(reply).unwrap();
-    raw.items[i].answers.expect("answered").get().to_owned()
-}
-
-fn stored_indexes(rig: &Rig, batch: &str) -> Vec<u64> {
-    let mut indexes: Vec<u64> = rig
-        .store
-        .outcomes(STORE_ROLE, batch)
-        .unwrap()
-        .iter()
-        .map(|outcome| outcome.index)
-        .collect();
-    indexes.sort_unstable();
-    indexes
-}
-
 /// Cloudflare's documented clef request (the role's `provider-examples.json`, verbatim from the
 /// model page) is exactly what the client sends for the same questions and state, to the
 /// documented URL with the bearer token; the documented `result` comes back as the item's
@@ -816,4 +781,39 @@ async fn workers_ai_metering_uses_the_attempts_resolved_credential_and_only_meas
         rig.export.read_export_page(None, 100).unwrap().facts.len(),
         2
     );
+}
+
+/// The exact text of item `i`'s answers.
+fn answers_text(reply: &str, i: usize) -> String {
+    #[derive(serde::Deserialize)]
+    struct Raw<'a> {
+        #[serde(borrow)]
+        items: Vec<RawItem<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawItem<'a> {
+        #[serde(borrow, default)]
+        answers: Option<&'a RawValue>,
+    }
+    let raw: Raw<'_> = serde_json::from_str(reply).unwrap();
+    raw.items[i].answers.expect("answered").get().to_owned()
+}
+
+fn items(reply: &str) -> Vec<Value> {
+    serde_json::from_str::<Value>(reply).unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn stored_indexes(rig: &Rig, batch: &str) -> Vec<u64> {
+    let mut indexes: Vec<u64> = rig
+        .store
+        .outcomes(STORE_ROLE, batch)
+        .unwrap()
+        .iter()
+        .map(|outcome| outcome.index)
+        .collect();
+    indexes.sort_unstable();
+    indexes
 }

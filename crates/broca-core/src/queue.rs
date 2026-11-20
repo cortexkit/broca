@@ -96,14 +96,6 @@ impl PendingSubmission {
     pub fn is_interrupt(&self) -> bool {
         self.delivery == Some(broca_protocol::Delivery::Interrupt)
     }
-
-    /// Whether draining this entry may start a run: every plain queued send, and an ordered send
-    /// only when its list names `idle_start`.
-    pub fn starts_runs(&self) -> bool {
-        self.order
-            .as_ref()
-            .is_none_or(broca_protocol::DeliveryOrder::starts_runs)
-    }
 }
 
 /// The submission a record removes from the pending queue without starting a run: a tombstone
@@ -221,47 +213,6 @@ pub fn pending_submissions(records: &[WalRecord]) -> Vec<PendingSubmission> {
     pending
 }
 
-/// The outcome of a retract request, decided purely from the durable records.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RetractDecision {
-    /// The submission is still pending → the caller (coordinator) appends a durable
-    /// `Retracted{submission_id}` tombstone.
-    Retract,
-    /// The submission was already consumed into a run (a `RunStarted{submission_id}`
-    /// exists) → it cannot be retracted; the run is active/terminal.
-    AlreadyStarted,
-    /// No such submission is queued (unknown id, or already retracted) → nothing to do.
-    NotPending,
-}
-
-/// Decide whether `submission_id` can be retracted, given the session's durable records.
-/// Pure: the coordinator calls this under its lock, then appends the `Retracted` record
-/// iff the decision is [`RetractDecision::Retract`]. A submission consumed into a run is
-/// `AlreadyStarted` (a `RunStarted{submission_id}` is durable); a still-pending one is
-/// `Retract`; anything else (unknown / already-retracted / not-yet-queued) is
-/// `NotPending`.
-pub fn retract_decision(records: &[WalRecord], submission_id: &SubmissionId) -> RetractDecision {
-    // Consumed wins over pending: once a RunStarted references the id, the run exists and
-    // a retract is too late, regardless of whether a Queued record is also present.
-    let consumed = records.iter().any(|r| {
-        matches!(
-            r,
-            WalRecord::RunStarted { submission_id: Some(id), .. } if id == submission_id
-        )
-    });
-    if consumed {
-        return RetractDecision::AlreadyStarted;
-    }
-    let pending = pending_submissions(records)
-        .iter()
-        .any(|p| &p.submission_id == submission_id);
-    if pending {
-        RetractDecision::Retract
-    } else {
-        RetractDecision::NotPending
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,79 +239,8 @@ mod tests {
         queued_as(id, text, None)
     }
 
-    #[test]
-    fn queued_input_hooks_survive_replay_and_checkpoint_roundtrip() {
-        let hooks = Box::new(broca_wal::Hooks {
-            original: None,
-            final_value: Some(serde_json::json!([msg("final")])),
-            ops: vec![broca_wal::HookOp {
-                module: "p0".into(),
-                hook: "pre_user".into(),
-                phase: None,
-                op: "append".into(),
-                block: Some(0),
-                note: None,
-            }],
-            unavailable: Some(vec!["p1".into()]),
-        });
-        let mut record = queued("hooked", "original");
-        let WalRecord::Queued {
-            hooks: recorded, ..
-        } = &mut record
-        else {
-            unreachable!()
-        };
-        *recorded = Some(hooks.clone());
-        let pending = pending_submissions(&[record.clone()]);
-        assert_eq!(pending[0].request.input, vec![msg("original")]);
-        assert_eq!(pending[0].hooks.as_ref(), Some(&hooks));
-        let mut checkpoint = crate::AdmissionCheckpointV1::default();
-        checkpoint.fold_record(1, &record).unwrap();
-        assert_eq!(checkpoint.pending_fifo[0].hooks.as_ref(), Some(&hooks));
-        let encoded = crate::encode_admission_checkpoint(&checkpoint).unwrap();
-        let decoded = crate::decode_admission_checkpoint(&encoded).unwrap();
-        assert_eq!(decoded.pending_fifo[0].hooks.as_ref(), Some(&hooks));
-    }
-
     fn interrupt(id: &str, text: &str) -> WalRecord {
         queued_as(id, text, Some(broca_protocol::Delivery::Interrupt))
-    }
-
-    #[test]
-    fn queued_abstract_tier_survives_replay_checkpoints_and_keeps_retry_identity() {
-        for level in ["standard", "fast", "ultrafast", "future-level"] {
-            let mut record = queued("tier", "original");
-            let WalRecord::Queued { request, .. } = &mut record else {
-                unreachable!()
-            };
-            let legacy = request.clone();
-            request.service_tier_level = Some(level.into());
-            assert_eq!(
-                crate::submission_difference(&legacy, request),
-                Some("service_tier_level")
-            );
-            assert_ne!(
-                crate::submission_identity_digest(&legacy),
-                crate::submission_identity_digest(request)
-            );
-            let pending = pending_submissions(&[record.clone()]);
-            assert_eq!(
-                pending[0].request.service_tier_level.as_deref(),
-                Some(level)
-            );
-            let mut checkpoint = crate::AdmissionCheckpointV1::default();
-            checkpoint.fold_record(1, &record).unwrap();
-            let encoded = crate::encode_admission_checkpoint(&checkpoint).unwrap();
-            let decoded = crate::decode_admission_checkpoint(&encoded).unwrap();
-            assert_eq!(
-                decoded.pending_fifo[0]
-                    .request
-                    .service_tier_level
-                    .as_deref(),
-                Some(level)
-            );
-            assert_eq!(decoded.pending_fifo.as_ref(), &pending);
-        }
     }
 
     fn queued_as(id: &str, text: &str, delivery: Option<broca_protocol::Delivery>) -> WalRecord {
@@ -539,37 +419,5 @@ mod tests {
             queued("s3", "c"),
         ];
         assert_eq!(ids(&pending_submissions(&recs)), vec!["s3"]);
-    }
-
-    #[test]
-    fn retract_decision_cases() {
-        let recs = vec![queued("s1", "a"), queued("s2", "b"), consumed("r1", "s2")];
-        // s1 pending → Retract.
-        assert_eq!(
-            retract_decision(&recs, &SubmissionId("s1".into())),
-            RetractDecision::Retract
-        );
-        // s2 consumed → AlreadyStarted.
-        assert_eq!(
-            retract_decision(&recs, &SubmissionId("s2".into())),
-            RetractDecision::AlreadyStarted
-        );
-        // unknown → NotPending.
-        assert_eq!(
-            retract_decision(&recs, &SubmissionId("nope".into())),
-            RetractDecision::NotPending
-        );
-    }
-
-    #[test]
-    fn consumed_wins_over_a_present_queued() {
-        // Both a Queued AND a RunStarted for the same id: consumed wins (a retract is
-        // too late once the run exists).
-        let recs = vec![queued("s1", "a"), consumed("r1", "s1")];
-        assert!(pending_submissions(&recs).is_empty());
-        assert_eq!(
-            retract_decision(&recs, &SubmissionId("s1".into())),
-            RetractDecision::AlreadyStarted
-        );
     }
 }

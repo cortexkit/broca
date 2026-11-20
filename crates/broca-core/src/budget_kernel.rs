@@ -39,23 +39,6 @@ impl BudgetReplayStateV1 {
             budget_last_threshold: None,
         }
     }
-
-    /// Validate durable state before using it to avoid changing a live budget decision.
-    pub fn is_valid_for(&self, budget: &BudgetConfig) -> bool {
-        self.version == BUDGET_REPLAY_STATE_VERSION
-            && self
-                .fired_nudge_indices
-                .windows(2)
-                .all(|pair| pair[0] < pair[1])
-            && self
-                .fired_nudge_indices
-                .iter()
-                .all(|index| *index < budget.nudges.len())
-            && self
-                .budget_last_threshold
-                .is_none_or(|last| self.tool_call_count >= last)
-            && (!self.finalize_pending || self.finalize_fired)
-    }
 }
 
 impl Default for BudgetReplayStateV1 {

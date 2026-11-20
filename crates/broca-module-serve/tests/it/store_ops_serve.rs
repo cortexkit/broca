@@ -1000,7 +1000,7 @@ async fn plan_view_wire_serves_applied_and_pending_plans_without_operator_requir
             )
             .await
             .unwrap(),
-        broca_module::actor::SessionRefreshOutcome::Accepted { .. }
+        broca_module::session_cmd::SessionRefreshOutcome::Accepted { .. }
     ));
     rig.send("r2", "next", None).await;
     let frame = rig
@@ -1024,7 +1024,7 @@ async fn plan_view_wire_serves_applied_and_pending_plans_without_operator_requir
             )
             .await
             .unwrap(),
-        broca_module::actor::SessionRefreshOutcome::Accepted { .. }
+        broca_module::session_cmd::SessionRefreshOutcome::Accepted { .. }
     ));
     let frame = rig
         .request(1, json!({"method":"session.plan_view","params":{}}))

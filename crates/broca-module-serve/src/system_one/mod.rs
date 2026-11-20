@@ -365,6 +365,35 @@ pub fn now_ms() -> i64 {
 }
 
 impl SystemOne {
+    /// [`Self::spawn_call`] for a call admitted before it runs. When `admitted_at_ms` is given
+    /// and the batch is new, its seven-day retention runs from that time rather than from
+    /// now, so a call held for consent and executed later expires on the same day as the
+    /// record of its admission. A batch already recorded keeps its first admission time.
+    pub async fn spawn_call_admitted_at(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+        admitted_at_ms: Option<i64>,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
+        self.spawn_call_with_images(
+            params,
+            scope,
+            admitted_at_ms,
+            images::PreparedImages::default(),
+        )
+        .await
+    }
+
+    /// Run one `classify.run` on a task of its own and wait for it. A panic inside answers
+    /// this call `internal_error`; the batch it held is released by its hold's drop.
+    pub async fn spawn_call(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
+        self.spawn_call_admitted_at(params, scope, None).await
+    }
+
     /// A service over `store`. `in_flight` is the gauge each running batch call raises (the
     /// registry's `batches_in_flight_gauge`).
     pub fn new(
@@ -794,35 +823,6 @@ impl SystemOne {
                 &format!("unknown method '{other}' on a classifier/v1 route"),
             )),
         }
-    }
-
-    /// Run one `classify.run` on a task of its own and wait for it. A panic inside answers
-    /// this call `internal_error`; the batch it held is released by its hold's drop.
-    pub async fn spawn_call(
-        self: Arc<Self>,
-        params: String,
-        scope: broca_store::system_one::BatchScope,
-    ) -> Result<Box<RawValue>, Vec<u8>> {
-        self.spawn_call_admitted_at(params, scope, None).await
-    }
-
-    /// [`Self::spawn_call`] for a call admitted before it runs. When `admitted_at_ms` is given
-    /// and the batch is new, its seven-day retention runs from that time rather than from
-    /// now, so a call held for consent and executed later expires on the same day as the
-    /// record of its admission. A batch already recorded keeps its first admission time.
-    pub async fn spawn_call_admitted_at(
-        self: Arc<Self>,
-        params: String,
-        scope: broca_store::system_one::BatchScope,
-        admitted_at_ms: Option<i64>,
-    ) -> Result<Box<RawValue>, Vec<u8>> {
-        self.spawn_call_with_images(
-            params,
-            scope,
-            admitted_at_ms,
-            images::PreparedImages::default(),
-        )
-        .await
     }
 
     async fn spawn_call_with_images(

@@ -215,6 +215,21 @@ pub struct AnthropicNormalizer {
 }
 
 impl AnthropicNormalizer {
+    /// Convenience: normalize a whole captured SSE buffer to the full event
+    /// sequence (skips `ping`/`[DONE]`). Errors on the first malformed payload, and on a
+    /// buffer whose SSE framing cannot be decoded.
+    pub fn normalize_sse(
+        step_id: StepId,
+        raw: &str,
+    ) -> Result<Vec<NormalizedEvent>, NormalizeError> {
+        let mut n = Self::new(step_id);
+        let mut out = Vec::new();
+        for payload in crate::sse::parse_data_events(raw).map_err(NormalizeError::Framing)? {
+            out.extend(n.push_json(&payload)?);
+        }
+        Ok(out)
+    }
+
     pub(crate) fn set_response_evidence(&mut self, evidence: SharedResponseEvidence) {
         self.response_evidence = Some(evidence);
     }
@@ -295,21 +310,6 @@ impl AnthropicNormalizer {
     pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
         self.max_output_tokens = Some(max_output_tokens);
         self
-    }
-
-    /// Convenience: normalize a whole captured SSE buffer to the full event
-    /// sequence (skips `ping`/`[DONE]`). Errors on the first malformed payload, and on a
-    /// buffer whose SSE framing cannot be decoded.
-    pub fn normalize_sse(
-        step_id: StepId,
-        raw: &str,
-    ) -> Result<Vec<NormalizedEvent>, NormalizeError> {
-        let mut n = Self::new(step_id);
-        let mut out = Vec::new();
-        for payload in crate::sse::parse_data_events(raw).map_err(NormalizeError::Framing)? {
-            out.extend(n.push_json(&payload)?);
-        }
-        Ok(out)
     }
 
     /// Push one raw event JSON payload.

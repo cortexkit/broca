@@ -76,11 +76,10 @@ pub mod store_tag_map;
 pub mod store_tag_read;
 pub mod store_tool_calls;
 mod uploads;
-pub mod wal_render;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};
-pub use executor::{RunExecutor, RunKind, SealedRun, WarmBase, WarmError, WarmJob};
-pub use fanout::{Delivery, FromCursor};
+pub use executor::{RunExecutor, RunKind, SealedRun, WarmError, WarmJob};
+pub use fanout::Delivery;
 pub use opener::DefaultOpener;
 pub use registry::{LineageKey, LineageRegistry};
 pub use serve::{

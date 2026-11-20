@@ -261,61 +261,11 @@ pub struct OrderedSend {
 }
 
 impl OrderedSend {
-    /// The queued entry of an ordered send, or `None` for a plain queued send.
-    pub fn from_pending(pending: &crate::PendingSubmission) -> Option<Self> {
-        let order = pending.order.clone()?;
-        let input = match pending
-            .hooks
-            .as_ref()
-            .and_then(|hooks| hooks.final_value.clone())
-            .and_then(|value| serde_json::from_value::<Vec<Message>>(value).ok())
-        {
-            Some(input) => input,
-            None => pending.request.input.clone(),
-        };
-        Some(Self {
-            admitted_at_ms: pending.admitted_at_ms,
-            submission_id: pending.submission_id.clone(),
-            order,
-            principal: pending
-                .sent_by
-                .clone()
-                .or_else(|| pending.principal.clone()),
-            input: input
-                .into_iter()
-                .filter(|message| message.role != Role::System)
-                .collect(),
-        })
-    }
-
     /// Whether `other` replaces this send: the same sender and the same dedupe key.
     pub fn replaced_by(&self, principal: Option<&BindPrincipal>, dedupe_key: Option<&str>) -> bool {
         dedupe_key.is_some()
             && self.order.dedupe_key.as_deref() == dedupe_key
             && self.principal.as_ref() == principal
-    }
-}
-
-/// The record that ends `submission_id` undelivered.
-pub fn ended(submission_id: &SubmissionId, reason: SendEndReason) -> WalRecord {
-    WalRecord::SendEnded {
-        submission_id: submission_id.clone(),
-        reason,
-    }
-}
-
-/// The record of a `steer` delivery of `send` into `run_id`.
-pub fn steered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
-    WalRecord::SendDelivered {
-        ride: None,
-        written_at_ms: send.admitted_at_ms,
-        tags: None,
-        submission_id: send.submission_id.clone(),
-        run_id: run_id.clone(),
-        mode: DeliveryMode::Steer,
-        input: Some(Arc::new(send.input.clone())),
-        tool_call_id: None,
-        appended_text: None,
     }
 }
 
@@ -337,26 +287,6 @@ pub fn system_delivered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
         input: Some(Arc::new(input)),
         tool_call_id: None,
         appended_text: None,
-    }
-}
-
-/// The record of a `tool_result` delivery of `send` into `run_id`, riding on `tool_call_id`.
-pub fn with_tool_result(
-    send: &OrderedSend,
-    run_id: &RunId,
-    tool_call_id: &ToolCallId,
-    text: String,
-) -> WalRecord {
-    WalRecord::SendDelivered {
-        ride: None,
-        written_at_ms: send.admitted_at_ms,
-        tags: None,
-        submission_id: send.submission_id.clone(),
-        run_id: run_id.clone(),
-        mode: DeliveryMode::ToolResult,
-        input: None,
-        tool_call_id: Some(tool_call_id.clone()),
-        appended_text: Some(text),
     }
 }
 
@@ -382,60 +312,6 @@ pub enum QueuedSendFate {
     Retracted,
 }
 
-/// The fate of the queued send minted from `run_id` (submission `sub-<run_id>`), or `None` when
-/// the records hold no queued send under that submission (the id is not a queued send's).
-///
-/// The records that settle a queued send are each written once, after its `Queued` record:
-/// `SendDelivered` or a `RunStarted` naming it when it is delivered, `SendEnded` or
-/// `Retracted` when it is not. The first settling record wins, so a later record about another
-/// send never changes an answer once given.
-pub fn queued_send_fate<'a>(
-    records: impl IntoIterator<Item = &'a WalRecord>,
-    run_id: &str,
-) -> Option<QueuedSendFate> {
-    let submission = format!("sub-{run_id}");
-    let mut fate = None;
-    for record in records {
-        let settled = match record {
-            WalRecord::Queued { submission_id, .. } if submission_id.0 == submission => {
-                fate.get_or_insert(QueuedSendFate::Pending);
-                continue;
-            }
-            WalRecord::SendDelivered {
-                submission_id,
-                run_id: into,
-                mode,
-                ..
-            } if submission_id.0 == submission => QueuedSendFate::Delivered {
-                run_id: into.clone(),
-                mode: *mode,
-            },
-            WalRecord::RunStarted {
-                run_id: started,
-                submission_id,
-                ..
-            } if started.0 == run_id
-                || submission_id.as_ref().is_some_and(|id| id.0 == submission) =>
-            {
-                QueuedSendFate::Started
-            }
-            WalRecord::SendEnded {
-                submission_id,
-                reason,
-            } if submission_id.0 == submission => QueuedSendFate::Ended(reason.clone()),
-            WalRecord::Retracted { submission_id, .. } if submission_id.0 == submission => {
-                QueuedSendFate::Retracted
-            }
-            _ => continue,
-        };
-        match fate {
-            None | Some(QueuedSendFate::Pending) => fate = Some(settled),
-            Some(_) => {}
-        }
-    }
-    fate
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,55 +331,6 @@ mod tests {
             output: ToolOutput::Text { text: text.into() },
             is_error: false,
         }
-    }
-
-    fn record(json: &str) -> WalRecord {
-        serde_json::from_str(json).unwrap()
-    }
-
-    /// A queued send's fate is the first record that settles it: queued alone is pending, and a
-    /// delivery, an end, a retraction or its own run start each settle it for good. An id that
-    /// names no queued send has no fate.
-    #[test]
-    fn a_queued_sends_fate_is_its_first_settling_record() {
-        let queued = record(
-            r#"{"type":"queued","submission_id":"sub-r2","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"note"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}}"#,
-        );
-        let delivered = record(
-            r#"{"type":"send_delivered","submission_id":"sub-r2","run_id":"r1","mode":"steer","input":[{"role":"user","content":[{"type":"text","text":"note"}]}]}"#,
-        );
-        let superseded = record(
-            r#"{"type":"send_ended","submission_id":"sub-r2","reason":{"kind":"superseded","by":"sub-r3"}}"#,
-        );
-        let retracted = record(r#"{"type":"retracted","submission_id":"sub-r2"}"#);
-        let other = record(r#"{"type":"retracted","submission_id":"sub-r9"}"#);
-
-        assert_eq!(
-            queued_send_fate([&queued], "r2"),
-            Some(QueuedSendFate::Pending)
-        );
-        assert_eq!(
-            queued_send_fate([&queued, &delivered, &superseded], "r2"),
-            Some(QueuedSendFate::Delivered {
-                run_id: RunId("r1".into()),
-                mode: DeliveryMode::Steer
-            })
-        );
-        assert_eq!(
-            queued_send_fate([&queued, &superseded], "r2"),
-            Some(QueuedSendFate::Ended(SendEndReason::Superseded {
-                by: SubmissionId("sub-r3".into())
-            }))
-        );
-        assert_eq!(
-            queued_send_fate([&queued, &other, &retracted], "r2"),
-            Some(QueuedSendFate::Retracted)
-        );
-        assert_eq!(
-            queued_send_fate([&queued, &other], "r2"),
-            Some(QueuedSendFate::Pending)
-        );
-        assert_eq!(queued_send_fate([&queued], "r9"), None);
     }
 
     /// The first possible mode wins; `turn_system` always falls through in this build; a list
@@ -692,45 +519,6 @@ impl RideLedger {
         }
     }
 
-    pub(crate) fn seed_pending(&mut self, pending: &crate::PendingSubmission) {
-        let Some(order) = pending.order.as_ref() else {
-            return;
-        };
-        let sender = match pending
-            .display_sent_by
-            .as_ref()
-            .or(pending.sent_by.as_ref())
-            .or(pending.principal.as_ref())
-        {
-            Some(BindPrincipal::Reserved { module_id }) => module_id.clone(),
-            _ => "broca".into(),
-        };
-        let forms = order
-            .modes
-            .iter()
-            .filter_map(|mode| match mode {
-                DeliveryMode::ToolResult => Some("tool_result".into()),
-                DeliveryMode::TurnSystem => Some("turn_system".into()),
-                _ => None,
-            })
-            .collect();
-        self.sends.insert(
-            pending.submission_id.0.clone(),
-            (
-                pending
-                    .send_id
-                    .clone()
-                    .unwrap_or_else(|| pending.submission_id.0.clone()),
-                sender,
-                forms,
-                pending
-                    .message_marks
-                    .as_ref()
-                    .and_then(|marks| marks.speaks_for.clone()),
-            ),
-        );
-    }
-
     pub(crate) fn envelope(
         &self,
         record: &WalRecord,
@@ -795,44 +583,6 @@ mod rename_tests {
 
 #[cfg(test)]
 mod ride_v2_tests {
-    #[test]
-    fn recorded_agent_marks_reach_rides_from_wal_and_checkpoint() {
-        let record = |value| serde_json::from_value::<broca_wal::WalRecord>(value).unwrap();
-        let mut checkpoint: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/golden/admission_before_message_marks.json"
-        ))
-        .unwrap();
-        checkpoint["pending_fifo"][0]["message_marks"] =
-            serde_json::json!({"speaks_for":{"agent_id":"Ada"}});
-        checkpoint["pending_fifo"][0]["order"] = serde_json::json!({"modes":["tool_result"]});
-        let checkpoint: crate::AdmissionCheckpointV1 = serde_json::from_value(checkpoint).unwrap();
-        let pending = &checkpoint.pending_fifo[0];
-        let mut queued: serde_json::Value = serde_json::from_str(include_str!(
-            "../../broca-wal/tests/golden/pre_step_transforms/queued.json"
-        ))
-        .unwrap();
-        queued["message_marks"] = serde_json::json!({"speaks_for":{"agent_id":"Ada"}});
-        for from_checkpoint in [false, true] {
-            let mut ledger = super::RideLedger::default();
-            if from_checkpoint {
-                ledger.seed_pending(pending);
-            } else {
-                ledger.observe(&record(serde_json::json!({"type":"delivery_ordered","submission_id":"sub-run-8","order":{"modes":["tool_result"]}})), 1);
-                ledger.observe(&record(queued.clone()), 2);
-            }
-            ledger.observe(&record(serde_json::json!({"type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"m","content":[{"type":"tool_call","tool_call_id":"c","tool_name":"work","input":{}}]},"usage":{}})), 3);
-            ledger.observe(&record(serde_json::json!({"type":"tool_dispatch_intent","batch_id":"batch","tool_call_id":"c","args":{}})), 4);
-            let delivery = record(
-                serde_json::json!({"type":"send_delivered","submission_id":"sub-run-8","run_id":"r","mode":"tool_result","tool_call_id":"c","appended_text":"\n\nhello"}),
-            );
-            let envelope = ledger.envelope(&delivery, Some("lineage")).unwrap();
-            assert_eq!(
-                envelope.speaks_for.unwrap().agent_id,
-                "Ada",
-                "checkpoint {from_checkpoint}"
-            );
-        }
-    }
     use super::*;
     use broca_protocol::{MediaKind, MediaRef, ToolOutputPart};
     use cortexkit_role_llm_runner::rides::Ride;

@@ -17,7 +17,6 @@ pub mod account_routing;
 pub mod agent_data;
 pub mod auth_routing;
 pub mod billing_routing;
-pub mod bundle;
 pub mod bus_events;
 pub mod bus_events_nats;
 pub mod cache_routing;
@@ -29,7 +28,6 @@ pub mod chatgpt_identity;
 pub use broca_module::claude_code_identity;
 pub mod client;
 pub mod codeassist_identity;
-pub mod compaction_bus;
 pub mod config;
 pub mod config_home;
 pub mod consumer_routes;
@@ -66,7 +64,6 @@ pub mod usage_observe;
 pub mod vault_audit;
 pub mod vault_config;
 // Moved into broca-module with `claude_code_identity`, for the same reason.
-pub use broca_module::wal_render;
 pub mod wire;
 
 pub use auth_routing::{family_for_method, AuthMethod, CredentialId, MethodConfig};

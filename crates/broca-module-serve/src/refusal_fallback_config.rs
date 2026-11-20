@@ -92,6 +92,34 @@ impl Default for RefusalFallbackConfig {
 }
 
 impl RefusalFallbackConfig {
+    /// Name every mapped model `catalog` does not serve, for one boot-time report. The loaded
+    /// catalog decides whether a route exists, so this is asked of a catalog rather than of the
+    /// section: it is a notice, never a refusal, and an entry that names nothing today may name
+    /// a model the next refresh serves.
+    pub fn unserved_notices(&self, catalog: &CatalogSnapshot) -> Vec<String> {
+        let mut named: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for (source, fallback) in &self.mappings {
+            named.insert((source.as_str(), "source"));
+            named.insert((fallback.as_str(), "fallback"));
+        }
+        named
+            .into_iter()
+            .filter(|(model, _)| !catalog.contains_model(FALLBACK_PROVIDER, model))
+            .map(|(model, side)| {
+                format!(
+                    "{MODELS_KEY} names {model} as a {side} model, but the loaded catalog \
+                     does not serve {FALLBACK_PROVIDER}/{model}; that mapping stays unused until \
+                     a catalog refresh serves it"
+                )
+            })
+            .collect()
+    }
+
+    /// Whether the operator switched the fallback on.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Build from pairs. Values are validated exactly as a loaded file's are.
     pub fn new(mappings: BTreeMap<String, String>) -> Result<Self, String> {
         if mappings.is_empty() {
@@ -131,11 +159,6 @@ impl RefusalFallbackConfig {
         self
     }
 
-    /// Whether the operator switched the fallback on.
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     /// The fallback model id a FRESH episode of `provider/model` is offered at admission:
     /// `Some` only when the switch is on, `provider` is [`FALLBACK_PROVIDER`] and the mapping
     /// names `model`. A resumed episode keeps what it froze and is never offered one.
@@ -168,29 +191,6 @@ impl RefusalFallbackConfig {
 
     pub fn is_empty(&self) -> bool {
         self.mappings.is_empty()
-    }
-
-    /// Name every mapped model `catalog` does not serve, for one boot-time report. The loaded
-    /// catalog decides whether a route exists, so this is asked of a catalog rather than of the
-    /// section: it is a notice, never a refusal, and an entry that names nothing today may name
-    /// a model the next refresh serves.
-    pub fn unserved_notices(&self, catalog: &CatalogSnapshot) -> Vec<String> {
-        let mut named: BTreeSet<(&str, &str)> = BTreeSet::new();
-        for (source, fallback) in &self.mappings {
-            named.insert((source.as_str(), "source"));
-            named.insert((fallback.as_str(), "fallback"));
-        }
-        named
-            .into_iter()
-            .filter(|(model, _)| !catalog.contains_model(FALLBACK_PROVIDER, model))
-            .map(|(model, side)| {
-                format!(
-                    "{MODELS_KEY} names {model} as a {side} model, but the loaded catalog \
-                     does not serve {FALLBACK_PROVIDER}/{model}; that mapping stays unused until \
-                     a catalog refresh serves it"
-                )
-            })
-            .collect()
     }
 }
 

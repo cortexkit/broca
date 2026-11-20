@@ -135,13 +135,7 @@ impl Drop for FenceMark {
     }
 }
 
-impl StoreMoveFence {
-    /// Whether the fence holds the session lease, taken itself or handed over by the actor it
-    /// closed.
-    pub fn holds_lease(&self) -> bool {
-        self.lease.is_some() || self.guard.as_ref().is_some_and(|g| g.handed_tenures() > 0)
-    }
-}
+impl StoreMoveFence {}
 
 impl LineageRegistry {
     /// Fences `key` for a move; see the module's description. `leases` is the store the

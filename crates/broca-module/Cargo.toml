@@ -57,7 +57,6 @@ futures = { workspace = true, features = ["executor"] }
 [dev-dependencies]
 # The synthetic session the memory budget tests load.
 broca-session-store = { path = "../broca-session-store", features = ["synthetic"] }
-broca-crash-harness = { path = "../broca-crash-harness" }
 tokio-tungstenite.workspace = true
 cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }
 # llm-runner 0.7.48's tags.json vectors pin recorded v1 tool-result numbering and rendering.

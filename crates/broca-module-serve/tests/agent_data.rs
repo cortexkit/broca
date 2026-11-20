@@ -1299,24 +1299,6 @@ async fn release_foreign_owner_is_terminal_invalid_state() {
 }
 
 #[tokio::test]
-#[cfg(feature = "test-clock")]
-async fn import_refuses_a_cut_larger_than_the_local_wal_limit() {
-    let (mut rig, params, _) = incoming_rig("cut-limit");
-    rig.wal = Arc::new(FileWalStore::new(rig.root.join("wal")).with_read_cap_for_test(10));
-    rig.service = Arc::new(AgentDataService::new(
-        rig.root.clone(),
-        rig.registry.as_ref().clone(),
-        rig.wal.clone(),
-        rig.index.clone(),
-        rig.door.clone(),
-    ));
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    let error = assert_code(wire.call("import", params).await, "unavailable");
-    assert!(error["message"].as_str().unwrap().contains("size limit"));
-    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 1);
-    assert_nothing_staged(&rig);
-}
-#[tokio::test]
 async fn import_refuses_sealed_metadata_that_changes_between_pages() {
     let (rig, params, _) = incoming_rig("seal-drift");
     rig.door.read_limit.store(100, Ordering::SeqCst);
@@ -1331,52 +1313,6 @@ async fn import_refuses_sealed_metadata_that_changes_between_pages() {
     assert_nothing_staged(&rig);
 }
 
-#[tokio::test]
-async fn expired_retention_ledger_ref_is_not_exportable_even_without_wal_bytes() {
-    let rig = Rig::new("expired-retention", Arc::new(FakeDoor::default()));
-    let session = rig.session("expired");
-    rig.index
-        .upsert_retention_lineage(
-            &broca_store::retention::RetentionLineageRow {
-                lineage_id: "expired-lineage".into(),
-                session: session.clone(),
-                retention_s: 60,
-                last_activity_ms: 100,
-                expires_at_ms: None,
-                wal_bytes: 0,
-                expired_at_ms: Some(60_100),
-            },
-            &[broca_store::retention::RetentionRunRow {
-                attribution: None,
-                run: broca_core::RunIndexRow {
-                    run_id: "expired-run".into(),
-                    withdrawals_owed: false,
-                    session: session.clone(),
-                    submission_id: None,
-                    request_identity_digest: None,
-                    state: broca_core::RunIndexState::Completed,
-                    usage: None,
-                    final_step_finish_reason: Some(broca_protocol::FinishReason::Stop),
-                    retries_used: 0,
-                    title: None,
-                },
-                state_changed_ms: Some(100),
-            }],
-        )
-        .unwrap();
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    assert_code(
-        wire.call("prepare", rig.params(CUT, std::slice::from_ref(&session)))
-            .await,
-        "not_exportable",
-    );
-    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
-    assert_nothing_staged(&rig);
-    rig.seed(&session, "fresh-lineage", true);
-    wire.call("prepare", rig.params(CUT, std::slice::from_ref(&session)))
-        .await
-        .unwrap();
-}
 #[test]
 fn ordinary_address_reader_keeps_the_moved_fence() {
     let rig = Rig::new("normal-address-reader", Arc::new(FakeDoor::default()));
@@ -2284,22 +2220,4 @@ async fn cut_without_required_addresses_is_named_unreadable_before_lookup() {
     );
     assert_eq!(std::fs::read(path).unwrap(), before);
     assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn discovery_skips_ambiguous_addresses_but_ordinary_inventory_fails_closed() {
-    let rig = Rig::new("ambiguous-inventory", Arc::new(FakeDoor::default()));
-    let a = rig.session("a");
-    let b = rig.session("b");
-    rig.seed(&a, "a", true);
-    rig.seed(&b, "b", true);
-    let ephemeral = rig.wal.ephemeral_wal_path(&b);
-    std::fs::create_dir_all(ephemeral.parent().unwrap()).unwrap();
-    std::fs::copy(rig.wal.wal_path(&b), ephemeral).unwrap();
-    assert!(rig.wal.addresses().is_err());
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    let params = rig.params(CUT, std::slice::from_ref(&a));
-    wire.call("prepare", params.clone()).await.unwrap();
-    wire.call("abort", params).await.unwrap();
-    assert!(!rig.wal.wal_path(&a).with_extension("moving").exists());
 }

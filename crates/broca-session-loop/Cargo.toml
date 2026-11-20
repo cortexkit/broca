@@ -37,7 +37,6 @@ tokio-util.workspace = true
 broca-session-store = { path = "../broca-session-store", features = ["synthetic"] }
 # Today's loop writes a ride's envelope in the comparisons only through its test seam.
 broca-core = { path = "../broca-core", features = ["test-clock"] }
-broca-crash-harness = { path = "../broca-crash-harness" }
 broca-test-support = { path = "../broca-test-support" }
 futures = { workspace = true, features = ["executor"] }
 tokio = { workspace = true, features = ["test-util"] }

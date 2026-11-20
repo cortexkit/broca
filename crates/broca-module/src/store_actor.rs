@@ -418,6 +418,22 @@ async fn media_built(
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
+    /// Serves `commands` until the session goes away: when the channel closes, or at an idle
+    /// tick that finds it idle with no subscriber attached. Returns the session, for whoever
+    /// closes it. A run still running when the channel closes is ended as a module stop ends it.
+    pub async fn serve(mut self, commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
+        let mut commands = Commands::from(commands);
+        let exit = self
+            .serve_until_exit(&mut commands, None, None, None, None)
+            .await;
+        self.stop_for_shutdown().await;
+        self.collect_on_exit(&exit).await;
+        if !self.session.unsynced() {
+            self.retire_recovery();
+        }
+        self.session
+    }
+
     pub fn new(
         key: BindIdentity,
         session: Session<B>,
@@ -664,22 +680,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             running.link.note_own(seq, &appended);
         }
         Ok(appended)
-    }
-
-    /// Serves `commands` until the session goes away: when the channel closes, or at an idle
-    /// tick that finds it idle with no subscriber attached. Returns the session, for whoever
-    /// closes it. A run still running when the channel closes is ended as a module stop ends it.
-    pub async fn serve(mut self, commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
-        let mut commands = Commands::from(commands);
-        let exit = self
-            .serve_until_exit(&mut commands, None, None, None, None)
-            .await;
-        self.stop_for_shutdown().await;
-        self.collect_on_exit(&exit).await;
-        if !self.session.unsynced() {
-            self.retire_recovery();
-        }
-        self.session
     }
 
     /// Serves the session as the module's actor for it, until it closes idle or the module

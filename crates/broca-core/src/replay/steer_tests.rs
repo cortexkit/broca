@@ -9,9 +9,9 @@ use broca_protocol::{
     request::{ModelHandle, StopCondition},
     BatchId, BindIdentity, Delivery, MessageId, RunId, StepId, ToolCallId, Usage,
 };
-use broca_wal::{DispatchOutcome, FramedRecord, RunConfig, RunOrigin, WalRecord};
+use broca_wal::{DispatchOutcome, RunConfig, RunOrigin, WalRecord};
 
-use super::{latest_projection_boundary, replay, ReplayResolution};
+use super::{replay, ReplayResolution};
 
 fn user(text: &str) -> Message {
     Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
@@ -451,49 +451,6 @@ fn terminal_status_tracks_only_steers_not_rendered_in_the_episode() {
             Some(vec![])
         );
     }
-}
-
-/// No materialization boundary is offered while a steer is pending across it: the store would
-/// fold the turn without the steer, and a tail replay after it would never see the record.
-#[test]
-fn no_projection_boundary_is_offered_with_a_steer_pending_across_it() {
-    let framed = |records: Vec<WalRecord>| -> Vec<FramedRecord> {
-        records
-            .into_iter()
-            .enumerate()
-            .map(|(index, record)| FramedRecord {
-                seq: index as u64 + 1,
-                fence: 1,
-                record,
-            })
-            .collect()
-    };
-    let records = records_with_steer_during_the_tool_call();
-    let turn_finished_seq = records.len() as u64;
-    let unsteered: Vec<WalRecord> = records
-        .iter()
-        .filter(|record| !matches!(record, WalRecord::Steered { .. }))
-        .cloned()
-        .collect();
-    assert_eq!(
-        latest_projection_boundary(&framed(unsteered.clone()), 0),
-        Some(turn_finished_seq - 1),
-        "without the steer the turn barrier is a boundary"
-    );
-    assert_eq!(
-        latest_projection_boundary(&framed(records.clone()), 0),
-        None
-    );
-
-    let mut placed = records;
-    placed.push(step_started(2));
-    placed.push(text_step(2, "answer"));
-    placed.push(run_finished(RunFinishReason::Completed));
-    let boundary = latest_projection_boundary(&framed(placed), 0);
-    assert!(
-        boundary.is_some_and(|seq| seq > turn_finished_seq),
-        "once placed, a later boundary is offered: {boundary:?}"
-    );
 }
 
 /// A resumed replay of a steered WAL reads the record as written: the input is rendered

@@ -701,22 +701,6 @@ impl Rig {
         self.sample_next = Some(name.to_owned());
     }
 
-    /// [`Rig::call`], also writing the reply's wire bytes to `name` in the folder
-    /// `BROCA_FORK_ANSWER_SAMPLES` names, when it names one: samples for the replies' readers.
-    async fn sampled(
-        &mut self,
-        name: &str,
-        channel: u16,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, Value> {
-        let reply = self
-            .request(channel, json!({"method": method, "params": params}))
-            .await;
-        sample(name, &reply);
-        outcome(&reply)
-    }
-
     async fn prepare(&mut self, channel: u16) -> Result<String, Value> {
         self.call(channel, "session.fork_prepare", json!({}))
             .await
@@ -741,6 +725,22 @@ impl Rig {
     async fn end(&mut self, channel: u16, fork: &str) -> Result<Value, Value> {
         self.call(channel, "session.fork_end", json!({"fork_id": fork}))
             .await
+    }
+
+    /// [`Rig::call`], also writing the reply's wire bytes to `name` in the folder
+    /// `BROCA_FORK_ANSWER_SAMPLES` names, when it names one: samples for the replies' readers.
+    async fn sampled(
+        &mut self,
+        name: &str,
+        channel: u16,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, Value> {
+        let reply = self
+            .request(channel, json!({"method": method, "params": params}))
+            .await;
+        sample(name, &reply);
+        outcome(&reply)
     }
 
     /// The head as its owner reads it: its head and every message.
@@ -803,47 +803,6 @@ fn texts(opts: &broca_protocol::request::CallOptions) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-/// Copies the state root `from` to a fresh `to`, as a crash leaves it: whatever is on disk now.
-fn crash_image(from: &Path, to: &Path) {
-    let _ = std::fs::remove_dir_all(to);
-    for entry in walk(from) {
-        let relative = entry.strip_prefix(from).unwrap();
-        let target = to.join(relative);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&target).unwrap();
-        } else {
-            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-            match std::fs::copy(&entry, &target) {
-                Ok(_) => {}
-                // Windows refuses to read a file another handle holds an OS lock on. The files
-                // broca keeps locked under its state root (`broca.lock` and the decision-model
-                // store's owner lock) hold no data, only the lock, and a crash frees the lock,
-                // so the image keeps such a file, empty.
-                Err(error) if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) => {
-                    std::fs::File::create(&target).unwrap();
-                }
-                Err(error) => panic!("copy {}: {error}", entry.display()),
-            }
-        }
-    }
-}
-
-/// Windows' `ERROR_LOCK_VIOLATION`: part of the file is locked by another handle.
-const ERROR_LOCK_VIOLATION: i32 = 33;
-
-fn walk(dir: &Path) -> Vec<PathBuf> {
-    let mut out = vec![dir.to_path_buf()];
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            out.extend(walk(&path));
-        } else {
-            out.push(path);
-        }
-    }
-    out
 }
 
 #[tokio::test]
@@ -1324,7 +1283,7 @@ async fn a_caller_dropped_from_the_plan_loses_its_forks_for_good() {
             assert!(
                 matches!(
                     outcome,
-                    broca_module::actor::SessionRefreshOutcome::Accepted { .. }
+                    broca_module::session_cmd::SessionRefreshOutcome::Accepted { .. }
                 ),
                 "{outcome:?}"
             );
@@ -1560,3 +1519,44 @@ async fn a_fork_expires_idle_on_the_daemon_clock_and_an_ask_in_flight_holds_it()
     rig.forks.answer(answered("still open"));
     rig.ask(1, &fork, "after", "still alive?").await.unwrap();
 }
+
+/// Copies the state root `from` to a fresh `to`, as a crash leaves it: whatever is on disk now.
+fn crash_image(from: &Path, to: &Path) {
+    let _ = std::fs::remove_dir_all(to);
+    for entry in walk(from) {
+        let relative = entry.strip_prefix(from).unwrap();
+        let target = to.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+        } else {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            match std::fs::copy(&entry, &target) {
+                Ok(_) => {}
+                // Windows refuses to read a file another handle holds an OS lock on. The files
+                // broca keeps locked under its state root (`broca.lock` and the decision-model
+                // store's owner lock) hold no data, only the lock, and a crash frees the lock,
+                // so the image keeps such a file, empty.
+                Err(error) if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) => {
+                    std::fs::File::create(&target).unwrap();
+                }
+                Err(error) => panic!("copy {}: {error}", entry.display()),
+            }
+        }
+    }
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![dir.to_path_buf()];
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Windows' `ERROR_LOCK_VIOLATION`: part of the file is locked by another handle.
+const ERROR_LOCK_VIOLATION: i32 = 33;

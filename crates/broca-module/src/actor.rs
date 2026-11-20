@@ -18,8 +18,11 @@ pub const IDLE_TTL: Duration = Duration::from_secs(30);
 pub(crate) const ON_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use crate::session_cmd::{
-    CancelAuthority, CancelOutcome, CutLockReply, ImportOutcome, LineageCmd, LineageStatus,
-    RetractOutcome, ScopeFreezeBusyReason, SendKey, SendOutcome, SendPlan,
+    ImportOutcome, LineageStatus, ScopeFreezeBusyReason, SendKey, SendOutcome, SendPlan,
+};
+
+pub(crate) use crate::session_cmd::{
+    CancelAuthority, CancelOutcome, CutLockReply, LineageCmd, RetractOutcome,
     SessionFlushPrefixOutcome, SessionRefreshOutcome, SessionRefreshPolicyOutcome,
     SubscribeOutcome, WarmOutcome,
 };

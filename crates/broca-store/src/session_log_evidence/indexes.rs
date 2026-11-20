@@ -1,8 +1,7 @@
 //! Shared additive index definitions for bounded session-history evidence reads.
 
 use crate::SqliteStore;
-use rusqlite::{Connection, TransactionBehavior};
-use serde::Serialize;
+use rusqlite::Connection;
 
 pub(crate) const RUNS: &str = "session_log_evidence_runs";
 pub(crate) const DELETION_IDENTITIES: &str = "session_log_evidence_deletion_identity";
@@ -115,33 +114,6 @@ impl Definition {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct IndexPlan {
-    pub name: &'static str,
-    pub exists: bool,
-    pub applicable: bool,
-    pub sql: String,
-}
-
-pub(crate) fn plan(conn: &Connection) -> rusqlite::Result<Vec<IndexPlan>> {
-    DEFINITIONS
-        .iter()
-        .map(|definition| {
-            let exists = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=?1)",
-                [definition.name],
-                |row| row.get(0),
-            )?;
-            Ok(IndexPlan {
-                name: definition.name,
-                exists,
-                applicable: definition.applicable(conn)?,
-                sql: definition.sql(),
-            })
-        })
-        .collect()
-}
-
 /// Normal initialization and explicit offline preparation execute this same DDL.
 pub(crate) fn install(conn: &Connection) -> rusqlite::Result<()> {
     for definition in DEFINITIONS {
@@ -150,22 +122,6 @@ pub(crate) fn install(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn require(conn: &Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let missing: Vec<_> = plan(conn)?
-        .into_iter()
-        .filter(|index| index.applicable && !index.exists)
-        .map(|index| index.name)
-        .collect();
-    if missing.is_empty() {
-        return Ok(());
-    }
-    let root = conn
-        .path()
-        .and_then(|path| std::path::Path::new(path).parent())
-        .ok_or("session-log index preparation requires an on-disk database")?;
-    Err(format!("session_log_evidence_index_missing: {}; stop broca and its supervisor, then run: store-maintenance prepare-session-log-indexes {:?} --write", missing.join(", "), root).into())
 }
 
 pub(crate) fn lineage_index(table: &str) -> Option<&'static str> {
@@ -178,24 +134,4 @@ pub(crate) fn lineage_index(table: &str) -> Option<&'static str> {
         .map(|definition| definition.name)
 }
 
-impl SqliteStore {
-    /// Inspect only; this method does not create or migrate the database.
-    pub fn preview_session_log_indexes(&self) -> Result<Vec<IndexPlan>, String> {
-        let conn = self.conn.lock().map_err(|error| error.to_string())?;
-        plan(&conn).map_err(|error| error.to_string())
-    }
-
-    /// The caller must keep broca and its supervisor stopped while preparing
-    /// session-log indexes.
-    pub fn prepare_session_log_indexes(&self) -> Result<(), String> {
-        let mut conn = self.conn.lock().map_err(|error| error.to_string())?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        install(&tx).map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests;
+impl SqliteStore {}
