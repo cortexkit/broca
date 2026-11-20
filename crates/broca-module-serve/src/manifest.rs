@@ -512,11 +512,11 @@ fn routing_declarations() -> ConsumerDeclarations {
     let mut runner = RunnerDeclaration::new(pairs);
     runner.follows_account_choice = true;
     // Routing places a task on a runner by the harness it names, so broca names its own.
-    // ChatGPT routes strip max_output_tokens, so broca cannot promise output_cap.
-    let limits = HarnessLimits::new().with_capabilities(vec![
-        HarnessCapability::OneOff,
-        HarnessCapability::ForkAnswer,
-    ]);
+    // ChatGPT routes strip max_output_tokens, so broca cannot promise output_cap. A worker's
+    // structured result is taken on every route in both modes, through a submit tool or as the
+    // final text: where a provider can't enforce the schema, broca still checks the result
+    // against it when the run ends.
+    let limits = HarnessLimits::new().with_capabilities(BROCA_HARNESS_CAPABILITIES.to_vec());
     runner = runner
         .with_harnesses(vec!["broca".into()])
         .with_harness_limits(BTreeMap::from([("broca".into(), limits)]));
@@ -530,6 +530,15 @@ fn routing_declarations() -> ConsumerDeclarations {
         .expect("broca's routing declaration is valid");
     declarations
 }
+
+/// What broca's own harness can do, as routing places tasks by it (routing contract §16.2).
+const BROCA_HARNESS_CAPABILITIES: [HarnessCapability; 5] = [
+    HarnessCapability::OneOff,
+    HarnessCapability::ForkAnswer,
+    HarnessCapability::SubmitTool,
+    HarnessCapability::FinalText,
+    HarnessCapability::Plans,
+];
 
 /// The manifest for a fully configured process: the resolved consumer routes shape `consumes`.
 pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) -> ModuleManifest {
@@ -860,7 +869,7 @@ mod routing_tests {
     #[test]
     fn routing_slot_declares_the_broca_harness_and_only_supported_capabilities() {
         let expected = concat!(
-            r#"{"runner":{"follows_account_choice":true,"harness_limits":{"broca":{"capabilities":["one_off","fork_answer"]}},"harnesses":["broca"],"pairs":["#,
+            r#"{"runner":{"follows_account_choice":true,"harness_limits":{"broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"]}},"harnesses":["broca"],"pairs":["#,
             r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
             r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
             r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,
@@ -897,6 +906,9 @@ mod routing_tests {
                 HarnessLimits::new().with_capabilities(vec![
                     HarnessCapability::OneOff,
                     HarnessCapability::ForkAnswer,
+                    HarnessCapability::SubmitTool,
+                    HarnessCapability::FinalText,
+                    HarnessCapability::Plans,
                 ]),
             )])
         );
