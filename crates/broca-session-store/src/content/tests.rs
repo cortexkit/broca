@@ -8,8 +8,8 @@ use broca_protocol::usage::Usage;
 use proptest::prelude::*;
 
 use super::{
-    base64_encode, canonical_base64, longest_base64_run, read_opaque, writer_splits_at, Alphabet,
-    MIN_BASE64_RUN,
+    base64_encode, canonical_base64, longest_base64_run, longest_run_bounds, read_opaque,
+    writer_splits_at, Alphabet, MIN_BASE64_RUN,
 };
 use crate::codec::{put_req, ByteBuf, Raw};
 use crate::codec::{DecodeErrorKind, Message as CodecMessage};
@@ -378,4 +378,88 @@ fn the_reader_accepts_exactly_the_splits_the_writer_makes() {
         }
     }
     assert!(checked > 100, "only {checked} canonical runs were checked");
+}
+
+/// `writer_splits_at` as it was before it learned to skip the middle of the run: both alphabets
+/// scanned over the whole text.
+fn splits_at_by_full_scans(text: &str, run: (usize, usize), alphabet: Alphabet) -> bool {
+    if longest_run_bounds(text, alphabet) != Some(run) {
+        return false;
+    }
+    let other = match alphabet {
+        Alphabet::Standard => Alphabet::UrlSafe,
+        Alphabet::UrlSafe => Alphabet::Standard,
+    };
+    let Some((start, end)) = longest_run_bounds(text, other) else {
+        return true;
+    };
+    let (length, run_length) = (end - start, run.1 - run.0);
+    let beats = length > run_length || (length == run_length && other == Alphabet::UrlSafe);
+    !(beats && canonical_base64(&text[start..end], other).is_some())
+}
+
+/// Skipping the middle of a run gives the same answer as scanning it, for ciphertext as it is
+/// stored (real base64 of random bytes, with and without padding, and with none, one or many of
+/// its alphabet's own letters) between text that touches it: runs of either alphabet, some long
+/// enough to beat it, padding and JSON.
+#[test]
+fn skipping_the_run_answers_like_scanning_it() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    let mut answers = [0usize; 2];
+    for case in 0..20_000 {
+        let alphabet = if case % 2 == 0 {
+            Alphabet::Standard
+        } else {
+            Alphabet::UrlSafe
+        };
+        let bytes: Vec<u8> = match case % 7 {
+            // Zero bytes encode as `A` only: no letter of the alphabet's own.
+            0 => vec![0; 48 + next(60)],
+            // One byte whose encoding holds the alphabet's own letters.
+            1 => {
+                let mut bytes = vec![0; 48 + next(60)];
+                let at = next(bytes.len());
+                bytes[at] = 0xff;
+                bytes
+            }
+            _ => (0..48 + next(200)).map(|_| next(256) as u8).collect(),
+        };
+        let run = base64_encode(&bytes, alphabet);
+        let piece = |next: &mut dyn FnMut(usize) -> usize| -> String {
+            let chars: &[u8] = match next(5) {
+                0 => b"ABCxyz019+/",
+                1 => b"ABCxyz019-_",
+                2 => b"ABCDEFxyz0123",
+                3 => b"==",
+                _ => b"\":{}, ",
+            };
+            let length = match next(3) {
+                0 => 1 + next(4),
+                1 => 1 + next(40),
+                _ => run.len() - 8 + next(16),
+            };
+            (0..length)
+                .map(|_| chars[next(chars.len())] as char)
+                .collect()
+        };
+        let before: String = (0..next(3)).map(|_| piece(&mut next)).collect();
+        let after: String = (0..next(3)).map(|_| piece(&mut next)).collect();
+        let text = format!("{before}{run}{after}");
+        let at = (before.len(), before.len() + run.len());
+        let expected = splits_at_by_full_scans(&text, at, alphabet);
+        assert_eq!(
+            writer_splits_at(&text, at, alphabet),
+            expected,
+            "{text:?} at {at:?} in {alphabet:?}"
+        );
+        answers[usize::from(expected)] += 1;
+    }
+    // Both answers are common, so neither half of the check is vacuous.
+    assert!(answers.iter().all(|&count| count > 1_000), "{answers:?}");
 }

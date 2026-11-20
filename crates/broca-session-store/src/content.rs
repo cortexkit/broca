@@ -177,13 +177,14 @@ fn read_opaque(raw: Raw<'_>) -> Result<String, DecodeError> {
         (None, Some(bytes)) => (Some(bytes), Alphabet::UrlSafe),
         (None, None) => (None, Alphabet::Standard),
     };
-    let mut text = before;
+    let mut text = before.into_bytes();
     let run_start = text.len();
     if let Some(bytes) = &run {
-        text.push_str(&base64_encode(&bytes.0, alphabet));
+        base64_encode_into(&bytes.0, alphabet, &mut text);
     }
     let run_end = text.len();
-    text.push_str(&after);
+    text.extend_from_slice(after.as_bytes());
+    let text = String::from_utf8(text).expect("text around base64, which is ASCII");
     // The writer splits the text around its longest base64 run when it has one, and only then,
     // so any other split is a second encoding of the same text.
     let canonical = match run {
@@ -284,7 +285,20 @@ fn longest_run_in(text: &str, alphabet: Alphabet) -> Option<Base64Run> {
 /// (with up to two `=` after it), trimmed to a multiple of four, when at least
 /// [`MIN_BASE64_RUN`] long. Whether that run is canonical base64 is not checked here.
 fn longest_run_bounds(text: &str, alphabet: Alphabet) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
+    run_bounds(text.as_bytes(), alphabet, None)
+}
+
+/// [`longest_run_bounds`] over `bytes`, jumping from `known.0` to `known.1` instead of reading
+/// the characters between: the caller vouches that all of them are in `alphabet`, so reading
+/// them could only extend the run the scan is already in.
+fn run_bounds(
+    bytes: &[u8],
+    alphabet: Alphabet,
+    known: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    debug_assert!(
+        known.is_none_or(|(from, to)| bytes[from..to].iter().all(|&c| alphabet.contains(c)))
+    );
     let in_alphabet = |c: u8| alphabet.contains(c);
     let mut best: Option<(usize, usize)> = None;
     let mut i = 0;
@@ -295,7 +309,10 @@ fn longest_run_bounds(text: &str, alphabet: Alphabet) -> Option<(usize, usize)> 
         }
         let start = i;
         while i < bytes.len() && in_alphabet(bytes[i]) {
-            i += 1;
+            i = match known {
+                Some((from, to)) if i == from => to,
+                _ => i + 1,
+            };
         }
         let mut end = i;
         while end < bytes.len() && end - i < 2 && bytes[end] == b'=' {
@@ -310,7 +327,7 @@ fn longest_run_bounds(text: &str, alphabet: Alphabet) -> Option<(usize, usize)> 
     // A run whose length isn't a multiple of four may still hold a canonical run if a trailing
     // alphabet character belongs to the text after it, as in a word directly following the
     // ciphertext; trimming to the largest multiple of four keeps that case.
-    if (end - start) % 4 != 0 && !text[start..end].ends_with('=') {
+    if (end - start) % 4 != 0 && bytes[end - 1] != b'=' {
         end = start + (end - start) / 4 * 4;
     }
     if end - start < MIN_BASE64_RUN {
@@ -324,14 +341,25 @@ fn longest_run_bounds(text: &str, alphabet: Alphabet) -> Option<(usize, usize)> 
 /// reader holds, so it is canonical by construction, and only its place needs checking: it must
 /// be where `alphabet`'s scan finds its run, and the other alphabet's run must neither be longer
 /// nor win a tie (`longest_base64_run` takes the URL-safe run on a tie) while also being
-/// canonical. Checked this way, a long ciphertext is scanned once per alphabet and never decoded
-/// again; decoding it again on every read was the larger part of reading opaque text.
+/// canonical. Checked this way, a long ciphertext is never decoded again, and neither scan reads
+/// the middle of the run (see [`run_bounds`] and [`other_run_bounds`]): reading every
+/// ciphertext twice on every read was most of the cost of reading opaque text.
 fn writer_splits_at(text: &str, run: (usize, usize), alphabet: Alphabet) -> bool {
-    if longest_run_bounds(text, alphabet) != Some(run) {
+    // The run's characters up to its padding are all in `alphabet`.
+    let letters = (
+        run.0,
+        run.1
+            - text[run.0..run.1]
+                .bytes()
+                .rev()
+                .take_while(|&c| c == b'=')
+                .count(),
+    );
+    if run_bounds(text.as_bytes(), alphabet, Some(letters)) != Some(run) {
         return false;
     }
     let other = alphabet.other();
-    let Some((start, end)) = longest_run_bounds(text, other) else {
+    let Some((start, end)) = other_run_bounds(text, letters, alphabet) else {
         return true;
     };
     let (length, run_length) = (end - start, run.1 - run.0);
@@ -339,9 +367,48 @@ fn writer_splits_at(text: &str, run: (usize, usize), alphabet: Alphabet) -> bool
     !(beats && canonical_base64(&text[start..end], other).is_some())
 }
 
+/// `other`'s run as far as [`writer_splits_at`] needs it: whether the run [`longest_run_bounds`]
+/// finds for `other` beats the run whose letters span `letters` (all in `own`), and where it is
+/// when it might. The run's letters outside the 62 both alphabets share break `other`'s runs,
+/// so every `other` run lying between the first and the last of them is shorter than the known
+/// run and can neither beat it nor change which longer run is found first. Only the text
+/// outside them is scanned: when `other`'s longest run there could beat the known run, its
+/// bounds are the ones `longest_run_bounds(text, other)` gives; otherwise both are too short.
+fn other_run_bounds(text: &str, letters: (usize, usize), own: Alphabet) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let other = own.other();
+    let middle = &bytes[letters.0..letters.1];
+    let breaks = middle
+        .iter()
+        .position(|&c| !other.contains(c))
+        .zip(middle.iter().rposition(|&c| !other.contains(c)));
+    let (cut_from, cut_to) = match breaks {
+        Some((first, last)) if last > first + 1 => (letters.0 + first + 1, letters.0 + last),
+        _ => return longest_run_bounds(text, other),
+    };
+    // Both cut ends are letters `other` doesn't have, so no `other` run spans the cut.
+    let mut outside = Vec::with_capacity(bytes.len() - (cut_to - cut_from));
+    outside.extend_from_slice(&bytes[..cut_from]);
+    outside.extend_from_slice(&bytes[cut_to..]);
+    let back = |at: usize| {
+        if at >= cut_from {
+            at + (cut_to - cut_from)
+        } else {
+            at
+        }
+    };
+    run_bounds(&outside, other, None).map(|(start, end)| (back(start), back(end)))
+}
+
 fn base64_encode(bytes: &[u8], alphabet: Alphabet) -> String {
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    base64_encode_into(bytes, alphabet, &mut out);
+    String::from_utf8(out).expect("the base64 alphabets are ASCII")
+}
+
+fn base64_encode_into(bytes: &[u8], alphabet: Alphabet, out: &mut Vec<u8>) {
     let chars = alphabet.chars();
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    out.reserve(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b = [
             chunk[0],
@@ -349,15 +416,22 @@ fn base64_encode(bytes: &[u8], alphabet: Alphabet) -> String {
             *chunk.get(2).unwrap_or(&0),
         ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(chars[((n >> (18 - 6 * i)) & 63) as usize] as char);
+        let quad = [
+            chars[((n >> 18) & 63) as usize],
+            chars[((n >> 12) & 63) as usize],
+            if chunk.len() > 1 {
+                chars[((n >> 6) & 63) as usize]
             } else {
-                out.push('=');
-            }
-        }
+                b'='
+            },
+            if chunk.len() > 2 {
+                chars[(n & 63) as usize]
+            } else {
+                b'='
+            },
+        ];
+        out.extend_from_slice(&quad);
     }
-    out
 }
 
 /// The bytes of `text` when it is padded base64 in `alphabet` that re-encodes to itself exactly.
