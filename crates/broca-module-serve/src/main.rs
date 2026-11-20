@@ -141,12 +141,22 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         "broca.jsonc",
     )
     .map_err(ServeIoError)?;
+    // Where the WAL, leases and run index live. Resolved before any connection is made so a
+    // machine that cannot place its durable state refuses to start by name instead of first
+    // registering and then failing. See `state_root` for the rule, and for why the location is a
+    // contract with astrocyte rather than a private choice. Resolving writes nothing.
+    let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
+        .map_err(|e| ServeIoError(e.to_string()))?
+        .path;
     // broca.jsonc, read once: every component it shapes reads its own section from here. Under
     // the settings gate broca registers first, and takes the daemon's settings when it offers
     // them; then it never reads the file.
     let mock_provider_path =
         std::env::var("BROCA_PROVIDER_BASE_URL").is_ok_and(|value| !value.trim().is_empty());
     let (settings, gated) = if SETTINGS_GATE {
+        // The gated start writes into the state root (the old settings file's saved copy) before
+        // settings arrive, so it takes the lock first.
+        lock_state_root(&state_root)?;
         match start_gated(&conn_path, &module_id, mock_provider_path).await? {
             Some(started) => started,
             None => return Ok(()),
@@ -192,24 +202,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let wal_recovery = broca_module_serve::config::WalRecoveryConfig::from_settings(&settings)
         .map_err(ServeIoError)?;
     let stop_signal = shutdown_signal()?;
-    // Where the WAL, leases and run index live. Resolved before any connection is made so a
-    // machine that cannot place its durable state refuses to start by name instead of first
-    // registering and then failing. See `state_root` for the rule, and for why the location is a
-    // contract with astrocyte rather than a private choice.
-    let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
-        .map_err(|e| ServeIoError(e.to_string()))?
-        .path;
-    // ONE BROCA PER STATE ROOT, decided before anything below touches the root: the state-format
-    // decision, the stall log, store opens and every boot recovery step (fence-index rebuild, cut
-    // reconcile, crash-orphan seal, System One release) assume no other process is doing the
-    // same work on the same files. A held lock exits at once, non-zero, so the daemon counts a
-    // failed start and backs off; see `state_root_lock`.
-    match broca_module_serve::state_root_lock::acquire(&state_root) {
-        Ok(lock) => lock.hold_until_exit(),
-        Err(error) => {
-            tracing::error!(target: "lifecycle", root = %state_root.display(), "{error}");
-            return Err(ServeIoError(error.to_string()).into());
-        }
+    // Without the settings gate the lock follows the settings checks, so a malformed file
+    // refuses the start before the state root is touched; under it the lock came first.
+    if !SETTINGS_GATE {
+        lock_state_root(&state_root)?;
     }
     // Refuse unsupported markers before the stall log or any durable store is opened.
     let wal_decision = state_format::prepare(&state_root).map_err(ServeIoError)?;
@@ -1269,6 +1265,24 @@ mod runtime_shutdown_tests {
 ///
 /// Only this arm re-raises. The serve-return arm ends with the ordinary return from `main`: the
 /// daemon went away or asked us to stop, and exit 0 is the true answer there.
+/// ONE BROCA PER STATE ROOT, decided before anything touches the root: the settings gate's copy
+/// of the old settings file, the state-format decision, the stall log, store opens and every
+/// boot recovery step (fence-index rebuild, cut reconcile, crash-orphan seal, System One release)
+/// assume no other process is doing the same work on the same files. A held lock exits at once,
+/// non-zero, so the daemon counts a failed start and backs off; see `state_root_lock`.
+fn lock_state_root(state_root: &std::path::Path) -> Result<(), ServeIoError> {
+    match broca_module_serve::state_root_lock::acquire(state_root) {
+        Ok(lock) => {
+            lock.hold_until_exit();
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(target: "lifecycle", root = %state_root.display(), "{error}");
+            Err(ServeIoError(error.to_string()))
+        }
+    }
+}
+
 /// Whether broca registers through the settings gate (`settings::gate`); a build switch.
 const SETTINGS_GATE: bool = cfg!(feature = "settings-gate");
 

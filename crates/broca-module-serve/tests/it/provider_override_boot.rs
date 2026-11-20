@@ -1,5 +1,8 @@
 //! Malformed runtime policy refuses startup before a subconscious daemon connection is attempted.
 
+// Under the settings gate broca takes its settings from the daemon after connecting, which
+// reviews them; it reads no broca.jsonc at boot, so this boot-time refusal doesn't happen.
+#[cfg(not(feature = "settings-gate"))]
 #[test]
 fn malformed_service_tier_switch_refuses_boot_by_name() {
     let root = broca_test_support::scratch_root()
@@ -34,6 +37,9 @@ fn malformed_service_tier_switch_refuses_boot_by_name() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+// Under the settings gate broca takes its settings from the daemon after connecting, which
+// reviews them; it reads no broca.jsonc at boot, so this boot-time refusal doesn't happen.
+#[cfg(not(feature = "settings-gate"))]
 #[test]
 fn malformed_provider_url_refuses_boot_with_provider_and_value() {
     let path = broca_test_support::scratch_root()
@@ -83,6 +89,9 @@ fn malformed_provider_url_refuses_boot_with_provider_and_value() {
 ///
 /// Without this, someone tidying the env lines would see three `.env` calls, judge one redundant
 /// with the config path, and silently restore a test that writes to production.
+// Under the settings gate broca takes its settings from the daemon after connecting, which
+// reviews them; it reads no broca.jsonc at boot, so this boot-time refusal doesn't happen.
+#[cfg(not(feature = "settings-gate"))]
 #[test]
 fn the_spawned_binary_writes_its_logs_under_the_pinned_data_home() {
     let data_home =

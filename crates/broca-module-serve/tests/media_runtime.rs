@@ -706,6 +706,9 @@ async fn media_read_boundaries(rig: &mut Rig) {
     assert_eq!(refusal(&reply)["code"], "unknown_media");
 }
 
+// Under the settings gate broca takes its settings from the daemon after connecting, which
+// reviews them; it reads no broca.jsonc at boot, so this boot-time refusal doesn't happen.
+#[cfg(not(feature = "settings-gate"))]
 #[test]
 fn obsolete_media_does_not_refuse_boot_before_connecting() {
     let root =

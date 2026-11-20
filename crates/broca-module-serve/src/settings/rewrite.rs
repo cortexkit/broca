@@ -224,6 +224,11 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     staged_name.push(format!(".move-{}", std::process::id()));
     let staged = path.with_file_name(staged_name);
     let write = || -> std::io::Result<()> {
+        // On a machine the daemon has not written settings to yet, its config folder may not
+        // exist; the move makes it rather than stopping broca's start.
+        if let Some(parent) = path.parent() {
+            broca_owner_only::create_dir_all(parent)?;
+        }
         let mut file = broca_owner_only::OpenOptions::new()
             .write(true)
             .create_new(true)

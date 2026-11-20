@@ -188,6 +188,25 @@ fn the_old_file_moves_to_the_daemons_path() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The daemon's config folder need not exist yet: the move makes it.
+#[test]
+fn the_move_makes_the_daemons_config_folder() {
+    let dir = scratch("move-folder");
+    let old = dir.join("old/broca.jsonc");
+    let new = dir.join("config/cortexkit/broca.jsonc");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, OLD).unwrap();
+    assert!(matches!(
+        move_old_file(&old, &new, &dir.join("data")).unwrap(),
+        Moved::Moved { .. }
+    ));
+    assert_eq!(
+        Some(std::fs::read_to_string(&new).unwrap()),
+        rewritten_text(OLD).unwrap().map(|(text, _)| text)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// With a file at both paths the new one is kept and the old one named as stale, even when the
 /// old one is newer: edits to it no longer reach this build.
 #[test]

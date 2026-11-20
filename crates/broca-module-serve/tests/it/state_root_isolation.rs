@@ -102,8 +102,15 @@ fn a_fresh_machine_boots_past_the_state_root() {
     // looking for paths in the message.
     let stderr = String::from_utf8_lossy(&output.stderr).replace("\\\\", "\\");
     assert!(!output.status.success(), "{stderr}");
+    // Under the settings gate broca connects first, to take its settings; without it, the tool
+    // plane's connection is the first.
+    let connect = if cfg!(feature = "settings-gate") {
+        "connection file open failed"
+    } else {
+        "tool-plane consumer connect"
+    };
     assert!(
-        stderr.contains("tool-plane consumer connect"),
+        stderr.contains(connect),
         "a fresh machine must reach the subc connection, not stop at the state root: {stderr}"
     );
     assert!(!stderr.contains("state root"), "{stderr}");
@@ -201,6 +208,9 @@ fn only_the_shared_resolver_names_the_state_root() {
 }
 
 /// Boot a child through each command builder and observe its writes beneath the selected root.
+// Under the settings gate broca opens its storage only after the daemon's settings arrive, and
+// this stand-in daemon offers none.
+#[cfg(not(feature = "settings-gate"))]
 #[tokio::test]
 async fn every_broca_spawn_site_pins_its_state_root() {
     let wrappers = [
