@@ -194,14 +194,25 @@ impl broca_core::Provider for Attempting {
         let mut inner = self.0.step(step_id, opts).await;
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
+            // A scripted step that fails is an attempt the provider didn't serve.
+            let first = inner.recv().await;
+            let failed = matches!(
+                first,
+                Some(NormalizedEvent::Control(ProviderControl::Error { .. }))
+            );
+            let (status, outcome) = if failed {
+                (500, "http_error")
+            } else {
+                (200, "complete")
+            };
             let attempt = serde_json::from_value(json!({
                 "attempt": 0,
                 "request_body_len": 10,
                 "request_body_sha256": digest,
-                "http_status": 200,
+                "http_status": status,
                 "response_body_len": 0,
                 "response_body_sha256": "0".repeat(64),
-                "outcome": "complete",
+                "outcome": outcome,
                 "ts_ms": 1,
                 "sent_at_ms": 1,
             }))
@@ -214,6 +225,11 @@ impl broca_core::Provider for Attempting {
                 .is_err()
             {
                 return;
+            }
+            if let Some(event) = first {
+                if tx.send(event).await.is_err() {
+                    return;
+                }
             }
             while let Some(event) = inner.recv().await {
                 if tx.send(event).await.is_err() {
@@ -368,6 +384,11 @@ impl RunExecutor for StoreLoop {
 }
 
 fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
+    finished_step(id, text, FinishReason::Stop)
+}
+
+/// A step whose reply ended for `finish_reason`.
+fn finished_step(id: &str, text: &str, finish_reason: FinishReason) -> Vec<NormalizedEvent> {
     vec![
         NormalizedEvent::Control(ProviderControl::AssistantMessage {
             message: AssistantMessage {
@@ -381,10 +402,21 @@ fn text_step(id: &str, text: &str) -> Vec<NormalizedEvent> {
                 output_tokens: Some(20),
                 ..Usage::default()
             },
-            finish_reason: FinishReason::Stop,
+            finish_reason,
             retries_used: 0,
         }),
     ]
+}
+
+/// A step the provider fails with a permanent error.
+fn failed_step() -> Vec<NormalizedEvent> {
+    vec![NormalizedEvent::Control(ProviderControl::Error {
+        error: serde_json::from_value(
+            json!({"class": "permanent", "message": "the provider refused the request"}),
+        )
+        .unwrap(),
+        retries_used: 0,
+    })]
 }
 
 fn request(text: &str) -> SubmissionRequest {
@@ -1217,6 +1249,66 @@ async fn refusals_before_a_model_call_store_nothing_and_each_retry_is_a_new_atte
             .collect::<Vec<_>>(),
         [calls[4].run_id.as_str()]
     );
+}
+
+/// The system text the head's plan gives it, first in every request it sends.
+const SYSTEM: &str = "you are a worker";
+
+/// The digest the executor checks a fork's base against: its options rendered under the rig's
+/// stateless render config.
+fn rendered_digest(opts: &broca_protocol::request::CallOptions) -> String {
+    broca_core::render::request_digest_hex(&broca_core::render::canonical_request_bytes(opts))
+}
+
+#[tokio::test]
+async fn a_finished_answer_follows_the_base_and_a_cut_off_one_does_not() {
+    let mut rig = Rig::head("answered", vec![text_step("a", "head reply")]).await;
+    let fork = rig.prepare(1).await.unwrap();
+    rig.forks.answer(answered("one"));
+    rig.ask(1, &fork, "one", "What did you say?").await.unwrap();
+    let call = rig.forks.calls()[0].clone();
+    // The head's reply asked for no tool call, so it ends the base, as an assistant message
+    // after the request, and the question follows it.
+    assert_eq!(texts(&call.base), [SYSTEM, "hello", "head reply"]);
+    assert_eq!(
+        call.base.prompt.last().unwrap().role,
+        broca_protocol::content::Role::Assistant
+    );
+    assert_eq!(
+        texts(&call.request),
+        [SYSTEM, "hello", "head reply", "What did you say?"]
+    );
+    // The base's digest is that of the bytes with the answer, which the executor checks.
+    assert_eq!(call.base_digest, rendered_digest(&call.base));
+
+    let mut cut = Rig::head(
+        "cut-off",
+        vec![finished_step("a", "a reply cut sh", FinishReason::Length)],
+    )
+    .await;
+    let fork = cut.prepare(1).await.unwrap();
+    cut.forks.answer(answered("one"));
+    cut.ask(1, &fork, "one", "What did you say?").await.unwrap();
+    let call = cut.forks.calls()[0].clone();
+    // An answer cut off at the output limit isn't the head's to carry on as it is.
+    assert_eq!(texts(&call.base), [SYSTEM, "hello"]);
+    assert_eq!(call.base_digest, rendered_digest(&call.base));
+}
+
+#[tokio::test]
+async fn a_newer_request_the_provider_did_not_serve_is_not_the_base() {
+    let mut rig = Rig::head(
+        "unserved",
+        vec![text_step("a", "head reply"), failed_step()],
+    )
+    .await;
+    rig.send("r2", "the provider refuses this", None).await;
+    let fork = rig.prepare(1).await.unwrap();
+    rig.forks.answer(answered("one"));
+    rig.ask(1, &fork, "one", "What did you say?").await.unwrap();
+    let call = rig.forks.calls()[0].clone();
+    // The newest request the provider served is the first, with its answer.
+    assert_eq!(texts(&call.base), [SYSTEM, "hello", "head reply"]);
 }
 
 #[tokio::test]

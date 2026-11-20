@@ -30,9 +30,10 @@ pub struct ForkCallJob {
     /// The fork attempt's own run identity, under which its spend is reported: equal to
     /// [`fork_admission_id`] of this attempt. Never one of the head's run ids.
     pub run_id: String,
-    /// The head's request the fork is based on, rebuilt from the head's records as idle cache
-    /// warming rebuilds a recorded request: its run, step, config, options, recorded digest and
-    /// refusal-fallback route. `base.config` is what the fork is pinned to: the head's frozen
+    /// The fork's base, rebuilt from the head's records as idle cache warming rebuilds a recorded
+    /// request: the head's request (its run, step, config, options and refusal-fallback route),
+    /// with the head's answer to it appended when the fork's prepare appended one, and the digest
+    /// of the bytes that renders to. `base.config` is what the fork is pinned to: the head's frozen
     /// provider, model, render config, auth selection (account, credential, routing decision
     /// with the head's `conversation_key`, pool) and service tier. The executor builds its
     /// provider from this config alone, renders `base.opts` and sends nothing when the bytes'

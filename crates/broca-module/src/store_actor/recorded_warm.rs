@@ -22,7 +22,29 @@ pub(crate) async fn request<W: Writer>(
     run_id: &str,
     step: Option<u64>,
 ) -> Result<RecordedRequest, String> {
-    rebuild(writer, records, parts, bind, run_id, step, false).await
+    rebuild(
+        writer,
+        records,
+        parts,
+        bind,
+        run_id,
+        step,
+        false,
+        Through::Request,
+    )
+    .await
+}
+
+/// Where a rebuilt request's conversation ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Through {
+    /// Before the step's own reply: the request the step sent.
+    Request,
+    /// After the step's own reply: the request the step sent with the reply appended, rendered
+    /// as history, as the session's next request would carry it. The reply must already be
+    /// placed in the conversation, which a reply that asked for no tool call is when its step
+    /// ends. The rebuilt request keeps the step's settings; its digest is not the recorded one.
+    Answer,
 }
 
 /// Build the request step `step` of run `run_id` sent, as the session stood when it sent it, for
@@ -39,9 +61,20 @@ pub(crate) async fn request_as_of<W: Writer>(
     run_id: &str,
     step: u64,
 ) -> Result<RecordedRequest, String> {
-    rebuild(writer, records, parts, bind, run_id, Some(step), true).await
+    rebuild(
+        writer,
+        records,
+        parts,
+        bind,
+        run_id,
+        Some(step),
+        true,
+        Through::Request,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rebuild<W: Writer>(
     writer: &W,
     records: &[(u64, Record)],
@@ -50,6 +83,7 @@ async fn rebuild<W: Writer>(
     run_id: &str,
     step: Option<u64>,
     as_of: bool,
+    through: Through,
 ) -> Result<RecordedRequest, String> {
     let (attempt_at, attempt) = records
         .iter()
@@ -189,11 +223,18 @@ async fn rebuild<W: Writer>(
         operations.run = prefix.run;
         operations
     };
-    let before = Before {
-        writer,
-        conversation: conversation
+    let conversation = match through {
+        Through::Request => conversation
             .before_entry(ordinal)
             .ok_or("the recorded step is outside the window")?,
+        // The open turn is a reply still waiting on its tool calls, which is never appended.
+        Through::Answer => conversation
+            .before_entry(ordinal + 1)
+            .ok_or("the recorded step's reply is not placed in the conversation")?,
+    };
+    let before = Before {
+        writer,
+        conversation,
         operations,
         ledger,
     };
@@ -252,7 +293,7 @@ async fn rebuild<W: Writer>(
 /// The request `session` last sent for run `run_id` (for its step `step`, when one is named),
 /// rebuilt from the session's records: its open log when that holds the run's start and the
 /// attempt, else its whole history read through `readers`, the backend of the root holding its
-/// sealed logs. Writes nothing.
+/// sealed logs. With [`Through::Answer`], the step's reply follows the request. Writes nothing.
 pub(crate) async fn recorded_request<B, R>(
     session: &broca_session_store::session::Session<B>,
     readers: Option<R>,
@@ -260,6 +301,7 @@ pub(crate) async fn recorded_request<B, R>(
     bind: &BindIdentity,
     run_id: &str,
     step: Option<u64>,
+    through: Through,
 ) -> Result<RecordedRequest, String>
 where
     B: broca_session_store::backend::SessionBackend,
@@ -287,7 +329,7 @@ where
             .await
             .map_err(|error| format!("read the recorded request's history: {error:?}"))?;
     }
-    request(session, &records, parts, bind, run_id, step).await
+    rebuild(session, &records, parts, bind, run_id, step, false, through).await
 }
 
 impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> super::StoreActor<B> {
@@ -327,6 +369,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
             &self.key,
             &run_id,
             None,
+            Through::Request,
         )
         .await
     }
