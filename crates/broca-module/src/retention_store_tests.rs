@@ -492,6 +492,57 @@ async fn unexpired_and_leased_sessions_in_the_new_storage_are_kept() {
     }
 }
 
+/// The deadlines a pass found are kept on disk, so the first pass after a restart reads only the
+/// sessions that changed since. Here the session's open log is damaged in place after the first
+/// pass, keeping its length, so its position doesn't move: a pass that read it again would
+/// count it unreadable.
+#[tokio::test]
+async fn a_restarted_pass_reads_no_session_the_kept_deadlines_already_decide() {
+    let rig = Rig::new("kept-deadlines", Duration::from_secs(600)).await;
+    let key = rig.key("idle");
+    rig.seed(
+        &key,
+        &[
+            store_start("r1", Some(SECONDS), STARTED_MS),
+            store_end("r1", ENDED_MS),
+            store_billed("r1"),
+        ],
+        false,
+    )
+    .await;
+    assert!(rig
+        .service
+        .sweep_store(&rig.runtime, DEADLINE_MS - 1)
+        .await
+        .is_empty());
+    assert_eq!(rig.service.unreadable_sessions(), 0);
+
+    let logs = rig.ephemeral().join("logs").join(addr(&key).0);
+    let log = std::fs::read_dir(&logs)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut bytes = std::fs::read(&log).unwrap();
+    let last = bytes.len() - 20;
+    bytes[last] ^= 0xff;
+    std::fs::write(&log, &bytes).unwrap();
+
+    let leases = Arc::new(FileLeaseStore::new(rig.root.join("leases")));
+    let restarted = RetentionService::new(&rig.root, leases).unwrap();
+    assert!(restarted
+        .sweep_store(&rig.runtime, DEADLINE_MS - 1)
+        .await
+        .is_empty());
+    assert_eq!(
+        restarted.unreadable_sessions(),
+        0,
+        "the restarted pass read a session whose kept deadline already decided it"
+    );
+    assert!(rig.holds(&key));
+}
+
 /// A fork's session in the ephemeral root, which holds only its fork's records, is kept until
 /// its retention time past the fork's idle time after its newest record, and then deleted by the
 /// same sweep, with no deletion deferred for want of a reading.

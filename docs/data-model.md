@@ -68,6 +68,12 @@ carries the deleted sessions' ledger-stamped tag floors. Computed numbering rese
 storage; only earlier ledger floors survive that reset. This entire root, including the
 markers, is excluded from backups (`engram-catalog.json`).
 
+`session-store-ephemeral/retention-deadlines.json` keeps the deadline retention found for
+each session, with the position it read the session at (head version, open log, length read),
+so the first pass after a restart reads only the sessions written to since. It holds addresses,
+positions and times, never content, and it is a cache: a missing or unreadable file means
+every session is read again.
+
 The version-1 marker body is the store's tagged binary encoding of its version, session
 triple, expiry timestamp, monotonic deletion sequence, next part-tag and legacy notice-sequence
 floors, and deleted run IDs. Its envelope is a cipher byte (0 plain, 1 encrypted), a little-endian

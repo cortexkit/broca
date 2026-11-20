@@ -33,13 +33,20 @@ use crate::store_open::StoreRuntime;
 
 #[path = "retention_store_counters.rs"]
 pub(crate) mod counters;
+#[path = "retention_store_deadlines.rs"]
+mod kept;
 
 /// What retention keeps between passes about the sessions in the new storage.
 #[derive(Default)]
 pub(super) struct StoreRetention {
     /// Each session's deadline, as its records said at the stored position it was read at, by
-    /// address. A pass reads a session's records again only once the session has changed.
+    /// address. A pass reads a session's records again only once the session has changed. Kept
+    /// on disk too ([`kept`]), so a restart's first pass doesn't read every session again.
     deadlines: Mutex<HashMap<String, (Position, Option<u64>)>>,
+    /// Whether `deadlines` was filled from the kept file, which the first pass does.
+    loaded: std::sync::atomic::AtomicBool,
+    /// Whether `deadlines` changed since it was last kept.
+    changed: std::sync::atomic::AtomicBool,
     /// The sessions being deleted now, under their lease.
     deleting: Mutex<HashSet<BindIdentity>>,
 }
@@ -191,7 +198,20 @@ impl RetentionService {
         runtime: &StoreRuntime,
         now_ms: u64,
     ) -> Vec<BindIdentity> {
-        let backend = LocalBackend::new(StorageClass::Ephemeral.store_root(runtime.state_root()));
+        use std::sync::atomic::Ordering;
+        let root = StorageClass::Ephemeral.store_root(runtime.state_root());
+        if !self.store.loaded.swap(true, Ordering::Relaxed) {
+            let kept = kept::load(&root);
+            let mut deadlines = self
+                .store
+                .deadlines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (address, found) in kept {
+                deadlines.entry(address).or_insert(found);
+            }
+        }
+        let backend = LocalBackend::new(&root);
         let (addresses, cut_short) = match backend.stored_sessions_and_deletions() {
             Ok(found) => found,
             Err(error) => {
@@ -204,11 +224,18 @@ impl RetentionService {
         // of thousands of sessions, and the scan cost each pass their count squared.
         let listed: std::collections::HashSet<&str> =
             addresses.iter().map(|addr| addr.0.as_str()).collect();
-        self.store
-            .deadlines
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|address, _| listed.contains(address.as_str()));
+        {
+            let mut deadlines = self
+                .store
+                .deadlines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let before = deadlines.len();
+            deadlines.retain(|address, _| listed.contains(address.as_str()));
+            if deadlines.len() != before {
+                self.store.changed.store(true, Ordering::Relaxed);
+            }
+        }
         for addr in cut_short {
             if let Err(error) = self.finish_store_deletion(runtime, &backend, &addr) {
                 tracing::warn!(target: "retention", session = %addr.0, %error,
@@ -232,6 +259,20 @@ impl RetentionService {
                     tracing::warn!(target: "retention", session = %addr.0, %error,
                         "deletion deferred; the new storage's session couldn't be decided or deleted");
                 }
+            }
+        }
+        if self.store.changed.swap(false, Ordering::Relaxed) {
+            let deadlines = self
+                .store
+                .deadlines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Err(error) = kept::save(&root, &deadlines) {
+                // Only the next restart pays: its first pass reads the sessions again.
+                self.store.changed.store(true, Ordering::Relaxed);
+                tracing::warn!(target: "retention", %error,
+                    "the retention deadlines found couldn't be kept on disk");
             }
         }
         deleted
@@ -375,11 +416,17 @@ impl RetentionService {
             Err(error) => return Err(self.unreadable_store_session(addr, error)),
         };
         let deadline = store_policy(&records).and_then(|(_, _, deadline)| deadline);
-        self.store
+        let previous = self
+            .store
             .deadlines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(addr.0.clone(), (position, deadline));
+        if previous != Some((position, deadline)) {
+            self.store
+                .changed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(deadline)
     }
 
