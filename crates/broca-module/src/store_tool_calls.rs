@@ -16,8 +16,9 @@
 //!   result. A call with no key yet takes the key the outcome recorded.
 //! - **The batch's end:** every call of the batch is listed, its results at the next ordinal. A
 //!   call with an intent and no outcome is indeterminate; one with neither isn't listed.
-//! - **A run still running:** the open batch's calls are listed as they stand, with no result
-//!   ordinal.
+//! - **A run still running:** the open batch's calls are listed as they stand. A call's result
+//!   is written as soon as it comes back, before the rest of its batch, so a call with an
+//!   outcome lists its result ordinal already: the contract wants it on every finished call.
 //!
 //! The keys are the ones the store recorded: a moved session keeps today's keys, and a session
 //! the new storage started has its own. A cursor carries the store's seqs and names the
@@ -315,6 +316,8 @@ fn walk(
                             call.call.call_key = outcome.call_key.clone();
                         }
                         call.call.outcome = outcomes::REFUSED.into();
+                        // The results' ordinal follows the message's, set when it is listed.
+                        call.call.result_ordinal = Some(0);
                         call.terminal = true;
                     }
                 } else if let Some(call) = active
@@ -349,6 +352,7 @@ fn walk(
                             })?
                             .len() as u64,
                     );
+                    call.call.result_ordinal = Some(0);
                     call.terminal = true;
                 }
             }

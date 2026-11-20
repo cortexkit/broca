@@ -430,6 +430,45 @@ async fn a_batch_in_flight_lists_alike() {
     }
 }
 
+/// A call's result is written as soon as it comes back, before the rest of its batch. While the
+/// batch is still open, that call is finished, so it lists the ordinal its result is read at,
+/// as the contract wants of every finished call; a call still waiting lists none.
+#[tokio::test]
+async fn a_finished_call_in_an_open_batch_lists_its_result_ordinal() {
+    let steps = || vec![reads("a1", &["c1", "c2"]), text_step("a2", "done")];
+    let (side, gate) = pair(steps, true, Cipher::None).await;
+    let gate = gate.unwrap();
+    assert!(matches!(
+        side.send("r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    gate.1.notify_one();
+    let page = broca_test_support::wait_until("one call of the batch is answered", || async {
+        let page = reply(side.calls("r1", None, None).await);
+        if outcomes(&page).iter().any(|outcome| outcome == "succeeded") {
+            Ok(page)
+        } else {
+            Err(page.to_string())
+        }
+    })
+    .await;
+    for call in page["calls"].as_array().unwrap() {
+        if call["outcome"] == "succeeded" {
+            let ordinal = call["ordinal"].as_u64().unwrap();
+            assert_eq!(call["result_ordinal"], json!(ordinal + 1), "{page}");
+        } else {
+            assert!(call.get("result_ordinal").is_none(), "{page}");
+        }
+    }
+    gate.1.notify_one();
+    side.idle().await;
+    let pages = side.pages("r1", None).await;
+    assert_eq!(
+        outcomes(&pages[0]),
+        [json!("succeeded"), json!("succeeded")]
+    );
+}
+
 /// Runs a session on `dir` until its run's call is dispatched and waiting for its tool, then
 /// drops every task where it waits, as a crash does: nothing records the call's result.
 async fn crash_mid_dispatch(dir: std::path::PathBuf, cipher: Cipher) {
