@@ -191,3 +191,9 @@ fn account_labels_are_truncated_hashes_of_the_vault_account() {
     // The static credential's account reports the same way when routing chose nothing.
     assert!(selection_account_label(&static_selection()).is_some());
 }
+
+#[path = "media_view_tests.rs"]
+mod media;
+
+#[path = "view_negotiation_tests.rs"]
+mod negotiation;

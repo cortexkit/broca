@@ -4673,7 +4673,9 @@ mod renamed_scope_owner {
 /// Answers the plane's route open, as the module end of an in-process connection, and returns
 /// the request that follows it with whether the open offered call keepalive.
 mod call_keepalive {
+    use super::*;
     use crate::connection::InProcessModuleEnd;
+    use subc_protocol::FrameType;
 
     pub(super) async fn bound_request(
         module: &mut InProcessModuleEnd,
@@ -4693,4 +4695,261 @@ mod call_keepalive {
         assert!(module.reply(&bind, serde_json::to_vec(&answer).unwrap()));
         (module.next_request().await, keepalive)
     }
+
+    fn frozen_manifest(keepalive: bool, reply: Option<u64>) -> broca_wal::PlanManifest {
+        let tool = serde_json::json!({
+            "name":"read", "description":"probe", "input_schema": {"type":"object"},
+            "module":"aft", "execution_mode":"parallel"
+        });
+        let mut fetch =
+            serde_json::json!({"provider":"aft", "catalog_digest":"digest", "tools":[tool]});
+        if keepalive {
+            fetch["declarations_frozen"] = serde_json::json!({"call_keepalive":true});
+        }
+        if let Some(max_ms) = reply {
+            fetch["reply"] = serde_json::json!({"read":{"max_ms":max_ms}});
+        }
+        let manifest: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+            "plan":r#"{"tool_items":[{"provider":"aft"}]}"#,
+            "plan_identity":"identity", "composition_digest":"composition",
+            "fetches":[fetch], "tools":[tool], "system_text":"", "system_digest":"",
+            "join_version":1, "role_versions":{}
+        }))
+        .unwrap();
+        // Resume reads only the stored promise, not the provider's current catalog.
+        serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap()
+    }
+
+    fn rig() -> (SubcToolPlane, InProcessModuleEnd) {
+        let (conn, route, module) = SubcConnection::in_process_for_test(7, 1);
+        let plane = SubcToolPlane::with_connection(
+            Arc::new(InProcessWireConnection { conn, route }),
+            "aft",
+        );
+        plane.windows.lock().unwrap().insert("aft".into(), 1);
+        (plane, module)
+    }
+
+    fn assert_cancel_and_ignore_late(
+        module: &mut InProcessModuleEnd,
+        request: &subc_protocol::Frame,
+    ) {
+        let frames = module.take_written_for_test();
+        let cancels: Vec<_> = frames
+            .iter()
+            .filter(|f| f.header.ty == FrameType::Cancel)
+            .collect();
+        assert_eq!(cancels.len(), 1, "{frames:?}");
+        assert_eq!(cancels[0].header.corr, request.header.corr);
+        assert_eq!(cancels[0].header.channel, request.header.channel);
+        assert_eq!(cancels[0].header.epoch, request.header.epoch);
+        assert!(
+            !frames.iter().any(|f| f.header.ty == FrameType::Request),
+            "no re-send"
+        );
+        assert_eq!(module.pending_count_for_test(), 0);
+        assert!(!module.push(
+            request,
+            cortexkit_role_tool_provider::keepalive_body().to_vec()
+        ));
+        assert!(!module.reply(
+            request,
+            br#"{"content":[{"type":"text","text":"late"}]}"#.to_vec()
+        ));
+    }
+
+    #[tokio::test]
+    async fn kit_keepalive_deadline_vectors_reach_frozen_dispatch_selection() {
+        let vectors: serde_json::Value = serde_json::from_str(
+            cortexkit_role_tool_provider_conformance::wire::vectors::CALL_KEEPALIVE_JSON,
+        )
+        .unwrap();
+        for case in vectors["deadlines"].as_array().unwrap() {
+            for keepalive in [false, true] {
+                let mut frozen = serde_json::to_value(frozen_manifest(keepalive, None)).unwrap();
+                if !case["reply"].is_null() {
+                    frozen["fetches"][0]["reply"] = serde_json::json!({"read":case["reply"]});
+                }
+                let frozen: broca_wal::PlanManifest = serde_json::from_value(frozen).unwrap();
+                let manifest = ToolManifest::from_tools(frozen.tools.as_ref().clone())
+                    .with_plan_manifest(&frozen)
+                    .unwrap();
+                let conn = ScriptedToolPlaneConnection::new(vec![vec![]], vec![]);
+                let plane = SubcToolPlane::with_connection(conn, "aft")
+                    .with_reply_fallback_for_test(case["runner_fallback_ms"].as_u64().unwrap());
+                plane.windows.lock().unwrap().insert("aft".into(), 1);
+                let ctx = batch_ctx("vectors");
+                let mut call = call("read");
+                call.input = case["arguments"].clone().into();
+                plane
+                    .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+                    .await
+                    .unwrap();
+                assert_eq!(plane.frozen_contract(&ctx, "aft").call_keepalive, keepalive);
+                let expected = if keepalive {
+                    "with_keepalive_ms"
+                } else {
+                    "without_keepalive_ms"
+                };
+                assert_eq!(
+                    plane.reply_deadline(&ctx, "aft", &call),
+                    Duration::from_millis(case[expected].as_u64().unwrap()),
+                    "{} (keepalive={keepalive})",
+                    case["name"],
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_aft_bounds_cover_blocking_bash_and_background_worker_watch_arguments() {
+        for (name, input) in [
+            ("bash", serde_json::json!({"command":"work","wait":true})),
+            ("bash", serde_json::json!({"command":"work"})),
+            (
+                "bash_watch",
+                serde_json::json!({"taskId":"task","background":true,"timeoutMs":600_000}),
+            ),
+            ("bash_watch", serde_json::json!({"taskId":"task"})),
+        ] {
+            let mut value = serde_json::to_value(frozen_manifest(false, None)).unwrap();
+            value["tools"][0]["name"] = serde_json::json!(name);
+            value["fetches"][0]["tools"][0]["name"] = serde_json::json!(name);
+            value["fetches"][0]["reply"] = serde_json::json!({name:{"max_ms":2_040_000}});
+            let plan: broca_wal::PlanManifest = serde_json::from_value(value).unwrap();
+            let manifest = ToolManifest::from_tools(plan.tools.as_ref().clone())
+                .with_plan_manifest(&plan)
+                .unwrap();
+            let conn =
+                ScriptedToolPlaneConnection::new(vec![vec![]], vec![successful_tool_reply("done")]);
+            let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+            plane.windows.lock().unwrap().insert("aft".into(), 1);
+            let ctx = batch_ctx("aft-declared-bounds");
+            let mut call = call(name);
+            call.input = input.into();
+            plane
+                .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+                .await
+                .unwrap();
+            assert!(matches!(
+                plane.dispatch(&ctx, &call).await,
+                DispatchResult::Completed(_)
+            ));
+            assert_eq!(
+                *conn.dispatched_deadlines.lock().unwrap(),
+                [Duration::from_millis(2_040_000)]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn module_restart_bind_wait_leaves_the_full_declared_budget_after_enqueue() {
+        for keepalive in [false, true] {
+            let (plane, mut module) = rig();
+            let ctx = batch_ctx("restart-budget");
+            let call = call("read");
+            let plan = frozen_manifest(keepalive, Some(120_000));
+            let manifest = ToolManifest::from_tools(plan.tools.as_ref().clone())
+                .with_plan_manifest(&plan)
+                .unwrap();
+            let dispatch = async {
+                plane
+                    .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+                    .await
+                    .unwrap();
+                plane.dispatch(&ctx, &call).await
+            };
+            let started = Instant::now();
+            let work = async {
+                loop {
+                    let bind = module.next_request().await;
+                    let raw: serde_json::Value = serde_json::from_slice(&bind.body).unwrap();
+                    assert_eq!(raw["op"], "route.open");
+                    if started.elapsed() < Duration::from_secs(25) {
+                        assert!(module.refuse(&bind, "module_reloading"));
+                    } else {
+                        let answer = subc_control::ClientControlResponse::RouteOpen {
+                            route_channel: 7,
+                            route_epoch: 1,
+                            request_window: None,
+                            watch_window: None,
+                        };
+                        assert!(module.reply(&bind, serde_json::to_vec(&answer).unwrap()));
+                        break;
+                    }
+                }
+                let request = module.next_request().await;
+                let enqueued = Instant::now();
+                for _ in 0..3 {
+                    sleep(Duration::from_secs(30)).await;
+                    assert!(module.push(&request, br#"{"kind":"progress"}"#.to_vec()));
+                }
+                sleep(Duration::from_secs(20)).await;
+                assert!(module.reply(&request, br#"{"content":[],"isError":false}"#.to_vec()));
+                enqueued
+            };
+            let (outcome, enqueued) = tokio::join!(dispatch, work);
+            assert!(
+                matches!(outcome, DispatchResult::Completed(ref r) if !r.is_error),
+                "{outcome:?}"
+            );
+            assert_eq!(enqueued.elapsed(), Duration::from_secs(110));
+            assert!(started.elapsed() >= Duration::from_secs(135));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn declared_reply_is_absolute_without_keepalive_even_with_progress() {
+        for frozen in [true, false] {
+            let (plane, mut module) = rig();
+            let ctx = batch_ctx("declared-progress");
+            let call = call("read");
+            let manifest = if frozen {
+                let plan = frozen_manifest(false, Some(120_000));
+                ToolManifest::from_tools(plan.tools.as_ref().clone())
+                    .with_plan_manifest(&plan)
+                    .unwrap()
+            } else {
+                ToolManifest::from_tools(vec![serde_json::from_value(serde_json::json!({
+                    "name":"read", "description":"probe", "input_schema":{}, "module":"aft",
+                    "reply":{"max_ms":120_000}
+                }))
+                .unwrap()])
+            };
+            let dispatch = async {
+                plane
+                    .batch_started(&ctx, std::slice::from_ref(&call), &manifest)
+                    .await
+                    .unwrap();
+                plane.dispatch(&ctx, &call).await
+            };
+            let provider = async {
+                let (request, keepalive) = bound_request(&mut module).await;
+                assert!(!keepalive);
+                let started = Instant::now();
+                for _ in 0..3 {
+                    sleep(Duration::from_secs(30)).await;
+                    assert!(module.push(
+                        &request,
+                        br#"{"kind":"progress","message":"working"}"#.to_vec()
+                    ));
+                }
+                (request, started)
+            };
+            let (outcome, (request, started)) = tokio::join!(dispatch, provider);
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_secs(120),
+                "frozen={frozen}"
+            );
+            assert!(
+                matches!(outcome, DispatchResult::SentButOutcomeUnknown { ref reason }
+                if reason.contains("timed out after 120s")),
+                "{outcome:?}"
+            );
+            assert_cancel_and_ignore_late(&mut module, &request);
+        }
+    }
 }
+
+mod outage_wait_tests;

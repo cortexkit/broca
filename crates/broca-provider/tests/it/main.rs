@@ -14,6 +14,7 @@
 //! - `tests/live`: the live-provider suite. It spends real provider credit, runs only by hand, and
 //!   the Rust gate leaves it out by its binary name.
 
+mod cache_warm_e2e;
 #[cfg(feature = "live")]
 mod family_e2e;
 #[path = "../live_common/mod.rs"]
@@ -82,6 +83,7 @@ mod renderer_version_reproduction;
 mod responses_cache_write_usage;
 mod ride_placement_render;
 mod runner_tags_render;
+mod service_tier_used;
 #[cfg(feature = "live")]
 mod stream_errors_e2e;
 mod structured_output_render;

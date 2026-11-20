@@ -1468,8 +1468,9 @@ impl Owner {
         self.episodes == 0 || self.awaiting_import_admission()
     }
 
-    /// Folds one run start's principal and scope, as `SessionOwnershipV1::fold_run_started`
-    /// folds them, and keeps the session's admitting start (or its pending import seed).
+    /// Folds one run start's principal and scope into the owner summary the admission rules
+    /// read (`broca_core::scope_admission`, through `broca_session_loop::owner::ownership`), and
+    /// keeps the session's admitting start (or its pending import seed).
     fn fold_run_start(&mut self, start: &crate::record::RunStart) {
         let principal = start.principal.as_ref();
         let scope = start.scope.as_ref();

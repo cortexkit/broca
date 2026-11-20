@@ -546,6 +546,112 @@ mod tests {
     /// the two spellings must differ somewhere before parsing, or there is nothing for the flag to
     /// preserve.
     #[test]
+    fn identical_failures_warn_on_the_second() {
+        let mut observer = RepetitionObserver::default();
+        let c = call("read", json!({"filePath": "a.rs"}));
+        assert_eq!(
+            observer.observe(&c, b"boom", true),
+            RepetitionVerdict::Quiet
+        );
+        assert!(matches!(
+            observer.observe(&c, b"boom", true),
+            RepetitionVerdict::RepeatedFailure { count: 2, .. }
+        ));
+    }
+
+    /// The rule that makes the counter honest: one success means the model is not stuck, so the
+    /// history must not survive it. Without this a tool that fails twice, works, then fails once
+    /// would warn on that single later failure.
+    #[test]
+    fn a_success_clears_the_failure_history() {
+        let mut observer = RepetitionObserver::default();
+        let c = call("read", json!({"filePath": "a.rs"}));
+        observer.observe(&c, b"boom", true);
+        observer.observe(&c, b"fine", false);
+        assert_eq!(
+            observer.observe(&c, b"boom", true),
+            RepetitionVerdict::Quiet,
+            "the failure before the success must not count toward the next one"
+        );
+    }
+
+    /// The polling counter-example, which is the whole reason outcome alone is not enough: the same
+    /// read against a file being written returns different bytes each time, and that is progress.
+    #[test]
+    fn a_changing_result_is_progress_not_repetition() {
+        let mut observer = RepetitionObserver::default();
+        let c = call("read", json!({"filePath": "growing.log"}));
+        for i in 0..6 {
+            let body = format!("line {i}");
+            assert_eq!(
+                observer.observe(&c, body.as_bytes(), false),
+                RepetitionVerdict::Quiet,
+                "a read whose contents keep changing is making progress"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanging_read_warns() {
+        let mut observer = RepetitionObserver::default();
+        let c = call("read", json!({"filePath": "static.rs"}));
+        assert_eq!(
+            observer.observe(&c, b"same", false),
+            RepetitionVerdict::Quiet
+        );
+        assert!(matches!(
+            observer.observe(&c, b"same", false),
+            RepetitionVerdict::NoProgress { count: 2, .. }
+        ));
+    }
+
+    /// Writing the same file twice is repetition and not a loop, so a mutating tool must never
+    /// produce a no-progress verdict however identical its results.
+    #[test]
+    fn a_mutating_tool_never_reports_no_progress() {
+        let mut observer = RepetitionObserver::default();
+        let c = call("write", json!({"filePath": "out.rs", "content": "x"}));
+        for _ in 0..5 {
+            assert_eq!(
+                observer.observe(&c, b"written", false),
+                RepetitionVerdict::Quiet
+            );
+        }
+    }
+
+    #[test]
+    fn one_tool_failing_on_varied_arguments_warns() {
+        let mut observer = RepetitionObserver::default();
+        for i in 0..3 {
+            let c = call("read", json!({ "filePath": format!("f{i}.rs") }));
+            let verdict = observer.observe(&c, b"missing", true);
+            if i < 2 {
+                assert_eq!(verdict, RepetitionVerdict::Quiet);
+            } else {
+                assert!(matches!(
+                    verdict,
+                    RepetitionVerdict::RepeatedToolFailure { count: 3, .. }
+                ));
+            }
+        }
+    }
+
+    /// Argument key order must not split one call into two signatures, or the counter silently
+    /// never fires on a model that varies key order between calls.
+    ///
+    /// BE CLEAR ABOUT WHAT HOLDS THIS UP: not the canonicaliser. `serde_json::Value` stores
+    /// objects in a sorted map, so both spellings are already identical by the time any code here
+    /// runs -- this test passes even with the canonicalisation removed entirely, which I verified
+    /// rather than assumed. What it actually pins is the DEPENDENCY ASSUMPTION: serde_json's
+    /// `preserve_order` feature swaps that sorted map for an insertion-ordered one, and cargo
+    /// feature unification means any crate in the tree turning it on would change it here. That is
+    /// a real regression this catches and a plausible one, since the flag is enabled for exactly
+    /// the round-trip-fidelity reasons another part of a workspace tends to want.
+    ///
+    /// Written from JSON TEXT rather than `json!` literals so a feature flip is observable at all:
+    /// the two spellings must differ somewhere before parsing, or there is nothing for the flag to
+    /// preserve.
+    #[test]
     fn argument_key_order_does_not_split_the_signature() {
         let ab: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
         let ba: serde_json::Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
@@ -554,5 +660,211 @@ mod tests {
             CallSignature::of(&call("read", ba)),
             "the same call written with its keys in a different order is the same call"
         );
+    }
+}
+
+#[cfg(test)]
+mod prompt_fold_tests {
+    use super::*;
+    use broca_protocol::{Message, Role, ToolCallId, ToolResult};
+    use serde_json::json;
+
+    /// The observer a prompt's history folds to, as the run loop rebuilds it after a restart.
+    fn from_prompt(prompt: &[Message]) -> RepetitionObserver {
+        let mut fold = RepetitionFold::default();
+        for message in prompt {
+            fold.push(message);
+        }
+        fold.into_observer()
+    }
+
+    fn call(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
+        ContentBlock::ToolCall(ToolCall {
+            tool_call_id: ToolCallId(id.to_string()),
+            tool_name: name.to_string(),
+            input: input.into(),
+            thought_signature: None,
+            provider_state: None,
+        })
+    }
+
+    fn result(id: &str, text: &str, is_error: bool) -> ContentBlock {
+        ContentBlock::ToolResult(ToolResult {
+            tool_call_id: ToolCallId(id.to_string()),
+            output: ToolOutput::Text {
+                text: text.to_string().into(),
+            },
+            is_error,
+        })
+    }
+
+    fn turn(role: Role, content: Vec<ContentBlock>) -> Message {
+        Message {
+            turn_system: false,
+            role,
+            content,
+            cache_prefix_blocks: None,
+            origin: None,
+            ordinal: None,
+            tags: Default::default(),
+        }
+    }
+
+    /// The property the whole design rests on: a warning written into a durable ToolResult must
+    /// come out the same after a crash, and it only can if the counters are a function of the
+    /// prompt. Folding the durable history must therefore land in the same state as having watched
+    /// the calls live.
+    #[test]
+    fn folding_a_prompt_matches_having_watched_it_live() {
+        let c = ToolCall {
+            tool_call_id: ToolCallId("t1".into()),
+            tool_name: "read".into(),
+            input: json!({"filePath": "a.rs"}).into(),
+            thought_signature: None,
+            provider_state: None,
+        };
+        let mut live = RepetitionObserver::default();
+        live.observe(&c, b"boom", true);
+        let live_verdict = live.observe(&c, b"boom", true);
+
+        let prompt = vec![
+            turn(
+                Role::Assistant,
+                vec![call("t1", "read", json!({"filePath": "a.rs"}))],
+            ),
+            turn(Role::Tool, vec![result("t1", "boom", true)]),
+        ];
+        let mut folded = from_prompt(&prompt);
+        let folded_verdict = folded.observe(&c, b"boom", true);
+
+        assert_eq!(
+            folded_verdict, live_verdict,
+            "a resumed run must reach the same verdict as one that never crashed"
+        );
+    }
+
+    /// An unanswered call is an in-flight or interrupted dispatch whose outcome nobody knows.
+    /// Counting it either way would invent history the live path never saw, and the direction that
+    /// matters is that it must not be counted as a failure.
+    #[test]
+    fn a_call_with_no_result_is_not_folded() {
+        let prompt = vec![
+            turn(
+                Role::Assistant,
+                vec![call("t1", "read", json!({"filePath": "a.rs"}))],
+            ),
+            turn(Role::Tool, vec![result("t1", "boom", true)]),
+            // second call was dispatched but its result never landed
+            turn(
+                Role::Assistant,
+                vec![call("t2", "read", json!({"filePath": "a.rs"}))],
+            ),
+        ];
+        let observer = from_prompt(&prompt);
+        let signature = CallSignature::of(&ToolCall {
+            tool_call_id: ToolCallId("t1".into()),
+            tool_name: "read".into(),
+            input: json!({"filePath": "a.rs"}).into(),
+            thought_signature: None,
+            provider_state: None,
+        });
+        assert_eq!(
+            observer.exact_failures.get(&signature).copied(),
+            Some(1),
+            "only the answered call counts; the dangling one must not add a second failure"
+        );
+    }
+
+    /// Google-family normalizers mint `call_0` again at the first call of every model step. A
+    /// resumed observer must therefore follow turn order rather than treating that step-local id as
+    /// an episode-wide identity. The live observer is the oracle for the bytes an uninterrupted run
+    /// would show the model.
+    #[test]
+    fn folding_reused_step_local_ids_matches_live_verdict_sequence() {
+        let first = ToolCall {
+            tool_call_id: ToolCallId("call_0".into()),
+            tool_name: "read".into(),
+            input: json!({"filePath": "A"}).into(),
+            thought_signature: None,
+            provider_state: None,
+        };
+        let second = ToolCall {
+            tool_call_id: ToolCallId("call_0".into()),
+            tool_name: "read".into(),
+            input: json!({"filePath": "B"}).into(),
+            thought_signature: None,
+            provider_state: None,
+        };
+        let continuation = [
+            ToolCall {
+                tool_call_id: ToolCallId("call_0".into()),
+                tool_name: "read".into(),
+                input: json!({"filePath": "C"}).into(),
+                thought_signature: None,
+                provider_state: None,
+            },
+            ToolCall {
+                tool_call_id: ToolCallId("call_0".into()),
+                tool_name: "read".into(),
+                input: json!({"filePath": "D"}).into(),
+                thought_signature: None,
+                provider_state: None,
+            },
+        ];
+
+        let mut live = RepetitionObserver::default();
+        assert_eq!(
+            live.observe(&first, b"A contents", false),
+            RepetitionVerdict::Quiet
+        );
+        assert_eq!(
+            live.observe(&second, b"B missing", true),
+            RepetitionVerdict::Quiet
+        );
+
+        let prompt = vec![
+            turn(
+                Role::Assistant,
+                vec![call("call_0", "read", json!({"filePath": "A"}))],
+            ),
+            turn(Role::Tool, vec![result("call_0", "A contents", false)]),
+            turn(
+                Role::Assistant,
+                vec![call("call_0", "read", json!({"filePath": "B"}))],
+            ),
+            turn(Role::Tool, vec![result("call_0", "B missing", true)]),
+        ];
+        let mut folded = from_prompt(&prompt);
+
+        let live_verdicts: Vec<_> = continuation
+            .iter()
+            .map(|call| live.observe(call, b"missing", true))
+            .collect();
+        let folded_verdicts: Vec<_> = continuation
+            .iter()
+            .map(|call| folded.observe(call, b"missing", true))
+            .collect();
+
+        assert_eq!(
+            folded_verdicts, live_verdicts,
+            "a resumed run must emit the same guidance sequence as an uninterrupted run"
+        );
+        assert_eq!(
+            live_verdicts,
+            vec![
+                RepetitionVerdict::Quiet,
+                RepetitionVerdict::RepeatedToolFailure {
+                    tool_name: "read".into(),
+                    count: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_prompt_folds_to_a_quiet_observer() {
+        let observer = from_prompt(&[]);
+        assert!(observer.exact_failures.is_empty());
+        assert!(observer.no_progress.is_empty());
     }
 }

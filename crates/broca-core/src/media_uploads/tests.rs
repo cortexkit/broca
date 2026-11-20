@@ -148,3 +148,188 @@ fn session_media_store_refuses_a_session_the_new_storage_holds() {
         "{refused}"
     );
 }
+
+#[test]
+fn identical_chunk_and_commit_retries_survive_reopen() {
+    let (root, uploads) = fixture();
+    let id = uploads
+        .begin(&identity(), &request(b"abcdef"), 0)
+        .unwrap()
+        .upload_id;
+    assert_eq!(
+        uploads
+            .append(&identity(), &id, 0, b"abc", 1)
+            .unwrap()
+            .received,
+        3
+    );
+    assert_eq!(
+        uploads
+            .append(&identity(), &id, 0, b"abc", 2)
+            .unwrap()
+            .received,
+        3
+    );
+    let before = snapshot(&root);
+    assert_eq!(
+        uploads
+            .append(&identity(), &id, 0, b"abd", 3)
+            .unwrap_err()
+            .code,
+        "upload_offset_mismatch"
+    );
+    assert_eq!(snapshot(&root), before);
+    uploads.append(&identity(), &id, 3, b"def", 4).unwrap();
+    let committed = uploads.commit(&identity(), &id, 5).unwrap();
+    let before = snapshot(&root);
+    let reopened = Uploads::at(&root);
+    assert_eq!(reopened.commit(&identity(), &id, 6).unwrap(), committed);
+    assert_eq!(snapshot(&root), before);
+    assert_eq!(
+        reopened
+            .append(&identity(), &id, 6, b"", 7)
+            .unwrap_err()
+            .field,
+        Some("upload_id")
+    );
+}
+
+#[test]
+fn foreign_unknown_and_expired_uploads_write_nothing() {
+    let (root, uploads) = fixture();
+    let id = uploads
+        .begin(&identity(), &request(b"abc"), 0)
+        .unwrap()
+        .upload_id;
+    for foreign in [
+        BindIdentity {
+            project_root: "/project/b".into(),
+            ..identity()
+        },
+        BindIdentity {
+            harness: "other".into(),
+            ..identity()
+        },
+        BindIdentity {
+            session: "other".into(),
+            ..identity()
+        },
+    ] {
+        let before = snapshot(&root);
+        for error in [
+            uploads.append(&foreign, &id, 0, b"abc", 1).unwrap_err(),
+            uploads.commit(&foreign, &id, 1).unwrap_err(),
+        ] {
+            assert_eq!(error.code, "unknown_upload");
+            assert!(error.subject.contains(&id));
+        }
+        assert_eq!(uploads.status(&foreign, &id, 1).unwrap().state, "gone");
+        assert_eq!(snapshot(&root), before);
+    }
+    uploads
+        .append(&identity(), &id, 0, b"abc", OPEN_TTL_SECONDS - 1)
+        .unwrap();
+    let before = snapshot(&root);
+    let expired = uploads
+        .append(&identity(), &id, 0, b"abc", OPEN_TTL_SECONDS)
+        .unwrap_err();
+    assert_eq!(expired.code, "upload_gone");
+    assert!(expired.subject.contains(&id));
+    assert_eq!(
+        uploads
+            .append(&identity(), "unknown", 0, b"abc", 1)
+            .unwrap_err()
+            .code,
+        "unknown_upload"
+    );
+    assert_eq!(
+        uploads
+            .commit(&identity(), &id, RETENTION_SECONDS)
+            .unwrap_err()
+            .code,
+        "upload_gone"
+    );
+    assert_eq!(snapshot(&root), before);
+}
+
+#[test]
+fn chunk_caps_and_declared_size_are_checked_before_write() {
+    let (root, uploads) = fixture();
+    let bytes = vec![1; wire::CHUNK_MAX];
+    let id = uploads
+        .begin(&identity(), &request(&bytes), 0)
+        .unwrap()
+        .upload_id;
+    let before = snapshot(&root);
+    let out_of_order = uploads
+        .append(&identity(), &id, u64::MAX, b"x", 1)
+        .unwrap_err();
+    assert_eq!(out_of_order.code, "upload_offset_mismatch");
+    assert_eq!(out_of_order.received, Some(0));
+    assert_eq!(snapshot(&root), before);
+    assert_eq!(
+        uploads
+            .append(&identity(), &id, 0, &bytes, 1)
+            .unwrap()
+            .received,
+        wire::CHUNK_MAX as u64
+    );
+    let before = snapshot(&root);
+    assert_eq!(
+        uploads
+            .append(&identity(), &id, wire::CHUNK_MAX as u64, b"x", 2)
+            .unwrap_err()
+            .code,
+        "upload_size_mismatch"
+    );
+    assert_eq!(
+        uploads
+            .append(&identity(), &id, 0, &vec![1; wire::CHUNK_MAX + 1], 2)
+            .unwrap_err()
+            .code,
+        "upload_chunk_too_large"
+    );
+    assert_eq!(snapshot(&root), before);
+}
+
+#[test]
+fn committed_reads_verify_identity_expiry_state_and_bytes_without_writes() {
+    let (root, uploads) = fixture();
+    let id = uploads
+        .begin(&identity(), &request(b"abc"), 0)
+        .unwrap()
+        .upload_id;
+    let before = snapshot(&root);
+    assert_eq!(
+        uploads
+            .read_committed(&identity(), &id, 0)
+            .unwrap_err()
+            .code,
+        "upload_not_committed"
+    );
+    assert_eq!(snapshot(&root), before);
+    uploads.append(&identity(), &id, 0, b"abc", 1).unwrap();
+    uploads.commit(&identity(), &id, 2).unwrap();
+    let before = snapshot(&root);
+    assert_eq!(
+        uploads.read_committed(&identity(), &id, 3).unwrap(),
+        ("application/pdf".into(), b"abc".to_vec())
+    );
+    let foreign = BindIdentity {
+        harness: "foreign".into(),
+        ..identity()
+    };
+    assert!(uploads
+        .read_committed(&foreign, &id, 3)
+        .unwrap_err()
+        .subject
+        .contains(&id));
+    assert!(uploads
+        .read_committed(&identity(), &id, 2 + RETENTION_SECONDS)
+        .is_err());
+    assert_eq!(snapshot(&root), before);
+    std::fs::write(uploads.data_path(&id), b"abd").unwrap();
+    let before = snapshot(&root);
+    assert!(uploads.read_committed(&identity(), &id, 3).is_err());
+    assert_eq!(snapshot(&root), before);
+}

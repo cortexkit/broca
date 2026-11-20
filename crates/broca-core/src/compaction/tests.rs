@@ -58,3 +58,27 @@ fn fixture_lineage_id() -> broca_wal::WalLineageId {
 
 #[path = "ceiling_tests.rs"]
 mod ceiling_tests;
+
+pub(super) fn image() -> broca_protocol::MediaRef {
+    broca_protocol::MediaRef {
+        kind: broca_protocol::MediaKind::Image,
+        mime: "image/png".into(),
+        byte_size: 68,
+        sha256: "a".repeat(64),
+        width: Some(1),
+        height: Some(1),
+    }
+}
+
+pub(super) fn altered_media() -> Vec<broca_protocol::MediaRef> {
+    let mut variants = vec![image(); 6];
+    variants[0].sha256 = "b".repeat(64);
+    variants[1].mime = "image/jpeg".into();
+    variants[2].byte_size += 1;
+    variants[3].width = Some(2);
+    variants[4].height = Some(2);
+    variants[5].kind = broca_protocol::MediaKind::Document;
+    variants[5].width = None;
+    variants[5].height = None;
+    variants
+}

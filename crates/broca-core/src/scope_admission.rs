@@ -701,6 +701,43 @@ pub fn reopen_refused(
     scoped_mismatch(frozen, principal, stamped)
 }
 
+/// Folds one run start into an ownership summary the way the session store's operations fold
+/// does (`broca_session_store::fold::operations`), so the tests here can build the summaries
+/// sessions with those histories are judged by.
+#[cfg(test)]
+trait FoldRunStarted {
+    fn fold_run_started(&mut self, principal: Option<&BindPrincipal>, scope: Option<&SessionScope>);
+}
+
+#[cfg(test)]
+impl FoldRunStarted for SessionOwnershipV1 {
+    fn fold_run_started(
+        &mut self,
+        principal: Option<&BindPrincipal>,
+        scope: Option<&SessionScope>,
+    ) {
+        if self.episodes == 0 {
+            self.first_principal = principal.cloned();
+        }
+        self.episodes = self.episodes.saturating_add(1);
+        match principal {
+            None => self.any_unrecorded_principal = true,
+            Some(principal) => {
+                // The store keeps the first two distinct principals: the only rule that reads
+                // them looks for the first principal other than the scope's owner.
+                if self.recorded_principals.len() < 2
+                    && !self.recorded_principals.contains(principal)
+                {
+                    self.recorded_principals.push(principal.clone());
+                }
+            }
+        }
+        if let Some(scope) = scope {
+            self.scope = Some(scope.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +961,342 @@ mod tests {
             )))
         );
     }
+
+    fn history(episodes: &[(Option<BindPrincipal>, Option<SessionScope>)]) -> SessionOwnershipV1 {
+        let mut ownership = SessionOwnershipV1::default();
+        for (principal, scope) in episodes {
+            ownership.fold_run_started(principal.as_ref(), scope.as_ref());
+        }
+        ownership
+    }
+
+    /// With `notice_with_speaks_for` the owner may combine a notice with a speaker and name the
+    /// speaker; without it, both refuse exactly as before the group existed.
+    #[test]
+    fn notice_with_speaks_for_admits_combined_and_named_marks_only_when_declared() {
+        let frozen = scope(core(), 3);
+        let session = history(&[(Some(core()), Some(frozen.clone()))]);
+        let send = stamped(frozen);
+        let admit = |marks: serde_json::Value, declared: bool| {
+            admit_message_marks_declaring(
+                marks.as_object().unwrap(),
+                &session,
+                Some(&core()),
+                &send,
+                declared,
+            )
+            .map(|marks| serde_json::to_value(marks).unwrap())
+        };
+        let combined = serde_json::json!({"notice": true, "speaks_for": {"agent_id": "agent-a"}});
+        let named = serde_json::json!({"speaks_for": {"agent_id": "agent-a", "name": "Ada"}});
+        let both = serde_json::json!({
+            "notice": true,
+            "speaks_for": {"agent_id": "agent-a", "name": "Ada"}
+        });
+        for marks in [&combined, &named, &both] {
+            assert_eq!(admit(marks.clone(), true), Ok(marks.clone()));
+        }
+        assert_eq!(admit(combined, false), Err("notice"));
+        assert_eq!(admit(named, false), Err("speaks_for.name"));
+        assert_eq!(admit(both.clone(), false), Err("notice"));
+        let unnamed = serde_json::json!({"speaks_for": {"agent_id": "agent-a"}});
+        assert_eq!(admit(unnamed.clone(), false), Ok(unnamed));
+        assert_eq!(
+            admit(
+                serde_json::json!({"speaks_for": {"agent_id": "agent-a", "name": ""}}),
+                true
+            ),
+            Err("speaks_for.name"),
+            "a name keeps its 1-64 printable ASCII bytes"
+        );
+        // Broca declares the group, so the admission it serves takes combined and named marks.
+        assert_eq!(
+            admit_message_marks(both.as_object().unwrap(), &session, Some(&core()), &send)
+                .map(|marks| serde_json::to_value(marks).unwrap()),
+            Ok(both.clone())
+        );
+    }
+
+    #[test]
+    fn a_scoped_session_accepts_only_its_owner_under_the_frozen_scope() {
+        let frozen = scope(core(), 3);
+        let session = history(&[(Some(core()), Some(frozen.clone()))]);
+        assert_eq!(
+            decide_scope(&session, Some(&core()), &stamped(frozen.clone())),
+            Ok(ScopeDecision::Frozen(frozen.clone()))
+        );
+        for (principal, send) in [
+            (Some(other()), stamped(frozen.clone())),
+            (Some(core()), stamped(scope(core(), 2))),
+            (Some(core()), stamped(scope(other(), 3))),
+            (Some(core()), SendScope::Unstamped),
+            (None, SendScope::Unstamped),
+        ] {
+            assert!(
+                matches!(
+                    decide_scope(&session, principal.as_ref(), &send),
+                    Err(ScopeRefusal::OwnerMismatch(m)) if matches!(*m, OwnerMismatch::Scoped { .. })
+                ),
+                "{principal:?} {send:?}"
+            );
+        }
+        assert_eq!(
+            decide_scope(&session, Some(&core()), &SendScope::DaemonWithoutScopes),
+            Err(ScopeRefusal::Unsupported {
+                scope: frozen.into()
+            })
+        );
+    }
+
+    /// The specimen: the owner's scope reopened at the next epoch after idle expiry ended the
+    /// first one. The same owner and ref under a later epoch reopen the session with that
+    /// epoch; the frozen epoch itself is still an ordinary frozen send, never a reopen. A flow
+    /// scope reopens the same way when its flow identifier and sender are unchanged.
+    #[test]
+    fn a_later_epoch_of_the_same_scope_reopens_the_session() {
+        let session = history(&[(Some(core()), Some(scope(core(), 1)))]);
+        assert_eq!(
+            decide_scope(&session, Some(&core()), &stamped(scope(core(), 2))),
+            Ok(ScopeDecision::Reopen(scope(core(), 2)))
+        );
+        assert_eq!(
+            decide_scope(&session, Some(&core()), &stamped(scope(core(), 7))),
+            Ok(ScopeDecision::Reopen(scope(core(), 7)))
+        );
+        assert_eq!(
+            decide_scope(&session, Some(&core()), &stamped(scope(core(), 1))),
+            Ok(ScopeDecision::Frozen(scope(core(), 1)))
+        );
+
+        let flow_scope = |epoch| SessionScope {
+            scope_epoch: epoch,
+            ..flow(Some(other()), "flow-1")
+        };
+        let flow_session = history(&[(Some(other()), Some(flow_scope(3)))]);
+        assert_eq!(
+            decide_scope(&flow_session, Some(&other()), &stamped(flow_scope(4))),
+            Ok(ScopeDecision::Reopen(flow_scope(4)))
+        );
+    }
+
+    /// Only a strictly later epoch with everything else identical reopens. An equal or lower
+    /// epoch with any other difference, another owner or ref, or an added flow identifier is
+    /// refused exactly as before reopening existed; a flow's changed identifier keeps its typed
+    /// flow refusal.
+    #[test]
+    fn an_equal_or_lower_epoch_or_another_identity_is_still_refused() {
+        let session = history(&[(Some(core()), Some(scope(core(), 3)))]);
+        let other_ref = |epoch| SessionScope {
+            scope_ref: "head-2".into(),
+            ..scope(core(), epoch)
+        };
+        let with_flow = SessionScope {
+            flow_id: Some("flow-1".into()),
+            ..scope(core(), 4)
+        };
+        for (principal, send) in [
+            (Some(core()), stamped(other_ref(3))),
+            (Some(core()), stamped(other_ref(4))),
+            (Some(core()), stamped(scope(core(), 2))),
+            (Some(core()), stamped(scope(other(), 4))),
+            (Some(other()), stamped(scope(core(), 4))),
+            (None, stamped(scope(core(), 4))),
+            (Some(core()), stamped(with_flow)),
+        ] {
+            assert!(
+                matches!(
+                    decide_scope(&session, principal.as_ref(), &send),
+                    Err(ScopeRefusal::OwnerMismatch(m)) if matches!(*m, OwnerMismatch::Scoped { .. })
+                ),
+                "{principal:?} {send:?}"
+            );
+        }
+
+        let flow_session = history(&[(Some(other()), Some(flow(Some(other()), "flow-1")))]);
+        let later_other_flow = SessionScope {
+            scope_epoch: 4,
+            ..flow(Some(other()), "flow-2")
+        };
+        assert_eq!(
+            decide_scope(&flow_session, Some(&other()), &stamped(later_other_flow)),
+            Err(ScopeRefusal::FlowMismatch {
+                field: FlowMismatchField::FlowId
+            })
+        );
+    }
+
+    #[test]
+    fn adoption_needs_the_owner_on_every_earlier_episode() {
+        let stamp = scope(core(), 3);
+        let recorded = history(&[(Some(core()), None), (Some(core()), None)]);
+        assert_eq!(
+            decide_scope(&recorded, Some(&core()), &stamped(stamp.clone())),
+            Ok(ScopeDecision::Freeze(stamp.clone()))
+        );
+
+        let one_unrecorded = history(&[(Some(core()), None), (None, None), (Some(core()), None)]);
+        assert_eq!(
+            decide_scope(&one_unrecorded, Some(&core()), &stamped(stamp.clone())),
+            Err(ScopeRefusal::AdoptionRefused(
+                AdoptionRefusal::NoRecordedPrincipal
+            ))
+        );
+
+        let different = history(&[(Some(core()), None), (Some(other()), None)]);
+        assert_eq!(
+            decide_scope(&different, Some(&core()), &stamped(stamp.clone())),
+            Err(ScopeRefusal::AdoptionRefused(
+                AdoptionRefusal::PrincipalMismatch { recorded: other() }
+            ))
+        );
+        // The adoption answer does not depend on who opened the route.
+        assert_eq!(
+            decide_scope(&one_unrecorded, Some(&other()), &stamped(stamp)),
+            Err(ScopeRefusal::AdoptionRefused(
+                AdoptionRefusal::NoRecordedPrincipal
+            ))
+        );
+    }
+
+    #[test]
+    fn flow_carrier_freezes_sender_and_flow_id_and_refuses_changes() {
+        let scope = flow(Some(other()), "flow-1");
+        assert_eq!(
+            decide_scope(
+                &SessionOwnershipV1::default(),
+                Some(&other()),
+                &stamped(scope.clone())
+            ),
+            Ok(ScopeDecision::Freeze(scope.clone()))
+        );
+        let history = history(&[(Some(other()), Some(scope.clone()))]);
+        assert_eq!(
+            decide_scope(&history, Some(&other()), &stamped(scope.clone())),
+            Ok(ScopeDecision::Frozen(scope))
+        );
+        assert_eq!(
+            decide_scope(
+                &history,
+                Some(&other()),
+                &stamped(flow(Some(other()), "flow-2"))
+            ),
+            Err(ScopeRefusal::FlowMismatch {
+                field: FlowMismatchField::FlowId
+            })
+        );
+        assert_eq!(
+            decide_scope(
+                &history,
+                Some(&core()),
+                &stamped(flow(Some(core()), "flow-1"))
+            ),
+            Err(ScopeRefusal::FlowMismatch {
+                field: FlowMismatchField::Sender
+            })
+        );
+    }
+
+    #[test]
+    fn flow_scope_needs_an_attested_opener_and_never_adopts_history() {
+        assert!(matches!(
+            decide_scope(
+                &SessionOwnershipV1::default(),
+                None,
+                &stamped(flow(None, "flow-1"))
+            ),
+            Err(ScopeRefusal::OwnerMismatch(_))
+        ));
+        assert_eq!(
+            decide_scope(
+                &SessionOwnershipV1::default(),
+                Some(&other()),
+                &stamped(flow(None, "flow-1"))
+            ),
+            Ok(ScopeDecision::Freeze(flow(Some(other()), "flow-1")))
+        );
+        let history = history(&[(Some(core()), None)]);
+        assert_eq!(
+            decide_scope(
+                &history,
+                Some(&core()),
+                &stamped(flow(Some(core()), "flow-1"))
+            ),
+            Err(ScopeRefusal::AdoptionRefused(AdoptionRefusal::FlowScope))
+        );
+    }
+
+    #[test]
+    fn an_unscoped_session_accepts_only_its_first_principal() {
+        let session = history(&[(Some(core()), None)]);
+        assert_eq!(
+            decide_scope(&session, Some(&core()), &SendScope::Unstamped),
+            Ok(ScopeDecision::Unscoped)
+        );
+        for principal in [Some(other()), None] {
+            assert!(matches!(
+                decide_scope(&session, principal.as_ref(), &SendScope::Unstamped),
+                Err(ScopeRefusal::OwnerMismatch(m)) if matches!(*m, OwnerMismatch::FirstPrincipal { .. })
+            ));
+        }
+        // A first episode that recorded no principal predates principal recording: the session
+        // keeps accepting sends as it always did.
+        let legacy = history(&[(None, None)]);
+        assert_eq!(
+            decide_scope(&legacy, Some(&other()), &SendScope::DaemonWithoutScopes),
+            Ok(ScopeDecision::Unscoped)
+        );
+    }
+
+    /// Without a stamp nobody can start a reserved session, whatever principal the route
+    /// carries, and whether or not the daemon advertises scopes. An address with no reservation
+    /// row (reserved unstamped, or before reservations were recorded), and any session that
+    /// already has an episode, keep the existing rules.
+    #[test]
+    fn a_reserved_session_refuses_an_unstamped_first_send_and_others_are_unchanged() {
+        for principal in [Some(other()), Some(core()), None] {
+            for send in [SendScope::Unstamped, SendScope::DaemonWithoutScopes] {
+                assert_eq!(
+                    decide_scope(&reserved_for(core(), "head-1"), principal.as_ref(), &send),
+                    reservation_refusal(core(), principal.clone()),
+                    "{principal:?} {send:?}"
+                );
+            }
+        }
+
+        let empty = SessionOwnershipV1::default();
+        assert_eq!(
+            decide_scope(&empty, Some(&other()), &SendScope::Unstamped),
+            Ok(ScopeDecision::Unscoped)
+        );
+        assert_eq!(
+            decide_scope(&empty, Some(&other()), &stamped(scope(other(), 1))),
+            Ok(ScopeDecision::Freeze(scope(other(), 1)))
+        );
+        let mut started = history(&[(Some(other()), None)]);
+        started.reservation = reserved_for(core(), "head-1").reservation;
+        assert_eq!(
+            decide_scope(&started, Some(&other()), &SendScope::Unstamped),
+            Ok(ScopeDecision::Unscoped)
+        );
+        assert_eq!(
+            check_scope_reservation(&started, Some(&other()), &SendScope::Unstamped),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_internal_send_carries_whatever_scope_the_session_froze() {
+        let frozen = scope(core(), 3);
+        let session = history(&[(Some(core()), Some(frozen.clone()))]);
+        assert_eq!(
+            decide_scope(&session, None, &SendScope::Internal),
+            Ok(ScopeDecision::Frozen(frozen))
+        );
+        assert_eq!(
+            decide_scope(&SessionOwnershipV1::default(), None, &SendScope::Internal),
+            Ok(ScopeDecision::Unscoped)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -987,5 +1360,347 @@ mod agent_run_tests {
             Some("plan.tool_items")
         );
         assert_eq!(model_only_scope_tool_field(&stamp, false, false), None);
+    }
+
+    fn frozen() -> SessionOwnershipV1 {
+        let mut history = SessionOwnershipV1::default();
+        history.fold_run_started(Some(&basal()), Some(&scope()));
+        history
+    }
+
+    #[test]
+    fn writer_freezes_and_advances_agent_run_scopes() {
+        let stamp = stamped(scope());
+        for (history, send, expected) in [
+            (
+                SessionOwnershipV1::default(),
+                stamp.clone(),
+                ScopeDecision::Freeze(scope()),
+            ),
+            (frozen(), stamp, ScopeDecision::Frozen(scope())),
+            (
+                frozen(),
+                SendScope::Internal,
+                ScopeDecision::Frozen(scope()),
+            ),
+        ] {
+            assert_eq!(decide_scope(&history, Some(&basal()), &send), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn enabled_agent_run_freezes_and_repeats_both_identifiers() {
+        let stamp = stamped(scope());
+        assert_eq!(
+            decide_scope_with_writer(&SessionOwnershipV1::default(), Some(&basal()), &stamp, true),
+            Ok(ScopeDecision::Freeze(scope()))
+        );
+        assert_eq!(
+            decide_scope_with_writer(&frozen(), Some(&basal()), &stamp, true),
+            Ok(ScopeDecision::Frozen(scope()))
+        );
+        let mut later = scope();
+        later.scope_epoch = 2;
+        assert_eq!(
+            decide_scope_with_writer(&frozen(), Some(&basal()), &stamped(later.clone()), true),
+            Ok(ScopeDecision::Reopen(later))
+        );
+    }
+
+    #[test]
+    fn enabled_agent_run_refuses_wrong_carrier_and_driving_owner() {
+        let wrong = BindPrincipal::Reserved {
+            module_id: "other".into(),
+        };
+        for principal in [Some(wrong), Some(scope().owner), None] {
+            assert!(matches!(
+                decide_scope_with_writer(
+                    &SessionOwnershipV1::default(),
+                    principal.as_ref(),
+                    &stamped(scope()),
+                    true
+                ),
+                Err(ScopeRefusal::OwnerMismatch(_))
+            ));
+            assert_eq!(
+                decide_scope_with_writer(&frozen(), principal.as_ref(), &stamped(scope()), true),
+                Err(ScopeRefusal::FlowMismatch {
+                    field: FlowMismatchField::Sender
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_agent_run_refuses_changed_run_id() {
+        for run_id in [Some("another-run".into()), None] {
+            let mut changed = scope();
+            changed.run_id = run_id;
+            assert_eq!(
+                decide_scope_with_writer(&frozen(), Some(&basal()), &stamped(changed), true),
+                Err(ScopeRefusal::RunMismatch {
+                    field: RunMismatchField::RunId
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_agent_run_refuses_changed_agent_id() {
+        for agent_id in [Some("another-agent".into()), None] {
+            let mut changed = scope();
+            changed.agent_id = agent_id;
+            assert_eq!(
+                decide_scope_with_writer(&frozen(), Some(&basal()), &stamped(changed), true),
+                Err(ScopeRefusal::RunMismatch {
+                    field: RunMismatchField::AgentId
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_agent_run_cannot_adopt_history_and_basal_cannot_touch_foreign_sessions() {
+        let mut history = SessionOwnershipV1::default();
+        history.fold_run_started(Some(&scope().owner), None);
+        assert_eq!(
+            decide_scope_with_writer(&history, Some(&basal()), &stamped(scope()), true),
+            Err(ScopeRefusal::SenderNotOwner)
+        );
+        history = SessionOwnershipV1::default();
+        history.fold_run_started(Some(&basal()), None);
+        assert!(matches!(
+            decide_scope_with_writer(&history, Some(&basal()), &stamped(scope()), true),
+            Err(ScopeRefusal::OwnerMismatch(_))
+        ));
+        assert_eq!(
+            decide_sender_access(Some(&basal()), Some(Some(&scope().owner))),
+            Err(ScopeRefusal::SenderNotOwner)
+        );
+    }
+}
+
+#[cfg(test)]
+mod flow_agent_freeze_tests {
+    use super::*;
+
+    fn flow(agent: Option<&str>) -> (BindPrincipal, SessionScope) {
+        let sender = BindPrincipal::Reserved {
+            module_id: "flow-carrier".into(),
+        };
+        let scope = serde_json::from_value(serde_json::json!({
+            "owner":{"kind":"reserved","module_id":"owner-module"},
+            "ref":"flow","scope_epoch":1,"flow_id":"flow",
+            "sender":{"kind":"reserved","module_id":"flow-carrier"},"agent_id":agent
+        }))
+        .unwrap();
+        (sender, scope)
+    }
+
+    fn send(scope: SessionScope) -> SendScope {
+        SendScope::Stamped(broca_protocol::BindScope {
+            scope,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+            owner_authorized: true,
+        })
+    }
+
+    #[test]
+    fn new_flow_freezes_agent_identity_including_absence() {
+        for original in [Some("agent-a"), None] {
+            let (sender, scope) = flow(original);
+            let decision =
+                decide_scope(&SessionOwnershipV1::default(), Some(&sender), &send(scope)).unwrap();
+            let frozen = decision.scope().unwrap();
+            assert!(frozen.agent_id_frozen);
+            assert_eq!(frozen.agent_id.as_deref(), original);
+            let mut ownership = SessionOwnershipV1::default();
+            ownership.fold_run_started(Some(&sender), Some(frozen));
+            let (_, changed) = flow(Some("agent-b"));
+            assert_eq!(
+                decide_scope(&ownership, Some(&sender), &send(changed)),
+                Err(ScopeRefusal::RunMismatch {
+                    field: RunMismatchField::AgentId
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_flow_keeps_agent_admission_while_new_flow_enforces_it() {
+        let (sender, scope) = flow(None);
+        let mut ownership = SessionOwnershipV1::default();
+        ownership.fold_run_started(Some(&sender), Some(&scope));
+        let (_, changed) = flow(Some("agent-b"));
+        assert_eq!(
+            decide_scope(&ownership, Some(&sender), &send(changed.clone())),
+            Ok(ScopeDecision::Frozen(scope.clone()))
+        );
+        let mut frozen = scope;
+        frozen.agent_id_frozen = true;
+        let mut ownership = SessionOwnershipV1::default();
+        ownership.fold_run_started(Some(&sender), Some(&frozen));
+        assert_eq!(
+            decide_scope(&ownership, Some(&sender), &send(changed)),
+            Err(ScopeRefusal::RunMismatch {
+                field: RunMismatchField::AgentId
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_access_tests {
+    use super::*;
+
+    fn reserved(id: &str) -> BindPrincipal {
+        BindPrincipal::Reserved {
+            module_id: id.into(),
+        }
+    }
+
+    fn protected() -> SessionOwnershipV1 {
+        let mut ownership = SessionOwnershipV1::default();
+        ownership.fold_run_started(
+            Some(&reserved("basal")),
+            Some(&SessionScope {
+                owner: reserved("prefrontal-core"),
+                agent_id_frozen: false,
+                scope_ref: "work".into(),
+                scope_epoch: 7,
+                flow_id: Some("flow".into()),
+                sender: Some(reserved("basal")),
+                agent_id: None,
+                run_id: None,
+            }),
+        );
+        ownership
+    }
+
+    #[test]
+    fn foreign_principal_is_refused_with_accepted_identity() {
+        let ownership = protected();
+        let foreign = reserved("operator");
+        let Err(ScopeRefusal::OwnerMismatch(refusal)) =
+            decide_owner_access(&ownership, Some(&foreign), &SendScope::Unstamped)
+        else {
+            panic!("foreign principal must be refused")
+        };
+        let OwnerMismatch::OwnerOperation { first, mismatch } = *refusal else {
+            panic!("refusal must name both owner principals")
+        };
+        assert_eq!(first, reserved("basal"));
+        assert!(matches!(
+            *mismatch, OwnerMismatch::Scoped { frozen, presented_principal, .. }
+                if frozen.owner == reserved("prefrontal-core")
+                    && presented_principal.as_ref() == Some(&foreign)
+        ));
+        assert!(matches!(
+            decide_owner_access(&ownership, None, &SendScope::Unstamped),
+            Err(ScopeRefusal::OwnerMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn scope_owner_is_admitted_on_unscoped_route_and_any_epoch() {
+        let ownership = protected();
+        let owner = reserved("prefrontal-core");
+        assert_eq!(
+            decide_owner_access(&ownership, Some(&owner), &SendScope::Unstamped),
+            Ok(())
+        );
+        for epoch in [1, 7, 9] {
+            let mut scope = ownership.scope.clone().unwrap();
+            scope.scope_epoch = epoch;
+            // Epoch does not grant a flow route owner authority, even to the scope owner.
+            let flow = SendScope::Stamped(broca_protocol::BindScope {
+                scope: scope.clone(),
+                owner_authorized: true,
+                kind: broca_protocol::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+            });
+            assert!(matches!(
+                decide_owner_access(&ownership, Some(&owner), &flow),
+                Err(ScopeRefusal::OwnerMismatch(_))
+            ));
+            scope.flow_id = None;
+            scope.sender = None;
+            let send = SendScope::Stamped(broca_protocol::BindScope {
+                scope,
+                owner_authorized: true,
+                kind: broca_protocol::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+            });
+            assert_eq!(decide_owner_access(&ownership, Some(&owner), &send), Ok(()));
+        }
+    }
+
+    #[test]
+    fn direct_is_never_an_owner_of_a_protected_session() {
+        assert!(matches!(
+            decide_owner_access(
+                &protected(),
+                Some(&BindPrincipal::Direct),
+                &SendScope::Unstamped
+            ),
+            Err(ScopeRefusal::OwnerMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn frozen_carrier_and_unscoped_first_principal_are_owners() {
+        let mut ownership = protected();
+        assert_eq!(
+            decide_owner_access(&ownership, Some(&reserved("basal")), &SendScope::Unstamped),
+            Ok(())
+        );
+        ownership.scope = None;
+        assert_eq!(
+            decide_owner_access(&ownership, Some(&reserved("basal")), &SendScope::Unstamped),
+            Ok(())
+        );
+        let Err(ScopeRefusal::OwnerMismatch(refusal)) = decide_owner_access(
+            &ownership,
+            Some(&reserved("prefrontal-core")),
+            &SendScope::Unstamped,
+        ) else {
+            panic!("a foreign unscoped caller must be refused")
+        };
+        let OwnerMismatch::OwnerOperation { mismatch, .. } = *refusal else {
+            panic!("owner-only refusal")
+        };
+        assert!(
+            matches!(*mismatch, OwnerMismatch::FirstPrincipal { first, .. } if first == reserved("basal"))
+        );
+    }
+
+    #[test]
+    fn histories_without_an_attested_first_sender_remain_unprotected() {
+        for first in [
+            None,
+            Some(BindPrincipal::Direct),
+            Some(BindPrincipal::Unverified),
+            Some(BindPrincipal::Unknown(serde_json::json!({"kind":"future"}))),
+        ] {
+            let mut ownership = SessionOwnershipV1::default();
+            ownership.fold_run_started(first.as_ref(), None);
+            // A later verified episode cannot retroactively protect earlier anonymous work.
+            ownership.fold_run_started(Some(&reserved("prefrontal-core")), None);
+            for caller in [
+                None,
+                Some(reserved("basal")),
+                Some(reserved("operator")),
+                Some(BindPrincipal::Direct),
+            ] {
+                assert_eq!(
+                    decide_owner_access(&ownership, caller.as_ref(), &SendScope::Unstamped),
+                    Ok(())
+                );
+            }
+        }
     }
 }

@@ -1707,3 +1707,245 @@ async fn an_applied_view_records_whether_it_kept_the_conversations_head() {
     }
     assert_eq!(*journal.heads.lock().unwrap(), [true, false, true]);
 }
+
+#[path = "statement_seq_tests.rs"]
+mod statement_seq;
+
+/// Setup, notices and rides carry the session's signed floor only to a provider whose catalog
+/// entry declares `compaction-signed-floor/v1`, read again at every Setup.
+#[tokio::test]
+async fn compaction_v2_only_a_declaring_provider_is_sent_the_signed_floor() {
+    use cortexkit_role_compaction::ride::{RideCause, RideRequest};
+    struct Declaring {
+        inner: RecordingPlane,
+        provides: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl runtime::Plane for Declaring {
+        async fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<Box<serde_json::value::RawValue>, runtime::CallError> {
+            self.inner.call(method, params).await
+        }
+        async fn provides_signed_floor(&self) -> bool {
+            cortexkit_role_compaction::provides_signed_floor(&self.provides.lock().unwrap())
+        }
+    }
+    let floor = cortexkit_role_compaction::SignedFloor::new("m12345678.1");
+    let mut conditions = conditions();
+    conditions.signed_floor = Some(floor.clone());
+    let mut setup = setup();
+    setup.signed_floor = Some(floor.clone());
+    let ride = RideRequest::new(vec![RideCause::OverLimit], 1000, conditions.clone());
+    let entries = |count| {
+        project(
+            &(0..count)
+                .map(|index| text(Role::User, &format!("message {index}")))
+                .collect::<Vec<_>>(),
+            &facts(count),
+            &Deliveries::new(),
+            true,
+        )
+    };
+    let plane = Declaring {
+        inner: RecordingPlane::default(),
+        provides: std::sync::Mutex::new(vec!["compaction-provider/v2".into()]),
+    };
+    plane.inner.answers.lock().unwrap().extend([
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+        json!({"answer":"nothing"}),
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+        json!({"answer":"nothing"}),
+    ]);
+    let runtime = runtime::Runtime::default();
+    // A provider that doesn't declare the capability hears no floor.
+    assert!(runtime.setup(&plane, &setup).await);
+    runtime.observe(&entries(1));
+    runtime.flush(&plane, &setup, &conditions, None).await;
+    runtime.ride(&plane, &setup, &ride).await;
+    // Once it declares it, the next Setup and everything after it carry the floor.
+    plane
+        .provides
+        .lock()
+        .unwrap()
+        .push(cortexkit_role_compaction::COMPACTION_SIGNED_FLOOR_PROVIDES.into());
+    assert!(runtime.setup(&plane, &setup).await);
+    runtime.observe(&entries(2));
+    runtime.flush(&plane, &setup, &conditions, None).await;
+    runtime.ride(&plane, &setup, &ride).await;
+    let calls = plane.inner.calls.lock().unwrap();
+    let floors: Vec<_> = calls
+        .iter()
+        .map(|(method, params)| {
+            let floor = if method == "compaction.setup" {
+                &params["signed_floor"]
+            } else {
+                &params["conditions"]["signed_floor"]
+            };
+            (method.as_str(), floor.clone())
+        })
+        .collect();
+    let sent = json!({"through": "m12345678.1"});
+    assert_eq!(
+        floors,
+        [
+            ("compaction.setup", serde_json::Value::Null),
+            ("compaction.notice", serde_json::Value::Null),
+            ("compaction.ride", serde_json::Value::Null),
+            ("compaction.setup", sent.clone()),
+            ("compaction.notice", sent.clone()),
+            ("compaction.ride", sent),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn compaction_v2_setup_unknown_answer_fails_and_next_setup_restarts_notice_seq() {
+    let plane = RecordingPlane::default();
+    plane.answers.lock().unwrap().extend([
+        json!({"answer":"future"}),
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+    ]);
+    let runtime = runtime::Runtime::default();
+    assert!(!runtime.setup(&plane, &setup()).await);
+    assert!(runtime.setup(&plane, &setup()).await);
+    runtime.observe(&project(
+        &[text(Role::User, "one")],
+        &facts(1),
+        &Deliveries::new(),
+        true,
+    ));
+    runtime.flush(&plane, &setup(), &conditions(), None).await;
+    assert!(runtime.setup(&plane, &setup()).await);
+    runtime.observe(&project(
+        &[text(Role::User, "one"), text(Role::User, "two")],
+        &facts(2),
+        &Deliveries::new(),
+        true,
+    ));
+    runtime.flush(&plane, &setup(), &conditions(), None).await;
+    let calls = plane.calls.lock().unwrap();
+    let notices: Vec<_> = calls
+        .iter()
+        .filter(|(method, _)| method == "compaction.notice")
+        .collect();
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[0].1["seq"], 1);
+    assert_eq!(notices[1].1["seq"], 1);
+    assert_eq!(notices[1].1["entries"].as_array().unwrap().len(), 1);
+    assert!(
+        calls[0].1.get("entries").is_none(),
+        "Setup must be content-free"
+    );
+}
+
+/// A failed Setup drops nothing from the queue: the provider didn't read the window, so the
+/// entries it named are still owed. (The ready Setup here names no newest entry, so it covers
+/// nothing and the notice shows exactly what the failed one left queued.)
+#[tokio::test]
+async fn compaction_v2_a_failed_setup_drops_nothing_from_the_queue() {
+    let plane = RecordingPlane::default();
+    plane.answers.lock().unwrap().extend([
+        json!({"answer":"future"}),
+        json!({"answer":"ready"}),
+        json!({"answer":"received"}),
+    ]);
+    let runtime = runtime::Runtime::default();
+    let first = project(
+        &[text(Role::User, "one")],
+        &facts(1),
+        &Deliveries::new(),
+        true,
+    );
+    let mut failed = setup();
+    failed.newest = views::newest(&first);
+    runtime.observe(&first);
+    assert!(!runtime.setup(&plane, &failed).await);
+    let second = project(
+        &[text(Role::User, "one"), text(Role::User, "two")],
+        &facts(2),
+        &Deliveries::new(),
+        true,
+    );
+    runtime.observe(&second);
+    assert!(runtime.setup(&plane, &setup()).await);
+    runtime.flush(&plane, &setup(), &conditions(), None).await;
+    let calls = plane.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    let entries = calls[2].1["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["ordinal"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+#[tokio::test]
+async fn compaction_v2_unknown_catalog_setup_keeps_attribution_unknown() {
+    let plane = CatalogPlane {
+        inner: RecordingPlane::default(),
+        capabilities: std::sync::Mutex::new([crate::ProviderCapabilities::Unknown].into()),
+    };
+    plane
+        .inner
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(json!({"answer":"ready"}));
+    let bind = broca_protocol::BindIdentity::new("/project", "test", "s");
+    let bound = runtime::BoundPlane {
+        plane: Some(&plane),
+        provider: "magic",
+        bind: &bind,
+        scope: None,
+    };
+    let runtime = runtime::Runtime::default();
+    let mut setup = setup();
+    setup.signed_floor = Some(cortexkit_role_compaction::SignedFloor::new("m12345678.1"));
+    assert!(
+        runtime.setup(&bound, &setup).await,
+        "unknown capabilities do not block Setup"
+    );
+    assert_eq!(runtime.entry_speaks_for(), None);
+    assert!(plane.inner.calls.lock().unwrap()[0]
+        .1
+        .get("signed_floor")
+        .is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn compaction_v2_catalog_deadline_does_not_learn_false_attribution() {
+    struct Slow(RecordingPlane);
+    #[async_trait::async_trait]
+    impl runtime::Plane for Slow {
+        async fn declarations(&self) -> runtime::Declarations {
+            std::future::pending().await
+        }
+        async fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<Box<serde_json::value::RawValue>, runtime::CallError> {
+            runtime::Plane::call(&self.0, method, params).await
+        }
+    }
+    let plane = Slow(RecordingPlane::default());
+    plane
+        .0
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(json!({"answer":"ready"}));
+    let runtime = runtime::Runtime::default();
+    assert!(runtime.setup(&plane, &setup()).await);
+    assert_eq!(runtime.entry_speaks_for(), None);
+}

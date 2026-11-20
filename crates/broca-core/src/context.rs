@@ -1462,3 +1462,150 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod call_identity_tests {}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use broca_wal::{Wal, WalError};
+
+    struct CountingWalStore {
+        reads: Mutex<HashMap<BindIdentity, usize>>,
+    }
+
+    thread_local! {
+        /// WAL reads and export emissions made on this thread, in order.
+        static EVENTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn note_event(event: String) {
+        EVENTS.with(|events| events.borrow_mut().push(event));
+    }
+
+    impl WalStore for CountingWalStore {
+        fn open(&self, _session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
+            Err(WalError::Io(std::io::Error::other(
+                "catch-up never opens an append handle",
+            )))
+        }
+
+        fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
+            note_event(format!("read {}", session.project_root.display()));
+            *self
+                .reads
+                .lock()
+                .expect("read counter lock")
+                .entry(session.clone())
+                .or_default() += 1;
+            Ok(Vec::new())
+        }
+    }
+
+    struct RecordingExportIndex {
+        missing: Vec<MissingExportRun>,
+        emitted: Mutex<Vec<RunId>>,
+        seen_frames: Mutex<Vec<usize>>,
+        fail_run: Option<RunId>,
+    }
+
+    impl ExportIndex for RecordingExportIndex {
+        fn missing_terminal_runs(&self) -> Result<Vec<MissingExportRun>, ExportError> {
+            Ok(self.missing.clone())
+        }
+
+        fn emit_run(
+            &self,
+            records: &[FramedRecord],
+            run_id: &RunId,
+            _resolver: &dyn ChargeBasisResolver,
+        ) -> Result<(), ExportError> {
+            if self.fail_run.as_ref() == Some(run_id) {
+                return Err(ExportError::Storage("injected export failure".into()));
+            }
+            note_event(format!("emit {}", run_id.0));
+            self.seen_frames.lock().unwrap().push(records.len());
+            self.emitted
+                .lock()
+                .expect("emitted runs lock")
+                .push(run_id.clone());
+            Ok(())
+        }
+
+        fn read_page(
+            &self,
+            _since: Option<ExportCursor>,
+            _limit: u64,
+        ) -> Result<ExportPage, ExportError> {
+            Err(ExportError::Storage("not used by catch-up".into()))
+        }
+
+        fn high_water(&self) -> u64 {
+            0
+        }
+
+        fn source_epoch(&self) -> u64 {
+            1
+        }
+
+        fn source_instance_id(&self) -> &str {
+            "catch-up-test"
+        }
+    }
+
+    /// Each session's WAL is read, its missing runs are emitted, and only then is the next
+    /// session's WAL read, so at most one session's WAL is resident at a time. Runs keep the
+    /// index's order within their session.
+    #[test]
+    fn catch_up_reads_each_missing_session_once_and_emits_it_before_reading_the_next() {
+        let first = BindIdentity::new("/tmp/first", "runner", "session");
+        let second = BindIdentity::new("/tmp/second", "runner", "session");
+        let index = RecordingExportIndex {
+            seen_frames: Mutex::new(Vec::new()),
+            fail_run: None,
+            missing: vec![
+                MissingExportRun {
+                    run_id: RunId("r1".into()),
+                    session: first.clone(),
+                },
+                MissingExportRun {
+                    run_id: RunId("r2".into()),
+                    session: second.clone(),
+                },
+                MissingExportRun {
+                    run_id: RunId("r3".into()),
+                    session: first.clone(),
+                },
+            ],
+            emitted: Mutex::new(Vec::new()),
+        };
+        let wal = CountingWalStore {
+            reads: Mutex::new(HashMap::new()),
+        };
+        let resolver = |_: &str, _: &str| (crate::ChargeBasis::Unknown, 1);
+
+        EVENTS.with(|events| events.borrow_mut().clear());
+        assert_eq!(catch_up_usage_exports(&index, &wal, &resolver), Ok(3));
+        assert_eq!(
+            *wal.reads.lock().expect("read counter lock"),
+            HashMap::from([(first, 1), (second, 1)])
+        );
+        assert_eq!(
+            EVENTS.with(|events| events.borrow().clone()),
+            [
+                "read /tmp/first",
+                "emit r1",
+                "emit r3",
+                "read /tmp/second",
+                "emit r2"
+            ],
+            "every missing run of one session is emitted before the next session's WAL is read"
+        );
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_attribution_tests {}
