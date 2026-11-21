@@ -1164,7 +1164,7 @@ pub fn admission_id(run_id: &str) -> String {
 pub fn conversation_key(session: &BindIdentity) -> String {
     format!(
         "broca-session:{}",
-        broca_core::wal_writer::session_addr(session)
+        broca_core::session_refs::session_addr(session)
     )
 }
 

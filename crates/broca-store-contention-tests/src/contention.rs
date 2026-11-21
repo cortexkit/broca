@@ -25,7 +25,7 @@ fn ref_index_write_finds_gaps_missed_by_default_backoff() {
             .unwrap()
         });
         let expected = [
-            broca_core::wal_writer::legacy_session_ref("broca", "/project", "new-session"),
+            broca_core::session_refs::legacy_session_ref("broca", "/project", "new-session"),
             agent_session_ref(&session),
         ];
         (result, stored, expected)

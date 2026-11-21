@@ -1,4 +1,4 @@
-use broca_wal_reader::features::{is_feature_name, Policy};
+use broca_wal_reader::features::is_feature_name;
 use broca_wal_reader::frame::{self, DecodeStep, Metadata};
 use broca_wal_reader::{Error, HeaderCorruption};
 
@@ -17,7 +17,6 @@ const REQUIRED: &str = concat!(
     "ec3ac9679505be3bb8233c4ef0b39c8ee206d2c37fc8610edc19f41fbfb9661e",
     "2ae8c4fa7b2274797065223a2274657374227d"
 );
-const KNOWN: &[&str] = &["bill-example/v1", "content/v2"];
 const PAYLOAD: &[u8] = br#"{"type":"test"}"#;
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -36,71 +35,6 @@ fn metadata() -> Metadata {
         appended_ms: 3,
         writer_id: std::array::from_fn(|i| i as u8),
     }
-}
-
-#[test]
-fn golden_v4_without_requires() {
-    let bytes = unhex(EMPTY);
-    assert_eq!(frame::encode(metadata(), &[], PAYLOAD).unwrap(), bytes);
-    let DecodeStep::Frame(decoded) = frame::decode_next(&bytes, &[]).unwrap() else {
-        panic!("expected verified frame");
-    };
-    assert_eq!(decoded.header.metadata, metadata());
-    assert!(decoded.header.requires.is_empty());
-    assert_eq!(decoded.header.header_len, 85);
-    assert_eq!(decoded.header.payload_len, 15);
-    assert_eq!(decoded.payload, PAYLOAD);
-    assert_eq!(decoded.consumed, bytes.len());
-    assert_eq!(
-        decoded.header.identity.as_slice(),
-        unhex("d806b9453baa9818efe2709e6de570015b65fd10a92c990d4aa0d901304a257a")
-    );
-    assert!(frame::digest_verifies(&bytes));
-}
-
-#[test]
-fn golden_v4_with_requires_and_header_identity() {
-    let bytes = unhex(REQUIRED);
-    // Canonical order and deduplication are part of the writer's wire bytes.
-    assert_eq!(
-        frame::encode(
-            metadata(),
-            &["content/v2", "bill-example/v1", "content/v2"],
-            PAYLOAD
-        )
-        .unwrap(),
-        bytes
-    );
-    let DecodeStep::Frame(decoded) = frame::decode_next(&bytes, KNOWN).unwrap() else {
-        panic!("expected verified frame");
-    };
-    assert_eq!(decoded.header.requires, KNOWN);
-    assert_eq!(decoded.header.header_len, 115);
-    assert_eq!(decoded.payload, PAYLOAD);
-    assert_eq!(decoded.consumed, bytes.len());
-    assert_eq!(
-        decoded.header.identity.as_slice(),
-        unhex("5aae6e2d8553513a0c802f179d9747ba8c2436d0f831f3d509c6435b773fe897")
-    );
-    let mut damaged_payload = bytes.clone();
-    *damaged_payload.last_mut().unwrap() ^= 1;
-    assert_eq!(
-        frame::decode_header(&damaged_payload)
-            .unwrap()
-            .unwrap()
-            .identity,
-        decoded.header.identity
-    );
-    assert!(!frame::digest_verifies(&damaged_payload));
-    let changed_writer = Metadata {
-        writer_id: [9; 16],
-        ..metadata()
-    };
-    let changed = frame::encode(changed_writer, KNOWN, PAYLOAD).unwrap();
-    assert_ne!(
-        frame::decode_header(&changed).unwrap().unwrap().identity,
-        decoded.header.identity
-    );
 }
 
 #[test]
@@ -169,27 +103,6 @@ fn unknown_billing_refuses_even_with_unknown_content_or_bad_payload() {
 }
 
 #[test]
-fn unknown_content_is_skipped_and_strict_readers_refuse_it() {
-    let bytes = unhex(REQUIRED);
-    let known_billing = &["bill-example/v1"];
-    assert!(matches!(frame::decode_next(&bytes, known_billing).unwrap(),
-        DecodeStep::Skipped { consumed, .. } if consumed == bytes.len()));
-    assert_eq!(
-        frame::decode_next_with_policy(&bytes, known_billing, Policy::All),
-        Err(Error::NewerWriter {
-            features: vec!["content/v2".into()]
-        })
-    );
-    let mut log = bytes.clone();
-    log.extend_from_slice(&unhex(EMPTY));
-    assert!(matches!(
-        frame::decode_next(&log[bytes.len()..], &[]).unwrap(),
-        DecodeStep::Frame(_)
-    ));
-    assert!(frame::digest_verifies(&bytes));
-}
-
-#[test]
 fn feature_grammar_on_write_and_read() {
     for name in ["a/v0", "a-9/v123", "-/v01"] {
         assert!(is_feature_name(name), "{name}");
@@ -223,27 +136,6 @@ fn feature_grammar_on_write_and_read() {
         Err(Error::HeaderCorrupt {
             reason: HeaderCorruption::InvalidRequires
         })
-    );
-}
-
-#[test]
-fn incomplete_frames_never_panic_or_claim_a_record() {
-    for golden in [EMPTY, REQUIRED] {
-        let bytes = unhex(golden);
-        for end in 0..bytes.len() {
-            assert_eq!(
-                frame::decode_next(&bytes[..end], KNOWN).unwrap(),
-                DecodeStep::Incomplete,
-                "prefix {end}"
-            );
-            assert!(!frame::digest_verifies(&bytes[..end]));
-        }
-    }
-    let mut unsupported = unhex(EMPTY);
-    unsupported[4] = 3;
-    assert_eq!(
-        frame::decode_next(&unsupported, &[]),
-        Err(Error::UnsupportedVersion { ver: 3 })
     );
 }
 

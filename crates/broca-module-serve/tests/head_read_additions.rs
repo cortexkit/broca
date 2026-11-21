@@ -288,7 +288,7 @@ async fn head_run_error_matches_status(storage: &str) {
             broca_provider::spec::WireFamilyId::AnthropicMessages,
             "fake",
         ));
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     rig.script.push(&[Step::Text("ready")]);
     let sent = rig
         .send("bootstrap", "prepare a synthetic session", None)

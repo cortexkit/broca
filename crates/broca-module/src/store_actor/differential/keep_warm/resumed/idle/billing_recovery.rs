@@ -103,7 +103,7 @@ async fn reopen(
 }
 
 async fn idle_open_recovery_never_reinserts_older_runs(cipher: Cipher) {
-    let side = super::super::super::side(false, cipher).await;
+    let side = super::super::super::side(cipher).await;
     let mut store = super::super::super::super::executor(
         vec![crate::store_actor::tests::text_step("next", "done")],
         None,

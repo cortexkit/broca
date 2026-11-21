@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use broca_core::{FileLeaseStore, FileWalStore};
+use broca_core::FileLeaseStore;
 use broca_protocol::{BindIdentity, RunId};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
@@ -332,10 +332,6 @@ async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
         broca_wal::session_storage_class(&module.dir, &address).unwrap(),
         None
     );
-    let wal = FileWalStore::new(module.dir.join("wal"));
-    for class in broca_wal::StorageClass::ALL {
-        assert!(!wal.class_wal_path(class, &head).exists(), "{class:?}");
-    }
     assert_eq!(module.registry.slot_state(&head), None);
 
     module.load_key().await;
@@ -345,9 +341,6 @@ async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
         broca_wal::session_storage_class(&module.dir, &address).unwrap(),
         Some(broca_wal::StorageClass::Durable)
     );
-    for class in broca_wal::StorageClass::ALL {
-        assert!(!wal.class_wal_path(class, &head).exists(), "{class:?}");
-    }
 }
 
 /// A worker or sidekick is held to the same rule as a head: its creating send, sent before the
@@ -381,10 +374,6 @@ async fn a_creating_send_is_refused_transient_until_the_new_storage_can_create_i
         broca_wal::session_storage_class(&module.dir, &address).unwrap(),
         None
     );
-    let wal = FileWalStore::new(module.dir.join("wal"));
-    for class in broca_wal::StorageClass::ALL {
-        assert!(!wal.class_wal_path(class, &session).exists(), "{class:?}");
-    }
 
     module.load_key().await;
     let outcome = send().await.expect("the sidekick opens once the key loads");
@@ -392,9 +381,6 @@ async fn a_creating_send_is_refused_transient_until_the_new_storage_can_create_i
     assert!(broca_wal::session_storage_class(&module.dir, &address)
         .unwrap()
         .is_some());
-    for class in broca_wal::StorageClass::ALL {
-        assert!(!wal.class_wal_path(class, &session).exists(), "{class:?}");
-    }
 }
 
 /// A plan naming `readers` (the apps it lets read the session), as every worker plan core sends

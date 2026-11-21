@@ -1,11 +1,10 @@
-//! SQLite usage export index for ASTRO metering.
+//! SQLite usage export index: the usage facts a metering module (Astrocyte) reads.
 //!
-//! Facts are appended only after a run's terminal WAL record is durable.  The
-//! coordinator then calls this index after the run-index terminal update; those
-//! writes cannot share a transaction because the WAL and SQLite run index have
-//! different durability owners. A crash between the two writes leaves a
-//! re-derivable fact missing, while the terminal run index supplies catch-up work
-//! and `fact_id` makes replay idempotent.
+//! A run's facts are inserted only after its end is durable in the session's records. The
+//! session actor then records the run billed in the session; the two writes can't share a
+//! transaction, as the session store and SQLite are separate stores. The session keeps the
+//! run owed until its billed record lands, so a crash between them bills the run again, and
+//! `fact_id` makes that insert change nothing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

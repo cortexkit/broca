@@ -128,7 +128,7 @@ struct Projector {
 impl Projector {
     fn new(session: BindIdentity, sink: Arc<dyn SendStateSink>) -> Self {
         Self {
-            session_ref: broca_core::wal_writer::agent_session_ref(&session),
+            session_ref: broca_core::session_refs::agent_session_ref(&session),
             session,
             sink,
             unsynced: Vec::new(),

@@ -9,44 +9,6 @@
 use super::*;
 
 #[test]
-fn compaction_v2_frames_decode_for_readers_and_writers_on_this_build() {
-    let mut records: Vec<WalRecord> =
-        include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
-            .lines()
-            .map(|bytes| serde_json::from_str(bytes).unwrap())
-            .collect();
-    // A body with no compaction fields still carries the frame requirement.
-    records.push(WalRecord::TurnFinished {
-        step_id: broca_protocol::StepId(1),
-    });
-    for record in records {
-        for bytes in [
-            encode_with_requires(1, 1, &[COMPACTION_V2_FEATURE], &record).unwrap(),
-            encode_v4(
-                v4::Metadata {
-                    seq: 1,
-                    fence: 1,
-                    appended_ms: 1,
-                    writer_id: [1; 16],
-                },
-                &[COMPACTION_V2_FEATURE],
-                &record,
-            )
-            .unwrap(),
-        ] {
-            assert!(
-                matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
-            );
-            // This build runs mode-3 sessions, so its writer opens them too. A reader-only
-            // build (`RUNS_COMPACTION_V2` false) refuses the writer path instead.
-            assert!(
-                matches!(decode_next_for_writer(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
-            );
-        }
-    }
-}
-
-#[test]
 fn compaction_v2_records_and_plan_version_round_trip_exact_bytes() {
     let records: Vec<WalRecord> = include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
         .lines().map(|pinned| {
@@ -167,80 +129,6 @@ fn compaction_plan_version_unions_with_other_record_requirements_even_when_zero(
     assert!(
         matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
     );
-}
-
-#[test]
-fn reader_path_tolerates_unknown_global_system_configuration_without_a_transcript_entry() {
-    let mut value: serde_json::Value = serde_json::from_str(
-        include_str!("../../tests/fixtures/compaction_v2_records.jsonl")
-            .lines()
-            .last()
-            .unwrap(),
-    )
-    .unwrap();
-    value["compaction_plan_version"] = serde_json::json!(2);
-    value["config"]["global_system"] = serde_json::json!([
-        {"role":"system","content":[{"type":"text","text":"first instructions"}]},
-        {"role":"system","content":[{"type":"text","text":"second instructions"}]}
-    ]);
-    let payload =
-        serde_json::to_vec(&serde_json::json!({"requires":[COMPACTION_V2_FEATURE],"record":value}))
-            .unwrap();
-    let bytes = frame(GATED_FRAMING_VERSION, 1, 1, &payload).unwrap();
-    let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
-        panic!("the reader refused a new optional config member")
-    };
-    let WalRecord::RunStarted { input, .. } = &framed.record else {
-        panic!("the reader lost the run start")
-    };
-    assert!(
-        input.is_empty(),
-        "the global prompt must not enter native history"
-    );
-    // The read-only reader's required config schema predates global_system.
-    // Keep its projection here after the writer learns the optional member.
-    #[derive(serde::Deserialize)]
-    struct ReaderConfig {
-        model: broca_protocol::ModelHandle,
-        tools: Vec<broca_protocol::Tool>,
-        tool_choice: broca_protocol::ToolChoice,
-        generation: broca_protocol::GenerationConfig,
-        response_format: broca_protocol::ResponseFormat,
-        context_epoch: u64,
-        renderer_version: u32,
-    }
-    #[derive(serde::Deserialize)]
-    struct ReaderStart {
-        config: ReaderConfig,
-        input: Vec<broca_protocol::Message>,
-        compaction_plan_version: Option<u32>,
-    }
-    let DecodeStep::Record { framed: reader, .. } = decode_projected(&bytes, |_, _, payload| {
-        serde_json::from_slice::<ReaderStart>(payload)
-    }) else {
-        panic!("the frozen reader config refused an unknown member")
-    };
-    assert!(reader.input.is_empty());
-    assert_eq!(reader.compaction_plan_version, Some(2));
-    assert_eq!(
-        reader.config.model,
-        broca_protocol::ModelHandle::new("p", "m")
-    );
-    assert!(reader.config.tools.is_empty());
-    assert!(matches!(
-        reader.config.tool_choice,
-        broca_protocol::ToolChoice::Auto
-    ));
-    assert_eq!(
-        reader.config.generation,
-        broca_protocol::GenerationConfig::default()
-    );
-    assert!(matches!(
-        reader.config.response_format,
-        broca_protocol::ResponseFormat::Text
-    ));
-    assert_eq!(reader.config.context_epoch, 0);
-    assert_eq!(reader.config.renderer_version, 1);
 }
 
 #[test]

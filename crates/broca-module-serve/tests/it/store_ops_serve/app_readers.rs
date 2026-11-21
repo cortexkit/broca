@@ -727,7 +727,6 @@ async fn app_readers_malformed_admission_writes_nothing() {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(rig.wal.wal_present(&rig.key), Some(false));
         sample("plan-readers-invalid-refusal.json", &refused.body);
     }
     let valid = readers_plan(Some(json!([])), false);

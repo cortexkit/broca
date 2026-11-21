@@ -33,12 +33,4 @@ pub enum ApprovalResponse {
     },
 }
 
-impl ApprovalResponse {
-    pub fn tool_call_id(&self) -> &ToolCallId {
-        match self {
-            ApprovalResponse::Allow { tool_call_id }
-            | ApprovalResponse::AllowNarrowed { tool_call_id, .. }
-            | ApprovalResponse::Deny { tool_call_id, .. } => tool_call_id,
-        }
-    }
-}
+impl ApprovalResponse {}

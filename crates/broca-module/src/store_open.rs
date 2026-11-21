@@ -1085,13 +1085,6 @@ impl StoreSlot {
         runtime.install_key(deployment, parts)
     }
 
-    /// Whether the session `key` is kept in the new storage, whether or not the deployment key
-    /// has loaded: one check of its head in each class root. A head found in two roots is
-    /// refused `session_in_two_classes`.
-    pub fn holds(&self, key: &BindIdentity) -> Result<bool, OpenError> {
-        Ok(head_class(&self.state_root, key)?.is_some())
-    }
-
     /// The runtime when the new storage keeps the session `key`; `None` for a session it
     /// doesn't keep. Once the key has loaded every session kept here is served. Before then the
     /// session's head names its mode: a plain session is served, and an encrypted one is refused

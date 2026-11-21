@@ -13,7 +13,6 @@ pub use broca_core::scope_admission::ScopeReservation;
 
 /// One row per address a stamped bind reserved. The owner is stored as the principal's JSON,
 /// which decodes back to the same `BindPrincipal`, including a kind this build does not know.
-/// Shared by the legacy run index and the broca-state/2 inventory.
 pub(crate) const SCOPE_RESERVATION_SCHEMA: &str =
     "CREATE TABLE IF NOT EXISTS session_scope_reservation (
     address TEXT PRIMARY KEY, owner TEXT NOT NULL, scope_ref TEXT NOT NULL

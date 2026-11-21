@@ -897,12 +897,9 @@ async fn approved_provider_held_reply_keeps_its_deferred_anchor() {
 #[cfg(feature = "test-attachments")]
 async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    use broca_core::{
-        media_store::{MediaStore, MediaStoreClass},
-        tool_media::ToolMediaCapture,
-        wal_writer::WalStore,
-    };
+    use broca_core::tool_media::MediaCapture;
     use broca_protocol::ToolOutputPart;
+    use sha2::{Digest, Sha256};
     let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
     let rig = Rig::new(true, true, true, true);
     *rig.reply.lock().unwrap() = json!({"content":[
@@ -912,14 +909,8 @@ async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
     ],"errorCode":null});
     let plane = rig.plane(true);
     let mut ctx = ctx();
-    let root =
-        broca_test_support::scratch_root().join(format!("negotiated-media-{}", std::process::id()));
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
-    drop(wal.open(&ctx.bind).unwrap());
-    ctx.media_capture = Some(std::sync::Arc::new(ToolMediaCapture::new(
-        wal.uploads().unwrap(),
-        ctx.bind.clone(),
-    )));
+    let held = std::sync::Arc::new(broca_session_loop::PendingMedia::default());
+    ctx.media_capture = Some(held.clone() as std::sync::Arc<dyn MediaCapture>);
     let call = call("captured");
     plane
         .batch_started(&ctx, std::slice::from_ref(&call), &manifest())
@@ -947,10 +938,11 @@ async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
     let ToolOutputPart::Media { media } = &parts[1] else {
         panic!("negotiated image was not captured")
     };
-    let store = MediaStore::open(&root, MediaStoreClass::NonDurable).unwrap();
+    let bytes = STANDARD.decode(data).unwrap();
+    assert_eq!(media.sha256, format!("{:x}", Sha256::digest(&bytes)));
     assert_eq!(
-        store.read_verified(media).unwrap(),
-        STANDARD.decode(data).unwrap()
+        held.captured_for(&ctx.batch_id, &call.tool_call_id),
+        vec![media.clone()]
     );
     assert_eq!(completed(plane.dispatch(&ctx, &call).await), result);
     assert_eq!(rig.sent.lock().unwrap().len(), 1);

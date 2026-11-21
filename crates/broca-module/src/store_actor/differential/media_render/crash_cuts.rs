@@ -190,7 +190,7 @@ async fn module(
     stop: CancellationToken,
     cipher: Cipher,
 ) -> (LineageRegistry, Arc<Compactor>) {
-    broca_core::media_store::create_media_directories(dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(dir).unwrap();
     let compactor = Arc::new(Compactor::default());
     let executor: Arc<dyn RunExecutor> = Arc::new(CutExecutor {
         script: Arc::new(super::super::super::tests::Gated {

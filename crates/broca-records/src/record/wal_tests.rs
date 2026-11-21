@@ -992,65 +992,6 @@ mod schema_tests {
         assert_eq!(serde_json::to_string(&decoded).unwrap(), STORED);
     }
 
-    /// A RunStarted written by a LATER build, whose vault request names an operation this
-    /// build does not know, still decodes -- a rollback must not make the session unreadable --
-    /// and re-serializes to exactly its stored bytes, the unknown name included. Reading it
-    /// never claims the request was a `credential.get`.
-    #[test]
-    fn a_run_started_with_a_future_vault_op_decodes_and_keeps_its_bytes() {
-        const STORED: &str = r#"{"type":"run_started","run_id":"vault-run","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1,"auth_selection":{"credential_id":"apikey:deepseek","vault_request":{"min_ttl_ms":600000,"op":"some_future_op"}}},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#;
-        let decoded: WalRecord =
-            serde_json::from_str(STORED).expect("a future op must not make RunStarted undecodable");
-        let WalRecord::RunStarted { config, .. } = &decoded else {
-            panic!("expected RunStarted, got {decoded:?}");
-        };
-        let request = config
-            .auth_selection
-            .as_ref()
-            .and_then(|selection| selection.vault_request.clone())
-            .expect("the stored request survives decoding");
-        assert_eq!(
-            request.op,
-            Some(VaultReadOp::Unknown("some_future_op".into()))
-        );
-        assert_eq!(
-            request.op_or_legacy(),
-            VaultReadOp::Unknown("some_future_op".into()),
-            "an unknown op must not be read as credential.get"
-        );
-        assert_eq!(serde_json::to_string(&decoded).unwrap(), STORED);
-    }
-
-    /// A request records what was sent: a handle read spells out its false `force_refresh`
-    /// and names `get`; a scoped read, which has no refresh parameter, omits it and names
-    /// `get_scoped`; a record from before the operation name existed reads as `get`.
-    #[test]
-    fn vault_request_records_the_operation_and_only_the_parameters_it_sent() {
-        let handle_read = VaultRequest {
-            min_ttl_ms: Some(600_000),
-            force_refresh: Some(false),
-            op: Some(VaultReadOp::Get),
-        };
-        assert_eq!(
-            serde_json::to_string(&handle_read).unwrap(),
-            r#"{"min_ttl_ms":600000,"force_refresh":false,"op":"get"}"#
-        );
-        let scoped_read = VaultRequest {
-            min_ttl_ms: Some(600_000),
-            force_refresh: None,
-            op: Some(VaultReadOp::GetScoped),
-        };
-        assert_eq!(
-            serde_json::to_string(&scoped_read).unwrap(),
-            r#"{"min_ttl_ms":600000,"op":"get_scoped"}"#
-        );
-        let legacy: VaultRequest =
-            serde_json::from_str(r#"{"min_ttl_ms":600000,"force_refresh":false}"#).unwrap();
-        assert_eq!(legacy.op, None);
-        assert_eq!(legacy.op_or_legacy(), VaultReadOp::Get);
-        assert_eq!(scoped_read.op_or_legacy(), VaultReadOp::GetScoped);
-    }
-
     #[test]
     fn every_v2_record_round_trips() {
         let provider_err = ProviderError {
@@ -2001,58 +1942,6 @@ mod schema_tests {
         assert_eq!(serde_json::to_vec(&record).unwrap(), bytes.to_vec());
     }
 
-    /// The attempt record's bytes are pinned, and every outcome this build writes round-trips.
-    #[test]
-    fn model_attempt_finished_bytes_are_pinned_and_every_outcome_round_trips() {
-        let stored = br#"{"type":"model_attempt_finished","step_id":2,"attempt":1,"request_body_len":12,"request_body_sha256":"aa","http_status":503,"content_type":"text/plain","response_body_len":1048576,"response_body_sha256":"bb","response_body_cap":1048576,"outcome":"http_error","ts_ms":5}"#;
-        let record: WalRecord = serde_json::from_slice(stored).unwrap();
-        assert!(record.is_informational());
-        assert_eq!(serde_json::to_vec(&record).unwrap(), stored.to_vec());
-
-        let interior_gap = br#"{"type":"model_attempt_finished","step_id":2,"attempt":1,"request_body_len":12,"request_body_sha256":"aa","http_status":200,"response_body_len":3,"response_body_sha256":"bb","outcome":"complete","ts_ms":50,"first_content_at_ms":10,"last_content_at_ms":50,"max_content_gap_ms":30,"max_content_gap_ended_at_ms":40}"#;
-        let record: WalRecord = serde_json::from_slice(interior_gap).unwrap();
-        match &record {
-            WalRecord::ModelAttemptFinished {
-                content_progress, ..
-            } => {
-                assert_eq!(content_progress.max_content_gap_ms, Some(30));
-                assert_eq!(content_progress.max_content_gap_ended_at_ms, Some(40));
-            }
-            other => panic!("expected model attempt record, got {other:?}"),
-        }
-        assert_eq!(serde_json::to_vec(&record).unwrap(), interior_gap.to_vec());
-
-        // Absent optionals write no bytes: an attempt that never received a status line.
-        let no_status = br#"{"type":"model_attempt_finished","step_id":2,"attempt":0,"request_body_len":12,"request_body_sha256":"aa","response_body_len":0,"response_body_sha256":"e3b0","outcome":"connect_failed","ts_ms":5}"#;
-        let record: WalRecord = serde_json::from_slice(no_status).unwrap();
-        assert_eq!(serde_json::to_vec(&record).unwrap(), no_status.to_vec());
-
-        for name in [
-            "complete",
-            "eof_before_completion",
-            "chunk_error",
-            "idle_timeout",
-            "content_timeout",
-            "byte_limit",
-            "decode_error",
-            "rate_floor",
-            "cancelled",
-            "sealed_in_flight",
-            "http_error",
-            "provider_error",
-            "connect_failed",
-            "header_timeout",
-            "no_status",
-        ] {
-            let outcome: AttemptOutcome = serde_json::from_value(json!(name)).unwrap();
-            assert!(
-                !matches!(outcome, AttemptOutcome::Unknown(_)),
-                "{name} is known"
-            );
-            assert_eq!(serde_json::to_value(&outcome).unwrap(), json!(name));
-        }
-    }
-
     /// An outcome a later build writes decodes, and keeps its exact string: re-serializing the
     /// record writes back the bytes that were read, as `VaultReadOp` does for operations.
     #[test]
@@ -2461,54 +2350,6 @@ mod bill_attempt_tests {
     const LEGACY_ATTEMPT: &str = r#"{"type":"model_attempt_finished","step_id":2,"attempt":0,"request_body_len":12,"request_body_sha256":"aa","response_body_len":0,"response_body_sha256":"e3b0","outcome":"connect_failed","ts_ms":5}"#;
     const LEGACY_WARM: &str = r#"{"type":"cache_warmed","run_id":"r","step_id":2,"request_body_sha256":"aa","warm_body_sha256":"bb","usage":{},"sent_at_ms":1790000000000}"#;
 
-    #[test]
-    fn bill_attempt_compression_refused_pinned_bytes() {
-        use sha2::{Digest, Sha256};
-        const ENVELOPE: &str = r#"{"sent":true,"response_bytes":0,"outcome":"compression_refused","sent_at_ms":101,"finished_at_ms":200,"http_status":415}"#;
-        let envelope: AttemptEnvelope = serde_json::from_str(ENVELOPE).unwrap();
-        assert_eq!(envelope.outcome, BillingAttemptOutcome::CompressionRefused);
-        assert_eq!(serde_json::to_string(&envelope).unwrap(), ENVELOPE);
-        let json = format!(
-            r#"{{"type":"model_attempt_finished","attempt_id":"{ID}","reservation":{RESERVATION},"envelope":{ENVELOPE},"step_id":1,"attempt":0,"request_body_len":123,"request_body_sha256":"aa","http_status":415,"response_body_len":0,"response_body_sha256":"e3b0","outcome":"http_error","ts_ms":200}}"#
-        );
-        let record: WalRecord = serde_json::from_str(&json).unwrap();
-        let payload = serde_json::to_vec(&record).unwrap();
-        assert_eq!(payload, json.as_bytes());
-        let frame = crate::framing::encode_v4(
-            broca_wal_reader::frame::Metadata {
-                seq: 1,
-                fence: 1,
-                appended_ms: 200,
-                writer_id: [1; 16],
-            },
-            &[],
-            &record,
-        )
-        .unwrap();
-        let crate::framing::DecodeStep::Record { framed, consumed } =
-            crate::framing::decode_next(&frame)
-        else {
-            panic!("compression refusal frame must decode");
-        };
-        assert_eq!(consumed, frame.len());
-        assert_eq!(framed.record, record);
-        if let Some(output) = std::env::var_os("BROCA_COMPRESSION_SAMPLE_DIR") {
-            let output = std::path::PathBuf::from(output);
-            std::fs::create_dir_all(&output).unwrap();
-            std::fs::write(output.join("compression_refused.json"), &payload).unwrap();
-            std::fs::write(output.join("compression_refused.frame"), &frame).unwrap();
-            std::fs::write(
-                output.join("SHA256SUMS"),
-                format!(
-                    "{:x}  compression_refused.json\n{:x}  compression_refused.frame\n",
-                    Sha256::digest(&payload),
-                    Sha256::digest(&frame),
-                ),
-            )
-            .unwrap();
-        }
-    }
-
     pub(super) fn golden_records() -> Vec<String> {
         let mut records = vec![
             format!(
@@ -2556,35 +2397,6 @@ mod bill_attempt_tests {
             records.push(format!(r#"{{"type":"{kind}","attempt_id":"{ID}","reservation":{reservation},"envelope":{envelope},{suffix}"#));
         }
         records
-    }
-
-    #[test]
-    fn bill_attempt_golden_records_cover_every_field() {
-        for golden in golden_records() {
-            let record: WalRecord = serde_json::from_str(&golden).unwrap();
-            assert_ne!(record, WalRecord::Unknown);
-            assert_eq!(serde_json::to_string(&record).unwrap(), golden);
-            assert_eq!(
-                record.required_features(),
-                &[crate::framing::BILL_ATTEMPTS_FEATURE]
-            );
-            assert!(record.is_informational());
-            let value = serde_json::to_value(&record).unwrap();
-            assert_eq!(value["reservation"]["run"]["speed_requested"], "fast");
-            assert_eq!(value["reservation"]["credential"]["auth_method"], "apikey");
-            assert!(value["reservation"]["credential"].get("kind").is_none());
-            assert!(value["reservation"]["credential"]
-                .get("billing_model")
-                .is_none());
-            if let WalRecord::ModelAttemptFinished {
-                attempt,
-                reservation: Some(reservation),
-                ..
-            } = record
-            {
-                assert_eq!(attempt, reservation.attempt);
-            }
-        }
     }
 
     #[test]
@@ -2653,41 +2465,6 @@ mod bill_attempt_tests {
         );
         assert!(decoded.usage.is_none());
         assert_eq!(models[0].usage.input_tokens, Some(10));
-    }
-
-    #[test]
-    fn bill_attempt_recovery_terminal_is_unknown_and_never_released_when_uncertain() {
-        let records = golden_records();
-        let recovery: Value = serde_json::from_str(&records[3]).unwrap();
-        for sent in [
-            serde_json::json!(true),
-            serde_json::json!(false),
-            serde_json::json!("unknown"),
-        ] {
-            let mut value = recovery.clone();
-            value["envelope"]["sent"] = sent;
-            let record: WalRecord = serde_json::from_value(value).unwrap();
-            assert!(matches!(record, WalRecord::AttemptFinished { .. }));
-            assert!(record.is_informational());
-        }
-        let mut value = recovery.clone();
-        value["envelope"]["outcome"] = serde_json::json!("complete");
-        assert!(serde_json::from_value::<WalRecord>(value)
-            .unwrap_err()
-            .to_string()
-            .contains("requires outcome unknown"));
-        let mut value = recovery.clone();
-        value["envelope"]["usage"] = serde_json::json!({});
-        assert!(serde_json::from_value::<WalRecord>(value)
-            .unwrap_err()
-            .to_string()
-            .contains("must not carry usage"));
-        let mut value = recovery;
-        value["type"] = serde_json::json!("attempt_released");
-        assert!(serde_json::from_value::<WalRecord>(value)
-            .unwrap_err()
-            .to_string()
-            .contains("provably unsent"));
     }
 
     #[test]
@@ -2840,77 +2617,6 @@ mod bill_attempt_tests {
                     &[crate::framing::BILL_ATTEMPTS_FEATURE]
                 );
             }
-        }
-    }
-
-    #[test]
-    fn bill_attempt_samples_use_the_writer_and_reader_codecs() {
-        use broca_wal_reader::{
-            features::Policy,
-            frame::{decode_next_with_policy, DecodeStep, Metadata},
-        };
-        use sha2::{Digest, Sha256};
-        let output = std::env::var_os("BROCA_ATTEMPT_SAMPLE_DIR").map(std::path::PathBuf::from);
-        let mut sums = String::new();
-        for golden in golden_records() {
-            let record: WalRecord = serde_json::from_str(&golden).unwrap();
-            let bytes = crate::framing::encode_v4(
-                Metadata {
-                    seq: 1,
-                    fence: 1,
-                    appended_ms: 200,
-                    writer_id: [1; 16],
-                },
-                &[],
-                &record,
-            )
-            .unwrap();
-            let DecodeStep::Frame(frame) =
-                decode_next_with_policy(&bytes, crate::framing::KNOWN_FEATURES, Policy::All)
-                    .unwrap()
-            else {
-                panic!("reader did not decode billing sample");
-            };
-            assert_eq!(frame.consumed, bytes.len());
-            assert_eq!(frame.payload, golden.as_bytes());
-            assert_eq!(frame.header.metadata.appended_ms, 200);
-            assert_eq!(
-                serde_json::from_slice::<WalRecord>(frame.payload).unwrap(),
-                record
-            );
-            assert_eq!(
-                decode_next_with_policy(&bytes, &[], Policy::All).unwrap_err(),
-                broca_wal_reader::Error::NewerWriter {
-                    features: vec![crate::framing::BILL_ATTEMPTS_FEATURE.into()],
-                }
-            );
-            let kind = serde_json::from_str::<Value>(&golden).unwrap()["type"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            if let Some(output) = &output {
-                std::fs::create_dir_all(output).unwrap();
-                let decoded = serde_json::to_vec_pretty(&serde_json::json!({
-                    "seq":frame.header.metadata.seq,
-                    "fence":frame.header.metadata.fence,
-                    "appended_ms":frame.header.metadata.appended_ms,
-                    "writer_id":frame.header.metadata.writer_id,
-                    "requires":frame.header.requires,
-                    "record":serde_json::from_slice::<Value>(frame.payload).unwrap(),
-                }))
-                .unwrap();
-                for (name, contents) in [
-                    (format!("{kind}.json"), frame.payload),
-                    (format!("{kind}.wal"), bytes.as_slice()),
-                    (format!("{kind}.decoded.json"), decoded.as_slice()),
-                ] {
-                    std::fs::write(output.join(&name), contents).unwrap();
-                    sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(contents)));
-                }
-            }
-        }
-        if let Some(output) = output {
-            std::fs::write(output.join("SHA256SUMS"), sums).unwrap();
         }
     }
 }

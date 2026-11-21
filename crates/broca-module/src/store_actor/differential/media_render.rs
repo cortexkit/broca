@@ -387,7 +387,7 @@ async fn registry(
     cipher: Cipher,
 ) -> LineageRegistry {
     assert!(store, "sessions start in the new storage");
-    broca_core::media_store::create_media_directories(dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(dir).unwrap();
     let executor: Arc<dyn RunExecutor> = Arc::new(RenderExecutor {
         script: Arc::new(super::super::tests::Gated {
             inner: broca_core::provider::StubProvider::new(steps),
@@ -968,8 +968,7 @@ async fn an_input_photo_and_a_tool_image_render_offline_as_sent(cipher: Cipher) 
     }
 }
 
-/// Media files under `dir` holding the image: the new storage's media object, and a copy at the
-/// media store's object path.
+/// Media files under `dir` holding the image: the session's media object, wherever it lies.
 fn media_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -987,8 +986,7 @@ fn media_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 
 /// A photo whose bytes can no longer be read refuses the request by name, and nothing is sent:
 /// never a request without its image. The bytes are read from the session's own object, so
-/// removing that object is what refuses it, even with the same bytes waiting at the media store's
-/// object path: a run of a session in the new storage never reads those.
+/// removing that object is what refuses it.
 async fn a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent(cipher: Cipher) {
     let store = both(three_texts(), false, cipher).await;
     for side in [&store] {
@@ -1002,19 +1000,6 @@ async fn a_photo_whose_bytes_cant_be_read_refuses_alike_and_nothing_is_sent(ciph
         for file in files {
             std::fs::remove_file(file).unwrap();
         }
-    }
-    for class in [
-        broca_core::media_store::MediaStoreClass::Durable,
-        broca_core::media_store::MediaStoreClass::NonDurable,
-        broca_core::media_store::MediaStoreClass::Ephemeral,
-    ] {
-        let objects = store.side.dir.join(class.directory()).join("objects");
-        std::fs::create_dir_all(&objects).unwrap();
-        std::fs::write(
-            objects.join(super::media::digest(&bytes_of(PNG))),
-            bytes_of(PNG),
-        )
-        .unwrap();
     }
     for side in [&store] {
         side.side.send("r3", text("and now?")).await;

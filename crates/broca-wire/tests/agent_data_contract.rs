@@ -28,7 +28,7 @@ fn legacy_session_reference_matches_shared_vectors() {
         let bind = &case["bind"];
         let reference = agent_data::refs::Ref::new(
             "broca-session",
-            broca_core::wal_writer::legacy_session_ref(
+            broca_core::session_refs::legacy_session_ref(
                 bind["harness"].as_str().unwrap(),
                 bind["project_root"].as_str().unwrap(),
                 bind["session"].as_str().unwrap(),

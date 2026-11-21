@@ -21,7 +21,7 @@ use broca_protocol::{
     error::ProviderError,
     BindIdentity, RunId, Usage,
 };
-use broca_wal::{FramedRecord, WalByteAnchor, WalRangeRead, WalRecord};
+use broca_wal::{FramedRecord, WalRecord};
 
 /// The default `session.read` page size.
 pub const SESSION_READ_DEFAULT_LIMIT: u64 = 200;
@@ -153,7 +153,6 @@ pub struct CompactionStorePage {
     pub head: Option<crate::head::HeadProjection>,
     pub watermark_seq: u64,
     pub lineage_id: Option<String>,
-    pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
     pub has_more: bool,
 }
@@ -275,7 +274,6 @@ pub struct StorePageSnapshot {
     pub lineage_id: Option<String>,
     /// Last control-stream unit represented by the materialized watermark state.
     pub control_head: Option<crate::Cursor>,
-    pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
     /// Model steps represented by the materialized prefix.
     pub completed_steps: u64,
@@ -312,7 +310,6 @@ impl StorePageSnapshot {
             watermark_seq: 0,
             lineage_id: None,
             control_head: None,
-            anchor: None,
             prefix_len: 0,
             completed_steps: 0,
             rows: Vec::new(),
@@ -332,7 +329,6 @@ pub struct AdmissionStoreSnapshot {
     pub watermark_seq: u64,
     /// WAL identity represented by the checkpoint. `None` is legacy/unknown.
     pub lineage_id: Option<String>,
-    pub anchor: Option<WalByteAnchor>,
     /// `None` means the row predates checkpoint support or its version/payload is unusable.
     pub checkpoint: Option<crate::AdmissionCheckpointV1>,
 }
@@ -391,199 +387,6 @@ pub trait RunEventBodies: Send + Sync {
     fn read_run_event(&self, event_key: &str) -> Result<Option<(BindIdentity, Vec<u8>)>, String>;
 }
 
-/// The materialized store read seam. The loop depends only on this trait.
-pub trait MaterializedStore: Send + Sync {
-    /// Durable snapshot identity is separate from rebuildable transcript rows.
-    fn served_history(&self) -> Option<&dyn crate::ServedHistory> {
-        None
-    }
-
-    /// Cache only the first-run mode proof, never rebuilding legacy message timestamps.
-    fn cache_history_mode(&self, _session: &BindIdentity, _mode3: bool) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// A neutral page from the same transcript projection as native reads. A
-    /// backend without this projection returns None rather than scanning history.
-    fn read_compaction_page(
-        &self,
-        _session: &BindIdentity,
-        _request: &crate::compaction_v2::protocol::read::ReadRequest,
-    ) -> Result<Option<CompactionStorePage>, crate::compaction_v2::read::ReadError> {
-        Ok(None)
-    }
-
-    /// Invalidate rebuildable views durably before physical WAL recovery cuts.
-    /// Usage export facts are independent authority and must not be changed.
-    fn invalidate_wal_recovery(
-        &self,
-        _session: &BindIdentity,
-        _cut: &broca_wal::recovery::RecoveryCut,
-    ) -> Result<(), String> {
-        Err("materialized store cannot durably invalidate a WAL recovery".into())
-    }
-    fn needs_wal_recovery_projection(
-        &self,
-        _session: &BindIdentity,
-        _cut_ids: &std::collections::BTreeSet<String>,
-    ) -> Result<bool, String> {
-        Ok(true)
-    }
-    fn reproject_wal_recovery(
-        &self,
-        _session: &BindIdentity,
-        _range: &WalRangeRead,
-    ) -> Result<(), String> {
-        Err("materialized store cannot reproject a WAL recovery".into())
-    }
-    /// Read the materialized prefix + counters + watermark + epoch in ONE
-    /// consistent transaction (never two racing reads). Any decode or component-read
-    /// failure must surface as an error so the caller can fall back to a full WAL replay
-    /// instead of merging a partial snapshot.
-    /// Messages carry their absolute store-row ordinals; merging never renumbers loaded rows.
-    fn read_prefix_with_watermark(&self, session: &BindIdentity) -> Result<StorePrefix, String>;
-
-    /// Read only the rows a run resumed under an applied compaction view holds (`held`), with
-    /// the prefix's watermark, identity, length, counters, seeds and the episode projection the
-    /// rows need, all in ONE transaction. The rows of the discarded range are never read.
-    ///
-    /// The default implementation keeps no such read: `Ok(None)` makes the caller merge the
-    /// complete prefix instead. A read failure is `Err`, and the caller replays the WAL.
-    fn read_held_prefix(
-        &self,
-        _session: &BindIdentity,
-        _held: &HeldRowsRequest,
-    ) -> Result<Option<HeldPrefix>, String> {
-        Ok(None)
-    }
-
-    /// Read the session's projected episode render inputs (start, original first user, first
-    /// model step and frozen render config per episode) without reading a transcript message.
-    ///
-    /// The default implementation keeps no such projection. A store that does returns
-    /// `Ok(Some(episodes))` only when every episode's values were computed at the projection's
-    /// materialization watermark. `Ok(None)` means they were not: a store written before the
-    /// column existed, or one whose projection advanced without recomputing them. A caller that
-    /// needs episode coordinates then replays the WAL rather than render from an absence, and
-    /// the projection fills the values on its next write. `Err` is a read failure, answered the
-    /// same way.
-    fn read_episode_projection(
-        &self,
-        _session: &BindIdentity,
-    ) -> Result<Option<Vec<EpisodeRenderProjection>>, String> {
-        Ok(None)
-    }
-
-    /// The same projection read for a running session's own loop, which must not wait on a
-    /// store lock. `Ok(None)` means the store cannot supply the values: it keeps no projection,
-    /// the projection is stale or absent, or it belongs to another lineage. The caller then uses
-    /// its WAL replay, and the projection fills the values on its next write.
-    fn read_episode_projection_async(&self, _session: &BindIdentity) -> EpisodeProjectionRead<'_> {
-        Box::pin(async { Ok(None) })
-    }
-
-    /// Read the watermark, matching byte anchor, and admission checkpoint in one transaction.
-    /// `None` means there is no metadata row; callers use the complete WAL.
-    fn read_admission_snapshot(
-        &self,
-        _session: &BindIdentity,
-    ) -> Result<Option<AdmissionStoreSnapshot>, String> {
-        Ok(None)
-    }
-
-    /// Read page metadata and rows in one transaction. `None` requests the newest
-    /// `limit` prefix rows; the caller trims them after deriving the WAL-tail length.
-    fn read_page_with_watermark(
-        &self,
-        session: &BindIdentity,
-        _from_ordinal: Option<u64>,
-        _limit: u64,
-        _view: ReadView,
-    ) -> Result<StorePageSnapshot, String> {
-        let prefix = self.read_prefix_with_watermark(session)?;
-        if prefix.prefix.is_empty() && prefix.watermark_seq == 0 {
-            Ok(StorePageSnapshot::empty())
-        } else {
-            Err("materialized store does not implement atomic paged reads".into())
-        }
-    }
-}
-
-/// The WAL→store projection seam. Defined in the loop crate (so `run_loop` can
-/// drive it without depending on the SQLite impl); `SqliteStore` implements it.
-pub trait Persister: Send + Sync {
-    /// Retained transcripts stay WAL-only; only content-free head facts may be checkpointed.
-    fn project_retained_head(
-        &self,
-        _session: &BindIdentity,
-        _lineage_id: &str,
-        _records: &[FramedRecord],
-    ) -> Result<(), String> {
-        Ok(())
-    }
-    /// Read the complete seed for a suffix-only projection. `None` asks the caller to provide
-    /// the full WAL because metadata from an older schema cannot safely seed incremental replay.
-    /// The default preserves compatibility for persisters that only support full-prefix replay.
-    fn projection_seed(
-        &self,
-        _session: &BindIdentity,
-    ) -> Result<Option<crate::ProjectionSeed>, String> {
-        Ok(None)
-    }
-
-    /// Project newly-COMPLETE turns from `records` (the durable WAL up to a
-    /// fsynced point, in seq order) into the store, in ONE transaction. `records` may be either
-    /// the complete prefix or the suffix selected from [`Self::projection_seed`]. Idempotent
-    /// (re-projecting is a no-op past the watermark). Returns the new watermark.
-    /// MUST only advance the watermark at a TURN boundary (so `run_finished` and a
-    /// natural-end terminal turn stay WAL-only and the tail carries the trailing
-    /// state on resume). A failure is non-fatal (the full-WAL fallback covers it).
-    fn project(&self, session: &BindIdentity, records: &[FramedRecord]) -> Result<u64, String>;
-
-    /// Persist only run-level withdrawal discovery for a retained lineage. The
-    /// input is deliberately content-free; ordinary projection never receives
-    /// that lineage's messages, checkpoint or deferred-call record summary.
-    fn project_retention_metadata(
-        &self,
-        _session: &BindIdentity,
-        _metadata: &crate::projection_plan::RetainedWithdrawalProjection,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Project a range while co-committing the anchor for the resulting watermark. Backends with
-    /// transactional metadata override this; the compatibility default retains the older
-    /// best-effort two-write behavior.
-    fn project_range(&self, session: &BindIdentity, range: &WalRangeRead) -> Result<u64, String> {
-        let watermark = self.project(
-            session,
-            match range.records() {
-                broca_wal::WalRangeRecords::Complete(records)
-                | broca_wal::WalRangeRecords::Partial(records)
-                | broca_wal::WalRangeRecords::Unknown(records) => records,
-                broca_wal::WalRangeRecords::Absent => &[],
-            },
-        )?;
-        let anchor = range.anchor_at(watermark);
-        self.persist_wal_anchor(session, anchor.as_ref())?;
-        Ok(watermark)
-    }
-
-    /// Persist a derived byte anchor after projection advances its watermark.
-    /// Implementations may ignore `None`, which is expected when the backend has no file identity.
-    fn persist_wal_anchor(
-        &self,
-        _session: &BindIdentity,
-        _anchor: Option<&WalByteAnchor>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-/// The combined session-store seam `run_loop` accepts (read + project). A single
-/// `SqliteStore` implements both halves.
-pub trait SessionStore: MaterializedStore + Persister {}
-
 /// Identity candidates are useful even when discovery is incomplete. Only a complete
 /// snapshot can establish absence or uniqueness; candidates still require WAL checks.
 #[derive(Default, Debug)]
@@ -634,7 +437,6 @@ impl<T: ExportIndex + ?Sized> ImportedRunExclusions for T {
         ExportIndex::is_imported_run(self, session, run_id)
     }
 }
-impl<T: MaterializedStore + Persister> SessionStore for T {}
 
 /// A run's coarse lifecycle state, as status reads report it from the session's records.
 #[derive(Debug, Clone, PartialEq, Eq)]

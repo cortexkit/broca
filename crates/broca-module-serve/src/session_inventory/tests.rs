@@ -186,7 +186,7 @@ async fn a_mid_run_gap_marker_is_repaired_by_the_next_new_pair_bind() {
     assert_eq!(fixture.inventory.inner.attempts.load(Ordering::SeqCst), 0);
     let marker = fixture
         .root
-        .join(broca_core::wal_writer::SESSION_PROJECTION_INCOMPLETE);
+        .join(broca_core::session_refs::SESSION_PROJECTION_INCOMPLETE);
     std::fs::write(&marker, b"").unwrap();
     assert!(
         !fixture

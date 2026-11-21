@@ -69,6 +69,7 @@ pub mod resume;
 pub mod retention;
 pub mod run;
 pub mod scope_admission;
+pub mod session_refs;
 pub mod shutdown_seal;
 pub mod signed_floor;
 pub mod step_usage;
@@ -81,7 +82,6 @@ pub mod tool_media;
 pub mod tool_plane;
 pub mod tool_repetition;
 pub mod tool_results;
-pub mod wal_writer;
 
 pub use admission::{
     digest_client_message_id, send_identity_difference_with_conversation_key,
@@ -113,8 +113,8 @@ pub use context::{
     ToolCallDispatch, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{
-    AdmissionStoreSnapshot, HeldEpisode, HeldPrefix, HeldRowsRequest, MaterializedStore, Persister,
-    SessionStore, StorePageRow, StorePageSnapshot, StorePrefix,
+    AdmissionStoreSnapshot, HeldEpisode, HeldPrefix, HeldRowsRequest, StorePageRow,
+    StorePageSnapshot, StorePrefix,
 };
 pub use context::{ModelEntry, ReadView};
 pub use hooks::{HookPlane, HookUnavailable, STEP_TRANSFORM_HOOK_CAP};
@@ -164,6 +164,10 @@ pub use run::{
     StartMode,
 };
 pub use run::{PriorWalSnapshot, RoutingUnavailableReason};
+pub use session_refs::{
+    agent_session_ref, record_candidate, session_addr, session_projection_incomplete,
+    ProjectionAdmission, ProjectionRepair, SessionRefIndex, SESSION_PROJECTION_INCOMPLETE,
+};
 pub use shutdown_seal::SealedAttempt;
 pub use shutdown_seal::ShutdownSeal;
 pub use step_usage::RunUsageProjection;
@@ -173,15 +177,6 @@ pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
 pub use tool_results::outcome_unknown_result;
 pub use tool_results::{no_dispatch_result, not_dispatched_result};
-pub use wal_writer::ProjectionAdmission;
-pub use wal_writer::{
-    agent_session_ref, record_candidate, session_addr, FileWalStore, ReadOnlyWalReader,
-    SessionRefIndex, WalStore,
-};
-pub use wal_writer::{
-    session_projection_incomplete, ProjectionRepair, SESSION_PROJECTION_INCOMPLETE,
-};
-pub use wal_writer::{session_storage_refusal, WAL_MANIFEST_FILENAME};
 
 pub mod account_limit_pause;
 pub use account_limit_pause::{

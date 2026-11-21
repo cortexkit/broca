@@ -7,7 +7,7 @@ use crate::late_results_store::LateResultsStore;
 use broca_core::tool_plane::LateResultRegistration;
 use broca_protocol::PauseReason;
 use broca_session_store::record::Record;
-use broca_wal::{record::RunCancelAt, WalRecord};
+use broca_wal::record::RunCancelAt;
 use cortexkit_role_tool_provider::withdraw::WithdrawVerdict;
 use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -39,7 +39,7 @@ impl WithdrawTransport for Withdrawals {
 }
 
 pub(super) async fn terminal(side: &Side) -> (Value, Vec<Value>) {
-    if side.store {
+    {
         let view = side
             .registry
             .store_runtime()
@@ -61,20 +61,6 @@ pub(super) async fn terminal(side: &Side) -> (Value, Vec<Value>) {
             _ => None,
         }).collect();
         (end, calls)
-    } else {
-        let records = side.executor.wal.read_records(&side.key).unwrap();
-        let end = records
-            .iter()
-            .find_map(|frame| match &frame.record {
-                WalRecord::RunFinished { reason, .. } => Some(json!(reason)),
-                _ => None,
-            })
-            .unwrap();
-        let calls = records.iter().filter_map(|frame| match &frame.record {
-            WalRecord::ToolResult {outcome, reason, ..} => Some(json!({"outcome": format!("{outcome:?}").to_ascii_lowercase(), "reason": reason})),
-            _ => None,
-        }).collect();
-        (end, calls)
     }
 }
 
@@ -92,7 +78,7 @@ pub(super) async fn cancelled(side: &Side) {
 }
 
 pub(super) async fn position(side: &Side) -> u64 {
-    if side.store {
+    {
         side.registry
             .store_runtime()
             .unwrap()
@@ -101,15 +87,6 @@ pub(super) async fn position(side: &Side) -> u64 {
             .unwrap()
             .unwrap()
             .next_seq()
-    } else {
-        side.executor
-            .wal
-            .read_records(&side.key)
-            .unwrap()
-            .last()
-            .unwrap()
-            .seq
-            + 1
     }
 }
 

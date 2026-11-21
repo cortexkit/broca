@@ -2182,43 +2182,6 @@ impl WalRecord {
         }
     }
 
-    /// Whether conversation and admission readers skip this record: a type from a newer build
-    /// ([`WalRecord::Unknown`]) or one this build knows but that carries no session semantics
-    /// ([`WalRecord::ModelAttemptFinished`], [`WalRecord::ResumeStarted`]). Sites that pick
-    /// "the first/next record that matters" filter on this so an informational record can
-    /// never move their decision.
-    pub fn is_informational(&self) -> bool {
-        matches!(
-            self,
-            WalRecord::Unknown
-                | WalRecord::WriterOpened { .. }
-                | WalRecord::WriterClosed { .. }
-                | WalRecord::VisibilityLate { .. }
-                | WalRecord::CompactionViewV2 { .. }
-                | WalRecord::CompactionMarker { .. }
-                | WalRecord::CompactionViewAppliedV2 { .. }
-                | WalRecord::ModelAttemptFinished { .. }
-                | WalRecord::AttemptReserved { .. }
-                | WalRecord::AttemptFinished { .. }
-                | WalRecord::AttemptReleased { .. }
-                | WalRecord::AttemptCorrected { .. }
-                | WalRecord::ResumeStarted { .. }
-                | WalRecord::CacheWarmed { .. }
-                | WalRecord::QuestionWithdrawalAcknowledged { .. }
-        )
-    }
-
-    /// The caller-supplied title this record carries: set only on the records a `session.send`
-    /// writes (`RunStarted`, `Queued` and `Steered`), and only when the send carried one.
-    pub fn title(&self) -> Option<&str> {
-        match self {
-            WalRecord::RunStarted { title, .. }
-            | WalRecord::Queued { title, .. }
-            | WalRecord::Steered { title, .. } => title.as_deref(),
-            _ => None,
-        }
-    }
-
     /// The WAL features a reader must know before it may interpret this record, sorted.
     ///
     /// Empty for every record that uses no must-understand value, which is then written in an
@@ -3404,7 +3367,8 @@ enum MediaHookSubject {
 }
 
 /// Decode the phase's known subject shape once, borrowing its fields. Tool input is opaque:
-/// a media-looking object in arguments is not native content and must not raise the floor.
+/// a media-looking object in arguments is not native content and must not make the record
+/// need a reader that understands media.
 fn hook_subject_carries_media(value: &Value, subject: MediaHookSubject) -> bool {
     match subject {
         MediaHookSubject::Messages => Vec::<MediaMessage>::deserialize(value)
@@ -4353,15 +4317,7 @@ pub struct VaultRequest {
     pub op: Option<VaultReadOp>,
 }
 
-impl VaultRequest {
-    /// The operation this request was sent as, reading an absent `op` as `credential.get`: the
-    /// only operation broca sent before the field existed. An operation name this build does
-    /// not know comes back as [`VaultReadOp::Unknown`], never as `Get`: a later build wrote it,
-    /// and this build cannot say what was sent.
-    pub fn op_or_legacy(&self) -> VaultReadOp {
-        self.op.clone().unwrap_or(VaultReadOp::Get)
-    }
-}
+impl VaultRequest {}
 
 /// The vault read operation a [`VaultRequest`] was sent as. Serialized as a bare string:
 /// `"get"`, `"get_scoped"`, or, for [`VaultReadOp::Unknown`], the string it was read from.
@@ -4458,7 +4414,7 @@ pub enum DispatchOutcome {
 }
 
 impl DispatchOutcome {
-    /// Whether this terminal's outcome is ambiguous — i.e. the request may have run
+    /// Whether this dispatch outcome is ambiguous — i.e. the request may have run
     /// with its result lost, so resume must stop for review rather than re-dispatch.
     /// Only `Unknown` qualifies.
     pub fn is_indeterminate(self) -> bool {

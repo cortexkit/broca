@@ -83,14 +83,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_seed_keeps_its_inventoried_address_without_a_live_wal() {
+    fn legacy_seed_keeps_its_inventoried_address() {
         let root = root("address-legacy");
         let seed = BindIdentity::new(root.join("legacy"), "harness", "session");
         assert_eq!(register_legacy_session(&root, &seed).unwrap(), seed);
         let claim = BindIdentity::new(root.join("other"), "harness", "session");
         assert_eq!(resolve_session_address(&root, &claim).unwrap(), seed);
-        let path = broca_core::FileWalStore::new(root.join("wal")).wal_path(&seed);
-        assert!(!path.exists());
     }
 
     #[test]

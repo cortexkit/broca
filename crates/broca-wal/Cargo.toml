@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "broca WAL: the intent-log source of truth — framed records (len/ver/seq/fence/SHA-256 digest), the durable record set, and FileWal (append+fsync, torn-tail-safe replay)."
+description = "What live broca code still uses from the old log format: record vocabulary, frame codec and feature names, the state-format marker, move fences and size limits."
 
 [features]
 # Test builds only: makes `framing::TEST_KNOWN_FEATURE` a known WAL feature, so tests in other

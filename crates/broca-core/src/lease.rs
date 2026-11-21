@@ -15,10 +15,6 @@ use broca_protocol::BindIdentity;
 use cortexkit_lease::LeaseKey;
 
 pub use cortexkit_lease::{FileLeaseStore, LeaseError, LeaseHandle, LeaseStore};
-// The canonical key derivation lives in `broca-wal`'s tenure module.
-// This module re-exports its key shape and tenure refusal so the derivation
-// cannot drift between the two spellings; the byte contract is pinned below.
-pub use broca_wal::writer_tenure::{TenureError, WalLeaseKey};
 
 /// Cut authority is serialized across daemon processes as well as tasks. Session
 /// leases are acquired only after this lock, keeping the lock order acyclic.
@@ -38,56 +34,20 @@ pub fn acquire_cut(
 /// share a name but differ in project or harness never collide — exactly the
 /// distinctness the file lease enforced before this crate existed.
 ///
-/// The bytes come from the canonical derivation in `broca-wal`'s tenure module:
-/// this wrapper only converts that identical triple into the shared lease crate's
-/// key type. Returning `WalLeaseKey` directly would require `broca-wal` to
-/// depend on `cortexkit-lease`, a manifest change not made here, so the
-/// conversion stays in this wrapper.
+/// The namespace is `broca`/`wal` and the scope joins the triple with U+001F, which
+/// [`BindIdentity::validate_keyable`] refuses inside any field, so one identity never
+/// aliases another's lock. Every lease ever taken used these bytes, so they never change.
 pub fn lease_key_for(session: &BindIdentity) -> LeaseKey {
-    let canonical = broca_wal::writer_tenure::lease_key_for(session);
-    LeaseKey::new(canonical.module_id, canonical.backend, canonical.scope_key)
-}
-
-pub(crate) enum LeaseProbe {
-    Held,
-    Free(Option<std::fs::File>),
-}
-
-/// Preview maintenance must not create a lease or change its epoch. The pinned
-/// lease crate exposes no read-only probe, so open its stable FNV-1a filename
-/// without creation and hold a shared OS lock. Tests compare this with a real
-/// FileLeaseStore writer to detect any dependency addressing drift.
-pub(crate) fn probe_writer(
-    state_root: &std::path::Path,
-    session: &BindIdentity,
-) -> std::io::Result<LeaseProbe> {
-    let key = lease_key_for(session);
-    let identity = format!(
-        "{}\u{1f}{}\u{1f}{}",
-        key.module_id, key.backend, key.scope_key
-    );
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in identity.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let path = state_root.join("leases").join(format!("{hash:016x}.lease"));
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LeaseProbe::Free(None))
-        }
-        Err(error) => return Err(error),
-    };
-    match file.try_lock_shared() {
-        Ok(()) => Ok(LeaseProbe::Free(Some(file))),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(LeaseProbe::Held),
-        Err(std::fs::TryLockError::Error(error)) => Err(error),
-    }
+    LeaseKey::new(
+        "broca",
+        "wal",
+        format!(
+            "{}\u{1f}{}\u{1f}{}",
+            session.project_root.display(),
+            session.harness,
+            session.session
+        ),
+    )
 }
 
 /// Hold for the entire mutating fold, resume, or unfold operation. Report-only
@@ -106,14 +66,6 @@ pub fn acquire_archive_pass(
         "wal-archive",
         "fold-pass",
     ))
-}
-
-/// Diagnostic path for the fixed archive-pass key. The shared crate keeps its
-/// path derivation private; this is its FNV-1a filename for
-/// `broca<US>wal-archive<US>fold-pass`, not a second locking implementation.
-/// The fold contention test verifies that the held lease actually exists here.
-pub fn archive_pass_lock_path(state_root: &std::path::Path) -> std::path::PathBuf {
-    state_root.join("leases/978f70b3270ef8da.lease")
 }
 
 #[cfg(test)]
@@ -171,14 +123,10 @@ mod tests {
     }
 
     #[test]
-    fn key_bytes_match_the_canonical_wal_derivation() {
-        // The shared bytes must never drift: the core key is built from the
-        // canonical broca-wal derivation, field for field.
-        let session = ident("/srv/project", "runner", "s1");
-        let core_key = lease_key_for(&session);
-        let canonical = broca_wal::writer_tenure::lease_key_for(&session);
-        assert_eq!(core_key.module_id, canonical.module_id);
-        assert_eq!(core_key.backend, canonical.backend);
-        assert_eq!(core_key.scope_key, canonical.scope_key);
+    fn the_key_bytes_are_pinned() {
+        let key = lease_key_for(&ident("/srv/project", "runner", "s1"));
+        assert_eq!(key.module_id, "broca");
+        assert_eq!(key.backend, "wal");
+        assert_eq!(key.scope_key.as_bytes(), b"/srv/project\x1frunner\x1fs1");
     }
 }

@@ -9,47 +9,6 @@ fn record() -> WalRecord {
 }
 
 #[test]
-fn queued_abstract_tier_bytes_and_reader_requirements_are_pinned() {
-    let record = record();
-    assert_eq!(record.required_features(), [SERVICE_TIER_QUEUE_FEATURE]);
-    let bytes = encode(7, 3, &record).unwrap();
-    assert_eq!(bytes[4], GATED_FRAMING_VERSION);
-    assert_eq!(
-        std::str::from_utf8(&bytes[HEADER_LEN..]).unwrap(),
-        GOLDEN.trim_end()
-    );
-    assert_eq!(
-        format!("{:x}", Sha256::digest(&bytes)),
-        "ffef0aa8a8496dd3dd8b56918851a702ebcbe4c71fbaa68ebc912fe75a91e31b"
-    );
-
-    let older: Vec<_> = KNOWN_FEATURES
-        .iter()
-        .copied()
-        .filter(|name| *name != SERVICE_TIER_QUEUE_FEATURE)
-        .collect();
-    let v4 = encode_v4(
-        v4::Metadata {
-            seq: 7,
-            fence: 3,
-            appended_ms: 123,
-            writer_id: [5; 16],
-        },
-        &[],
-        &record,
-    )
-    .unwrap();
-    for bytes in [bytes, v4] {
-        assert!(
-            matches!(decode_next(&bytes), DecodeStep::Record { framed, .. } if framed.record == record)
-        );
-        assert!(
-            matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [SERVICE_TIER_QUEUE_FEATURE])
-        );
-    }
-}
-
-#[test]
 fn queued_tier_readers_keep_every_level_and_compose_feature_requirements() {
     for level in ["standard", "fast", "ultrafast", "future-level"] {
         let mut value = serde_json::to_value(record()).unwrap();

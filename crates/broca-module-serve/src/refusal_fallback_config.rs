@@ -145,14 +145,6 @@ impl RefusalFallbackConfig {
         })
     }
 
-    /// A config with no mappings: every refusal commits as it does with no fallback at all.
-    pub fn disabled() -> Self {
-        Self {
-            mappings: BTreeMap::new(),
-            enabled: false,
-        }
-    }
-
     /// The same mappings with the operator switch set to `enabled`.
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;

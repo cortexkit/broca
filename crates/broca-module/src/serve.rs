@@ -874,36 +874,10 @@ pub(crate) fn wake_directives(
         .map(|directive| vec![directive.into()])
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub(crate) struct RunToolCallsAnchor {
-    file_id: u64,
-    seq: u64,
-    byte_end: u64,
-}
-
-impl From<broca_wal::WalByteAnchor> for RunToolCallsAnchor {
-    fn from(anchor: broca_wal::WalByteAnchor) -> Self {
-        Self {
-            file_id: anchor.file_id,
-            seq: anchor.seq,
-            byte_end: anchor.byte_end,
-        }
-    }
-}
-
-impl From<RunToolCallsAnchor> for broca_wal::WalByteAnchor {
-    fn from(anchor: RunToolCallsAnchor) -> Self {
-        Self {
-            file_id: anchor.file_id,
-            seq: anchor.seq,
-            byte_end: anchor.byte_end,
-        }
-    }
-}
-
-/// A continuation resumes at the next call's assistant record, not at the session's WAL head.
-/// For a session kept in the new storage the seqs are the store's own, `lineage_id` names the
-/// session's log incarnation, and no byte anchors are kept.
+/// A continuation resumes at the next call's assistant record, not at the session's newest
+/// record. The record numbers (`seq`) are the session store's own, and `lineage_id` names this
+/// copy of the session's log: a log deleted and created again gets a new one, so a cursor from
+/// the old log is refused.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunToolCallsCursor {
@@ -916,7 +890,6 @@ pub(crate) struct RunToolCallsCursor {
     call_index: usize,
     pub(crate) batch_end_seq: u64,
     ordinal: u64,
-    anchor_before: Option<RunToolCallsAnchor>,
     after_batch: Vec<RunToolCallsPosition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     authentication: Option<String>,
@@ -928,7 +901,6 @@ pub(crate) struct RunToolCallsPosition {
     call_index: usize,
     batch_end_seq: u64,
     ordinal: u64,
-    anchor_before: Option<RunToolCallsAnchor>,
 }
 
 #[derive(Clone, Debug)]
@@ -951,11 +923,6 @@ pub(crate) struct RunToolCallsPageContext<'a> {
     pub(crate) lineage_id: Option<&'a str>,
     pub(crate) run_start_seq: u64,
     pub(crate) run_end_seq: u64,
-    /// The WAL range the calls were read from, whose byte anchors a cursor keeps; `None` for a
-    /// session kept in the new storage, whose cursors keep none.
-    pub(crate) range: Option<&'a broca_wal::WalRangeRead>,
-    pub(crate) range_start_seq: u64,
-    pub(crate) fallback: Option<RunToolCallsAnchor>,
     pub(crate) seed: Option<&'a RunToolCallsCursor>,
 }
 
@@ -1042,29 +1009,12 @@ fn run_tool_calls_cursor_is_authentic(cursor: &RunToolCallsCursor) -> Result<boo
     Ok(provided.len() == expected.len() && difference == 0)
 }
 
-fn indexed_run_tool_call_position(
-    entry: &IndexedRunToolCall,
-    range: Option<&broca_wal::WalRangeRead>,
-    range_start_seq: u64,
-    fallback: Option<RunToolCallsAnchor>,
-) -> RunToolCallsPosition {
-    let anchor_before = if entry.step_seq == range_start_seq {
-        fallback
-    } else {
-        range.and_then(|range| {
-            entry
-                .step_seq
-                .checked_sub(1)
-                .and_then(|seq| range.anchor_at(seq))
-                .map(Into::into)
-        })
-    };
+fn indexed_run_tool_call_position(entry: &IndexedRunToolCall) -> RunToolCallsPosition {
     RunToolCallsPosition {
         step_seq: entry.step_seq,
         call_index: entry.call_index,
         batch_end_seq: entry.batch_end_seq,
         ordinal: entry.ordinal,
-        anchor_before,
     }
 }
 
@@ -1086,7 +1036,6 @@ fn run_tool_calls_cursor_token(
         call_index: position.call_index,
         batch_end_seq: position.batch_end_seq,
         ordinal: position.ordinal,
-        anchor_before: position.anchor_before,
         after_batch: after_batch.to_vec(),
         authentication: None,
     };
@@ -1101,12 +1050,7 @@ fn next_run_tool_calls_cursor(
     context: &RunToolCallsPageContext<'_>,
 ) -> Result<Option<String>, ServeError> {
     if let Some(entry) = entries.get(index) {
-        let position = indexed_run_tool_call_position(
-            entry,
-            context.range,
-            context.range_start_seq,
-            context.fallback,
-        );
+        let position = indexed_run_tool_call_position(entry);
         return run_tool_calls_cursor_token(
             &position,
             &entry.after_batch,
@@ -1160,9 +1104,6 @@ pub(crate) fn checked_tool_calls_cursor(
         || cursor.batch_end_seq < cursor.step_seq
         || cursor.batch_end_seq > cursor.run_end_seq
         || cursor.step_seq <= cursor.run_start_seq
-        || cursor
-            .anchor_before
-            .is_some_and(|anchor| anchor.seq != cursor.step_seq - 1)
     {
         return Err(invalid_tool_call_cursor(
             "run.tool_calls.after is not a cursor returned for this run",
@@ -1205,12 +1146,7 @@ pub(crate) fn run_tool_calls_answer(
                 .last()
                 .is_none_or(|position: &RunToolCallsPosition| position.step_seq != entry.step_seq)
             {
-                future_batches.push(indexed_run_tool_call_position(
-                    entry,
-                    context.range,
-                    context.range_start_seq,
-                    context.fallback,
-                ));
+                future_batches.push(indexed_run_tool_call_position(entry));
             }
         }
         for entry in &mut entries {

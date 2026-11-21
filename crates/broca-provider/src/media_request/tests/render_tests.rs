@@ -217,22 +217,13 @@ fn image_only_tag_label_does_not_detach_the_prepared_payload() {
 #[tokio::test]
 async fn failed_image_capture_keeps_the_numbered_label_before_its_failure_line() {
     let fixture = Fixture::new();
-    let blocked = fixture.root.join("blocked-media-root");
-    std::fs::write(&blocked, b"not a directory").unwrap();
-    let capture = broca_core::tool_media::ToolMediaCapture::new(
-        broca_core::media_uploads::Uploads::at(&blocked),
-        BindIdentity::new(&fixture.root, "tags", "failed-capture"),
-    );
-    let failure = capture
-        .capture(
-            &broca_protocol::BatchId("failed".into()),
-            &broca_protocol::ToolCallId("failed".into()),
-            fixture.bytes.clone(),
-            "image/png".into(),
-        )
-        .await
-        .expect_err("the valid PNG cannot be captured into a file");
-    assert_eq!(failure.reason, MediaMarkerReason::StoreFailed);
+    // A valid image the capture handle could not store: its failure keeps the detected media.
+    let failure = broca_core::tool_media::CaptureFailure {
+        reason: MediaMarkerReason::StoreFailed,
+        media: Some(
+            broca_core::media_validation::validate_media(&fixture.bytes, "image/png").unwrap(),
+        ),
+    };
     let line = broca_protocol::content::media_not_shown_marker(
         failure.media.as_ref().unwrap(),
         failure.reason,

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::compaction_v2::protocol::read::{Detail, ReadPage, ReadRequest, Select};
-use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent, StubToolPlane};
+use broca_core::{AllowAll, FileLeaseStore, OutputEvent, StubToolPlane};
 use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason};
 use broca_protocol::{
     BindIdentity, MessageId, NormalizedEvent, ProviderControl, RunId, SubmissionRequest, Usage,
@@ -2385,17 +2385,10 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     }
     broca_test_support::pin!("alike", replies[0]);
     let address = |side: &Side| broca_core::session_addr(&side.key);
-    let wal_folder = |side: &Side| {
-        let wal = FileWalStore::new(side.dir.join("wal"));
-        StorageClass::ALL
-            .into_iter()
-            .find(|class| wal.class_wal_path(*class, &side.key).is_file())
-    };
     assert_eq!(
         broca_wal::session_storage_class(&store.dir, &address(&store)).unwrap(),
         Some(StorageClass::Durable)
     );
-    assert_eq!(wal_folder(&store), None);
     let current = || async {
         store
             .registry
@@ -2460,11 +2453,6 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
         side.settled(&format!("run-{second_id}")).await;
         side.assert_completed(&format!("run-{second_id}")).await;
     }
-    assert_eq!(
-        wal_folder(&store),
-        None,
-        "the next turn ran in the new storage"
-    );
 
     // Magic Context drops the first turn's reply, entry 2, while the head is idle; the turn
     // after applies the view at its first step.

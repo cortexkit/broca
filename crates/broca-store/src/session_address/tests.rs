@@ -121,7 +121,7 @@ fn recorded_pair_resolves_with_incomplete_inventory_and_a_gap_marker() {
         recorded
     );
     std::fs::write(
-        root.join(broca_core::wal_writer::SESSION_PROJECTION_INCOMPLETE),
+        root.join(broca_core::session_refs::SESSION_PROJECTION_INCOMPLETE),
         b"",
     )
     .unwrap();
@@ -151,7 +151,7 @@ fn a_filesystem_projection_gap_refuses_even_with_complete_sqlite_markers() {
     let store = SqliteStore::open(root.join("run-index.db")).unwrap();
     complete(&store);
     std::fs::write(
-        root.join(broca_core::wal_writer::SESSION_PROJECTION_INCOMPLETE),
+        root.join(broca_core::session_refs::SESSION_PROJECTION_INCOMPLETE),
         b"",
     )
     .unwrap();

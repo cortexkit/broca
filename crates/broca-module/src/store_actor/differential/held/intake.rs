@@ -519,7 +519,6 @@ async fn new_storage_feed_resumes_held_run_and_duplicate_is_noop(cipher: Cipher)
 #[tokio::test]
 async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike() {
     use broca_session_store::record::{Record, Stream};
-    use broca_wal::WalRecord;
 
     let mut observations = Vec::new();
     for store in [true] {
@@ -578,7 +577,7 @@ async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike()
             before.2 .1,
             [json!({"outcome": "interrupted", "reason": "provider_held_cancelled"})]
         );
-        if store {
+        {
             let view = side
                 .registry
                 .store_runtime()
@@ -621,19 +620,6 @@ async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike()
                 matches!(last_ledger, Some((_, Record::RunEnd(end))) if end.run_id == "r1"),
                 "last ledger record must be RunEnd for r1; tail={tail:?}"
             );
-        } else {
-            let records = side.executor.wal.read_records(&side.key).unwrap();
-            assert_eq!(
-                records
-                    .iter()
-                    .filter(|frame| matches!(frame.record, WalRecord::ToolBatchFinished { .. }))
-                    .count(),
-                1
-            );
-            assert!(matches!(
-                records.last().map(|frame| &frame.record),
-                Some(WalRecord::RunFinished { .. })
-            ));
         }
         let before_feed = position(&side).await;
 
@@ -641,7 +627,7 @@ async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike()
         // acknowledged tool.withdraw for the held call.
         rig.feed.entries.lock().unwrap().push(entry);
         let ((), logs) = broca_test_support::capture_logs(rig.tick()).await;
-        if store {
+        {
             assert!(
                 logs.iter().any(|event| {
                     event.target == "late_results"

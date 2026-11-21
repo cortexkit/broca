@@ -271,7 +271,7 @@ async fn every_broca_spawn_site_pins_its_state_root() {
                 }
             })
             .await;
-            for directory in ["leases", "wal-durable", "wal-archive-durable"] {
+            for directory in ["leases", "session-store", "session-store-durable"] {
                 assert!(
                     machine.new_root().join(directory).is_dir(),
                     "{wrapper}: missing {directory}"

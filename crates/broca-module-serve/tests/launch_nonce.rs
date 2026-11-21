@@ -22,7 +22,7 @@ use std::process::{Command, Output};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore};
+use broca_core::FileLeaseStore;
 use broca_module::executor::RunExecutor;
 include!("common/address_inventory.rs");
 use broca_module::{DefaultOpener, LineageRegistry};
@@ -96,7 +96,6 @@ async fn serve_until_hello(
 ) {
     let dir = scratch(tag);
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let _wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
         DefaultOpener::new(lease, Arc::new(NoRuns)),
     ))));

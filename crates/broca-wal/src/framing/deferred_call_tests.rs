@@ -15,7 +15,7 @@
 use super::*;
 use crate::record::{
     DeferredDecision, DeferredExecutor, LateDecision, LateExecution, LateOutcome, OnExpiry,
-    ProviderHeld, WithdrawElicitation, WithdrawalAnswer,
+    ProviderHeld, WithdrawElicitation,
 };
 use serde_json::Value;
 
@@ -608,41 +608,6 @@ fn a_gated_record_is_never_written_in_an_ordinary_frame() {
         let bytes = encode_with_requires(1, 1, &[], &record).unwrap();
         assert_eq!(bytes[4], GATED_FRAMING_VERSION, "{}", fixture.name);
     }
-}
-
-/// `question_withdrawal_acknowledged` is informational: an ordinary version-1 frame whose payload
-/// is the bare record, no required feature (so it never extends a frame's `requires`), readable
-/// by a reader that knows no feature at all, and skipped by every session reader.
-#[test]
-fn question_withdrawal_acknowledged_is_ungated_ver_1_and_informational() {
-    let _table = lock_feature_table_for_test();
-    let ungated: Vec<&Fixture> = FIXTURES.iter().filter(|f| f.requires.is_empty()).collect();
-    assert_eq!(ungated.len(), 2);
-    for fixture in ungated {
-        let record = decode_with(fixture, &[]);
-        assert!(
-            matches!(record, WalRecord::QuestionWithdrawalAcknowledged { .. }),
-            "{}",
-            fixture.name
-        );
-        assert!(record.required_features().is_empty(), "{}", fixture.name);
-        assert!(record.is_informational(), "{}", fixture.name);
-        let bytes = encode(1, 1, &record).unwrap();
-        assert_eq!(bytes[4], FRAMING_VERSION, "{}", fixture.name);
-        assert_eq!(&bytes[HEADER_LEN..], fixture.record.as_bytes());
-        assert_eq!(bytes, pinned_frame(fixture), "{}", fixture.name);
-    }
-    let WalRecord::QuestionWithdrawalAcknowledged { answer, reason, .. } = decode_with(
-        FIXTURES
-            .iter()
-            .find(|f| f.name == "question_withdrawal_not_sent")
-            .unwrap(),
-        &[],
-    ) else {
-        panic!("expected QuestionWithdrawalAcknowledged");
-    };
-    assert_eq!(answer, WithdrawalAnswer::NotSent);
-    assert_eq!(reason.as_deref(), Some("already_answered"));
 }
 
 /// An executor value this build does not know (one reserved for calls a tool provider executes,

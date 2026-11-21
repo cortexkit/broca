@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "broca materialized store: SqliteStore (the MaterializedStore impl) + the persister that projects committed WAL turns into SQLite (one txn per range, resume from last seq). Keeps the SQLite native dep out of the pure loop crate."
+description = "broca's SQLite stores: run-index.db (session-ref index, scope reservations, bus outboxes, usage export facts), System One, grants and late results."
 
 [features]
 default = []

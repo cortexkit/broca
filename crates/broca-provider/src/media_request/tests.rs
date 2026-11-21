@@ -3,54 +3,68 @@ use crate::{
     media_profile::{select_media_profile, AgingThresholds, DimensionLimit},
     spec::{InputModalities, WireFamilyId},
 };
-use broca_core::media_store::{MediaStore, MediaStoreClass};
-use broca_protocol::{BindIdentity, Role};
+use broca_core::media_store::{MediaBytes, MediaReadError};
+use broca_protocol::Role;
 use broca_wal::WalRecord;
 use serde_json::json;
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 mod checkpoint_compat_tests;
 #[cfg(feature = "test-attachments")]
 mod live_tests;
 mod render_tests;
 
+/// A session's media objects held in memory, by digest. A read returns an object's bytes only
+/// when their size and SHA-256 match the `MediaRef` asked for, as the session store checks its
+/// media objects.
+#[derive(Debug, Clone, Default)]
+struct Objects(Arc<Mutex<BTreeMap<String, Vec<u8>>>>);
+
+impl MediaBytes for Objects {
+    fn read_verified(&self, reference: &MediaRef) -> Result<Vec<u8>, MediaReadError> {
+        let bytes = self
+            .0
+            .lock()
+            .unwrap()
+            .get(&reference.sha256)
+            .cloned()
+            .ok_or_else(|| MediaReadError::Missing(reference.sha256.clone()))?;
+        let matches = bytes.len() as u64 == reference.byte_size && {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(&bytes)) == reference.sha256
+        };
+        if matches {
+            Ok(bytes)
+        } else {
+            Err(MediaReadError::Corrupt(reference.sha256.clone()))
+        }
+    }
+}
+
+impl std::panic::RefUnwindSafe for Objects {}
+
 struct Fixture {
-    root: PathBuf,
-    store: MediaStore,
+    store: Objects,
     media: MediaRef,
     bytes: Vec<u8>,
 }
 
 impl Fixture {
     fn new() -> Self {
-        // `scratch_root` is already private to this process; a counter keeps parallel tests apart.
-        // The wall clock cannot: on macOS it ticks in microseconds, so two fixtures created in the
-        // same tick shared one directory and the first to drop deleted the other's store.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let root = broca_test_support::scratch_root().join(format!(
-            "media-request-{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        broca_owner_only::create_dir_all(&root).unwrap();
-        let store = MediaStore::open(&root, MediaStoreClass::Durable).unwrap();
+        let store = Objects::default();
         let png = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
         let bytes: Vec<_> = (0..png.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&png[i..i + 2], 16).unwrap())
             .collect();
         let media = broca_core::media_validation::validate_media(&bytes, "image/png").unwrap();
-        let identity = BindIdentity {
-            project_root: root.clone(),
-            harness: "media".into(),
-            session: "session".into(),
-        };
         store
-            .session(&identity)
+            .0
+            .lock()
             .unwrap()
-            .register_and_append(&media, &bytes, || Ok(()))
-            .unwrap();
+            .insert(media.sha256.clone(), bytes.clone());
         Self {
-            root,
             store,
             media,
             bytes,
@@ -82,12 +96,6 @@ impl Fixture {
                 is_error: false,
             })],
         )
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -430,15 +438,15 @@ fn stored_media_profiles_and_session_scope_fail_closed_without_reading_foreign_b
         foreign.read(&fixture.media).is_err(),
         "an existing shared-store object does not grant session authority"
     );
-    let object = fixture
-        .root
-        .join("media-durable/objects")
-        .join(&fixture.media.sha256);
-    std::fs::write(&object, b"corrupt").unwrap();
+    let objects = &fixture.store.0;
+    objects
+        .lock()
+        .unwrap()
+        .insert(fixture.media.sha256.clone(), b"corrupt".to_vec());
     let err = prepare(&session, Some(&profile), &prompt, &MediaAging::default()).unwrap_err();
     assert_eq!(err.code(), "media_object_corrupt");
     assert!(err.to_string().contains(&fixture.media.sha256));
-    std::fs::remove_file(object).unwrap();
+    objects.lock().unwrap().remove(&fixture.media.sha256);
     assert_eq!(
         prepare(&session, Some(&profile), &prompt, &MediaAging::default())
             .unwrap_err()

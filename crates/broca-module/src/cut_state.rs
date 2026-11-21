@@ -528,9 +528,6 @@ impl CutStore {
         self.reconcile_locked(cut_id, &mut state, artifacts, false)
             .await
     }
-    pub fn state_root(&self) -> &Path {
-        &self.root
-    }
 }
 
 #[cfg(test)]

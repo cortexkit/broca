@@ -153,7 +153,7 @@ async fn new_only(
                 approval: &HarnessPolicy,
                 hook_plane: Some(harness_hooks()),
                 now_ms: &now,
-                session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+                session_address: Some(broca_core::session_refs::session_addr(&bind)),
                 compaction_plane: spy
                     .as_deref()
                     .map(|spy| spy as &dyn broca_core::CompactionPlane),

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, RunError};
+use broca_core::{FileLeaseStore, OutputEvent, RunError};
 use broca_module::executor::{RunExecutor, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode};
 use broca_module::{DefaultOpener, LineageRegistry};
 use broca_module_serve::{serve_connection, ServeEnd};
@@ -193,13 +193,12 @@ impl Rig {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        broca_core::media_store::create_media_directories(&dir).unwrap();
+        broca_core::media_uploads::create_upload_directories(&dir).unwrap();
         Self::open(dir).await
     }
 
     /// A module serving the state root `dir` as it is, as a restarted module does.
     async fn open(dir: PathBuf) -> Self {
-        let _wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let executor = Arc::new(Refusing {
             error: Mutex::new(None),
             hold: Mutex::new(None),

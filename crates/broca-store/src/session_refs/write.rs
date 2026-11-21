@@ -15,7 +15,7 @@ pub(crate) fn insert(
     }
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO agent_data_session_ref(session_ref,address,project_root,harness,session) VALUES(?1,?2,?3,?4,?5)",
-        params![broca_core::wal_writer::legacy_session_ref(&session.harness, &session.project_root.to_string_lossy(), &session.session),address,session.project_root.to_string_lossy(),session.harness,session.session],
+        params![broca_core::session_refs::legacy_session_ref(&session.harness, &session.project_root.to_string_lossy(), &session.session),address,session.project_root.to_string_lossy(),session.harness,session.session],
     )?;
     insert_v2(conn, address, session)?;
     Ok(inserted)

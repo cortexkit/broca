@@ -7913,8 +7913,8 @@ mod tests {
 
     /// The served newer-writer refusal is byte for byte `broca-wire/tests/golden/
     /// wal_newer_writer.json`, and its error class is permanent (a caller must not retry it).
-    /// The message is rendered from a real `WalError::NewerWriter`, so a change to that
-    /// error's wording is caught here too.
+    /// The reason is the golden's own text: the code and detail are the contract, the message
+    /// only carries it.
     #[tokio::test]
     async fn wal_newer_writer_error_body_is_the_pinned_golden() {
         let missing = vec!["probe-unknown/v1".to_string()];
@@ -7925,11 +7925,6 @@ mod tests {
             .admission_error_class(),
             broca_protocol::error::ErrorClass::Permanent
         );
-        let wal_error = broca_wal::WalError::NewerWriter {
-            offset: 69,
-            ver: 3,
-            missing: missing.clone(),
-        };
         let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
         send_serve_error(
             &tx,
@@ -7939,7 +7934,10 @@ mod tests {
             11,
             &ServeError::WalNewerWriter {
                 missing,
-                reason: format!("wal range-read failed: {wal_error}"),
+                reason: "wal range-read failed: wal written by a newer broca (NewerWriter): the \
+                         version 3 frame at offset 69 requires features this build does not \
+                         know: probe-unknown/v1"
+                    .into(),
             },
         )
         .await

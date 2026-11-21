@@ -14,7 +14,7 @@ use broca_protocol::{
 use broca_wal::WalRecord;
 use serde::{Deserialize, Serialize};
 
-use crate::media_store::{MediaBytes, MediaReadError, MediaStoreClass, ReadOnlyMediaStore};
+use crate::media_store::{MediaBytes, MediaReadError};
 use crate::placement::{AppendKind, Placement, PlacementAction};
 use compact::{MessageCopy, RefId, References};
 
@@ -208,7 +208,6 @@ pub struct MediaIndexState {
 #[derive(Debug, Clone)]
 pub struct SessionMedia {
     store: Option<std::sync::Arc<dyn MediaBytes>>,
-    read_only: Option<(std::path::PathBuf, MediaStoreClass)>,
     placement: Placement,
     records: u64,
     boundary: u64,
@@ -389,7 +388,6 @@ impl SessionMedia {
     fn metadata(store: Option<std::sync::Arc<dyn MediaBytes>>) -> Self {
         Self {
             store,
-            read_only: None,
             placement: Placement::default(),
             records: 0,
             boundary: 0,
@@ -1289,28 +1287,11 @@ impl SessionMedia {
         {
             return Err(MediaReadError::Corrupt(reference.sha256.clone()));
         }
-        let bytes = if let Some((state_root, class)) = &self.read_only {
-            ReadOnlyMediaStore::open_existing(state_root, *class)
-                .map_err(|source| {
-                    if source.kind() == std::io::ErrorKind::NotFound {
-                        MediaReadError::StoreMissing {
-                            root: state_root.join(class.directory()),
-                            digest: reference.sha256.clone(),
-                        }
-                    } else {
-                        MediaReadError::Io {
-                            digest: reference.sha256.clone(),
-                            source,
-                        }
-                    }
-                })?
-                .read_verified(reference)?
-        } else {
-            self.store
-                .as_ref()
-                .expect("render session has a media store")
-                .read_verified(reference)?
-        };
+        let bytes = self
+            .store
+            .as_ref()
+            .expect("render session has a media store")
+            .read_verified(reference)?;
         if crate::media_validation::validate_media(&bytes, &reference.mime).as_ref()
             != Ok(reference)
         {

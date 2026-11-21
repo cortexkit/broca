@@ -44,7 +44,6 @@ pub enum WalFormat {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WalConfig {
     pub format: WalFormat,
-    pub recovery: crate::recovery::RecoveryPolicy,
 }
 
 /// A root decision made once at boot. Tokens borrow this checked root rather
@@ -52,22 +51,6 @@ pub struct WalConfig {
 pub struct StateRootDecision<'a> {
     root: &'a Path,
     config: WalConfig,
-}
-
-pub struct OwnedStateRootDecision {
-    root: std::path::PathBuf,
-    config: WalConfig,
-}
-impl OwnedStateRootDecision {
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-    pub fn borrowed(&self) -> StateRootDecision<'_> {
-        StateRootDecision {
-            root: &self.root,
-            config: self.config,
-        }
-    }
 }
 
 pub struct LegacyStateRoot<'a> {
@@ -79,15 +62,6 @@ impl LegacyStateRoot<'_> {
     }
 }
 impl<'a> StateRootDecision<'a> {
-    pub fn root(&self) -> &Path {
-        self.root
-    }
-    pub fn into_owned(self) -> OwnedStateRootDecision {
-        OwnedStateRootDecision {
-            root: self.root.to_path_buf(),
-            config: self.config,
-        }
-    }
     pub fn config(&self) -> WalConfig {
         self.config
     }
@@ -106,11 +80,9 @@ pub fn decide_state_root(root: &Path) -> Result<StateRootDecision<'_>, StateRoot
 impl WalConfig {
     pub const LEGACY: Self = Self {
         format: WalFormat::Legacy,
-        recovery: crate::recovery::RecoveryPolicy::Repair,
     };
     pub const OVERHAUL: Self = Self {
         format: WalFormat::Overhaul,
-        recovery: crate::recovery::RecoveryPolicy::Repair,
     };
 
     pub fn is_overhaul(self) -> bool {

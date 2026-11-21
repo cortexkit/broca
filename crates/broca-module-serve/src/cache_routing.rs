@@ -69,16 +69,6 @@ enum RawProviderCacheRow {
 }
 
 impl CacheTtlTable {
-    /// A table with no user rows. Resolution still falls back to shipped provider defaults
-    /// when a caller explicitly asks for cache; with no caller request the table is not
-    /// consulted at all (see `default_cache_policy`).
-    pub fn empty() -> Self {
-        Self {
-            rows: HashMap::new(),
-            session_key_providers: BTreeSet::new(),
-        }
-    }
-
     /// The shipped default provider rows.
     ///
     /// These describe what a provider supports, not what any run does. A row is consulted

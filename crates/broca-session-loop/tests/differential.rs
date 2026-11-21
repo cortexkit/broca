@@ -2866,7 +2866,7 @@ async fn new_source(
         approval: &HarnessPolicy,
         hook_plane: Some(harness_hooks_cancelling(cancel)),
         now_ms: &now,
-        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        session_address: Some(broca_core::session_refs::session_addr(&bind)),
         compaction_plane: spy
             .as_deref()
             .map(|spy| spy as &dyn broca_core::CompactionPlane),
@@ -4143,7 +4143,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         approval: &HarnessPolicy,
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
-        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        session_address: Some(broca_core::session_refs::session_addr(&bind)),
         compaction_plane: spy
             .as_deref()
             .map(|spy| spy as &dyn broca_core::CompactionPlane),
@@ -4833,7 +4833,7 @@ async fn new_with_actions(
         approval: &HarnessPolicy,
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
-        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        session_address: Some(broca_core::session_refs::session_addr(&bind)),
         compaction_plane: None,
         compaction_session: None,
         compaction_changes: false,
@@ -5403,7 +5403,7 @@ async fn compare_auth_pause_in_once(
         approval: &HarnessPolicy,
         hook_plane: Some(harness_hooks()),
         now_ms: &now,
-        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        session_address: Some(broca_core::session_refs::session_addr(&bind)),
         compaction_plane: None,
         compaction_session: None,
         compaction_changes: false,
@@ -9748,7 +9748,7 @@ async fn enroll_run_with(
         approval: &HarnessPolicy,
         hook_plane: None,
         now_ms: &now,
-        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        session_address: Some(broca_core::session_refs::session_addr(&bind)),
         compaction_plane: Some(plane),
         compaction_session: None,
         compaction_changes: false,
@@ -9810,7 +9810,7 @@ async fn enroll_resume_with(
         approval: &HarnessPolicy,
         hook_plane: None,
         now_ms: &now,
-        session_address: Some(broca_core::wal_writer::session_addr(&bind)),
+        session_address: Some(broca_core::session_refs::session_addr(&bind)),
         compaction_plane: Some(plane),
         compaction_session: None,
         compaction_changes: false,

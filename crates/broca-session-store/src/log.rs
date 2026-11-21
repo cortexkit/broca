@@ -498,11 +498,6 @@ impl<F: LogFile> LogWriter<F> {
         self.encoder.offset()
     }
 
-    /// The seq the next record will take.
-    pub fn next_seq(&self) -> u64 {
-        self.encoder.next_seq()
-    }
-
     pub fn into_file(self) -> F {
         self.file
     }

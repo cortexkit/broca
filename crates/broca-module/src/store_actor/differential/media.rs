@@ -182,7 +182,7 @@ async fn registry_gated(
     gate: Option<Arc<tokio::sync::Notify>>,
     cipher: Cipher,
 ) -> LineageRegistry {
-    broca_core::media_store::create_media_directories(dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(dir).unwrap();
     // The runs freeze the media profile of a model that takes images.
     let mut store_executor = crate::store_actor::tests::executor(steps, gate);
     store_executor.provider.render_config = Some(image_render_config());

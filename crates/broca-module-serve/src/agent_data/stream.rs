@@ -2,8 +2,9 @@ use super::*;
 use broca_session_store::session::moves;
 use sha2::{Digest as _, Sha256};
 
-// The existing 1 GiB read budget applies to the newest whole export, not to older snapshots.
-pub(super) const MOVE_IMPORT_BUDGET: u64 = broca_wal::DEFAULT_MAX_READ_BYTES;
+// The most an incoming move reads of the newest whole export, 1 GiB; older snapshots are not
+// counted against it.
+pub(super) const MOVE_IMPORT_BUDGET: u64 = 1024 * 1024 * 1024;
 
 impl Driver {
     pub(super) async fn incoming_store(

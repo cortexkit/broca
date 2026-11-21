@@ -43,7 +43,7 @@ use broca_protocol::{
 };
 use broca_wal::{
     DeferredDecision, DispatchOutcome, FramedRecord, LateDecision, LateExecution, NoDispatchReason,
-    PauseReason, RunConfig, WalByteAnchor, WalLineageId, WalRecord, WithdrawElicitation,
+    PauseReason, RunConfig, WalLineageId, WalRecord, WithdrawElicitation,
 };
 /// WAL-derived identity of the run that produced one transcript message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -122,7 +122,7 @@ pub struct ReplayState {
     /// Timed recovery evidence from the current pause, never inferred from an error code.
     pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
     /// Session-scoped recovery tombstones survive episode boundaries.
-    pub recovered_calls: Vec<broca_wal::recovery::RecoveryRun>,
+    pub recovered_calls: Vec<broca_records::recovery::RecoveryRun>,
     /// Next absolute transcript ordinal, including messages not held in the prompt.
     pub extent: u64,
     /// Retained read-side field from the v1 provider-owned numbering protocol.
@@ -437,7 +437,7 @@ pub struct DeferredCallProjection {
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub recovery_call_keys: std::collections::BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recovery_identities: Vec<broca_wal::recovery::RecoveryRun>,
+    pub recovery_identities: Vec<broca_records::recovery::RecoveryRun>,
     /// Latest generation in the folded WAL prefix. Each projected deferred call
     /// retains the generation that preceded its Prepared frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -465,14 +465,14 @@ pub struct ProjectedDeferredCall {
 fn deferred_effect_identity(
     lineage: &str,
     call: &ProjectedDeferredCall,
-) -> Option<broca_wal::recovery::RecoveryCall> {
+) -> Option<broca_records::recovery::RecoveryCall> {
     let WalRecord::ToolCallDeferred {
         call_id, batch_id, ..
     } = call.prepared.as_ref()
     else {
         return None;
     };
-    let key = broca_wal::recovery::physical_call_key(
+    let key = physical_call_key(
         lineage,
         call.prepared_seq,
         call.recovery_generation.as_deref(),
@@ -482,7 +482,7 @@ fn deferred_effect_identity(
     } else {
         batch_id.clone()
     };
-    Some(broca_wal::recovery::RecoveryCall {
+    Some(broca_records::recovery::RecoveryCall {
         tool_call_id: call_id.clone(),
         batch_id: Some(batch),
         step_id: None,
@@ -529,7 +529,7 @@ impl DeferredCallProjection {
                     }
                 }
                 WalRecord::ToolCallDeferred { .. } => {
-                    let key = broca_wal::recovery::physical_call_key(
+                    let key = physical_call_key(
                         &self.lineage_id,
                         frame.seq,
                         self.recovery_generation.as_deref(),
@@ -664,7 +664,7 @@ impl DeferredCallProjection {
                     step_id,
                     ..
                 } => {
-                    let mut terminal = broca_wal::recovery::RecoveryCall {
+                    let mut terminal = broca_records::recovery::RecoveryCall {
                         tool_call_id: tool_call_id.clone(),
                         batch_id: batch_id.clone(),
                         step_id: *step_id,
@@ -685,7 +685,7 @@ impl DeferredCallProjection {
                         .insert((run_id.0.clone(), tool_call_id.0.clone()));
                     self.recovery_call_keys.extend(call_key.iter().cloned());
                     self.recovery_identities
-                        .push(broca_wal::recovery::RecoveryRun {
+                        .push(broca_records::recovery::RecoveryRun {
                             run_id: run_id.clone(),
                             calls: vec![terminal.clone()],
                         });
@@ -765,7 +765,7 @@ impl DeferredCallProjection {
     pub(crate) fn effect_identity(
         &self,
         call: &ProjectedDeferredCall,
-    ) -> Option<broca_wal::recovery::RecoveryCall> {
+    ) -> Option<broca_records::recovery::RecoveryCall> {
         deferred_effect_identity(&self.lineage_id, call)
     }
 
@@ -1233,7 +1233,6 @@ pub struct ProjectionSeed {
     /// `None` while they are absent or superseded, which is when a projection refills them.
     pub projection_episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
     pub watermark_seq: u64,
-    pub anchor: Option<WalByteAnchor>,
     pub prefix_len: u64,
     pub completed_steps: u64,
     pub usage: Usage,
@@ -1460,7 +1459,7 @@ fn replay_seeded_with_compaction<'a>(
         refused_steps: refusal.refused_steps,
         ..Episode::default()
     };
-    let mut recovered_calls: Vec<broca_wal::recovery::RecoveryRun> = Vec::new();
+    let mut recovered_calls: Vec<broca_records::recovery::RecoveryRun> = Vec::new();
     let mut episode_step_spans: Vec<std::ops::Range<usize>> = Vec::new();
     let mut render_episodes = Vec::new();
     let mut committed_tool_turns: Vec<(usize, usize)> = Vec::new();
@@ -1828,9 +1827,9 @@ fn replay_seeded_with_compaction<'a>(
                 tool_call_id,
                 ..
             } => {
-                recovered_calls.push(broca_wal::recovery::RecoveryRun {
+                recovered_calls.push(broca_records::recovery::RecoveryRun {
                     run_id: owner.clone(),
-                    calls: vec![broca_wal::recovery::RecoveryCall {
+                    calls: vec![broca_records::recovery::RecoveryCall {
                         tool_call_id: tool_call_id.clone(),
                         step_id: *step_id,
                         batch_id: batch_id.clone(),
@@ -3371,6 +3370,15 @@ fn commit_tool_turn(
         tags: Default::default(),
     });
     crate::tags::attach_parts(prompt.last_mut().expect("just pushed"), batch.result_tags());
+}
+
+/// The key a recovered call is filed under: its log's lineage, the generation when the log was
+/// rewritten, and the call's record number.
+fn physical_call_key(lineage: &str, seq: u64, generation: Option<&str>) -> String {
+    match generation {
+        Some(generation) => format!("{lineage}~{generation}:{seq}"),
+        None => format!("{lineage}:{seq}"),
+    }
 }
 
 #[cfg(test)]

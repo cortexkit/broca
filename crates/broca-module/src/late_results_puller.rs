@@ -323,10 +323,6 @@ impl LateResultsIntake {
         self.rebuilding.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub fn store(&self) -> &Arc<LateResultsStore> {
-        &self.store
-    }
-
     /// The custodian string the provider stamps on entries served to this process.
     pub fn custodian(&self) -> String {
         format!("reserved:{}", self.consumer_module)

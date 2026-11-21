@@ -789,7 +789,7 @@ fn projection_repair_observes_other_process_writers() {
 fn session_ref_v2_startup_rekey_is_idempotent_and_keeps_v1() {
     let store = SqliteStore::open_in_memory().unwrap();
     let session = BindIdentity::new("/synthetic/project", "runner", "ref-migration");
-    let v1 = broca_core::wal_writer::legacy_session_ref(
+    let v1 = broca_core::session_refs::legacy_session_ref(
         &session.harness,
         &session.project_root.to_string_lossy(),
         &session.session,
@@ -827,7 +827,7 @@ fn session_ref_v2_rekey_runs_only_after_a_change() {
     let conn = store.conn.lock().unwrap();
     let add = |name: &str| {
         let session = BindIdentity::new("/synthetic/project", "runner", name);
-        let v1 = broca_core::wal_writer::legacy_session_ref(
+        let v1 = broca_core::session_refs::legacy_session_ref(
             &session.harness,
             &session.project_root.to_string_lossy(),
             &session.session,
@@ -881,7 +881,7 @@ fn session_ref_v2_ambiguous_roots_refuse_but_v1_stays_exact() {
         store
             .record_session(&session_addr(session), session)
             .unwrap();
-        let v1 = broca_core::wal_writer::legacy_session_ref(
+        let v1 = broca_core::session_refs::legacy_session_ref(
             &session.harness,
             &session.project_root.to_string_lossy(),
             &session.session,

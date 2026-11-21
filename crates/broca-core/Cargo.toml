@@ -16,6 +16,7 @@ base64 = "=0.22.1"
 broca-owner-only.workspace = true
 broca-diagnostics = { path = "../broca-diagnostics" }
 broca-protocol = { path = "../broca-protocol" }
+broca-records = { path = "../broca-records" }
 broca-wal = { path = "../broca-wal" }
 cortexkit-role-compaction-provider = { workspace = true }
 cortexkit-role-compaction.workspace = true

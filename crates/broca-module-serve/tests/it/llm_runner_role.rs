@@ -2907,7 +2907,7 @@ fn upload_staging_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, V
 #[tokio::test]
 async fn upload_staging_is_declared_but_invalid_pdf_is_not_admitted() {
     let mut rig = Rig::start("upload-roundtrip").await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     let begin = serde_json::json!({"mime":"application/pdf","bytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"});
     let missing = call(&mut rig, "session.upload_begin", begin.clone()).await;
     assert_eq!(refusal(&missing)["code"], "unknown_session");
@@ -2970,7 +2970,7 @@ async fn upload_staging_is_declared_but_invalid_pdf_is_not_admitted() {
 #[tokio::test]
 async fn upload_requires_send_standing_before_any_staging_write() {
     let mut rig = Rig::start("upload-standing").await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     rig.bind_as(
         7,
         Some(subc_protocol::Principal::Reserved {
@@ -3021,7 +3021,7 @@ async fn upload_requires_send_standing_before_any_staging_write() {
 async fn upload_raw_chunk_cap_is_enforced_on_real_serve_path() {
     use base64::Engine;
     let mut rig = Rig::start("upload-cap").await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     rig.script.push(&[Step::Text("ready")]);
     rig.send("turn-1", "hi", None).await;
     rig.wait_for_finished(1).await;
@@ -3080,7 +3080,7 @@ async fn upload_plan_named_sender_has_standing_on_the_frozen_session() {
         }
     }
     let mut rig = Rig::start("upload-plan-sender").await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     rig.registry()
         .set_plan_admitter(std::sync::Arc::new(SenderPlanAdmitter));
     rig.bind_as(
@@ -3126,7 +3126,7 @@ async fn upload_plan_named_sender_has_standing_on_the_frozen_session() {
 async fn debug_pdf_send_is_refused_before_any_session_write() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::start("debug-pdf-send-gate").await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     let uploads = broca_core::media_uploads::Uploads::at(&rig.dir);
     let bytes = b"%PDF-1.7\n%%EOF\n";
     let now = broca_module::person_media::now_seconds();
@@ -3165,16 +3165,6 @@ async fn debug_pdf_send_is_refused_before_any_session_write() {
         "a refused send must not create a session"
     );
     assert_eq!(upload_staging_snapshot(&rig.dir), before);
-    for class in ["media", "media-durable", "media-ephemeral"] {
-        for dir in ["objects", "refs"] {
-            assert_eq!(
-                std::fs::read_dir(rig.dir.join(class).join(dir))
-                    .unwrap()
-                    .count(),
-                0
-            );
-        }
-    }
     let describe = call(&mut rig, "role.describe", serde_json::json!({})).await;
     let checked = cortexkit_role_llm_runner::describe::check_describe(&result(&describe)).unwrap();
     assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ATTACHMENTS));

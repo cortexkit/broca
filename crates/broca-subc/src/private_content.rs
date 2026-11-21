@@ -73,11 +73,6 @@ impl PrivateContent {
     pub fn unmarked() -> Self {
         Self::default()
     }
-
-    /// Whether both answers name the same kinds, in the same order, with the same mark.
-    pub fn same_as(&self, other: &Self) -> bool {
-        self.marked == other.marked && self.sources == other.sources
-    }
 }
 
 /// Why the question could not be answered. Every variant means the caller must treat the scope

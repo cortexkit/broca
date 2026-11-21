@@ -7,7 +7,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use broca_core::wal_writer::agent_session_ref;
+use broca_core::session_refs::agent_session_ref;
 use broca_protocol::{
     run_events::{EncodeError, RunEvent, RunEventDetail},
     send_states::SendStateNotice,
@@ -1180,7 +1180,7 @@ mod tests {
             &[start(), finish(2, RunFinishReason::Completed)],
             2000,
         );
-        let old = broca_core::wal_writer::legacy_session_ref("runner", "/synthetic/old", "s1");
+        let old = broca_core::session_refs::legacy_session_ref("runner", "/synthetic/old", "s1");
         let event = store.pending_bus_event().unwrap().unwrap();
         let mut body: serde_json::Value = serde_json::from_slice(&event.body).unwrap();
         body["session_ref"] = old.clone().into();

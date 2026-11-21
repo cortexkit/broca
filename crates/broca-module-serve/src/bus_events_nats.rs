@@ -1250,7 +1250,7 @@ mod tests {
         use broca_protocol::run_events::{RunEvent, RunEventDetail};
         let event = |seq: u64, detail: RunEventDetail| RunEvent {
             v: 1,
-            session_ref: broca_core::wal_writer::agent_session_ref(session),
+            session_ref: broca_core::session_refs::agent_session_ref(session),
             run_id: run_id.into(),
             seq,
             at_ms: now_ms(),

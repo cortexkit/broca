@@ -814,42 +814,6 @@ pub fn legacy_delivery(delivery: Option<&SendDelivery>) -> broca_protocol::Deliv
     delivery.and_then(SendDelivery::mode).unwrap_or_default()
 }
 
-/// The `delivery_order` group as a send uses it, or `None` for a send that uses none of it (which
-/// then behaves exactly as before the group existed). `dedupe_key` and `expires_at_ms` are valid
-/// only when `delivery` is an ordered list: with a legacy string or no `delivery` they are
-/// refused, so a runner that would ignore them never sees them as part of an ordinary send.
-/// Refusals name the field.
-pub fn delivery_order(
-    delivery: Option<&SendDelivery>,
-    dedupe_key: Option<&str>,
-    expires_at_ms: Option<u64>,
-) -> Result<Option<broca_protocol::DeliveryOrder>, (&'static str, String)> {
-    use cortexkit_role_llm_runner::delivery_order::{
-        DeliveryOrder, DEDUPE_KEY_FIELD, EXPIRES_AT_FIELD,
-    };
-    let modes = match delivery {
-        Some(SendDelivery::Order(modes)) => Some(modes.as_slice()),
-        _ => None,
-    };
-    let mut members = serde_json::Map::new();
-    if let Some(key) = dedupe_key {
-        members.insert(DEDUPE_KEY_FIELD.into(), key.into());
-    }
-    if let Some(at) = expires_at_ms {
-        members.insert(EXPIRES_AT_FIELD.into(), at.into());
-    }
-    DeliveryOrder::decode(modes, &members)
-        .map(|order| {
-            order.map(|order| broca_protocol::DeliveryOrder {
-                modes: order.modes,
-                dedupe_key: order.dedupe_key,
-                expires_at_ms: order.expires_at_ms,
-                template: order.template,
-            })
-        })
-        .map_err(|field| (field, format!("invalid ordered delivery member {field}")))
-}
-
 /// Use the role's string-or-array decoder; its wire enum is private, so retain a local
 /// carrier only for broca's optional-send-id request shape.
 fn deserialize_delivery<'de, D>(deserializer: D) -> Result<Option<SendDelivery>, D::Error>

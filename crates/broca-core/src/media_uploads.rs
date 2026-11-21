@@ -97,6 +97,30 @@ struct Metadata {
     gone: bool,
 }
 
+/// Creates the upload tree before the backup catalog is published, because the catalog names
+/// it and engram refuses a capture whose declared path is missing. The parent folders are
+/// synced to disk on every start, not only when created: an existing folder may be left from
+/// a create that crashed before its sync.
+pub fn create_upload_directories(state_root: &Path) -> io::Result<()> {
+    for child in ["objects", "refs"] {
+        let path = state_root.join("media-uploads").join(child);
+        broca_wal::migration::durable_dir(state_root, &path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("create media directory {}: {error}", path.display()),
+            )
+        })?;
+    }
+    let lock = broca_owner_only::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(state_root.join("media-uploads/uploads.lock"))?;
+    lock.sync_all()?;
+    broca_wal::migration::sync_dir(&state_root.join("media-uploads"))?;
+    Ok(())
+}
+
 pub struct Uploads {
     root: PathBuf,
 }
@@ -111,41 +135,6 @@ impl Uploads {
         now: u64,
     ) -> Result<wire::UploadAppendReply, UploadError> {
         self.append_inner(identity, id, offset, bytes, now, true)
-    }
-
-    /// Publication chooses the store alongside the already selected WAL durability class.
-    pub fn media_store(
-        &self,
-        class: crate::media_store::MediaStoreClass,
-    ) -> io::Result<crate::media_store::MediaStore> {
-        crate::media_store::MediaStore::open(
-            self.root.parent().expect("uploads have a state root"),
-            class,
-        )
-    }
-
-    pub fn session_media_store(
-        &self,
-        identity: &BindIdentity,
-    ) -> io::Result<crate::media_store::MediaStore> {
-        let state = self.root.parent().expect("uploads have a state root");
-        let wal = crate::FileWalStore::new(state.join("wal"));
-        let address = crate::wal_writer::session_addr(identity);
-        // The new session storage keeps its own media; today's stores hold nothing new for a
-        // session it owns, or that a move is taking there.
-        if wal
-            .address_owned_by_store(&address)
-            .map_err(io::Error::other)?
-        {
-            return Err(io::Error::other(
-                "session is owned by the new session storage, which keeps its media",
-            ));
-        }
-        let class = wal
-            .media_store_class(&address)
-            .map_err(io::Error::other)?
-            .ok_or_else(|| io::Error::other("session WAL has no media store class"))?;
-        self.media_store(class)
     }
 
     /// Read a committed upload without changing staging, stores or WALs. Ownership,

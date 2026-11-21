@@ -812,11 +812,10 @@ async fn an_imported_image_is_a_persons_at_its_place_and_renders_with_its_bytes(
 /// that starts every new session there stays off, as in production.
 #[tokio::test]
 async fn the_registry_creates_an_imported_session_in_the_new_storage() {
-    use broca_core::{FileLeaseStore, FileWalStore, WalStore};
+    use broca_core::FileLeaseStore;
     const IDLE: std::time::Duration = std::time::Duration::from_millis(100);
     let source = Source::new("registry");
     let dir = source.dir.join("state");
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn crate::executor::RunExecutor> = Arc::new(executor(Vec::new(), None));
     let runtime =
         crate::store_open::StoreRuntime::open(&dir, deployment(), Arc::clone(&executor), IDLE)
@@ -844,7 +843,6 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
     );
     assert_eq!(reply.imported_messages, 4);
     assert!(runtime.holds(&key).unwrap());
-    assert_eq!(wal.wal_present(&key), Some(false));
     let retry = imported(
         registry
             .route_store_command(&key, source.import(source.params("imp-1")))
@@ -870,13 +868,12 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
 #[tokio::test]
 async fn an_import_meets_the_scope_reservation_of_the_session_it_creates() {
     use broca_core::scope_admission::OwnerMismatch;
-    use broca_core::{FileLeaseStore, FileWalStore, ScopeRefusal, WalStore};
+    use broca_core::{FileLeaseStore, ScopeRefusal};
     use broca_store::session_address::ScopeReservation;
     const IDLE: std::time::Duration = std::time::Duration::from_millis(100);
     let source = Source::new("reserved");
     let dir = source.dir.join("state");
     std::fs::create_dir_all(&dir).unwrap();
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let executor: Arc<dyn crate::executor::RunExecutor> = Arc::new(executor(Vec::new(), None));
     let runtime = Arc::new(
         crate::store_open::StoreRuntime::open(&dir, deployment(), Arc::clone(&executor), IDLE)
@@ -940,7 +937,6 @@ async fn an_import_meets_the_scope_reservation_of_the_session_it_creates() {
         !runtime.holds(&theirs).unwrap(),
         "the session created to admit the refused import is gone"
     );
-    assert_eq!(wal.wal_present(&theirs), Some(false));
 
     match registry
         .route_store_command(&damaged, source.import(source.params("imp-1")))

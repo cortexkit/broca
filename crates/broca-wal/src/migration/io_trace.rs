@@ -47,6 +47,8 @@ impl Drop for Guard {
         HOOK.with(|hook| *hook.borrow_mut() = None);
     }
 }
+/// Install `hook` to see (and fail) this thread's storage events until the guard drops. For
+/// tests that prove each sync happens and that a failed one stops the operation.
 pub fn install(hook: impl FnMut(Event) -> io::Result<()> + 'static) -> Guard {
     HOOK.with(|slot| {
         assert!(slot.borrow().is_none());

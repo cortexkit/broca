@@ -27,7 +27,7 @@ pub fn matches_session_ref(
     session: &str,
 ) -> bool {
     reference == session_ref(harness, project_root, session)
-        || reference == broca_core::wal_writer::legacy_session_ref(harness, project_root, session)
+        || reference == broca_core::session_refs::legacy_session_ref(harness, project_root, session)
 }
 
 /// The kind entorhinal uses to route a registered broca session to this participant.

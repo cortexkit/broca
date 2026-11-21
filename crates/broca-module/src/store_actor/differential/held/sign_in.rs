@@ -310,7 +310,7 @@ async fn a_restart_resume_pauses_for_sign_in() {
 
 async fn record_meaning(side: &Side) -> Vec<Value> {
     let mut meaning = Vec::new();
-    if side.store {
+    {
         use broca_session_store::record::Record;
         let view = side
             .registry
@@ -329,27 +329,6 @@ async fn record_meaning(side: &Side) -> Vec<Value> {
                 Record::BatchEnd(_) => json!({"batch_end":true}),
                 Record::RunEnd(end) => json!({"end":end.reason, "error":end.error}),
                 Record::AuthRefrozen(_) => panic!("sign-in must not change the frozen account"),
-                _ => continue,
-            };
-            meaning.push(item);
-        }
-    } else {
-        use broca_wal::WalRecord;
-        for frame in side.executor.wal.read_records(&side.key).unwrap() {
-            let item = match frame.record {
-                WalRecord::RunStarted { run_id, .. } => json!({"start":run_id}),
-                WalRecord::RunPaused { reason, error, .. } => {
-                    json!({"pause":reason, "error":error})
-                }
-                WalRecord::ResumeStarted { episode, .. } => json!({"resume":episode}),
-                WalRecord::ToolResult { result, .. } => json!({"result":result}),
-                WalRecord::ToolBatchFinished { .. } => json!({"batch_end":true}),
-                WalRecord::RunFinished { reason, error, .. } => {
-                    json!({"end":reason, "error":error})
-                }
-                WalRecord::RunAuthRefrozen { .. } => {
-                    panic!("sign-in must not change the frozen account")
-                }
                 _ => continue,
             };
             meaning.push(item);

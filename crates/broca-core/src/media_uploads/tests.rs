@@ -15,7 +15,7 @@ fn fixture() -> (PathBuf, Uploads) {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     broca_owner_only::create_dir_all(&root).unwrap();
-    crate::media_store::create_media_directories(&root).unwrap();
+    crate::media_uploads::create_upload_directories(&root).unwrap();
     let uploads = Uploads::at(&root);
     (root, uploads)
 }
@@ -123,30 +123,6 @@ fn begin_reserves_session_bytes_and_count_before_creating_files() {
         "upload_session_full"
     );
     assert_eq!(snapshot(&root), before);
-}
-
-/// A session the new session storage holds keeps its media there: today's media-class lookup
-/// refuses it instead of choosing one of today's stores for it.
-#[test]
-fn session_media_store_refuses_a_session_the_new_storage_holds() {
-    let (root, uploads) = fixture();
-    let wal = crate::FileWalStore::new(root.join("wal"));
-    drop(crate::WalStore::open(&wal, &identity()).unwrap());
-    // On today's storage the session's media store is its WAL's class.
-    assert!(uploads.session_media_store(&identity()).is_ok());
-    // The head is in the ephemeral root: every root of the new storage claims its session.
-    let head = broca_wal::session_storage_head(
-        &root,
-        broca_wal::StorageClass::Ephemeral,
-        &crate::session_addr(&identity()),
-    );
-    fs::create_dir_all(head.parent().unwrap()).unwrap();
-    fs::write(&head, b"head").unwrap();
-    let refused = uploads.session_media_store(&identity()).unwrap_err();
-    assert!(
-        refused.to_string().contains("new session storage"),
-        "{refused}"
-    );
 }
 
 #[test]

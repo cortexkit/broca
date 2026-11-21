@@ -3,18 +3,6 @@
   "module_id": "broca",
   "entries": [
     {
-      "entry_id": "broca/durable-wals",
-      "class": "portable",
-      "mechanism": "filetree",
-      "path": "wal-durable"
-    },
-    {
-      "entry_id": "broca/durable-archive",
-      "class": "portable",
-      "mechanism": "filetree",
-      "path": "wal-archive-durable"
-    },
-    {
       "entry_id": "broca/session-store-durable",
       "class": "portable",
       "mechanism": "filetree",
@@ -25,75 +13,20 @@
       "class": "excluded",
       "mechanism": "filetree",
       "path": "session-store",
-      "reason": "non-durable sessions in the new session storage (sidekicks, one-shots, consults, masons, other modules); only sessions marked durable are backed up, in session-store-durable, and none live in this tree"
+      "reason": "non-durable sessions in the session store (sidekicks, one-shots, consults, masons, other modules); only sessions marked durable are backed up, in session-store-durable, and none live in this tree"
     },
     {
       "entry_id": "broca/session-store-ephemeral",
       "class": "excluded",
       "mechanism": "filetree",
       "path": "session-store-ephemeral",
-      "reason": "sessions in the new session storage with caller-chosen retention; an immutable backup snapshot would outlive that promise"
+      "reason": "sessions in the session store with caller-chosen retention; an immutable backup snapshot would outlive that promise"
     },
     {
       "entry_id": "broca/session-store-moves",
       "class": "device-local",
       "mechanism": "filetree",
       "path": "session-store-moves"
-    },
-    {
-      "entry_id": "broca/conversion-ledger",
-      "class": "device-local",
-      "mechanism": "whole-db",
-      "path": "conversion-ledger.db",
-      "reason": "cutover-only recovery bookkeeping, removed with legacy storage; paths refer to this device's converted-source backups"
-    },
-    {
-      "entry_id": "broca/conversion-staging",
-      "class": "device-local",
-      "mechanism": "filetree",
-      "path": "conversion-staging",
-      "reason": "cutover-only staged sessions, removed with legacy storage; may hold ordinary or retained sessions that must not enter portable backups"
-    },
-    {
-            "entry_id": "broca/session-wals",
-            "class": "excluded",
-            "mechanism": "filetree",
-            "path": "wal",
-            "reason": "non-durable sessions (sidekicks, one-shots, consults, masons, other modules); only sessions marked durable are backed up, and none live in this tree"
-    },
-    {
-            "entry_id": "broca/session-archive",
-            "class": "excluded",
-            "mechanism": "filetree",
-            "path": "wal-archive",
-            "reason": "folded non-durable sessions from wal/; only sessions marked durable are backed up, and none live in this tree"
-    },
-    {
-      "entry_id": "broca/ephemeral-wals",
-      "class": "excluded",
-      "mechanism": "filetree",
-      "path": "wal-ephemeral",
-      "reason": "sessions with caller-chosen retention; an immutable backup snapshot would outlive that promise"
-    },
-    {
-      "entry_id": "broca/durable-media",
-      "class": "portable",
-      "mechanism": "filetree",
-      "path": "media-durable"
-    },
-    {
-      "entry_id": "broca/session-media",
-      "class": "excluded",
-      "mechanism": "filetree",
-      "path": "media",
-      "reason": "non-durable sessions (sidekicks, one-shots, consults, masons, other modules); only sessions marked durable are backed up, and none live in this tree"
-    },
-    {
-      "entry_id": "broca/ephemeral-media",
-      "class": "excluded",
-      "mechanism": "filetree",
-      "path": "media-ephemeral",
-      "reason": "sessions with caller-chosen retention; an immutable backup snapshot would outlive that promise"
     },
     {
       "entry_id": "broca/media-uploads",

@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use broca_core::{FileLeaseStore, FileWalStore, OutputEvent, WalStore as _};
+use broca_core::{FileLeaseStore, OutputEvent};
 use broca_protocol::{BindIdentity, RunId};
 use broca_session_store::keys::Cipher;
 use broca_session_store::record::Record;
@@ -144,8 +144,7 @@ impl RunExecutor for Loops {
 struct Side {
     dir: std::path::PathBuf,
     registry: LineageRegistry,
-    runtime: Option<Arc<crate::store_open::StoreRuntime>>,
-    wal: Arc<FileWalStore>,
+    runtime: Arc<crate::store_open::StoreRuntime>,
     key: BindIdentity,
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
     /// Signalled when the tool call is dispatched, and what releases it.
@@ -158,17 +157,12 @@ impl Drop for Side {
     }
 }
 
-/// A module whose sessions start in the new storage when `store`; the new storage creates
-/// sessions in mode `cipher`.
-async fn side(store: bool, cipher: Cipher) -> Side {
-    side_events(store, cipher, None).await
+/// A module whose sessions the store creates in mode `cipher`.
+async fn side(cipher: Cipher) -> Side {
+    side_events(cipher, None).await
 }
 
-async fn side_events(
-    store: bool,
-    cipher: Cipher,
-    events: Option<Arc<crate::step_events::StepEvents>>,
-) -> Side {
+async fn side_events(cipher: Cipher, events: Option<Arc<crate::step_events::StepEvents>>) -> Side {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -189,11 +183,6 @@ async fn side_events(
         tool_gate: Some(tool.clone()),
         ..Default::default()
     };
-    let wal = Arc::new(if events.is_some() {
-        FileWalStore::with_config(dir.join("wal"), broca_wal::WalConfig::OVERHAUL)
-    } else {
-        FileWalStore::new(dir.join("wal"))
-    });
     let mut store_loop = super::executor(steps(), None);
     store_loop.provider.render_config = render_config;
     store_loop.provider.notes_sends = true;
@@ -228,8 +217,7 @@ async fn side_events(
         key: BindIdentity::new(dir.join("project"), "store-actor", "s1"),
         dir,
         registry,
-        runtime: store.then_some(runtime),
-        wal,
+        runtime,
         sent,
         tool,
     }
@@ -301,64 +289,31 @@ impl Side {
 
     /// The warms the session recorded.
     async fn warms(&self) -> Vec<Warm> {
-        match &self.runtime {
-            None => self
-                .wal
-                .read_records(&self.key)
-                .unwrap()
-                .into_iter()
-                .filter_map(|frame| match frame.record {
-                    broca_wal::WalRecord::CacheWarmed {
-                        trigger,
-                        run_id,
-                        step_id,
-                        request_body_sha256,
-                        warm_body_sha256,
-                        usage,
-                        sent_at_ms,
-                        ttl_ms,
-                        expires_at_ms,
-                        ..
-                    } => Some((
-                        trigger,
-                        run_id.0,
-                        step_id.0,
-                        request_body_sha256,
-                        warm_body_sha256,
-                        usage,
-                        ttl_ms,
-                        expires_at_ms.map(|expires| expires - sent_at_ms),
-                    )),
-                    _ => None,
-                })
-                .collect(),
-            Some(runtime) => {
-                let view = runtime.current_view(&self.key).await.unwrap().unwrap();
-                view.open_log_records()
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .filter_map(|(_, record)| match record {
-                        Record::Warmed(warmed) => {
-                            assert_eq!(warmed.reached_cache, Some(true));
-                            Some((
-                                warmed.trigger,
-                                warmed.run_id,
-                                warmed.step_id,
-                                hex(&warmed.request_body_sha256),
-                                hex(&warmed.warm_body_sha256),
-                                warmed.usage,
-                                warmed.ttl_ms,
-                                warmed
-                                    .expires_at_ms
-                                    .map(|expires| expires - warmed.sent_at_ms),
-                            ))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            }
-        }
+        let runtime = &self.runtime;
+        let view = runtime.current_view(&self.key).await.unwrap().unwrap();
+        view.open_log_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, record)| match record {
+                Record::Warmed(warmed) => {
+                    assert_eq!(warmed.reached_cache, Some(true));
+                    Some((
+                        warmed.trigger,
+                        warmed.run_id,
+                        warmed.step_id,
+                        hex(&warmed.request_body_sha256),
+                        hex(&warmed.warm_body_sha256),
+                        warmed.usage,
+                        warmed.ttl_ms,
+                        warmed
+                            .expires_at_ms
+                            .map(|expires| expires - warmed.sent_at_ms),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -367,7 +322,7 @@ impl Side {
 /// the request's digest, the warm's usage and the policy's lifetime counted from the warm's own
 /// send. The run then goes on to its end.
 async fn a_keep_warm_resends_the_last_request_and_records_it_alike(cipher: Cipher) {
-    let store = side(true, cipher).await;
+    let store = side(cipher).await;
     store.keep_warm_once().await;
     broca_test_support::pin!("the same bytes warmed", *store.sent.lock().unwrap());
     let warms = store.warms().await;
@@ -390,7 +345,7 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
             StepEvents::start("fixture", "broca", Arc::new(Capture { calls, fail: false }))
                 .unwrap(),
         );
-        let side = side_events(new_storage, cipher, Some(events)).await;
+        let side = side_events(cipher, Some(events)).await;
         side.keep_warm_once().await;
         assert!(side.registry.stop_and_seal().await);
         let (subject, body) =
@@ -421,7 +376,8 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
             event.request_body_bytes,
             Some(side.sent.lock().unwrap()[0].len() as u64)
         );
-        if let Some(runtime) = &side.runtime {
+        {
+            let runtime = &side.runtime;
             let view = runtime.current_view(&side.key).await.unwrap().unwrap();
             let warms: Vec<_> = view
                 .open_log_records()
@@ -450,8 +406,6 @@ async fn keep_warm_step_events_match(cipher: Cipher) {
                 .map(|b| format!("{b:02x}"))
                 .collect();
             assert_eq!(event.log_incarnation, incarnation);
-        } else {
-            panic!("the module serves the new storage");
         }
         tokio::task::yield_now().await;
         assert!(inbox.try_recv().is_err(), "a warm published twice");

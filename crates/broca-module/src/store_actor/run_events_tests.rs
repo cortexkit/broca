@@ -168,7 +168,7 @@ async fn a_run_hands_its_events_once_their_records_are_durable() {
             },
         ]
     );
-    let session_ref = broca_core::wal_writer::agent_session_ref(&bind());
+    let session_ref = broca_core::session_refs::agent_session_ref(&bind());
     for event in &events {
         assert_eq!(event.run_id, "r1");
         assert_eq!(event.session_ref, session_ref);

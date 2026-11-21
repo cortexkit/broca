@@ -1,14 +1,10 @@
-//! Materialized store — `SqliteStore` (the [`MaterializedStore`] impl) + the
-//! persister that projects committed WAL turns into SQLite.
+//! broca's SQLite stores: `run-index.db` ([`SqliteStore`]: the session-ref index, scope
+//! reservations, bus outboxes and usage export facts), `system-one.db`, `grants.db` and
+//! `late-results.db`.
 //!
-//! Kept in its own crate so the bundled-SQLite native dep stays OUT of the pure
-//! loop crate (the same separation as the subc adapter). The runner is the
-//! EXCLUSIVE writer; the persister runs off the hot path.
-//!
-//! Projection is INCREMENTAL + idempotent. It snapshots the committed watermark,
-//! computes the newly complete turns without holding the shared connection mutex,
-//! then verifies the watermark and atomically writes messages plus metadata. A crash
-//! before commit changes nothing; on restart it resumes from the last committed seq.
+//! None of them holds a session's records: those live in `broca-session-store`, and anything
+//! here that is derived from them loses to them. Kept in its own crate so the bundled SQLite
+//! dependency stays out of the run loop's crates.
 #![forbid(unsafe_code)]
 
 use std::path::Path;

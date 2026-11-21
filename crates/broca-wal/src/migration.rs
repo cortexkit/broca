@@ -50,26 +50,6 @@ impl std::fmt::Display for MoveRefusal {
 }
 impl std::error::Error for MoveRefusal {}
 
-impl From<MoveRefusal> for crate::WalError {
-    fn from(value: MoveRefusal) -> Self {
-        match value {
-            MoveRefusal::Moving { cut_id } => Self::SessionMoving { cut_id },
-            MoveRefusal::Moved { holder } => Self::SessionMoved { holder },
-        }
-    }
-}
-
-pub fn guard(wal: &Path, session_ref: &str, write: bool) -> Result<(), crate::WalError> {
-    guard_refs(wal, &[session_ref], write)
-}
-
-/// [`guard`] for a session named by several references; see [`check_refs`].
-pub fn guard_refs(wal: &Path, session_refs: &[&str], write: bool) -> Result<(), crate::WalError> {
-    check_refs(wal, session_refs, write)
-        .map_err(crate::WalError::Io)?
-        .map_err(Into::into)
-}
-
 /// Makes a rename, create or unlink inside `path` durable. On unix that takes an fsync of the
 /// directory itself, and a failure must propagate.
 #[cfg(unix)]

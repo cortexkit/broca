@@ -40,52 +40,6 @@ impl LiveMedia {
         }
     }
 
-    pub fn from_checkpoint(
-        store: impl MediaBytes + 'static,
-        checkpoint: broca_core::media_request::MediaCheckpoint,
-        budget: Option<broca_protocol::request::BudgetConfig>,
-        profile: Option<MediaProfile>,
-        read_tail: Box<ReadTail>,
-    ) -> Result<Self, String> {
-        use broca_core::media_request::MediaHistory;
-        let (session, history, step_open, head) = checkpoint.into_session(store, budget);
-        let mut active = profile;
-        let mut aging = MediaAging::default();
-        for event in history {
-            match event {
-                MediaHistory::Profile { media, selected } => {
-                    let next: MediaProfile = serde_json::from_value(media)
-                        .map_err(|error| format!("invalid media seed profile: {error}"))?;
-                    if active.as_ref() != Some(&next) {
-                        aging = MediaAging::default();
-                        aging.reconcile_view(&next, &selected);
-                        active = Some(next);
-                    }
-                }
-                MediaHistory::Changes(changes) => {
-                    if let Some(profile) = &active {
-                        aging.fold_changes(profile, changes);
-                    }
-                }
-                MediaHistory::Boundary => {
-                    if let Some(profile) = &active {
-                        aging.apply(profile, AgingEvent::Boundary);
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            state: Mutex::new(State {
-                session,
-                aging,
-                profile: active,
-                head,
-                step_open,
-            }),
-            read_tail,
-        })
-    }
-
     pub fn render(
         &self,
         config: &serde_json::Value,

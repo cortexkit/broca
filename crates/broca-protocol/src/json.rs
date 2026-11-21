@@ -69,11 +69,6 @@ impl Json {
         Self(Arc::from("null"))
     }
 
-    /// An empty JSON object, `{}`.
-    pub fn empty_object() -> Self {
-        Self(Arc::from("{}"))
-    }
-
     /// The canonical text, shared: another holder of the same JSON can keep it without a copy.
     pub fn shared_text(&self) -> Arc<str> {
         Arc::clone(&self.0)
@@ -98,11 +93,6 @@ impl Json {
     /// Whether the value is a JSON array.
     pub fn is_array(&self) -> bool {
         self.0.starts_with('[')
-    }
-
-    /// Whether the value is `null`.
-    pub fn is_null(&self) -> bool {
-        &*self.0 == "null"
     }
 
     /// Bytes held for the text, for memory accounting.

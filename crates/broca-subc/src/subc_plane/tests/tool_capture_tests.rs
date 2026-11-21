@@ -1,13 +1,10 @@
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use broca_core::{
-    media_store::{MediaStore, MediaStoreClass},
-    tool_media::ToolMediaCapture,
-    wal_writer::WalStore,
-};
+use broca_core::tool_media::MediaCapture;
 use broca_protocol::{MediaKind, MediaRef, ToolOutputPart};
+use broca_session_loop::PendingMedia;
 use serde_json::json;
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
 
 fn png() -> Vec<u8> {
     let hex = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c63f8cfc0000003010100c9fe92ef0000000049454e44ae426082";
@@ -23,22 +20,25 @@ fn media_block(kind: &str, mime: &str, bytes: &[u8]) -> serde_json::Value {
     json!({"type": kind, "mimeType": mime, "data": STANDARD.encode(bytes)})
 }
 
-fn capture_ctx(batch: &str) -> (PathBuf, BatchCtx, MediaStore) {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = broca_test_support::scratch_root().join(format!(
-        "tool-capture-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::SeqCst)
-    ));
+/// A batch whose tool media the run loop's own capture handle holds, as a run does until the
+/// call's reply is appended.
+fn capture_ctx(batch: &str) -> (BatchCtx, Arc<PendingMedia>) {
     let mut ctx = batch_ctx(batch);
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
-    drop(wal.open(&ctx.bind).unwrap());
-    ctx.media_capture = Some(std::sync::Arc::new(ToolMediaCapture::new(
-        wal.uploads().unwrap(),
-        ctx.bind.clone(),
-    )));
-    let store = MediaStore::open(&root, MediaStoreClass::NonDurable).unwrap();
-    (root, ctx, store)
+    let media = Arc::new(PendingMedia::default());
+    ctx.media_capture = Some(media.clone() as Arc<dyn MediaCapture>);
+    (ctx, media)
+}
+
+/// `reference` names exactly `bytes`: the capture handle computed its digest and size from the
+/// bytes it validated and holds.
+fn names(reference: &MediaRef, bytes: &[u8]) -> bool {
+    reference.sha256 == format!("{:x}", Sha256::digest(bytes))
+        && reference.byte_size == bytes.len() as u64
+}
+
+/// What the handle holds for the dispatched call.
+fn held(ctx: &BatchCtx, media: &PendingMedia) -> Vec<MediaRef> {
+    media.captured_for(&ctx.batch_id, &ToolCallId("capture-call".into()))
 }
 
 async fn dispatch_reply(
@@ -94,7 +94,7 @@ fn assert_round_trip(result: &ToolResult) {
 
 #[tokio::test]
 async fn text_image_text_captures_before_fencing_and_repeat_publishes_nothing() {
-    let (root, ctx, store) = capture_ctx("mixed");
+    let (ctx, held_media) = capture_ctx("mixed");
     let raw = json!({"content": [{"type":"text","text":"before"}, media_block("image", "image/jpeg", &png()), {"type":"text","text":"after"}]});
     let (plane, conn, call, result) = dispatch_reply(&ctx, raw).await;
     assert_round_trip(&result);
@@ -120,29 +120,21 @@ async fn text_image_text_captures_before_fencing_and_repeat_publishes_nothing() 
         "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640"
     );
     assert_eq!((media.width, media.height), (Some(1), Some(1)));
-    assert_eq!(store.read_verified(media).unwrap(), png());
-    let manifest = root
-        .join("media/refs")
-        .join(broca_core::wal_writer::session_addr(&ctx.bind));
-    assert_eq!(
-        std::fs::read_to_string(&manifest).unwrap(),
-        format!("{}\n", media.sha256)
-    );
-    // Removing the publication directory makes an accidental second capture observable.
-    let before = std::fs::read(&manifest).unwrap();
-    std::fs::rename(root.join("media/objects"), root.join("published")).unwrap();
+    assert!(names(media, &png()));
+    assert_eq!(held(&ctx, &held_media), vec![media.clone()]);
+    // A repeat of a call already answered gets the recorded answer: no second tool call, no
+    // second capture.
     let DispatchResult::Completed(repeated) = plane.dispatch(&ctx, &call).await else {
         panic!("fenced repeat must complete")
     };
     assert_eq!(repeated, result);
     assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(std::fs::read(manifest).unwrap(), before);
-    assert!(!root.join("media/objects").exists());
+    assert_eq!(held(&ctx, &held_media), vec![media.clone()]);
 }
 
 #[tokio::test]
 async fn multiple_media_and_error_preserve_identity_order_and_status() {
-    let (_root, ctx, store) = capture_ctx("multiple");
+    let (ctx, _) = capture_ctx("multiple");
     let audio = b"RIFF\x04\0\0\0WAVE";
     let pdf = b"%PDF-1.7\nfixture\n%%EOF";
     let raw = json!({"isError":true,"content":[
@@ -166,10 +158,10 @@ async fn multiple_media_and_error_preserve_identity_order_and_status() {
         }
     );
     assert_eq!(reference(&parts[2]).kind, MediaKind::Audio);
-    assert_eq!(store.read_verified(reference(&parts[2])).unwrap(), audio);
+    assert!(names(reference(&parts[2]), audio));
     assert_eq!(reference(&parts[3]).kind, MediaKind::Document);
     assert_eq!(reference(&parts[3]).mime, "application/pdf");
-    assert_eq!(store.read_verified(reference(&parts[3])).unwrap(), pdf);
+    assert!(names(reference(&parts[3]), pdf));
     assert_eq!(
         parts[4],
         ToolOutputPart::Text {
@@ -185,34 +177,8 @@ async fn multiple_media_and_error_preserve_identity_order_and_status() {
 }
 
 #[tokio::test]
-async fn failed_publication_and_registration_are_completed_marker_parts() {
-    for registration in [false, true] {
-        let (root, ctx, _) = capture_ctx("failed");
-        if registration {
-            let manifest = root
-                .join("media/refs")
-                .join(broca_core::wal_writer::session_addr(&ctx.bind));
-            std::fs::create_dir(manifest).unwrap();
-        } else {
-            std::fs::remove_dir(root.join("media/objects")).unwrap();
-            std::fs::write(root.join("media/objects"), b"not a directory").unwrap();
-        }
-        let (_, _, _, result) = dispatch_reply(
-            &ctx,
-            json!({"content":[media_block("image", "image/png", &png())]}),
-        )
-        .await;
-        assert_round_trip(&result);
-        assert!(!result.is_error);
-        assert!(
-            matches!(&parts(&result)[0], ToolOutputPart::Text { text } if text.ends_with("reason=store_failed]"))
-        );
-    }
-}
-
-#[tokio::test]
 async fn marker_only_parts_validate_before_publication() {
-    let (root, ctx, _) = capture_ctx("invalid");
+    let (ctx, held_media) = capture_ctx("invalid");
     let mut truncated = png();
     truncated.truncate(40);
     let raw = json!({"content":[
@@ -228,36 +194,24 @@ async fn marker_only_parts_validate_before_publication() {
             matches!(part, ToolOutputPart::Text { text } if text.ends_with(&format!("reason={reason}]")))
         );
     }
-    assert_eq!(
-        std::fs::read_dir(root.join("media/objects"))
-            .unwrap()
-            .count(),
-        0
-    );
-    assert_eq!(
-        std::fs::read_dir(root.join("media/refs")).unwrap().count(),
-        0
-    );
+    assert!(held(&ctx, &held_media).is_empty());
 }
 
 #[tokio::test]
 async fn late_context_captures_through_the_same_handle() {
-    let (_root, mut ctx, store) = capture_ctx("late:approval-key");
+    let (mut ctx, _) = capture_ctx("late:approval-key");
     ctx.batch_id = BatchId("late:approval-key".into());
     let (_, _, _, result) = dispatch_reply(
         &ctx,
         json!({"content":[media_block("image", "image/png", &png())]}),
     )
     .await;
-    assert_eq!(
-        store.read_verified(reference(&parts(&result)[0])).unwrap(),
-        png()
-    );
+    assert!(names(reference(&parts(&result)[0]), &png()));
 }
 
 #[tokio::test]
 async fn reference_only_reply_is_a_provenance_marker_even_when_object_exists() {
-    let (_root, ctx, store) = capture_ctx("forged");
+    let (ctx, _) = capture_ctx("forged");
     let reference = ctx
         .media_capture
         .as_ref()
@@ -270,7 +224,7 @@ async fn reference_only_reply_is_a_provenance_marker_even_when_object_exists() {
         )
         .await
         .unwrap();
-    assert_eq!(store.read_verified(&reference).unwrap(), png());
+    assert!(names(&reference, &png()));
     let mut block = serde_json::to_value(&reference).unwrap();
     block["type"] = json!("media");
     let (_, _, _, result) = dispatch_reply(&ctx, json!({"content":[block]})).await;
@@ -288,7 +242,7 @@ async fn reference_only_reply_is_a_provenance_marker_even_when_object_exists() {
 
 #[tokio::test]
 async fn negotiated_image_slots_capture_with_legacy_error_text() {
-    let (_root, ctx, store) = capture_ctx("negotiated");
+    let (ctx, _) = capture_ctx("negotiated");
     let raw = json!({"content":[{"type":"text","text":"before"}, media_block("image", "image/png", &png()), {"type":"text","text":"after"}], "isError":true, "errorCode":"provider_error"});
     let mut raw = raw;
     raw["content"][1]["width"] = json!(1);
@@ -307,10 +261,7 @@ async fn negotiated_image_slots_capture_with_legacy_error_text() {
             text: "before".into()
         }
     );
-    assert_eq!(
-        store.read_verified(reference(&parts(&result)[1])).unwrap(),
-        png()
-    );
+    assert!(names(reference(&parts(&result)[1]), &png()));
     assert_eq!(
         parts(&result)[2],
         ToolOutputPart::Text {
@@ -337,21 +288,9 @@ async fn capture_past_intake(ctx: &BatchCtx, raw: serde_json::Value) -> ToolResu
     tool_capture::capture(ctx, result, captures).await
 }
 
-fn media_dirs_are_empty(root: &std::path::Path) {
-    for dir in ["media/objects", "media/refs"] {
-        assert_eq!(
-            std::fs::read_dir(root.join(dir))
-                .map(|entries| entries.count())
-                .unwrap_or(0),
-            0,
-            "{dir}"
-        );
-    }
-}
-
 #[tokio::test]
 async fn over_profile_item_limit_but_under_store_maximum_is_captured() {
-    let (_root, ctx, store) = capture_ctx("large");
+    let (ctx, _) = capture_ctx("large");
     let mut pdf = b"%PDF-1.7\n".to_vec();
     pdf.resize(4_500_001, b' ');
     pdf.extend_from_slice(b"%%EOF");
@@ -371,12 +310,12 @@ async fn over_profile_item_limit_but_under_store_maximum_is_captured() {
         .unwrap()
         .admits(media.byte_size));
     assert!(media.byte_size < broca_core::media_validation::store_max_bytes(MediaKind::Document));
-    assert_eq!(store.read_verified(media).unwrap(), pdf);
+    assert!(names(media, &pdf));
 }
 
 #[tokio::test]
 async fn over_store_maximum_is_a_marker_and_publishes_nothing() {
-    let (root, ctx, _) = capture_ctx("too-large");
+    let (ctx, held_media) = capture_ctx("too-large");
     let mut bytes = png();
     bytes.resize(33_554_433, 0);
     let result = capture_past_intake(
@@ -387,7 +326,7 @@ async fn over_store_maximum_is_a_marker_and_publishes_nothing() {
     assert!(
         matches!(&parts(&result)[0], ToolOutputPart::Text { text } if text.ends_with("reason=too_large]"))
     );
-    media_dirs_are_empty(&root);
+    assert!(held(&ctx, &held_media).is_empty());
 }
 
 /// A reply on a route that doesn't read `tool-result/v1` counts its whole JSON body, media data
@@ -395,7 +334,7 @@ async fn over_store_maximum_is_a_marker_and_publishes_nothing() {
 /// whole output is discarded at intake, before any media is captured.
 #[tokio::test]
 async fn an_oversized_legacy_reply_is_discarded_before_capture() {
-    let (root, ctx, _) = capture_ctx("legacy-too-large");
+    let (ctx, held_media) = capture_ctx("legacy-too-large");
     let mut bytes = png();
     bytes.resize(70_000, 0);
     let (_, _, _, result) = dispatch_reply(
@@ -408,5 +347,5 @@ async fn an_oversized_legacy_reply_is_discarded_before_capture() {
         panic!("an oversized legacy reply must be a size error: {result:?}")
     };
     assert_eq!(code.as_deref(), Some("tool_result_too_large"));
-    media_dirs_are_empty(&root);
+    assert!(held(&ctx, &held_media).is_empty());
 }

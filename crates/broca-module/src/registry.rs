@@ -21,14 +21,12 @@ use async_trait::async_trait;
 use broca_protocol::{BindIdentity, RunId};
 use tokio::sync::{broadcast, mpsc};
 
-// WAL reads may cross several blocking handoffs after a seed is refused. Keep
-// the caller's operation on every registry job, including the full-replay route.
 fn spawn_blocking<F, T>(kind: JobKind, work: F) -> tokio::task::JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    broca_diagnostics::spawn_blocking(kind, broca_wal::access_counter::inherit(work))
+    broca_diagnostics::spawn_blocking(kind, work)
 }
 
 const CLOSE_REOPEN_MAX_RETRIES: usize = 3;
@@ -150,45 +148,6 @@ pub struct HistoryReadContext {
     pub lineage_id: Option<String>,
     pub prompt_len: Option<u64>,
     pub tags_await_setup: bool,
-}
-
-impl OpenError {
-    fn temporary_io(error: &std::io::Error) -> bool {
-        matches!(
-            error.kind(),
-            std::io::ErrorKind::Interrupted
-                | std::io::ErrorKind::WouldBlock
-                | std::io::ErrorKind::TimedOut
-        )
-    }
-
-    /// Classify a WAL read failure, keeping a newer-writer refusal typed. `reason` is the full
-    /// text to report, already including the failure's own rendering.
-    pub(crate) fn from_wal_read(reason: String, error: &broca_wal::WalError) -> Self {
-        match error {
-            broca_wal::WalError::RelocationIncomplete { .. } => Self::Classified {
-                reason,
-                class: broca_protocol::ErrorClass::Transient,
-            },
-            broca_wal::WalError::SessionMoving { cut_id } => Self::SessionMoving {
-                cut_id: cut_id.clone(),
-            },
-            // A move of the old storage names the new computer only by its backup author id,
-            // which a caller is never told.
-            broca_wal::WalError::SessionMoved { .. } => Self::SessionMoved { holder: None },
-            broca_wal::WalError::NewerWriter { missing, .. } => OpenError::NewerWriter {
-                missing: missing.clone(),
-                reason,
-            },
-            // For generic I/O failures, only these temporary OS kinds establish retryability.
-            broca_wal::WalError::Io(error) if Self::temporary_io(error) => OpenError::Classified {
-                reason,
-                class: broca_protocol::ErrorClass::Transient,
-            },
-            // Corruption, replay/shape errors and opaque failures are not presumed retryable.
-            _ => OpenError::Open(reason),
-        }
-    }
 }
 
 impl std::fmt::Display for OpenError {
@@ -1119,7 +1078,7 @@ impl LineageRegistry {
         }
     }
     fn cut_gate(&self, key: &LineageKey) -> Arc<tokio::sync::Mutex<()>> {
-        let reference = broca_core::wal_writer::legacy_session_ref(
+        let reference = broca_core::session_refs::legacy_session_ref(
             &key.harness,
             &key.project_root.to_string_lossy(),
             &key.session,
@@ -1161,18 +1120,18 @@ impl LineageRegistry {
     ) -> Result<MoveSessionGuard, OpenError> {
         let mut sorted = sessions.to_vec();
         sorted.sort_by_key(|key| {
-            broca_core::wal_writer::legacy_session_ref(
+            broca_core::session_refs::legacy_session_ref(
                 &key.harness,
                 &key.project_root.to_string_lossy(),
                 &key.session,
             )
         });
         sorted.dedup_by(|a, b| {
-            broca_core::wal_writer::legacy_session_ref(
+            broca_core::session_refs::legacy_session_ref(
                 &a.harness,
                 &a.project_root.to_string_lossy(),
                 &a.session,
-            ) == broca_core::wal_writer::legacy_session_ref(
+            ) == broca_core::session_refs::legacy_session_ref(
                 &b.harness,
                 &b.project_root.to_string_lossy(),
                 &b.session,
@@ -1192,11 +1151,11 @@ impl LineageRegistry {
             let handle = {
                 let slots = self.inner.slots.lock().unwrap();
                 if let Some((bound, _)) = slots.get_key_value(&key) {
-                    if broca_core::wal_writer::legacy_session_ref(
+                    if broca_core::session_refs::legacy_session_ref(
                         &bound.harness,
                         &bound.project_root.to_string_lossy(),
                         &bound.session,
-                    ) != broca_core::wal_writer::legacy_session_ref(
+                    ) != broca_core::session_refs::legacy_session_ref(
                         &key.harness,
                         &key.project_root.to_string_lossy(),
                         &key.session,
@@ -3102,6 +3061,192 @@ impl Drop for CloseToken {
     }
 }
 
+impl LineageRegistry {
+    /// Install before actors or requests can read retained sessions, so every reader and writer
+    /// uses the same expiry clock.
+    pub fn set_retention_service(&self, service: Arc<crate::retention::RetentionService>) {
+        let inner = Arc::downgrade(&self.inner);
+        service.set_evictor(Arc::new(move |key| {
+            if let Some(inner) = inner.upgrade() {
+                let registry = LineageRegistry { inner };
+                // Deletion invokes this callback while it still holds the session lease.
+                // Repeated cache eviction after that lease is released must not close routes
+                // belonging to a session recreated at the same address.
+                if registry.evict_retention_caches(key) {
+                    registry.inner.opener.on_session_deleted(key);
+                }
+            }
+        }));
+        let _ = self.inner.retention.set(service);
+    }
+
+    /// Deletes the retained sessions whose policy has expired, each under its lease.
+    pub async fn sweep_once(&self, now_ms: u64) -> Result<usize, OpenError> {
+        let Some(service) = self.inner.retention.get().cloned() else {
+            return Ok(0);
+        };
+        let now_ms = if service
+            .clock
+            .refresh()
+            .map_err(|e| OpenError::Open(e.to_string()))?
+        {
+            service.clock.now_ms()
+        } else {
+            now_ms
+        };
+        let mut deleted = 0;
+        if let Some(runtime) = self.store_runtime() {
+            for key in service.sweep_store(&runtime, now_ms).await {
+                self.evict_retention_caches(&key);
+                deleted += 1;
+            }
+        }
+        tracing::info!(target: "retention", deleted, "retention sweep complete");
+        Ok(deleted)
+    }
+
+    /// Runs a pass every five minutes. A clock-change notification also runs a pass immediately,
+    /// so tests can advance time rather than wait days.
+    pub async fn run_retention_sweeper(&self) -> Result<(), OpenError> {
+        let Some(service) = self.inner.retention.get().cloned() else {
+            return Ok(());
+        };
+        tracing::info!(target: "retention", interval_ms = crate::retention::SWEEP_INTERVAL_MS, "retention sweep armed");
+        let mut changes = service.clock.subscribe();
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+            crate::retention::SWEEP_INTERVAL_MS,
+        ));
+        let clock = service.clock.clone();
+        let poll = clock.poll_changes();
+        tokio::pin!(poll);
+        tokio::select! {
+            _ = self.inner.stopping.cancelled() => Ok(()),
+            result = &mut poll => result.map_err(|e| OpenError::Open(e.to_string())),
+            _ = async {
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {},
+                        _ = changes.changed() => {},
+                    }
+                    if self.sweep_once(service.clock.now_ms()).await.is_err() {
+                        tracing::warn!(target: "retention", "retention sweep deferred; retrying next pass");
+                    }
+                }
+            } => Ok(()),
+        }
+    }
+
+    async fn check_authorization_expired(&self, key: &LineageKey) -> Result<(), OpenError> {
+        match self.check_expired(key, None).await {
+            // Ownership must be checked against the old copy before disclosing a move or cut.
+            // The request's operation-specific move check runs after authorization succeeds.
+            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => Ok(()),
+            result => result,
+        }
+    }
+
+    pub(crate) async fn check_expired(
+        &self,
+        key: &LineageKey,
+        run: Option<&str>,
+    ) -> Result<(), OpenError> {
+        self.check_expired_with_view(key, run).await.map(|_| ())
+    }
+
+    /// Check the same expiry barrier as every operation, retaining its stored snapshot so a
+    /// read can serve it without loading an over-budget view again.
+    pub(crate) async fn check_expired_with_view(
+        &self,
+        key: &LineageKey,
+        run: Option<&str>,
+    ) -> Result<Option<crate::store_read::StoredLocalView>, OpenError> {
+        let Some(runtime) = self.store_runtime() else {
+            return Ok(None);
+        };
+        let now_ms = self
+            .inner
+            .retention
+            .get()
+            .map_or(0, |service| service.clock.now_ms());
+        let (expired_at_ms, view) = runtime.expiry_with_view(key, run, now_ms).await?;
+        if let Some(expired_at_ms) = expired_at_ms {
+            return Err(OpenError::Expired { expired_at_ms });
+        }
+        Ok(view)
+    }
+
+    fn evict_retention_caches(&self, key: &LineageKey) -> bool {
+        self.handle().stop_idle_warm(key, "expired");
+        self.inner.opener.retire_session_transport(key);
+        self.inner.cache.remove(key);
+        true
+    }
+}
+
+impl RegistryHandle {
+    pub(crate) fn retention_service(&self) -> Option<Arc<crate::retention::RetentionService>> {
+        self.inner.retention.get().cloned()
+    }
+
+    pub(crate) fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
+        self.inner.opener.store_runtime()
+    }
+
+    pub(crate) fn backup_classes(&self) -> Vec<String> {
+        self.inner.opener.backup_classes()
+    }
+}
+
+struct Inner {
+    /// The sessions a move into the new storage holds (see `store_move`), by address, and the
+    /// reads in flight per address that take no session lease, which such a move waits out.
+    store_moves: store_move::MoveFences,
+    /// What runs `session.restore_from_backup`, installed by the daemon with its stores.
+    store_restorer: std::sync::OnceLock<Arc<dyn store_restore::StoreRestorer>>,
+    session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
+    session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
+    tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
+    actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
+    /// Subscribers to sessions nothing has written yet, by session. They are attached from the
+    /// session's start once its first send creates it.
+    waiting_subscribers: Mutex<HashMap<LineageKey, Vec<mpsc::Sender<crate::fanout::Delivery>>>>,
+    idle_warms: Mutex<HashMap<LineageKey, idle_warm::Scheduled>>,
+    idle_warm_stops: Mutex<HashSet<LineageKey>>,
+    /// Raised and lowered by the System One batch service (`classify.run` on the classifier
+    /// route); read into `batches_in_flight`.
+    batches_in_flight: Arc<AtomicUsize>,
+    cut_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// Serialize refresh fetches without blocking sends or the actor's running episode.
+    change_gates: Mutex<HashMap<LineageKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    retention: std::sync::OnceLock<Arc<crate::retention::RetentionService>>,
+    /// Serves the fork operations of the heads kept in the new storage, made on the first one.
+    forks: std::sync::OnceLock<Arc<crate::fork_answer::ForkManager>>,
+    /// Who owns each session whose ownership was read lately, for the reader census, which
+    /// must not read storage itself. Bounded: emptied when it reaches [`OWNERS_CACHED`].
+    owners: Mutex<HashMap<LineageKey, OwnerFacts>>,
+    #[cfg(test)]
+    close_started: tokio::sync::watch::Sender<u64>,
+    /// The admitter for sends carrying a fetch plan: it fetches from every provider the plan
+    /// names and builds the manifest to freeze. Unset, a send carrying a plan is refused.
+    plan_admitter: std::sync::OnceLock<Arc<dyn broca_fetch_plan::PlanAdmitter>>,
+    slots: Mutex<HashMap<LineageKey, Entry>>,
+    next_gen: AtomicU64,
+    /// Sessions whose creating send or import the store actor serves, marked by it with how the
+    /// session it creates is placed, and taken by the opener, which starts such a session in the
+    /// new storage when it exists nowhere yet.
+    store_eligible: Mutex<HashMap<LineageKey, StoreCreation>>,
+    opener: Arc<dyn LineageOpener>,
+    run_index: Option<Arc<dyn broca_core::RunEventBodies>>,
+    stopping: tokio_util::sync::CancellationToken,
+    seal: tokio_util::sync::CancellationToken,
+    seal_state: Mutex<SealState>,
+    shutdown_report: Mutex<Option<ShutdownReport>>,
+    restart_resume_ready: AtomicBool,
+    /// Every session's prompt-cache facts. Kept here rather than in the actor so they outlive
+    /// the actor's idle close: a caller warms a session minutes after its last round.
+    cache: crate::cache::CacheTable,
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -3516,218 +3661,4 @@ mod tests {
     fn test_key(name: &str) -> LineageKey {
         BindIdentity::new(std::path::PathBuf::from("/tmp").join(name), "runner", name)
     }
-}
-
-#[cfg(test)]
-mod open_error_class_tests {
-    use super::OpenError;
-
-    #[test]
-    fn temporary_wal_io_is_transient_but_unknown_io_stays_unclassified() {
-        for kind in [
-            std::io::ErrorKind::Interrupted,
-            std::io::ErrorKind::WouldBlock,
-            std::io::ErrorKind::TimedOut,
-        ] {
-            let error = broca_wal::WalError::Io(std::io::Error::from(kind));
-            assert!(matches!(
-                OpenError::from_wal_read("read failed".into(), &error),
-                OpenError::Classified {
-                    class: broca_protocol::ErrorClass::Transient,
-                    ..
-                }
-            ));
-        }
-        let error =
-            broca_wal::WalError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert!(matches!(
-            OpenError::from_wal_read("read failed".into(), &error),
-            OpenError::Open(_)
-        ));
-    }
-}
-
-impl LineageRegistry {
-    /// Install before actors or requests can read retained sessions, so every reader and writer
-    /// uses the same expiry clock.
-    pub fn set_retention_service(&self, service: Arc<crate::retention::RetentionService>) {
-        let inner = Arc::downgrade(&self.inner);
-        service.set_evictor(Arc::new(move |key| {
-            if let Some(inner) = inner.upgrade() {
-                let registry = LineageRegistry { inner };
-                // Deletion invokes this callback while it still holds the session lease.
-                // Repeated cache eviction after that lease is released must not close routes
-                // belonging to a session recreated at the same address.
-                if registry.evict_retention_caches(key) {
-                    registry.inner.opener.on_session_deleted(key);
-                }
-            }
-        }));
-        let _ = self.inner.retention.set(service);
-    }
-
-    /// Deletes the retained sessions whose policy has expired, each under its lease.
-    pub async fn sweep_once(&self, now_ms: u64) -> Result<usize, OpenError> {
-        let Some(service) = self.inner.retention.get().cloned() else {
-            return Ok(0);
-        };
-        let now_ms = if service
-            .clock
-            .refresh()
-            .map_err(|e| OpenError::Open(e.to_string()))?
-        {
-            service.clock.now_ms()
-        } else {
-            now_ms
-        };
-        let mut deleted = 0;
-        if let Some(runtime) = self.store_runtime() {
-            for key in service.sweep_store(&runtime, now_ms).await {
-                self.evict_retention_caches(&key);
-                deleted += 1;
-            }
-        }
-        tracing::info!(target: "retention", deleted, "retention sweep complete");
-        Ok(deleted)
-    }
-
-    /// Runs a pass every five minutes. A clock-change notification also runs a pass immediately,
-    /// so tests can advance time rather than wait days.
-    pub async fn run_retention_sweeper(&self) -> Result<(), OpenError> {
-        let Some(service) = self.inner.retention.get().cloned() else {
-            return Ok(());
-        };
-        tracing::info!(target: "retention", interval_ms = crate::retention::SWEEP_INTERVAL_MS, "retention sweep armed");
-        let mut changes = service.clock.subscribe();
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-            crate::retention::SWEEP_INTERVAL_MS,
-        ));
-        let clock = service.clock.clone();
-        let poll = clock.poll_changes();
-        tokio::pin!(poll);
-        tokio::select! {
-            _ = self.inner.stopping.cancelled() => Ok(()),
-            result = &mut poll => result.map_err(|e| OpenError::Open(e.to_string())),
-            _ = async {
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {},
-                        _ = changes.changed() => {},
-                    }
-                    if self.sweep_once(service.clock.now_ms()).await.is_err() {
-                        tracing::warn!(target: "retention", "retention sweep deferred; retrying next pass");
-                    }
-                }
-            } => Ok(()),
-        }
-    }
-
-    async fn check_authorization_expired(&self, key: &LineageKey) -> Result<(), OpenError> {
-        match self.check_expired(key, None).await {
-            // Ownership must be checked against the old copy before disclosing a move or cut.
-            // The request's operation-specific move check runs after authorization succeeds.
-            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => Ok(()),
-            result => result,
-        }
-    }
-
-    pub(crate) async fn check_expired(
-        &self,
-        key: &LineageKey,
-        run: Option<&str>,
-    ) -> Result<(), OpenError> {
-        self.check_expired_with_view(key, run).await.map(|_| ())
-    }
-
-    /// Check the same expiry barrier as every operation, retaining its stored snapshot so a
-    /// read can serve it without loading an over-budget view again.
-    pub(crate) async fn check_expired_with_view(
-        &self,
-        key: &LineageKey,
-        run: Option<&str>,
-    ) -> Result<Option<crate::store_read::StoredLocalView>, OpenError> {
-        let Some(runtime) = self.store_runtime() else {
-            return Ok(None);
-        };
-        let now_ms = self
-            .inner
-            .retention
-            .get()
-            .map_or(0, |service| service.clock.now_ms());
-        let (expired_at_ms, view) = runtime.expiry_with_view(key, run, now_ms).await?;
-        if let Some(expired_at_ms) = expired_at_ms {
-            return Err(OpenError::Expired { expired_at_ms });
-        }
-        Ok(view)
-    }
-
-    fn evict_retention_caches(&self, key: &LineageKey) -> bool {
-        self.handle().stop_idle_warm(key, "expired");
-        self.inner.opener.retire_session_transport(key);
-        self.inner.cache.remove(key);
-        true
-    }
-}
-
-impl RegistryHandle {
-    pub(crate) fn retention_service(&self) -> Option<Arc<crate::retention::RetentionService>> {
-        self.inner.retention.get().cloned()
-    }
-
-    pub(crate) fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
-        self.inner.opener.store_runtime()
-    }
-
-    pub(crate) fn backup_classes(&self) -> Vec<String> {
-        self.inner.opener.backup_classes()
-    }
-}
-
-struct Inner {
-    /// The sessions a move into the new storage holds (see `store_move`), by address, and the
-    /// lease-free WAL reads in flight per address, which such a move waits out.
-    store_moves: store_move::MoveFences,
-    /// What runs `session.restore_from_backup`, installed by the daemon with its stores.
-    store_restorer: std::sync::OnceLock<Arc<dyn store_restore::StoreRestorer>>,
-    session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,
-    session_inventory_readiness: std::sync::OnceLock<Arc<dyn SessionInventoryReadiness>>,
-    tool_route_health: std::sync::OnceLock<Arc<ToolRouteHealth>>,
-    actor_idle_holds: Mutex<HashMap<LineageKey, (u64, Vec<&'static str>)>>,
-    /// Subscribers to sessions nothing has written yet, by session. They are attached from the
-    /// session's start once its first send creates it.
-    waiting_subscribers: Mutex<HashMap<LineageKey, Vec<mpsc::Sender<crate::fanout::Delivery>>>>,
-    idle_warms: Mutex<HashMap<LineageKey, idle_warm::Scheduled>>,
-    idle_warm_stops: Mutex<HashSet<LineageKey>>,
-    /// Raised and lowered by the System One batch service; read into `batches_in_flight`.
-    batches_in_flight: Arc<AtomicUsize>,
-    cut_gates: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-    /// Serialize refresh fetches without blocking sends or the actor's running episode.
-    change_gates: Mutex<HashMap<LineageKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-    retention: std::sync::OnceLock<Arc<crate::retention::RetentionService>>,
-    /// Serves the fork operations of the heads kept in the new storage, made on the first one.
-    forks: std::sync::OnceLock<Arc<crate::fork_answer::ForkManager>>,
-    /// Who owns each session whose ownership was read lately, for the reader census, which
-    /// must not read storage itself. Bounded: emptied when it reaches [`OWNERS_CACHED`].
-    owners: Mutex<HashMap<LineageKey, OwnerFacts>>,
-    #[cfg(test)]
-    close_started: tokio::sync::watch::Sender<u64>,
-    /// The admitter for sends carrying a fetch plan: it fetches from every provider the plan
-    /// names and builds the manifest to freeze. Unset, a send carrying a plan is refused.
-    plan_admitter: std::sync::OnceLock<Arc<dyn broca_fetch_plan::PlanAdmitter>>,
-    slots: Mutex<HashMap<LineageKey, Entry>>,
-    next_gen: AtomicU64,
-    /// Sessions whose creating send or import the store actor serves, marked by it with how the
-    /// session it creates is placed, and taken by the opener, which starts such a session in the
-    /// new storage when it exists nowhere yet.
-    store_eligible: Mutex<HashMap<LineageKey, StoreCreation>>,
-    opener: Arc<dyn LineageOpener>,
-    run_index: Option<Arc<dyn broca_core::RunEventBodies>>,
-    stopping: tokio_util::sync::CancellationToken,
-    seal: tokio_util::sync::CancellationToken,
-    seal_state: Mutex<SealState>,
-    shutdown_report: Mutex<Option<ShutdownReport>>,
-    restart_resume_ready: AtomicBool,
-    /// Every session's prompt-cache facts. Kept here rather than in the actor so they outlive
-    /// the actor's idle close: a caller warms a session minutes after its last round.
-    cache: crate::cache::CacheTable,
 }

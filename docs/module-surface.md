@@ -2472,26 +2472,19 @@ is the field that does track its timestamp: every fact without `pricing_at_ms` r
 once at database creation and survives every process restart, so a changed value means the
 database was replaced, not that the daemon bounced. An incremental reader whose saved identity
 no longer matches must reset its position rather than continue from a sequence in the previous
-database. `export_seq` is insertion order, NOT event order — a catch-up backfill assigns fresh
-high sequence numbers to old runs — so ordering a report by `export_seq` orders by when broca
+database. `export_seq` is insertion order, NOT event order — a run billed again after a crash
+gets fresh high sequence numbers — so ordering a report by `export_seq` orders by when broca
 learned a fact, and ordering by `occurred_at_ms` orders by when it happened.
 
 **Delivery.** Facts are insert-once and never rewritten, so a re-read of the same range returns
 the same bytes. A terminal run is expected to produce its facts; a run that ends without any is
 a defect on this side, not a consumer-side filter to work around.
 
-## 18. WAL enrichment + fork origin (real, now)
+## 18. Session records
 
-Record changes:
-- `RunStarted` gains `origin: Fresh | SeededFrom{source_lineage, at_seq}` (default
-  `Fresh`; `seed_from` reserved on the wire, v1 rejects non-Fresh — the fork seam is real,
-  cross-lineage read is future) and `submission_id` (§11), and is run_id-authoritative.
-- Replay-fidelity additions: a `StepStarted` marker; `finish_reason` on
-  `ModelStepFinished`; `tool_name` on `ToolDispatchIntent`; typed `error: Option<ProviderError>`
-  on `RunFinished`.
-- Queue identity: `Queued{submission_id, message}`, `Retracted{submission_id}` (wire the
-  formerly-dead `SteerQueued`/`FollowUpQueued` into this shape).
-- `RunPaused{run_id, reason, error}` (§17).
+A session's records are defined in `crates/broca-session-store/src/record.rs`; their meaning,
+and how a run is written and resumed, are in [the session store](session-store.md). A new
+record kind or must-understand field ships in a reader release before any build writes it.
 
 ## 19. SubcToolPlane hardening
 
@@ -2775,58 +2768,41 @@ This recovery support does not enable `held-reply/v1` declarations in release bu
 
 ```
 ~/.local/share/cortexkit/broca/
-  wal/<addr>.wal            ← one WAL per session (sequence of runs), flat; <addr> is the
-                              session address derived from the bind triple
-  wal-durable/<addr>.wal    ← sessions selected for backup at first send
-  wal-ephemeral/<addr>.wal  ← sessions with retention; never backed up or folded
-  wal-archive/, wal-archive-durable/ ← sealed archive containers of cold WALs
-  run-index.db              ← SQLite: the durable run index, materialized transcript,
-                              admission checkpoints, usage export facts
-  caps.db                   ← left over from removed spend caps; broca no longer opens it
+  session-store/, session-store-durable/, session-store-ephemeral/
+                            ← the session store, one root per storage class: heads, logs,
+                              objects and setup parts, under each session's address
+  run-index.db              ← SQLite: session-ref index, scope reservations, bus outboxes,
+                              usage export facts
   leases/                   ← single-writer lease files
 ```
-WAL = source of truth (portable unit); `run-index.db` = derived projection. Resume =
-DB-prefix ⊕ WAL-tail. The full layout, with every file and its section, is maintained in
-[data-model.md §1](data-model.md#1-the-state-root); that list wins where the two differ.
+A session's records are its authority; everything in `run-index.db` is either its own
+authority (the export facts) or operational state. The full layout, with every file, is
+maintained in [data-model.md §1](data-model.md#1-the-state-root); that list wins where the two
+differ.
 
 The state root shown above is the default. It resolves to `BROCA_STATE_ROOT` when set and
 non-empty, else `$XDG_DATA_HOME/cortexkit/broca`, else `~/.local/share/cortexkit/broca`, and
 broca refuses to start when none is available (`crates/broca-module-serve/src/state_root.rs`).
 Astrocyte reads `run-index.db` at that data-home path, so the location is a contract. Older
 builds defaulted to `broca-state` beside the subc connection file; when only that old
-directory holds a `wal/` or `run-index.db` and `BROCA_STATE_ROOT` is unset, broca refuses to
-start and names both paths.
+directory holds state and `BROCA_STATE_ROOT` is unset, broca refuses to start and names both
+paths.
 
-## 21. Core, WAL, and store invariants
+## 21. Core and store invariants
 
-Additive WAL changes must retain the existing compatibility rules:
-1. **Episode-aware replay state machine**: per-`RunStarted` episode reset; prior
-   episodes → prefix; last-unfinished resumable; explicit append-new-episode path.
-   **Resume uses the LAST active/resumable episode's config/run_id/counters,
-   not the first `RunStarted`**. The `recover_run_config` test helper likewise returns
-   the last started episode's effective config, including subsequent render-config
-   and auth refreezes. Replay classification: last
-   episode `RunPaused` → `AuthRequired`; last episode `RunFinished` → idle/appendable;
-   last episode open → resume it.
-2. **WAL enrichment** (§18): `origin`+`submission_id` on `RunStarted`; `StepStarted`;
-   `finish_reason`; `tool_name`; typed error; `Queued`/`Retracted`/`RunPaused`.
-3. **Durable cursor + projection**: `WAL+store → Vec<ControlUnit>` keyed by
-   `(wal_seq, sub_index)`; non-blocking in-process live tail; attach-barrier dedup by the
-   durable cursor. **The durable head MUST be the last FSYNCED WAL seq, NOT
-   `FileWal::last_seq()`** — `append(sync=false)` advances `next_seq` before fsync, so a
-   client cursor must only advance past the fsync barrier (the live tail backpatches its
-   events with assigned seqs once fsynced). `WalHandle::record` returns `RecordOutcome`
-   (`Accepted(seq)` or `Refused(error)`); `sync` returns the last fsynced head on success.
-   An accepted append's seq is not durable until sync succeeds. Cursor state does NOT
-   reset at episode boundaries (WAL seq is monotonic per lineage file across episodes).
-4. **Durable queue + identity**: wire the queue records, replay = queued − retracted
-   − consumed.
-5. **AuthRequired = RunPaused**: non-terminal record + `ReplayResolution::AuthRequired`
-   + same-run_id resume.
-6. **Cancel token + provider watchdog** (§13).
-7. **Mid-turn input channel:** the loop accepts follow-up turns from the coordinator.
-8. **Durable run index** (§14).
-9. **WAL lease-tenure stamps and file-integrity rejection**.
+The rules a run keeps across a crash, a restart or a stop are in the
+[durability contract](durability-contract.md). The ones callers see on this surface:
+1. **A session is a sequence of runs.** Each admitted send opens a run with `RunStart`; it ends
+   with `RunEnd` or stops at a `Pause`. Resume continues the last open run with its own frozen
+   config, run id and counters, never the first run's.
+2. **Durable cursor.** Control units are keyed by `(wal_seq, sub_index)` plus the log's
+   incarnation, so a recreated log refuses a stale cursor with `cursor_expired`. A cursor
+   advances only past records that are durable, and it does not reset between runs.
+3. **Durable queue and identity.** Queued sends, retractions and steers are records, so a
+   queued send survives a restart and is consumed exactly once.
+4. **Auth required is a pause.** A run that loses its sign-in pauses `auth_required` and
+   resumes under the same run id.
+5. **One writer per session**, held by the session lease and the head's version check.
 
 ## 22. Session CLI
 
@@ -2838,7 +2814,7 @@ the same admission, durability and coordination contracts as other consumers.
 
 **Zero subc-CORE changes**. All `session.*`/`run.*` are opaque
 management-surface RPCs; fan-out/replay/backpressure/coordinator/run-index are
-module-side. The §21 changes are **broca-core/WAL/store**, not subc-core.
+module-side. The §21 rules live in broca's own crates, not in subc-core.
 
 ## 24. Conformance coverage
 

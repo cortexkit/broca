@@ -9,9 +9,6 @@
 // Fixtures deliberately prepare and inspect files outside the production seam.
 #![allow(clippy::disallowed_methods)]
 
-mod archive_inventory;
-mod archive_reader_perf;
-mod compaction_reader;
 mod compaction_source;
 mod historical_usage;
 mod retention_bytes;

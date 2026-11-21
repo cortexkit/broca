@@ -317,14 +317,8 @@ pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
 pub fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDir> {
     current().read_dir(path.as_ref())
 }
-pub fn validate_if_exists(path: impl AsRef<Path>) -> io::Result<()> {
-    current().validate_if_exists(path.as_ref())
-}
 pub fn is_dir(path: impl AsRef<Path>) -> bool {
     metadata(path).is_ok_and(|m| m.is_dir())
-}
-pub fn exists(path: impl AsRef<Path>) -> bool {
-    metadata(path).is_ok()
 }
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -375,10 +369,6 @@ impl File {
     }
     pub fn try_lock(&self) -> Result<(), TryLockError> {
         self.0.try_lock()
-    }
-    #[cfg(unix)]
-    pub fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
-        self.0.read_exact_at(bytes, offset)
     }
 }
 impl Read for File {

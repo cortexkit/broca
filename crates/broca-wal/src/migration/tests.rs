@@ -1,5 +1,4 @@
 use super::*;
-use crate::{FileWal, Wal, WalRecord};
 use std::fs;
 fn root(tag: &str) -> PathBuf {
     let root = broca_test_support::scratch_root()
@@ -274,57 +273,6 @@ fn corrupt_cut_authority_fails_closed_without_repairing_it() {
     fs::write(&path, b"not JSON").unwrap();
     assert!(check(&wal, "ref", true).is_err());
     assert_eq!(fs::read(&path).unwrap(), b"not JSON");
-}
-
-#[test]
-fn staging_digest_and_population_are_not_live_session_inputs() {
-    let root = root("staging");
-    let path = staging_path(&root.join("wal"), "cut", "addr").unwrap();
-    assert!(stage(&root, &path, b"secret", &digest(b"different")).is_err());
-    assert!(!path.exists());
-    let live = root.join("live.wal");
-    let writer = FileWal::open(&live).unwrap();
-    writer.sync().unwrap();
-    let bytes = fs::read(live).unwrap();
-    stage(&root, &path, &bytes, &digest(&bytes)).unwrap();
-    assert!(FileWal::open(&path).is_err());
-    assert!(staging_path(&root.join("wal"), "../other", "addr").is_err());
-}
-
-#[test]
-fn existing_writer_rechecks_freeze_before_every_append() {
-    let root = root("writer");
-    let path = root.join("wal/a.wal");
-    let mut wal = FileWal::open(&path).unwrap();
-    wal.sync().unwrap();
-    let before = fs::read(&path).unwrap();
-    freeze(&root, &path, &owner("a")).unwrap().unwrap();
-    assert!(matches!(
-        wal.append(
-            1,
-            &WalRecord::ModelStepFinished {
-                raw_finish_reason: None,
-                fallback: Default::default(),
-                written_at_ms: None,
-                tags: None,
-                hooks: None,
-                step_id: broca_protocol::StepId(1),
-                assistant_message: broca_protocol::content::AssistantMessage {
-                    message_id: broca_protocol::MessageId("m".into()),
-                    content: vec![]
-                }
-                .into(),
-                usage: broca_protocol::Usage::default(),
-                finish_reason: None,
-                retries_used: 0,
-                service_tier_used: None,
-                speed_used: None
-            },
-            true
-        ),
-        Err(crate::WalError::SessionMoving { .. })
-    ));
-    assert_eq!(fs::read(&path).unwrap(), before);
 }
 
 #[test]

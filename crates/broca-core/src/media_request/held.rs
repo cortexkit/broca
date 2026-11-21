@@ -182,11 +182,7 @@ impl SessionMedia {
                 }) + self
                     .restored_selection
                     .as_ref()
-                    .map_or(0, |selection| vec(selection, binding))
-                    + self
-                        .read_only
-                        .as_ref()
-                        .map_or(0, |(root, _)| root.as_os_str().len()),
+                    .map_or(0, |selection| vec(selection, binding)),
             ),
         ]
     }

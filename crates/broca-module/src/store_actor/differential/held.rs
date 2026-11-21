@@ -174,7 +174,6 @@ impl ToolPlane for HoldingTools {
 struct HeldExecutor {
     auth_selection: std::sync::Mutex<Option<broca_wal::AuthSelection>>,
     provider: Gated,
-    wal: Arc<FileWalStore>,
     tools: Arc<HoldingTools>,
     slots: Arc<HeldSlots>,
     // Replace a scripted auth pause with another pause reason, without involving timers or
@@ -355,7 +354,6 @@ impl Side {
         tools: Arc<HoldingTools>,
         gate: Option<Arc<Notify>>,
     ) -> Self {
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let executor = Arc::new(HeldExecutor {
             provider: Gated {
                 inner: broca_core::provider::StubProvider::new(steps),
@@ -364,7 +362,6 @@ impl Side {
                 notes_sends: false,
                 hold: None,
             },
-            wal: wal.clone(),
             tools,
             slots: HeldSlots::new(),
             pause_as: Default::default(),
@@ -502,7 +499,7 @@ impl Side {
             ts_ms: None,
             delivery: Some(broca_protocol::Delivery::Interrupt),
         };
-        if self.store {
+        {
             let runtime = self.registry.store_runtime().unwrap();
             let class = runtime.class_of(&self.key).unwrap().unwrap();
             let backend = LocalBackend::new(class.store_root(&self.dir));
@@ -532,51 +529,11 @@ impl Side {
             Writer::append(&mut session, &[Record::QueuedSend(queued)], true)
                 .await
                 .unwrap();
-        } else {
-            assert!(self
-                .executor
-                .wal
-                .read_records(&self.key)
-                .unwrap()
-                .iter()
-                .any(|frame| matches!(
-                    &frame.record,
-                    broca_wal::WalRecord::RunPaused {
-                        reason: broca_protocol::PauseReason::ToolHeld,
-                        ..
-                    }
-                )));
-            self.executor
-                .wal
-                .open(&self.key)
-                .unwrap()
-                .append(
-                    1,
-                    &broca_wal::WalRecord::Queued {
-                        submission_id: broca_protocol::SubmissionId("sub-i1".into()),
-                        request: Box::new(request),
-                        written_at_ms: at.written_at_ms,
-                        ts_ms: at.ts_ms,
-                        delivery: at.delivery,
-                        request_identity_digest: None,
-                        principal: None,
-                        sent_by: None,
-                        retention: None,
-                        keep_warm: None,
-                        conversation_key: None,
-                        send_id: None,
-                        title: None,
-                        hooks: None,
-                        message_marks: None,
-                    },
-                    true,
-                )
-                .unwrap();
         }
     }
 
     async fn pending(&self) -> Vec<String> {
-        if self.store {
+        {
             self.registry
                 .store_runtime()
                 .unwrap()
@@ -588,19 +545,6 @@ impl Side {
                 .queue
                 .iter()
                 .map(|pending| pending.submission_id.clone())
-                .collect()
-        } else {
-            let records = self
-                .executor
-                .wal
-                .read_records(&self.key)
-                .unwrap()
-                .into_iter()
-                .map(|frame| frame.record)
-                .collect::<Vec<_>>();
-            broca_core::queue::pending_submissions(&records)
-                .into_iter()
-                .map(|pending| pending.submission_id.0)
                 .collect()
         }
     }
@@ -1243,7 +1187,6 @@ async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {
                 notes_sends: false,
                 hold: None,
             },
-            wal: source.executor.wal.clone(),
             tools: source.executor.tools.clone(),
             slots: HeldSlots::new(),
             pause_as: Default::default(),

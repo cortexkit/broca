@@ -942,7 +942,7 @@ async fn run_case(case: Case) -> Ran {
         Default::default(),
     );
     if let Some(compactor) = &case.compaction {
-        seams.session_address = Some(broca_core::wal_writer::session_addr(&bind()));
+        seams.session_address = Some(broca_core::session_refs::session_addr(&bind()));
         seams.compaction_plane = Some(&**compactor as &dyn broca_core::CompactionPlane);
     }
     let mut writer = Logging {

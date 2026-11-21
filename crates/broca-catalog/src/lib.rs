@@ -461,12 +461,6 @@ impl Catalog {
         rows
     }
 
-    /// Whether fusiform explicitly reports this model as withdrawn/retired.
-    pub fn is_withdrawn(&self, provider_id: &str, model_id: &str) -> bool {
-        self.withdrawn_models
-            .contains(&(provider_id.to_string(), model_id.to_string()))
-    }
-
     /// Resolve a `(ProviderSpec, ModelSpec)` serving pair. The family is resolved per
     /// `(provider, model)`: the provider default, overridden by an explicit
     /// `wire_family` on the model (e.g. OpenAI Chat vs Responses per model). The

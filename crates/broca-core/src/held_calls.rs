@@ -11,7 +11,7 @@ use std::collections::HashMap;
 /// same steps one by one from its own records.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HeldCallsProjection {
-    recoveries: Vec<broca_wal::recovery::RecoveryRun>,
+    recoveries: Vec<broca_records::recovery::RecoveryRun>,
     tool_names: HashMap<ToolCallId, String>,
     calls: Vec<(
         BatchId,
@@ -188,7 +188,7 @@ impl HeldCallsProjection {
     }
 
     /// A recovery found `runs` with calls whose outcome is unknown.
-    pub fn recovery_cut(&mut self, runs: &[broca_wal::recovery::RecoveryRun]) {
+    pub fn recovery_cut(&mut self, runs: &[broca_records::recovery::RecoveryRun]) {
         self.recoveries.extend(runs.iter().cloned());
     }
 
@@ -202,7 +202,7 @@ impl HeldCallsProjection {
         batch_id: Option<BatchId>,
         step_id: Option<broca_protocol::StepId>,
     ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
-        let mut terminal = broca_wal::recovery::RecoveryCall {
+        let mut terminal = broca_records::recovery::RecoveryCall {
             tool_call_id: tool_call_id.clone(),
             batch_id,
             step_id,
@@ -217,7 +217,7 @@ impl HeldCallsProjection {
         }
         let previous = self.calls.len();
         self.calls.retain(|(batch, id, held)| {
-            let identity = broca_wal::recovery::RecoveryCall {
+            let identity = broca_records::recovery::RecoveryCall {
                 tool_call_id: id.clone(),
                 batch_id: Some(batch.clone()),
                 step_id: None,

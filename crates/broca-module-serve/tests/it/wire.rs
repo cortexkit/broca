@@ -19,9 +19,7 @@ mod address_inventory;
 use address_inventory::test_registry;
 
 use async_trait::async_trait;
-use broca_core::{
-    ChargeBasis, FileLeaseStore, FileWalStore, OutputEvent, Provider, StubProvider, StubToolPlane,
-};
+use broca_core::{ChargeBasis, FileLeaseStore, OutputEvent, Provider, StubProvider, StubToolPlane};
 use broca_module::executor::RunExecutor;
 use broca_module::serve::{
     CancelResponse, RetractResponse, RunStatusResponse, SendRequest, SendResponse, ServeError,
@@ -201,7 +199,6 @@ async fn registry_and_wal_inner(
     hold: Option<Arc<tokio::sync::Notify>>,
 ) -> (Arc<LineageRegistry>, Sessions) {
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
     let exec = Arc::new(FakeExec {
         started: Arc::new(AtomicUsize::new(0)),
@@ -211,7 +208,6 @@ async fn registry_and_wal_inner(
     let opener = DefaultOpener::new(lease, exec)
         .with_store_runtime(runtime.clone())
         .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1)));
-    let _wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
     broca_store::session_refs::migrate(
         &dir.join("store.db"),
         &broca_store::session_refs::StoredSessions::new(dir),
@@ -228,7 +224,6 @@ async fn registry(dir: &Path) -> Arc<LineageRegistry> {
 
 async fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_store::SqliteStore>) {
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
-    let wal = Arc::new(FileWalStore::new(dir.join("wal")));
     let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
     let exec = Arc::new(FakeExec {
         started: Arc::new(AtomicUsize::new(0)),
@@ -254,7 +249,6 @@ async fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_st
     let opener = DefaultOpener::new(lease, exec_opener)
         .with_store_runtime(runtime)
         .with_charge_basis_resolver(resolver);
-    let _wal_reader: Arc<dyn broca_core::WalStore> = wal;
     broca_store::session_refs::migrate(
         &dir.join("store.db"),
         &broca_store::session_refs::StoredSessions::new(dir),

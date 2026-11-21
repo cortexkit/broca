@@ -78,8 +78,8 @@ impl CapabilityCatalog {
 // The bound route supplies the full session identity. Accept its historical
 // handle, but address the provider using the current folder-independent handle.
 fn current_reference(bind: &BindIdentity, supplied: &str) -> Result<String, CompactionUnavailable> {
-    let current = broca_core::wal_writer::agent_session_ref(bind);
-    let legacy = broca_core::wal_writer::legacy_session_ref(
+    let current = broca_core::session_refs::agent_session_ref(bind);
+    let legacy = broca_core::session_refs::legacy_session_ref(
         &bind.harness,
         &bind.project_root.to_string_lossy(),
         &bind.session,

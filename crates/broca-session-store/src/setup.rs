@@ -151,10 +151,6 @@ impl<'a, B: SessionBackend> SetupStore<'a, B> {
         self.backend
     }
 
-    pub fn key(&self) -> &'a SetupKey {
-        self.key
-    }
-
     /// Stores `bytes` as a part of `kind`, durable on return, and returns the reference a record
     /// names it by, and whether this call asked the backend to store it. A part this store
     /// already read or stored is known to be stored, so it asks nothing.

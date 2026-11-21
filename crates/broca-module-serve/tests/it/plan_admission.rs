@@ -2498,7 +2498,7 @@ async fn flow_and_run_carrier_cannot_retract_as_owner() {
 async fn flow_and_run_carrier_cannot_upload_as_owner() {
     for run_scope in [false, true] {
         let (mut rig, _) = carrier_owner_rig("carrier-upload", run_scope).await;
-        broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+        broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
         let before = rig.records().await;
         let reply = rig.request(8, json!({"method":"session.upload_begin","params":{"mime":"image/png","bytes":1,"sha256":"0".repeat(64)}})).await;
         assert_carrier_owner_refusal(&rig, &before, &reply).await;

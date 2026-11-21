@@ -230,7 +230,6 @@ struct Request<'a, P> {
 pub struct LateResultsFeed {
     conn: Arc<SubcConnection>,
     route: RouteHandle,
-    module: String,
     reply_timeout: Duration,
 }
 
@@ -265,13 +264,8 @@ impl LateResultsFeed {
         Ok(Self {
             conn,
             route,
-            module: module.to_owned(),
             reply_timeout: REPLY_TIMEOUT,
         })
-    }
-
-    pub fn module(&self) -> &str {
-        &self.module
     }
 
     /// Pull the entries after `since`; `None` reads from the start of this incarnation.
@@ -486,7 +480,6 @@ mod tests {
             LateResultsFeed {
                 conn: Arc::new(conn),
                 route,
-                module: "core".into(),
                 reply_timeout,
             },
             module,

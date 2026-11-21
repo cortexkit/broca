@@ -565,7 +565,7 @@ async fn view_get_and_ride_role_route(scoped: bool) {
         scoped,
     )
     .await;
-    let session_ref = broca_core::wal_writer::agent_session_ref(&serving.bind);
+    let session_ref = broca_core::session_refs::agent_session_ref(&serving.bind);
     let view = CompactionView::new(
         &session_ref,
         2,

@@ -1,4 +1,4 @@
-//! Consent authority and held tool calls. This database is not rebuilt from the session WAL:
+//! Consent authority and held tool calls. This database is not rebuilt from the sessions' records:
 //! losing a grant asks again, while losing a held request would lose the caller's work.
 
 use std::{

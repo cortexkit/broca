@@ -156,37 +156,6 @@ pub fn check(
         .map_err(|refusal| RunError::MediaUnsupported(refusal.to_string()))
 }
 
-pub fn frozen(config: &broca_wal::RunConfig) -> Option<Box<MediaProfile>> {
-    serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
-        config.frozen_render_config.clone(),
-    )
-    .ok()
-    .and_then(|config| config.media.map(Box::new))
-}
-
-/// All storage barriers complete before an inbox lock or a WAL append can name
-/// these references. A refused steer can leave extra manifest entries until sweep.
-pub fn publish(
-    uploads: Option<&Uploads>,
-    identity: &BindIdentity,
-    staged: &[StagedMedia],
-) -> Result<(), RunError> {
-    if staged.is_empty() {
-        return Ok(());
-    }
-    let uploads = uploads.ok_or_else(|| RunError::Wal("upload staging is unavailable".into()))?;
-    let mut manifest = uploads
-        .session_media_store(identity)
-        .and_then(|store| store.session(identity))
-        .map_err(|error| RunError::Wal(error.to_string()))?;
-    for media in staged {
-        manifest
-            .register_and_append(&media.reference, &media.bytes, || Ok(()))
-            .map_err(|error| RunError::Wal(error.to_string()))?;
-    }
-    Ok(())
-}
-
 /// Refuses an ordered send holding media whose delivery list names no mode that can carry them:
 /// only a steer or an idle-start run places the send's own messages, while a tool result carries
 /// text only and turn-scoped system text is a template's text. `model` is the model the refusal

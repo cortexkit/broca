@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent};
+use broca_core::{AllowAll, FileLeaseStore, OutputEvent};
 use broca_module::actor::{SendKey, SendOutcome, SendPlan};
 use broca_module::executor::{
     ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, RunExecutor, RunKind,
@@ -489,7 +489,7 @@ fn scratch(tag: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    broca_core::media_store::create_media_directories(&dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&dir).unwrap();
     dir
 }
 
@@ -507,7 +507,6 @@ impl Rig {
         forks: Arc<ForkScript>,
         owns_dir: bool,
     ) -> Self {
-        let _wal = Arc::new(FileWalStore::new(dir.join("wal")));
         let compaction = Arc::new(CountingCompaction::default());
         let executor: Arc<dyn RunExecutor> = Arc::new(StoreLoop {
             provider: Attempting(broca_core::provider::StubProvider::new(steps)),

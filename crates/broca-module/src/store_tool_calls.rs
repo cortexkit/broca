@@ -74,9 +74,6 @@ pub async fn run_tool_calls<B: SessionBackend>(
                     lineage_id: Some(&incarnation),
                     run_start_seq: *run_start_seq,
                     run_end_seq: *run_end_seq,
-                    range: None,
-                    range_start_seq: 0,
-                    fallback: None,
                     seed: None,
                 },
             )
@@ -102,9 +99,6 @@ pub async fn run_tool_calls<B: SessionBackend>(
                     lineage_id: cursor.lineage_id.as_deref(),
                     run_start_seq: cursor.run_start_seq,
                     run_end_seq: cursor.run_end_seq,
-                    range: None,
-                    range_start_seq: cursor.step_seq,
-                    fallback: None,
                     seed: Some(&cursor),
                 },
             )

@@ -39,7 +39,7 @@ async fn warm(actor: &mut StoreActor<LocalBackend>) -> crate::actor::WarmOutcome
 }
 
 async fn idle_head_uses_hour_lifetime_and_stops_at_durable_cap(cipher: Cipher) {
-    let side = super::super::side(false, cipher).await;
+    let side = super::super::side(cipher).await;
     let history = converted("finished-head");
     let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
     let executor = Arc::new(Warming {
@@ -81,7 +81,7 @@ async fn idle_head_uses_hour_lifetime_and_stops_at_durable_cap(cipher: Cipher) {
 }
 
 async fn idle_warm_rebuilds_after_restart_without_changing_prompt_state(cipher: Cipher) {
-    let side = super::super::side(false, cipher).await;
+    let side = super::super::side(cipher).await;
     let history = converted("finished-head");
     let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
     let executor = Arc::new(Warming {
@@ -183,7 +183,7 @@ async fn idle_warm_rebuilds_after_restart_without_changing_prompt_state(cipher: 
     .unwrap();
     let mut restarted = StoreActor::new(bind(), session, executor, Box::new(parts))
         .with_readers(Arc::new(move || LocalBackend::new(&root)));
-    let reboot = super::super::side(false, cipher).await;
+    let reboot = super::super::side(cipher).await;
     restarted.registry = Some(reboot.registry.handle());
     restarted = restarted.with_clock(Arc::new(move || clock.load(Ordering::SeqCst)));
     restarted.billing = Some(billing.clone());
@@ -221,7 +221,7 @@ async fn idle_warm_rebuilds_after_restart_without_changing_prompt_state(cipher: 
 }
 
 async fn idle_real_run_cancels_timer_and_end_rearms(cipher: Cipher) {
-    let side = super::super::side(false, cipher).await;
+    let side = super::super::side(cipher).await;
     let history = converted("finished-head");
     let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
     let mut store = super::super::super::executor(
@@ -259,7 +259,7 @@ async fn idle_real_run_cancels_timer_and_end_rearms(cipher: Cipher) {
 
 async fn idle_warm_failure_and_no_cache_read_stop(cipher: Cipher) {
     for no_cache in [false, true] {
-        let side = super::super::side(false, cipher).await;
+        let side = super::super::side(cipher).await;
         let history = converted("finished-head");
         let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
         let executor = Arc::new(Warming {
@@ -301,7 +301,7 @@ async fn idle_warm_failure_and_no_cache_read_stop(cipher: Cipher) {
 /// an unclassed session warms like a head, while an off run and a one-shot run never arm.
 async fn idle_warm_follows_the_frozen_warming_not_the_class(cipher: Cipher) {
     for case in ["off", "non_head", "one_shot"] {
-        let side = super::super::side(false, cipher).await;
+        let side = super::super::side(cipher).await;
         let history = converted(match case {
             "off" => "finished-head-keep-warm-off",
             "non_head" => "finished-head-unclassed",

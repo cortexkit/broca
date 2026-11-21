@@ -211,7 +211,6 @@ pub struct PriorWalSnapshot {
     /// Identity and exact byte boundary observed with this admission prefix, never
     /// sampled later after executor dependency resolution.
     pub lineage_id: Option<String>,
-    pub anchor: Option<broca_wal::WalByteAnchor>,
     /// Store watermark that precedes `tail`; zero for a complete-WAL fallback snapshot.
     pub base_watermark: u64,
     /// Durable writer head captured before this snapshot was loaded.
@@ -479,8 +478,8 @@ impl std::fmt::Display for RunError {
             RunError::CredentialsUnavailable => write!(f, "the vault credential listing has not loaded yet"),
             RunError::CredentialAmbiguous { credential, candidate_ids } => write!(f, "credential {credential} is ambiguous: {}", candidate_ids.join(", ")),
             RunError::Lease(s) => write!(f, "lease error: {s}"),
-            RunError::RetainedSessionTooLarge { max_bytes } => write!(f, "{}", crate::wal_writer::retained_size::error(*max_bytes).message),
-            RunError::SessionTooLarge { max_bytes } => write!(f, "{}", crate::wal_writer::retained_size::scoped_error(*max_bytes, broca_wal::size_limit::SizeScope::Session).message),
+            RunError::RetainedSessionTooLarge { max_bytes } => write!(f, "{}", broca_wal::size_limit::error(*max_bytes).message),
+            RunError::SessionTooLarge { max_bytes } => write!(f, "{}", broca_wal::size_limit::scoped_error(*max_bytes, broca_wal::size_limit::SizeScope::Session).message),
             RunError::Wal(s) => write!(f, "wal failure: {s}"),
             RunError::NewerWriter { missing } if missing.iter().any(|name| name == broca_wal::COMPACTION_V2_FEATURE) => write!(
                 f,
@@ -531,20 +530,6 @@ impl std::fmt::Display for RunError {
                 "routing_unavailable: the routing module gave no usable account decision ({})",
                 unavailable.reason.as_str()
             ),
-        }
-    }
-}
-
-impl From<broca_wal::WalError> for RunError {
-    /// Keep a newer-writer refusal typed so admission can class it permanent. Every other WAL
-    /// failure, corruption included, stays [`RunError::Wal`] with its text, exactly as before.
-    fn from(error: broca_wal::WalError) -> Self {
-        match error {
-            error @ broca_wal::WalError::RelocationIncomplete { .. } => {
-                RunError::Transient(error.to_string())
-            }
-            broca_wal::WalError::NewerWriter { missing, .. } => RunError::NewerWriter { missing },
-            other => RunError::Wal(other.to_string()),
         }
     }
 }

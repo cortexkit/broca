@@ -36,11 +36,6 @@ impl MoveRefusal {
             detail: None,
         }
     }
-
-    pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
-        self.detail = Some(detail);
-        self
-    }
 }
 
 /// The sessions moves hold, and the lease-free reads in flight for each session.
@@ -61,11 +56,8 @@ impl MoveFences {
         let address = broca_core::session_addr(key);
         let held = self.fenced.lock().unwrap().contains(&address)
             || self.unsettled.lock().unwrap().contains(&address);
-        held.then(|| {
-            let error = broca_wal::WalError::SessionMoving {
-                cut_id: "store-move".into(),
-            };
-            super::OpenError::from_wal_read(error.to_string(), &error)
+        held.then(|| super::OpenError::SessionMoving {
+            cut_id: "store-move".into(),
         })
     }
 

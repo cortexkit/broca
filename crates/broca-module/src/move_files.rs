@@ -164,43 +164,6 @@ fn cut_id(request: &Request) -> Result<String, ErrorBody> {
         .ok_or_else(|| unavailable("cut request has no cutId"))
 }
 
-/// Import already verified these bytes. A later digest change is corrupt local
-/// staging. agent-data/v1 stops automatic activation for operator resolution
-/// rather than retrying or returning the claim while another participant may
-/// already be active.
-pub fn staging_digest_failure(
-    cut_id: &str,
-    step: broca_wire::agent_data::step::Step,
-    session: &str,
-) -> ErrorBody {
-    use broca_wire::agent_data::errors::{
-        digest_mismatch_reason, driver_action_for, DigestMismatchDetail, RefusalCode,
-    };
-    let action = driver_action_for(Op::Activate, &RefusalCode::DigestMismatch);
-    tracing::error!(
-        session,
-        cut_id,
-        ?step,
-        ?action,
-        "agent-data verified activation staging is corrupt"
-    );
-    ErrorBody::with_digest_mismatch_detail(DigestMismatchDetail::new(digest_mismatch_reason::STAGING_DIGEST_MISMATCH),
-        format!("session {session}, cut {cut_id} at {step:?}: verified activation staging no longer matches its sealed digest"))
-}
-
-pub fn activation_refusal(
-    cut_id: &str,
-    step: broca_wire::agent_data::step::Step,
-    session: &str,
-    error: ErrorBody,
-) -> ErrorBody {
-    if error.code.as_str() == "digest_mismatch" {
-        staging_digest_failure(cut_id, step, session)
-    } else {
-        error
-    }
-}
-
 /// The refusal of source operation `op` on a session that moved to `holder` at `cut_id`: the ref
 /// is no longer this computer's, so the driver stops rather than retries.
 pub(super) fn moved_source(plan: &PlannedSession, holder: &str, cut_id: &str, op: Op) -> ErrorBody {

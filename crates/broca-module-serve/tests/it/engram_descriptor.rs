@@ -1,19 +1,7 @@
-//! The backup descriptor is a DEPLOYMENT ARTIFACT, and until now it lived only on the disk
-//! whose loss it exists to survive.
-//!
 //! `engram-catalog.json` at the repo root declares which parts of broca's state root engram
-//! captures. It is placed at `<state-root>/engram-catalog.json`, and it was NOT tracked here —
-//! zero copies in git against 54 other tracked `.json` files, so the search that found it was
-//! reaching. A rebuilt machine would have had no declaration of what broca needs captured, in
-//! exactly the scenario the file is for.
-//!
-//! It also explains a smaller failure: I described this descriptor to the fleet FROM MEMORY and
-//! got the entry count, two mechanisms and one entry name wrong, because there was no copy in
-//! the tree to read in passing — only one in a runtime directory nobody browses.
-//!
-//! The first test always runs and is the real one. The second compares the tracked copy against
-//! the placed copy and can only run where a state root exists; it says so loudly when it skips
-//! rather than reporting a pass over nothing.
+//! captures. broca places it at `<state-root>/engram-catalog.json` at start. The first test
+//! pins the declared entries and always runs; the second compares the tracked copy with the
+//! placed one and runs only where a state root exists, saying so loudly when it skips.
 
 use std::path::PathBuf;
 
@@ -27,18 +15,13 @@ fn tracked_descriptor() -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("tracked descriptor is not JSON: {e}"))
 }
 
-/// Engram includes only `portable` entries in
-/// each backup generation; `rebuild`, `device-local` and `excluded` entries are left out.
-/// Only durable sessions are backed up, in their own trees. `wal/` and
-/// `wal-archive/` hold disposable sessions whose callers relaunch rather than restore
-/// them, so both are `excluded`. Retention
-/// transcripts in `wal-ephemeral/` are `excluded` too: deleting a live WAL cannot remove a
-/// backup that already holds it, so a retained session must never be captured. The new session
-/// storage splits the same way, one complete store per class: `session-store-durable/` is
-/// captured, `session-store/` and `session-store-ephemeral/` are not, and its moves' journals
-/// and staged copies (`session-store-moves/`) stay on the device. Billing does
-/// not depend on these trees surviving a disk loss: the billing collector ingests export
-/// facts into its own backed-up store.
+/// Engram includes only `portable` entries in each backup generation; `rebuild`,
+/// `device-local` and `excluded` entries are left out. The session store keeps one complete
+/// store per backup class: `session-store-durable/` is captured, `session-store/` (disposable
+/// sessions their callers relaunch) and `session-store-ephemeral/` (sessions with a retention
+/// policy, which a backup must not outlive) are not, and its moves' journals and staged copies
+/// (`session-store-moves/`) stay on the device. Billing does not depend on these trees surviving
+/// a disk loss: the billing collector ingests export facts into its own backed-up store.
 #[test]
 fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
     let d = tracked_descriptor();
@@ -63,35 +46,19 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
         // knows what the file is. `rebuild` only means "safely skippable at capture"; nothing
         // reprojects it, and nothing needs to, because no build reads it.
         ("broca/caps", "rebuild", "whole-db"),
-        ("broca/durable-wals", "portable", "filetree"),
-        ("broca/durable-archive", "portable", "filetree"),
-        ("broca/durable-media", "portable", "filetree"),
-        // The new session storage, one complete store per backup class, placed by the rule
-        // today's storage places a WAL by. Its durable root holds the sessions whose creating
-        // send carried a class in `backup_classes`, the agent heads a file import brought onto
-        // broca, and the long-lived sessions an operator moved there; it is captured. A head is
-        // backed up only when it is created with `session_class: "head"`; an operator moves an
-        // unlabelled one from `wal/` with `class: "durable"`. Its ordinary
-        // root holds disposable sessions, and its ephemeral root sessions with a retention
-        // policy; neither is captured. A move keeps its journal and staged copy outside all
-        // three, so no capture holds a half-staged session.
+        // Its durable root holds the sessions whose creating send carried a class in
+        // `backup_classes`, the heads (an agent's long-lived main session) that `session.import`
+        // brought onto broca from another runner's files, and the
+        // long-lived sessions an operator moved there. A head is backed up only when it is
+        // created with `session_class: "head"`.
         ("broca/session-store-durable", "portable", "filetree"),
         ("broca/session-store", "excluded", "filetree"),
         ("broca/session-store-ephemeral", "excluded", "filetree"),
         ("broca/session-store-moves", "device-local", "filetree"),
-        // Cutover-only recovery artifacts, removed with legacy storage. Neither staged
-        // ordinary/retained sessions nor device-specific source paths enter portable backups.
-        ("broca/conversion-ledger", "device-local", "whole-db"),
-        ("broca/conversion-staging", "device-local", "filetree"),
-        ("broca/session-media", "excluded", "filetree"),
-        ("broca/ephemeral-media", "excluded", "filetree"),
         ("broca/media-uploads", "excluded", "filetree"),
-        ("broca/ephemeral-wals", "excluded", "filetree"),
         ("broca/leases", "device-local", "filetree"),
         ("broca/request-dumps", "device-local", "filetree"),
         ("broca/run-index", "rebuild", "whole-db"),
-        ("broca/session-archive", "excluded", "filetree"),
-        ("broca/session-wals", "excluded", "filetree"),
         // System One's batch store keeps caller text for seven days by ruling; a backup
         // generation would keep it longer.
         ("broca/system-one", "excluded", "whole-db"),
@@ -108,37 +75,21 @@ fn the_tracked_descriptor_declares_brocas_entries_with_their_classes() {
          captures, so this must be a deliberate edit rather than a surprise"
     );
 
-    // Pin the captured entries independently: making wal/, wal-archive/ or the new storage's
-    // ordinary or ephemeral root portable would silently include disposable or retained
-    // sessions in every backup generation.
+    // Pin the captured entries independently: making the session store's ordinary or ephemeral
+    // root portable would silently include disposable or retained sessions in every backup
+    // generation.
     let mut portable: Vec<&str> = entries
         .iter()
         .filter(|e| e["class"] == "portable")
         .filter_map(|e| e["entry_id"].as_str())
         .collect();
     portable.sort();
-    assert_eq!(
-        portable,
-        [
-            "broca/durable-archive",
-            "broca/durable-media",
-            "broca/durable-wals",
-            "broca/session-store-durable"
-        ]
-    );
+    assert_eq!(portable, ["broca/session-store-durable"]);
     for (id, path) in [
-        ("broca/session-wals", "wal"),
-        ("broca/session-archive", "wal-archive"),
-        ("broca/ephemeral-wals", "wal-ephemeral"),
-        ("broca/durable-wals", "wal-durable"),
-        ("broca/durable-archive", "wal-archive-durable"),
-        ("broca/durable-media", "media-durable"),
         ("broca/session-store-durable", "session-store-durable"),
         ("broca/session-store", "session-store"),
         ("broca/session-store-ephemeral", "session-store-ephemeral"),
         ("broca/session-store-moves", "session-store-moves"),
-        ("broca/session-media", "media"),
-        ("broca/ephemeral-media", "media-ephemeral"),
         ("broca/media-uploads", "media-uploads"),
     ] {
         let entry = entries.iter().find(|e| e["entry_id"] == id).unwrap();

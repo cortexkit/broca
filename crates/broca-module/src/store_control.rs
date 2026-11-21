@@ -980,7 +980,7 @@ impl StoreControl {
                 }
             }
             "recovery_cut" => {
-                let runs: Vec<broca_wal::recovery::RecoveryRun> = body
+                let runs: Vec<broca_records::recovery::RecoveryRun> = body
                     .get("recovery")
                     .and_then(|recovery| recovery.get("runs"))
                     .map(|runs| serde_json::from_value(runs.clone()))

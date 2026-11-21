@@ -686,7 +686,7 @@ impl EffortHistoryV1 {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recovery_cuts: Vec<broca_wal::recovery::RecoveryCut>,
+    pub recovery_cuts: Vec<broca_records::recovery::RecoveryCut>,
     /// Reference-only media resume state, omitted for media-free histories. A captured-reference
     /// index without a valid matching seed requires a named, counted full-replay repair.
     #[serde(default, skip_serializing_if = "Option::is_none")]

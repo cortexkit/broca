@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent, WalStore};
+use broca_core::{AllowAll, FileLeaseStore, OutputEvent};
 use broca_module::actor::{SendKey, SendOutcome, SendPlan};
 use broca_module::executor::{
     RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode,
@@ -282,7 +282,6 @@ struct Rig {
     registry: Arc<LineageRegistry>,
     /// The session the test binds, as the registry resolves the bind's identity.
     key: BindIdentity,
-    wal: Arc<FileWalStore>,
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     _serve: tokio::task::JoinHandle<Result<ServeEnd, broca_module_serve::serve::ServeIoError>>,
@@ -334,8 +333,7 @@ impl Rig {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        broca_core::media_store::create_media_directories(&dir).unwrap();
-        let wal = Arc::new(FileWalStore::new(dir.join("wal")));
+        broca_core::media_uploads::create_upload_directories(&dir).unwrap();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let executor: Arc<dyn RunExecutor> = Arc::new(StoreLoop {
             provider: broca_core::provider::StubProvider::new(steps),
@@ -410,7 +408,6 @@ impl Rig {
             dir,
             registry,
             key,
-            wal,
             reader,
             writer,
             _serve: serve,
@@ -547,7 +544,6 @@ impl Rig {
                 .is_some(),
             "the session's head is in the new storage"
         );
-        assert_eq!(self.wal.wal_present(&self.key), Some(false), "no WAL");
     }
 
     async fn request(&mut self, channel: u16, body: Value) -> Frame {

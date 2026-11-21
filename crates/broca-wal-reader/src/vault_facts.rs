@@ -59,18 +59,7 @@ pub enum VaultFactsAttribution<'a> {
     WitnessMismatch,
 }
 
-impl VaultBillingFacts {
-    pub fn attribution(&self, served_credential_id: Option<&str>) -> VaultFactsAttribution<'_> {
-        let Self::Observed(facts) = self else {
-            return VaultFactsAttribution::Unknown(self);
-        };
-        match served_credential_id.filter(|id| !id.trim().is_empty()) {
-            None => VaultFactsAttribution::WitnessMissing,
-            Some(id) if id != facts.credential_id => VaultFactsAttribution::WitnessMismatch,
-            Some(_) => VaultFactsAttribution::Observed(facts),
-        }
-    }
-}
+impl VaultBillingFacts {}
 
 fn nonblank(value: &str) -> bool {
     !value.trim().is_empty()
@@ -173,10 +162,6 @@ mod tests {
         ] {
             let value = json!({"state": state, "credential_id":"vault-id", "record_version":232});
             let facts: VaultBillingFacts = serde_json::from_value(value.clone()).unwrap();
-            assert!(matches!(
-                facts.attribution(Some("vault-id")),
-                VaultFactsAttribution::Unknown(_)
-            ));
             assert_eq!(serde_json::to_value(facts).unwrap(), value);
         }
         let value = json!({"state":"future_reason", "future_field": [1,2]});
@@ -186,18 +171,6 @@ mod tests {
         let value = json!({"state":"observed", "credential_id":"vault-id", "record_version":232,
             "provider_ids":["anthropic", "claude-code"], "plan_tier":"future-tier", "plan_tier_source":"future-source", "future_field":7});
         let facts: VaultBillingFacts = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(
-            facts.attribution(None),
-            VaultFactsAttribution::WitnessMissing
-        );
-        assert_eq!(
-            facts.attribution(Some("other")),
-            VaultFactsAttribution::WitnessMismatch
-        );
-        assert!(matches!(
-            facts.attribution(Some("vault-id")),
-            VaultFactsAttribution::Observed(_)
-        ));
         assert_eq!(serde_json::to_value(facts).unwrap(), value);
     }
 

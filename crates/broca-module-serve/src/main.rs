@@ -370,14 +370,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // connection, because the daemon answers it only on a registered module's connection. The
     // serve loop below attaches the describer once that connection has registered.
     let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
-    let _media_sweep = {
-        let ready = scope_describer.clone();
-        let root = state_root.clone();
-        tokio::spawn(async move {
-            ready.wait_registered().await;
-            start_media_sweep(&root);
-        })
-    };
     plane.set_scope_describer(scope_describer.clone());
     let index = Arc::new(
         broca_store::SqliteStore::open_boot_legacy(
@@ -1554,12 +1546,6 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
 /// wiring is the only place that builds a live provider.
 mod executor;
 
-fn start_media_sweep(state_root: &Path) {
-    if let Err(error) = broca_core::media_store::spawn_startup_sweep(state_root.to_path_buf()) {
-        tracing::warn!(target: "media", "could not start media maintenance; continuing to serve: {error}");
-    }
-}
-
 fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoError> {
     broca_owner_only::create_dir_all(state_root)
         .map_err(|e| ServeIoError(format!("create state root {}: {e}", state_root.display())))?;
@@ -1576,8 +1562,6 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
     // Storage folders are created here, not on their first write, because the backup
     // descriptor names them, and engram refuses a capture whose declared path is missing.
     for name in [
-        "wal-durable",
-        "wal-archive-durable",
         broca_wal::SESSION_STORAGE_DURABLE_DIR,
         broca_wal::SESSION_STORAGE_DIR,
         broca_wal::SESSION_STORAGE_EPHEMERAL_DIR,
@@ -1598,7 +1582,7 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
 
     broca_module::store_open::recovery::prepare_directories(state_root)
         .map_err(|error| ServeIoError(format!("create recovery candidate directories: {error}")))?;
-    broca_core::media_store::create_media_directories(state_root)
+    broca_core::media_uploads::create_upload_directories(state_root)
         .map_err(|error| ServeIoError(error.to_string()))?;
     Ok(())
 }
@@ -1664,8 +1648,6 @@ mod windows_acl_tests {
         write_engram_catalog(&root).unwrap();
         assert_private(&root);
         assert_private(&root.join("leases"));
-        assert_private(&root.join("wal-durable"));
-        assert_private(&root.join("wal-archive-durable"));
         assert_private(&root.join("session-store-durable"));
         assert_private(&root.join("session-store"));
         assert_private(&root.join("session-store-ephemeral"));
@@ -1865,7 +1847,6 @@ mod state_directory_tests {
                 .collect();
             actual.sort();
             let expected: &[&str] = match relative_path {
-                "media-durable" => &["objects", "refs"],
                 broca_wal::SESSION_STORAGE_DURABLE_DIR => &["recovery-candidates"],
                 _ => &[],
             };
@@ -1935,38 +1916,27 @@ mod state_directory_tests {
     }
 
     #[test]
-    fn media_trees_exist_before_catalog_and_match_backup_classes() {
+    fn the_upload_tree_exists_before_catalog_and_is_excluded() {
         let state_root = fresh_root("media-catalog");
         create_state_directories(&state_root).unwrap();
         assert!(!state_root.join("engram-catalog.json").exists());
-        for name in ["media-durable", "media", "media-ephemeral", "media-uploads"] {
-            for child in ["objects", "refs"] {
-                let path = state_root.join(name).join(child);
-                assert!(path.is_dir(), "startup must create {}", path.display());
-                broca_owner_only::validate(&path).unwrap();
-            }
+        for child in ["objects", "refs"] {
+            let path = state_root.join("media-uploads").join(child);
+            assert!(path.is_dir(), "startup must create {}", path.display());
+            broca_owner_only::validate(&path).unwrap();
         }
         write_engram_catalog(&state_root).unwrap();
         let catalog: serde_json::Value =
             serde_json::from_slice(&std::fs::read(state_root.join("engram-catalog.json")).unwrap())
                 .unwrap();
         let entries = catalog["entries"].as_array().unwrap();
-        for (path, class) in [
-            ("media-durable", "portable"),
-            ("media", "excluded"),
-            ("media-ephemeral", "excluded"),
-            ("media-uploads", "excluded"),
-        ] {
-            let matching: Vec<_> = entries
-                .iter()
-                .filter(|entry| entry["path"] == path)
-                .collect();
-            assert_eq!(matching.len(), 1, "one catalog entry for {path}");
-            assert_eq!(matching[0]["class"], class, "backup class for {path}");
-            if class == "excluded" {
-                assert!(!matching[0]["reason"].as_str().unwrap().is_empty());
-            }
-        }
+        let matching: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry["path"] == "media-uploads")
+            .collect();
+        assert_eq!(matching.len(), 1, "one catalog entry for media-uploads");
+        assert_eq!(matching[0]["class"], "excluded");
+        assert!(!matching[0]["reason"].as_str().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(state_root);
     }
 
@@ -1977,7 +1947,10 @@ mod state_directory_tests {
 
         let state_root = fresh_root("existing");
         std::fs::create_dir_all(&state_root).expect("create existing state root");
-        let expected = [("wal-durable", 0o750), ("wal-archive-durable", 0o755)];
+        let expected = [
+            (broca_wal::SESSION_STORAGE_DURABLE_DIR, 0o750),
+            (broca_wal::SESSION_STORAGE_MOVES_DIR, 0o755),
+        ];
         for (name, mode) in expected {
             let path = state_root.join(name);
             std::fs::create_dir(&path).expect("create existing durable directory");
@@ -2003,7 +1976,7 @@ mod state_directory_tests {
     fn startup_directory_errors_name_the_path() {
         let state_root = fresh_root("blocked");
         std::fs::create_dir_all(&state_root).expect("create blocked state root");
-        let blocked = state_root.join("wal-durable");
+        let blocked = state_root.join(broca_wal::SESSION_STORAGE_DURABLE_DIR);
         std::fs::write(&blocked, "not a directory").expect("occupy durable directory path");
 
         let error =

@@ -156,23 +156,6 @@ impl<M: Clone> Transitions<M> {
         self.prefix = self.current.clone();
     }
 
-    /// Whether the pending change applies at a run start on the model keyed `model`, and how
-    /// ([`applies_at_run_start`]). Asked before the run start's own transitions.
-    pub fn applying(&self, model: &str) -> Option<Applying> {
-        let pending = self.pending.as_ref()?;
-        applies_at_run_start(
-            &pending.policy,
-            self.rebuild_since_accept,
-            self.flushed_since_accept,
-            self.last_model.as_deref(),
-            model,
-        )
-        .map(|applied_by| Applying {
-            generation: pending.generation,
-            applied_by,
-        })
-    }
-
     /// A run started on the model keyed `model`, freezing `manifest`. A run on another model
     /// than the previous run is a prefix rebuild whose prefix is this run's manifest. A first
     /// run, or one after a flush, starts a new prefix.

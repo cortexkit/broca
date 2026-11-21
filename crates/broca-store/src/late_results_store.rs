@@ -1,4 +1,5 @@
-//! Durable intake registrations. Feed ownership is independent of the rebuildable run index.
+//! Durable intake registrations: which session and scope own each late-result key. This file is
+//! its own authority; nothing rebuilds it from the sessions' records.
 //!
 //! Runtime installation is intentionally left to the held-call lifecycle wiring. Merely
 //! registering an ordinary call never opens a provider route or starts a puller.

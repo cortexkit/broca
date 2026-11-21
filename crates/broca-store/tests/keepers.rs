@@ -117,7 +117,7 @@ fn standalone_inventory_reads_legacy_roots_aliases_scope_and_ambiguity_without_w
         inventory.scope_reservation(&known()).unwrap(),
         Some(reservation())
     );
-    let v1 = broca_core::wal_writer::legacy_session_ref("fixture", "/fixture/original", "known");
+    let v1 = broca_core::session_refs::legacy_session_ref("fixture", "/fixture/original", "known");
     let v2 = broca_core::agent_session_ref(&known());
     let refs = inventory
         .session_refs([v1.as_str(), v2.as_str()].into_iter())

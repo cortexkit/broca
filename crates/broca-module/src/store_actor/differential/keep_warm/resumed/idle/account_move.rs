@@ -55,7 +55,7 @@ fn moved_history() -> (Converted, Vec<Vec<u8>>) {
 }
 
 async fn idle_warm_uses_moved_account_and_recorded_bytes(cipher: Cipher) {
-    let side = super::super::super::side(false, cipher).await;
+    let side = super::super::super::side(cipher).await;
     let (converted, bodies) = moved_history();
     let clock = Arc::new(AtomicU64::new(crate::actor::epoch_ms()));
     let executor = Arc::new(Warming {
@@ -98,7 +98,7 @@ async fn idle_warm_uses_moved_account_and_recorded_bytes(cipher: Cipher) {
 }
 
 async fn recorded_request_uses_config_at_its_attempt(cipher: Cipher) {
-    let side = super::super::super::side(false, cipher).await;
+    let side = super::super::super::side(cipher).await;
     let (converted, bodies) = moved_history();
     let actor = reopened(&side, converted, cipher, Arc::new(Warming::default())).await;
     // The current account selection reflects the later move. Rebuilding an older attempt must
@@ -140,7 +140,7 @@ async fn recorded_request_uses_config_at_its_attempt(cipher: Cipher) {
 }
 
 async fn recorded_request_without_refreezes_keeps_pinned_bytes(cipher: Cipher) {
-    let side = super::super::super::side(false, cipher).await;
+    let side = super::super::super::side(cipher).await;
     let actor = head(
         &side,
         cipher,

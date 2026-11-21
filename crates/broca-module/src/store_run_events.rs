@@ -99,7 +99,7 @@ impl Projector {
         now_ms: fn() -> u64,
     ) -> Self {
         Self {
-            session_ref: broca_core::wal_writer::agent_session_ref(&session),
+            session_ref: broca_core::session_refs::agent_session_ref(&session),
             session,
             epoch,
             sink,

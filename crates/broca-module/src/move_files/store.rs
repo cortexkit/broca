@@ -9,9 +9,6 @@ use broca_session_store::{
 };
 use broca_wal::StorageClass;
 
-pub fn is_store(plan: &PlannedSession) -> bool {
-    plan.format.starts_with(moves::FORMAT)
-}
 pub fn failure(error: moves::Error) -> ErrorBody {
     match error {
         moves::Error::DeploymentKeyMissing(id) => refusal("unavailable",

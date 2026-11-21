@@ -43,7 +43,7 @@ struct Warming {
 }
 
 async fn cold_cache_predecessor_rebuilds_the_previous_run_lazily(cipher: Cipher) {
-    let side = super::side(false, cipher).await;
+    let side = super::side(cipher).await;
     // Run r1's two tool steps, then a run r2 that started and sent nothing yet.
     let history = converted("cold-predecessor");
     let expected = history.recorded_sha256.clone().unwrap();
@@ -289,7 +289,7 @@ async fn finish_media(actor: &mut StoreActor<LocalBackend>) {
 
 async fn first_resumed_wait_warms_the_recorded_base(cipher: Cipher) {
     for closed in [false, true] {
-        let side = super::side(false, cipher).await;
+        let side = super::side(cipher).await;
         let history = converted(if closed {
             "closed-tool-wait"
         } else {
@@ -352,7 +352,7 @@ async fn first_resumed_wait_warms_the_recorded_base(cipher: Cipher) {
 }
 
 async fn resumed_warm_waits_for_the_media_fold(cipher: Cipher) {
-    let side = super::side(false, cipher).await;
+    let side = super::side(cipher).await;
     let history = converted("open-tool-wait");
     let executor = Arc::new(Warming::default());
     let gate = Arc::new(Notify::new());
@@ -386,7 +386,7 @@ async fn resumed_warm_waits_for_the_media_fold(cipher: Cipher) {
 }
 
 async fn mismatched_recorded_digest_never_warms(cipher: Cipher) {
-    let side = super::side(false, cipher).await;
+    let side = super::side(cipher).await;
     let history = converted("mismatched-digest");
     let executor = Arc::new(Warming::default());
     let mut actor = reopened(&side, history, cipher, Arc::clone(&executor)).await;

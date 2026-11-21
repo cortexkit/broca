@@ -90,16 +90,8 @@ pub fn cursor_frame_identity(bytes: &[u8]) -> Option<CursorFrameIdentity> {
 pub struct WalLineageId([u8; 16]);
 
 impl WalLineageId {
-    /// Only a UUID v4 header supplies the non-repeating identity exposed as `session.head.incarnation`.
-    pub fn incarnation(self) -> Option<String> {
-        (self.0[6] >> 4 == 4 && self.0[8] >> 6 == 2).then(|| self.to_string())
-    }
-    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
-    }
-
-    pub(crate) fn as_bytes(self) -> [u8; 16] {
-        self.0
     }
 }
 
@@ -213,10 +205,10 @@ pub const FRAME_STAMPS_FEATURE: &str = "frame-stamps/v1";
 /// placement tooling can refuse to install a build that cannot read what is already on disk.
 pub const KNOWN_FEATURES: &[&str] = &[
     ACCOUNT_LIMIT_PAUSE_FEATURE,
-    crate::recovery::FEATURE,
+    broca_records::recovery::FEATURE,
     BILL_ATTEMPTS_FEATURE,
     BILL_VAULT_FACTS_FEATURE,
-    crate::head_proof::VISIBILITY_LATE_FEATURE,
+    broca_records::head_proof::VISIBILITY_LATE_FEATURE,
     WRITER_ID_FEATURE,
     INTERRUPT_REASON_FEATURE,
     TURN_DIRECTIVES_FEATURE,
@@ -279,23 +271,6 @@ pub const KNOWN_FEATURES: &[&str] = &[
 /// Whether this build runs `compaction-v2/v1` sessions. A reader-only build sets it false: it
 /// decodes those frames but marks the log read-only, so a rollback never runs a mode-3 session.
 pub const RUNS_COMPACTION_V2: bool = true;
-
-/// Writer opens verify the same framing as reads. This build writes `compaction-v2/v1` sessions,
-/// so a writer accepts every feature a reader knows. (The 0.3.306 reader release refused that
-/// one feature here, which keeps a rollback from running mode-3 sessions.)
-pub(crate) fn decode_next_for_writer(buf: &[u8]) -> DecodeStep {
-    decode_projected_for_writer(buf, |seq, fence, payload| {
-        let record = serde_json::from_slice(payload)?;
-        Ok(FramedRecord { seq, fence, record })
-    })
-}
-
-pub(crate) fn decode_projected_for_writer<T>(
-    buf: &[u8],
-    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
-) -> DecodeStep<T> {
-    decode_projected_with(buf, KNOWN_FEATURES, project)
-}
 
 /// Not a WAL frame feature: no frame ever requires it, so its entry here is inert for the
 /// decoder. It is listed because this table is also what `--wal-known-features` reports to
@@ -424,27 +399,6 @@ fn compute_digest(ver: u8, seq: u64, fence: u64, payload: &[u8]) -> [u8; DIGEST_
     h.finalize().into()
 }
 
-/// Verify the fixed frame envelope without interpreting its version or payload.
-/// Intact bytes that this reader rejects may belong to a newer writer, not a crash.
-pub(crate) fn digest_verifies(buf: &[u8]) -> bool {
-    if buf.get(4) == Some(&V4_FRAMING_VERSION) {
-        return broca_wal_reader::frame::digest_verifies(buf);
-    }
-    if buf.len() < HEADER_LEN {
-        return false;
-    }
-    let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
-    let Some(total) = HEADER_LEN.checked_add(len) else {
-        return false;
-    };
-    if buf.len() < total {
-        return false;
-    }
-    let seq = u64::from_le_bytes(buf[5..13].try_into().unwrap());
-    let fence = u64::from_le_bytes(buf[13..21].try_into().unwrap());
-    compute_digest(buf[4], seq, fence, &buf[HEADER_LEN..total]).as_slice() == &buf[21..53]
-}
-
 /// Encode a record into its complete framed bytes.
 ///
 /// A [`WalRecord::Unknown`] is refused with `FrameError::Serialize`: it holds none of the
@@ -452,26 +406,6 @@ pub(crate) fn digest_verifies(buf: &[u8]) -> bool {
 /// empty placeholder.
 pub fn encode(seq: u64, fence: u64, record: &WalRecord) -> Result<Vec<u8>, FrameError> {
     encode_with_requires(seq, fence, &[], record)
-}
-
-/// Check caller-supplied bytes against the record whose features the writer will publish.
-/// The encoder's exact frame proves the sequence, fence, digest, single-frame boundary and
-/// required gates without assuming JSON decoding preserves every in-memory value.
-pub(crate) fn validate_preencoded(
-    bytes: &[u8],
-    seq: u64,
-    fence: u64,
-    record: &WalRecord,
-) -> Result<(), FrameError> {
-    let expected = encode(seq, fence, record)?;
-    if bytes != expected.as_slice() {
-        return Err(FrameError::Serialize(
-            <serde_json::Error as serde::ser::Error>::custom(
-                "preencoded WAL frame differs from its sequence, fence, record or requirements",
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Encode a record that may need features an older reader lacks.
@@ -529,116 +463,6 @@ pub fn v4_header_len(buf: &[u8]) -> Option<usize> {
 /// decodes can only agree.
 pub use broca_wal_reader::frame as v4;
 
-/// Encode an overhaul-root record with caller-supplied writer metadata. This is
-/// deliberately separate from legacy encoding: adding the codec must not turn
-/// version 4 writes on for existing state roots.
-pub fn encode_v4(
-    metadata: broca_wal_reader::frame::Metadata,
-    requires: &[&str],
-    record: &WalRecord,
-) -> Result<Vec<u8>, FrameError> {
-    let own = record.required_features();
-    let requires: Vec<&str> = requires.iter().chain(own.iter()).copied().collect();
-    let payload = serde_json::to_vec(record).map_err(FrameError::Serialize)?;
-    broca_wal_reader::frame::encode(metadata, &requires, &payload).map_err(|error| match error {
-        broca_wal_reader::Error::InvalidFeatureName { name } => {
-            FrameError::InvalidFeatureName { name }
-        }
-        error => FrameError::V4(error),
-    })
-}
-
-/// A record's version 4 frame, settled except for the two fields the writer stamps.
-///
-/// The only way to build one is [`PreparedV4Frame::prepare`], which serializes the record with
-/// the shared codec, digests it and fixes its must-understand names (the record's own plus
-/// [`FRAME_STAMPS_FEATURE`]). An overhaul log writes nothing else: it never accepts caller-built
-/// bytes, so every version 4 frame on disk is the codec's encoding of the record it was handed
-/// with. Serializing and digesting is the costly half of framing and may run on any thread; the
-/// log assembles the short header on its writer thread with the `appended_ms` sampled there and
-/// its own `writer_id`.
-#[derive(Debug)]
-pub struct PreparedV4Frame {
-    payload: Vec<u8>,
-    payload_sha256: [u8; 32],
-    requires: Vec<&'static str>,
-    header_len: usize,
-}
-
-impl PreparedV4Frame {
-    /// Serialize and digest `record`, and check that its header will encode. The header length
-    /// depends on the feature names, never on the stamped values, so [`Self::frame_len`] is the
-    /// exact size of the frame the log will write.
-    pub fn prepare(record: &WalRecord) -> Result<Self, FrameError> {
-        let payload = serde_json::to_vec(record).map_err(FrameError::Serialize)?;
-        let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
-        let mut requires = record.required_features().to_vec();
-        requires.push(FRAME_STAMPS_FEATURE);
-        let header_len = v4_header(
-            broca_wal_reader::frame::Metadata {
-                seq: 0,
-                fence: 0,
-                appended_ms: 0,
-                writer_id: [0; 16],
-            },
-            &requires,
-            payload.len(),
-            payload_sha256,
-        )?
-        .len();
-        Ok(Self {
-            payload,
-            payload_sha256,
-            requires,
-            header_len,
-        })
-    }
-
-    /// The bytes the finished frame occupies on disk, for append budgets.
-    pub fn frame_len(&self) -> usize {
-        self.header_len + self.payload.len()
-    }
-
-    /// Every must-understand name the frame's header lists. The machine's feature floor must
-    /// list them all before the frame is written.
-    pub fn requires(&self) -> &[&'static str] {
-        &self.requires
-    }
-
-    /// The complete frame, stamped with `metadata`. Only the log that writes it calls this.
-    pub(crate) fn stamp(
-        &self,
-        metadata: broca_wal_reader::frame::Metadata,
-    ) -> Result<Vec<u8>, FrameError> {
-        let mut frame = v4_header(
-            metadata,
-            &self.requires,
-            self.payload.len(),
-            self.payload_sha256,
-        )?;
-        frame.extend_from_slice(&self.payload);
-        Ok(frame)
-    }
-}
-
-/// The shared codec's version 4 header, with its feature-name refusal mapped to the same error a
-/// legacy gated frame reports.
-fn v4_header(
-    metadata: broca_wal_reader::frame::Metadata,
-    requires: &[&str],
-    payload_len: usize,
-    payload_sha256: [u8; 32],
-) -> Result<Vec<u8>, FrameError> {
-    broca_wal_reader::frame::encode_header(metadata, requires, payload_len, payload_sha256).map_err(
-        |error| match error {
-            broca_wal_reader::Error::InvalidFeatureName { name } => {
-                FrameError::InvalidFeatureName { name }
-            }
-            error => FrameError::V4(error),
-        },
-    )
-}
-
 /// The `appended_ms` a version 4 frame written now carries: the wall clock in milliseconds since
 /// the Unix epoch, never lower than any value this process has stamped before, so the field does
 /// not go backwards within one process when the wall clock does. A clock before the epoch reads
@@ -690,26 +514,6 @@ fn frame(ver: u8, seq: u64, fence: u64, payload: &[u8]) -> Result<Vec<u8>, Frame
 /// Fixed byte length of a lineage frame, for bounded identity checks without log replay.
 pub const LINEAGE_FRAME_LEN: usize = HEADER_LEN + LINEAGE_PAYLOAD_LEN as usize;
 
-/// Encode lineage metadata in the framing stream without consuming a record sequence number.
-///
-/// Returns a FIXED ARRAY rather than a `Vec` because this runs on EVERY append, not only on the
-/// legacy-mint path that needs it: `file_wal.rs` calls it unconditionally and only afterwards
-/// decides whether the bytes are used. A heap allocation per WAL append is pure waste for a
-/// frame whose length is known at compile time.
-pub(crate) fn encode_lineage(lineage_id: WalLineageId) -> [u8; LINEAGE_FRAME_LEN] {
-    let payload = lineage_id.as_bytes();
-    let digest = compute_digest(LINEAGE_FRAMING_VERSION, 0, 0, &payload);
-
-    let mut out = [0u8; LINEAGE_FRAME_LEN];
-    out[0..4].copy_from_slice(&LINEAGE_PAYLOAD_LEN.to_le_bytes());
-    out[4] = LINEAGE_FRAMING_VERSION;
-    out[5..13].copy_from_slice(&0u64.to_le_bytes());
-    out[13..21].copy_from_slice(&0u64.to_le_bytes());
-    out[21..53].copy_from_slice(&digest);
-    out[53..69].copy_from_slice(&payload);
-    out
-}
-
 /// Outcome of decoding one frame from a byte cursor.
 pub enum DecodeStep<T = FramedRecord> {
     /// A complete, digest-verified record + how many bytes it consumed. Boxed: the
@@ -755,16 +559,6 @@ fn decode_next_with(buf: &[u8], known: &[&str]) -> DecodeStep {
     })
 }
 
-/// Project a verified frame without constructing a full record. Feature requirements are
-/// still checked before the projection, so an admission index cannot skip a newer writer.
-/// The projection receives only the record JSON, with any gated envelope already removed.
-pub(crate) fn decode_projected<T>(
-    buf: &[u8],
-    project: impl FnOnce(u64, u64, &[u8]) -> Result<T, serde_json::Error>,
-) -> DecodeStep<T> {
-    decode_projected_with(buf, KNOWN_FEATURES, project)
-}
-
 fn decode_projected_with<T>(
     buf: &[u8],
     known: &[&str],
@@ -772,13 +566,6 @@ fn decode_projected_with<T>(
 ) -> DecodeStep<T> {
     decode_projected_with_requirements(buf, known, |seq, fence, payload, _| {
         project(seq, fence, payload)
-    })
-}
-
-pub(crate) fn decode_with_run_requirement(buf: &[u8]) -> DecodeStep<(FramedRecord, bool)> {
-    decode_projected_with_requirements(buf, KNOWN_FEATURES, |seq, fence, payload, read_only| {
-        let record = serde_json::from_slice(payload)?;
-        Ok((FramedRecord { seq, fence, record }, read_only))
     })
 }
 
@@ -953,32 +740,6 @@ mod service_tier_queue_tests;
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn recovery_completion_requires_the_recovery_reader_feature() {
-        use super::*;
-        let record: WalRecord = serde_json::from_str(
-            r#"{"type":"recovery_call_closed","cut_id":"cut-1","run_id":"removed-r","call_key":"lineage:4","tool_call_id":"call_0","outcome":"unknown","result":{"tool_call_id":"call_0","output":{"kind":"error","message":"outcome_unknown"},"is_error":true}}"#,
-        ).unwrap();
-        let bytes = encode_v4(
-            v4::Metadata {
-                seq: 1,
-                fence: 1,
-                appended_ms: 0,
-                writer_id: [1; 16],
-            },
-            &[FRAME_STAMPS_FEATURE],
-            &record,
-        )
-        .unwrap();
-        assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
-        let older: Vec<_> = KNOWN_FEATURES
-            .iter()
-            .copied()
-            .filter(|feature| *feature != crate::recovery::FEATURE)
-            .collect();
-        assert!(matches!(decode_next_with(&bytes, &older),
-            DecodeStep::NewerWriter { missing, .. } if missing == [crate::recovery::FEATURE]));
-    }
 
     #[test]
     fn message_times_require_an_understanding_reader() {
@@ -1032,140 +793,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn incarnation_requires_a_uuid_v4_header() {
-        use super::*;
-        assert!(WalLineageId::from_bytes([0; 16]).incarnation().is_none());
-        let mut bytes = [1; 16];
-        bytes[6] = 0x41;
-        bytes[8] = 0x81;
-        let id = WalLineageId::from_bytes(bytes);
-        assert_eq!(id.incarnation(), Some(id.to_string()));
-    }
     use super::*;
     use broca_protocol::StepId;
 
     fn rec(n: u64) -> WalRecord {
         WalRecord::TurnFinished { step_id: StepId(n) }
-    }
-
-    fn v4_metadata() -> broca_wal_reader::frame::Metadata {
-        broca_wal_reader::frame::Metadata {
-            seq: 7,
-            fence: 3,
-            appended_ms: 123,
-            writer_id: [5; 16],
-        }
-    }
-
-    #[test]
-    fn v4_round_trip_and_projection_delegate_to_shared_codec() {
-        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
-        assert_eq!(bytes[4], V4_FRAMING_VERSION);
-        assert!(digest_verifies(&bytes));
-        match decode_next(&bytes) {
-            DecodeStep::Record { framed, consumed } => {
-                assert_eq!(consumed, bytes.len());
-                assert_eq!((framed.seq, framed.fence), (7, 3));
-                assert_eq!(framed.record, rec(1));
-            }
-            _ => panic!("expected v4 record"),
-        }
-        assert!(matches!(
-            decode_projected(&bytes, |seq, fence, payload| {
-                assert_eq!((seq, fence), (7, 3));
-                serde_json::from_slice::<WalRecord>(payload)
-            }),
-            DecodeStep::Record { .. }
-        ));
-        // Existing roots must not start writing v4 merely because it is readable.
-        assert_eq!(encode(7, 3, &rec(1)).unwrap()[4], FRAMING_VERSION);
-    }
-
-    #[test]
-    fn v4_unknown_features_refuse_before_record_projection() {
-        for feature in ["future-content/v1", "bill-future/v1"] {
-            let bytes =
-                broca_wal_reader::frame::encode(v4_metadata(), &[feature], b"not JSON").unwrap();
-            match decode_projected::<()>(&bytes, |_, _, _| {
-                panic!("must not interpret unknown record")
-            }) {
-                DecodeStep::NewerWriter { ver, missing } => {
-                    assert_eq!(ver, V4_FRAMING_VERSION);
-                    assert_eq!(missing, vec![feature]);
-                }
-                _ => panic!("unknown feature must refuse the whole log"),
-            }
-        }
-    }
-
-    #[test]
-    fn v4_own_features_are_required_and_unknown_names_do_not_panic_writer() {
-        let mut value: serde_json::Value = serde_json::from_str(
-            include_str!("../tests/fixtures/before_message_times.jsonl")
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        value["written_at_ms"] = serde_json::json!(42);
-        value["session_class"] = serde_json::json!("head");
-        value["config"]["budget"] = serde_json::json!({"max_input_tokens":5});
-        let record: WalRecord = serde_json::from_value(value).unwrap();
-        let bytes = encode_v4(v4_metadata(), &["future-content/v1"], &record).unwrap();
-        let header = broca_wal_reader::frame::decode_header(&bytes)
-            .unwrap()
-            .unwrap();
-        for feature in record.required_features() {
-            assert!(header.requires.iter().any(|name| name == feature));
-        }
-        assert!(matches!(
-            decode_next(&bytes),
-            DecodeStep::NewerWriter { .. }
-        ));
-        assert!(matches!(
-            encode_v4(v4_metadata(), &["Bad/v1"], &record),
-            Err(FrameError::InvalidFeatureName { .. })
-        ));
-    }
-
-    #[test]
-    fn v4_corruption_distinguishes_header_from_payload() {
-        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
-        let mut header_bad = bytes.clone();
-        header_bad[21] ^= 1;
-        assert!(matches!(
-            decode_next(&header_bad),
-            DecodeStep::Corrupt(FrameError::V4(
-                broca_wal_reader::Error::HeaderCorrupt { .. }
-            ))
-        ));
-        let mut payload_bad = bytes;
-        *payload_bad.last_mut().unwrap() ^= 1;
-        assert!(matches!(
-            decode_next(&payload_bad),
-            DecodeStep::Corrupt(FrameError::DigestMismatch { seq: 7 })
-        ));
-    }
-
-    #[test]
-    fn v4_broca_unlinks_log_held_open_by_reader() {
-        use std::io::Read;
-        let dir = broca_test_support::scratch_root()
-            .join(format!("v4-reader-unlink-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("session.wal");
-        let bytes = encode_v4(v4_metadata(), &[], &rec(1)).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
-        let mut held = broca_wal_reader::open_log(&path).unwrap();
-        std::fs::remove_file(&path)
-            .expect("a read-only billing handle must not block broca's unlink");
-        assert!(!path.exists());
-        let mut read = Vec::new();
-        held.read_to_end(&mut read).unwrap();
-        assert_eq!(read, bytes);
-        drop(held);
-        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
@@ -1259,94 +891,6 @@ mod tests {
         }
     }
 
-    /// A digest-valid frame carrying a record type from a newer build decodes as a record, not
-    /// as corruption, and the framing refuses to write the lossy placeholder back out.
-    #[test]
-    fn a_frame_with_an_unknown_record_type_decodes_and_is_never_re_encoded() {
-        let bytes = encode_payload(
-            4,
-            2,
-            br#"{"type":"attempt_digest_from_a_newer_build","attempt":1}"#,
-        )
-        .unwrap();
-        match decode_next(&bytes) {
-            DecodeStep::Record { framed, consumed } => {
-                assert_eq!(consumed, bytes.len());
-                assert_eq!((framed.seq, framed.fence), (4, 2));
-                assert_eq!(framed.record, WalRecord::Unknown);
-            }
-            _ => panic!("expected a record"),
-        }
-        assert!(matches!(
-            encode(5, 2, &WalRecord::Unknown),
-            Err(FrameError::Serialize(_))
-        ));
-    }
-
-    #[test]
-    fn lineage_metadata_round_trips_outside_the_record_sequence() {
-        let lineage_id = WalLineageId::from_bytes([0x5a; 16]);
-        let bytes = encode_lineage(lineage_id);
-        match decode_next(&bytes) {
-            DecodeStep::Lineage {
-                lineage_id: decoded,
-                consumed,
-            } => {
-                assert_eq!(decoded, lineage_id);
-                assert_eq!(consumed, bytes.len());
-            }
-            _ => panic!("expected lineage metadata"),
-        }
-    }
-
-    /// Pins the lineage frame's EXACT WIRE BYTES for a known identity.
-    ///
-    /// The round-trip test above cannot catch a layout change, because it encodes and decodes
-    /// with the same code: reorder two fields and both halves agree with each other while every
-    /// WAL already on disk becomes unreadable. This asserts the bytes themselves, so the layout
-    /// is pinned independently of the encoder that produces it.
-    ///
-    /// If this fails, the framing changed. That is a DURABILITY BREAK for every existing WAL,
-    /// not a golden to refresh -- fix the encoder rather than the expectation.
-    #[test]
-    fn lineage_frame_wire_bytes_are_pinned() {
-        let bytes = encode_lineage(WalLineageId::from_bytes([0x5a; 16]));
-
-        assert_eq!(bytes.len(), LINEAGE_FRAME_LEN);
-        assert_eq!(LINEAGE_FRAME_LEN, 69, "header 53 + identity 16");
-
-        // Field-by-field, at fixed offsets, so a failure names WHICH field moved.
-        assert_eq!(&bytes[0..4], &16u32.to_le_bytes(), "payload length");
-        assert_eq!(bytes[4], 2, "lineage framing version");
-        assert_eq!(
-            &bytes[5..13],
-            &0u64.to_le_bytes(),
-            "seq: consumes no record number"
-        );
-        assert_eq!(&bytes[13..21], &0u64.to_le_bytes(), "fence");
-        assert_eq!(&bytes[53..69], &[0x5a; 16], "identity payload");
-
-        // THE DIGEST IS A FROZEN LITERAL, COMPUTED OUTSIDE THIS CRATE.
-        //
-        // It was first asserted as `compute_digest(2, 0, 0, &[0x5a; 16])`, reasoning that this
-        // test is about LAYOUT and the digest only needs to be non-blank. That was wrong, and it
-        // reintroduced the very defect this test exists to close: the encoder, the decoder AND
-        // that assertion all call `compute_digest`, so a change to its domain moved all three
-        // together. Swapping seq/fence inside the hash left the ENTIRE broca-wal suite green
-        // while every frame already on disk would decode as DigestMismatch.
-        //
-        // sha256 over: version byte 0x02, seq 0u64 LE, fence 0u64 LE, payload [0x5a; 16].
-        // An expectation derived from the code under test cannot detect a change to that code.
-        // If this literal ever needs updating, the framing changed and every existing WAL is
-        // unreadable — fix the encoder, not this array.
-        const EXPECTED_DIGEST: [u8; 32] = [
-            0xb8, 0xc1, 0xc2, 0x6f, 0x10, 0xd3, 0xd6, 0x36, 0xff, 0x9d, 0x9d, 0x83, 0x61, 0x97,
-            0x15, 0x8a, 0x04, 0x82, 0xd1, 0x39, 0x75, 0xcc, 0x1b, 0x7c, 0x52, 0xa3, 0xf1, 0x43,
-            0xac, 0x76, 0x45, 0x80,
-        ];
-        assert_eq!(&bytes[21..53], &EXPECTED_DIGEST[..], "digest");
-    }
-
     /// Pins the EXACT WIRE BYTES of an ordinary record frame (framing version 1).
     ///
     /// Every WAL on disk is made of these frames, so a change to their layout or to the digest
@@ -1408,154 +952,6 @@ mod tests {
             }
             _ => panic!("expected an unsupported-version refusal"),
         }
-    }
-
-    #[test]
-    fn recovery_cut_is_a_must_understand_overhaul_record() {
-        let record: WalRecord = serde_json::from_value(serde_json::json!({
-            "type":"recovery_cut", "cut_id":"cut", "sidecar_basename":"log.cut-1",
-            "cut_offset":69, "removed_len":1, "removed_sha256":"digest",
-            "reason":"unproven_corruption", "active_run":null, "runs":[], "unattributed_tool_risk":true
-        })).unwrap();
-        assert_eq!(record.required_features(), &[crate::recovery::FEATURE]);
-        let frame = PreparedV4Frame::prepare(&record)
-            .unwrap()
-            .stamp(v4::Metadata {
-                seq: 1,
-                fence: 1,
-                appended_ms: 1,
-                writer_id: [1; 16],
-            })
-            .unwrap();
-        let older: Vec<_> = KNOWN_FEATURES
-            .iter()
-            .copied()
-            .filter(|name| *name != crate::recovery::FEATURE)
-            .collect();
-        assert!(
-            matches!(decode_next_with(&frame, &older), DecodeStep::NewerWriter { missing, .. }
-            if missing == [crate::recovery::FEATURE])
-        );
-        assert!(
-            matches!(decode_next(&frame), DecodeStep::Record { framed, .. } if framed.record == record)
-        );
-    }
-
-    /// The production `KNOWN_FEATURES` table holds exactly the features this build interprets.
-    /// A name enters it only with the release that reads its records, so a build never claims
-    /// to understand a frame it would misread; the test-only name is never in it.
-    #[test]
-    fn the_shipped_known_feature_table_holds_exactly_the_interpreted_features() {
-        assert_eq!(
-            KNOWN_FEATURES,
-            &[
-                ACCOUNT_LIMIT_PAUSE_FEATURE,
-                crate::recovery::FEATURE,
-                BILL_ATTEMPTS_FEATURE,
-                BILL_VAULT_FACTS_FEATURE,
-                crate::head_proof::VISIBILITY_LATE_FEATURE,
-                "writer-id/v1",
-                INTERRUPT_REASON_FEATURE,
-                TURN_DIRECTIVES_FEATURE,
-                AGENT_RUN_SCOPE_FEATURE,
-                ARCHIVE_INDEX_V2_FEATURE,
-                SESSION_STORAGE_FEATURE,
-                AUTH_SELECTION_METHOD_FEATURE,
-                CHATGPT_CODEX_WIRE_FEATURE,
-                CLIENT_MESSAGE_ID_FEATURE,
-                COMPACTION_RIDE_WAIT_FEATURE,
-                COMPACTION_V2_FEATURE,
-                COMPACTION_VIEW_META_FEATURE,
-                COMPACTION_VIEW_NEGOTIATION_FEATURE,
-                COMPACTION_VIEW_FEATURE,
-                COMPACTION_WAIT_FEATURE,
-                COMPACTION_FEATURE,
-                CONTEXT_CEILING_FEATURE,
-                DEFERRED_CALL_FEATURE,
-                DELIVERY_ORDER_FEATURE,
-                TURN_SYSTEM_FEATURE,
-                DISPATCH_MODULE_FEATURE,
-                FLOW_SCOPE_FEATURE,
-                FRAME_STAMPS_FEATURE,
-                GOOGLE_RPC_ERROR_DETAILS_FEATURE,
-                INPUT_TOKEN_CAP_FEATURE,
-                MEDIA_CONTENT_FEATURE,
-                MESSAGE_MARKS_FEATURE,
-                SPEAKS_FOR_NAME_FEATURE,
-                OPENROUTER_REASONING_FEATURE,
-                OUTPUT_RESERVATION_FEATURE,
-                PLAN_MANIFEST_FEATURE,
-                PLAN_REFERENCE_SLOTS_FEATURE,
-                PROVIDER_DECLARATIONS_FEATURE,
-                PROVIDER_FALLBACK_BLOCK_FEATURE,
-                TOOL_SCHEMA_PINS_FEATURE,
-                PROVIDER_HELD_FEATURE,
-                PROVIDER_TEXT_STATE_FEATURE,
-                REFUSAL_FALLBACK_FEATURE,
-                RESTART_PAUSE_FEATURE,
-                RETENTION_FEATURE,
-                RIDES_V2_FEATURE,
-                RUNNER_TAGS_FEATURE,
-                RUNNER_TAGS_V2_FEATURE,
-                RUN_CANCEL_AT_FEATURE,
-                SCOPE_FEATURE,
-                SERVICE_TIER_QUEUE_FEATURE,
-                SESSION_CHANGE_FEATURE,
-                SESSION_CLASS_FEATURE,
-                STEER_QUEUE_FEATURE,
-                STEP_TRANSFORMS_FEATURE,
-                STRUCTURED_OUTPUT_FEATURE,
-                STRUCTURED_OUTPUT_DOWNGRADE_FEATURE,
-                STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
-                TOOL_REPLY_FEATURE,
-                TOOL_NAME_ALIASES_FEATURE,
-                TOOL_TIMES_FEATURE,
-                MESSAGE_TIMES_FEATURE,
-            ]
-        );
-        assert_eq!(TOOL_REPLY_FEATURE, "tool-reply/v1");
-        assert_eq!(BILL_ATTEMPTS_FEATURE, "bill-attempts/v1");
-        assert_eq!(MESSAGE_TIMES_FEATURE, "message-times/v1");
-        assert_eq!(SPEAKS_FOR_NAME_FEATURE, "speaks-for-name/v1");
-        assert_eq!(OUTPUT_RESERVATION_FEATURE, "output-reservation/v1");
-        assert_eq!(RUNNER_TAGS_FEATURE, "runner-tags/v1");
-        assert_eq!(RUNNER_TAGS_V2_FEATURE, "runner-tags/v2");
-        assert_eq!(ARCHIVE_INDEX_V2_FEATURE, "archive-index/v2");
-        assert_eq!(COMPACTION_FEATURE, "compaction/v1");
-        assert_eq!(COMPACTION_V2_FEATURE, "compaction-v2/v1");
-        assert_eq!(COMPACTION_WAIT_FEATURE, "compaction-wait/v1");
-        assert_eq!(DEFERRED_CALL_FEATURE, "deferred-call/v1");
-        assert_eq!(DISPATCH_MODULE_FEATURE, "dispatch-module/v1");
-        assert_eq!(PLAN_MANIFEST_FEATURE, "plan-manifest/v1");
-        assert_eq!(PLAN_REFERENCE_SLOTS_FEATURE, "plan-reference-slots/v1");
-        assert_eq!(PROVIDER_DECLARATIONS_FEATURE, "provider-declarations/v1");
-        assert_eq!(TOOL_SCHEMA_PINS_FEATURE, "tool-schema-pins/v1");
-        assert_eq!(PROVIDER_TEXT_STATE_FEATURE, "provider-text-state/v1");
-        assert_eq!(
-            PROVIDER_FALLBACK_BLOCK_FEATURE,
-            "provider-fallback-block/v1"
-        );
-        assert_eq!(REFUSAL_FALLBACK_FEATURE, "refusal-fallback/v1");
-        assert_eq!(CHATGPT_CODEX_WIRE_FEATURE, "chatgpt-codex-wire/v1");
-        assert_eq!(OPENROUTER_REASONING_FEATURE, "openrouter-reasoning/v1");
-        assert_eq!(RESTART_PAUSE_FEATURE, "restart-pause/v1");
-        assert_eq!(PROVIDER_HELD_FEATURE, "provider-held/v1");
-        assert_eq!(SCOPE_FEATURE, "scope/v1");
-        assert_eq!(SESSION_CHANGE_FEATURE, "session-change/v1");
-        assert_eq!(FLOW_SCOPE_FEATURE, "flow-scopes/v1");
-        assert_eq!(
-            GOOGLE_RPC_ERROR_DETAILS_FEATURE,
-            "google-rpc-error-details/v1"
-        );
-        assert_eq!(INPUT_TOKEN_CAP_FEATURE, "input-token-cap/v1");
-        assert_eq!(AUTH_SELECTION_METHOD_FEATURE, "auth-selection-method/v1");
-        assert_eq!(STEER_QUEUE_FEATURE, "steer-queue/v1");
-        assert_eq!(STEP_TRANSFORMS_FEATURE, "step-transforms/v1");
-        assert_eq!(STRUCTURED_OUTPUT_FEATURE, "structured-output/v1");
-        assert_eq!(
-            STRUCTURED_OUTPUT_PARAGRAPH_FEATURE,
-            "structured-output-paragraph/v1"
-        );
     }
 
     /// A run start or refreeze whose frozen structured output carries the instructions
@@ -1918,7 +1314,6 @@ mod tests {
     }
 
     fn chatgpt_wire_gate(mut value: serde_json::Value, pointer: &str) {
-        use crate::file_wal::Wal;
         let older: Vec<_> = KNOWN_FEATURES
             .iter()
             .copied()
@@ -1943,37 +1338,6 @@ mod tests {
         let record: WalRecord = serde_json::from_value(value.clone()).unwrap();
         let bytes = encode(1, 1, &record).unwrap();
         assert_eq!(bytes[4], GATED_FRAMING_VERSION);
-        let root = broca_test_support::scratch_root().join(format!(
-            "codex-floor-{}-{}",
-            std::process::id(),
-            pointer.replace('/', "-")
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let floor = root.join("floor");
-        std::fs::write(&floor, b"not a directory").unwrap();
-        let wal_path = root.join("writer.wal");
-        let mut wal = crate::file_wal::FileWal::open(&wal_path)
-            .unwrap()
-            .with_feature_floor(floor.join("feature-floor"));
-        wal.append(1, &legacy, true).unwrap();
-        let before_append = std::fs::metadata(&wal_path).unwrap().len();
-        assert!(wal.append(1, &record, true).is_err());
-        assert_eq!(
-            std::fs::metadata(&wal_path).unwrap().len(),
-            before_append,
-            "floor failure must prevent the gated append"
-        );
-        drop(wal);
-        std::fs::remove_file(&floor).unwrap();
-        let mut wal = crate::file_wal::FileWal::open(&wal_path)
-            .unwrap()
-            .with_feature_floor(&floor);
-        wal.append(1, &record, true).unwrap();
-        assert!(std::fs::read_to_string(&floor)
-            .unwrap()
-            .contains(CHATGPT_CODEX_WIRE_FEATURE));
-        drop(wal);
-        std::fs::remove_dir_all(root).unwrap();
         assert!(
             matches!(decode_next_with(&bytes, &older), DecodeStep::NewerWriter { missing, .. } if missing == [CHATGPT_CODEX_WIRE_FEATURE])
         );
@@ -2133,46 +1497,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_times_publish_the_feature_floor_before_the_first_timed_record() {
-        use crate::{FileWal, Wal, WalError};
-        let root = broca_test_support::scratch_root().join(format!(
-            "tool-times-floor-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = root.join("session.wal");
-        let floor = root.join("wal-feature-floor");
-        let legacy: WalRecord = serde_json::from_value(serde_json::json!({
-            "type":"tool_no_dispatch","batch_id":"b","tool_call_id":"c",
-            "reason":{"kind":"denied","reason":"no"}
-        }))
-        .unwrap();
-        let mut value = serde_json::to_value(&legacy).unwrap();
-        value["dispatched_at_ms"] = serde_json::json!(1_800_000_000_123_u64);
-        let timed: WalRecord = serde_json::from_value(value).unwrap();
-        let mut wal = FileWal::open(&path).unwrap();
-        wal.append(1, &legacy, true).unwrap();
-        let before = std::fs::read(&path).unwrap();
-        assert!(!floor.exists());
-        assert!(matches!(
-            wal.append(1, &timed, true),
-            Err(WalError::FeatureFloor { path: None, .. })
-        ));
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        drop(wal);
-        let mut wal = FileWal::open(&path).unwrap().with_feature_floor(&floor);
-        wal.append(1, &timed, true).unwrap();
-        assert_eq!(
-            crate::floor::read_floor(&floor).unwrap(),
-            std::collections::BTreeSet::from([TOOL_TIMES_FEATURE.to_owned()])
-        );
-        assert_eq!(wal.replay().unwrap().last().unwrap().record, timed);
-    }
-
-    #[test]
     fn deferred_tool_times_are_must_understand_and_legacy_times_are_absent() {
         let older: Vec<_> = KNOWN_FEATURES
             .iter()
@@ -2230,45 +1554,6 @@ mod tests {
         assert!(matches!(decode_next_with(&bytes, &older),
             DecodeStep::NewerWriter { missing, .. } if missing == [DELIVERY_ORDER_FEATURE]));
         assert!(matches!(decode_next(&bytes), DecodeStep::Record { .. }));
-    }
-
-    #[test]
-    fn compaction_records_require_their_features_and_refuse_older_readers() {
-        for json in include_str!("../tests/fixtures/compaction_records.jsonl").lines() {
-            let record: WalRecord = serde_json::from_str(json).unwrap();
-            let feature = if json.contains(r#""type":"compaction_wait""#) {
-                "compaction-wait/v1"
-            } else {
-                "compaction/v1"
-            };
-            assert_eq!(record.required_features(), &[feature]);
-            assert!(!record.is_informational());
-            let bytes = encode(7, 3, &record).unwrap();
-            assert_eq!(bytes[4], GATED_FRAMING_VERSION);
-            let DecodeStep::Record { framed, consumed } = decode_next(&bytes) else {
-                panic!("reader release must decode {json}");
-            };
-            assert_eq!(consumed, bytes.len());
-            assert_eq!(framed.record, record);
-            let older: Vec<&str> = KNOWN_FEATURES
-                .iter()
-                .copied()
-                .filter(|known| *known != feature)
-                .collect();
-            assert!(
-                matches!(decode_next_with(&bytes, &older),
-                DecodeStep::NewerWriter { missing, .. } if missing == [feature]),
-                "{json}"
-            );
-
-            // Refusal happens before interpreting a newer writer's closed-set values.
-            let payload = format!(
-                r#"{{"requires":["{feature}"],"record":{{"type":"compaction_message","kind":"future"}}}}"#
-            );
-            let future = frame(GATED_FRAMING_VERSION, 7, 3, payload.as_bytes()).unwrap();
-            assert!(matches!(decode_next_with(&future, &older),
-                DecodeStep::NewerWriter { missing, .. } if missing == [feature]));
-        }
     }
 
     #[test]
@@ -3097,28 +2382,6 @@ mod v4_header_len_tests {
             );
         }
     }
-
-    #[test]
-    fn a_prepared_frame_measures_the_frame_it_stamps() {
-        for record in [
-            WalRecord::TurnFinished {
-                step_id: broca_protocol::StepId(3),
-            },
-            WalRecord::InputTokenCapFrozen { limit: 9 },
-        ] {
-            let prepared = PreparedV4Frame::prepare(&record).unwrap();
-            assert!(prepared.requires().contains(&FRAME_STAMPS_FEATURE));
-            let frame = prepared
-                .stamp(broca_wal_reader::frame::Metadata {
-                    seq: 4,
-                    fence: 2,
-                    appended_ms: u64::MAX,
-                    writer_id: [1; 16],
-                })
-                .unwrap();
-            assert_eq!(frame.len(), prepared.frame_len(), "{record:?}");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3153,8 +2416,6 @@ mod view_negotiation_tests {
 #[cfg(test)]
 #[path = "framing/account_limit_pause_tests.rs"]
 mod account_limit_pause_tests;
-#[cfg(test)]
-mod vault_facts_tests;
 
 #[cfg(test)]
 mod turn_system_tests;

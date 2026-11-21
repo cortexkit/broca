@@ -3,7 +3,7 @@ use broca_provider::wire::ClaudeCodePersona;
 
 /// Keep upstream routing scoped to the full bind triple, as Claude Code identities are.
 pub fn for_session(session: &BindIdentity) -> String {
-    let reference = broca_core::wal_writer::legacy_session_ref(
+    let reference = broca_core::session_refs::legacy_session_ref(
         &session.harness,
         &session.project_root.to_string_lossy(),
         &session.session,

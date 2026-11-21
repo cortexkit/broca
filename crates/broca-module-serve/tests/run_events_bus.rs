@@ -158,7 +158,7 @@ async fn provision(conn: &NatsConnection, names: &AccountNames) -> NatsPublisher
 fn run_events(session: &BindIdentity, run_id: &str) -> Vec<RunEvent> {
     let event = |seq, detail| RunEvent {
         v: 1,
-        session_ref: broca_core::wal_writer::agent_session_ref(session),
+        session_ref: broca_core::session_refs::agent_session_ref(session),
         run_id: run_id.into(),
         seq,
         at_ms: now_ms(),
@@ -246,7 +246,7 @@ async fn real_bus_headers_digest_sequence_and_ack_retention() {
         assert_eq!(delivery.message.headers["run_id"], "bus-run");
         assert_eq!(
             delivery.message.headers["session_ref"],
-            broca_core::wal_writer::agent_session_ref(&session)
+            broca_core::session_refs::agent_session_ref(&session)
         );
         let broca_wire::RunEventGetResponse::Found { event_key, jcs } = registry
             .run_event_get(&session, &delivery.message.id)

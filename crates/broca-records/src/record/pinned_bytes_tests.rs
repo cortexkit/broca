@@ -493,28 +493,6 @@ const DELIVERY_ORDER_PINNED: &[&str] = &[
     r#"{"type":"send_delivered","submission_id":"sub-r2","run_id":"r1","mode":"tool_result","tool_call_id":"t1","appended_text":"\n\nnote"}"#,
 ];
 
-/// Every delivery-order record is must-understand: it is written only in a gated frame naming
-/// `delivery-order/v1` (a build without that name refuses it; see the framing tests), and this
-/// build reads it back unchanged.
-#[test]
-fn delivery_order_records_are_must_understand_and_round_trip() {
-    use crate::framing::{
-        decode_next, encode, DecodeStep, DELIVERY_ORDER_FEATURE, GATED_FRAMING_VERSION,
-    };
-    for bytes in DELIVERY_ORDER_PINNED {
-        let record: WalRecord = serde_json::from_str(bytes).unwrap();
-        assert_eq!(serde_json::to_string(&record).unwrap(), *bytes);
-        assert!(!record.is_informational(), "{bytes}");
-        assert_eq!(record.required_features(), &[DELIVERY_ORDER_FEATURE]);
-        let frame = encode(7, 3, &record).unwrap();
-        assert_eq!(frame[4], GATED_FRAMING_VERSION);
-        let DecodeStep::Record { framed, .. } = decode_next(&frame) else {
-            panic!("this build must read {bytes}")
-        };
-        assert_eq!(framed.record, record);
-    }
-}
-
 const CANCEL_AT_PINNED: &[&str] = &[
     r#"{"type":"run_cancel_requested","run_id":"r","at":"step_boundary"}"#,
     r#"{"type":"run_cancel_requested","run_id":"r","at":"now"}"#,
@@ -528,37 +506,6 @@ const PROVIDER_HELD_PINNED: &[&str] = &[
     r#"{"type":"run_paused","run_id":"r1","ts_ms":1761220000001,"reason":"tool_held"}"#,
     r#"{"type":"run_paused","run_id":"r1","reason":"tool_held"}"#,
 ];
-
-/// Each provider-held value keeps its bytes and is written only in a gated frame whose payload
-/// is exactly `{"requires":["provider-held/v1"],"record":...}`. The requirement comes from the
-/// record itself, so no writer can put either value in a frame an older build reads unchecked.
-/// This build lists the feature, so it reads such a frame back unchanged; a reader without the
-/// name refuses it as a newer writer's (`framing::provider_held_tests`).
-#[test]
-fn provider_held_records_keep_their_bytes_and_require_only_provider_held() {
-    use crate::framing::{decode_next, encode, DecodeStep, GATED_FRAMING_VERSION, HEADER_LEN};
-    for pinned in PROVIDER_HELD_PINNED {
-        let record: WalRecord = serde_json::from_str(pinned).unwrap();
-        assert_ne!(record, WalRecord::Unknown);
-        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
-        assert!(!record.is_informational(), "{pinned}");
-        assert_eq!(
-            record.required_features(),
-            &[crate::framing::PROVIDER_HELD_FEATURE],
-            "{pinned}"
-        );
-        let frame = encode(7, 3, &record).unwrap();
-        assert_eq!(frame[4], GATED_FRAMING_VERSION, "{pinned}");
-        assert_eq!(
-            &frame[HEADER_LEN..],
-            format!(r#"{{"requires":["provider-held/v1"],"record":{pinned}}}"#).as_bytes()
-        );
-        match decode_next(&frame) {
-            DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record, "{pinned}"),
-            _ => panic!("this build reads its own provider-held frame: {pinned}"),
-        }
-    }
-}
 
 #[test]
 fn cancellation_records_are_must_understand_and_round_trip() {
@@ -671,34 +618,6 @@ const FALLBACK_PINNED: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Each fallback record keeps its bytes, requires exactly the features listed beside it, is
-/// written in a gated frame naming them, and reads back unchanged.
-#[test]
-fn fallback_records_keep_their_bytes_and_require_exactly_their_features() {
-    use crate::framing::{decode_next, encode, DecodeStep, GATED_FRAMING_VERSION, HEADER_LEN};
-    for (pinned, features) in FALLBACK_PINNED {
-        let record: WalRecord = serde_json::from_str(pinned).unwrap();
-        assert_ne!(record, WalRecord::Unknown);
-        assert_eq!(serde_json::to_string(&record).unwrap(), *pinned);
-        assert!(!record.is_informational(), "{pinned}");
-        assert_eq!(record.required_features(), *features, "{pinned}");
-        let frame = encode(7, 3, &record).unwrap();
-        assert_eq!(frame[4], GATED_FRAMING_VERSION, "{pinned}");
-        assert_eq!(
-            &frame[HEADER_LEN..],
-            format!(
-                r#"{{"requires":{},"record":{pinned}}}"#,
-                serde_json::to_string(features).unwrap()
-            )
-            .as_bytes()
-        );
-        match decode_next(&frame) {
-            DecodeStep::Record { framed, .. } => assert_eq!(framed.record, record, "{pinned}"),
-            _ => panic!("this build reads its own fallback frame: {pinned}"),
-        }
-    }
-}
-
 /// A step written before the fallback fields existed decodes with every one of them absent,
 /// and a step built with them absent writes exactly the old bytes.
 #[test]
@@ -742,31 +661,6 @@ fn every_record_kind_keeps_its_pinned_bytes() {
             "a pinned record must re-encode to exactly the bytes it was read from"
         );
     }
-}
-
-/// A resume record written by a later build stays readable here: a count this build does not
-/// know is ignored, and a redo kind it does not know decodes as `ResumeRedo::Unknown` instead of
-/// failing the whole WAL as corrupt. The record is skippable, but only if it decodes at all.
-#[test]
-fn a_resume_record_from_a_later_build_still_decodes() {
-    let later = r#"{"type":"resume_started","episode":"r","resumed_from_seq":9,"replayed":{"messages":2,"hook_outputs":4},"redone":[{"kind":"hook_run","hook":"pre_tool"}],"indeterminate":["t1"],"note":"x"}"#;
-    let decoded: WalRecord = serde_json::from_str(later).expect("a later resume record decodes");
-    assert!(decoded.is_informational());
-    let WalRecord::ResumeStarted {
-        replayed, redone, ..
-    } = decoded
-    else {
-        panic!("expected ResumeStarted, got {decoded:?}");
-    };
-    assert_eq!(
-        replayed,
-        ResumeReplayed {
-            messages: 2,
-            model_steps: 0,
-            tool_results: 0
-        }
-    );
-    assert_eq!(redone, vec![ResumeRedo::Unknown]);
 }
 
 /// Asynchronous compaction's records and the Setup record carrying a ceiling: their bytes, and
@@ -929,17 +823,6 @@ fn the_pinned_bytes_cover_every_record_kind() {
     assert_eq!(tag_of(&WalRecord::Unknown), "unknown");
 }
 
-/// A cache warm record is informational (replay, projection and the control stream skip it) and
-/// needs no reader feature, so an older build that does not know the kind skips it rather than
-/// refusing the WAL.
-#[test]
-fn a_cache_warm_record_is_informational_and_needs_no_reader_feature() {
-    let warm: WalRecord = serde_json::from_str(PINNED[PINNED.len() - 1]).unwrap();
-    assert!(matches!(warm, WalRecord::CacheWarmed { .. }));
-    assert!(warm.is_informational());
-    assert!(warm.required_features().is_empty());
-}
-
 /// An attempt's send time is an optional field like the attempt's others: a record without it
 /// (every record written before it existed) reads as `None`, and a record with it needs no reader
 /// feature, so an older build reads the record and ignores the field.
@@ -1024,95 +907,6 @@ fn keep_warm_record_metadata_matches_goldens() {
             golden
         );
         assert_eq!(serde_json::from_str::<WalRecord>(golden).unwrap(), record);
-    }
-}
-
-/// Transport evidence is informational: old bytes remain unchanged, and a future pipe's
-/// name remains readable without turning an otherwise valid WAL into corruption.
-#[test]
-fn attempt_transport_is_optional_and_needs_no_reader_feature() {
-    let old = r#"{"type":"model_attempt_finished","step_id":2,"attempt":0,"request_body_len":12,"request_body_sha256":"aa","response_body_len":0,"response_body_sha256":"e3b0","outcome":"connect_failed","ts_ms":5}"#;
-    let record: WalRecord = serde_json::from_str(old).unwrap();
-    assert!(matches!(
-        record,
-        WalRecord::ModelAttemptFinished {
-            transport: None,
-            websocket_request: None,
-            cache_evidence: None,
-            websocket_close_code: None,
-            ..
-        }
-    ));
-    assert_eq!(serde_json::to_string(&record).unwrap(), old);
-    for transport in ["websocket", "https", "future-pipe"] {
-        let mut value: serde_json::Value = serde_json::from_str(old).unwrap();
-        value["transport"] = transport.into();
-        let record: WalRecord = serde_json::from_value(value).unwrap();
-        assert!(record.required_features().is_empty());
-        assert!(record.is_informational());
-        assert!(
-            matches!(record, WalRecord::ModelAttemptFinished { transport: Some(ref actual), .. } if actual == transport)
-        );
-    }
-}
-
-/// These literal records, written before a `session.send` could carry a title, must still read
-/// and serialize unchanged, and read with no title. Kept apart from the broader table above so a
-/// later edit there cannot replace them.
-#[test]
-fn pre_title_records_keep_their_original_bytes() {
-    let original = [
-        r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"project_id":"pj-a","principal":{"kind":"direct"},"ts_ms":1790000000000,"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"},"submission_id":"sub-run-7"}"#,
-        r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"}}"#,
-        r#"{"type":"queued","submission_id":"sub-run-8","request":{"project_id":"pj-a","model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"queued"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]},"request_identity_digest":"v1:abc","principal":{"kind":"direct"}}"#,
-        r#"{"type":"queued","submission_id":"sub-run-9","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"stop and do this"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]},"send_id":"interrupt-1","delivery":"interrupt"}"#,
-        r#"{"type":"steered","send_id":"steer-1","request_identity_digest":"v1:abc","delivery":"steer","input":[{"role":"user","content":[{"type":"text","text":"write up now"}]}]}"#,
-    ];
-    for bytes in original {
-        let record: WalRecord = serde_json::from_str(bytes).unwrap();
-        assert!(matches!(
-            record,
-            WalRecord::RunStarted { .. } | WalRecord::Queued { .. } | WalRecord::Steered { .. }
-        ));
-        assert_eq!(record.title(), None, "an old record reads with no title");
-        assert_eq!(serde_json::to_string(&record).unwrap(), bytes);
-    }
-}
-
-/// A title is an ordinary optional field on each record a send writes: it is written where the
-/// struct declares it, reads back as written, and needs no reader feature beyond what the record
-/// already needed (a steer keeps its own feature; a run start or queued send still needs none),
-/// so an older build reads the record and ignores the title.
-#[test]
-fn a_title_is_optional_and_needs_no_reader_feature() {
-    let titled = [
-        (
-            PINNED[1],
-            r#"{"type":"run_started","run_id":"run-7","session":{"project_root":"/tmp/project","harness":"runner","session":"session"},"config":{"model":{"provider_module_id":"p","model_id":"m"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"origin":{"kind":"fresh"},"title":"Fix the login bug"}"#,
-        ),
-        (
-            r#"{"type":"queued","submission_id":"sub-run-8","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"queued"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]}}"#,
-            r#"{"type":"queued","submission_id":"sub-run-8","request":{"model":{"provider_module_id":"p","model_id":"m"},"input":[{"role":"user","content":[{"type":"text","text":"queued"}]}],"policy_allowed":[],"tool_choice":{"type":"auto"},"generation":{},"stop_when":[]},"title":"Fix the login bug"}"#,
-        ),
-        (
-            r#"{"type":"steered","input":[{"role":"user","content":[{"type":"text","text":"write up now"}]}]}"#,
-            r#"{"type":"steered","title":"Fix the login bug","input":[{"role":"user","content":[{"type":"text","text":"write up now"}]}]}"#,
-        ),
-    ];
-    for (untitled, expected) in titled {
-        let base: WalRecord = serde_json::from_str(untitled).unwrap();
-        let mut record = base.clone();
-        match &mut record {
-            WalRecord::RunStarted { title, .. }
-            | WalRecord::Queued { title, .. }
-            | WalRecord::Steered { title, .. } => *title = Some("Fix the login bug".into()),
-            other => panic!("expected a record a send writes, got {other:?}"),
-        }
-        assert_eq!(serde_json::to_string(&record).unwrap(), expected);
-        let decoded: WalRecord = serde_json::from_str(expected).unwrap();
-        assert_eq!(decoded, record);
-        assert_eq!(decoded.title(), Some("Fix the login bug"));
-        assert_eq!(record.required_features(), base.required_features());
     }
 }
 

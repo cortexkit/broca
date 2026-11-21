@@ -5,40 +5,13 @@
 //! header makes it safe to advance past a damaged payload.
 //!
 //! Durability is a claim by the trusted writer/filesystem, not an authenticated
-//! property of a CRC or digest. Raw `open_log` and `frame` access do not enforce
-//! published bounds. Billing readers should use [`proof::PublishedLog`], treat
-//! unavailable proofs as unavailable rather than EOF, and fully consume its
-//! bounded iterator (including unreadable evidence) before advancing progress.
+//! property of a cyclic redundancy check (CRC) or digest.
 
 #![forbid(unsafe_code)]
 
-pub mod billing;
-mod billing_types;
-pub mod checkpoint;
 pub mod error;
 pub mod features;
 pub mod frame;
-pub mod proof;
-pub mod resolve;
-pub mod unreadable;
 pub mod vault_facts;
 
 pub use error::{Error, HeaderCorruption};
-
-/// Open a log without locks or write access, allowing its owner to unlink it.
-///
-/// Keep share-delete enabled on Windows as well: a billing reader must never
-/// prevent broca from removing an eligible log.
-pub fn open_log(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_SHARE_READ: u32 = 1;
-        const FILE_SHARE_WRITE: u32 = 2;
-        const FILE_SHARE_DELETE: u32 = 4;
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-    }
-    options.open(path)
-}

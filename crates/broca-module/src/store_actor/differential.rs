@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{AllowAll, FileLeaseStore, FileWalStore, OutputEvent, RunError, WalStore};
+use broca_core::{AllowAll, FileLeaseStore, OutputEvent, RunError};
 use broca_protocol::content::ContentBlock;
 use broca_protocol::{BindIdentity, NormalizedEvent, RunId, SubmissionRequest};
 use broca_session_store::backend::MemoryBackend;

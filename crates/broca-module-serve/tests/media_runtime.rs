@@ -232,7 +232,7 @@ async fn tool_png_on_next_request(accepts_images: bool) {
         "tool-marker"
     })
     .await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     let mut config = frozen(WireFamilyId::AnthropicMessages);
     if !accepts_images {
         config.media = None;
@@ -409,7 +409,7 @@ async fn media_runtime_child() {
         std::fs::write(dir.join(format!("{mode}-family-matrix.jsonl")), []).unwrap();
     }
     let mut rig = Rig::start(&format!("runtime-media-{mode}")).await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     *rig.script.media_frozen.lock().unwrap() = Some(frozen(WireFamilyId::AnthropicMessages));
     *rig.script.tool_plane.lock().unwrap() = Some(Arc::new(ImageTool));
     refusals::configure(&rig, &case);
@@ -588,7 +588,7 @@ async fn family_roundtrip(family: WireFamilyId) {
     use broca_provider::media_profile::MediaCarrier;
     let config = frozen(family);
     let mut rig = Rig::start(&format!("media-family-{family:?}")).await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     *rig.script.media_frozen.lock().unwrap() = Some(config.clone());
     *rig.script.tool_plane.lock().unwrap() = Some(Arc::new(ImageTool));
     rig.send("init", "ready", None).await;
@@ -775,7 +775,7 @@ async fn obsolete_media_does_not_refuse_boot() {
 
 async fn runner_media_rig(tag: &str, family: WireFamilyId, held: bool) -> Rig {
     let mut rig = Rig::start(tag).await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     *rig.script.media_frozen.lock().unwrap() = Some(frozen(family));
     rig.script.hold_model(held);
     rig.script.push(&[Step::Text("ready")]);
@@ -885,28 +885,26 @@ async fn runner_head_reports_known_image_limits_and_omits_unknown_limits() {
     }
 }
 
-fn durable_media_snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-    fn visit(
-        root: &Path,
-        path: &Path,
-        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
-    ) {
-        for entry in std::fs::read_dir(path).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            let bytes = if path.is_dir() {
-                Vec::new()
-            } else {
-                std::fs::read(&path).unwrap()
-            };
-            out.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
+/// Every file under the session store's roots in `state_root`, with its bytes: two readings
+/// are equal exactly when nothing was published to any session in between, media included.
+fn stored_snapshot(state_root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(path: &Path, out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
             if path.is_dir() {
-                visit(root, &path, out);
+                visit(&path, out);
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
             }
         }
     }
     let mut out = Default::default();
-    visit(root, root, &mut out);
+    for class in broca_wal::StorageClass::ALL {
+        visit(&class.store_root(state_root), &mut out);
+    }
     out
 }
 
@@ -928,7 +926,7 @@ fn padded_png(bytes: &[u8], size: usize) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn runner_committed_image_limits_refuse_before_wal_or_media_publication() {
+async fn runner_committed_image_limits_refuse_before_any_session_or_media_write() {
     let wide = STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAIygAAAABCAYAAACzIwVFAAAAOklEQVR4nO3BMQEAAADCoPVPbQ0PoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAGwOMoQABZriCzQAAAABJRU5ErkJggg==").unwrap();
     let mut rig = runner_media_rig(
         "synthetic-large-image",
@@ -955,7 +953,7 @@ async fn runner_committed_image_limits_refuse_before_wal_or_media_publication() 
         }
         let id = upload(&mut rig, "image/png", &bytes).await;
         let before = rig.records().await;
-        let media = durable_media_snapshot(&rig.dir.join("media-durable"));
+        let media = stored_snapshot(&rig.dir);
         let refused = call(
             &mut rig,
             "session.send",
@@ -985,10 +983,7 @@ async fn runner_committed_image_limits_refuse_before_wal_or_media_publication() 
         }
         errors.push((error, expected));
         assert_eq!(rig.records().await, before);
-        assert_eq!(
-            durable_media_snapshot(&rig.dir.join("media-durable")),
-            media
-        );
+        assert_eq!(stored_snapshot(&rig.dir), media);
     }
     rig.finish().await;
     for (error, expected) in errors {

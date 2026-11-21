@@ -189,7 +189,7 @@ fn carries_tool_images(family: WireFamilyId) -> bool {
 async fn run_cases(family: WireFamilyId, accepts_images: bool) -> (Vec<u8>, Frame) {
     let mode = if accepts_images { "image" } else { "text" };
     let mut rig = Rig::start(&format!("tool-outputs-{}-{mode}", family_name(family))).await;
-    broca_core::media_store::create_media_directories(&rig.dir).unwrap();
+    broca_core::media_uploads::create_upload_directories(&rig.dir).unwrap();
     let mut config = frozen(family);
     if !accepts_images {
         config.media = None;

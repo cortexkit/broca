@@ -7,11 +7,7 @@ async fn run_awaits_restart_pause_waits_on_the_runner() {
         crate::store_actor::awaits_tests::prove(
             &side.registry,
             &side.key,
-            if store {
-                "restart.after"
-            } else {
-                "restart.before"
-            },
+            "restart.after",
             store.then_some(("paused", "runner", Some("restart"))),
         )
         .await;
@@ -82,7 +78,7 @@ async fn seed_queued_send(side: &Side) {
     req.on_restart = Some(broca_protocol::request::OnRestart::Resume);
     // The restart image is captured before a queued send's coordinator can drain it.
     assert!(side.registry.slot_state(&side.key).is_none());
-    if side.store {
+    {
         let runtime = side.registry.store_runtime().unwrap();
         let class = runtime.class_of(&side.key).unwrap().unwrap();
         let mut session = Session::load(
@@ -116,33 +112,6 @@ async fn seed_queued_send(side: &Side) {
         .await
         .unwrap();
         session.close().await.unwrap();
-    } else {
-        side.executor
-            .wal
-            .open(&side.key)
-            .unwrap()
-            .append(
-                1,
-                &broca_wal::WalRecord::Queued {
-                    submission_id: broca_protocol::SubmissionId("sub-r2".into()),
-                    request: Box::new(req),
-                    written_at_ms: Some(1),
-                    ts_ms: None,
-                    delivery: None,
-                    request_identity_digest: None,
-                    principal: None,
-                    sent_by: None,
-                    retention: None,
-                    keep_warm: None,
-                    conversation_key: None,
-                    send_id: None,
-                    title: None,
-                    hooks: None,
-                    message_marks: None,
-                },
-                true,
-            )
-            .unwrap();
     }
 }
 
@@ -164,7 +133,7 @@ async fn ended_without_reading(side: &Side, run: &str) {
             .registry
             .open_handle(&side.key)
             .is_none_or(|handle| handle.run_in_flight.load(Ordering::Acquire) == 0);
-        if side.store {
+        {
             let runtime = side.registry.store_runtime().unwrap();
             let view = runtime
                 .current_view(&side.key)
@@ -182,18 +151,6 @@ async fn ended_without_reading(side: &Side, run: &str) {
             } else {
                 Err(format!("{:?}", view.operations.run))
             }
-        } else {
-            let records = side
-                .executor
-                .wal
-                .read_records(&side.key)
-                .map_err(|e| e.to_string())?;
-            let state = broca_core::reconcile_run_state(records.iter().map(|r| &r.record), run);
-            if state.is_some_and(|state| state.state.is_terminal()) && idle {
-                Ok(())
-            } else {
-                Err("legacy continuation is unfinished".into())
-            }
         }
     })
     .await;
@@ -201,7 +158,7 @@ async fn ended_without_reading(side: &Side, run: &str) {
 
 async fn story(side: &Side) -> Vec<String> {
     let mut result = Vec::new();
-    if side.store {
+    {
         let view = side
             .registry
             .store_runtime()
@@ -232,31 +189,6 @@ async fn story(side: &Side) -> Vec<String> {
                             .get("provider_code")
                             .and_then(Value::as_str)
                             .map(str::to_owned))
-                )),
-                _ => {}
-            }
-        }
-    } else {
-        for record in side.executor.wal.read_records(&side.key).unwrap() {
-            match record.record {
-                broca_wal::WalRecord::RunStarted { run_id, .. } => {
-                    result.push(format!("start {}", run_id.0))
-                }
-                broca_wal::WalRecord::RunPaused { run_id, reason, .. } => {
-                    result.push(format!("pause {} {:?}", run_id.0, reason))
-                }
-                broca_wal::WalRecord::ResumeStarted {
-                    episode, replayed, ..
-                } => result.push(format!(
-                    "resume {} {} {} {}",
-                    episode.0, replayed.messages, replayed.model_steps, replayed.tool_results
-                )),
-                broca_wal::WalRecord::RunFinished { reason, error, .. } => result.push(format!(
-                    "end {:?} {:?}",
-                    reason,
-                    error
-                        .as_ref()
-                        .and_then(|error| error.provider_code.as_deref())
                 )),
                 _ => {}
             }
@@ -328,7 +260,7 @@ async fn restart_command_waits_for_readiness_and_the_later_command_resumes() {
         let side = original.restarted().await;
         resume_command(&side).await;
         assert_eq!(side.executor.provider.inner.calls().len(), 0);
-        if store {
+        {
             let view = side
                 .registry
                 .store_runtime()

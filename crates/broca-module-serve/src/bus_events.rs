@@ -534,7 +534,7 @@ impl Service {
                                 }
                                 let event = RunEvent {
                                     v: 1,
-                                    session_ref: broca_core::wal_writer::agent_session_ref(
+                                    session_ref: broca_core::session_refs::agent_session_ref(
                                         &session,
                                     ),
                                     run_id,
@@ -643,7 +643,7 @@ pub(crate) mod tests {
         let store = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
         let events = StoreRunEvents::new(store.clone());
         let session = BindIdentity::new(&root, "broca", "s1");
-        let session_ref = broca_core::wal_writer::agent_session_ref(&session);
+        let session_ref = broca_core::session_refs::agent_session_ref(&session);
         let event = |seq: u64, detail: RunEventDetail| RunEvent {
             v: 1,
             session_ref: session_ref.clone(),

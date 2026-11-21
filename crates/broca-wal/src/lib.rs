@@ -1,32 +1,20 @@
-//! broca WAL — the intent-log source of truth.
+//! What live code still uses from the old log format, whose file store is gone.
 //!
-//! Framed records (len/ver/seq/fence/SHA-256 digest), the durable record set
-//! (`record::WalRecord` — semantics authoritative in
-//! `docs/durability-contract.md`), and [`FileWal`] behind the [`Wal`] trait. The
-//! writer task, replay state machine, and materialized store build on top of this
-//! foundation.
+//! The record vocabulary (re-exported from `broca-records`; the session store's own record
+//! kinds are in `broca-session-store`), the frame codec and its must-understand feature names,
+//! the `state-format` marker check at startup, and size limits. It also keeps the move fences
+//! (see [`migration`]): small files under `agent-data/` that hold no session content and stop
+//! writes to a session while it moves to another computer.
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // Test fixtures intentionally use direct I/O to prepare and inspect crash images.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
-pub mod access_counter;
-pub mod archive;
-use broca_records::directory_sync;
-pub mod file_wal;
 pub mod framing;
-pub mod head_proof;
-pub mod recovery;
 pub use broca_records::{floor, fs_ops, record, session_storage};
 pub mod state_format;
 
-pub use file_wal::{
-    file_identity, format_manifest_line, read_records_range, read_records_range_from_valid_anchor,
-    read_records_tail, replay_file, wal_bytes_read, wal_file_exists, FileWal, Wal, WalByteAnchor,
-    WalError, WalRangeRead, WalRangeRecords, WalTailRead, DEFAULT_MAX_READ_BYTES,
-};
 pub use floor::{raise_floor, read_floor, FEATURE_FLOOR_FILENAME};
-pub use framing::PreparedV4Frame;
 #[cfg(any(test, feature = "test-known-feature"))]
 pub use framing::{forget_feature_for_test, ForgottenFeature};
 pub use framing::{
@@ -73,4 +61,3 @@ pub use broca_protocol::PauseReason;
 pub mod migration;
 
 pub mod size_limit;
-pub mod writer_tenure;

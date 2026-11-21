@@ -2627,20 +2627,9 @@ fn headers_pass_through_unknown_names_and_odd_values_verbatim() {
 
 #[test]
 fn event_id_is_the_lineage_and_wal_sequence_joined_by_a_colon() {
-    let dir = broca_test_support::scratch_root()
-        .join(format!("broca-account-event-id-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut wal = broca_wal::FileWal::open(dir.join("session.wal")).unwrap();
-    use broca_wal::Wal;
-    let seq = wal.append(0, &any_record(), true).unwrap();
-    let lineage = wal.lineage_id().expect("an appended log has a lineage");
-    assert_eq!(
-        event_id(Some(lineage), seq),
-        Some(format!("{lineage}:{seq}"))
-    );
-    assert_eq!(event_id(None, seq), None);
-    let _ = std::fs::remove_dir_all(&dir);
+    let lineage = lineage();
+    assert_eq!(event_id(Some(lineage), 7), Some(format!("{lineage}:7")));
+    assert_eq!(event_id(None, 7), None);
 }
 
 // ---- the reporter ---------------------------------------------------------------------------
@@ -2656,24 +2645,12 @@ async fn settle(routing: &FakeRouting, expected: usize) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-fn lineage_wal() -> broca_wal::FileWal {
-    // scratch_root is shared by this process. A clock reading is not a unique allocation:
-    // simultaneous fixtures can get the same timestamp and become writers of the same WAL.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = broca_test_support::scratch_root().join(format!(
-        "broca-account-lineage-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    broca_wal::FileWal::open(dir.join("session.wal")).unwrap()
-}
-
+/// A lineage id no other fixture in this process shares.
 fn lineage() -> WalLineageId {
-    let mut wal = lineage_wal();
-    use broca_wal::Wal;
-    wal.append(0, &any_record(), true).unwrap();
-    wal.lineage_id().unwrap()
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    WalLineageId::from_bytes(bytes)
 }
 
 #[tokio::test]
@@ -3380,18 +3357,6 @@ async fn a_scoped_not_found_is_reported_and_a_still_listed_credential_alarms() {
     );
     settle(&routing, 2).await;
     assert_eq!(client.counters.get("scoped_not_found_still_listed"), 1);
-}
-
-/// Any record, to give a scratch log its lineage id.
-fn any_record() -> broca_wal::WalRecord {
-    broca_wal::WalRecord::RunFinished {
-        interrupt_reason: None,
-        ts_ms: None,
-        reason: RunFinishReason::Completed,
-        usage: Default::default(),
-        error: None,
-        retries_used: 0,
-    }
 }
 
 #[tokio::test]
