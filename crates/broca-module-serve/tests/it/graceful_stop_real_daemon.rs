@@ -150,11 +150,18 @@ impl Rig {
             serde_json::json!({
                 "cadence_ms": 3600000, "deadline_ms": 5000, "failure_threshold": 3
             }),
+            None,
         )
         .await
     }
 
-    async fn start_with_health(model_url: &str, health: Value) -> Option<Self> {
+    /// `drain_timeout_ms`, when given, is broca's drain budget in the daemon's module config:
+    /// how long a restart's teardown waits for the old process to exit before killing it.
+    async fn start_with_health(
+        model_url: &str,
+        health: Value,
+        drain_timeout_ms: Option<u64>,
+    ) -> Option<Self> {
         let subc_source = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         for bin in [&subc_source, &fake_aft] {
@@ -232,6 +239,9 @@ impl Rig {
         )
         .unwrap();
         let mut config = config;
+        if let Some(budget) = drain_timeout_ms {
+            config["modules"]["broca"]["drain_timeout_ms"] = budget.into();
+        }
         config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
             broca_config.display().to_string().into();
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
@@ -589,11 +599,16 @@ fn restart_health_evidence_does_not_infer_eviction_from_other_events() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn health_restart_can_coalesce_manual_restart_without_another_drain_verdict() {
     let url = serve_model(Arc::new(AtomicUsize::new(0))).await;
+    // The manual restart coalesces only while the health restart's teardown still waits for
+    // the held process to exit, which lasts as long as broca's drain budget. A `ck` process can
+    // take over a second to start on a loaded machine, so the budget is long enough to cover it;
+    // releasing the process ends the wait early.
     let Some(rig) = Rig::start_with_health(
         &url,
         serde_json::json!({
             "cadence_ms": 100, "deadline_ms": 500, "failure_threshold": 1
         }),
+        Some(10_000),
     )
     .await
     else {
