@@ -8,14 +8,18 @@ use crate::common;
 
 #[cfg(unix)]
 use broca_core::ToolManifest;
+#[cfg(unix)]
 use broca_protocol::request::{ExecutionMode, Tool};
 use broca_protocol::BindIdentity;
 #[cfg(unix)]
 use broca_protocol::{content::ToolCall, ToolCallId};
 use broca_subc::SubcToolPlane;
 use common::{wait_for_aft, Rig};
+#[cfg(unix)]
 use serde_json::json;
 
+// Only the module-restart test, which needs Unix signals, dispatches a tool.
+#[cfg(unix)]
 fn tool(name: &str) -> Tool {
     Tool {
         name: name.into(),
