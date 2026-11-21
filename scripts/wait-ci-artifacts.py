@@ -11,7 +11,8 @@ import time
 
 
 class TransientQueryError(RuntimeError):
-    """A GitHub API failure that says nothing about the artifacts: a 5xx or a timeout."""
+    """A GitHub API failure that says nothing about the artifacts: a 5xx, a timeout, or a
+    reply cut short."""
 
 
 def api(path):
@@ -21,9 +22,10 @@ def api(path):
         raise TransientQueryError(f"GitHub artifact query timed out: {error}") from error
     if result.returncode:
         message = result.stderr.strip()
-        # A server error is GitHub failing to answer, not an answer about this run, so the
-        # poll retries it until the deadline. Every other failure (auth, 404) is final.
-        if re.search(r"HTTP 5\d\d", message):
+        # A server error, or a reply body cut short (gh then reports "unexpected end of JSON
+        # input"), is GitHub failing to answer, not an answer about this run, so the poll
+        # retries it until the deadline. Every other failure (auth, 404) is final.
+        if re.search(r"HTTP 5\d\d|unexpected end of JSON input", message):
             raise TransientQueryError(f"GitHub artifact query failed: {message}")
         raise RuntimeError(f"GitHub artifact query failed: {message}")
     return json.loads(result.stdout)

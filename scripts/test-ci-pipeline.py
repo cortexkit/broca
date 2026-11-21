@@ -1237,11 +1237,15 @@ class ArtifactWait(unittest.TestCase):
                              self.artifacts('fixtures-Windows', 'integration-windows')])
         self.assertEqual(api.call_count, 4)
 
-    def test_api_classifies_only_server_errors_and_timeouts_as_transient(self):
+    def test_api_classifies_only_server_errors_cut_replies_and_timeouts_as_transient(self):
         def failed(stderr):
             return subprocess.CompletedProcess(['gh'], 1, stdout='', stderr=stderr)
 
         with patch.object(self.module.subprocess, 'run', return_value=failed('gh: Server Error (HTTP 502)')):
+            with self.assertRaises(self.module.TransientQueryError):
+                self.module.api('repos/x/actions/runs/1/artifacts')
+        # A reply GitHub cut short: two shards of one run failed on it in November 2026.
+        with patch.object(self.module.subprocess, 'run', return_value=failed('unexpected end of JSON input')):
             with self.assertRaises(self.module.TransientQueryError):
                 self.module.api('repos/x/actions/runs/1/artifacts')
         with patch.object(self.module.subprocess, 'run', return_value=failed('gh: Not Found (HTTP 404)')):
