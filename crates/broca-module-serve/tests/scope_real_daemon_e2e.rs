@@ -219,10 +219,22 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
     // The daemon validates the same registered scope on catalog and management routes.
     let fetcher =
         broca_subc::SubcPlanFetcher::new(owner.clone(), session.clone(), Some(scope.clone()));
-    let items = serde_json::from_slice(
-        &std::fs::read(root.join("scripts/fixtures/acceptance-reader-plan.json")).unwrap(),
-    )
-    .unwrap();
+    // AFT's reader preset, the plan a scoped worker's first send names.
+    let items = serde_json::json!({
+        "tool_items": [{
+            "provider": "aft",
+            "preset": "reader",
+            "params": {
+                "behavior": "autonomous",
+                "scope": "read",
+                "tool_descs": "concise",
+                "host": "broca"
+            }
+        }],
+        "system_text_items": [],
+        "step_transform_items": []
+    });
+    let items = serde_json::from_value(items).unwrap();
     let plan = broca_fetch_plan::compose(&items, &fetcher, broca_fetch_plan::ADMISSION_DEADLINE)
         .await
         .expect("compose through the owner's real scoped AFT route");
@@ -290,8 +302,6 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
         .arg(&rig.connection_file)
         .arg("--state-root")
         .arg(&rig.state_root)
-        .arg("--project-root")
-        .arg(&rig.dir)
         .arg("--placement-report")
         .arg(&placement_report)
         .args(["--timeout", "30"])
