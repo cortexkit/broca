@@ -37,11 +37,3 @@ impl From<std::num::TryFromIntError> for ProjectionPlanError {
         Self::Int(e)
     }
 }
-
-/// The only deferred-approval facts a retained lineage may persist. Unlike
-/// `DeferredCallProjection`, this contains no Prepared arguments or late results.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetainedWithdrawalProjection {
-    pub lineage_id: String,
-    pub withdrawals_owed_runs: Vec<String>,
-}

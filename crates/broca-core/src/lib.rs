@@ -59,7 +59,6 @@ pub mod repetition;
 pub mod replay;
 pub mod seal;
 pub mod served_history;
-pub use served_history::ServedHistory;
 
 pub use context::state_for_terminal;
 pub use context::StorePageReadError;
@@ -88,9 +87,7 @@ pub use admission::{
     BudgetReplayStateV1, FirstEpisodeV1, SessionOwnershipV1, BUDGET_REPLAY_STATE_VERSION,
 };
 
-pub use admission::{
-    send_identity_digest, AdmissionCheckpointV1, EpisodeDisposition, LastEpisodeV1,
-};
+pub use admission::{send_identity_digest, AdmissionCheckpointV1, LastEpisodeV1};
 pub use billing::{
     charge_basis_overrides_digest, compute_segments_for_run, imported_run_ids, ChargeBasis,
     ChargeBasisResolver, ModelShare, SpendSegment, NO_CHARGE_BASIS_OVERRIDES,
@@ -105,15 +102,10 @@ pub use compaction::{
     ProviderCapabilities, ViewReadyInbox, MAX_REPLACEMENT_BYTES,
 };
 pub use context::{
-    emit_lineage_usage_exports, replay_transcript, ExportCursor, ExportError, ExportFact,
-    ExportIndex, ExportPage, ImportedRunExclusions, RunEventBodies, RunIndexState,
-    SessionInventory, SessionReadLineageState, SessionReadMessage, SessionReadPage,
-    SessionReadReason, SessionReadStateKind, SessionRefResolver, SessionRefs, TagLocation,
-    ToolCallDispatch, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
-};
-pub use context::{
-    AdmissionStoreSnapshot, HeldEpisode, HeldPrefix, HeldRowsRequest, StorePageRow,
-    StorePageSnapshot, StorePrefix,
+    emit_lineage_usage_exports, ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage,
+    RunEventBodies, RunIndexState, SessionInventory, SessionReadLineageState, SessionReadMessage,
+    SessionReadPage, SessionReadReason, SessionReadStateKind, SessionRefResolver, SessionRefs,
+    TagLocation, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{ModelEntry, ReadView};
 pub use hooks::{HookPlane, HookUnavailable, STEP_TRANSFORM_HOOK_CAP};
@@ -122,7 +114,6 @@ pub use import::{
     IMPORT_MAX_SERIALIZED_BYTES,
 };
 pub use lease::{lease_key_for, FileLeaseStore, LeaseError, LeaseHandle, LeaseStore};
-pub use projection::ControlProjectionState;
 pub use projection::Cursor;
 pub use provider::{Provider, StubProvider};
 pub use queue::pending_submissions;
@@ -135,8 +126,7 @@ pub use replay::{
 };
 pub use replay::{
     DeferredCallObligations, DeferredCallProjection, OpenToolBatch, OwedWithdrawal, PendingTurn,
-    PreparedCall, ProjectedDeferredCall, ProjectionDelta, ProjectionSeed, ReplayResolution,
-    ReplayState,
+    PreparedCall, ProjectedDeferredCall, ReplayResolution, ReplayState,
 };
 pub use resume::DeferredCloseKind;
 pub use retention::is_retention_lineage;
@@ -157,11 +147,10 @@ pub use input_transformations::{
     input_transformations_reported, input_transformations_unmeasured_attempts,
 };
 pub use output_events::OutputEvent;
+pub use run::RoutingUnavailableReason;
 pub use run::{
     AccountSelectionRefusal, RoutingUnavailable, RunControl, RunError, RunRequest, RunSummary,
-    StartMode,
 };
-pub use run::{PriorWalSnapshot, RoutingUnavailableReason};
 pub use session_refs::{
     agent_session_ref, record_candidate, session_addr, session_projection_incomplete,
     ProjectionAdmission, ProjectionRepair, SessionRefIndex, SESSION_PROJECTION_INCOMPLETE,

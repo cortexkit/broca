@@ -25,8 +25,6 @@
 //! different type, no implicit conversion. The projection is computed from a record
 //! RANGE addressed by cursors, never "from the materialization watermark forward".
 
-use std::sync::Arc;
-
 use broca_protocol::{
     caller::{ControlUnit, RunFinishReason, SharedProviderError},
     content::ContentBlock,
@@ -174,48 +172,6 @@ impl IndeterminateToolCalls {
         calls
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveCallIdentity {
-    seq: u64,
-    schema_pin: Option<String>,
-    recorded_key: Option<String>,
-    dispatched: bool,
-}
-
-/// Context for incremental projection. Placement and log identity survive episode
-/// boundaries; call facts are bounded to the current tool batch.
-///
-/// Batch replay constructs this state internally, while the live projector keeps
-/// an instance so later records retain their run, message and call identities.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ControlProjectionState {
-    call_anchors: crate::call_identity::CallAnchors,
-    current_call: Option<crate::call_identity::CallAnchor>,
-    wal_lineage_id: Option<broca_wal::WalLineageId>,
-    call_identities: std::collections::HashMap<ToolCallId, LiveCallIdentity>,
-    notice_senders: std::collections::HashMap<String, String>,
-    notice_sends: std::collections::HashMap<String, (String, String)>,
-    notice_carriers: std::collections::HashMap<ToolCallId, (u64, u32, Option<String>)>,
-    placement: crate::placement::Placement,
-    placement_error: Option<String>,
-    assistant_ordinal: Option<u64>,
-    tool_result_ordinal: Option<u64>,
-    assistant_message: Option<Arc<broca_protocol::AssistantMessage>>,
-    assistant_started: bool,
-    started_tools: std::collections::HashSet<broca_protocol::ToolCallId>,
-    cancelled: bool,
-    pending_inputs: Vec<Arc<Vec<broca_protocol::Message>>>,
-    /// The recorded episode identity, including when restored from a store seed.
-    /// `RunFinished` carries no run id in the WAL, so its control unit needs this context.
-    run_id: Option<RunId>,
-    final_step_finish_reason: Option<FinishReason>,
-    has_completed_step: bool,
-    indeterminate_tool_calls: IndeterminateToolCalls,
-    held_calls: crate::replay::HeldCallsProjection,
-}
-
-impl ControlProjectionState {}
 
 /// A notice fact and its source send identity, kept outside the serialized reader envelope.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

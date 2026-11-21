@@ -771,6 +771,7 @@ pub type CompactionItem = (
     Map<String, Value>,
     Map<String, Value>,
 );
+
 pub fn item(manifest: &broca_wal::PlanManifest) -> Result<Option<CompactionItem>, String> {
     let plan: Value =
         serde_json::from_str(manifest.plan.as_json_text()).map_err(|e| e.to_string())?;

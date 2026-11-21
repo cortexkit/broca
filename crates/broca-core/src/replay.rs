@@ -1219,62 +1219,6 @@ pub fn replay(records: &[WalRecord]) -> Result<ReplayState, ReplayError> {
     )
 }
 
-/// Persisted state needed to project a WAL suffix without replaying the materialized prefix.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectionSeed {
-    pub refusal: crate::refusal_fallback::RefusalReplayState,
-    /// First model-produced message of the episode open at the watermark, if it has one.
-    pub open_episode_span: Option<u64>,
-    /// The episode open at the watermark, as the projection holds it, and every earlier
-    /// episode's render inputs.
-    pub open_episode: Option<crate::context::EpisodeRenderProjection>,
-    pub earlier_episodes: Vec<crate::context::EpisodeRenderProjection>,
-    /// Every episode the projection holds, when it computed them and its reader may reuse any.
-    /// `None` while they are absent or superseded, which is when a projection refills them.
-    pub projection_episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
-    pub watermark_seq: u64,
-    pub prefix_len: u64,
-    pub completed_steps: u64,
-    pub usage: Usage,
-    pub retries_used: u32,
-    pub last_step_usage: Option<Usage>,
-    pub last_step_finish_reason: Option<FinishReason>,
-    pub trailing_origin: Option<broca_protocol::request::ModelHandle>,
-    pub last_run_id: Option<RunId>,
-    pub admission_checkpoint: crate::AdmissionCheckpointV1,
-    /// Approval metadata for the materialized prefix, including answered calls and late work.
-    pub deferred_calls: Option<DeferredCallProjection>,
-    /// Where tag numbering continues after the materialized prefix.
-    pub tag_seed: crate::tags::TagSeed,
-}
-
-impl ProjectionSeed {}
-
-/// The store-ready result of folding records after a [`ProjectionSeed`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectionDelta {
-    pub refusal: crate::refusal_fallback::RefusalReplayState,
-    pub episode_spans: Vec<std::ops::Range<u64>>,
-    pub open_episode_span: Option<u64>,
-    /// Every episode's render inputs after the tail, in lineage order; `None` while the seed's
-    /// projection holds none (see [`ProjectionSeed::projection_episodes`]).
-    pub episodes: Option<Vec<crate::context::EpisodeRenderProjection>>,
-    pub messages: Vec<Message>,
-    pub message_runs: Vec<Option<RunAttribution>>,
-    pub run_finals: BTreeMap<u64, RunAttribution>,
-    /// Replace a materialized suffix before appending `messages`.
-    pub truncate_prefix_to: Option<u64>,
-    pub completed_steps: u64,
-    pub usage: Usage,
-    pub retries_used: u32,
-    pub last_step_usage: Option<Usage>,
-    pub last_step_finish_reason: Option<FinishReason>,
-    pub last_run_id: Option<RunId>,
-    pub admission_checkpoint: crate::AdmissionCheckpointV1,
-    /// Approval metadata for the materialized prefix, including answered calls and late work.
-    pub deferred_calls: Option<DeferredCallProjection>,
-}
-
 /// The `CorruptLineage` reason replay gives when a tool batch or tool-calling step would
 /// replace an uncommitted batch that holds call evidence. Read-only scanners match on it to
 /// tell this refusal from other corrupt lineages.

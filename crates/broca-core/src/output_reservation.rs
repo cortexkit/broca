@@ -53,17 +53,6 @@ impl OutputLimits {
     }
 }
 
-/// What a step's output cap is, given its estimated input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reservation {
-    /// The frozen cap fits: render the request unchanged.
-    Unchanged,
-    /// The frozen cap does not fit and this smaller cap does.
-    Clamped { max_output_tokens: u32 },
-    /// Not even the floor fits: the request must not be sent.
-    Overflow { available: u64, floor: u32 },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Measured {
     /// The step's full input occupancy as the provider reported it.

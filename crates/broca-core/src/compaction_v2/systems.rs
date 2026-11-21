@@ -35,30 +35,6 @@ pub fn from_manifest(manifest: &broca_wal::PlanManifest) -> Vec<Message> {
     )]
 }
 
-pub fn frozen(
-    mode3: bool,
-    config: &broca_wal::RunConfig,
-    manifest: Option<&broca_wal::PlanManifest>,
-) -> Result<Vec<Message>, String> {
-    if !mode3 {
-        if config.global_system.is_some() {
-            return Err("global_system is only valid on mode-3 runs".into());
-        }
-        return Ok(Vec::new());
-    }
-    if let Some(manifest) = manifest {
-        if config.global_system.is_some() {
-            return Err("global_system must be absent on planned runs".into());
-        }
-        return Ok(from_manifest(manifest));
-    }
-    let global = config.global_system.as_deref().cloned().unwrap_or_default();
-    if global.iter().any(|message| !is_global(message)) {
-        return Err("global_system configuration contains a transcript message".into());
-    }
-    Ok(global)
-}
-
 pub fn view(opts: &CallOptions, global: &[Message]) -> Result<Option<CallOptions>, String> {
     if global.iter().any(|message| !is_global(message)) {
         return Err("global_system configuration contains a transcript message".into());

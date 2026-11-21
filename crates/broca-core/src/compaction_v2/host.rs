@@ -9,7 +9,7 @@ use super::{
         setup::ModelRef,
     },
 };
-use broca_wal::{FramedRecord, PlanManifest, RunConfig, WalRecord};
+use broca_wal::{PlanManifest, RunConfig};
 use cortexkit_compaction_view::rules::Floor;
 
 /// What a send's compaction conditions and context read from its run's frozen configuration.
@@ -223,24 +223,6 @@ pub fn fallback_fill(
         return None;
     }
     super::metadata::step_usage(*last_usage)?.prompt_tokens
-}
-
-pub fn frozen(records: &[FramedRecord]) -> Result<(RunConfig, Option<&PlanManifest>), String> {
-    let start = records
-        .iter()
-        .rposition(|frame| matches!(frame.record, WalRecord::RunStarted { .. }))
-        .ok_or("compaction session has no frozen run configuration")?;
-    let WalRecord::RunStarted {
-        config, manifest, ..
-    } = &records[start].record
-    else {
-        unreachable!()
-    };
-    let mut config = (**config).clone();
-    for frame in &records[start + 1..] {
-        crate::cache_warm::fold_refreeze(&mut config, &frame.record);
-    }
-    Ok((config, manifest.as_deref()))
 }
 
 pub fn image_reference(

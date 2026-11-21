@@ -34,7 +34,6 @@ pub use crate::tool_results::{
 };
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use broca_protocol::BindIdentity;
 use tokio_util::sync::CancellationToken;
@@ -202,25 +201,6 @@ impl RunRequest {
         }
     }
 }
-
-/// Admission-time WAL view: a materialized checkpoint plus only the records after its watermark.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PriorWalSnapshot {
-    /// Identity and exact byte boundary observed with this admission prefix, never
-    /// sampled later after executor dependency resolution.
-    pub lineage_id: Option<String>,
-    /// Store watermark that precedes `tail`; zero for a complete-WAL fallback snapshot.
-    pub base_watermark: u64,
-    /// Durable writer head captured before this snapshot was loaded.
-    pub head_seq: u64,
-    pub tail: Arc<Vec<broca_wal::FramedRecord>>,
-    /// Checkpoint at `base_watermark` for a bounded snapshot. Budget resume must start from
-    /// this prefix state rather than state already folded through the WAL head.
-    pub checkpoint_at_base: Option<crate::AdmissionCheckpointV1>,
-    pub checkpoint_at_head: crate::AdmissionCheckpointV1,
-}
-
-impl PriorWalSnapshot {}
 
 /// What a finished run reports back to the caller.
 #[derive(Debug, Clone, PartialEq)]
@@ -512,20 +492,6 @@ impl std::fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
-
-/// Which start mode a run uses. The lineage coordinator chooses; the loop obeys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartMode {
-    /// A fresh run, or resume the last (unfinished) episode (decided from the WAL: empty
-    /// ⇒ fresh, non-empty ⇒ resume the last episode).
-    FreshOrResume,
-    /// Append a NEW episode to an idle lineage (the prior conversation is the prefix).
-    AppendEpisode,
-    /// Continue a run that paused awaiting re-auth (after the credential refreshed).
-    ResumeAfterAuth,
-}
-
-impl StartMode {}
 
 pub(crate) fn first_system_index(messages: &[Message]) -> Option<usize> {
     messages

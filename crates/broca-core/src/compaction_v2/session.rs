@@ -1,9 +1,6 @@
 //! Session-owned memory shared by run boundaries and pushed-view admission.
 
-use broca_protocol::BindIdentity;
-use broca_wal::{FramedRecord, WalRecord};
-
-use super::{conditions::check_plan_version, fold, runtime::Runtime, state::State, systems};
+use super::{runtime::Runtime, state::State};
 
 #[async_trait::async_trait]
 pub trait Changes: Send + Sync {
@@ -50,39 +47,4 @@ impl Session {
         self.initialized
             .store(true, std::sync::atomic::Ordering::Release);
     }
-}
-
-pub fn load(session: &BindIdentity, records: &[FramedRecord]) -> Result<State, String> {
-    if !crate::is_mode3_log(records.iter().map(|frame| &frame.record)) {
-        return Err("compaction v2 requires a mode-3 session".into());
-    }
-    let mut state = State::default();
-    let mut active_version = None;
-    for frame in records {
-        if let WalRecord::RunStarted {
-            config,
-            manifest,
-            compaction_plan_version,
-            input,
-            ..
-        } = &frame.record
-        {
-            let version = compaction_plan_version
-                .ok_or("compaction_plan_version is missing from a mode-3 run")?;
-            active_version = Some(version);
-            systems::frozen(true, config, manifest.as_deref())?;
-            if input.iter().any(systems::is_global) {
-                return Err("mode-3 RunStarted.input contains a global system prompt".into());
-            }
-        }
-        if matches!(frame.record, WalRecord::RunFinished { .. }) {
-            active_version = None;
-        }
-        fold::fold(&mut state, &frame.record, session)?;
-    }
-    if let Some(version) = active_version {
-        check_plan_version(version)?;
-    }
-    fold::validate_identity(&state, session)?;
-    Ok(state)
 }

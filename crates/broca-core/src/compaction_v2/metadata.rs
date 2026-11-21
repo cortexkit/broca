@@ -263,10 +263,6 @@ pub fn numbered_parts_of(role: HostRole, kinds: impl IntoIterator<Item = Numberi
         .count() as u64
 }
 
-fn numbered_flags(message: &Message) -> Vec<bool> {
-    numbered_flags_of(message.role, message.content.iter().map(NumberingKind::of))
-}
-
 fn numbered_flags_of(role: HostRole, kinds: impl IntoIterator<Item = NumberingKind>) -> Vec<bool> {
     let role = match role {
         HostRole::Tool => return kinds.into_iter().map(|_| false).collect(),
@@ -292,35 +288,6 @@ fn numbered_flags_of(role: HostRole, kinds: impl IntoIterator<Item = NumberingKi
             cortexkit_compaction_view::tags::is_numbered(&role, &body)
         })
         .collect()
-}
-
-pub fn attach_native_tags(message: &mut Message, metadata: &Metadata) -> Result<(), String> {
-    check_number_range(metadata)?;
-    let flags = numbered_flags(message);
-    if flags.iter().filter(|numbered| **numbered).count() as u64 != metadata.tag_count {
-        return Err("compaction tag metadata disagrees with native message parts".into());
-    }
-    let mut high = metadata.tag_base;
-    let parts = flags
-        .into_iter()
-        .map(|numbered| {
-            if numbered {
-                high += 1;
-                Some(high)
-            } else {
-                None
-            }
-        })
-        .collect();
-    message.set_tags(Some(std::sync::Arc::new(broca_protocol::tags::PartTags {
-        parts,
-        computed: Some(broca_protocol::tags::ComputedTags {
-            render: metadata.render_tags,
-            clean: metadata.clean_reply,
-            base: metadata.tag_base,
-        }),
-    })));
-    Ok(())
 }
 
 impl Fold {

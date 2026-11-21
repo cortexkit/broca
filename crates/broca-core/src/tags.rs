@@ -211,18 +211,6 @@ impl TagNumbering {
         numbering
     }
 
-    /// Number `prompt[from..]`, messages a replay held back (steers waiting for their step
-    /// boundary) and a rebuild appends, by the rules of the run `config` froze.
-    pub fn number_appended(
-        prompt: &mut [broca_protocol::Message],
-        from: usize,
-        config: &broca_wal::RunConfig,
-    ) -> Result<(), broca_protocol::tags::NumberingOverflow> {
-        let mut numbering = Self::new(TagSeed::from_prefix(&prompt[..from]), from);
-        numbering.rules = computed_rules(config);
-        numbering.number_new(prompt)
-    }
-
     /// A run starts: from here on messages are numbered by its rules, after its checkpoint.
     pub fn start_run(&mut self, config: &broca_wal::RunConfig) {
         self.rules = computed_rules(config);

@@ -27,56 +27,6 @@ pub use release::released_but_read;
 /// with the released placeholder in it.
 const RELEASED_READ: &str = "a part the view sends was released from memory and not read back";
 
-/// Rebuild a request offline for a log whose first run froze a compaction plan version.
-/// Boundary options must already contain restored tool-output decorations. Image capture belongs
-/// to the live boundary; offline rendering only recreates content-addressed image references.
-pub fn request_options(
-    records: &[broca_wal::FramedRecord],
-    lineage: &str,
-    mut boundary: broca_protocol::CallOptions,
-    applied: Option<&cortexkit_role_compaction::view::View>,
-) -> Result<broca_protocol::CallOptions, String> {
-    let transcript = super::transcript::project(records, lineage)?;
-    let (config, manifest) = super::host::frozen(records)?;
-    let prompt = if manifest.is_some_and(crate::compaction::has_compaction) {
-        let conditions = super::host::conditions(
-            &config,
-            &transcript.entries,
-            false,
-            None,
-            super::host::floor_entry(transcript.signed_floor, &transcript.entries),
-        )?;
-        prompt_view_with_rides(
-            &boundary.prompt,
-            &transcript.entries,
-            &transcript.rides,
-            applied,
-            &conditions.rules,
-            super::host::view_floor(&conditions),
-            super::host::image_reference,
-        )?
-    } else {
-        deliveries_only_with_rides(&boundary.prompt, &transcript.entries, &transcript.rides)?
-    };
-    boundary.ephemeral_session |=
-        crate::retention::is_retention_records(records.iter().map(|frame| &frame.record));
-    finish(&boundary, prompt, &config, manifest)
-}
-
-/// Complete an already-rendered prompt with the frozen run's global system messages.
-/// Boundary options preserve the ephemeral-session flag and renderer-only settings. The live
-/// caller passes Prepared::Ready's prompt, so finishing never selects a different view.
-pub fn finish(
-    boundary: &broca_protocol::CallOptions,
-    prompt: Vec<Message>,
-    config: &broca_wal::RunConfig,
-    manifest: Option<&broca_wal::PlanManifest>,
-) -> Result<broca_protocol::CallOptions, String> {
-    let opts = options(boundary, prompt);
-    let globals = super::systems::frozen(true, config, manifest)?;
-    Ok(super::systems::view(&opts, &globals)?.unwrap_or(opts))
-}
-
 pub fn prompt_with_rides(
     stored: &[Message],
     entries: &[Entry],

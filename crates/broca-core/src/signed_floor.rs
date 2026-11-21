@@ -133,14 +133,6 @@ impl FloorFold {
             floor.observe_run(start, digest);
         }
     }
-
-    /// The floor, when the fold knows it.
-    pub fn known(&self) -> Option<&SignedFloor> {
-        match self {
-            Self::Unknown => None,
-            Self::Known(floor) => Some(floor),
-        }
-    }
 }
 
 /// The tool-set facts an admission checkpoint folds from its lineage's run starts, so an append

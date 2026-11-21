@@ -60,16 +60,6 @@ pub struct SealedAttempt {
     pub attempt: ModelAttempt,
 }
 
-/// Write-time stage ordered by step first, then tool calls in batch source order.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum HookStage {
-    PostAssistant,
-    PostTool {
-        source_index: usize,
-        tool_call_id: String,
-    },
-}
-
 impl ShutdownSeal {
     /// A seal whose run's sends also move the session's cache clock.
     pub fn with_cache_clock(cache_clock: CacheClock) -> Self {

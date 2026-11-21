@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use broca_protocol::{error::ProviderError, AttemptOutcome, CallOptions, RunId, StepId, Usage};
-use broca_wal::{RunConfig, WalRecord};
+use broca_wal::RunConfig;
 
 /// A warm is refused, and nothing sent, when less than this much of the cache's estimated
 /// lifetime remains. The estimate is only that, so a warm at the very edge could arrive after the
@@ -261,23 +261,6 @@ pub struct RecordedRequest {
     /// warm must render it for that model (`opts.target_model` already names it), and its
     /// digest only matches when it does. `None` for a request to the episode's own model.
     pub route: Option<broca_wal::StepRoute>,
-}
-
-pub(crate) fn fold_refreeze(config: &mut RunConfig, record: &WalRecord) {
-    match record {
-        WalRecord::RunConfigRefrozen {
-            renderer_version,
-            frozen_render_config,
-            ..
-        } => {
-            config.renderer_version = *renderer_version;
-            config.frozen_render_config = frozen_render_config.clone();
-        }
-        WalRecord::RunAuthRefrozen { auth_selection, .. } => {
-            config.auth_selection = Some(auth_selection.clone())
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]
