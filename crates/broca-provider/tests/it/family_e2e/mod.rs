@@ -343,7 +343,19 @@ pub fn decide<T>(outcome: Option<T>, required: bool, context: &str) -> Option<T>
     }
 }
 
+/// Runs `spec` through `family` against aimock, the local mock model provider this suite starts.
+/// The run is boxed so its future stays small: in a debug build the session loop's future is
+/// large, and a test that joins several runs (`tokio::join!`) keeps them all in the test's own
+/// future, on the test thread's stack.
 pub async fn run_family_e2e<F: WireFamily + 'static>(
+    family: F,
+    frozen: FrozenRenderConfig,
+    spec: RunSpec,
+) -> Option<RunOutcome> {
+    Box::pin(family_e2e(family, frozen, spec)).await
+}
+
+async fn family_e2e<F: WireFamily + 'static>(
     family: F,
     mut frozen: FrozenRenderConfig,
     spec: RunSpec,
