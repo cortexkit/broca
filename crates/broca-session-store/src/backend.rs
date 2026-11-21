@@ -355,6 +355,10 @@ pub struct MemoryBackend {
 struct MemorySession {
     head: Option<(Vec<u8>, Version)>,
     logs: HashMap<Id128, Vec<u8>>,
+    /// Each log's length at its last barrier: what [`MemoryBackend::power_loss`] keeps, as the
+    /// file backend's sync makes only that much survive. Creating and truncating a log count as
+    /// synced, as the file backend syncs both.
+    synced: HashMap<Id128, usize>,
     objects: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
@@ -374,6 +378,22 @@ impl MemoryBackend {
     pub fn snapshot(&self) -> MemoryBackend {
         MemoryBackend {
             sessions: Mutex::new(self.sessions.lock().unwrap().clone()),
+            setup: Mutex::new(self.setup.lock().unwrap().clone()),
+            ..Default::default()
+        }
+    }
+
+    /// A copy of the backend as a power loss at this moment would leave it: like [`Self::snapshot`],
+    /// but each log keeps only what its last barrier synced. Tests only.
+    pub fn power_loss(&self) -> MemoryBackend {
+        let mut sessions = self.sessions.lock().unwrap().clone();
+        for session in sessions.values_mut() {
+            for (log, bytes) in &mut session.logs {
+                bytes.truncate(session.synced.get(log).copied().unwrap_or(0));
+            }
+        }
+        MemoryBackend {
+            sessions: Mutex::new(sessions),
             setup: Mutex::new(self.setup.lock().unwrap().clone()),
             ..Default::default()
         }
@@ -478,11 +498,9 @@ impl MemoryBackend {
     /// Replaces a log's bytes, as a crash or damage would leave them. Tests only.
     pub fn set_log(&self, s: &SessionAddr, log: &Id128, bytes: Vec<u8>) {
         let mut sessions = self.sessions.lock().unwrap();
-        sessions
-            .entry(s.clone())
-            .or_default()
-            .logs
-            .insert(*log, bytes);
+        let session = sessions.entry(s.clone()).or_default();
+        session.synced.insert(*log, bytes.len());
+        session.logs.insert(*log, bytes);
     }
 }
 
@@ -521,6 +539,7 @@ impl SessionBackend for MemoryBackend {
         let session = sessions.entry(s.clone()).or_default();
         session.fence(at)?;
         session.logs.insert(*log, Vec::new());
+        session.synced.insert(*log, 0);
         Ok(())
     }
 
@@ -569,7 +588,7 @@ impl SessionBackend for MemoryBackend {
         bytes: &[u8],
         expected_end: u64,
         at: Version,
-        _barrier: bool,
+        barrier: bool,
     ) -> Result<u64, BackendError> {
         self.mutate()?;
         let mut sessions = self.sessions.lock().unwrap();
@@ -580,7 +599,11 @@ impl SessionBackend for MemoryBackend {
             return Err(BackendError::Fenced);
         }
         stored.extend_from_slice(bytes);
-        Ok(stored.len() as u64)
+        let end = stored.len();
+        if barrier {
+            session.synced.insert(*log, end);
+        }
+        Ok(end as u64)
     }
 
     async fn truncate_log(
@@ -600,6 +623,7 @@ impl SessionBackend for MemoryBackend {
             return Err(BackendError::Fenced);
         }
         stored.truncate(to as usize);
+        session.synced.insert(*log, to as usize);
         Ok(())
     }
 

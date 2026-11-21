@@ -6101,9 +6101,9 @@ async fn settle<W: Writer, P, T: ToolPlane>(
             }
         }
     } else {
-        // Written now, unsynced, so a reader sees it while the batch's other calls run (a `say`
-        // beside a long `bash`). The batch's end syncs it with the batch's last records. The
-        // next request still lists the batch's results in the order its calls were planned.
+        // Written and synced now: a reader sees it while the batch's other calls run (a `say` by a
+        // long `bash`), and a crash can't lose a result a reader saw, which would make it unknown.
+        // The next request still lists the batch's results in the order its calls were planned.
         let mut records = Vec::new();
         terminal_with_reason(
             &mut records,
@@ -6117,7 +6117,7 @@ async fn settle<W: Writer, P, T: ToolPlane>(
         if let Some(Record::ToolOutcome(record)) = records.last_mut() {
             record.hooks = hooks.map(Into::into);
         }
-        writer.append(&records, false).await?;
+        writer.append(&records, true).await?;
     }
     answers[index] = Some(Answer { outcome });
     Ok(())

@@ -1,6 +1,7 @@
-//! A call's result is written as soon as the call answers, while the batch's other calls still
-//! run: a `say` that answers at once is readable beside a `bash` that runs on. The next request
-//! still lists the batch's results in the order the calls were planned.
+//! A call's result is written and synced as soon as the call answers, while the batch's other
+//! calls still run: a `say` that answers at once is readable beside a `bash` that runs on, and
+//! survives a power loss while `bash` runs. The next request still lists the batch's results in
+//! the order the calls were planned.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -246,6 +247,16 @@ async fn a_calls_result_is_written_while_the_batchs_other_call_still_runs() {
     // Nothing is written after `bash` answers: whatever the session holds was written before.
     let backend = run_batch(true).await;
     let session = reload(backend).await;
+    assert_eq!(answered(&session).await, ["say-1"]);
+}
+
+#[tokio::test]
+async fn a_result_a_reader_could_see_survives_a_power_loss_before_the_batch_ends() {
+    // The power loss keeps only what was synced: the `say` result a reader could already see
+    // must be part of it, or resume would find `say` without an outcome and stop the run.
+    let backend = run_batch(true).await;
+    let lost: &'static MemoryBackend = Box::leak(Box::new(backend.power_loss()));
+    let session = reload(lost).await;
     assert_eq!(answered(&session).await, ["say-1"]);
 }
 
