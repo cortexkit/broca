@@ -90,6 +90,7 @@ pub trait MoveDriver: Send + Sync {
         &self,
         _cut: &str,
         _plan: &PlannedSession,
+        _op: Op,
     ) -> Result<(), ErrorBody> {
         Err(unavailable("store stream cache unavailable"))
     }

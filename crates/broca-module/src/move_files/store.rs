@@ -242,7 +242,7 @@ impl FileCutArtifacts {
         let sidecar = self.move_sidecar(plan);
         match op {
             Op::Prepare => {
-                self.driver.cache_store_stream(cut, plan).await?;
+                self.driver.cache_store_stream(cut, plan, op).await?;
                 let (_, version) = export.head(&addr, runtime.deployment()).map_err(failure)?;
                 migration::freeze(
                     &self.state_root,
@@ -283,7 +283,7 @@ impl FileCutArtifacts {
                     .map_err(unavailable)?;
             }
             Op::Import => {
-                self.driver.cache_store_stream(cut, plan).await?;
+                self.driver.cache_store_stream(cut, plan, op).await?;
                 let staged = self.store_staged(cut, plan);
                 export
                     .stage(&staged, &addr, runtime.deployment())

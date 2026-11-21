@@ -321,24 +321,59 @@ struct SessionInventory {
     unreadable: Vec<String>,
 }
 
-fn door_refusal(error: SessionDoorError) -> ErrorBody {
-    let code = match error.door_code.as_deref() {
-        Some("not_found") => "cut_not_ready",
-        Some("verify_failed") => "digest_mismatch",
-        _ => "unavailable",
+/// What a failed door read during `op` answers the mover. The driver's next step follows from
+/// the code, and each op may refuse only the codes its row of the agent-data table lists, so a
+/// door code maps to the first allowed code that carries its meaning, and to `unavailable` (a
+/// plain retry) when the op allows none:
+/// - a cut the door will serve once its import progresses (`cut_import_pending`, and
+///   `not_found` from a door older than hub moves) is `cut_not_ready`, retried within the step;
+/// - a cut the door will never serve here (`cut_not_published`, `cut_takeover_closed`,
+///   `cut_range_not_local`) aborts the move, as `cut_unknown` or `participant_failed`;
+/// - bytes that fail the door's own check (`verify_failed`) are `digest_mismatch`.
+///
+/// `diverged` allows none of the aborting codes. A cut that cannot be compared there makes the
+/// ref's divergence unknown, which blocks the move, so the failure carries that reason too.
+/// The door's code stays in the message, and in `detail.reason` of a `participant_failed`.
+fn door_failure(op: Op, error: SessionDoorError) -> CutReadFailure {
+    let (wanted, unknown_cause): (&[&str], _) = match error.door_code.as_deref() {
+        Some("not_found" | "cut_import_pending") => (&["cut_not_ready"], None),
+        Some("verify_failed") => (
+            &["digest_mismatch", "participant_failed"],
+            Some("verify_failed"),
+        ),
+        Some("cut_not_published") => (&ABORTS, Some("cut_not_published")),
+        Some("cut_takeover_closed") => (&ABORTS, Some("cut_takeover_closed")),
+        Some("cut_range_not_local") => (&ABORTS, Some("cut_range_not_local")),
+        _ => (&[], None),
     };
-    refusal(code, error.to_string(), Value::Null)
+    const ABORTS: [&str; 2] = ["cut_unknown", "participant_failed"];
+    let detail = |code: &str| match (code, error.door_code.as_deref()) {
+        ("participant_failed", Some(door)) => json!({ "reason": door }),
+        _ => Value::Null,
+    };
+    let refusal = wanted
+        .iter()
+        .map(|code| refusal(code, error.to_string(), detail(code)))
+        .find(|body| contract::errors::may_refuse(op, &body.code))
+        .unwrap_or_else(|| refusal("unavailable", error.to_string(), Value::Null));
+    CutReadFailure {
+        refusal,
+        unknown_cause,
+    }
 }
 
 struct CutReadFailure {
     refusal: ErrorBody,
-    verification_cause: Option<&'static str>,
+    /// Why the cut could not be compared with the local copy, when that is a fact about the cut
+    /// rather than a fault here: `diverged` then answers the ref's divergence unknown with this
+    /// reason instead of refusing.
+    unknown_cause: Option<&'static str>,
 }
 impl From<ErrorBody> for CutReadFailure {
     fn from(refusal: ErrorBody) -> Self {
         Self {
             refusal,
-            verification_cause: None,
+            unknown_cause: None,
         }
     }
 }
@@ -462,7 +497,12 @@ impl Driver {
         )?;
         Ok(bytes)
     }
-    async fn incoming(&self, reference: &str, cut_id: &str) -> Result<Incoming, CutReadFailure> {
+    async fn incoming(
+        &self,
+        reference: &str,
+        cut_id: &str,
+        op: Op,
+    ) -> Result<Incoming, CutReadFailure> {
         let mut bytes = Vec::new();
         let mut metadata = None;
         loop {
@@ -470,16 +510,9 @@ impl Driver {
                 .door
                 .read(reference, bytes.len() as u64, cut_id)
                 .await
-                .map_err(|error| {
-                    let verification_cause = (error.door_code.as_deref() == Some("verify_failed"))
-                        .then_some("verify_failed");
-                    CutReadFailure {
-                        refusal: door_refusal(error),
-                        verification_cause,
-                    }
-                })?;
+                .map_err(|error| door_failure(op, error))?;
             if bytes.is_empty() && page.bytes.starts_with(b"broca-store-export/") {
-                return self.incoming_store(reference, cut_id, page).await;
+                return self.incoming_store(reference, cut_id, page, op).await;
             }
             if page.stream_end > self.wal.max_read_bytes() {
                 return Err(unavailable("sealed cut exceeds the session WAL size limit").into());
@@ -502,7 +535,7 @@ impl Driver {
                             "WAL bytes differ from the door's sealed digest",
                             Value::Null,
                         ),
-                        verification_cause: Some("sealed SHA mismatch"),
+                        unknown_cause: Some("sealed SHA mismatch"),
                     });
                 }
                 return Ok(Incoming {
@@ -548,8 +581,13 @@ impl Driver {
 
 #[async_trait::async_trait]
 impl MoveDriver for Driver {
-    async fn cache_store_stream(&self, cut: &str, plan: &PlannedSession) -> Result<(), ErrorBody> {
-        self.cache_stream(cut, plan).await
+    async fn cache_store_stream(
+        &self,
+        cut: &str,
+        plan: &PlannedSession,
+        op: Op,
+    ) -> Result<(), ErrorBody> {
+        self.cache_stream(cut, plan, op).await
     }
     async fn verify_store(
         &self,
@@ -744,7 +782,7 @@ impl MoveDriver for Driver {
                         continue;
                     }
                     Ok(false) => {
-                        match self.incoming(&reference.r#ref, cut_id).await {
+                        match self.incoming(&reference.r#ref, cut_id, op).await {
                             Ok(incoming) => {
                                 let bytes = incoming.bytes;
                                 divergence = Some(if bytes.starts_with(&local) {
@@ -754,12 +792,12 @@ impl MoveDriver for Driver {
                                 });
                                 bytes
                             }
-                            Err(error) => match error.verification_cause {
+                            Err(error) => match error.unknown_cause {
                                 Some(cause) => {
                                     // Divergence entries carry only a state, not a
                                     // per-ref message. Preserve the safe cause for the
                                     // answer without logging WAL content.
-                                    tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot verify the cut for a held ref");
+                                    tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot compare the cut with a held ref");
                                     sealed = false;
                                     divergence =
                                         Some(broca_module::move_files::LocalDivergence::Unknown);
@@ -780,7 +818,7 @@ impl MoveDriver for Driver {
                         .exists()
                 }) {
                     let incoming = self
-                        .incoming(&reference.r#ref, cut_id)
+                        .incoming(&reference.r#ref, cut_id, op)
                         .await
                         .map_err(|error| error.refusal)?;
                     plans.push(self.incoming_store_plan(&reference.r#ref, incoming).await?);
@@ -796,7 +834,7 @@ impl MoveDriver for Driver {
                 Vec::new()
             } else if receiver {
                 let incoming = self
-                    .incoming(&reference.r#ref, cut_id)
+                    .incoming(&reference.r#ref, cut_id, op)
                     .await
                     .map_err(|error| error.refusal)?;
                 if incoming.store {
@@ -999,6 +1037,102 @@ fn source_busy_reason(bytes: &[u8]) -> Result<Option<&'static str>, ErrorBody> {
     let range =
         broca_wal::file_wal::read_verified_member_range(bytes, 0, 0, None).map_err(unavailable)?;
     broca_module::move_files::source_busy_reason(&range)
+}
+
+#[cfg(test)]
+mod door_failure_tests {
+    use super::*;
+    use contract::errors::{driver_action_for, may_refuse, DriverAction};
+
+    fn failure(op: Op, door_code: Option<&str>) -> CutReadFailure {
+        door_failure(
+            op,
+            SessionDoorError {
+                door_code: door_code.map(str::to_owned),
+                message: "refused".into(),
+            },
+        )
+    }
+
+    const STOPS: [&str; 3] = [
+        "cut_not_published",
+        "cut_takeover_closed",
+        "cut_range_not_local",
+    ];
+
+    /// Every op that reads a cut answers only codes its row of the agent-data table allows, and
+    /// a door code that means "never here" never comes back as something the driver retries.
+    #[test]
+    fn each_op_refuses_only_its_allowed_codes_with_the_door_codes_meaning() {
+        let doors = [
+            Some("not_found"),
+            Some("cut_import_pending"),
+            Some("verify_failed"),
+            Some("lease_unavailable"),
+            None,
+        ]
+        .into_iter()
+        .chain(STOPS.map(Some));
+        for op in [Op::Prepare, Op::Diverged, Op::Import, Op::Activate] {
+            for door in doors.clone() {
+                let failure = failure(op, door);
+                let body = &failure.refusal;
+                assert!(
+                    may_refuse(op, &body.code),
+                    "{op:?} {door:?} -> {:?}",
+                    body.code
+                );
+                assert!(body.message.contains("refused"), "{}", body.message);
+                if door.is_some_and(|door| STOPS.contains(&door)) && op != Op::Diverged {
+                    assert!(
+                        !driver_action_for(op, &body.code).retryable(),
+                        "{op:?} {door:?} -> {:?}",
+                        body.code
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn import_retries_a_pending_cut_and_names_the_door_code_when_it_aborts() {
+        for door in ["not_found", "cut_import_pending"] {
+            let body = failure(Op::Import, Some(door)).refusal;
+            assert_eq!(body.code.as_str(), "cut_not_ready");
+            assert_eq!(
+                driver_action_for(Op::Import, &body.code),
+                DriverAction::RetryWithinStep
+            );
+        }
+        for door in STOPS {
+            let body = failure(Op::Import, Some(door)).refusal;
+            assert_eq!(body.code.as_str(), "participant_failed");
+            assert_eq!(body.detail, Some(json!({ "reason": door })));
+        }
+        assert_eq!(
+            failure(Op::Import, Some("verify_failed"))
+                .refusal
+                .code
+                .as_str(),
+            "digest_mismatch"
+        );
+        assert_eq!(
+            failure(Op::Activate, Some(STOPS[0])).refusal.code.as_str(),
+            "cut_unknown"
+        );
+    }
+
+    /// `diverged` has no aborting code, so a cut the door will never serve here leaves the ref's
+    /// divergence unknown; a pending one is still retried.
+    #[test]
+    fn diverged_reports_a_cut_it_can_never_read_as_unknown() {
+        for door in STOPS {
+            assert_eq!(failure(Op::Diverged, Some(door)).unknown_cause, Some(door));
+        }
+        let pending = failure(Op::Diverged, Some("cut_import_pending"));
+        assert_eq!(pending.unknown_cause, None);
+        assert_eq!(pending.refusal.code.as_str(), "cut_not_ready");
+    }
 }
 
 #[cfg(test)]

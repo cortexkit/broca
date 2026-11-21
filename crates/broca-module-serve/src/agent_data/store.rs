@@ -25,6 +25,7 @@ impl Driver {
         &self,
         cut: &str,
         plan: &PlannedSession,
+        op: Op,
     ) -> Result<(), ErrorBody> {
         use std::io::Write as _;
         let addr = SessionAddr(broca_core::session_addr(&plan.session));
@@ -77,7 +78,7 @@ impl Driver {
                 .door
                 .read(&plan.reference, offset, cut)
                 .await
-                .map_err(door_refusal)?;
+                .map_err(|error| door_failure(op, error).refusal)?;
             if page.stream_end != plan.end_offset
                 || page.digest != plan.digest
                 || page.from_offset != offset
@@ -228,7 +229,7 @@ impl Driver {
         };
         if matches!(op, Op::Import | Op::Activate) {
             let bytes = self
-                .incoming(reference, cut)
+                .incoming(reference, cut, op)
                 .await
                 .map_err(|error| error.refusal)?;
             return self.incoming_store_plan(reference, bytes).await.map(Some);
@@ -348,21 +349,31 @@ impl Driver {
                     .map_err(stream_lost)?;
             (bytes, end, digest, None)
         };
+        let mut divergence_reason = busy.map(str::to_owned);
         let divergence = if op == Op::Diverged {
-            let incoming = self.incoming(reference, cut).await.map_err(|e| e.refusal)?;
-            // The cached stream is what the move brought; the session itself can have gone on
-            // here since, which the stream never shows. So the copy is at the cut only when the
-            // door's bytes match the stream and the session holds no record past the stream's
-            // last export.
-            let at_cut = incoming.end == end_offset
-                && incoming.digest == digest
-                && view.next_seq()
-                    == exported_next_seq(&bytes, &addr, runtime.deployment()).await?;
-            Some(if at_cut {
-                LocalDivergence::AtCut
-            } else {
-                LocalDivergence::Advanced
-            })
+            match self.incoming(reference, cut, op).await {
+                Ok(incoming) => {
+                    // The cached stream is what the move brought; the session itself can have
+                    // gone on here since, which the stream never shows. So the copy is at the cut
+                    // only when the door's bytes match the stream and the session holds no record
+                    // past the stream's last export.
+                    let at_cut = incoming.end == end_offset
+                        && incoming.digest == digest
+                        && view.next_seq()
+                            == exported_next_seq(&bytes, &addr, runtime.deployment()).await?;
+                    Some(if at_cut {
+                        LocalDivergence::AtCut
+                    } else {
+                        LocalDivergence::Advanced
+                    })
+                }
+                Err(error) => {
+                    let cause = error.unknown_cause.ok_or(error.refusal)?;
+                    tracing::error!(session_ref = %reference, cut, cause, "agent-data cannot compare the cut with a held ref");
+                    divergence_reason = Some(cause.to_owned());
+                    Some(LocalDivergence::Unknown)
+                }
+            }
         } else {
             None
         };
@@ -378,7 +389,7 @@ impl Driver {
             lineage_id: broca_session_store::codec::hex(&head.session_id.0),
             local_archive: None,
             divergence,
-            divergence_reason: busy.map(str::to_owned),
+            divergence_reason,
         }))
     }
 

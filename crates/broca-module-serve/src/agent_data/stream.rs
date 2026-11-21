@@ -11,8 +11,9 @@ impl Driver {
         reference: &str,
         cut: &str,
         page: DoorRead,
+        op: Op,
     ) -> Result<Incoming, CutReadFailure> {
-        self.incoming_store_bounded(reference, cut, page, MOVE_IMPORT_BUDGET)
+        self.incoming_store_bounded(reference, cut, page, MOVE_IMPORT_BUDGET, op)
             .await
     }
 
@@ -22,6 +23,7 @@ impl Driver {
         cut: &str,
         mut page: DoorRead,
         budget: u64,
+        op: Op,
     ) -> Result<Incoming, CutReadFailure> {
         let metadata = (page.stream_end, page.digest.clone());
         let mut hash = Sha256::new();
@@ -115,7 +117,7 @@ impl Driver {
                 .door
                 .read(reference, offset, cut)
                 .await
-                .map_err(door_refusal)?;
+                .map_err(|error| door_failure(op, error))?;
         }
     }
 }
@@ -189,7 +191,7 @@ mod tests {
         let (driver, door) = driver(framed(&[&old, b"last"]));
         let first = door.read("r", 0, "c").await.unwrap();
         let incoming = driver
-            .incoming_store_bounded("r", "c", first, 8)
+            .incoming_store_bounded("r", "c", first, 8, Op::Import)
             .await
             .unwrap_or_else(|error| panic!("{:?}", error.refusal));
         assert_eq!(incoming.bytes, framed(&[b"last"]));
@@ -200,7 +202,10 @@ mod tests {
     async fn newest_budget_refusal_names_size_before_reading_or_allocating_the_payload() {
         let (driver, door) = driver(framed(&[&vec![7; 4096]]));
         let first = door.read("r", 0, "c").await.unwrap();
-        let error = match driver.incoming_store_bounded("r", "c", first, 8).await {
+        let error = match driver
+            .incoming_store_bounded("r", "c", first, 8, Op::Import)
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("over-budget export accepted"),
         };
