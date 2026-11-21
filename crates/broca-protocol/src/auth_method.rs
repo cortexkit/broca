@@ -16,11 +16,20 @@ pub enum AuthMethod {
     Antigravity,
     /// OpenAI ChatGPT-subscription OAuth.
     Chatgpt,
+    /// A company AI gateway's key. The request goes to the gateway's own address, which the
+    /// vault holds with the key, and the gateway pays the provider.
+    Gateway,
 }
 
 impl AuthMethod {
     /// Every method, in declaration order.
-    pub const ALL: [Self; 4] = [Self::ApiKey, Self::Oauth, Self::Antigravity, Self::Chatgpt];
+    pub const ALL: [Self; 5] = [
+        Self::ApiKey,
+        Self::Oauth,
+        Self::Antigravity,
+        Self::Chatgpt,
+        Self::Gateway,
+    ];
 
     /// The stable credential-id token for this method.
     pub fn as_token(self) -> &'static str {
@@ -29,6 +38,7 @@ impl AuthMethod {
             Self::Oauth => "oauth",
             Self::Antigravity => "antigravity",
             Self::Chatgpt => "chatgpt",
+            Self::Gateway => "gateway",
         }
     }
 
@@ -40,10 +50,11 @@ impl AuthMethod {
     }
 
     /// Whether the method signs in to a subscription account, whose use draws on the account's
-    /// quota rather than being billed per token. Every method but an API key does.
+    /// quota rather than being billed per token. An API key and a gateway key are billed per
+    /// token; every other method signs in to a subscription.
     pub fn is_subscription(self) -> bool {
         match self {
-            Self::ApiKey => false,
+            Self::ApiKey | Self::Gateway => false,
             Self::Oauth | Self::Antigravity | Self::Chatgpt => true,
         }
     }
@@ -63,11 +74,11 @@ mod tests {
     }
 
     #[test]
-    fn only_an_api_key_is_metered() {
+    fn only_api_and_gateway_keys_are_metered() {
         let metered: Vec<_> = AuthMethod::ALL
             .into_iter()
             .filter(|method| !method.is_subscription())
             .collect();
-        assert_eq!(metered, [AuthMethod::ApiKey]);
+        assert_eq!(metered, [AuthMethod::ApiKey, AuthMethod::Gateway]);
     }
 }

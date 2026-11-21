@@ -30,7 +30,7 @@ use crate::auth_routing::AuthMethod;
 /// the moment someone is deciding whether the risk is still real. Ask ASTRO to re-run the join
 /// measurement against the routing you are proposing, before it lands rather than after: that
 /// splits one simultaneous test of two unproven mechanisms into two separate ones.
-pub const CHARGE_BASIS_MAPPING_VERSION: u32 = 5;
+pub const CHARGE_BASIS_MAPPING_VERSION: u32 = 6;
 
 /// The provider/method table used while deriving spend facts.
 ///
@@ -132,6 +132,11 @@ impl ChargeBasisTable {
         // the two methods for the same provider land on different bases -- the clearest case
         // for keying this table on the pair rather than on either half.
         table.insert("xai", "oauth", ChargeBasis::SubscriptionIncluded);
+        // A company gateway's key for Anthropic is billed per token through the gateway, so its
+        // spend is priced at Anthropic's list rates: an estimate of what the company pays, as
+        // every metered call's price is. Added in version 6, after the billing consumer checked
+        // that those facts join Anthropic's catalog rows.
+        table.insert("anthropic", "gateway", ChargeBasis::MeteredApi);
         table
     }
 
@@ -360,6 +365,10 @@ mod tests {
         );
         assert_eq!(
             table.resolve("anthropic", AuthMethod::ApiKey),
+            (ChargeBasis::MeteredApi, CHARGE_BASIS_MAPPING_VERSION)
+        );
+        assert_eq!(
+            table.resolve("anthropic", AuthMethod::Gateway),
             (ChargeBasis::MeteredApi, CHARGE_BASIS_MAPPING_VERSION)
         );
         assert_eq!(

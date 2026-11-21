@@ -1896,7 +1896,13 @@ impl BrocaSubject {
         });
         let routed_services = match routed_session {
             Some(session) => Some(
-                routed_accounts::register(&connection_file, self.shared.clone(), session).await?,
+                routed_accounts::register(
+                    &connection_file,
+                    self.shared.clone(),
+                    session,
+                    &self.model_url,
+                )
+                .await?,
             ),
             None => None,
         };

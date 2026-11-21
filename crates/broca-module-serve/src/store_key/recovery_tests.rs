@@ -91,6 +91,7 @@ impl DeploymentKeySource for DelayedKey {
                 account_id: None,
                 resolved_credential_id: None,
                 hosts: None,
+                gateway: None,
             }),
             vault_replied: true,
         }

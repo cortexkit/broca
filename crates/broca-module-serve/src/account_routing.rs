@@ -963,6 +963,30 @@ impl Candidates {
         }
     }
 
+    /// The company AI gateway keys of `listing` listed under the gateway's provider id, sorted
+    /// by credential id. Like an API key, a gateway key that names no account is its own.
+    pub fn gateway_keys(listing: &ScopedList, provider: &str) -> Self {
+        let mut accounts: Vec<_> = listing
+            .credentials
+            .iter()
+            .filter(|row| {
+                row.state == "active"
+                    && row.operations.iter().any(|op| op == "read")
+                    && row.auth_method.as_deref() == Some(AuthMethod::Gateway.as_token())
+                    && row.provider_ids.iter().any(|id| id == provider)
+            })
+            .map(|row| Candidate {
+                account_id: row.account_id.clone().unwrap_or_else(|| row.id.clone()),
+                credential_id: row.id.clone(),
+            })
+            .collect();
+        accounts.sort_by(|a, b| a.credential_id.cmp(&b.credential_id));
+        Self {
+            view_digest: listing.view.clone(),
+            accounts,
+        }
+    }
+
     /// The rows of `listing` that are credentials of `method` for `provider` and name a
     /// provider account, sorted by credential id so identical listings give identical requests.
     ///
@@ -1008,7 +1032,7 @@ impl Candidates {
             })
             .filter_map(|row| {
                 let account_id = match method {
-                    AuthMethod::ApiKey => {
+                    AuthMethod::ApiKey | AuthMethod::Gateway => {
                         Some(row.account_id.clone().unwrap_or_else(|| row.id.clone()))
                     }
                     AuthMethod::Oauth | AuthMethod::Antigravity | AuthMethod::Chatgpt => {
@@ -2022,6 +2046,8 @@ where
         Candidates::pinned(&listing, method, &inputs.static_credential.to_id_string())
     } else if method == AuthMethod::ApiKey {
         Candidates::api_keys(&listing, requested, inputs.catalog_serves)
+    } else if method == AuthMethod::Gateway {
+        Candidates::gateway_keys(&listing, requested)
     } else {
         Candidates::from_listing(&listing, method, requested)
     };
@@ -2056,10 +2082,11 @@ where
             decision_id,
             service_tier_chosen,
         } => {
-            // Every answer must name an offered account/credential pair. API-key pool
-            // answers must also confirm the auth method of the offered key.
+            // Every answer must name an offered account/credential pair. Answers for a key
+            // (an API key or a gateway key) must also confirm the offered key's method.
             let valid_pick = candidates.offers(&account_id, &credential_id)
-                && (method != AuthMethod::ApiKey || answered_method.as_deref() == Some("apikey"));
+                && (!matches!(method, AuthMethod::ApiKey | AuthMethod::Gateway)
+                    || answered_method.as_deref() == Some(method.as_token()));
             if !valid_pick {
                 client.counters.bump("invalid_pick");
                 tracing::error!(

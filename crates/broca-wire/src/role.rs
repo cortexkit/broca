@@ -532,6 +532,7 @@ pub fn broca_role_describe_with_writers(
         "chatgpt".into(),
         "apikey".into(),
         "antigravity".into(),
+        "gateway".into(),
     ]);
     if broca_protocol::FORK_ANSWER_SERVED {
         describe = describe.with_fork_idle_s(broca_protocol::FORK_IDLE_S);
@@ -1450,7 +1451,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "435c3d40ab7e7589c40eb2962fa6f5c8833a0d766bec71e5d9192cdcf0c8dd66",
+            "d08e9062721203e0997b1651246dac7e0f9bf3aecc45b7959ccbb4a6182ed0f1",
         );
     }
 
@@ -1647,7 +1648,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "5af2861fd5ced027c6043b9f4cfc60944d43859cab0d98cfa5f9812163ea5938";
+        "0b23965ed0b9af8763aa403498d4700555471aa488068a07fa13b023c95b0d47";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

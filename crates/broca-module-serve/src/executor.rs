@@ -487,8 +487,36 @@ pub enum AuthDecision {
 /// resumable pause (the refresh token is dead → the user must re-auth, and the run waits
 /// for them). Connectivity and lock failures reject admission as transient because no run
 /// exists to pause yet; malformed/missing credentials remain permanent configuration faults.
+/// `mode` when it fits the credential's method: a gateway key, and only a gateway key, comes
+/// with its gateway's address. Anything else would send the company's key to the provider's
+/// own address, or an ordinary key to a gateway, so the run is refused before it starts.
+fn gateway_mode_for(
+    method: AuthMethod,
+    mode: AuthMode,
+    credential: &str,
+) -> Result<AuthMode, RunError> {
+    match (method, &mode) {
+        (AuthMethod::Gateway, AuthMode::Gateway { .. }) => Ok(mode),
+        (AuthMethod::Gateway, _) => Err(RunError::Config(format!(
+            "gateway credential '{credential}' came without its gateway's address"
+        ))),
+        (_, AuthMode::Gateway { .. }) => Err(RunError::Config(format!(
+            "credential '{credential}' has a gateway's address but is not a gateway key"
+        ))),
+        _ => Ok(mode),
+    }
+}
+
 pub fn vault_outcome_to_decision(result: Result<VaultToken, VaultError>) -> AuthDecision {
     match result {
+        Ok(VaultToken {
+            token,
+            gateway: Some(endpoint),
+            ..
+        }) => AuthDecision::Proceed(AuthMode::Gateway {
+            key: token,
+            endpoint,
+        }),
         Ok(token) => AuthDecision::Proceed(AuthMode::Secret(token.token)),
         Err(VaultError::NeedsReauth) => AuthDecision::PauseForReauth(Box::new(ProviderError {
             provider_details: None,
@@ -2633,8 +2661,11 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
         // The Claude Code persona a fresh episode freezes; the catalog keeps it only when
         // the episode resolves to the Anthropic OAuth shape. A resume restores the persona
         // its episode recorded, or its recorded absence, below.
-        let speaks_as_claude_code =
-            catalog_provider == "anthropic" && resolution.method != Some(AuthMethod::ApiKey);
+        let speaks_as_claude_code = catalog_provider == "anthropic"
+            && !matches!(
+                resolution.method,
+                Some(AuthMethod::ApiKey | AuthMethod::Gateway)
+            );
         let fresh_persona = match (&self.claude_code_install_id, fresh_episode) {
             (Some(install_id), true) if speaks_as_claude_code => {
                 let last_frozen = history
@@ -2875,8 +2906,13 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                     opencode_go_session_id: opencode_go_session_id.as_deref(),
                     codeassist_identity: codeassist_identity.as_ref(),
                     chatgpt_wire: chatgpt_wire.as_ref(),
+                    // A gateway key goes to its gateway's own address, which the run freezes
+                    // like any other endpoint, so a resume keeps it.
                     base_url: if fresh_episode {
-                        self.provider_overrides.base_url(catalog_provider)
+                        match &resolution.mode {
+                            AuthMode::Gateway { endpoint, .. } => Some(endpoint.base_url.as_str()),
+                            _ => self.provider_overrides.base_url(catalog_provider),
+                        }
                     } else {
                         None
                     },
@@ -4027,7 +4063,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 credential_hosts: Default::default(),
             }),
             AuthDecision::Proceed(mode) => Ok(AuthResolution {
-                mode,
+                mode: gateway_mode_for(credential_method, mode, &credential_key)?,
                 pause: None,
                 selection,
                 method,
@@ -4243,7 +4279,8 @@ impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
                         && listing.credentials.iter().any(|row| {
                             row.state == "active"
                                 && row.operations.iter().any(|op| op == "read")
-                                && (key.method == AuthMethod::ApiKey || row.account_id.is_some())
+                                && (matches!(key.method, AuthMethod::ApiKey | AuthMethod::Gateway)
+                                    || row.account_id.is_some())
                                 && row.provider_ids.contains(&model.provider)
                                 && row.auth_method.as_deref() == Some(key.method.as_token())
                         });

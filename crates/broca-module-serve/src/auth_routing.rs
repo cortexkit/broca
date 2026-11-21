@@ -15,8 +15,8 @@ pub use broca_catalog::live::AuthMethod;
 /// family a run renders with and the family the guard asserts can never come from two
 /// sources, hence can never drift to a mismatched (family, credential) pair.
 ///
-/// A same-family method (`ApiKey`/`Oauth`) returns `None` → the catalog's family is used
-/// unchanged. The catalog still receives the method separately because Anthropic API key
+/// A same-family method (`ApiKey`/`Oauth`/`Gateway`) returns `None` → the catalog's family is
+/// used unchanged. A gateway key borrows the rows of the provider its gateway serves. The catalog still receives the method separately because Anthropic API key
 /// changes frozen quirks and auth headers without changing the family. A wire-changing
 /// method returns its family: `Antigravity` renders the Code-Assist envelope
 /// (`GoogleCodeAssist`), `Chatgpt` renders the codex `/responses`
@@ -29,7 +29,7 @@ pub fn family_for_method(method: AuthMethod) -> Option<broca_catalog::live::Wire
     use broca_catalog::live::WireFamilyId;
     match method {
         // Same family: catalog resolution applies any method-specific quirks/auth kind.
-        AuthMethod::ApiKey | AuthMethod::Oauth => None,
+        AuthMethod::ApiKey | AuthMethod::Oauth | AuthMethod::Gateway => None,
         // Wire-changing: these select their own grammar (distinct endpoint + body).
         AuthMethod::Antigravity => Some(WireFamilyId::GoogleCodeAssist),
         AuthMethod::Chatgpt => Some(WireFamilyId::OpenAiResponsesChatgpt),
@@ -171,11 +171,12 @@ pub fn catalog_provider(
 
 /// Subscription credentials precede metered API keys when a provider has several methods.
 /// Keep the policy in one place so changing the default never depends on listing order.
-pub const DEFAULT_METHOD_ORDER: [AuthMethod; 4] = [
+pub const DEFAULT_METHOD_ORDER: [AuthMethod; 5] = [
     AuthMethod::Chatgpt,
     AuthMethod::Oauth,
     AuthMethod::Antigravity,
     AuthMethod::ApiKey,
+    AuthMethod::Gateway,
 ];
 
 pub fn default_method(listing: &ScopedList, provider: &str) -> Option<AuthMethod> {

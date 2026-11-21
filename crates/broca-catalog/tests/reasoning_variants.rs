@@ -91,7 +91,7 @@ mod gated {
         let family_override = match method {
             AuthMethod::Antigravity => Some(WireFamilyId::GoogleCodeAssist),
             AuthMethod::Chatgpt => Some(WireFamilyId::OpenAiResponsesChatgpt),
-            AuthMethod::ApiKey | AuthMethod::Oauth => None,
+            AuthMethod::ApiKey | AuthMethod::Oauth | AuthMethod::Gateway => None,
         };
         let options = ResolveOptions {
             auth_method: Some(method),

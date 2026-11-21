@@ -21,13 +21,15 @@ fn routed_accounts_discovery_lists_every_sign_in_method() {
         AuthMethod::Oauth,
         AuthMethod::Antigravity,
         AuthMethod::Chatgpt,
+        AuthMethod::Gateway,
     ];
     for method in every {
         match method {
             AuthMethod::ApiKey
             | AuthMethod::Oauth
             | AuthMethod::Antigravity
-            | AuthMethod::Chatgpt => {}
+            | AuthMethod::Chatgpt
+            | AuthMethod::Gateway => {}
         }
     }
     for describe in [
@@ -39,7 +41,7 @@ fn routed_accounts_discovery_lists_every_sign_in_method() {
         assert!(checked.declares(cortexkit_role_llm_runner::capabilities::ROUTED_ACCOUNTS));
         assert_eq!(
             value["routed_accounts"],
-            json!(["oauth", "chatgpt", "apikey", "antigravity"])
+            json!(["oauth", "chatgpt", "apikey", "antigravity", "gateway"])
         );
         let listed = checked.routed_accounts.as_ref().unwrap();
         for method in every {
@@ -813,6 +815,97 @@ async fn choose_api_key_with_decision(
         tokio::time::Instant::now() + ADMISSION_BUDGET,
     )
     .await
+}
+
+/// A gateway run offers routing the gateway keys listed under its gateway's provider id, each
+/// as its own account, and takes routing's answer only when it names one of them as a gateway
+/// key.
+#[tokio::test]
+async fn a_gateway_run_offers_its_gateways_keys_and_takes_only_a_gateway_answer() {
+    let gateway_key = |id: &str, provider: &str| {
+        let mut key = row(id, None, provider, "gateway");
+        key.serves = vec!["anthropic".into()];
+        key.categories = vec!["llm-gateway".into()];
+        key.refresh_adapter = None;
+        key
+    };
+    let mut no_read = gateway_key("apikey:anthropic-gw-acme:listed", "anthropic-gw-acme");
+    no_read.operations = vec!["list".into()];
+    let rows = listing(vec![
+        gateway_key("apikey:anthropic-gw-acme", "anthropic-gw-acme"),
+        gateway_key("apikey:anthropic-gw-other", "anthropic-gw-other"),
+        no_read,
+        row("apikey:anthropic", None, "anthropic-gw-acme", "apikey"),
+    ]);
+    assert_eq!(
+        Candidates::gateway_keys(&rows, "anthropic-gw-acme").accounts,
+        [Candidate {
+            account_id: "apikey:anthropic-gw-acme".into(),
+            credential_id: "apikey:anthropic-gw-acme".into(),
+        }]
+    );
+    let choose = |routing: &Arc<FakeRouting>| {
+        let key = CredentialId::new(AuthMethod::Gateway, "anthropic-gw-acme", None);
+        let client = client(routing);
+        let rows = rows.clone();
+        async move {
+            choose_account(
+                &client,
+                ChoiceInputs {
+                    catalog_serves: &|_: &str| false,
+                    account_route: None,
+                    static_credential: &key,
+                    caller_named_account: false,
+                    pool: None,
+                    credential_id: None,
+                    decision_id: None,
+                    service_tier: None,
+                    conversation_key: None,
+                    inherited_conversation_key: None,
+                    hold_cap: Default::default(),
+                    model: "claude-opus-5-5",
+                    session: &session(),
+                    send_id: None,
+                    run_id: "run-1",
+                    initial_input_bytes: 42,
+                    head_turn: false,
+                    warm_credential: None,
+                },
+                async { Some(rows) },
+                tokio::time::Instant::now() + ADMISSION_BUDGET,
+            )
+            .await
+        }
+    };
+    let routing = api_key_router("gateway", "apikey:anthropic-gw-acme");
+    assert!(matches!(
+        choose(&routing).await,
+        Ok(AccountChoice::Routed { .. })
+    ));
+    let offered = routing.requests.lock().unwrap()[0]["params"].clone();
+    assert_eq!(offered["provider"], "anthropic-gw-acme", "{offered}");
+    // A sample file of the request, for the routing module to check its reader against,
+    // written only when asked.
+    if let Some(dir) = std::env::var_os("BROCA_ROUTING_SLOT_SAMPLE_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("gateway-account-for.json"),
+            serde_json::to_vec(&offered).unwrap(),
+        )
+        .unwrap();
+    }
+    for (method, id) in [
+        ("apikey", "apikey:anthropic-gw-acme"),
+        ("gateway", "apikey:anthropic-gw-other"),
+    ] {
+        assert_eq!(
+            choose(&api_key_router(method, id)).await,
+            Err(ChoiceRefusal::Unavailable(
+                RoutingUnavailable::invalid_pick()
+            )),
+            "{method} {id}"
+        );
+    }
 }
 
 /// A paid-key run on a catalog model, routed through a pool its keys are filed under, offers

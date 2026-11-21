@@ -257,6 +257,9 @@ pub struct VaultToken {
     /// The hosts the credential's record lists (exact host names); `None` when the record has
     /// no host fact. A request carrying the token may go only to one of them.
     pub hosts: Option<Vec<String>>,
+    /// Where a company AI gateway's key is sent: `Some` only for a gateway credential, whose
+    /// record holds an address of its own. `None` for every other credential.
+    pub gateway: Option<broca_protocol::gateway::GatewayEndpoint>,
 }
 
 impl std::fmt::Debug for VaultToken {
@@ -414,31 +417,53 @@ struct GetResponse {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum GetOutcome {
-    Success {
-        payload: Vec<u8>,
-        #[serde(default)]
-        expires_at_ms: Option<i64>,
-        record_version: u64,
-        // Present (and non-null) only for an Antigravity credential; absent on the wire for
-        // every other credential kind (the vault serde-skips it when None).
-        #[serde(default)]
-        project_id: Option<String>,
-        // Present only for a ChatGPT credential (vault-parsed from the token). Absent on
-        // the wire elsewhere.
-        #[serde(default)]
-        account_id: Option<String>,
-        // Absence is deliberate information-hiding on unresolved addresses: no witness
-        // is available, not evidence of drift or a malformed reply.
-        #[serde(default)]
-        credential_id: Option<String>,
-        // The hosts this credential may be sent to, top-level on the same reply as the token.
-        // Absent when the record has no host fact, which admits no host.
-        #[serde(default)]
-        hosts: Option<Vec<String>>,
-    },
-    AppError {
-        error: ReadError,
-    },
+    // Boxed: a success carries far more than an error, and the reply is decoded once.
+    Success(Box<GetSuccess>),
+    AppError { error: ReadError },
+}
+
+/// A successful read's fields; see [`GetOutcome`] for why this struct is the only record of
+/// what broca takes from the reply.
+#[derive(Deserialize)]
+struct GetSuccess {
+    payload: Vec<u8>,
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+    record_version: u64,
+    // Present (and non-null) only for an Antigravity credential; absent on the wire for
+    // every other credential kind (the vault serde-skips it when None).
+    #[serde(default)]
+    project_id: Option<String>,
+    // Present only for a ChatGPT credential (vault-parsed from the token). Absent on
+    // the wire elsewhere.
+    #[serde(default)]
+    account_id: Option<String>,
+    // The vault leaves it out for a credential address it did not resolve, on purpose; its
+    // absence alone means nothing is wrong with the reply.
+    #[serde(default)]
+    credential_id: Option<String>,
+    // The hosts this credential may be sent to, top-level on the same reply as the token.
+    // Absent when the record lists no hosts, which allows sending it to none.
+    #[serde(default)]
+    hosts: Option<Vec<String>>,
+    // A gateway credential's own address. Its presence is what makes the reply a gateway
+    // key's; `auth` and `headers` then say how the key is sent.
+    #[serde(default)]
+    base_url: Option<String>,
+    // The header and scheme that carry the key. The vault sends this for other keys too,
+    // where it describes the provider's own header, so it is read, and its shape checked,
+    // only on a gateway reply: a malformed `auth` never fails an ordinary key's reply.
+    #[serde(default)]
+    auth: Option<serde_json::Value>,
+    // A gateway's fixed, non-secret headers, read on a gateway reply only, like `auth`.
+    #[serde(default)]
+    headers: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct GatewayAuth {
+    header: String,
+    scheme: String,
 }
 
 #[derive(Deserialize)]
@@ -484,18 +509,25 @@ fn decode_get_reply(body: &serde_json::Value) -> Result<VaultToken, VaultError> 
     let parsed: GetResponse = serde_json::from_value(body.clone())
         .map_err(|e| VaultError::Protocol(format!("decode credential.get result: {e}")))?;
     match parsed.result {
-        GetOutcome::Success {
-            payload,
-            expires_at_ms,
-            record_version,
-            project_id,
-            account_id,
-            credential_id,
-            hosts,
-        } => {
+        GetOutcome::Success(success) => {
+            let GetSuccess {
+                payload,
+                expires_at_ms,
+                record_version,
+                project_id,
+                account_id,
+                credential_id,
+                hosts,
+                base_url,
+                auth,
+                headers,
+            } = *success;
             let token = String::from_utf8(payload).map_err(|_| {
                 VaultError::Protocol("credential payload is not valid UTF-8".to_string())
             })?;
+            let gateway = base_url
+                .map(|base_url| gateway_endpoint(base_url, auth, headers))
+                .transpose()?;
             Ok(VaultToken {
                 token,
                 expires_at_ms,
@@ -509,10 +541,44 @@ fn decode_get_reply(body: &serde_json::Value) -> Result<VaultToken, VaultError> 
                 // but normalize empty spellings just like account_id above.
                 resolved_credential_id: credential_id.filter(|value| !value.trim().is_empty()),
                 hosts,
+                gateway,
             })
         }
         GetOutcome::AppError { error } => Err(error.code.into_error()),
     }
+}
+
+/// A gateway reply's endpoint. A gateway key without its header, or with a scheme other than
+/// the vault's two, can't be sent, so the reply is refused as contract drift.
+fn gateway_endpoint(
+    base_url: String,
+    auth: Option<serde_json::Value>,
+    headers: Option<serde_json::Value>,
+) -> Result<broca_protocol::gateway::GatewayEndpoint, VaultError> {
+    use broca_protocol::gateway::{GatewayEndpoint, GatewayScheme};
+    let auth: GatewayAuth = auth
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| VaultError::Protocol(format!("decode gateway auth: {e}")))?
+        .ok_or_else(|| {
+            VaultError::Protocol("gateway credential reply has a base_url but no auth".into())
+        })?;
+    let headers: Option<std::collections::BTreeMap<String, String>> = headers
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| VaultError::Protocol(format!("decode gateway headers: {e}")))?;
+    let auth_scheme = GatewayScheme::from_token(&auth.scheme).ok_or_else(|| {
+        VaultError::Protocol(format!(
+            "gateway credential reply names auth scheme {:?}, not bearer or raw",
+            auth.scheme
+        ))
+    })?;
+    Ok(GatewayEndpoint {
+        base_url,
+        auth_header: auth.header,
+        auth_scheme,
+        headers: headers.unwrap_or_default().into_iter().collect(),
+    })
 }
 
 /// The `reporter_source` broca puts on every failure report; see [`ReportParams`].
@@ -2422,6 +2488,7 @@ mod tests {
             project_id: Some("project-id".to_string()),
             account_id: None,
             resolved_credential_id: None,
+            gateway: None,
         };
         let debug = format!("{token:?}");
 
@@ -2465,6 +2532,7 @@ mod tests {
                 project_id: None,
                 account_id: None,
                 resolved_credential_id: None,
+                gateway: None,
             }
         );
     }
@@ -2519,6 +2587,78 @@ mod tests {
         assert_eq!(got.expires_at_ms, None);
         assert_eq!(got.token, "a");
         assert_eq!(got.project_id, None);
+    }
+
+    /// A gateway key's reply, byte for byte as the vault's own code writes it: the test vectors
+    /// the claustrum repository publishes under its tag `gateway-keys-vectors-v1`, a reply with
+    /// fixed headers and one without. It carries the gateway's address, the key's header and
+    /// the fixed headers in name order.
+    #[test]
+    fn decodes_a_gateway_keys_endpoint() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"result":{"auth":{"header":"authorization","scheme":"bearer"},"base_url":"http://[::1]:4000/v1","credential_id":"apikey:anthropic-gw-acme","expires_at_ms":null,"headers":{"x-a":"a\"b\\c","x-z":"engineering"},"hosts":["[::1]"],"invalid_key":null,"payload":[118,101,99,116,111,114,45,116,101,115,116,45,107,101,121],"record_version":1}}"#,
+        )
+        .unwrap();
+        let got = decode_get_reply(&body).unwrap();
+        assert_eq!(got.token, "vector-test-key");
+        assert_eq!(got.hosts, Some(vec!["[::1]".to_string()]));
+        assert_eq!(
+            got.gateway,
+            Some(broca_protocol::gateway::GatewayEndpoint {
+                base_url: "http://[::1]:4000/v1".into(),
+                auth_header: "authorization".into(),
+                auth_scheme: broca_protocol::gateway::GatewayScheme::Bearer,
+                headers: vec![
+                    ("x-a".into(), "a\"b\\c".into()),
+                    ("x-z".into(), "engineering".into()),
+                ],
+            })
+        );
+        let empty: serde_json::Value = serde_json::from_str(
+            r#"{"result":{"auth":{"header":"authorization","scheme":"bearer"},"base_url":"http://[::1]:4000/v1","credential_id":"apikey:anthropic-gw-acme:empty","expires_at_ms":null,"headers":{},"hosts":["[::1]"],"invalid_key":null,"payload":[118,101,99,116,111,114,45,116,101,115,116,45,107,101,121],"record_version":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_get_reply(&empty).unwrap().gateway.unwrap().headers,
+            []
+        );
+    }
+
+    /// Only an address makes a reply a gateway key's: an ordinary key's `auth` describes the
+    /// provider's own header and is not read. A gateway reply the key can't be sent with is
+    /// refused as a `Protocol` error.
+    #[test]
+    fn a_gateway_reply_needs_its_address_header_and_a_known_scheme() {
+        let reply = |extra: serde_json::Value| {
+            let mut result = json!({"payload": [107], "record_version": 1});
+            result
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            decode_get_reply(&json!({ "result": result }))
+        };
+        let ordinary = reply(json!({"auth": {"header": "x-api-key", "scheme": "raw"}})).unwrap();
+        assert_eq!(ordinary.gateway, None);
+        // An ordinary key's descriptor in a shape broca doesn't know still decodes.
+        assert!(reply(json!({"auth": {"kind": "future"}, "headers": ["x"]})).is_ok());
+        assert!(matches!(
+            reply(json!({"base_url": "https://gateway.example"})),
+            Err(VaultError::Protocol(_))
+        ));
+        assert!(matches!(
+            reply(
+                json!({"base_url": "https://gateway.example", "auth": {"header": "authorization", "scheme": "basic"}})
+            ),
+            Err(VaultError::Protocol(_))
+        ));
+        let raw = reply(json!({"base_url": "https://gateway.example", "auth": {"header": "x-portkey-api-key", "scheme": "raw"}}))
+            .unwrap()
+            .gateway
+            .unwrap();
+        assert_eq!(
+            raw.auth_headers("k"),
+            [("x-portkey-api-key".to_string(), "k".to_string())]
+        );
     }
 
     /// An Antigravity credential carries the bound `project_id` alongside the token.

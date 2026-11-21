@@ -103,7 +103,9 @@ fn render_one_shot(route: Route, session: &str, cache_key: &str, varying: &str) 
         AuthMethod::ApiKey => AuthMode::Secret("test-openai-api-key".into()),
         AuthMethod::Chatgpt => AuthMode::Bearer("test-chatgpt-token".into()),
         AuthMethod::Oauth => AuthMode::Bearer("test-meta-oauth-token".into()),
-        AuthMethod::Antigravity => unreachable!("the test routes do not use Antigravity"),
+        AuthMethod::Antigravity | AuthMethod::Gateway => {
+            unreachable!("the test routes use neither Antigravity nor a gateway")
+        }
     };
     let options = ResolveOptions {
         auth_method: Some(route.auth_method),

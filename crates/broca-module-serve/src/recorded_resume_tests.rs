@@ -192,3 +192,160 @@ async fn a_pool_key_run_sends_the_variant_it_was_asked_for() {
     assert_eq!(body["thinking"], plain_body["thinking"]);
     assert_eq!(body["output_config"], plain_body["output_config"]);
 }
+
+/// A company AI gateway key, filed under the gateway's own provider id: the vault serves it with
+/// the gateway's address, the header and scheme that carry it, and fixed headers.
+#[tokio::test]
+async fn a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers() {
+    // It replaces the process-wide catalog, so it runs in a child process of its own.
+    if !run_catalog_drift_child("a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers")
+    {
+        return;
+    }
+    let _catalog = install_test_catalog();
+    let root = fresh_vault_root("gateway-key");
+    let server = resume_http_fixture().await;
+    // The stand-in answers under `/v1`; the gateway's root stands in for Anthropic's, so the
+    // request path `/v1/messages` lands below it.
+    let gateway_root = server.url.trim_end_matches("/v1").to_owned();
+    let vault = CapturingVaultDaemon::start(&root).await;
+    vault.record.lock().unwrap().credential_replies.insert(
+        "apikey:anthropic-gw-acme".into(),
+        std::collections::VecDeque::from([serde_json::json!({"result": {
+            "payload": "gateway-key".as_bytes(), "expires_at_ms": null, "record_version": 1,
+            "credential_id": "apikey:anthropic-gw-acme", "hosts": ["127.0.0.1"],
+            "base_url": gateway_root, "auth": {"header": "authorization", "scheme": "bearer"},
+            "headers": {"x-team": "engineering"}, "invalid_key": null,
+        }})]),
+    );
+    let listing = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+    listing.store(broca_subc::vault::ScopedList {
+        credentials: vec![serde_json::from_value(serde_json::json!({
+            "id": "apikey:anthropic-gw-acme", "type": "apikey", "categories": ["llm-gateway"],
+            "serves": ["anthropic"], "state": "active", "record_version": 1,
+            "operations": ["read", "list"], "auth_method": "gateway",
+            "provider_ids": ["anthropic-gw-acme"]}))
+        .unwrap()],
+        grants: 1,
+        grant_tuples: vec![],
+        view: "fixture".into(),
+    });
+    // No provider override: the gateway's address comes from its credential alone.
+    let executor = executor_with_vault_addressing(
+        &root,
+        &vault,
+        Duration::from_secs(2),
+        listing,
+        supervised_broca_identity(),
+    )
+    .await;
+    let mut req = drift_request(&root);
+    req.run_id = broca_protocol::RunId("gateway".into());
+    req.model = broca_protocol::request::ModelHandle::new("anthropic-gw-acme", "claude-haiku-4-5");
+    req.generation.max_output_tokens = Some(1024);
+    req.input = vec![broca_protocol::Message::new(
+        broca_protocol::Role::User,
+        vec![broca_protocol::ContentBlock::Text { text: "hello".into() }],
+    )];
+    let mut session = store_session().await;
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    let auth = broca_protocol::AuthRequest {
+        method: "gateway".into(),
+        account: None,
+        pool: None,
+        credential_id: None,
+    };
+    let end = serve_store_run_with_control(
+        &executor,
+        &mut session,
+        &parts,
+        req,
+        broca_module::executor::StoreRunMode::Fresh,
+        Default::default(),
+        Some(auth),
+    )
+    .await;
+    vault.assert_healthy();
+    match end.result {
+        Ok(finished) => assert_eq!(finished.reason, RunFinishReason::Completed),
+        Err(error) => panic!("{error:?}"),
+    }
+    let (writer, _link) = broca_session_loop::shared::ActorWriter::new(&session, None);
+    let config = store_history(&writer, &parts)
+        .await
+        .unwrap()
+        .prior_run
+        .expect("the run started")
+        .config;
+    let gateway = server.requests.lock().unwrap().pop().expect("one model call");
+    let (records, _) = broca_session_loop::billing::run_billing_inputs(
+        &session,
+        "gateway",
+        &broca_protocol::BindIdentity::new(&root, "test", "session"),
+        &parts,
+    )
+    .await
+    .unwrap();
+    let segments = broca_core::billing::compute_segments_for_run(
+        &records,
+        &broca_protocol::RunId("gateway".into()),
+        "instance",
+        &broca_module_serve::ChargeBasisTable::shipped_defaults(),
+    );
+    drop(executor);
+    let _ = std::fs::remove_dir_all(root);
+    let (plain, _) = borrowed_rows_run(
+        "gateway-plain",
+        "anthropic",
+        listed_credentials([("apikey:anthropic", "apikey:anthropic")]),
+    )
+    .await;
+
+    let request_line = gateway.headers.lines().next().unwrap().to_owned();
+    assert!(request_line.contains(" /v1/messages "), "{request_line}");
+    let headers = gateway.headers.to_ascii_lowercase();
+    assert!(headers.contains("authorization: bearer gateway-key"), "the key in the gateway's header");
+    assert!(headers.contains("x-team: engineering"), "with the gateway's fixed headers");
+    assert!(!headers.contains("x-api-key:"), "and never in Anthropic's own header");
+    assert_eq!(gateway.body, plain.body, "a gateway run renders a paid key's request");
+    assert!(!String::from_utf8_lossy(&gateway.body).contains("Claude Code"));
+
+    assert_eq!(config.model.provider_module_id, "anthropic-gw-acme");
+    assert_eq!(config.served_provider.as_deref(), Some("anthropic"));
+    assert_eq!(
+        config.frozen_render_config["base_url"],
+        serde_json::json!(gateway_root),
+        "the run freezes the gateway's address, so a resume sends there"
+    );
+    let selection = config.auth_selection.as_ref().expect("a vault run freezes its selection");
+    assert_eq!(selection.resolved_credential_id.as_deref(), Some("apikey:anthropic-gw-acme"));
+    assert_eq!(config.billed_provider(), "anthropic", "its spend names the rows it borrowed");
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].provider, "anthropic", "the provider the spend is priced as");
+    assert_eq!(
+        segments[0].charge_basis,
+        broca_core::ChargeBasis::MeteredApi,
+        "priced at Anthropic's rates"
+    );
+    // Sample files for the modules that read these bytes, written only when asked: the
+    // gateway run's spend segment (the usage export's `segment_json`), its frozen run config
+    // and the request the gateway received, through the serializers the export and the session
+    // store use. The key is synthetic.
+    if let Some(dir) = std::env::var_os("BROCA_GATEWAY_SAMPLES") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| std::fs::write(dir.join(name), bytes).unwrap();
+        write(
+            "gateway-run-export-fact-segment.json",
+            &serde_json::to_vec_pretty(&segments[0]).unwrap(),
+        );
+        write(
+            "gateway-run-frozen-run-config.json",
+            &serde_json::to_vec_pretty(&config).unwrap(),
+        );
+        write("gateway-run-request-body.json", &gateway.body);
+        write("gateway-run-request-headers.txt", gateway.headers.as_bytes());
+    }
+}

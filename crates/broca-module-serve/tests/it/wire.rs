@@ -2589,7 +2589,7 @@ async fn hello_bind_send_status_roundtrip() {
         .expect("HELLO declares broca as a runner");
     assert!(runner.follows_account_choice);
     assert!(!runner.requires_wire_api());
-    assert_eq!(runner.pairs.len(), 12);
+    assert_eq!(runner.pairs.len(), 13);
     assert_eq!(
         runner
             .pairs

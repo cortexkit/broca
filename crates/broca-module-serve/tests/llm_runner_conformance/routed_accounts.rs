@@ -84,6 +84,15 @@ pub(super) fn code_assist_stream(
     body
 }
 
+/// The provider id the fixture vault files its gateway keys under.
+const GATEWAY_PROVIDER: &str = "kit-gateway";
+
+/// Whether `method`'s credentials are keys, which the vault lists without a provider account:
+/// routing names the key itself as the account.
+fn is_key(method: &str) -> bool {
+    matches!(method, "apikey" | "gateway")
+}
+
 pub(super) fn runner_declaration() -> Value {
     json!({"follows_account_choice":true})
 }
@@ -93,6 +102,9 @@ pub(super) fn fixture(method: &str) -> Result<Value, HarnessError> {
         "oauth" => "anthropic",
         "chatgpt" | "apikey" => "openai",
         "antigravity" => "google",
+        // A company gateway's own provider id, which the catalog lacks: its keys serve
+        // Anthropic, so a run on it borrows Anthropic's rows.
+        "gateway" => GATEWAY_PROVIDER,
         _ => {
             return Err(HarnessError::new(format!(
                 "no routed-account fixture for {method}"
@@ -100,7 +112,7 @@ pub(super) fn fixture(method: &str) -> Result<Value, HarnessError> {
         }
     };
     Ok(
-        json!({"provider":provider,"account_id":if method == "apikey" { format!("fixture-credential-{method}") } else { format!("fixture-{method}") },
+        json!({"provider":provider,"account_id":if is_key(method) { format!("fixture-credential-{method}") } else { format!("fixture-{method}") },
         "credential_id":format!("fixture-credential-{method}")}),
     )
 }
@@ -407,16 +419,21 @@ impl subc_client_rs::ModuleHandler for Router {
 /// routing the pool's accounts.
 fn credentials() -> Vec<Value> {
     let mut rows = vec![];
-    for method in ["oauth", "chatgpt", "apikey", "antigravity"] {
+    for method in ["oauth", "chatgpt", "apikey", "antigravity", "gateway"] {
         let fixture = fixture(method).unwrap();
-        let vendor = fixture["provider"].as_str().unwrap();
-        let filed = [vendor.to_string(), format!("kit-pool-{vendor}")];
+        let filed_under = fixture["provider"].as_str().unwrap();
+        let filed = [filed_under.to_string(), format!("kit-pool-{filed_under}")];
+        let (vendor, category) = if method == "gateway" {
+            ("anthropic", "llm-gateway")
+        } else {
+            (filed_under, "llm-provider")
+        };
         for spare in [false, true] {
             let mut row = json!({"id":format!("{}{}",fixture["credential_id"].as_str().unwrap(),if spare {"-spare"} else {""}),
-                "categories":["llm-provider"],"type":if method == "apikey" {"apikey"} else {"oauth"},"serves":[vendor],
+                "categories":[category],"type":if is_key(method) {"apikey"} else {"oauth"},"serves":[vendor],
                 "provider_ids":filed,"auth_method":method,"state":"active","record_version":1,
                 "operations":["read"],"account_id":format!("{}{}",fixture["account_id"].as_str().unwrap(),if spare {"-spare"} else {""})});
-            if method == "apikey" {
+            if is_key(method) {
                 row.as_object_mut().unwrap().remove("account_id");
             }
             rows.push(row);
@@ -425,7 +442,11 @@ fn credentials() -> Vec<Value> {
     rows
 }
 
-struct Vault;
+/// The fixture vault. Its gateway keys answer with `gateway_root`, the model stand-in's address
+/// as a gateway's root, which stands in for Anthropic's.
+struct Vault {
+    gateway_root: String,
+}
 
 fn credential_payload(id: &str) -> Vec<u8> {
     format!("synthetic-fixture-token-{id}").into_bytes()
@@ -466,7 +487,13 @@ pub(super) fn http_request_evidence(headers: &str) -> HttpRequestEvidence {
 }
 
 impl Vault {
-    fn request(request: &Value) -> Result<Value, HarnessError> {
+    fn new(model_url: &str) -> Self {
+        Self {
+            gateway_root: model_url.trim_end_matches("/v1").to_owned(),
+        }
+    }
+
+    fn request(&self, request: &Value) -> Result<Value, HarnessError> {
         match request["method"].as_str() {
             Some("credential.list_scoped") => Ok(json!({"result":{"credentials":credentials(),
                 "grants":1,"grant_tuples":[],"view":"routed-fixture"}})),
@@ -480,6 +507,19 @@ impl Vault {
                 // A Code Assist sign-in carries the Google Cloud project its requests name.
                 if row["auth_method"] == "antigravity" {
                     reply["result"]["project_id"] = json!("fixture-project");
+                }
+                // A gateway key carries its gateway's address and the header its key goes in.
+                // The key goes as a bearer token, so the stand-in tells which key paid as it
+                // does for every other method.
+                if row["auth_method"] == "gateway" {
+                    let result = reply["result"].as_object_mut().unwrap();
+                    result.insert("base_url".into(), json!(self.gateway_root));
+                    result.insert(
+                        "auth".into(),
+                        json!({"header": "authorization", "scheme": "bearer"}),
+                    );
+                    result.insert("headers".into(), json!({}));
+                    result.remove("account_id");
                 }
                 Ok(reply)
             }
@@ -497,7 +537,7 @@ impl subc_client_rs::ModuleHandler for Vault {
     ) -> subc_client_rs::HandlerOutcome {
         let result = serde_json::from_slice(&body)
             .map_err(|error| HarnessError::new(error.to_string()))
-            .and_then(|request| Self::request(&request));
+            .and_then(|request| self.request(&request));
         match result {
             Ok(answer) => {
                 subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&answer).unwrap())
@@ -514,6 +554,7 @@ pub(super) async fn register(
     connection: &Path,
     shared: Arc<Shared>,
     session: &str,
+    model_url: &str,
 ) -> Result<Services, HarnessError> {
     let mut services = Services(vec![]);
     services.0.push(
@@ -539,7 +580,7 @@ pub(super) async fn register(
             connection,
             VAULT,
             &["credential.list_scoped", "credential.get_scoped"],
-            Vault,
+            Vault::new(model_url),
         )
         .await?,
     );
@@ -923,7 +964,10 @@ mod tests {
         let static_credential =
             broca_module_serve::auth_routing::CredentialId::new(auth_method, provider, None);
         let listing = serde_json::from_value(
-            Vault::request(&json!({"method":"credential.list_scoped"})).unwrap()["result"].clone(),
+            Vault::new(&model_url)
+                .request(&json!({"method":"credential.list_scoped"}))
+                .unwrap()["result"]
+                .clone(),
         )
         .unwrap();
         let client = RoutingClient::new(
@@ -969,10 +1013,11 @@ mod tests {
         assert_eq!(credential_id, ids["credential_id"]);
         assert_eq!(account_id, ids["account_id"]);
         assert_eq!(method, auth_method);
-        let vault = Vault::request(
-            &json!({"method":"credential.get_scoped","params":{"credential_id":credential_id}}),
-        )
-        .unwrap();
+        let vault = Vault::new(&model_url)
+            .request(
+                &json!({"method":"credential.get_scoped","params":{"credential_id":credential_id}}),
+            )
+            .unwrap();
         let token =
             String::from_utf8(serde_json::from_value(vault["result"]["payload"].clone()).unwrap())
                 .unwrap();
@@ -1170,7 +1215,10 @@ mod tests {
     #[test]
     fn routed_accounts_fixtures_offer_two_real_candidates_for_each_declared_method() {
         let listing: broca_subc::vault::ScopedList = serde_json::from_value(
-            Vault::request(&json!({"method":"credential.list_scoped"})).unwrap()["result"].clone(),
+            Vault::new("http://127.0.0.1:1/v1")
+                .request(&json!({"method":"credential.list_scoped"}))
+                .unwrap()["result"]
+                .clone(),
         )
         .unwrap();
         let describe = serde_json::to_value(broca_wire::broca_role_describe("fixtures")).unwrap();
@@ -1187,6 +1235,8 @@ mod tests {
                     provider,
                     &|_| true,
                 )
+            } else if auth == broca_catalog::live::AuthMethod::Gateway {
+                broca_module_serve::account_routing::Candidates::gateway_keys(&listing, provider)
             } else {
                 broca_module_serve::account_routing::Candidates::from_listing(
                     &listing, auth, provider,

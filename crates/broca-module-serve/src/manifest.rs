@@ -471,6 +471,18 @@ fn routing_wire_api(family: WireFamilyId) -> &'static str {
 fn routing_runner_pairs() -> Vec<RoutingRunnerPair> {
     let mut pairs = BTreeMap::new();
     for method in crate::auth_routing::DEFAULT_METHOD_ORDER {
+        // The vault's gateways serve Anthropic's Messages API only, at an address the
+        // credential holds, so the pair never needs the catalog's endpoint.
+        if method == crate::AuthMethod::Gateway {
+            pairs.insert(
+                (
+                    routing_wire_api(WireFamilyId::AnthropicMessages),
+                    method.as_token(),
+                ),
+                false,
+            );
+            continue;
+        }
         let mut insert = |family, catalog_endpoint| {
             pairs
                 .entry((routing_wire_api(family), method.as_token()))
@@ -772,6 +784,7 @@ mod routing_tests {
         let expected = BTreeSet::from([
             ("anthropic.messages", "apikey", true),
             ("anthropic.messages", "oauth", true),
+            ("anthropic.messages", "gateway", false),
             ("aws.bedrock_converse", "apikey", true),
             ("aws.bedrock_converse", "oauth", true),
             ("google.code_assist", "antigravity", false),
@@ -805,9 +818,8 @@ mod routing_tests {
             .collect();
         assert_eq!(
             methods,
-            BTreeSet::from(["apikey", "oauth", "chatgpt", "antigravity"])
+            BTreeSet::from(["apikey", "oauth", "chatgpt", "antigravity", "gateway"])
         );
-        // Routing also knows gateway credentials, which broca does not yet serve.
         for method in methods {
             assert!(cortexkit_role_routing::spellings::AUTH_METHODS.contains(&method));
         }
@@ -818,6 +830,16 @@ mod routing_tests {
         let manifest = serde_json::to_value(manifest("broca")).unwrap();
         let slot = &manifest["role_declarations"][cortexkit_role_routing::ROLE_DECLARATIONS_KEY];
         assert_eq!(*slot, serialized_routing_slot());
+        // A sample file of the runner declaration, for the routing module to check its
+        // reader against, written only when asked.
+        if let Some(dir) = std::env::var_os("BROCA_ROUTING_SLOT_SAMPLE_DIR") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                std::path::Path::new(&dir).join("routing-runner-slot.json"),
+                serde_json::to_vec(&slot["runner"]).unwrap(),
+            )
+            .unwrap();
+        }
         let parsed = parse_consumer_declarations(slot).expect("the entire routing slot validates");
         assert!(parsed.consumers.is_empty());
         let runner = parsed.runner.as_ref().expect("broca declares its runner");
@@ -827,7 +849,7 @@ mod routing_tests {
             .as_object()
             .unwrap()
             .contains_key("requires_wire_api"));
-        assert_eq!(runner.pairs.len(), 12);
+        assert_eq!(runner.pairs.len(), 13);
         let sources = routing_runner_pairs();
         for (pair, source) in runner.pairs.iter().zip(&sources) {
             assert_eq!(pair.wire_api, source.pair.wire_api);
@@ -871,6 +893,7 @@ mod routing_tests {
         let expected = concat!(
             r#"{"runner":{"follows_account_choice":true,"harness_limits":{"broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"]}},"harnesses":["broca"],"pairs":["#,
             r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
+            r#"{"auth_method":"gateway","requires_wire_api":false,"wire_api":"anthropic.messages"},"#,
             r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
             r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,
             r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,

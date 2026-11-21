@@ -603,11 +603,64 @@ fn vault_success_proceeds_with_secret() {
         project_id: None,
         account_id: None,
         resolved_credential_id: None,
+        gateway: None,
     };
     match vault_outcome_to_decision(Ok(token)) {
         AuthDecision::Proceed(AuthMode::Secret(s)) => assert_eq!(s, "tok-123"),
         _ => panic!("a successful token must Proceed with AuthMode::Secret"),
     }
+}
+
+/// A gateway key's read carries its gateway's address, and only a gateway key may: a gateway
+/// key without one, or another key with one, is refused before the run starts.
+#[test]
+fn a_gateway_key_and_only_a_gateway_key_proceeds_to_its_gateway() {
+    let endpoint = broca_protocol::gateway::GatewayEndpoint {
+        base_url: "https://gateway.example".into(),
+        auth_header: "authorization".into(),
+        auth_scheme: broca_protocol::gateway::GatewayScheme::Bearer,
+        headers: Vec::new(),
+    };
+    let token = VaultToken {
+        hosts: Some(vec!["gateway.example".into()]),
+        token: "gateway-key".into(),
+        expires_at_ms: None,
+        record_version: 1,
+        project_id: None,
+        account_id: None,
+        resolved_credential_id: None,
+        gateway: Some(endpoint.clone()),
+    };
+    let AuthDecision::Proceed(mode) = vault_outcome_to_decision(Ok(token)) else {
+        panic!("a gateway key's read proceeds");
+    };
+    assert!(
+        matches!(&mode, AuthMode::Gateway { key, endpoint: got } if key == "gateway-key" && *got == endpoint)
+    );
+    assert!(matches!(
+        gateway_mode_for(AuthMethod::Gateway, mode, "apikey:anthropic-gw-acme"),
+        Ok(AuthMode::Gateway { .. })
+    ));
+    let gateway = || AuthMode::Gateway {
+        key: "k".into(),
+        endpoint: endpoint.clone(),
+    };
+    assert!(matches!(
+        gateway_mode_for(AuthMethod::ApiKey, gateway(), "apikey:anthropic"),
+        Err(RunError::Config(message)) if message.contains("not a gateway key")
+    ));
+    assert!(matches!(
+        gateway_mode_for(AuthMethod::Gateway, AuthMode::Secret("k".into()), "apikey:anthropic-gw-acme"),
+        Err(RunError::Config(message)) if message.contains("without its gateway's address")
+    ));
+    assert!(matches!(
+        gateway_mode_for(
+            AuthMethod::ApiKey,
+            AuthMode::Secret("k".into()),
+            "apikey:anthropic"
+        ),
+        Ok(AuthMode::Secret(_))
+    ));
 }
 
 #[test]
@@ -703,6 +756,7 @@ fn cached_token(expires_at_ms: Option<i64>) -> VaultToken {
         project_id: None,
         account_id: None,
         resolved_credential_id: None,
+        gateway: None,
     }
 }
 
@@ -814,6 +868,7 @@ fn an_authoritative_negative_evicts_so_an_outage_cannot_resurrect_it() {
                 project_id: None,
                 account_id: None,
                 resolved_credential_id: None,
+                gateway: None,
             },
         );
 
@@ -863,6 +918,7 @@ fn a_request_shaped_refusal_does_not_evict_a_good_token() {
                 project_id: None,
                 account_id: None,
                 resolved_credential_id: None,
+                gateway: None,
             },
         );
         evict_if_vault_authoritative(&cache, "apikey:openai", lkg_error_class(&benign));

@@ -891,6 +891,7 @@ async fn a_refused_vault_route_served_from_cache_records_no_request() {
             project_id: None,
             account_id: None,
             resolved_credential_id: None,
+            gateway: None,
         },
     );
 

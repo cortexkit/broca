@@ -47,6 +47,7 @@ pub mod content;
 mod diagnostic;
 pub mod display;
 pub mod error;
+pub mod gateway;
 pub mod ids;
 pub mod json;
 pub mod media_event;

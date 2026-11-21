@@ -172,6 +172,12 @@ pub enum AuthMode {
     /// Gemini uses `x-goog-api-key`, not Bearer. The caller owns the async vault fetch;
     /// this synchronous resolver only shapes the supplied secret.
     Secret(String),
+    /// A company AI gateway's key, sent to the gateway in the header the vault names with the
+    /// gateway's fixed headers (see [`GatewayEndpoint::auth_headers`]).
+    Gateway {
+        key: String,
+        endpoint: broca_protocol::gateway::GatewayEndpoint,
+    },
     /// No auth header (the mock path — aimock needs none).
     None,
 }
@@ -2304,15 +2310,25 @@ fn secret_refresher_for(
     auth_provider: &str,
     method: Option<AuthMethod>,
 ) -> Option<Arc<dyn CredentialRefresher>> {
-    if !matches!(auth, AuthMode::Secret(_)) {
-        return None;
-    }
     let source = opts.secret_refresher.as_ref()?.0.clone();
-    let kind = auth_kind_for_method(auth_provider, method, auth_kind);
-    Some(Arc::new(ShapedSecretRefresher::new(
-        source,
-        move |secret| shape_secret(secret, &kind),
-    )))
+    match auth {
+        AuthMode::Secret(_) => {
+            let kind = auth_kind_for_method(auth_provider, method, auth_kind);
+            Some(Arc::new(ShapedSecretRefresher::new(
+                source,
+                move |secret| shape_secret(secret, &kind),
+            )))
+        }
+        // A refreshed gateway key goes in the same headers as the one admission read.
+        AuthMode::Gateway { endpoint, .. } => {
+            let endpoint = endpoint.clone();
+            Some(Arc::new(ShapedSecretRefresher::new(
+                source,
+                move |secret| AuthHandle::Headers(endpoint.auth_headers(&secret)),
+            )))
+        }
+        AuthMode::Bearer(_) | AuthMode::None => None,
+    }
 }
 
 /// Shape a raw secret string into the provider's declared auth header. A provider with an
@@ -2355,6 +2371,12 @@ fn resolve_auth(
             method,
         )),
         AuthMode::Secret(_) => Err(format!("empty vault credential for '{auth_provider}'")),
+        AuthMode::Gateway { key, endpoint } if !key.is_empty() => Ok((
+            AuthHandle::Headers(endpoint.auth_headers(key)),
+            format!("vault-gateway({auth_provider})"),
+            method,
+        )),
+        AuthMode::Gateway { .. } => Err(format!("empty gateway key for '{auth_provider}'")),
     }
 }
 
@@ -2377,9 +2399,10 @@ fn apply_auth_method_quirks(
     method: Option<AuthMethod>,
     frozen: &mut FrozenRenderConfig,
 ) {
-    // The same quirks apply to a plain `anthropic` api-key request and to OpenCode Go's
-    // Anthropic wire shape, which its SDK reaches with an api-key header.
-    if (provider == "anthropic" && method == Some(AuthMethod::ApiKey))
+    // The same quirks apply to a plain `anthropic` api-key request, to a company gateway's,
+    // which forwards an api-key request to Anthropic with the company's own key, and to
+    // OpenCode Go's Anthropic wire shape, which its SDK reaches with an api-key header.
+    if (provider == "anthropic" && matches!(method, Some(AuthMethod::ApiKey | AuthMethod::Gateway)))
         || (provider == "opencode-go" && frozen.family_id == WireFamilyId::AnthropicMessages)
     {
         apply_anthropic_apikey_quirks(frozen);
@@ -2495,6 +2518,10 @@ fn chatgpt_codex_headers(
 fn chatgpt_account_id(token: &str) -> Option<String> {
     cortexkit_chatgpt_policy::account_id(None, token).ok()
 }
+
+#[cfg(test)]
+#[path = "live_gateway_tests.rs"]
+mod gateway_tests;
 
 #[cfg(all(test, feature = "live"))]
 mod tests {
