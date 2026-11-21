@@ -14,11 +14,7 @@
 //! watermark always begins at a clean turn boundary and [`replay`] reconstructs
 //! it coherently.
 
-use std::collections::HashMap;
-
 use crate::billing::ChargeBasisResolver;
-use crate::wal_writer::WalStore;
-use broca_protocol::FinishReason;
 use broca_protocol::{
     caller::{PauseReason, RunFinishReason},
     content::Message,
@@ -613,14 +609,6 @@ pub trait SessionInventory: SessionRefResolver + crate::SessionRefIndex {
     fn forget_projection(&self, session: &BindIdentity) -> Result<(), String>;
 }
 
-/// Advisory recovery candidates only. The recovery service must confirm each
-/// candidate against the durable WAL before resuming or interrupting a run.
-pub trait RecoveryDiscovery: Send + Sync {
-    fn active_runs(&self) -> Result<Vec<(String, BindIdentity)>, String>;
-    fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, String>;
-    fn withdrawal_candidates(&self) -> Result<Vec<WithdrawalRun>, String>;
-}
-
 /// Identity-only billing exclusions durable before a moved session can be served
 /// or billed. The move coordinator keeps its irreversible activation intent
 /// fenced until installation and cut completion recover; the SQL commit does not
@@ -652,12 +640,7 @@ impl<T: ExportIndex + ?Sized> ImportedRunExclusions for T {
 }
 impl<T: MaterializedStore + Persister> SessionStore for T {}
 
-/// A run's coarse lifecycle state in the durable run index. This is the index's view —
-/// a DERIVED projection of the WAL, NOT the source of truth. An `Active` row can go STALE
-/// across a crash (a crash between a run's durable `RunFinished` and the index terminal
-/// write leaves the row `Active` for a finished run), and a `Paused` row can go stale after
-/// a later resume, so a run-keyed lookup must treat only true terminals as authoritative
-/// without WAL reconciliation.
+/// A run's coarse lifecycle state, as status reads report it from the session's records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunIndexState {
     Active,
@@ -708,107 +691,10 @@ impl RunIndexState {
         }
     }
 
-    /// Whether this state is terminal (the run reached an end; the row won't go stale).
+    /// Whether this state is terminal: the run reached an end.
     pub fn is_terminal(&self) -> bool {
         !matches!(self, RunIndexState::Active | RunIndexState::Paused)
     }
-}
-
-/// One row of the durable run index: a run_id resolved to its session + lifecycle state,
-/// so run-keyed ops (`run.cancel`/`run.status`) resolve without scanning every WAL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunIndexRow {
-    pub run_id: String,
-    pub session: BindIdentity,
-    /// The submission this run consumed, if it was a queued submission (else `None`).
-    pub submission_id: Option<String>,
-    /// Canonical caller-request identity for deterministic send-id retries. `None` identifies a
-    /// nonce-minted run or a legacy row whose identity cannot be verified.
-    pub request_identity_digest: Option<String>,
-    pub state: RunIndexState,
-    /// Run-total usage persisted with a terminal state. `None` marks active, paused, or
-    /// legacy terminal rows that still require WAL reconciliation.
-    pub usage: Option<Usage>,
-    /// The provider's final model-step reason when one was observed.
-    pub final_step_finish_reason: Option<FinishReason>,
-    /// Retries spent across the episode's provider calls.
-    pub retries_used: u32,
-    /// The caller's title for the send behind this run, written at admission from the same
-    /// value the run's `RunStarted` records. `None` for a send without one and for rows written
-    /// before the column existed; a reader then falls back to the WAL.
-    pub title: Option<String>,
-    /// Durable discovery flag for unanswered questions closed without dispatch.
-    pub withdrawals_owed: bool,
-}
-
-/// The durable run index seam: `run_id → {session, submission_id, state}` in `store.db`, so
-/// run-keyed ops survive a restart and resolve a run_id to its session without scanning.
-/// OWNED BY THE COORDINATOR (the actor writes it at admission + on terminal) — the loop
-/// stays pure-WAL. A DERIVED projection: see [`RunIndexState`] for the stale-Active rule.
-pub trait RunIndex: Send + Sync {
-    /// Record a run as `Active` at admission (before the coordinator replies `active`), so a
-    /// cancel/status racing the reply always resolves the run_id.
-    fn index_run_active(&self, row: &RunIndexRow) -> Result<(), String>;
-
-    /// Update a run to its terminal `state` and metadata before the coordinator emits the
-    /// terminal. Metadata is optional so legacy and synthetic terminal paths remain representable.
-    fn index_run_terminal(
-        &self,
-        run_id: &str,
-        state: RunIndexState,
-        usage: Option<Usage>,
-        final_step_finish_reason: Option<FinishReason>,
-        retries_used: u32,
-    ) -> Result<(), String>;
-
-    /// Publish content-free durable evidence atomically with the lifecycle state. Older index
-    /// implementations may omit attribution, but must still publish the terminal normally.
-    fn index_run_attributed(
-        &self,
-        run_id: &str,
-        state: RunIndexState,
-        usage: Option<Usage>,
-        final_step_finish_reason: Option<FinishReason>,
-        retries_used: u32,
-        _attribution: &RunIndexAttribution,
-    ) -> Result<(), String> {
-        self.index_run_terminal(run_id, state, usage, final_step_finish_reason, retries_used)
-    }
-
-    /// Look up a run by id. `None` = unknown run (the lookup falls back to the WAL).
-    fn lookup_run(&self, run_id: &str) -> Result<Option<RunIndexRow>, String>;
-
-    /// Only the session actor clears this flag, after deriving empty debt from the full WAL.
-    fn index_run_withdrawals_owed(&self, _run_id: &str, _owed: bool) -> Result<(), String> {
-        Err("run index does not track withdrawal debt".into())
-    }
-
-    /// Boot discovery, including terminal sessions that ordinary restart scans never open.
-    fn runs_with_withdrawals_owed(&self) -> Result<Vec<WithdrawalRun>, String> {
-        Err("run index does not track withdrawal debt".into())
-    }
-}
-
-/// Scalar evidence from a run's frozen selection and durable lifecycle records. No provider
-/// messages, render configuration, prompts or tool payloads belong in the run-index evidence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RunIndexAttribution {
-    pub provider_module_id: Option<String>,
-    pub credential_id: Option<String>,
-    pub error_class: Option<String>,
-    pub error_code: Option<String>,
-    pub pause_reason: Option<String>,
-    pub interrupt_reason: Option<String>,
-    pub at_ms: Option<u64>,
-}
-
-impl RunIndexAttribution {}
-
-/// A run whose session actor must service durable question withdrawals.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WithdrawalRun {
-    pub run_id: RunId,
-    pub session: BindIdentity,
 }
 
 /// A source-bound position in the daemon-wide usage export stream.
@@ -834,13 +720,6 @@ pub struct ExportPage {
     pub facts: Vec<ExportFact>,
     pub next: Option<ExportCursor>,
     pub high_water: u64,
-}
-
-/// A terminal run-index row that has not yet produced any usage-export facts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MissingExportRun {
-    pub run_id: RunId,
-    pub session: BindIdentity,
 }
 
 /// An export read or emission failure. Epoch changes are a typed, recoverable condition: the
@@ -873,9 +752,9 @@ impl std::fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
-/// The durable usage export index. The coordinator calls `emit_run` only after a terminal WAL
-/// record and the run-index terminal update are durable. The serve adapter uses `read_page` for
-/// a lease-free, daemon-scoped pull.
+/// The durable usage export index. Billing calls `emit_run` only after a run's terminal record is
+/// durable. Readers page the facts with `read_page`, which takes no session lease, so a reader
+/// never waits on a running session.
 pub trait ExportIndex: Send + Sync {
     fn is_imported_run(
         &self,
@@ -908,12 +787,6 @@ pub trait ExportIndex: Send + Sync {
         ))
     }
 
-    /// List terminal run-index rows that have no corresponding export fact. The durable run
-    /// index acts as the catch-up outbox for the normal terminal-write-before-export ordering.
-    /// Runs recorded as imported are excluded: their facts belong to the source
-    /// machine, so absence here is not a missed local export.
-    fn missing_terminal_runs(&self) -> Result<Vec<MissingExportRun>, ExportError>;
-
     fn emit_run(
         &self,
         records: &[FramedRecord],
@@ -945,51 +818,6 @@ pub trait ExportIndex: Send + Sync {
     fn source_epoch(&self) -> u64;
 
     fn source_instance_id(&self) -> &str;
-}
-
-/// Re-derive usage facts for terminal run-index rows missed by the live export path.
-///
-/// Callers run this off the async runtime's blocking pool. Missing rows are grouped by
-/// session so one WAL read heals every missed run in that lineage. Sessions are handled one at
-/// a time, in the order the index first lists them, and each WAL is dropped before the next is
-/// read: after an export outage many sessions can be missing rows, and holding every one of
-/// their WALs at once at boot could exhaust memory. Within a session, runs are emitted in the
-/// index's order. `fact_id` uniqueness makes overlapping live emission and repeated catch-up
-/// harmless, including a retry after a later session's read failed.
-pub fn catch_up_usage_exports(
-    index: &dyn ExportIndex,
-    wal_store: &dyn WalStore,
-    resolver: &dyn ChargeBasisResolver,
-) -> Result<usize, ExportError> {
-    let missing = index.missing_terminal_runs()?;
-    let count = missing.len();
-    let mut sessions: Vec<(BindIdentity, Vec<RunId>)> = Vec::new();
-    let mut position_by_session = HashMap::new();
-    for run in missing {
-        let position = *position_by_session
-            .entry(run.session.clone())
-            .or_insert_with(|| {
-                sessions.push((run.session.clone(), Vec::new()));
-                sessions.len() - 1
-            });
-        sessions[position].1.push(run.run_id);
-    }
-
-    for (session, run_ids) in sessions {
-        let records = wal_store.read_records(&session).map_err(|error| {
-            ExportError::Storage(format!(
-                "read WAL for missed export run {}: {error}",
-                run_ids[0].0
-            ))
-        })?;
-        for run_id in &run_ids {
-            index.emit_run(&records, run_id, resolver)?;
-            // Each emit has released the store connection. Give admissions and the
-            // census a chance to acquire it before the next catch-up transaction.
-            std::thread::yield_now();
-        }
-    }
-    Ok(count)
 }
 
 /// Export every terminal run in this WAL before deleting its lineage, including
@@ -1462,150 +1290,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod call_identity_tests {}
-
-#[cfg(test)]
-mod catch_up_tests {
-    use std::sync::Mutex;
-
-    use super::*;
-    use broca_wal::{Wal, WalError};
-
-    struct CountingWalStore {
-        reads: Mutex<HashMap<BindIdentity, usize>>,
-    }
-
-    thread_local! {
-        /// WAL reads and export emissions made on this thread, in order.
-        static EVENTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    fn note_event(event: String) {
-        EVENTS.with(|events| events.borrow_mut().push(event));
-    }
-
-    impl WalStore for CountingWalStore {
-        fn open(&self, _session: &BindIdentity) -> Result<Box<dyn Wal + Send>, WalError> {
-            Err(WalError::Io(std::io::Error::other(
-                "catch-up never opens an append handle",
-            )))
-        }
-
-        fn read_records(&self, session: &BindIdentity) -> Result<Vec<FramedRecord>, WalError> {
-            note_event(format!("read {}", session.project_root.display()));
-            *self
-                .reads
-                .lock()
-                .expect("read counter lock")
-                .entry(session.clone())
-                .or_default() += 1;
-            Ok(Vec::new())
-        }
-    }
-
-    struct RecordingExportIndex {
-        missing: Vec<MissingExportRun>,
-        emitted: Mutex<Vec<RunId>>,
-        seen_frames: Mutex<Vec<usize>>,
-        fail_run: Option<RunId>,
-    }
-
-    impl ExportIndex for RecordingExportIndex {
-        fn missing_terminal_runs(&self) -> Result<Vec<MissingExportRun>, ExportError> {
-            Ok(self.missing.clone())
-        }
-
-        fn emit_run(
-            &self,
-            records: &[FramedRecord],
-            run_id: &RunId,
-            _resolver: &dyn ChargeBasisResolver,
-        ) -> Result<(), ExportError> {
-            if self.fail_run.as_ref() == Some(run_id) {
-                return Err(ExportError::Storage("injected export failure".into()));
-            }
-            note_event(format!("emit {}", run_id.0));
-            self.seen_frames.lock().unwrap().push(records.len());
-            self.emitted
-                .lock()
-                .expect("emitted runs lock")
-                .push(run_id.clone());
-            Ok(())
-        }
-
-        fn read_page(
-            &self,
-            _since: Option<ExportCursor>,
-            _limit: u64,
-        ) -> Result<ExportPage, ExportError> {
-            Err(ExportError::Storage("not used by catch-up".into()))
-        }
-
-        fn high_water(&self) -> u64 {
-            0
-        }
-
-        fn source_epoch(&self) -> u64 {
-            1
-        }
-
-        fn source_instance_id(&self) -> &str {
-            "catch-up-test"
-        }
-    }
-
-    /// Each session's WAL is read, its missing runs are emitted, and only then is the next
-    /// session's WAL read, so at most one session's WAL is resident at a time. Runs keep the
-    /// index's order within their session.
-    #[test]
-    fn catch_up_reads_each_missing_session_once_and_emits_it_before_reading_the_next() {
-        let first = BindIdentity::new("/tmp/first", "runner", "session");
-        let second = BindIdentity::new("/tmp/second", "runner", "session");
-        let index = RecordingExportIndex {
-            seen_frames: Mutex::new(Vec::new()),
-            fail_run: None,
-            missing: vec![
-                MissingExportRun {
-                    run_id: RunId("r1".into()),
-                    session: first.clone(),
-                },
-                MissingExportRun {
-                    run_id: RunId("r2".into()),
-                    session: second.clone(),
-                },
-                MissingExportRun {
-                    run_id: RunId("r3".into()),
-                    session: first.clone(),
-                },
-            ],
-            emitted: Mutex::new(Vec::new()),
-        };
-        let wal = CountingWalStore {
-            reads: Mutex::new(HashMap::new()),
-        };
-        let resolver = |_: &str, _: &str| (crate::ChargeBasis::Unknown, 1);
-
-        EVENTS.with(|events| events.borrow_mut().clear());
-        assert_eq!(catch_up_usage_exports(&index, &wal, &resolver), Ok(3));
-        assert_eq!(
-            *wal.reads.lock().expect("read counter lock"),
-            HashMap::from([(first, 1), (second, 1)])
-        );
-        assert_eq!(
-            EVENTS.with(|events| events.borrow().clone()),
-            [
-                "read /tmp/first",
-                "emit r1",
-                "emit r3",
-                "read /tmp/second",
-                "emit r2"
-            ],
-            "every missing run of one session is emitted before the next session's WAL is read"
-        );
-    }
-}
-
-#[cfg(test)]
-mod diagnostics_attribution_tests {}

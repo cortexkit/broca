@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use broca_core::{
     compute_segments_for_run, ChargeBasisResolver, ExportCursor, ExportError, ExportFact,
-    ExportIndex, ExportPage, MissingExportRun, SpendSegment,
+    ExportIndex, ExportPage, SpendSegment,
 };
 use broca_protocol::RunId;
 use broca_wal::FramedRecord;
@@ -786,19 +786,6 @@ impl ExportStore {
     }
 }
 
-// Conversion and catch-up must agree about export debt before the old WAL goes away.
-const MISSING_TERMINAL_EXPORT: &str = "runs.state NOT IN ('active', 'paused')
-    AND runs.expired_at_ms IS NULL
-    AND NOT EXISTS (
-        SELECT 1 FROM export_facts AS facts WHERE facts.run_id = runs.run_id
-    )
-    AND NOT EXISTS (
-        SELECT 1 FROM export_imported_runs AS imported
-        WHERE imported.session = runs.session AND imported.run_id = runs.run_id
-    )";
-
-impl SqliteStore {}
-
 impl ExportIndex for SqliteStore {
     fn is_imported_run(
         &self,
@@ -815,38 +802,6 @@ impl ExportIndex for SqliteStore {
         run_ids: &[RunId],
     ) -> Result<(), ExportError> {
         self.export.record_imported_runs(session, cut_id, run_ids)
-    }
-
-    // Catch-up work comes from the legacy run index, not the standalone export tables.
-    // Keep this query in SqliteStore while catch-up work is sourced from run_index.
-    fn missing_terminal_runs(&self) -> Result<Vec<MissingExportRun>, ExportError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| storage("store mutex poisoned"))?;
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT runs.run_id, runs.session
-                   FROM run_index AS runs
-                  WHERE {MISSING_TERMINAL_EXPORT}
-                  ORDER BY runs.run_id ASC",
-            ))
-            .map_err(storage)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(storage)?;
-        let mut missing = Vec::new();
-        for row in rows {
-            let (run_id, session_json) = row.map_err(storage)?;
-            let session = serde_json::from_str(&session_json).map_err(storage)?;
-            missing.push(MissingExportRun {
-                run_id: RunId(run_id),
-                session,
-            });
-        }
-        Ok(missing)
     }
 
     fn emit_run(

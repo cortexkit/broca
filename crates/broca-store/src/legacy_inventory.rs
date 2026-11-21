@@ -1,6 +1,6 @@
 //! Legacy inventory adapters shared by serving and read-only tools.
 
-use broca_core::{RecoveryDiscovery, SessionInventory, SessionRefResolver, SessionRefs};
+use broca_core::{SessionInventory, SessionRefResolver, SessionRefs};
 use broca_protocol::BindIdentity;
 use std::path::Path;
 
@@ -34,18 +34,6 @@ impl SessionInventory for crate::SqliteStore {
     }
     fn forget_projection(&self, session: &BindIdentity) -> Result<(), String> {
         self.drop_session_projection(session)
-    }
-}
-
-impl RecoveryDiscovery for crate::SqliteStore {
-    fn withdrawal_candidates(&self) -> Result<Vec<broca_core::WithdrawalRun>, String> {
-        broca_core::RunIndex::runs_with_withdrawals_owed(self)
-    }
-    fn active_runs(&self) -> Result<Vec<(String, BindIdentity)>, String> {
-        crate::SqliteStore::active_runs(self).map_err(|e| e.to_string())
-    }
-    fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, String> {
-        crate::SqliteStore::restart_resume_candidates(self).map_err(|e| e.to_string())
     }
 }
 

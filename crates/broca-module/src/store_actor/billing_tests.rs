@@ -113,10 +113,6 @@ impl Export {
 }
 
 impl ExportIndex for Export {
-    fn missing_terminal_runs(&self) -> Result<Vec<broca_core::MissingExportRun>, ExportError> {
-        ExportIndex::missing_terminal_runs(&self.store)
-    }
-
     fn emit_run(
         &self,
         records: &[broca_wal::FramedRecord],

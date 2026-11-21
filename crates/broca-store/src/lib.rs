@@ -14,10 +14,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use broca_core::{session_addr, RunIndex, RunIndexRow, RunIndexState};
 use broca_protocol::BindIdentity;
-use broca_protocol::{FinishReason, Usage};
-use rusqlite::{config::DbConfig, Connection, OptionalExtension};
+use rusqlite::{config::DbConfig, Connection};
 
 mod served_history;
 
@@ -42,12 +40,10 @@ pub mod retention_withdrawals;
 pub mod session_address;
 pub mod session_inventory;
 pub use session_inventory::SessionInventory;
-mod run_lifecycle;
 pub mod session_log_evidence;
 pub mod session_ref_audit;
 pub mod session_refs;
 pub mod system_one;
-mod wal_recovery;
 pub use fold_identities::{require_legacy_operator_root, LegacyOnlyOperator};
 
 /// Reserve a logical session's storage address and verify its history through
@@ -482,54 +478,6 @@ impl SqliteStore {
         tx.commit().map_err(|e| e.to_string())
     }
 
-    /// Every run the index calls `active`, with its session: the candidate list for the
-    /// startup crash-orphan pass.
-    ///
-    /// Candidates only. The WAL is the authority and this row can lag it in either direction
-    /// (a crash between a WAL terminal and its index write leaves a finished run here), so a
-    /// caller must confirm each run from its WAL before acting. Reading the index instead of
-    /// replaying every live WAL is what keeps the pass proportional to the handful of runs
-    /// that might be orphaned rather than to the tens of thousands of sessions on disk.
-    ///
-    /// A row whose session column does not decode is left out; the WAL cannot be located
-    /// without it, so there is nothing a caller could confirm.
-    pub fn active_runs(&self) -> Result<Vec<(String, BindIdentity)>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut statement =
-            conn.prepare("SELECT run_id, session FROM run_index WHERE state = 'active'")?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut runs = Vec::new();
-        for row in rows {
-            let (run_id, session) = row?;
-            // `index_run_active` stores the session as a JSON-encoded `BindIdentity`.
-            if let Ok(session) = serde_json::from_str::<BindIdentity>(&session) {
-                runs.push((run_id, session));
-            }
-        }
-        Ok(runs)
-    }
-
-    /// Candidate episodes for restart recovery, including a pause whose index update was lost.
-    /// The caller must confirm the latest pause reason from the WAL before resuming anything.
-    pub fn restart_resume_candidates(&self) -> Result<Vec<(String, BindIdentity)>, StoreError> {
-        let conn = self.conn.lock().unwrap();
-        let mut statement = conn
-            .prepare("SELECT run_id, session FROM run_index WHERE state IN ('active', 'paused')")?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut runs = Vec::new();
-        for row in rows {
-            let (run_id, session) = row?;
-            if let Ok(session) = serde_json::from_str::<BindIdentity>(&session) {
-                runs.push((run_id, session));
-            }
-        }
-        Ok(runs)
-    }
-
     fn init(conn: &Connection) -> Result<(String, u64, u64), StoreError> {
         crate::busy::configure_writer_connection(conn)?;
         let deadline = std::time::Instant::now() + crate::busy::STORE_BUSY_TIMEOUT;
@@ -865,16 +813,6 @@ impl SqliteStore {
         Ok(source)
     }
 
-    /// Wall-clock millis for a run-index state transition. Only ever compared against other
-    /// wall-clock readings to answer "how long has this row been in this state", never used
-    /// for ordering or identity, so clock adjustment cannot corrupt anything durable.
-    fn now_epoch_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
-    }
-
     fn key(session: &BindIdentity) -> String {
         format!(
             "{}\u{1f}{}\u{1f}{}",
@@ -888,255 +826,6 @@ impl SqliteStore {
 impl broca_core::RunEventBodies for SqliteStore {
     fn read_run_event(&self, event_key: &str) -> Result<Option<(BindIdentity, Vec<u8>)>, String> {
         self.get_bus_event(event_key).map_err(|e| e.to_string())
-    }
-}
-
-impl SqliteStore {}
-
-impl RunIndex for SqliteStore {
-    fn index_run_active(&self, row: &RunIndexRow) -> Result<(), String> {
-        // The full session triple is stored as JSON so lookup_run reconstructs the exact
-        // BindIdentity (the flat `key()` string is lossy — it can't be parsed back).
-        let session_json = serde_json::to_string(&row.session).map_err(|e| e.to_string())?;
-        let usage_json = row
-            .usage
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        let finish_reason_json = row
-            .final_step_finish_reason
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        let mut connection = self.conn.lock().unwrap();
-        let conn = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        conn.execute("INSERT INTO agent_data_writer VALUES(1)", [])
-            .map_err(|error| error.to_string())?;
-        session_refs::insert(&conn, &session_addr(&row.session), &row.session)
-            .map_err(|error| error.to_string())?;
-        conn.execute(
-            // The first title written for a run wins: its `RunStarted` is written once, so a
-            // later admission of the same run id (a resume) never holds a different one.
-            "INSERT INTO run_index \
-                 (run_id, session, submission_id, request_identity_digest, state, usage_json, final_step_finish_reason_json, retries_used, state_changed_ms, title, withdrawals_owed) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-             ON CONFLICT(run_id) DO UPDATE SET \
-                session=excluded.session, submission_id=excluded.submission_id, \
-                 request_identity_digest=COALESCE(excluded.request_identity_digest, run_index.request_identity_digest), state=excluded.state, usage_json=excluded.usage_json, \
-                 final_step_finish_reason_json=excluded.final_step_finish_reason_json, retries_used=excluded.retries_used, \
-                 state_changed_ms=excluded.state_changed_ms, title=COALESCE(run_index.title, excluded.title), withdrawals_owed=MAX(run_index.withdrawals_owed, excluded.withdrawals_owed) \
-             WHERE run_index.state IN ('active', 'paused')",
-            rusqlite::params![
-                row.run_id,
-                session_json,
-                row.submission_id,
-                row.request_identity_digest,
-                row.state.as_str(),
-                usage_json,
-                finish_reason_json,
-                row.retries_used,
-                Self::now_epoch_ms(),
-                row.title,
-                row.withdrawals_owed,
-             ],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM agent_data_writer", [])
-            .map_err(|error| error.to_string())?;
-        conn.commit().map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    fn index_run_terminal(
-        &self,
-        run_id: &str,
-        state: RunIndexState,
-        usage: Option<Usage>,
-        final_step_finish_reason: Option<FinishReason>,
-        retries_used: u32,
-    ) -> Result<(), String> {
-        let usage_json = usage
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        let finish_json = final_step_finish_reason
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        run_lifecycle::write_lifecycle(
-            &conn,
-            run_id,
-            state.as_str(),
-            usage_json.as_deref(),
-            finish_json.as_deref(),
-            retries_used,
-            None,
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-    }
-
-    fn index_run_attributed(
-        &self,
-        run_id: &str,
-        state: RunIndexState,
-        usage: Option<Usage>,
-        final_step_finish_reason: Option<FinishReason>,
-        retries_used: u32,
-        attribution: &broca_core::RunIndexAttribution,
-    ) -> Result<(), String> {
-        let usage_json = usage
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        let finish_reason_json = final_step_finish_reason
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| e.to_string())?;
-        let conn = self.conn.lock().unwrap();
-        run_lifecycle::write_lifecycle(
-            &conn,
-            run_id,
-            state.as_str(),
-            usage_json.as_deref(),
-            finish_reason_json.as_deref(),
-            retries_used,
-            Some(attribution),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    fn index_run_withdrawals_owed(&self, run_id: &str, owed: bool) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE run_index SET withdrawals_owed=?2 WHERE run_id=?1",
-                rusqlite::params![run_id, owed],
-            )
-            .map_err(|e| e.to_string())?;
-        if changed != 1 {
-            return Err(format!(
-                "cannot record withdrawal debt: run '{run_id}' has no index row"
-            ));
-        }
-        Ok(())
-    }
-
-    fn runs_with_withdrawals_owed(&self) -> Result<Vec<broca_core::WithdrawalRun>, String> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT run_id, session FROM run_index WHERE withdrawals_owed=1 AND expired_at_ms IS NULL ORDER BY run_id ASC")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.map(|row| {
-            let (run_id, session) = row.map_err(|e| e.to_string())?;
-            Ok(broca_core::WithdrawalRun {
-                run_id: broca_protocol::RunId(run_id),
-                session: serde_json::from_str(&session).map_err(|e| e.to_string())?,
-            })
-        })
-        .collect()
-    }
-
-    fn lookup_run(&self, run_id: &str) -> Result<Option<RunIndexRow>, String> {
-        let conn = self.conn.lock().unwrap();
-        let tx = if self.wal_config.is_overhaul() {
-            Some(
-                conn.unchecked_transaction()
-                    .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
-        let connection = tx.as_deref().unwrap_or(&conn);
-        let row = connection
-            .query_row(
-                "SELECT session, submission_id, request_identity_digest, state, usage_json, \
-                           final_step_finish_reason_json, retries_used, title, withdrawals_owed \
-                  FROM run_index WHERE run_id=?1",
-                [run_id],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, Option<String>>(4)?,
-                        r.get::<_, Option<String>>(5)?,
-                        r.get::<_, i64>(6)?,
-                        r.get::<_, Option<String>>(7)?,
-                        r.get::<_, bool>(8)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        match row {
-            None => Ok(None),
-            Some((
-                session_json,
-                submission_id,
-                request_identity_digest,
-                state_str,
-                usage_json,
-                finish_reason_json,
-                retries_used,
-                title,
-                withdrawals_owed,
-            )) => {
-                let session: BindIdentity =
-                    serde_json::from_str(&session_json).map_err(|e| e.to_string())?;
-                if tx
-                    .as_ref()
-                    .map(|tx| wal_recovery::read_fence(tx, &Self::key(&session)))
-                    .transpose()
-                    .map_err(|error| error.to_string())?
-                    .flatten()
-                    .is_some_and(|fence| fence.pending)
-                {
-                    return Err(format!(
-                        "WAL recovery is pending for run {run_id}; run summary is unavailable"
-                    ));
-                }
-                let state = RunIndexState::parse(&state_str)
-                    .ok_or_else(|| format!("unknown run-index state '{state_str}'"))?;
-                let usage = usage_json
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(|e| e.to_string())?;
-                let final_step_finish_reason = finish_reason_json
-                    .as_deref()
-                    .map(serde_json::from_str)
-                    .transpose()
-                    .map_err(|e| e.to_string())?;
-                Ok(Some(RunIndexRow {
-                    run_id: run_id.to_string(),
-                    session,
-                    submission_id,
-                    request_identity_digest,
-                    state,
-                    usage,
-                    final_step_finish_reason,
-                    retries_used: u32::try_from(retries_used).map_err(|e| e.to_string())?,
-                    title,
-                    withdrawals_owed,
-                }))
-            }
-        }
     }
 }
 
@@ -1357,11 +1046,9 @@ mod tests {
         }
     }
 
-    use std::sync::{Arc, Mutex};
+    use broca_core::SessionRefIndex;
 
-    use broca_core::RunIndex;
-
-    use super::{ExportStore, SqliteStore};
+    use super::SqliteStore;
 
     #[test]
     fn retention_and_approval_migrations_commute_and_are_idempotent() {
@@ -1472,55 +1159,6 @@ mod tests {
         assert_eq!(layouts[0], layouts[1]);
     }
 
-    #[test]
-    fn boot_withdrawal_discovery_excludes_retention_expired_runs() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        for (run_id, state, owed) in [
-            ("active", broca_core::RunIndexState::Active, true),
-            ("terminal", broca_core::RunIndexState::Cancelled, true),
-            ("expired", broca_core::RunIndexState::Cancelled, true),
-            ("clear", broca_core::RunIndexState::Cancelled, false),
-        ] {
-            store
-                .index_run_active(&broca_core::RunIndexRow {
-                    run_id: run_id.into(),
-                    session: crate::conformance::session(run_id),
-                    submission_id: None,
-                    request_identity_digest: None,
-                    state,
-                    usage: None,
-                    final_step_finish_reason: None,
-                    retries_used: 0,
-                    title: None,
-                    withdrawals_owed: owed,
-                })
-                .unwrap();
-        }
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE run_index SET expired_at_ms=1 WHERE run_id='expired'",
-                [],
-            )
-            .unwrap();
-        let rows = store.runs_with_withdrawals_owed().unwrap();
-        assert_eq!(
-            rows.iter()
-                .map(|row| row.run_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["active", "terminal"]
-        );
-        assert!(
-            store
-                .lookup_run("expired")
-                .unwrap()
-                .unwrap()
-                .withdrawals_owed
-        );
-    }
-
     /// A run-index row records WHEN it entered its state, so a stale row is distinguishable
     /// from a live one.
     ///
@@ -1545,20 +1183,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = SqliteStore::open(dir.join("run-index.db")).unwrap();
         // Force a write so the -wal sidecar exists rather than being absent by luck.
+        let session = crate::conformance::session("mode-probe");
         store
-            .index_run_active(&broca_core::RunIndexRow {
-                withdrawals_owed: false,
-                title: None,
-                run_id: "run-mode".into(),
-                session: crate::conformance::session("mode-probe"),
-                submission_id: None,
-                request_identity_digest: None,
-                state: broca_core::RunIndexState::Active,
-                usage: None,
-                final_step_finish_reason: None,
-                retries_used: 0,
-            })
-            .expect("index active");
+            .record_session(&broca_core::session_addr(&session), &session)
+            .expect("record a session reference");
 
         // Establish what the ambient default IS before judging what the code set. Asserting
         // owner-only alone measures the machine: under a 0077 umask every file lands 0600
@@ -1606,20 +1234,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("run-index.db");
         let store = SqliteStore::open(&path).expect("open writer");
+        let session = crate::conformance::session("retained");
+        let address = broca_core::session_addr(&session);
         store
-            .index_run_active(&broca_core::RunIndexRow {
-                withdrawals_owed: false,
-                title: None,
-                run_id: "retained-run".into(),
-                session: crate::conformance::session("retained-run"),
-                submission_id: None,
-                request_identity_digest: None,
-                state: broca_core::RunIndexState::Active,
-                usage: None,
-                final_step_finish_reason: None,
-                retries_used: 0,
-            })
-            .expect("write run row");
+            .record_session(&address, &session)
+            .expect("record a session reference");
         drop(store);
 
         assert!(
@@ -1630,171 +1249,31 @@ mod tests {
             path.with_file_name("run-index.db-shm").exists(),
             "SHM must survive close"
         );
-        let uri = format!("file:{}?mode=ro", path.display());
-        let reader = rusqlite::Connection::open_with_flags(
-            uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .expect("read-only SQLite reader opens while writer is down");
-        let state: String = reader
-            .query_row(
-                "SELECT state FROM run_index WHERE run_id = 'retained-run'",
-                [],
-                |row| row.get(0),
+        let committed = || {
+            let uri = format!("file:{}?mode=ro", path.display());
+            let reader = rusqlite::Connection::open_with_flags(
+                uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
             )
-            .expect("read committed run row");
-        assert_eq!(state, "active");
-        drop(reader);
+            .expect("read-only SQLite reader opens while writer is down");
+            reader
+                .query_row(
+                    "SELECT count(*) FROM agent_data_session_ref WHERE address = ?1",
+                    [&address],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read committed session reference")
+        };
+        assert_eq!(committed(), 1);
 
         let reopened = SqliteStore::open(&path).expect("reopen writer from retained WAL");
-        assert!(
-            reopened.lookup_run("retained-run").unwrap().is_some(),
-            "reopen must recover the row"
-        );
         drop(reopened);
+        assert_eq!(committed(), 1, "reopen must keep the row");
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_run_index_row_records_when_it_changed_state() {
-        let store = sqlite_store();
-        let session = crate::conformance::session("state-changed-ms");
-        let before = SqliteStore::now_epoch_ms();
-        store
-            .index_run_active(&broca_core::RunIndexRow {
-                withdrawals_owed: false,
-                title: None,
-                run_id: "run-ts".into(),
-                session,
-                submission_id: None,
-                request_identity_digest: None,
-                state: broca_core::RunIndexState::Active,
-                usage: None,
-                final_step_finish_reason: None,
-                retries_used: 0,
-            })
-            .expect("index active");
-
-        let read = |store: &SqliteStore| -> Option<i64> {
-            let conn = store.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT state_changed_ms FROM run_index WHERE run_id = 'run-ts'",
-                [],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .unwrap()
-        };
-
-        let active_at = read(&store).expect("an active row must carry a transition time");
-        assert!(
-            active_at >= before,
-            "the stamp must be the time of the transition, not an epoch default"
-        );
-
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        store
-            .index_run_terminal(
-                "run-ts",
-                broca_core::RunIndexState::Completed,
-                None,
-                None,
-                0,
-            )
-            .expect("index terminal");
-        let terminal_at = read(&store).expect("a terminal row must carry a transition time");
-        assert!(
-            terminal_at > active_at,
-            "reaching a terminal state must advance the stamp, or it records creation rather \
-             than transition and a long-running row looks freshly changed"
-        );
     }
 
     fn sqlite_store() -> SqliteStore {
         SqliteStore::open_in_memory().expect("in-memory sqlite store opens")
-    }
-
-    #[test]
-    fn init_migrates_legacy_run_index_metadata_columns() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open legacy store");
-        let session = crate::conformance::session("legacy-run-index-schema");
-        let session_json = serde_json::to_string(&session).expect("serialize session");
-        conn.execute_batch(
-            "CREATE TABLE run_index (
-                 run_id        TEXT PRIMARY KEY,
-                 session       TEXT NOT NULL,
-                 submission_id TEXT,
-                 state         TEXT NOT NULL
-             );",
-        )
-        .expect("create legacy run-index schema");
-        conn.execute(
-            "INSERT INTO run_index (run_id, session, submission_id, state)
-             VALUES (?1, ?2, NULL, 'completed')",
-            rusqlite::params!["legacy-run", session_json],
-        )
-        .expect("insert legacy terminal row");
-
-        let (source_instance_id, source_epoch, high_water) =
-            SqliteStore::init(&conn).expect("migrate legacy store");
-        let conn = Arc::new(Mutex::new(conn));
-        let store = SqliteStore {
-            wal_config: broca_wal::WalConfig::LEGACY,
-            bus_events: crate::bus_events::State::default(),
-            conn: Arc::clone(&conn),
-            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
-        };
-        let row = store
-            .lookup_run("legacy-run")
-            .expect("lookup legacy row")
-            .expect("legacy row exists");
-        assert_eq!(row.usage, None);
-        assert_eq!(row.final_step_finish_reason, None);
-        assert_eq!(row.request_identity_digest, None);
-    }
-
-    /// A store opened on a database written before titles existed gains both nullable title
-    /// columns, and its existing rows read back with no title rather than an empty one.
-    #[test]
-    fn init_adds_the_title_columns_to_an_existing_store() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open legacy store");
-        let session = crate::conformance::session("legacy-title-schema");
-        let session_json = serde_json::to_string(&session).expect("serialize session");
-        conn.execute_batch(
-            "CREATE TABLE run_index (
-                 run_id        TEXT PRIMARY KEY,
-                 session       TEXT NOT NULL,
-                 submission_id TEXT,
-                 state         TEXT NOT NULL
-             );",
-        )
-        .expect("create legacy run-index schema");
-        conn.execute(
-            "INSERT INTO run_index (run_id, session, submission_id, state)
-             VALUES (?1, ?2, NULL, 'completed')",
-            rusqlite::params!["legacy-run", session_json],
-        )
-        .expect("insert legacy row");
-        let (source_instance_id, source_epoch, high_water) =
-            SqliteStore::init(&conn).expect("migrate legacy store");
-        for (table, column) in [("run_index", "title"), ("meta", "last_title")] {
-            let present: i64 = conn
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
-                    [column],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(present, 1, "{table}.{column} is added");
-        }
-        let conn = Arc::new(Mutex::new(conn));
-        let store = SqliteStore {
-            wal_config: broca_wal::WalConfig::LEGACY,
-            bus_events: crate::bus_events::State::default(),
-            conn: Arc::clone(&conn),
-            export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
-        };
-        let row = store.lookup_run("legacy-run").unwrap().unwrap();
-        assert_eq!(row.title, None);
     }
 
     #[test]
@@ -1906,19 +1385,10 @@ mod tests {
     }
 
     #[test]
-    fn run_index_conformance() {
-        crate::conformance::assert_run_index_conformance(sqlite_store);
-    }
-
-    #[test]
     fn export_index_conformance() {
         crate::conformance::assert_export_conformance(sqlite_store);
     }
 }
-
-#[cfg(test)]
-#[path = "withdrawal_writer_tests.rs"]
-mod withdrawal_writer_tests;
 
 #[cfg(all(test, windows))]
 mod windows_acl_tests {

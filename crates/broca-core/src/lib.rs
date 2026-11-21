@@ -107,11 +107,10 @@ pub use compaction::{
 };
 pub use context::{
     emit_lineage_usage_exports, replay_transcript, ExportCursor, ExportError, ExportFact,
-    ExportIndex, ExportPage, ImportedRunExclusions, MissingExportRun, RecoveryDiscovery,
-    RunEventBodies, RunIndex, RunIndexAttribution, RunIndexRow, RunIndexState, SessionInventory,
-    SessionReadLineageState, SessionReadMessage, SessionReadPage, SessionReadReason,
-    SessionReadStateKind, SessionRefResolver, SessionRefs, TagLocation, ToolCallDispatch,
-    WithdrawalRun, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
+    ExportIndex, ExportPage, ImportedRunExclusions, RunEventBodies, RunIndexState,
+    SessionInventory, SessionReadLineageState, SessionReadMessage, SessionReadPage,
+    SessionReadReason, SessionReadStateKind, SessionRefResolver, SessionRefs, TagLocation,
+    ToolCallDispatch, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{
     AdmissionStoreSnapshot, HeldEpisode, HeldPrefix, HeldRowsRequest, MaterializedStore, Persister,

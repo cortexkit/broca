@@ -11,9 +11,6 @@ cipher_tests!(idle_open_recovery_never_reinserts_older_runs);
 struct Inserts(Mutex<Vec<String>>);
 
 impl ExportIndex for Inserts {
-    fn missing_terminal_runs(&self) -> Result<Vec<broca_core::MissingExportRun>, ExportError> {
-        Ok(Vec::new())
-    }
     fn emit_run(
         &self,
         _: &[FramedRecord],
