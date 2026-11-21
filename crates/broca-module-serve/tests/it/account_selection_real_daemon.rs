@@ -1370,11 +1370,30 @@ impl Rig {
         let bytes = reply.expect_err("the send is refused");
         // Long enough for a run that had been admitted to write its RunStarted.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(
-            super::stored_log::stored_files(&self.state_root),
-            before,
-            "a refused send writes nothing to the new storage"
-        );
+        // A creating send opens its session to resolve the run, and a refused one deletes that
+        // session again, which can finish after the refusal is answered (on a slow machine, after
+        // the sleep above). So the files are compared once they match again; a session that is
+        // never deleted, or a file that changed, fails here and shows the difference.
+        let state_root = self.state_root.clone();
+        broca_test_support::wait_for(
+            "the refused send's session to be deleted",
+            async {
+                while super::stored_log::stored_files(&state_root) != before {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            },
+            || {
+                let now = super::stored_log::stored_files(&state_root);
+                format!(
+                    "a refused send writes nothing to the new storage; changed: {:?}",
+                    now.iter()
+                        .filter(|(path, size)| before.get(*path) != Some(*size))
+                        .chain(before.iter().filter(|(path, _)| !now.contains_key(*path)))
+                        .collect::<Vec<_>>()
+                )
+            },
+        )
+        .await;
         assert!(
             self.frames(name)
                 .await
