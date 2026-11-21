@@ -41,14 +41,6 @@ pub struct RefusalReplayState {
     pub refused_steps: std::collections::BTreeSet<broca_protocol::StepId>,
 }
 
-static UNRECORDED_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Prior reconstructions that required complete WAL replay because a legacy prefix
-/// did not record refusal state. Recorded empty schedules do not increment this counter.
-pub fn refusal_schedule_unrecorded_replays() -> u64 {
-    UNRECORDED_REPLAYS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// How a committed step ended, as the schedule needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommittedStep {

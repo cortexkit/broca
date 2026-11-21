@@ -204,8 +204,8 @@ impl LateResultsStore {
     /// Open the intake projection in `path`, creating it when absent.
     ///
     /// The caller owns rebuilding a missing projection before enabling feed intake: a store that
-    /// was just created here holds no registration, so its answers are only safe once the WAL
-    /// scan has filled it.
+    /// was just created here holds no registration, so its answers are only safe once the
+    /// rebuild scan has filled it.
     pub fn open(path: &Path) -> Result<Self, String> {
         Self::open_with_wal_recovery(path, false)
     }

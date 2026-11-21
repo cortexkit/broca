@@ -12,14 +12,14 @@ encrypted session files in the client. It uses the same session authorization as
 
 ### Frozen run admission
 
-`run.admission {"run_id":"…"}` reads the requested run's own start, on either storage,
-not the latest baseline of its session. A known run returns:
+`run.admission {"run_id":"…"}` reads the requested run's own start, not the latest baseline
+of its session. A known run returns:
 
 ```json
 {"run_id":"…","session_class":"sidekick","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true}}],"scope":{"owner":{"kind":"reserved","module_id":"core"},"ref":"worker-1","epoch":1,"principal":{"kind":"reserved","module_id":"core"}}}
 ```
 
-`storage` is `wal` or `store`. `session_class` and each fetch's
+`storage` is always `store` (`wal` named the old log format and is no longer produced). `session_class` and each fetch's
 `declarations_frozen` are omitted when absent in the recorded admission; absence
 is not replaced by an empty value. `fetches` contains only provider names and
 their frozen declarations, not tools, messages, system text or credentials. A
@@ -33,66 +33,29 @@ not assigned a fabricated start time.
 scoped start, `scope.owner`, `scope.ref` and `scope.epoch` project the recorded scope's
 owner principal, reference and `scope_epoch`; `scope.principal` is the recorded driving
 principal, omitted when the start did not record one. These fields come from the
-requested run's own start on either storage, never from the caller's current bind or
+requested run's own start, never from the caller's current bind or
 the session's latest ownership. They expose no tool arguments, transcript or credentials;
 adding scope metadata does not change which callers may read `run.admission`. A worker
 class or a fetch from the `aft` tool provider alone does not establish a scope.
-Write-ahead log (WAL) readers still verify `scope/v1` on the original frame;
-new storage records the scope in its typed start schema rather than a WAL feature list.
+The query uses the run-id index to find the run's `RunStart` and resolves the setup parts it
+froze, without a transcript walk.
 
-On new storage the query uses the run-id index to find `RunStart` and resolves
-the setup parts it froze, without a transcript walk. On WAL storage it reads
-the run's `RunStarted`. WAL envelope feature lists are not exposed by this op;
-the deployment acceptance script still verifies those features directly from
-WAL frames. New storage has a record schema, not a WAL feature list.
-The worker acceptance summary's `storage_counts=wal:N,store:N` counts observed
-post-restart worker runs, including workers without an AFT fetch that are counted
-separately in `ignored_counts`. Only AFT-fetching workers can certify acceptance.
+`broca-session --subc CONNECTION read <id>` (also `--session <id> read`) looks the session up
+by name. It tries the supplied name first, then `alfonso:<id>` for an unprefixed name. The
+lookup scans only the compact session-ref inventory, with the name predicate in SQL. Lookup
+duration is logged at debug level. Missing names refuse with the searched spellings; an
+incomplete inventory is identified rather than claiming the session is unknown, and a single
+candidate is not treated as unique until the inventory is complete. Ambiguous names list up to
+100 candidates' project-root, harness, and session values, say when more were omitted, and
+refuse to choose one.
 
-`broca-session trajectory <id> [--transcript] [--out FILE]` exports JSONL directly
-from the recorded WAL, without a daemon connection. Without `--out`, JSONL goes
-to stdout. Output files are created owner-only and must not already exist. It uses
-broca's read-only WAL reader, live-first and then `wal-archive/`,
-and respects retention expiration; it never opens a recovery writer or extracts
-an archived session into the live directory.
-
-The event kinds are `run`, `run_end`, `gap`, `model_request` (one per attempt),
-`model_step`, and `tool_call`. Tool rows appear at their intent/no-dispatch record
-and include later recorded result metadata. Bash rows include recorded execution
-knobs and an `exit_code` only when the result prints a `[exit code: N]` line.
-Missing timestamps, usage, routing, and result observations remain null or absent,
-not zero. `--transcript` adds `message` rows containing text and complete tool
-arguments/results, plus a `reasoning` byte-count row per step, never reasoning text
-or provider continuation state. Message `ordinal` and `mid` use the same placement
-as `session.read`; multiple results in one tool-role message share its coordinate.
-Messages not yet visible in `session.read`, including pending inputs and open
-tool turns before dispatch, have null coordinates. Transcript rows
-stay at their source record's position, even when a later boundary places them.
-Treat transcript exports as sensitive conversation data.
-
-Task/session-name lookup is shared by trajectory, `cache-diagnose <id>`, `cache-dump --session <id>`, and
-`broca-session --subc CONNECTION read <id>` (also `--session <id> read`). It tries
-the supplied name first, then `alfonso:<id>` for an unprefixed name. The lookup
-scans only the compact session-ref inventory, with the name predicate in SQL;
-it does not scan run-index history or add an index/migration. Lookup duration is
-logged at debug level. Missing names refuse with the searched spellings; an
-incomplete inventory is identified rather than claiming the session is unknown,
-and a single candidate is not treated as unique until the inventory is complete.
-Ambiguous names list up to 100 candidates' project-root, harness, and session
-values, say when more were omitted, and refuse to choose one.
-
-`--state-root DIR` overrides the normal state-root resolver for these lookups and
-offline exports. Explicit `--project-root ROOT --harness HARNESS` bypass lookup
-and keep the session name literal, as before; use the full recorded session name
-(including `alfonso:` when present) when selecting an ambiguous candidate. Existing
-read calls with only one bind flag use lookup and require that flag to match the
-recorded identity. Other daemon commands still accept their original bind flags.
-The connection file is
-only an argument; its path and contents are not printed on connection failures.
-Put the offline `trajectory`, `cache-diagnose`, and `cache-dump` subcommands before their flags;
-prefixed global flags are refused by command name before any session lookup.
-These commands refuse `--subc` by command name,
-whether the daemon flag appears before or after the subcommand, without binding.
+`--state-root DIR` overrides the normal state-root resolver for the lookup. Explicit
+`--project-root ROOT --harness HARNESS` bypass lookup and keep the session name literal; use the
+full recorded session name (including `alfonso:` when present) when selecting an ambiguous
+candidate. Existing read calls with only one bind flag use lookup and require that flag to
+match the recorded identity. Other daemon commands still accept their original bind flags. The
+connection file is only an argument; its path and contents are not printed on connection
+failures.
 
 `broca-session --subc CONNECTION compose-plan --items FILE [--scope OWNER/REF/EPOCH]`
 composes a tool-only plan from live provider catalogs without creating a session or sending
@@ -164,7 +127,7 @@ fallback to a folder claimed by the CLI.
 
 The process-level **Fusiform catalog and vault routes stay unscoped and need no
 carrier entry**. The proof lives only in the tool plane, never in the composed
-plan, session identity, model input, or WAL. Composing a plan does not create a
+plan, session identity, model input, or the session's records. Composing a plan does not create a
 session or authorize a subsequent session route to carry the scope.
 
 ---
@@ -301,13 +264,13 @@ A consumer can be both. The surface is **session-centric**: consumers address
 
 ## 3. Foundational model: a session is a LINEAGE OF RUNS (turns)
 
-- **Session / lineage** — the durable conversation. One single-writer **lease**, one
-  **WAL**, one **store** partition, keyed `{project_root, harness, session}`.
+- **Session / lineage** — the durable conversation. One single-writer **lease** and one session
+  in the session store, keyed `{project_root, harness, session}`.
   The storage root is resolved before acknowledging a session bind: an existing
   `(harness, session)` pair keeps its unique inventory root; a new scoped pair uses
   stamped `workdir`. A new pair without stamped workdir uses the fixed storage namespace
-  `broca-unscoped-v1`, not a directory. WALs still live in the state root's log folders,
-  at the inventory-assigned address. A stamp's `project_id` never
+  `broca-unscoped-v1`, not a directory. The session's folders live in the state root's
+  session store, at the inventory-assigned address. A stamp's `project_id` never
   keys a session. Two inventory roots refuse `session_address_ambiguous` (permanent);
    Known pairs resolve immediately from positive inventory evidence even during repair.
    An absent pair waits on shared discovery readiness for at most 60 seconds; incomplete
@@ -315,7 +278,7 @@ A consumer can be both. The surface is **session-centric**: consumers address
    Its `detail.reason` distinguishes `wait_expired`, `migration_failed` and a remaining
    `gap_marker`. Boot and on-demand repairs are single-flight and do not block serve
    startup. Existing-pair lookups use a read transaction; only absent pairs take the
-   write lock, recheck discovery, and reserve a root before any actor or WAL opens.
+   write lock, recheck discovery, and reserve a root before any actor or session opens.
    A stamped bind that reserves a new pair also records its stamp's owner and scope `ref`
    (not its epoch), in the same transaction. Until that session's first episode,
    `session.send` and `session.import` are admitted only over a route stamped with a scope of
@@ -349,21 +312,17 @@ A consumer can be both. The surface is **session-centric**: consumers address
   string being unique per consumer and provider, which every caller today satisfies
   (Core names each session with its own task id).
 - **Run = one turn's loop execution** — a user message in → the agent loops until its
-  response → a terminal. Each run begins with a `RunStarted` **episode marker** (input +
-  frozen config + `origin` + `submission_id`). Runs **accumulate** in the lineage WAL:
-  `RunStarted₁ …turn-1… RunFinished₁ RunStarted₂ …turn-2… …`. **One ACTIVE run per
+  response → a terminal. Each run begins with a `RunStart` record (input, frozen config,
+  `origin` and `submission_id`). Runs **accumulate** in the session's records:
+  `RunStart₁ …turn-1… RunEnd₁ RunStart₂ …turn-2… …`. **One ACTIVE run per
   lineage at a time** (lease-enforced); idle between runs. **Chosen: one run per turn.**
-- **Episode state machine:** replay walks the WAL
-  as a sequence of episodes. Each `RunStarted` **closes/validates the previous episode,
-  resets per-episode state (terminal flag, open tool batches, finish state), and appends
-  the previous episode's messages to the lineage PREFIX.** Only the **last** episode is a
-  resume/continue target; all prior episodes are immutable conversation prefix. A durable
-  `RunFinished` for episode N must NOT mark the lineage finished — it marks episode N
-  finished. There is an explicit **append-new-episode** path (idle `session.send` after a
-  finished episode writes a fresh `RunStarted`), distinct from resume-the-last-unfinished.
+- **Runs in sequence:** only the **last** run is a resume target; all earlier runs are
+  immutable conversation history. A `RunEnd` for run N ends run N, not the session. An idle
+  `session.send` after a finished run starts a fresh run with its own `RunStart`, distinct from
+  resuming the last unfinished one.
 - **Conversation history** = the prefix across all closed episodes ⊕ the current episode.
 - **Submission** = one prompt injection. PENDING (durably queued, retractable) → consumed
-  into a run (coordinator writes `RunStarted{submission_id}`) → ACTIVE → TERMINAL.
+  into a run (the actor writes `RunStart{submission_id}`) → ACTIVE → TERMINAL.
 - **Session coordinator** (§12) — the in-process lineage owner that drains the durable
   queue and starts each run.
 - **Fork** (future) — a separate lineage `SeededFrom` a parent; v4 lands the durable
@@ -464,10 +423,10 @@ Default `session.read`, `run.status`, stored messages and subscribe bytes are un
 Read-entry `written_at` is an optional Unix-millisecond time in the **entry envelope**, never
 inside the opaque `message`. It is part of default reads, with no request opt-in. New input
 and steers record admission time; a completed assistant records the end of its successful model
-attempt, before post-assistant hooks. The `message-times/v1` WAL feature preserves those times
-across rollback. Existing records are not rewritten: reads expose only recorded admission or
-successful-attempt times, and tool results' recorded `tool-times/v1` finish times. Unknown times
-stay absent, never zero. The same placement rules attach these facts before and after projection.
+attempt, before post-assistant hooks. Existing records are not rewritten: reads expose only
+recorded admission or
+successful-attempt times, and tool results' recorded finish times. Unknown times stay absent,
+never zero.
 
 `session.head.model` is the latest recorded next-send selection. Broca declares the
 `head_selection` capability group in `role.describe`; it lets an admitted creating plan or
@@ -486,30 +445,22 @@ model omission rule. Unsupported plan models (including unavailable provider sig
 refuse `invalid_params` with `{field:"plan.model", reason:"unsupported_model"}`; unsupported
 plan tiers name `plan.model.service_tier` with reason `unsupported_tier`. These checks are
 read-only and precede acceptance and writes. The selection is recovered from the creating
-`RunStarted.manifest` and later `session_refresh_accepted` manifests, not from a run's applied
-tier or a refetch of the original plan. Bounded authenticated source references keep these
-facts independent of transcript length.
+`RunStart`'s manifest and later accepted refreshes, not from a run's applied tier or a refetch of
+the original plan.
 
 `usage`, behind the `session_usage` group, is incremental durable session spend with
 `since` naming the first counted run. Its selection keys, first-use ordering and lower-bound
 totals are exactly run usage's: a field no counted step reported is absent; unreported steps
-are counted, not silently treated as measured zeros. Projection commits totals with its WAL
-watermark. `reasoning_tokens` is already included in `output_tokens`, not an additional charge;
-the session and run totals preserve that breakdown without adding it again. Head folds only
-the unprojected suffix. Retained sessions use a separate,
-lineage-bound checkpoint of content-free spend and grant facts; its watermark never advances
-the transcript projection. Expiry deletes that checkpoint in the retained-metadata transaction,
-and late writes cannot recreate it. A missing or unreadable checkpoint is reconstructed from
-the WAL, never served as a partial total. The retained head operation still uses its existing
-full-WAL latest-message read for older metadata and titles: spend is incremental, but the whole
-retained `session.head` operation is not yet constant-time.
+are counted, not silently treated as measured zeros. `reasoning_tokens` is already included in
+`output_tokens`, not an additional charge; the session and run totals preserve that breakdown
+without adding it again.
 
 `sender`, behind `head_sender`, reports
 the attested caller's own effective grant, using send admission's owner and plan checks. Owners
 receive all supported modes and interruption; named senders receive `idle_start` and interruption
 only when their entries grant them. An absent sender means no grant. `incarnation` is the UUID v4
-already stored in the WAL header, preserved by restart, archive and move; it is omitted for an
-unverifiable or missing header and is never minted by a read.
+minted with the session and kept in its head, preserved by restart and move. A session that
+has never been written reads `"unwritten"`; a read never mints one.
 
 Sessions recorded before attested owners were stamped, and direct or unverified sessions, retain
 their pre-existing unrestricted admission: any attested caller is admitted as owner. Head therefore
@@ -530,13 +481,6 @@ just like preset-selected text. A preset-less step declaration refused by its pr
 message and field; it does not invent a `preset_missing` difference for a nonexistent name.
 
 ### Health counters and per-request diagnostics
-
-`health.check.metrics.refusal_schedule_unrecorded_replays` counts prior reconstructions
-that require complete WAL replay because the legacy materialized prefix has no recorded
-refusal state at its watermark. It is a process-lifetime counter, present at zero. A
-recorded empty schedule needs no extra WAL read and does not increment it. Projection
-writes record the state so later resumes can use the prefix again; an older writer's
-replaced row or stale watermark-bound checkpoint requires replay rather than guessing.
 
 `health.check.metrics.tool_routes` is an in-memory census of the shared tool-provider route
 cache. It reports `open_session_actors`, `cached_routes`, `cached_routes_per_provider`,
@@ -563,7 +507,7 @@ active runs, held calls (or unknown held state), live subscribers, manual/source
 work/cancellation, withdrawals and startup recovery. Actors with no observed hold are counted
 under `idle_ttl`; asynchronous holder changes become visible on the next actor turn, at latest
 its ordinary idle tick. A paused held episode alone does not prevent idle-close.
-Session-close INFO records use the hashed WAL address, provider module ids, successful
+Session-close INFO records use the hashed session address, provider module ids, successful
 Goodbye count and failure count; each failed or timed-out Goodbye also emits a WARN.
 
 `health.check` includes `metrics.management_ops`, a process-lifetime counter for every
@@ -588,7 +532,7 @@ Only Anthropic `oauth` and OpenAI `chatgpt` runs with a frozen vault-resolved cr
 participate. The account, when present, is the run's frozen vault-returned account reference.
 Broca forwards unified Claude headers and allowlisted Codex headers/raw `codex.rate_limits`
 JSON, without interpreting quota values. The per-conversation `x-codex-turn-state` token
-is never forwarded. No observation enters the WAL, rendering or billing lanes.
+is never forwarded. No observation enters the session's records, rendering or billing lanes.
 
 The always-on sender uses a management route to `insula` without a project scope, with the same attested
 consumer connection as routing. Every 30 seconds it takes all pending readings and sends
@@ -658,81 +602,7 @@ A phase exceeding its budget emits one WARN on `session_storage`, with `phase`, 
 collection/sweep 1 s. Append and media wait have counters but no slow-line policy. Normal phases
 emit no lines.
 
-### Temporary storage cutover
-
-The cutover-only `broca.jsonc` switches `session_conversion.archives` and
-`session_conversion.live_at_startup` are independent and **off by default**. A default
-configuration does not inspect or convert legacy sources. Startup still creates the empty
-device-local ledger and staging folder because backup capture requires every declared path to
-exist. Enable archives
-first, after the operator verifies a clone rehearsal has no unexpected failures; enable the live startup window only for the cutover
-deploy. Both switches are removed with legacy storage, not permanent tuning options.
-
-When `live_at_startup` is enabled, routed session operations refuse `session_converting`, with
-`detail.class: "transient"` and `detail.retryable: true`, until startup recovery has completed,
-the configured encryption mode can create sessions, and every live source has an outcome.
-This is the exception to ordinary startup's nonblocking deployment-key load. The existing
-crash-orphan seal and usage-export backfill finish before conversion starts. An unexpected
-conversion failure blocks only its session: `session_unconverted`, `detail.class: "permanent"`,
-with the ledger's class in `detail.refusal_class`. Other sessions resume service after the live
-pass. With `archives` enabled, the background job prioritizes archived members, then
-idle live logs oldest last-write first, with a pause outside each worker's session fence.
-Startup and background conversion use two workers; an offline `--convert-clone` rehearsal uses
-half the available cores (at least one, capped at eight). Sources sharing an archive container,
-backup path or session address run serially, including overlapping archive snapshots. Other
-sessions may finish out of selection order. The registry
-selects a live session only with no opening, open or closing actor and no durable active or
-paused run, queued send or held call, under the session's admission fence. Busy sessions are
-skipped and revisited on later passes, never waited on. During conversion that session's
-operations refuse retryable `session_converting`; other sessions continue serving. The fence
-is released on publication or refusal, including task cancellation. Live files without a
-decodable session identity remain untouched until a `live_at_startup` pass can classify them
-without racing a serving writer.
-
-Conversion reuses the online move's staging, media copy and verification. It keeps storage
-class, compaction views and the legacy WAL lineage id, so previously issued output-reference
-IDs still resolve. A verified head publishes the session
-only after its data is durable and the root's minimum-reader feature list names
-`session-storage/v1`, preventing an older build from opening the converted root. The address
-inventory remains in `run-index.db`; conversion does not rewrite its immutable usage-export
-facts. The new run loop does not support the original compaction protocol (as opposed to current
-compaction-view records), approval history or input-token budgets. Logs using these features,
-and missing, empty or undecodable logs, are terminal refusals. Unexpected refusal classes retain their source for
-repair instead of silently publishing an incomplete session.
-
-Source files move, without `moved` markers, to `session_conversion.backup_root` (by default
-`broca-converted-sources/` beside the state root), preserving their relative paths. The backup
-must be outside the state root. A sealed archive moves whole only after every member has a
-terminal outcome; the converter never rewrites its members. Keep backups until the release has
-run a week without a conversion finding.
-
-The owner-only `conversion-ledger.db` in the state root uses SQLite WAL journaling with
-`synchronous=FULL`. Each source's identity, path, class, current intent, outcome/refusal class,
-destination, backup, source SHA-256, failure detail and timestamps are recorded independently, with each intent committed before
-its filesystem operation. The source fingerprint is bound under the session fence before staging;
-resume through publication or backup refuses `source_changed` without changing the source if its
-bytes no longer match. Restart resumes incomplete publication and backup steps. This ledger
-is temporary and is removed with the converter after its final counts enter the release notes.
-`health.check.metrics.session_conversion` reports cached ledger counts by step, outcome and
-refusal class, the live barrier, and any job-level error, without probing source files. It also
-reports `live_background_converted` and `live_skipped_busy` since process start,
-`live_remaining` as of the latest pass (including deferred or failed live sources), and
-`deferred_no_identity` counting identity-less live files deferred across passes. Failed and
-refused ledger rows retain the error message; verification details name the mismatched check
-and first differing response field or message ordinal. A session conversion panic uses the same
-failure path, with refusal class `panic` and its panic message in the detail; the other workers
-continue. Failed sessions are retried on later passes or restart, while final rows are skipped.
-Each failed attempt logs a WARN with source path, class
-and detail. The standalone `--convert-clone` command, which tests conversion on an
-operator-supplied state-root copy without starting the daemon, writes these warnings to stderr.
-
-Verification reports historical provider-rejected requests separately as
-`provider_rejected_request`, with a count and run/step examples in the report and ledger detail.
-This category requires a step with no successful `ModelStepFinished` in a run that ended with a
-permanent `request_invalid`; it never exempts a successful step. Read, history, head and fresh
-next-send verification still run. Import markers are not provider runs to resume: verification
-admits a fresh synthetic next send with one config supplied to the legacy WAL renderer and the
-new session loop, leaving the marker and its imported history unchanged.
+### Repetition warnings
 
 Fresh admissions freeze `repetition_after_input` in the render config: repetition warnings start
 at each run's first model answer, not at assistant messages supplied as its input. A seeded import
@@ -744,31 +614,7 @@ model answers from caller-supplied input when available; when neither attributio
 input boundary survives, rendering keeps the legacy
 boundary and logs a warning naming the session rather than refusing the run.
 
-An inventory re-key first filters named candidates by both stored and derived source address,
-then requires one distinct identity in a complete inventory. An otherwise unservable live log
-can also recover its filename identity from inventoried project roots, `runner`/`broca` harnesses,
-and recorded or inventoried session names. Exactly one candidate must hash to the filename, and
-no new-store head may occupy it. Historical and inventory identities remain provenance in
-`run_choices.record.session`; they do not change the head's serving address. An archived alias
-is `superseded_alias` only when a canonical converted source has the identical prefix and its
-published session still serves the source pages. The ledger names the canonical address, no
-second session is published, and the original archive bytes remain in the backup.
-
-An unfinished archived crash-orphan run is sealed `Interrupted` only on a staging-owned copy.
-The recovery is persisted separately from disposable conversion staging, so retries reuse its
-exact tail without writing the archive container. The configured usage export bills the recovered
-run's own steps through `StoreBilling` before `Billed` is appended and before verification or
-publication. Existing facts deduplicate by their normal fact id. A failed or unavailable export
-is a visible `billing_failed` conversion failure, never an unbilled conversion. Only the recovered
-run's withdrawal-free active legacy row is carried; other reconciliation debt still refuses the
-conversion. The converted store owns the recovered run and leaves its legacy index row alone.
-
-For an operator-supplied **clone only**, `ck-broca --convert-clone ROOT --converted-sources BACKUP`
-runs the same conversion in plain mode without starting a daemon or reading the vault. It prints
-JSON counts, live-pass and total milliseconds, and session addresses whose legacy run-index rows
-still require terminal-state or usage-export reconciliation (`reconcile_owed`). It
-does not implement another billing reconciliation path or change export facts. Never point this
-command at a running state root; a rehearsal writes its clone and its outside-root backups.
+### Per-request debug records
 
 To see one debug record per served operation, add a `CK_LOG` value to broca's module environment
 in `subc.jsonc`:
@@ -813,17 +659,15 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   metadata overflow uses the adapter's generic `response_too_large` refusal because there is no
   message or model entry to name.
 - `tool_calls[].call_key` preserves a recorded consent-preparation or dispatch key. Without
-  such a key, a native call uses `<lineage_id>:<wal_seq>` of its own dispatch intent, or of its
-  singular `ToolNoDispatch` / intentless `ToolResult` terminal when it never dispatched.
+  such a key, a native call uses `<lineage_id>:<wal_seq>` of its own `ToolIntent` record, or of
+  its outcome record when it never dispatched.
   Calls sharing a model ID still have distinct per-occurrence anchors. Imported calls and
   results synthesized into one run's input remain keyless: their shared input record cannot
   identify each call uniquely. `dispatched_to` remains the dispatch intent's recorded module,
   absent for calls never dispatched and for historical intents without that observation.
   The same durable key is served on call, read, display and live facts before and after restart.
-  Facts of a turn in the read's WAL tail come with the page; an older turn's come from a
-  per-session cache that one pass over the whole WAL fills when a read first needs them.
-- Every known run's `run.status` and `run.result` carry `usage` from completed
-  `ModelStepFinished` and billed `ModelStepRefused` WAL records, including while the run is
+- Every known run's `run.status` and `run.result` carry `usage` from completed `StepEnd` and
+  billed `StepRefused` records, including while the run is
   active. It always has
   `steps` and `unreported_steps`; a run with no completed step reports exactly
   `{"steps":0,"unreported_steps":0,"by_model":[]}`. A step is unreported only if **all five** token
@@ -842,7 +686,7 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   Each entry carries the same counters and optional token totals. An unnamed variant is
   omitted, never an empty string; each entry contributes to the run totals, including
   unreported steps. These counters and the model breakdown do not change subscriber
-  `step_finished` / `run_finished` usage units or the WAL record format.
+  `step_finished` / `run_finished` usage units or the record format.
   An optional `generation` list groups measured model calls by `{model, service_tier?, speed?}`
   in first-measured order. Each entry has `model_calls`, `output_tokens`,
   `sent_to_last_content_ms` and `first_to_last_content_ms`: both durations and the token total
@@ -880,24 +724,14 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   tool_call_id, call_key?}`. The answer includes only `result_bytes`, the byte length of the
   stored tool-result encoding; result content is never returned. Calls with a durable intent but
   no result read as `indeterminate`, not as a failed zero-byte result.
-  The durable run index has no WAL sequence boundary, so the first page reads the session WAL
-  once from sequence zero to locate the run and save the positions of its call batches.
-  Continuations resume at the next assistant-step sequence and its batch end; file-backed readers
-  use a byte anchor when available, and other readers keep the sequence bound while scanning to
-  that batch. Sibling-call pages may revisit their shared batch, but do not decode earlier runs or
-  the remaining run suffix again.
 - `session.baseline` and the admitting send's `baseline`: sessions are admitted without a fetch
   plan, so `items` is empty and `composition_digest` absent; `tool_names` are the first
   episode's tools; both generations are 0. The send reply carries it only when the session's
   first episode runs under the send's own run id, from what the session's actor holds; it
   reads nothing.
-- `session.head` reads the store's last row and the WAL past the store's watermark. For a
-  retained session, `updated_at` is the durable activity that sets its expiry: lifecycle/send
-  records advance it, but cache warms and other maintenance do not. Retained content is
-  WAL-only, so that tail holds its policy. For sessions without retention, the value still
-  uses the live WAL file's write time; only a folded session whose tail holds no timestamped
-  record reads its whole WAL. Its `title` is the newest title in that WAL tail, else the one
-  the store's projection folded (`meta.last_title`).
+- `session.head`'s `updated_at`, for a retained session, is the durable activity that sets its
+  expiry: lifecycle and send records advance it, but cache warms and other maintenance do not.
+  Its `title` is the newest title a send recorded.
 - A `steer` or `interrupt` into a session that has an episode takes every runner parameter it
   omits (`model` with its variant, `tool_choice`, `generation`, `stop_when`, `cache`, `budget`,
   `context_limit`, `work_class`, `service_tier`) from the session's latest frozen config, so its
@@ -905,9 +739,8 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   contains a mode that can join an episode (`steer`, `tool_result`, or `turn_system`); an
   `idle_start`-only list takes defaults, like a plain queue send. A session with no episode
   has nothing to inherit: it requires `model` and takes defaults for other omitted runner
-  parameters, even if its WAL already has a lineage header. If WAL presence cannot be
-  classified, a send needing that classification refuses with class `transient` rather than
-  assuming the session has history. `tools` and `context_management` already inherit on
+  parameters, even if the session already exists with no run. If the session's history cannot be
+  read, a send needing it refuses with class `transient` rather than assuming the session has none. `tools` and `context_management` already inherit on
   omission for every send. Any other send must name `model`. When an inheriting send is
   queued behind a running turn, its recorded request carries the frozen model itself, so a
   build that does not know the inherited set still runs it on the session's model.
@@ -1009,7 +842,7 @@ an unknown member in the block, or a non-boolean `enabled` refuses boot naming
 `service_tier.enabled`. Other root settings remain owned by their existing loaders.
 Like `anthropic_fallbacks.refusal_resend.enabled`, changing this switch requires a restart.
 
-Off preserves the legacy `flex`/`default`/`priority` admission and frozen bundles, WAL bytes,
+Off preserves the legacy `flex`/`default`/`priority` admission and frozen bundles, record bytes,
 discovery, default replies and provider requests. It does not declare the `service_tier`
 group or add tier members to default run usage. Queue reading remains available
 even when the writer switch is off.
@@ -1050,30 +883,10 @@ observations still carry neither applied nor served tier. There is no second acc
 
 The operator's `broca.jsonc` may set `"tool_name_aliases": {"oauth:example": {"names": {"bash": "client_bash"}}}` or use `{"prefix_all": "client_"}` for that credential route to rename every declared tool. Each route accepts exactly one form and no other members; malformed shapes refuse boot. Keys are credential routing keys (`<method>:<provider>`), not account IDs. Aliases affect only provider requests and are restored on replies; stored tools, history and dispatch remain canonical. Invalid names or collisions refuse admission as permanent `tool_alias_invalid` with `detail.tool` naming the tool, before any write. The resolved map is frozen into each new run; resume and retry retain it even after the config changes or is removed. Restart to load operator config changes.
 
-#### Hard session input-token cap
+#### Session input-token cap
 
-The `input_token_cap` discovery group enables optional `session.send.budget.max_input_tokens`
-(u64, at least 1). Once set, this session-wide cap can only decrease. Omission keeps it;
-an existing uncapped session may adopt one. Zero and a raise are `invalid_params` naming
-`budget.max_input_tokens`. `budget` is closed to unknown members; each `nudges` element is
-also closed to members other than `at_tool_calls` and `text`. These refusals name the unknown
-member. A cap-only budget does not require tool-call reminder fields.
-
-Consumed input is the saturating sum of each completed model step's fresh input, cache-read
-and cache-write tokens across every episode, all at face value. Output is excluded. The WAL
-and its constant-size admission checkpoint carry the sum across restarts; no step size is
-estimated. No step starts at or above the cap, and a crossing step dispatches none of its
-tools. Its never-executed error results (`reason: "budget_exhausted"`, the definite `max_steps`
-dispatch outcome) and run terminal share one durability barrier, preserving provider-valid
-call/result pairs for later sends. A lower cap accepted while a run is active applies at its
-next model or post-step boundary, including when delivered as queued work or a steer.
-
-The terminal reason and run state are `budget_exhausted`. `run.status` and `run.result` carry
-`detail: {limit, spent, cause}`, where `cause` is `limit_reached` or `usage_unreported`.
-Missing input usage fails closed; a reported zero is known usage. For `usage_unreported`,
-`spent` is only the measured sum before the first unreported step, not an estimate of that
-step's input. Capped sessions require the must-understand WAL feature `input-token-cap/v1`;
-older readers refuse them by that name rather than run without the cap.
+broca keeps no session input-token budget and does not declare `input_token_cap`. A send
+carrying `budget.max_input_tokens` is refused `invalid_params` naming that field.
 
 ### 4a. `session.warm`
 
@@ -1088,7 +901,7 @@ what it cost.
 
 - **Base.** While a run is generating, the exact bytes its in-flight attempt sent (their digest
   is the `request_body_sha256` that attempt's `model_attempt_finished` records). Otherwise the
-  session's last request, rebuilt from the WAL and rendered from the frozen config; it is sent
+  session's last request, rebuilt from its records and rendered from the frozen config; it is sent
   only if it renders to the digest its step recorded, else refused `warm_prefix_unavailable`. A
   running run is never a refusal.
 - **Refusals**, each decided before anything is sent and with a pinned golden body under
@@ -1111,74 +924,28 @@ what it cost.
   it at its own send start. `expiry_basis` is always `"estimated"`. The clock lives in memory, so
   after a restart it is unknown (and warms are refused `cache_expired`) until the session sends
   again.
-- **Records.** On legacy roots, each successful warm writes one informational, ungated `cache_warmed` WAL record
-  (digests, usage, account, the raw `anthropic-ratelimit-unified-*` headers, expiry). Replay,
-  `session.read` and projection skip it; it is never a transcript message. Billing turns it into
-  its own export fact marked `warm: true`, priced from its own usage, whose id is taken over the
-  record's WAL sequence so the run's ordinary facts keep their ids. Absent usage stays absent.
-  The retained version-4 WAL compatibility path reserves every physical warm send before sending
-  and normally gets a `cache_warmed` terminal with its reservation and outcome envelope even
-  when it fails;
-  those records require the `bill-attempts/v1` WAL feature. A compression refusal and
-  uncompressed resend are separate attempts. The billing envelope distinguishes a failed send
-  from a cache refresh. A failed warm never refreshes cache expiry on any root. If a crash loses
-  the outcome or a full WAL refuses its terminal, reclaim lets the billing reader report the
-  reserved attempt as possibly billed,
-  without inventing usage, deduplicated by its random `attempt_id`.
-  These low-level compatibility records do not enable daemon service on roots marked
-  `broca-state/2`: startup refuses those roots and requires a fresh state root.
-- **Head and declaration.** `session.head.cache` reports the clock from memory, with no WAL
+- **Records.** Each warm writes one `Warmed` record (digests, usage, account, the raw
+  `anthropic-ratelimit-unified-*` headers, expiry). `session.read` skips it; it is never a
+  transcript message. Billing turns it into its own export fact marked `warm: true`, priced
+  from its own usage. Absent usage stays absent. A failed warm never refreshes cache expiry.
+- **Head and declaration.** `session.head.cache` reports the clock from memory, with no record
   scan. The admitting send's `baseline` and `session.baseline` carry `cache {ttl_ms,
   ttl_options_ms, read_refreshes_ttl, warm: "supported" | "unsupported", basis}`, every member
   absent when unknown; `basis` is `requested` when the session's cache request named the
   lifetime and `provider_default` when the provider's default applies.
 
-Source-cache maintenance additionally follows the current
-`anthropic_fallbacks.refusal_resend.enabled` switch read at module boot. When off, no source
-task, subscription or source-record tap is installed, even for a session with a frozen fallback.
-Its durable refusal routing still resumes unchanged; only source-cache maintenance is disabled.
-When enabled, broca keeps a separate clock for the refused source request of a run that froze
-the client-side fallback. While its allowance of 10, 20 or 40 successful fallback replies remains,
-broca refreshes that source prefix only
-near expiry: 30 seconds before a five-minute TTL, or two minutes before a one-hour TTL. The
-base is the source request that was actually sent, not a converted fallback request. Its
-rebuilt bytes must hash to that source request's recorded digest before the warm's output-only
-settings and server-fallback opt-out are applied. A source warm does not refresh the active
-fallback route's clock.
-
-Sessions whose frozen `session_class` is `head` may keep that source prefix warm between runs;
-other classes (including absent or unknown classes) warm only while a run is active. The same
-quota and rent-or-rewrite budget checks apply. Idle head warming stops before its cumulative
-cost reaches one source rewrite, using the source model's prices and frozen TTL; a new run
-resets this warming-cost allowance, whereas resuming the same run does not. Once the configured
-number of successful fallback replies has been served, broca stops keeping the old source prefix
-warm, before making
-the next source-model request. It does not wait for that source request to answer.
-Applied compaction messages/views, account or credential changes, model/config refreezes and
-the source answering again also invalidate the old prefix. Authentication pauses suspend warming;
-shutdown and restart pauses stop local IO, and a new process rebuilds eligible schedules from
-the WAL, including warm spend. No timer or new record type is persisted. These rules do not
-enable the default-off refusal fallback switch.
-
-New source-maintenance records use the existing optional `cache_warmed.trigger` string value
-`source_keep_warm` to select source-model attribution. Records without that discriminator,
-including historical late manual warms, keep their original attribution and export-fact bytes.
-
-A **subscribe cursor** is `{wal_seq, sub_index, incarnation, digest}`. The incarnation
-names the WAL, and `digest` is a 16-hex-character verified source-frame identity.
+A **subscribe cursor** is `{wal_seq, sub_index, incarnation, digest}`: the record's sequence
+number, the unit's index within that record's projection, the log's incarnation, and a
+16-hex-character identity of the record.
 `subscribe`, `session.head.head` and `session.read.head` share this domain.
 A cursor attach starts strictly after that unit, so `read → subscribe(from: head)` is a
 gapless, duplicate-free handoff. `head` is absent when the log has no control unit.
-Historical logs without retained identity still stream with position-only cursors;
-those cursors cannot resume, but missing proof never prevents reading the stream.
 Malformed `from` refuses `invalid_params` naming `from`; a parsed cursor with a missing or
 different incarnation, a missing or different frame digest, an absent frame, or a
-sub-index with no corresponding control unit refuses `cursor_expired` before any event. Legacy position-only wire cursors
-also expire. Normal restarts preserve cursors; restoring a shorter WAL and reusing its
-positions cannot revive a cursor whose original frame was replaced.
-Within the same log incarnation, a restored cursor remains valid exactly when its frame
-survives at the same sequence with the same digest, which covers version, sequence,
-the lease fence (the writer's ownership generation) and payload.
+sub-index with no corresponding control unit refuses `cursor_expired` before any event. Position-only
+wire cursors also expire. Normal restarts preserve cursors. Within the same log incarnation, a
+cursor remains valid exactly when its record survives at the same sequence with the same
+identity.
 Missing or null `from`
 means live. On either refusal, drop the cursor, reopen live, and read `session.head`.
 
@@ -1189,21 +956,17 @@ the numeric `wal_seq` position. Pass the string unchanged as `subscribe --from-c
 string is not a resume cursor. If no control event was delivered, both `cursor` and
 `wal_seq` are null: there is no resume position, so use `subscribe --from start`.
 
-Broca declares `notices` only when its envelope writer is enabled, with
-`read_display_facts`, `history_display` and `live_events`. A reader-only build can
-read older envelope records without promising to record new notices. Its existing
-`delivery_order` capability remains served with legacy joined tool-result deliveries.
-A send recorded with a `rides-v2/v1` envelope adds a `notices` list to its tool-result entry on opted-in reads and
+Broca declares `notices`, with `read_display_facts`, `history_display` and `live_events`.
+A notice delivered with a tool result is stored apart from the result and adds a `notices` list to its tool-result entry on opted-in reads and
 to its display row, never a new transcript entry. Each fact names its stored result `part`,
 carrying `call_key`, `send_id`, `sender`, exact `text` and `delivered_as: "tool_result"`.
-That mode belongs to the notice fact, not the carrier: an envelope ride never adds
-`delivered_as` to the carrying transcript message. Legacy ride attribution and all
-existing message ordinals and mids stay unchanged.
+That mode belongs to the notice fact, not the carrier: a notice never adds `delivered_as` to
+the carrying transcript message, and message ordinals and mids are unchanged.
 The corresponding `notice_delivered` live event names the same result and carrying call.
-Envelope carriers serve only the tool's own output on default and opt-in reads, raw and
+Carriers serve only the tool's own output on default and opt-in reads, raw and
 display history, compaction entries and subscribe frames. The shared renderer adds the
 recorded ride only when constructing model input; model request bytes do not change.
-A legacy delivery without the envelope keeps its joined read/history output and emits
+A delivery recorded before notices were stored apart keeps its joined read/history output and emits
 neither a notice fact nor a notice event. Its subscribe result and compaction entry still
 contain only the tool's own output, without riding text. Compaction's separate `delivered`
 list retains the recorded send text and attribution.
@@ -1286,7 +1049,7 @@ fetch plan, because tool providers require a per-call preset on scoped routes; o
 frozen plan manifest supplies those presets. A send carrying a plan, or using a session's
 already-frozen manifest, keeps the existing plan checks. Scope and plan refusals take
 precedence, and keyed resends of already-admitted runs keep their existing answer.
-This refusal precedes any WAL write or catalog fetch. Unscoped legacy sends and scoped
+This refusal precedes any write or catalog fetch. Unscoped legacy sends and scoped
 sends with absent or empty tools remain admitted, including steers, interrupts and queued
 sends that declare no tools. Flow sends retain their own `invalid_params` tool refusal.
 On a scoped, planless session admitted by an older build, a later send declaring non-empty
@@ -1318,13 +1081,10 @@ reported before any refresh applies.
 
 Refresh admission uses the ordinary plan admitter and durably records the fetched manifest and
 original reply before answering. Identical retries fetch and write nothing, even after restart
-or application. Changes never alter a running episode: the applying `RunStarted` freezes its
+or application. Changes never alter a running episode: the applying `RunStart` freezes its
 own manifest, and an earlier episode resumes from its own manifest. While a change is pending,
 sends may carry either the effective or latest accepted plan; any other identity is `plan_drift`
 against the latest accepted identity. Sessions never refreshed retain the first-plan drift rule.
-The three change records require the must-understand WAL feature `session-change/v1`; its
-reader must be deployed before enabling the writer in a later release.
-
 A refresh carries no model. Before an episode can apply it, broca checks its model-bearing
 items against that episode's resolved model, including an inherited model. A mismatch is
 `plan_model_mismatch`, permanent, with `detail.generation` naming the pending refresh and
@@ -1339,14 +1099,13 @@ its calls may take to answer, with N from 1 to 86,400,000 (the bound a tool prov
 tool's `reply`: `max_ms`, never less than its default 120-second wait. Without `reply` the tool
 keeps the default wait, after which a call with no answer is indeterminate and the run ends
 `interrupted`. A frozen fetch plan's own `reply` for the tool takes precedence. The deadline is
-frozen with the tool in the run's `RunStarted` (a resume keeps it, and a later send or catalog
+frozen with the tool in the run's `RunStart` (a resume keeps it, and a later send or catalog
 cannot change it); a send that omits `tools` inherits it with the rest of the tool. It is never
 rendered into a provider request and never sent to the tool. `reply` is strict: a non-object,
 a missing, zero, too large or non-integer `max_ms`, or any other member inside `reply` is
 refused `invalid_params` naming the member (`tools[0].reply.max_ms`, `tools[0].reply.grace_ms`,
 ...) before anything is written. Other unknown members of a tool stay tolerated and ignored, as
-before. Records whose tools carry a `reply` require the must-understand WAL feature
-`tool-reply/v1`; tools without one keep their old bytes.
+before.
 
 `role.describe.capabilities` includes `fetch-plan-optional-tools/v1`. A caller may mark
 a plan's tool item `optional: true`; literal `false`, optional compaction/transform items,
@@ -1362,19 +1121,19 @@ and resumes use the manifest without refetching.
 
 `session.send.conversation_key` optionally selects routing's provider-account affinity across
 sessions. When present it must be a string of 1–256 bytes, all printable ASCII `0x21`–`0x7E`
-(no spaces). Invalid values, including null or non-strings, are refused before any WAL write
-with `invalid_params {field: "conversation_key"}`. Absent inherits the latest episode's frozen
-key from the durable admission snapshot, without an additional full-WAL read. If that episode
+(no spaces). Invalid values, including null or non-strings, are refused before anything is
+written, with `invalid_params {field: "conversation_key"}`. Absent inherits the latest episode's
+frozen key from the durable admission snapshot. If that episode
 predates key recording, the key is derived from the session as before; older episodes are not
 searched. Episodes admitted with a recorded key carry it forward for subsequent sends.
 The key is part of send identity: reuse of a `send_id` with a different key is refused as
 `send_id_reuse` naming `conversation_key`. A queued send retains it durably until admission,
 including across a crash. A steer joining a running run accepts the key but ignores it for
 routing, since no admission takes place; an interrupt admits a new episode with its own key
-(or the inherited key if absent). `RunStarted.auth_selection.account_decision` records the
+(or the inherited key if absent). `RunStart`'s `auth_selection.account_decision` records the
 frozen `conversation_key` and `conversation_key_source: "caller" | "session" | "inherited"`,
 absent on old records. The source is an open string so future values survive replay.
-Raw keys are stored in the WAL on `Queued` and `RunStarted`, not in usage exports.
+Raw keys are stored on `QueuedSend` and `RunStart` records, not in usage exports.
 
 For each `route.account_for` admission request, broca also sends the top-level integer
 `hold_wait_max_s`: the longest wait it permits routing to hold for the session's previous
@@ -1393,14 +1152,14 @@ outgoing request fields; routing decides whether and how to honor the allowance.
 `session.send.title` optionally names the work a send carries, for dashboards and logs, on
 every delivery mode. When present it must be a string of 1–200 Unicode scalar values, not all
 whitespace, with no control character (newline and tab included). Anything else, including null
-or a non-string, is refused before any WAL write with `invalid_params {field: "title"}`; a title
-is never truncated. It is recorded on the record the send writes (`run_started`, `queued` or
-`steered`, absent when the send carried none) and on the run's index row. A queued send's title
-is carried onto the `run_started` that drains it. It is INFORMATIONAL ONLY: never rendered into
+or a non-string, is refused before anything is written, with `invalid_params {field: "title"}`;
+a title is never truncated. It is recorded on the record the send writes (`RunStart`,
+`QueuedSend` or `Steer`, absent when the send carried none). A queued send's title is carried
+onto the `RunStart` that drains it. It is INFORMATIONAL ONLY: never rendered into
 a provider request, and not part of routing, `conversation_key`, cache keys or send identity, so
 a retry under a known `send_id` with a different title gets the recorded answer, is not refused
 `send_id_reuse`, and keeps the first title. Run-keyed `run.status` returns the run's `title`
-when one was recorded (from the run index, else the run's `run_started`), and `session.head`
+when one was recorded (from the run's `RunStart`), and `session.head`
 returns the session's newest title across all three record kinds. Absent stays absent in both,
 never `""`. Usage export facts do not carry it.
 
@@ -1411,7 +1170,7 @@ identity: the same `send_id` with another mode is refused `send_id_reuse` naming
 
 - `queue`: the message is durably queued and started as the next turn once the active run
   ends; the reply is `pending`. Unchanged from a send without the field, byte for byte.
-- `steer`: the message joins the RUNNING turn. It is written as a `steered` WAL record (synced
+- `steer`: the message joins the RUNNING turn. It is written as a `Steer` record (synced
   before the reply) and the model sees it as a user message at the turn's next step boundary,
   never between a tool call and its result; a final answer given while it is pending is
   followed by one more step to render it, within the run's step and budget limits. The reply
@@ -1452,18 +1211,18 @@ context window (design and rationale: `docs/context-management-design.md`):
 - `"compaction"`: broca-native summarise-and-continue. Accepted by the parser, and refused at
   admission (`context_management_unavailable`) until the mode exists. Never run as `"none"`.
 - `{"transform": "<module id>"}`: a context-management value broca does not serve. It still
-  parses, because older `RunStarted` records carry it. A send naming it, a later send inheriting
+  parses, because older `RunStart` records carry it. A send naming it, a later send inheriting
   it, and a resume of an episode frozen onto it are all refused by name with
   `context_management_unavailable` before anything runs, rather than run as `"none"`.
 
 Any other value is refused as `invalid_params` naming `context_management`. Unknown FIELDS on
 `session.send` are still tolerated; only this field's value is strict.
 
-The session's FIRST episode binds the value, and it is frozen onto every `RunStarted`
+The session's FIRST episode binds the value, and it is frozen onto every `RunStart`
 (`config.context_management`). A later send that omits the field inherits it; one carrying
 the same value is accepted; one carrying a different value is refused permanently with
 `context_management_changed`, naming both values. A resume always runs under the frozen
-value and never reads process configuration. Every refusal happens before `RunStarted`, so a
+value and never reads process configuration. Every refusal happens before `RunStart`, so a
 refused send leaves no episode. A send that queues behind an active run is admitted when it
 drains, so its refusal happens then (recorded as a failed queued admission), exactly as a
 queued changed system prompt is.
@@ -1486,14 +1245,14 @@ With the field omitted on a session's first send, the first match wins:
 A malformed section, a `"compaction"` default, or a `{"transform":...}` default refuses boot
 by name. Changing `broca.jsonc` later never changes a session that already bound its value.
 
-A session whose last `RunStarted` carries no `context_management` binds its next new episode to
+A session whose last `RunStart` carries no `context_management` binds its next new episode to
 `"none"` and freezes it; `broca.jsonc` defaults never reach it, and a differing explicit value
 is refused like any change. A resumed episode of such a session runs as `"none"`.
 
 `session.send.model.variant` is an OPTIONAL reasoning variant name, sent inside the `model`
 object as OpenCode sends it: `"model": {"provider": "openai", "model": "gpt-5.6-luna",
 "variant": "xhigh"}`. There is no top-level spelling. The variant travels through the queue,
-is recorded on the run's `RunStarted` config (`variant`, absent when not sent), and a resume
+is recorded on the run's `RunStart` config (`variant`, absent when not sent), and a resume
 keeps the recorded value. A different variant under a reused `send_id` is a different request,
 reported as a changed `variant`.
 
@@ -1532,7 +1291,7 @@ variant 'max'; its variants are [none, low, medium, high]`. A model whose option
 `session.send` refusals use error code `variant_unsupported` and structured detail:
 `{"model":"anthropic/claude-opus-4-6","variant":"max","defined":["none","low","medium","high"]}`.
 `defined` is empty when the model defines no variants. The human message keeps its existing
-`open failed: run resolution failed: ` prefix and wording. No `RunStarted` or other WAL record
+`open failed: run resolution failed: ` prefix and wording. No `RunStart` or other record
 is written, and no provider request is made. Also refused (as `open_failed`, not
 `variant_unsupported`): an Anthropic budget variant when the output cap does not exceed the budget. A ChatGPT `-pro` id is not a variant: it resolves
 only if the catalog lists that exact model, and maximum reasoning is `model.variant: "max"`.
@@ -1580,7 +1339,7 @@ The manifest lists `classifier/v1` in `capabilities.provides`.
   and `llm-runner`, or a `classifier` version other than `v1`, is refused at bind
   with `role_versions_unsupported`.
 - **No session.** A classifier route names no session: nothing opens a session,
-  takes a lease, touches a WAL, or writes session projections. Each call runs on its own task,
+  takes a lease, or touches the session store. Each call runs on its own task,
   capped per process and per model, and holds none of the connection's request slots.
 - **Work scope.** `classify.run` requires a daemon-stamped run scope (`agent_id` and
   `run_id`) or flow scope (`flow_id`), otherwise `scope_required` before any write or
@@ -1702,7 +1461,7 @@ That imposes a *structural* requirement, not a behavioural one:
 carries the authoritative text and replaces the streamed tail wholesale, so on a normal run a
 marker is visible only for the seconds between reattach and that message. A run cancelled or
 failed mid-step never produces one — the assembled message is projected from
-`ModelStepFinished`, which that run never reaches — so **the torn tail is what the transcript
+`StepEnd`, which that run never reaches — so **the torn tail is what the transcript
 keeps, and the marker is permanent**. Do not size the effort by the seconds-long case.
 Display is a latency optimisation, never a source of truth — which is also why the lane will not be made replayable: durable
 per-token replay would let a slow subscriber backpressure the single-writer loop, and the
@@ -1710,39 +1469,25 @@ reliable lane already carries the complete text.
 
 ## 6. Multi-client fan-out + per-subscriber backpressure
 
-subc is 1:1, no broadcast → **broca owns the fan-out**. Per subscriber: **display
-lossy** (coalesce/drop + `DisplayGap`); **control bounded-then-DETACH** the route (it
-resubscribes from its cursor) — never blocks the run, never silently drops control. One
-slow subscriber never affects the run or co-subscribers.
+subc is 1:1, with no broadcast, so broca owns the fan-out. Per subscriber, the display lane is
+lossy (coalesce or drop, then `DisplayGap`) and the control lane is bounded, then detaches the
+route so the subscriber resubscribes from its cursor. A slow subscriber never blocks the run or
+co-subscribers, and control units are never silently dropped.
 
-## 7. The control stream: durable cursor + in-process live tail
+## 7. The control stream and its cursor
 
-The control stream is sourced from the **enriched WAL** (§18 adds the missing facts) via
-a **deterministic projection** `WAL+store → Vec<ControlUnit>`, addressed by a **durable
-cursor `(wal_seq, sub_index)`** — one record can project to several ordered ControlUnits,
-disambiguated by `sub_index`. This cursor is **durable and lineage-scoped**: it is what a
-consumer holds and **resubscribes with**, and it **survives the coordinator's
-release/re-open** (§12) because it is derived from the WAL, not from process memory.
+The control stream is projected from the session's records, addressed by the cursor
+`(wal_seq, sub_index)` described in §4a. Because it comes from the records, not process memory,
+a cursor survives the actor closing and reopening the session. How an attach replays and then
+streams live without a gap or a duplicate is in [session actors](session-actors.md) §5.
+`from:"live"` replays no history and waits for future units. Display events are live-only: a
+finished turn shows assembled text, not re-typed tokens.
 
-For the **not-yet-fsynced live tail** of the active run, the coordinator keeps a small
-**in-process event log**: the loop appends each event to it **non-blocking** (NOT
-`await out.send` per event — the #13 producer-stall fix), and the fan-out task drains it.
-On fsync, those events acquire their durable `(wal_seq, sub_index)`. The **attach
-barrier** (under the coordinator lock): capture the durable head cursor `H` and the live
-tail; replay the projection `≤ H`, then stream the live tail, **deduplicating by the
-durable cursor** for any tail event that crossed `H` during attach. **The in-process live
-seq is internal only** — it is never handed to a client and never used as a resubscribe
-cursor (so a re-open's reset cannot break a client). A cursor attach is strictly after the
-named unit. `from:"live"` resolves to strictly after the last projected unit at `H`, so it
-replays no history and waits for future units. Display events are live-only (not in the
-projection — a finished turn shows assembled text, not re-typed tokens).
+## 8. Replay scope
 
-## 8. Replay scope (honest)
-
-`from:"start"` (or a cursor) = the durable projection (§7) from that point, then the live
-tail. The projection is **semantically equivalent, not event-identical** to the original
-live stream (display tokens are not reproduced). The §18 WAL enrichment is what makes it
-faithful for step boundaries, finish reasons, tool names, and error detail.
+`from:"start"` (or a cursor) replays the projection from that point, then streams live. The
+replay is semantically equivalent to the original live stream, not event-identical: display
+tokens are not reproduced, but step boundaries, finish reasons, tool names and error detail are.
 
 ## 9. Subscribe routing
 
@@ -1782,11 +1527,10 @@ deliveries on the original stream correlation.
 
 ## 10. Admission barrier + early failure
 
-Idle `session.send` returns `{state:"active", run_id}` **only after** the run acquires
-the lease and writes durable `RunStarted`. **Model/auth resolution happens BEFORE
-`RunStarted`** so a resolution failure is a typed `session.send` error, not a ghost run.
-A failure *after* `RunStarted` is a legitimate short terminal run answerable via
-`run.status`, error persisted.
+Idle `session.send` returns `{state:"active", run_id}` only after the run's `RunStart` is
+synced. Model and auth resolution happen before `RunStart`, so a resolution failure is a
+typed `session.send` error, not a ghost run. A failure after `RunStart` is a short terminal
+run answerable via `run.status`, with its error recorded.
 
 ### 10.1 A vanished project root refuses WRITES and still serves READS
 
@@ -1806,8 +1550,8 @@ Legacy directory-root sessions retain the guard.
 **This is deliberate.** Writes create durable state under a key derived from the bind
 triple, and appending new state beneath a root that is gone (or running tools there) is
 how a lineage ends up describing a place that does not exist. Reads have no such
-problem: the WAL is the archive and does not live under the project root, so a
-transcript outlives the directory it was recorded in.
+problem: the session store does not live under the project root, so a transcript outlives
+the directory it was recorded in.
 
 **What a consumer must not infer.** `!root.exists()` does NOT mean the session is dead
 or unopenable. It opens, pages its full history, and only continuation fails. A UI that
@@ -1815,49 +1559,30 @@ treats a missing root as a corpse and offers to prune it has the advice backward
 transcript still reads, and forgetting the record is then the only action that loses it.
 
 
-### 10.2 A WAL written by a newer broca is refused by name
+### 10.2 Open failures and their classes
 
-If a session's WAL holds a complete frame that requires WAL features this build does not
-know, a newer broca wrote it. Every operation that reads or opens that WAL refuses with
-error code `wal_newer_writer`: `session.read` (which reads the WAL without opening the
-session) and every operation that opens the session, `session.send`, `run.status`,
-`session.subscribe`, `session.retract`, `run.cancel` and `session.import`, including a
-send refused at admission for the same reason. The body is:
+A session that cannot be opened answers `open_failed`. When the producer knows the remedy, it
+adds `detail.class`: `transient`, `permanent`, `auth_required`, or `context_overflow`.
+Admission and run-resolution failures use `RunError::admission_error_class`; for example, an
+OpenAI Chat provider that cannot honour cache preferences returns `permanent`. An open that may
+succeed when repeated is not answered `open_failed`: it takes the contract's retryable code
+`transient`, with `detail.class: "transient"` and `detail.cause` naming the cause
+(`key_unavailable` while the session store's key is still loading after a start), because
+callers decide retries by code alone. Corruption and errors whose causes were erased remain
+unclassified: `detail` is absent. Absent is not a retry recommendation; consumers retain their
+fallback only for absent classes. The served bytes are pinned by `open_failed_permanent.json`
+and `open_transient.json` under `crates/broca-wire/tests/golden/`.
 
-```json
-{"code":"wal_newer_writer","message":"open failed: wal range-read failed: wal written by a newer broca (NewerWriter): the version 3 frame at offset 69 requires features this build does not know: probe-unknown/v1","detail":{"kind":"newer_writer","missing":["probe-unknown/v1"]}}
-```
-
-`detail.missing` names the features the refused frame requires. The class is `permanent`:
-the bytes are intact, nothing was written, and retrying cannot help, so the remedy is to
-place a broca that knows every missing feature. Branch on `code`, then `detail.kind`. The
-message keeps the wording the refusal carried before it had its own code and is never
-parsed. These exact bytes are pinned by `crates/broca-wire/tests/golden/wal_newer_writer.json`.
-
-The same refusal, with `detail.missing` set to `["session-storage/v1"]`, answers every operation
-on a session kept in broca's newer session storage, which has no WAL. This build doesn't serve
-such a session, and it never creates a WAL for one, so a downgrade past the storage release
-leaves those sessions refused until a build that serves them is placed again.
+A log holding a record kind or a must-understand field this build does not know was written by
+a newer broca. Release placement refuses such a downgrade before it happens: the state root's
+feature floor lists what its logs need, and a build that does not know every entry is not
+placed. The `wal_newer_writer` code (pinned by `crates/broca-wire/tests/golden/wal_newer_writer.json`)
+named the same refusal for the old log format.
 
 `session.read`'s permanent `history_unreachable` refusal is described in section 15 and
-pinned by `crates/broca-wire/tests/golden/session_read.history_unreachable.json`.
-
-Every other failure to open a session's WAL, corruption included, still answers
-`open_failed`, with the same message. When the producer knows the remedy, it adds
-`detail.class`: `transient`, `permanent`, `auth_required`, or `context_overflow`.
-Admission and run-resolution failures use `RunError::admission_error_class`; for example,
-an OpenAI Chat provider that cannot honour cache preferences returns `permanent`.
-An open that may succeed when repeated is not answered `open_failed`: it takes the contract's
-retryable code `transient`, with `detail.class: "transient"` and `detail.cause` naming the
-cause (`key_unavailable` while the new storage's key is still loading after a start,
-`open_failed` for a temporary WAL read interruption), because callers decide retries by code
-alone. Corruption and errors whose causes were erased remain unclassified: `detail` is absent
-and the entire legacy body is unchanged. Absent is not a retry recommendation; consumers
-retain their fallback only for absent classes. The served bytes are pinned by
-`open_failed_permanent.json` and `open_transient.json` under `crates/broca-wire/tests/golden/`.
-One path keeps its existing code: when the session is already open,
-`session.subscribe` attaches and then replays the WAL in the stream, and a frame it cannot read
-there, a newer writer's included, ends the stream with `subscribe_replay_failed`, as before.
+pinned by `crates/broca-wire/tests/golden/session_read.history_unreachable.json`. When the
+session is already open, `session.subscribe` attaches and then replays its records in the
+stream; a record it cannot read there ends the stream with `subscribe_replay_failed`.
 
 ## 11. Submission lifecycle + durable queue + retract
 
@@ -1869,25 +1594,27 @@ send. Succession is one hop and grants no delivery, cancellation or withdrawal
 permission. The latest accepted refresh supplies the sender policy immediately.
 
 - **Idle send** → starts a run (active, run_id).
-- **Running send** → durably queued as **`Queued{submission_id, message}`** (a WAL
-  record carrying IDENTITY, not just the message). State "pending".
-- **Retract** → a durable **`Retracted{submission_id}`** tombstone, taken **atomically
-  under the coordinator lock** (remove-if-pending vs `already_started`). Crash-safe.
-- **Consume** → the coordinator writes **`RunStarted{submission_id, run_id, …}`**
-  referencing the submission + emits `SubmissionStarted{submission_id, run_id}`.
+- **Running send** → durably queued as a `QueuedSend{submission_id, input, …}` record, which
+  carries the submission's identity, not just the message. State "pending".
+- **Retract** → a durable `Retraction{submission_id}` record. The actor is the session's only
+  writer, so a retraction and a start that race are ordered by whichever record it writes
+  first (remove-if-pending vs `already_started`).
+- **Consume** → the actor writes `RunStart{submission_id, run_id, …}` referencing the
+  submission. A queued send whose admission fails is closed by a `SendEnded` record instead.
   A drained run's id is `"run-" + submission_id` (the submission id itself carries a
   `sub-` prefix, so the id reads `run-sub-…`). The string formula is diagnostics-only:
   consumers correlate a queued send to its drained run by matching `submission_id`,
   never by parsing the run id.
-- **Replay is unambiguous:** the pending set = `Queued − Retracted − consumed-by-a-RunStarted`.
-  A crash BEFORE the consuming `RunStarted` ⇒ still pending (re-drained on re-open); a
+- **Recovery is unambiguous:** the pending set is the queued sends with no retraction, no
+  consuming `RunStart` and no `SendEnded`. A crash before the consuming `RunStart` leaves the
+  send pending (started on re-open); a
   crash AFTER ⇒ that run is active/resumable, never double-consumed. FIFO; each queued
   prompt becomes its own episode.
 
 Broca declares `retract_own_send` with `retract`. On a session with a recorded owner,
 `session.retract {submission_id}` also admits the submission's recorded daemon-attested
-sender. Delegated sends retain that sender in `DeliveryOrdered.sent_by`; ordinary sends
-retain it in `Queued.principal`. Request-body sender claims never grant access. Missing,
+sender: the delegated sender for an ordered send, the attested principal for an ordinary one.
+Request-body sender claims never grant access. Missing,
 unverified or ambiguous attribution grants no exception to the owner's existing path.
 Answers and durable tombstones are identical to an owner's withdrawal: `retracted`,
 `already_started` or `not_pending`. A delivered steer is `not_pending`. This does not
@@ -1903,36 +1630,14 @@ followed by that run ID. Retries and `send.status` resolve the same ID from dura
 attribution, including after restart. Owner IDs and the first episode's recorded model,
 tool configuration, owner scope and plan manifest are unchanged.
 
-## 12. Session coordinator = a lineage actor
+## 12. Session actors
 
-One in-process **lineage actor** per open session with states **`Opening | Open |
-Closing | Closed`**. ALL `session.send`/`retract`/`subscribe` for a lineage go through
-its actor; a teardown cannot start while an op holds the actor. Lease lifetime: the actor
-holds the lease while there are **subscribers OR pending work OR within a short idle
-TTL**; otherwise it transitions `Closing` → releases the lease → `Closed`. A send,
-cancel, retract or subscription re-opens it (`Opening` → reacquire → replay).
-Finished one-shots can be polled without reopening their actor. Session status
-reads a closed live WAL only when it is at most 1 MiB; larger, archived or
-size-unknown logs use the ordinary actor path so repeated polls do not replay
-the entire history. There is no reverse WAL reader to locate the latest episode
-without a seek anchor. Run-keyed status/result and transcript reads retain their
-durable index/WAL paths. Unproven history is refused rather than guessed, and a
-nonterminal index row cannot override a WAL terminal. While crash-orphan sealing
-is pending, an unsealed run is retryable; afterward a status poll can open its
-coordinator and seal an unmarked orphan as interrupted rather than strand it.
-Durable queued work also wakes the coordinator, even when the latest run has
-already finished, so a crash cannot leave the FIFO permanently idle.
-Races handled by the actor:
-- A send arriving as the actor is `Closing` → it waits/re-opens, never races a half-torn
-  state.
-- Two concurrent re-opens of one lineage → the actor registry admits exactly one
-  `Opening` (the other awaits it).
-- A subscriber across a release → its route is closed on `Closing`; it resubscribes from
-  its durable cursor on re-open.
-**Defense-in-depth:** the lease's OS lock is the primary single-writer guard, and WAL append
-checks the file-integrity high-water mark so a draining old actor is rejected after a new actor
-has written. Each record also carries the lease epoch as a forensic tenure stamp; FileWal does
-not compare that stamp with an authority or reject an append solely because it is stale.
+One in-process actor per open session, reached through a registry; every `session.*` and
+`run.*` op for the session goes through it. The registry's slot states, the actor's lease and
+when it closes, and how races between a send, a close and a reopen resolve are described in
+[session actors](session-actors.md) §2-3. A subscriber across a close has its route closed and
+resubscribes from its durable cursor on re-open. Durable queued work also wakes the actor, even
+when the latest run has already finished, so a crash cannot leave the queue idle.
 
 ## 13. Cancel token + provider watchdog (core change)
 
@@ -1948,57 +1653,49 @@ so recovery finishes the cancellation without dispatching an in-flight call agai
 Omitted `at` (or `at: "now"`) retains immediate cancellation:
 the model stream is cancelled and sent tool calls retain the existing at-most-once recovery
 rules. `at: "step_boundary"` finishes the in-flight model step and its entire tool batch,
-records the results, and writes no further `StepStarted` before `RunFinished{Cancelled}`.
+records the results, and writes no further `StepStart` before `RunEnd{Cancelled}`.
 Discovery advertises `run_cancel.at: ["now", "step_boundary"]` under the existing `run_cancel`
 capability group. An unlisted or non-string `at` is refused as `invalid_params` naming `at`,
 with no writes. Both modes answer the JSON string `"ack"` or `"not_active"`.
 
-A boundary request is durable (`RunCancelRequested`, requiring `run-cancel-at/v1`) before
-`"ack"`. Duplicate boundary requests are idempotent; a later immediate request durably
+A boundary request is durable (a `CancelRequest` record) before `"ack"`. Duplicate boundary requests are idempotent; a later immediate request durably
 escalates it. Recovery never repeats a sent call or starts another model step: it completes
 recorded tool work using the existing dispatch evidence, or repairs ambiguous calls with
 their unknown-outcome results. A model response lost in a crash is not regenerated. A terminal
 the current step reaches first, including `completed`, `max_steps` or `error`, still wins.
-Readers predating this feature refuse affected WALs by name; ordinary sessions keep their
-existing bytes and remain readable on rollback.
 
 A paused run is already at a boundary and is cancelled without another model step. A queued
 submission is not an active run: cancellation answers `"not_active"`; use `session.retract`
 to remove it. An active tool batch awaiting human approval still owns that wait, so boundary
 cancellation waits for the decision/expiry and the batch's results; an immediate cancellation
 can end the wait. V2 Setup, notices and rides finish within their call budgets before the next model request.
-They do not create durable provider-wait states. A historical compaction wait the removed
-synchronous client recorded and a crash left open is sealed on recovery with its recorded
-exit, without calling the provider or the model.
+They do not create durable provider-wait states.
 
 The provider-call watchdog is separate from caller cancellation. A timed-out provider attempt
-ends `Interrupted`, not `Cancelled`, and releases the lease on legacy-format roots. In the retained
-version-4 WAL compatibility path, a billing-reservation durability failure takes precedence: the step fails with a WAL
-durability error instead of `Interrupted`. A writer whose sync never returns remains a
-process-level failure for the supervisor, not a bounded close-out; ownership is not released early.
-Roots marked `broca-state/2` are not served by the daemon.
+ends `Interrupted`, not `Cancelled`. A writer whose sync never returns remains a process-level
+failure for the supervisor, not a bounded close-out; ownership is not released early.
 
-## 14. run.status enum + durable run index + busy-vs-stale
+## 14. run.status states and busy-vs-stale
 
 Startup recovery seals runs left in flight by a previous process as `interrupted`, with
 an optional `error` diagnostic on `run.status`: `{class: "transient", provider_code:
 "previous_process_ended_unsealed", message: "the previous broca process ended without sealing
-this run: host crash, kill, or power loss"}`. This uses the existing WAL `RunFinished.error`,
-not a new terminal reason. The control lane projects the diagnostic as `ControlUnit::Error`
-before `RunFinished{reason: Interrupted}`; that final reason remains authoritative. Export
+this run: host crash, kill, or power loss"}`. This is the `RunEnd` record's error, not a new
+terminal reason. The control lane projects the diagnostic as `ControlUnit::Error` before the
+`interrupted` terminal; that final reason remains authoritative. Export
 facts carry `terminal_reason: "interrupted"`, but no interruption diagnostics. Graceful seals
 keep their existing behavior and omit this diagnostic.
 
 - **State enum:** `Idle | Active{run_id, step} | Paused{run_id, reason} | Interrupted{run_id} |
   Terminal{run_id, reason} | Error{run_id, detail}`. `run.status(session)` resolves the
-  in-process active run first, then WAL inference.
+  in-process active run first, then the session's records.
 - **Timed account pauses:** the root `broca.jsonc` setting `max_same_account_wait` defaults to
   `15`. A non-negative integer caps the wait in minutes; `0` never pauses, and `"max"` removes
   the cap but still respects cache expiry. Other values refuse boot by name. The obsolete
   `account_limit_pause` key is ignored with one boot warning naming the replacement.
   The setting is loaded once at boot; changes take effect at the next restart, like other
-  `broca.jsonc` settings. Each fresh run freezes only consent (`setting != 0`) in its existing
-  WAL boolean; a new pause uses the executor's in-memory cap. For a source-classified transient
+  `broca.jsonc` settings. Each fresh run freezes only consent (`setting != 0`) on its
+  `RunStart`; a new pause uses the executor's in-memory cap. For a source-classified transient
   account limit,
   `wake` is the latest blocking reset/retry floor (including any scheduling jitter),
   `cache_expiry` is the last 2xx attempt's send time on that account in this session plus the
@@ -2020,37 +1717,20 @@ keep their existing behavior and omit this diagnostic.
   health metric `account_limit_stale_resets`. `health.check.metrics.account_limit_pause_declined`
   always reports lifetime counts for `disabled`, `no_accepted_response`, `cache_expires_first`
   and `beyond_cap`; each decline logs reset, wake, cache expiry, cap and reason at info level.
-  Readers must understand `account-limit-pause/v1` before a consenting run writes it.
-- **Durable run index** in `run-index.db`: `run_id → {session, lineage, submission_id, state,
-  wal_path}` so run-keyed ops survive restart. Resume **reuses the original run_id**
-  (today it mints `req.run_id`).
+- **Run ids survive restart:** run-keyed ops find a run through the session store's id index,
+  and a resumed run keeps its original `run_id`.
 - **Busy-vs-stale:** `session.send` on a live-active lineage returns `session_busy{run_id,
   state}` vs `lease_stale`.
-- **Eventual-consistency contract (run-keyed `run.status{run_id}`):** the response reflects
-  the **coordinator's PROCESSED lifecycle state**, eventually consistent with the durable WAL
-  within ~one command-loop iteration. The run-status resolution checks the live actor's state
-  FIRST (it's authoritative for a running run), then the durable index, then WAL inference.
-  Because a subscriber observes `RunFinished` from the WAL projection (the writer-observer
-  path) which is **decoupled** from the actor's command loop, a run that JUST emitted
-  `RunFinished` on its subscription stream may briefly report `Active` via `run.status` until
-  the coordinator processes its own terminal command (which writes the index terminal and goes
-  idle in one atomic handler). **The durable terminal is IMMEDIATELY authoritative on the
-  WAL/stream** — only this convenience read-path lags. This window is structurally absent for
-  the case `run.status{run_id}` exists to serve — querying a run NOT in a live subscription
-  (a finished/crashed run): there the actor is already idle or closed, so its live state
-  doesn't match and the index/WAL resolve the terminal directly with no lag. A consumer
-  needing the synchronous terminal reads the stream; a consumer polling `run.status` for an
-  unwatched run sees the terminal immediately. The decoupling is deliberate (coupling the
-  projection to the actor state would reintroduce a double-publish), so this is a stated
-  contract, not a defect.
-- **`TransformUnavailable` is read, never written:** older WAL records and run-index rows carry
-  it, and readers report it (`run.status`, `session.read`, the run index), but this build never
-  ends a run with it. It is terminal, not a pause: a pause preserves a resolvable nonterminal
+- **Reading a terminal promptly:** `run.status{run_id}` resolves the live actor's state first,
+  then the session's records. A consumer that needs the terminal at the moment it is written
+  reads the subscription stream.
+- **`TransformUnavailable` is read, never written:** older records carry it, and readers report
+  it (`run.status`, `session.read`), but this build never ends a run with it. It is terminal, not a pause: a pause preserves a resolvable nonterminal
   cause and the same run rather than sealing the episode.
 - **Active model-step progress:** run-keyed `run.status` can include an optional `step` object
   `{step_id, started_at_ms, attempt, attempt_started_at_ms, last_content_at_ms?,
   max_content_gap_ms?, max_content_gap_ended_at_ms?}`. It is a cheap snapshot of the live actor's
-  in-memory model call, never inferred from WAL. Timestamps are
+  in-memory model call, never inferred from records. Timestamps are
   Unix milliseconds; `attempt` is zero-based and its content progress resets on reissue. The
   longest gap is measured only between consecutive real-content events, and its end time is the
   later event's timestamp. With fewer than two content events both gap fields are absent.
@@ -2064,8 +1744,8 @@ keep their existing behavior and omit this diagnostic.
   llm-runner role contract does not define these answers: there an id naming no run answers
   `unknown`, and llm-runner will not adopt them. Core (the
   session's owner) needs them until it tracks each send by its `send_id` instead of by this run
-  id. The answers come from the WAL alone, so they are the same on a live session and a
-  closed one, before and after a restart:
+  id. The answers come from the session's records alone, so they are the same on a live session
+  and a closed one, before and after a restart:
   - while the send is queued: `{state: "pending"}`
     (`run_status.provisional_pending.json`);
   - delivered into a run X that was already going (as a steer, with a tool result, or as a
@@ -2080,9 +1760,9 @@ keep their existing behavior and omit this diagnostic.
   A re-send of the queued send's `send_id` answers the same way (§9 of the role contract): once
   delivered into X it answers X's state with `run_id: X` and `delivered: {as: "step", ref: X}`;
   once an ordered send started its own run, that run with `delivered: {as: "turn", ref: <its
-  run id>}` (a plain queued send's re-send carries no receipt). Both
-  are rebuilt from the WAL (`send_delivered`, and the run's `RunStarted` beside its
-  `delivery_ordered`), so a re-send after a restart never answers `pending` again.
+  run id>}` (a plain queued send's re-send carries no receipt). Both are rebuilt from the
+  records (the `Delivery` record, and the run's `RunStart` beside its `DeliveryOrdered`), so a
+  re-send after a restart never answers `pending` again.
 
 ### Run waits on the new storage
 
@@ -2156,16 +1836,15 @@ Accounting event IDs use `lineage_id:wal_seq`, and timestamps are not join keys.
 
 ## 15. session.read consistency + pagination
 
-`session.read` cuts each page from one atomic materialized-store snapshot plus its exact
-bounded WAL tail. The response's optional `head: {wal_seq, sub_index, incarnation, digest}` is the last durable
-control unit covered by that same snapshot. `session.subscribe {from: head}` therefore
+`session.read` cuts each page from one view of the session. The response's optional
+`head: {wal_seq, sub_index, incarnation, digest}` is the last durable control unit covered by
+that same view. `session.subscribe {from: head}` therefore
 starts strictly after the read snapshot without a race, gap, or duplicate.
 
-If the materialized store proves the session has history but neither a live nor archived WAL
-can cover it, the read refuses with `history_unreachable` (`class: "permanent"`). Its detail
-contains `class` and `session_ref`, never filesystem paths, so callers can classify the lost
-history without parsing the message. The served bytes are pinned by
-`crates/broca-wire/tests/golden/session_read.history_unreachable.json`.
+The `history_unreachable` refusal (`class: "permanent"`, pinned by
+`crates/broca-wire/tests/golden/session_read.history_unreachable.json`) named a session whose
+stored rows outlived its old-format log. The session store keeps a session's history in one
+place, so it no longer arises.
 
 An explicit `from_ordinal` is one-based (`0` aliases `1`) and returns the forward range
 `[from_ordinal, from_ordinal + limit)`, capped at the transcript's end. With no cursor the newest
@@ -2184,8 +1863,8 @@ naming the key and the caller's harness, once per key per process. `model.varian
 is never reported as unknown. Before making an operation strict, verify that its
 callers do not send unsupported fields and check compatibility tests.
 
-Each entry's `ordinal` is its stored position plus one. Legacy log mids stay `m<position>`;
-logs whose first `RunStarted` has `compaction_plan_version` use `m<lineage-prefix>.<position>`,
+Each entry's `ordinal` is its stored position plus one. Mids of older logs stay `m<position>`;
+logs whose first `RunStart` has `compaction_plan_version` use `m<lineage-prefix>.<position>`,
 where the prefix is the lineage's first eight hex characters. Never derive a mid from an ordinal.
 Native sessions on the new storage mint unique message ids, including after a cancelled step
 announced an id but placed no message; converted sessions retain their positional ids and may
@@ -2224,8 +1903,7 @@ dispatch keeps its key but has no dispatch schema pin.
 
 For sessions held by `broca-session-store`, an assistant reply routed to the refusal fallback
 carries `model_fallback: {requested, answered}` on a `session.read` entry with
-`include_display_facts: true` and on its display-history row. Legacy WAL storage omits the
-fact. The requested id comes from the durable `RunStart.model`; `StepStart.mid` links the
+`include_display_facts: true` and on its display-history row. The requested id comes from the durable `RunStart.model`; `StepStart.mid` links the
 reply to `StepEnd.fallback.route`, with `served_model` taking precedence for a recorded
 provider handoff. Both ids are provider-qualified like the row's `model`, and the answered
 id must match the reply's stored origin. No route, missing ids or an answer from the requested
@@ -2235,17 +1913,6 @@ The fact is a bounded, non-encoded session projection populated while existing a
 open-log load/view and recovery folds pass the evidence. Reads never fetch ledger records
 to establish it. A sealed transcript or checkpoint alone lacks that evidence, so a fresh
 view may omit an older fact, as may cache eviction; absence means no claim.
-
-The first opt-in read, or first default read containing a tool result, lazily backfills
-only its own session's rebuildable display projection. Native tool output is copied from
-WAL results, never recovered by splitting joined text. The overlay changes only response
-copies, not model-facing materialized rows or `history_version`. Fact versions and a
-versioned continuation (the last processed log sequence
-plus pending-message and tool-batch state) commit atomically, so a failed
-backfill remains incomplete and retries on demand. Later reads select only their page's
-rows and fold the bounded WAL suffix since that continuation. No boot-time sweep visits
-historical sessions. Retention expiry removes the cache and prevents a racing reader
-from repopulating an expired lineage.
 
 **Message marks.** Broca declares `message_marks` and `notice_with_speaks_for`. A scoped
 session's attested owner can send `speaks_for: {agent_id, name?}`, where `name` is a
@@ -2260,16 +1927,11 @@ these carry `speaks_for`, never a redundant `notice` flag.
 An identical `send_id` retry compares normalized marks as well as the request: changed
 marks refuse `send_id_reuse` with `detail.field` naming `speaks_for` or `notice`, while
 absent and `notice: false` compare equal and retain the original answer. `speaks_for` is
-compared whole, so a changed, added or removed `name` refuses naming `speaks_for`. The WAL's
-`message-marks/v1` reader shipped before the writer. After marked sends have been written,
-rolling back the daemon requires a build retaining that reader; older builds refuse the
-must-understand WAL feature rather than silently lose the attribution.
+compared whole, so a changed, added or removed `name` refuses naming `speaks_for`.
 A runner without `notice_with_speaks_for` refuses a combined notice naming `notice`, and a
 speaker's `name` naming `speaks_for.name`. The reader of names shipped one release before
-the writer. In WAL storage, a record with a named speaker (on its marks, its tool-result
-delivery or its retry identity) requires the must-understand WAL feature `speaks-for-name/v1`.
-In `broca-session-store` storage, every stored speaker with a name has a must-understand
-`named_speaker` field beside it. After named speakers have been written, rolling back requires
+the writer. Every stored speaker with a name has a must-understand `named_speaker` field
+beside it. After named speakers have been written, rolling back requires
 a build with that reader; older builds refuse such a record rather than drop the name.
 
 **Compaction entry attribution.** A marked send's user entries carry `speaks_for`
@@ -2305,16 +1967,13 @@ older manifests that did not freeze teaching metadata. User, system and tool mes
 never carry the stamp.
 
 **Declared tools (opt-in).** `include_tools: true` adds `tools` and `tools_run_id` to the
-response: the tool list frozen on the durable `RunStarted` of the session's LATEST episode
+response: the tool list frozen on the durable `RunStart` of the session's LATEST episode
 (`name`, `description`, `input_schema`, and `module` when the episode recorded one), in
-recorded order, and the run whose `RunStarted` it came from. It is copied from the WAL record
-as written, never rebuilt (the run index keeps only a digest of the tools). The list comes
-from the same snapshot as the page; when the latest episode began inside the materialized
-prefix, this costs one extra WAL read bounded at the store's watermark, which is why it is
-opt-in. A session with no episode omits both fields (never `tools: []`); an episode admitted
-with no tools returns `tools: []`. If the store holds history but the WAL can no longer show
-the `RunStarted`, the read fails rather than omit `tools`, since omission would claim the
-session never ran. Without the flag the response bytes are exactly what they were before the
+recorded order, and the run whose `RunStart` it came from. It is copied from the recorded
+tools as written, never rebuilt. The list comes from the same view as the page; reading it
+costs an extra setup-part read, which is why it is opt-in. A session with no episode omits both fields (never `tools: []`); an episode admitted
+with no tools returns `tools: []`. If the run's recorded tools cannot be read, the read fails
+rather than omit `tools`, since omission would claim the session never ran. Without the flag the response bytes are exactly what they were before the
 flag existed, and the request omits `include_tools` when false. `include_tools` is a known
 field only in that spelling: `ReadParams` stays strict, so an older daemon refuses it with
 `invalid_params` instead of silently answering without tools.
@@ -2394,23 +2053,20 @@ plans omitting it keep their previous stored bytes.
 ## 16. Subscribe to a terminal run
 
 Terminal state does not special-case attach behavior. `from:"start"` or a historical cursor
-replays every strictly eligible durable unit, including `RunFinished`/`Paused`, and then
+replays every strictly eligible durable unit, including the run's terminal or pause, and then
 stays quietly attached for a later episode. `from:"live"` resolves at the attach barrier to
 strictly after the current durable head, so it replays no terminal or other history and
 stays quietly attached. Idle pinning keeps either stream open; a subsequent `session.send`
 can append another episode whose units arrive on the same subscription.
 
-## 17. Auth failure mid-run = RunPaused, resumable
+## 17. Auth failure mid-run = a resumable pause
 
-A mid-run `needs_reauth`/revoke writes a **NON-terminal durable `RunPaused{run_id,
-reason: AuthRequired, error}`** record (NOT `RunFinished` — replay treats `RunFinished`
-as terminal/no-op, so a "resumable terminal" would seal the run). Replay gains a
-`ReplayResolution::AuthRequired`: the episode is **paused, not finished**; after re-auth,
-resume **continues the SAME run_id from the last durable boundary**; no new episode starts
-until the pause is resolved or cancelled. The error detail is persisted for `run.status`.
-(Auto pause→refresh→continue is deferred; the lineage is preserved + manually resumable.)
+A mid-run `needs_reauth`/revoke writes a non-terminal `Pause{reason: auth_required, error}`
+record, not a `RunEnd`: the run is paused, not finished. After re-auth, resume continues the
+same `run_id` from the last durable boundary; no new episode starts until the pause is resolved
+or cancelled. The error detail is recorded for `run.status`.
 
-On `broca-session-store` storage only, a routed run may instead move to another compatible account
+A routed run may instead move to another compatible account
 through `route.account_for` with `mode: "continue"` and `exhausted.limit_window: "signed_out"`.
 This requires all three current declarations: `account_continue`, `account_continue_resume`
 and `account_continue_signed_out`; unknown support counts as no support. The signal is a vault
@@ -2419,8 +2075,7 @@ post-rejection vault read says `needs_reauth` or supplied a newer token that was
 When the vault read after a 401 fails, or returns the same token version, the 401 alone does
 not prove the sign-in is lost: the run keeps today's auth pause and does not ask routing. An unreachable vault, transient failure or
 timeout never triggers the exchange.
-A still-unexpired held token remains usable even when its refresh needs sign-in. Legacy
-storage retains its auth pause and never moves an account through this exchange.
+A still-unexpired held token remains usable even when its refresh needs sign-in.
 
 An offer uses the existing durable account move before another send: `AuthRefrozen`, together
 with `ConfigRefrozen` when the renderer carries account identity. A live move writes no pause;
@@ -2569,9 +2224,8 @@ The operations follow the pinned llm-runner contract §9.12. In particular,
 past EOF refuses by name. Only durable captures in the bound session authorize a digest:
 another session's objects and unreferenced committed uploads return `unknown_media`.
 Read admission is the same as `session.read`.
-Capture authorization uses the stored admission checkpoint and a strictly anchored durable
-WAL tail, not a replay of the transcript for every chunk. A missing or unusable checkpoint
-requires a named, counted full-replay repair through the shared media-seed fallback counter.
+Capture authorization reads the session's media index, not a replay of the transcript for
+every chunk.
 
 Upload appends are strictly contiguous; replaying a chunk refuses
 `upload_offset_mismatch` with the current `received` count. Sends preserve the upload refusal
@@ -2582,9 +2236,7 @@ session open. A send carrying a kind the model cannot accept is refused before a
 MIME types from the in-memory catalog
 and adapter MIME filter without changing the recorded config or fetching catalog data.
 Known per-image `max_image_bytes` (uploaded file bytes, not base64 bytes) and `max_image_dimension` (longest side for one image) come from that same profile; unknown limits are omitted, never zero. A committed image exceeding a reported limit is refused before writing as non-retryable `media_too_large`, whose detail contains only the exceeded limits.
-Active resident heads use frozen facts published by the writer's durable metadata tap.
-Nonresident resumable heads cache the frozen facts by session, lineage and WAL sequence;
-only a cold position requires a historical read. No stored head-projection shape is added.
+These facts come from the session's latest frozen run config.
 
 Default reads keep media as text markers. `session.read` with `media: "blocks"` returns
 stored references; descriptors and history display rows expose refs rather than payload
@@ -2624,23 +2276,22 @@ an undeclared route becomes a malformed-reply error result with reason
 
 With the capabilities declared, the core batch passes durable intent keys through its keyed
 dispatch methods and registers each dispatch group in one synced intake transaction before
-sending it. Plain keys (`<lineage_id>:<seq of the call's ToolDispatchIntent>`) go only to
+sending it. Plain keys (`<lineage_id>:<seq of the call's ToolIntent>`) go only to
 providers whose frozen plan manifest declares `late_results`, on a consumer-identity
 connection; approved calls keep their deferred key and exact argument bytes. Routing and
 decoding read only the provider declarations frozen into the session's plan manifest (on a
-fresh run the admitted manifest, on a resume the one its `RunStarted` recorded), never a live
-catalog. An accepted held reply first syncs `ToolCallProviderHeld`, then waits in its slot;
-when every remaining call is held the core parks through `pause_run_impl` with an internal
-`RunPaused {tool_held}` recovery boundary and sends nothing to the model. This provider-owned
-wait remains `active` on `run.status`; it does not emit `run_paused` on `session.subscribe`.
-`provider-held/v1` is a known reader feature.
+fresh run the admitted manifest, on a resume the one its `RunStart` recorded), never a live
+catalog. An accepted held reply first syncs a `ToolHeld` record, then waits in its slot; when
+every remaining call is held the run pauses `tool_held` (an internal `Pause` record) and sends
+nothing to the model. This provider-owned wait remains `active` on `run.status`; it does not
+emit `run_paused` on `session.subscribe`.
 
 Each change to the ordered `held_calls` list emits a durable subscribe control frame from
 the existing held/terminal records. The frame has `unit: {type: "status", run_id}`, top-level
 `state`, a durable `cursor`, and the stream's next `seq`; it includes top-level `held_calls`
 only when that list is nonempty. It has no
 `event` member: this is a status snapshot, not a live lifecycle or display reset. The list
-uses the same WAL fold as `run.status`. Clearing the final held call emits another status
+uses the same fold of the session's records as `run.status`. Clearing the final held call emits another status
 frame with `held_calls` omitted; absence means none. Ordinary sessions acquire neither new
 frames nor new fields. Live display sequence numbers are not replayed, so a reconnect's
 `seq` starts again, while its durable units, cursors and status lists are unchanged.
@@ -2651,12 +2302,12 @@ delivery of withdrawal packets.
 The puller pulls `late_results` under broca's own principal on one unscoped route per module
 (the custodian is the carrier, tool-provider contract §7), every 3 s while the module needs
 its feed, backing off to 30 s after errors. Each entry is classed from the intake registrations
-and the registered session's own records (its WAL or new session storage), never from
-`run-index.db`: an entry for an open held call
+and the registered session's own records, never from a projection: an entry for an open held
+call
 is mapped with the same `content/v1` mapper a synchronous reply uses (`not_started` and
 `expired` become error results whose text is pinned by golden), deposited in the call's slot,
 and the session's actor resumes a paused run into its original batch, which writes the result
-as the call's `ToolResult` at the call's position and syncs it. Only then is the entry acked,
+as the call's result at the call's position and syncs it. Only then is the entry acked,
 through exactly the cursor the provider returned. An entry whose call already has its terminal
 (including an inline answer), whose dispatching run has ended, whose kind is unknown, or which
 no registration names is acked as a no-op. A durable intent with no terminal or held record is
@@ -2669,14 +2320,13 @@ Entries are deduplicated on
 start. The ack advances only over a settled prefix. An unsettled entry pins the ack: no ack may
 cover that entry until it settles. An entry that pins the ack for five minutes logs one WARN
 per entry with its module, call key and event id; `health.check`'s `provider_held.overdue_pins`
-counts currently pinned entries at least five minutes old, without reading any WAL.
+counts currently pinned entries at least five minutes old, without reading any session.
 Batch completion prunes registrations after the terminals and commit are durable. The puller
 also retires old inline-terminal registrations as it encounters them. A maintenance sweep
 checks at most 64 registrations every 3 s, starting after recovery, even for modules without
 a running puller. It lazily retires stale terminal rows without scanning every log at startup;
 held calls that still owe a batch commit keep their registrations for recovery.
-For new-storage sessions the intake reads the durable intent, held and terminal records and
-the operational run state. Delivery uses the same slots and the store actor's `ResumeHeld`
+The intake reads the durable intent, held and terminal records and the operational run state. Delivery uses the same slots and the store actor's `ResumeHeld`
 continuation; a cancelling or ended run cannot take an answer, nor can a later run take an
 earlier run's key. Deferred entries and retired registrations log their session address,
 call key and reason.
@@ -2684,15 +2334,14 @@ call key and reason.
 At boot tombstoned lineages are pruned from the intake without opening an actor. Every remaining
 session with a registration is opened so its open-time recovery runs, then each
 module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
-rebuilt off the startup path by verifying every live WAL and every published archive member,
-and reading operational state and active run records for every session in the session store's
-inventory across all backup classes, including intent-only calls whose registration may precede
+rebuilt off the startup path by reading the operational state and active run records of every
+session in the session store's inventory across all backup classes, including intent-only calls whose registration may precede
 their held reply. The rebuild
 retains each episode's original scope. Until that scan completes no entry is delivered or
-acked. Only roots with neither registration history nor a held feature floor may skip a
-rebuild scan. An existing unheld database starts no scan, reads no WAL and gains no writes;
-boot adds only a read-only probe of the rebuild fence.
-An unreadable session in either storage keeps the rebuild fence pinned until a rescan succeeds.
+acked. Only roots with no registration history may skip a rebuild scan. An existing unheld
+database starts no scan, reads no session and gains no writes; boot adds only a read-only probe
+of the rebuild fence. An unreadable session keeps the rebuild fence pinned until a rescan
+succeeds.
 
 After a held run's cancel seal is synced, `tool.withdraw` is sent on the original provider's
 tool route with its frozen scope, under broca's carrier identity. The cancellation outcome
@@ -2717,15 +2366,15 @@ no-op when the module's on-demand feed next drains, not guaranteed to be deliver
 
 Late-result pullers start before withdrawal recovery, which runs independently and obeys the
 registry's stop signal. Withdrawal recovery snapshots the outbox once, groups rows by session,
-and reads each session's WAL once, in batches of at most four sessions separated by 3 s. As it
+and reads each session's records once, in batches of at most four sessions separated by 3 s. As it
 reads, it retires inline-terminal watches and their registrations in one transaction; normal
-inline batch completion performs the same retirement without reading the WAL again. Ordinary
+inline batch completion performs the same retirement without reading the session again. Ordinary
 intake pruning still preserves a held call's withdrawal watch if broca crashes after the run's
 cancellation seal is durable but before `tool.withdraw` is sent.
 Each sweep logs one summary with sessions read, rows settled, withdrawals sent and elapsed time.
 `provider_held.withdrawals.sweep_running` and `rows_remaining` report whether a sweep is running
 and how many snapshot rows remain to examine; `watching` counts retained watches at the last
-completed sweep or withdrawal attempt. All these health values are cached, not WAL probes.
+completed sweep or withdrawal attempt. All these health values are cached, not session reads.
 
 Ack guarantee, narrowed: broca puts no bound of its own on a hold. A provider keeps at most
 1,000 unacked results per session and drops the oldest first; a held call whose entry was
@@ -2739,30 +2388,18 @@ lineage's registrations and receipts, and late entries for that lineage are acke
 The shared module feed row, cursor and owed ack survive so other sessions can still receive
 their results. Deletion sends no `tool.withdraw`.
 
-Until archive folding can verify intake ownership per session, its production default keeps
-every held-record range live. Retention separately blocks deletion while a decoded held record
+Retention blocks deletion while a decoded held record
 or an intake registration remains. A missing intake
-store also prevents deletion after any registration history, held feature floor or rebuild
-marker; an unreadable store prevents deletion and counts in retention's unreadable-session
+store also prevents deletion after any registration history or rebuild marker; an unreadable store prevents deletion and counts in retention's unreadable-session
 health total. Before the first registration, `late-results-registered` is synced at the state
 root so losing the rebuildable database cannot erase that history. None of these guards changes
 ordinary expiry on roots that have never enabled held intake.
 Recreating a missing projection with held history leaves `late-results-rebuild-required` set.
 That fence also resumes a rebuild when a partial database exists after restart. It is removed
-and its directory synced (including retries after an already-absent marker) only after a
-complete, stable log inventory has been verified and all rebuilt rows committed with SQLite
-synchronous FULL. An unreadable, truncated, conflicting or
-moving log keeps the fence, including every unsealed archive: a missing footer does not prove
-that its source logs are still live. Identities include length, full content SHA-256, and each
-archive's seal state and member inventory. Decode and hashing use the same open file, and a
-second pass reopens each pathname and compares its identity. Supported WAL writers append under
-the session lease; published archives are immutable, and folding preserves sources until a
-verified copy is sealed. Calls created after the final comparison register durably in this same
-database before dispatch. These invariants cover the publication gap, not an uncooperative
-writer changing and restoring bytes between comparisons. A crash after commit and before
-removal repeats the scan safely.
-Health names the fence and reports files scanned, files decoded, registrations and unreadables.
-This recovery support does not enable `held-reply/v1` declarations in release builds.
+and its directory synced only after the scan over the session store's inventory has succeeded
+and all rebuilt rows are committed with SQLite synchronous FULL. An unreadable session keeps
+the fence. Calls created after the scan register durably in this same database before
+dispatch. A crash after commit and before removal repeats the scan safely.
 
 ## 20. Persistence + storage
 
@@ -2813,7 +2450,7 @@ the same admission, durability and coordination contracts as other consumers.
 ## 23. Thin-core fit (subc)
 
 **Zero subc-CORE changes**. All `session.*`/`run.*` are opaque
-management-surface RPCs; fan-out/replay/backpressure/coordinator/run-index are
+management-surface RPCs; fan-out, replay, backpressure and the session actors are
 module-side. The §21 rules live in broca's own crates, not in subc-core.
 
 ## 24. Conformance coverage
@@ -2823,15 +2460,15 @@ module-side. The §21 rules live in broca's own crates, not in subc-core.
 - Queue retract/consume races must remain unambiguous across crashes; durable
   cursors must remain continuous across reopening; authentication continuation
   retains the run_id; cancellation seals Cancelled.
-- Module tests cover actor admission, fan-out backpressure, the attach barrier,
-  durable run indexing, and tool-route lifecycle.
+- Module tests cover actor admission, fan-out backpressure, the attach barrier, run-id
+  lookup across restart, and tool-route lifecycle.
 - End-to-end tests cover multiple clients, reopening, multiple turns, terminal
   subscriptions, status, and session-read pagination.
 
 ## 25. Explicit deferrals
 
 Fork UX (cross-lineage prefix read) · interrupt-steering (v1 = queue + retract) · auto
-pause→refresh→continue (v1 = manual resume of `RunPaused`) · router-driven model
+pause→refresh→continue (v1 = manual resume of a paused run) · router-driven model
 selection · cross-machine portability (distributed lease) · consumer-provided custom
 tools.
 
@@ -2839,8 +2476,8 @@ tools.
 
 `session.send` accepts `on_restart: "resume" | "interrupt"`. Omission means
 `interrupt`; there is no daemon-level default knob. Invalid values are refused as
-`invalid_params` naming `on_restart` before any WAL write. The policy belongs to
-one send: durable queued submissions retain it in their request, and `RunStarted`
+`invalid_params` naming `on_restart` before anything is written. The policy belongs to
+one send: durable queued submissions retain it in their request, and `RunStart`
 freezes it for the episode. It is not inherited from an earlier send and is part
 of keyed-send identity.
 
@@ -2849,10 +2486,8 @@ queued dispatch immediately, without starting its final seal timer. Requests ref
 because broca is stopping answer code `transient` with
 `detail: {class: "transient", cause: "module_stopping"}` (see
 [module lifecycle and shutdown](module-lifecycle.md)). A resume-enabled
-run finishes its current work and writes
-`RunPaused{Restart}` at the next clean step-entry boundary. The gated frame requires
-`restart-pause/v1`; the writer raises the local WAL feature floor before appending
-it. Interrupt-enabled runs seal `Interrupted` at the same boundary. GOODBYE (or
+run finishes its current work and writes a `Pause{reason: restart}` record at the next clean
+step-entry boundary. Interrupt-enabled runs seal `Interrupted` at the same boundary. GOODBYE (or
 connection loss) starts the final 10 s grace and 20 s total shutdown budget: a tool
 gets the daemon's drain window **plus** the grace to reach that boundary. A tool
 still in flight after grace is sealed `Interrupted` with `outcome_unknown` even
@@ -2866,20 +2501,18 @@ After the serving connection registers, boot recovery resumes restart-paused
 sessions through the existing admission checks: the recorded model must still
 resolve, its recorded account must match the served account, tool routes must be
 available, and stamped scopes must pass synchronization and access checks. It
-continues the same run and send IDs, records `resume_started`, and reconstructs
-provider request bytes from the WAL. A readable session refused by admission is
-sealed `Interrupted` with the refusal reason. An unreadable newer-writer WAL is
-only logged at WARN with its session and missing features: no bytes or metadata
-are changed, and other sessions still resume.
+continues the same run and send IDs, records a `Resumed` record, and reconstructs
+provider request bytes from the session's records. A readable session refused by admission is
+sealed `Interrupted` with the refusal reason. An unreadable session is only logged at WARN: no
+bytes or metadata are changed, and other sessions still resume.
 
-On the session-store backend a restart pause is continued only within one hour of the
+A restart pause is continued only within one hour of the
 time it records. A restart takes seconds to minutes, so an older pause was left by a long
 outage and its caller has stopped waiting. Such a run, or one whose pause records no time,
 is not continued: when its session is next opened (at startup for every session with an
 unfinished run) the run is sealed `Interrupted` with `restart_resume_expired`, no provider
 request is sent for it, and the session's queue drains. The caller decides whether to send
-again. A paused run with a cancel pending still ends `Cancelled`. The WAL backend has no
-such limit: it resumes every restart pause at its next start.
+again. A paused run with a cancel pending still ends `Cancelled`.
 
 New episodes freeze image-only labeling for multipart image-notice text; older episodes keep
 their literal text projection on resume, while a new episode adopting the rule may rebuild its
@@ -2900,50 +2533,34 @@ their existing format (`reason: "auth_required"`, without `pause_reason`).
 and `retention`. Its grammar is `[a-z0-9_-]{1,32}`; explicit null, non-string values,
 uppercase, whitespace and all other characters are refused as `invalid_params`,
 naming `session_class`. The first send freezes the label. Later sends may omit it
-or repeat the same label, but cannot change it. On WAL storage, absence on the first
-send stays frozen too. On the session-store backend, an unlabelled session adopts
+or repeat the same label, but cannot change it. An unlabelled session adopts
 the first later run start's label only if that label would place it in the folder
 already holding the session; otherwise the label is ignored. Adoption never moves
 files or changes the class labels recorded for earlier runs. A queued send adopts
 when its run starts.
-The label is recorded on the run's start (`RunStarted` on WAL or `RunStart` on the
-session-store backend), not sent to model providers.
+The label is recorded on the run's `RunStart`, not sent to model providers.
 
 The daemon reads `backup_classes` from `broca.jsonc`, defaulting to `["head"]`.
 `role.describe.capabilities` includes `session_class`, and its
-`session_class.backup_classes` lists the configured labels. A first send whose
-class is listed creates its live WAL in `wal-durable/`; its folded containers live
-in `wal-archive-durable/`. Unclassed sessions and other labels use `wal/` and
-`wal-archive/`. Changing configuration never moves an existing session, including
-when an archived session is reopened. Each fold container belongs to exactly one
-of these populations. A send with `retention` always uses `wal-ephemeral/` and is
-never backed up, even if its class is listed: deletion takes precedence.
+`session_class.backup_classes` lists the configured labels. The session store keeps one
+complete store per class: `session-store-durable/`, `session-store/` (ordinary) and
+`session-store-ephemeral/`. A first send whose class is listed creates the session in
+`session-store-durable/`; unclassed sessions and other labels use `session-store/`. A send with
+`retention` always uses `session-store-ephemeral/` and is never backed up, even if its class is
+listed: deletion takes precedence. Changing configuration never moves an existing session. The
+root holding a session's head is authoritative afterwards, and a head found in two roots is
+refused `session_in_two_classes`.
 
-Engram captures only `wal-durable/`, `wal-archive-durable/` and the new session
-storage's durable root, `session-store-durable/`. An agent head is backed up only when
-it is created with `session_class: "head"` (or another label listed in
-`backup_classes`). The new session storage places a
-session it creates by the same rule, in one complete store per class:
-`session-store-durable/`, `session-store/` (ordinary) and `session-store-ephemeral/`;
-the root holding a session's head is authoritative afterwards, and a head found in
-two roots is refused `session_in_two_classes`. A file import (`session.import` with a
-file source, which brings an OpenCode 1, OpenCode 2 or Pi agent head onto broca) carries no
-label and is placed durable by the same rule: ephemeral if it carries a retention
+Engram captures only `session-store-durable/`. An agent head is backed up only when it is
+created with `session_class: "head"` (or another label listed in `backup_classes`). A file
+import (`session.import` with a file source, which brings an OpenCode 1, OpenCode 2 or Pi agent
+head onto broca) carries no label and is placed durable: ephemeral if it carries a retention
 policy, else `session-store-durable/`, whatever `backup_classes` lists. Its optional
 `retention` (seconds, with a send's limits; a larger value is `invalid_params`) is that policy:
 the seeded run records it, and the session is deleted once that long passes after its last
 activity with no run active or paused. The import's own time counts as activity. `retention`
-is part of the import's payload, so a repeat must carry the same value.
-`session.move_to_store` (operator only)
-places a moved session in the root matching its WAL's folder; its optional
-`class: "durable"` places a session from `wal/` in the durable root, and any other
-class change is refused `not_movable {reason: "class_refused"}`. Live-first reads,
-exports and move discovery resolve all three live trees and both archive trees;
-session addressing and leases remain keyed by the original session triple.
-Classed records require the must-understand WAL feature `session-class/v1`.
-A `v0.3.205` reader refuses those records by feature name; unclassed records retain
-their old bytes and remain readable. The reader, writer and capability ship
-together, with no writer switch or second rollout release.
+is part of the import's payload, so a repeat must carry the same value. Session addressing and
+leases remain keyed by the original session triple.
 
 A file import records its attested owner and scope but applies no plan. Its owner's first
 `session.send` must carry `plan` and passes ordinary plan admission, including compaction
@@ -3159,7 +2776,7 @@ broca-session --subc <connection file> --project-root <root> --harness <harness>
 
 New external session references use the llm-runner v2 derivation over
 `{runner: "broca", harness, session}`. Folder spelling is not part of that reference.
-The WAL address, lease and store identity remain the full
+The session's storage address, lease and store identity remain the full
 `(project_root, harness, session)` triple. At startup, broca maps v2 references to
 their sessions and continues to accept the older folder-based v1 references. A v2
 reference shared by multiple roots is ambiguous and does not resolve to an arbitrary
@@ -3169,10 +2786,9 @@ to the full triple and are not the external session references described above.
 
 With `call_identity`, display-history tool-call parts and live `tool_started` and
 `tool_finished` frames carry the durable call's `call_key` and its recorded
-`schema_pin`. Ordinary keys are `<WAL lineage id>:<dispatch-intent sequence>`;
-approved calls preserve the preparation key recorded on their dispatch intent. Plan sessions
-freeze actual provider catalog pins at admission, protected by the must-understand
-`tool-schema-pins/v1` WAL feature. A later catalog cannot change a recorded pin.
+`schema_pin`. Ordinary keys are `<lineage id>:<ToolIntent sequence>`; approved calls preserve
+the preparation key recorded on their `ToolIntent`. Plan sessions freeze actual provider
+catalog pins at admission. A later catalog cannot change a recorded pin.
 Legacy non-plan tools and older manifests have no recorded provider semantics, so
 their pins remain absent rather than being invented from the argument schema.
 Default `session.read` and `run.status` gain no call-identity members.
@@ -3195,7 +2811,7 @@ next-step view application, or the per-session retention policy group.
 
 ## Mode-3 compaction
 
-A log whose first `RunStarted` carries `compaction_plan_version` uses mode-3 semantics.
+A log whose first `RunStart` carries `compaction_plan_version` uses mode-3 semantics.
 New compaction sessions use one session-scoped `compaction-provider/v2` route. Broca declares
 `compaction-runner/v1`; a route for that role is authorized only for the provider in the
 session's effective plan, not a pending refresh. Provider, preset and params remain fixed for
@@ -3216,16 +2832,14 @@ The provider reads `session.entries`, pushes `session.apply_view` and reads
 Application occurs only at a step boundary and is recorded separately, including ride answers
 used for that same request. Notices, applied-view reads and `generated_under` name the applied
 view. Notices are serialized, coalesced in memory, and flushed completely before every ride;
-they create neither `CompactionNotice` records nor bus outbox work. An over-limit ride is
-followed by a fresh estimate and `context_ceiling` if the request still does not fit.
+they create neither records nor bus outbox work. broca sends a request without sizing it
+first: a provider's context-length refusal asks for a fold (a ride with cause `over_limit`)
+and resends once, and a second refusal ends the run `context_ceiling`.
 
-While the materialized compaction entry projection is incomplete, `session.entries` refuses
-with `projection_not_ready` and `detail.class: "transient"`, for ordinal, message-id and tag
-selections alike. The caller may retry; this refusal does not mean an empty transcript or
-missing ids/tags. `session.apply_view` returns the same refusal if its entry read is not ready.
-Other projection faults remain `internal_error`.
-If a delivery template needs a part's number before the projection is ready, `session.send`
-uses its existing `transient` admission refusal without writing the send.
+When the provider catalog that decides an entry's attribution cannot be read,
+`session.entries` refuses with `projection_not_ready` and `detail.class: "transient"`, for
+ordinal, message-id and tag selections alike. The caller may retry; this refusal does not mean
+an empty transcript or missing ids/tags.
 
 Numbered parts follow the latest host marker's checkpoint. A marker naming another harness or
 session refuses the log on load. Tool-result deliveries are a separate `delivered` list, with
@@ -3241,62 +2855,17 @@ Legacy logs never enroll in v2. They render their last applied v1 view, or raw h
 never applied one, and drop an outstanding v1 `view_due`. They make no v1 provider calls or new
 notice/outbox work, and decide an over-window request themselves without waiting.
 
-## Historical compaction pricing signals and rollback
+### ChatGPT chain resets
 
-The following v1 metadata remains readable for historical replay. The current writer does not
-send these v1 signals or publish old compaction notice outbox rows.
-
-`broca.jsonc` accepts the boot-only boolean `compaction_signals` (default `true`).
-A config change takes effect after restarting broca; it is not frozen into a session.
-With it on, advance notices describe the next call's current route with
-`history_edit_cost`: `suffix` for prefix-byte prompt caches (Anthropic, Bedrock,
-Gemini/Code Assist, Chat Completions and ordinary Responses), or `full_resend`
-for ChatGPT's WebSocket response-chain route. A switch to HTTPS changes the hint
-on the next notice, even within the same session. Unknown routes omit the hint.
-The header is a pricing hint, never permission to rewrite history.
-
-Before rendering a ChatGPT step, a known missing chain can also request a bounded
-`compaction.ride` RPC with cause `chain_reset`. Age retirement uses the transport's 40-minute decision, and
-run-start acquisition supplies its existing idle/absent-socket decision. The
+Before rendering a ChatGPT step, a known missing response chain can request a bounded
+`compaction.ride` RPC with cause `chain_reset`. Age retirement uses the transport's 40-minute
+decision, and run-start acquisition supplies its existing idle/absent-socket decision. The
 transport records why the socket has no usable completion receipt in the attempt's
-`full_input_reason` (for example, `new_connection_age`). The pre-render request and
-the attempt use that same retirement decision, not an elapsed-gap guess.
-A retry or refusal discovered during sending does
-not re-enter this boundary and never announces a new chain-reset request. Cache
-warms, including warms of the original model after a fallback, neither produce
-these step signals nor replace the previous model request's
-[segment-hash fingerprint](cache-dump.md#offline-cache-diagnosis).
-
-Set `"compaction_signals": false` to omit both new signals from newly created
-notices and chain-reset requests. Disabled notices keep the old header encoding/digest. This does
-**not** strip, suppress or rewrite any notice already durable in the WAL, queued
-in the outbox, or accepted by the broker: notice sequence/headers/digest are immutable.
-Notice readers must support the `history_edit_cost` header and digest rules in
-`cortexkit-role-compaction-provider` 0.7.9 before signals are enabled.
-The reader-only pin ships in broca 0.3.290; the signal writer ships in 0.3.291.
-The writer's broca rollback floor is therefore 0.3.290. An older broca can read
-the WAL header map but cannot correctly re-encode this header's notice digest.
-
-**One-step Magic Context rollback:** the kept rollback build `34a40ebc`
-already accepts both signals. Rolling back to that build needs neither switch-off
-nor a compatibility drain.
-
-**Rollback to `4eac8781` or older:** these builds reject the new notice
-header and requires this order:
-
-1. Set `compaction_signals` to `false` and restart broca, leaving bus events enabled.
-2. Let bus recovery finish, then inspect
-   `health.check.metrics.bus_events.compaction_notice_outbox_pending` until zero
-   (and check that the bus loop is progressing without publication failures).
-   This count covers only unpublished notices in broca's outbox. Zero means only
-   that broca has published the queued notices, **never that Magic Context consumed
-   or acknowledged them**; it is not a substitute for completed WAL recovery.
-3. Separately pass Magic Context's own consumer-ACK drain check for advance notices.
-   This is an MC-owned operational check, not a broca API. Obtain its command or
-   dashboard procedure from the MC operator before attempting this rollback.
-   Broca's JetStream publish receipts are not that check. Do not proceed while the MC-owned check is unavailable or nonzero.
-4. Only then roll the Magic Context reader back. A rollback reader that itself
-   tolerates the new header does not need this compatibility drain.
+`full_input_reason` (for example, `new_connection_age`). The pre-render request and the
+attempt use that same retirement decision, not an elapsed-gap guess. A retry or refusal
+discovered during sending does not re-enter this boundary and never announces a new
+chain-reset request. Cache warms neither produce these signals nor replace the previous model
+request's [segment-hash fingerprint](cache-dump.md#offline-cache-diagnosis).
 
 ## Retired ride-placement trial
 

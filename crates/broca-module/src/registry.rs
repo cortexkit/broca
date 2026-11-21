@@ -541,10 +541,10 @@ pub enum CutLockMode {
     /// lease to the guard; the guard commits its slot closed when released. Other actors
     /// pause as for `Inspect`; a busy actor refuses without changing its writer.
     Mutate,
-    /// The move takes the session out of today's storage (`session.move_to_store`): any idle
-    /// actor closes, tearing down its subscribers and joining its writer, and hands its
-    /// session lease to the guard, whether its writer or the actor itself held it. A busy
-    /// actor refuses without changing its writer.
+    /// A restore from backup replaces the session (`fence_store_move`): any idle actor closes,
+    /// tearing down its subscribers and joining its writer, and hands its session lease to the
+    /// guard, whether its writer or the actor itself held it. A busy actor refuses without
+    /// changing its writer.
     Retire,
 }
 

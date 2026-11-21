@@ -70,7 +70,7 @@ impl StorageClass {
     /// Every class, in the order the new storage's roots are probed.
     pub const ALL: [Self; 3] = [Self::Durable, Self::Ordinary, Self::Ephemeral];
 
-    /// The class's name, as `session.move_to_store` takes it and refusals print it.
+    /// The class's name, as move exports carry it and refusals print it.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Durable => "durable",

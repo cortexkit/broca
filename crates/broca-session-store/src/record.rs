@@ -1151,10 +1151,10 @@ message! {
 }
 
 message! {
-    /// The session moved here from today's storage (`session.move_to_store`), written in the
-    /// batch that holds the last of its converted records. Nothing happened in the session: the
-    /// record's time is the one today's `session.head` served as the session's last update before
-    /// the move, so the head reads the same after it, and later records advance it.
+    /// The session was converted here from the old log format, written in the batch that holds
+    /// the last of its converted records. Nothing happened in the session: the record's time is
+    /// the one the old `session.head` served as the session's last update before the conversion,
+    /// so the head reads the same after it, and later records advance it.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub struct Moved {
         /// The move that wrote it, `store-move:<uuid>`.

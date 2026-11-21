@@ -7,7 +7,7 @@ use broca_session_store::record::{CallOutcome, Record, ToolHeld, ToolIntent};
 /// Extend a lost-database rebuild with every backup class's `broca-session-store` inventory.
 /// Only the latest open batch can still accept an answer; read its durable dispatch records
 /// back to the run's start, which also retains the frozen scope.
-/// The caller must keep intake fenced until both this scan and the WAL scan succeed.
+/// The caller must keep intake fenced until this scan succeeds.
 pub async fn rebuild_store_from_sessions_with_progress(
     store: &LateResultsStore,
     state_root: &Path,
