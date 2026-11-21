@@ -3756,15 +3756,24 @@ fn with_feature(base: &'static [&'static str], feature: &'static str) -> &'stati
     })
 }
 
-/// The schema a tool call was dispatched against: the tool's `schema_digest` and `semantics`
-/// version as its provider answered them when the session's tools were frozen. A provider that
-/// has since changed the tool refuses the call instead of running it against a different schema.
+/// The schema a tool call was dispatched against: the tool's `schema_digest`, `semantics` and,
+/// for a versioned tool, its major version, as its provider answered them when the session's
+/// tools were frozen. A provider that has since changed the tool refuses the call instead of
+/// running it against a different schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchSchemaPin {
     /// The provider's digest of the tool's structural schema.
     pub schema_digest: String,
-    /// The provider's version of the tool's behaviour where its schema did not change.
+    /// The provider's version of the tool's behaviour where its schema did not change. Calls
+    /// to a tool without a version name it in their `tp1` pin.
     pub semantics: u64,
+    /// The major of the tool's version, when its catalog answered one. Calls then carry a
+    /// `tp2` pin naming this major, and the provider runs any call of the same major whose
+    /// arguments validate. Absent for an unversioned tool and for every pin written before
+    /// broca read versions; a build that skips the field sends the `tp1` pin, which a
+    /// versioned provider still maps to the version it shipped it under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub major: Option<u64>,
 }
 
 /// Who executes a held call once a human approves it ([`WalRecord::ToolCallDeferred`]).

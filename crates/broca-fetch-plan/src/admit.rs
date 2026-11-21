@@ -1060,6 +1060,7 @@ fn frozen_provider_declarations(
                         broca_wal::DispatchSchemaPin {
                             schema_digest: tool.schema_digest.clone(),
                             semantics: tool.semantics,
+                            major: tool.version.map(|version| version.major),
                         },
                     )
                 })
@@ -2195,6 +2196,34 @@ mod tests {
             format!("tp1:work:{digest}:7")
         );
         assert!(FrozenProviderDeclarations::default().schema_pins.is_none());
+        // An unversioned tool's frozen pin keeps the bytes it had before versions existed.
+        assert_eq!(
+            serde_json::to_value(pin).unwrap(),
+            json!({"schema_digest": digest, "semantics": 7})
+        );
+    }
+
+    #[test]
+    fn a_versioned_tool_freezes_its_major_and_not_its_minor_or_patch() {
+        let digest = "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335";
+        let answer: cortexkit_role_tool_provider::catalog::CatalogAnswer =
+            serde_json::from_value(json!({
+                "generation":"one", "catalog_digest":"one", "tools":[{
+                    "name":"work", "input_schema":{"type":"object"}, "schema_digest":digest,
+                    "semantics":7, "version":"3.4.5", "capabilities":[]
+                }]
+            }))
+            .unwrap();
+        let frozen = frozen_provider_declarations(&answer, false, false).unwrap();
+        let pin = &frozen.schema_pins.as_ref().unwrap()["work"];
+        assert_eq!(pin.major, Some(3));
+        assert_eq!(
+            serde_json::to_value(pin).unwrap(),
+            json!({"schema_digest": digest, "semantics": 7, "major": 3})
+        );
+        let round_trip: broca_wal::DispatchSchemaPin =
+            serde_json::from_value(serde_json::to_value(pin).unwrap()).unwrap();
+        assert_eq!(&round_trip, pin);
     }
 
     struct DefaultTextFetcher {

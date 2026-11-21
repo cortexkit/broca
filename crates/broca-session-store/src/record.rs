@@ -498,7 +498,7 @@ message! {
         /// The call's durable key, unique within the runner that minted it.
         2 req call_key: String,
         /// The schema pin the call ran under: for a call broca dispatched, the pin as reads
-        /// serve it (llm-runner's encoded `SchemaPin`); for an imported call, as its runner
+        /// serve it (the encoded `tp1` or `tp2` pin); for an imported call, as its runner
         /// recorded it. Held once per process for every call under the same pin.
         3 opt schema_pin: SharedJson,
         /// The attested module id of the runner that minted `call_key`, when that wasn't broca:

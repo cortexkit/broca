@@ -1224,12 +1224,11 @@ pub fn rich_ui(stamp: &broca_protocol::RichUiStamp) -> Option<RichUi> {
 }
 
 /// A dispatch intent's schema pin (`ToolIntent::schema_pin`, the pin its tool provider declared)
-/// as reads serve it: llm-runner's encoded `SchemaPin` for the tool `tool_name`.
+/// as reads serve it: the encoded `tp1` or `tp2` pin for the tool `tool_name`
+/// ([`broca_core::projection::schema_pin_text`]).
 pub fn served_schema_pin(tool_name: &str, pin: &serde_json::Value) -> Option<String> {
     let pin: broca_wal::DispatchSchemaPin = serde_json::from_value(pin.clone()).ok()?;
-    cortexkit_role_tool_provider::call::SchemaPin::new(tool_name, &pin.schema_digest, pin.semantics)
-        .encode()
-        .ok()
+    broca_core::projection::schema_pin_text(tool_name, &pin)
 }
 
 /// The facts of the conversation's newest assistant message, when it made tool calls that have

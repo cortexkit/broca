@@ -490,6 +490,7 @@ async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
     *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
         schema_digest: "a".repeat(64),
         semantics: 7,
+        major: None,
     });
     rig.script
         .push(&[Step::Call("facts-call"), Step::Text("answer")]);

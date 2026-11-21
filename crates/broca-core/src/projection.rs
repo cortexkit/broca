@@ -510,12 +510,18 @@ pub fn notice_delivered_event(
     }))
 }
 
-/// The schema pin a call's start and end carry: the pin it was dispatched under, encoded with
-/// the name it was dispatched as.
+/// The encoded schema pin of a call to `tool_name` dispatched under `pin`: `tp2` naming the major
+/// when the tool's catalog answered a version, else `tp1` naming its semantics. A call's
+/// dispatch, its stored facts and every read of it all encode through here, so a provider and a
+/// reader see the same pin. `None` when the pin cannot be encoded (an empty tool name, a digest
+/// that is not 64 lowercase hex, or a pin over the byte bound); the call then goes without one.
 pub fn schema_pin_text(tool_name: &str, pin: &broca_wal::DispatchSchemaPin) -> Option<String> {
-    cortexkit_role_tool_provider::call::SchemaPin::new(tool_name, &pin.schema_digest, pin.semantics)
-        .encode()
-        .ok()
+    use cortexkit_role_tool_provider::call::{SchemaPin, ToolMajorPin};
+    match pin.major {
+        Some(major) => ToolMajorPin::new(tool_name, &pin.schema_digest, major).encode(),
+        None => SchemaPin::new(tool_name, &pin.schema_digest, pin.semantics).encode(),
+    }
+    .ok()
 }
 
 /// The finish reason implied by an assistant message's SHAPE, used only when the record
@@ -543,3 +549,51 @@ pub fn message_shape_finish_reason(
 // most one episode's records to rebuild state, instead of replaying the whole log. These
 // helpers check everything they take from the index against the log before relying on it, and
 // a read that fails any check replays the whole log instead.
+
+#[cfg(test)]
+mod schema_pin_tests {
+    use super::schema_pin_text;
+    use broca_wal::DispatchSchemaPin;
+
+    const DIGEST: &str = "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335";
+
+    fn pin(major: Option<u64>) -> DispatchSchemaPin {
+        DispatchSchemaPin {
+            schema_digest: DIGEST.into(),
+            semantics: 7,
+            major,
+        }
+    }
+
+    #[test]
+    fn an_unversioned_tool_is_pinned_tp1_by_semantics() {
+        assert_eq!(
+            schema_pin_text("work:run", &pin(None)).unwrap(),
+            format!("tp1:work%3Arun:{DIGEST}:7")
+        );
+    }
+
+    #[test]
+    fn a_versioned_tool_is_pinned_tp2_by_major_whatever_its_semantics() {
+        let text = schema_pin_text("work:run", &pin(Some(3))).unwrap();
+        assert_eq!(text, format!("tp2:work%3Arun:{DIGEST}:3"));
+        let parsed = cortexkit_role_tool_provider::call::VersionedSchemaPin::parse(&text).unwrap();
+        assert_eq!(parsed.encode().unwrap(), text);
+    }
+
+    #[test]
+    fn a_pin_written_before_versions_decodes_as_unversioned() {
+        let stored: DispatchSchemaPin =
+            serde_json::from_value(serde_json::json!({"schema_digest": DIGEST, "semantics": 7}))
+                .unwrap();
+        assert_eq!(stored, pin(None));
+    }
+
+    #[test]
+    fn a_pin_that_cannot_be_encoded_is_left_off() {
+        let mut bad = pin(Some(1));
+        bad.schema_digest = "not hex".into();
+        assert_eq!(schema_pin_text("work", &bad), None);
+        assert_eq!(schema_pin_text("", &pin(None)), None);
+    }
+}

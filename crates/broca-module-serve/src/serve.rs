@@ -496,6 +496,8 @@ mod hello;
 #[cfg(test)]
 #[path = "serve_project_identity_tests.rs"]
 mod project_identity_tests;
+#[path = "serve_refresh.rs"]
+mod serve_refresh;
 #[path = "serve_tag_read.rs"]
 mod serve_tag_read;
 use hello::{expect_hello_ack, send_hello};
@@ -4616,25 +4618,10 @@ where
                         .await;
                     }
                 };
-            if let Err(field) = request.check_policy() {
-                return send_invalid_params(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    Some(field.into()),
-                    &format!(
-                        "policy must be one of {}",
-                        cortexkit_role_llm_runner::rungs::ALL.join(", ")
-                    ),
-                )
-                .await;
-            }
             let advertised = handler
                 .plan_admitter()
                 .is_some_and(|admitter| admitter.admits_output_refs());
-            if let Err(field) = request.check_output_refs(advertised) {
+            if let Some((field, message)) = serve_refresh::params_refusal(&request, advertised) {
                 return send_invalid_params(
                     writer,
                     ver,
@@ -4642,7 +4629,7 @@ where
                     epoch,
                     corr,
                     Some(field.into()),
-                    "a plan item carries output_refs on a runner without the group",
+                    &message,
                 )
                 .await;
             }

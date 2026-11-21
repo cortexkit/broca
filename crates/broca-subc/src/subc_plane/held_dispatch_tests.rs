@@ -999,6 +999,7 @@ async fn a_resumed_batch_dispatches_under_the_schema_pin_its_plan_recorded() {
     let pin = broca_wal::DispatchSchemaPin {
         schema_digest: "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335".into(),
         semantics: 7,
+        major: None,
     };
     let call = call("call");
     for (pins, expected) in [

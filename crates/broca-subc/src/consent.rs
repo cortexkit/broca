@@ -955,6 +955,7 @@ mod tests {
                     *schema_pin = Some(broca_wal::DispatchSchemaPin {
                         schema_digest: "s".into(),
                         semantics: 1,
+                        major: None,
                     })
                 }
                 "options" => ask.options.push("later".into()),

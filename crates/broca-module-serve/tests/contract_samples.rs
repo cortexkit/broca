@@ -179,6 +179,7 @@ async fn tool_identity_contract_samples() {
     *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
         schema_digest: digest.clone(),
         semantics: 7,
+        major: None,
     });
     rig.script
         .push(&[Step::Call("sample-call"), Step::Text("synthetic answer")]);

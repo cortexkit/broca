@@ -132,13 +132,10 @@ impl CallAnchors {
                 slot.dispatched = true;
                 slot.dispatched_to.clone_from(module_id);
                 slot.schema_pin = schema_pin.as_ref().and_then(|pin| {
-                    cortexkit_role_tool_provider::call::SchemaPin::new(
+                    crate::projection::schema_pin_text(
                         tool_name.as_deref().unwrap_or(&slot.tool_name),
-                        &pin.schema_digest,
-                        pin.semantics,
+                        pin,
                     )
-                    .encode()
-                    .ok()
                 });
             }
             WalRecord::ToolCallDeferred { .. } => {

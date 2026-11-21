@@ -567,6 +567,7 @@ mod tests {
                             super::super::DispatchSchemaPin {
                                 schema_digest: "0".repeat(64),
                                 semantics: 7,
+                                major: None,
                             },
                         )]
                         .into(),

@@ -116,6 +116,35 @@ async fn direct_preset_reaches_catalog_and_calls_with_catalog_schema_pins() {
 }
 
 #[tokio::test]
+async fn a_versioned_tool_is_called_with_a_tp2_pin_naming_its_major() {
+    let digest = "1".repeat(64);
+    let conn = ScriptedToolPlaneConnection::new(
+        vec![vec![catalog_entry("aft", &["registration-only"])]; 2],
+        vec![
+            Ok(serde_json::json!({
+                "generation":"1", "catalog_digest":"versioned", "tools":[{
+                    "name":"echo", "input_schema":{"type":"object"}, "schema_digest":digest,
+                    "semantics":7, "version":"2.4.1", "capabilities":[]
+                }]
+            })),
+            successful_tool_reply("done"),
+        ],
+    );
+    let plane = SubcToolPlane::with_connection(conn.clone(), "aft").with_direct_tool_preset("worker");
+    let ctx = batch_ctx("versioned-pin");
+    let tools = plane.tools_from_catalog_for_bind(&ctx.bind, Duration::from_secs(1)).await.unwrap();
+    let manifest = ToolManifest::from_tools(tools);
+    let call = call("echo");
+    plane.batch_started(&ctx, std::slice::from_ref(&call), &manifest).await.unwrap();
+    assert_completed_success(plane.dispatch(&ctx, &call).await);
+    plane.batch_finished(&ctx).await.unwrap();
+    assert_eq!(
+        *conn.dispatched_schema_pins.lock().unwrap(),
+        [Some(format!("tp2:echo:{digest}:2"))]
+    );
+}
+
+#[tokio::test]
 async fn direct_preset_with_explicit_tools_does_not_leak_to_other_providers() {
     let conn = ScriptedToolPlaneConnection::new(
         vec![vec![catalog_entry("aft", &["echo"]), catalog_entry("other", &["look"])]; 3],

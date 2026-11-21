@@ -1293,15 +1293,7 @@ impl SubcToolPlane {
         let preset = self.frozen_preset(ctx, module);
         let schema_pin = self
             .dispatch_schema_pin(ctx, &call.tool_call_id, &call.tool_name)
-            .and_then(|pin| {
-                cortexkit_role_tool_provider::call::SchemaPin::new(
-                    &call.tool_name,
-                    pin.schema_digest,
-                    pin.semantics,
-                )
-                .encode()
-                .ok()
-            });
+            .and_then(|pin| broca_core::projection::schema_pin_text(&call.tool_name, &pin));
         let late_results = self.frozen_contract(ctx, module).late_results;
         let plain_key = key.filter(|_| {
             self.held_reply_declared() && late_results && self.conn.consumer_module_id().is_some()
