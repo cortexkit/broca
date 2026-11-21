@@ -148,23 +148,17 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
         .map_err(|e| ServeIoError(e.to_string()))?
         .path;
-    // broca.jsonc, read once: every component it shapes reads its own section from here. Under
-    // the settings gate broca registers first, and takes the daemon's settings when it offers
-    // them; then it never reads the file.
+    // broca's settings, read once: every component they shape reads its own section from here.
+    // broca registers first, and takes the daemon's settings when the daemon manages them;
+    // then it never reads the file. Under a daemon that doesn't, it reads broca.jsonc.
     let mock_provider_path =
         std::env::var("BROCA_PROVIDER_BASE_URL").is_ok_and(|value| !value.trim().is_empty());
-    let (settings, gated) = if SETTINGS_GATE {
-        // The gated start writes into the state root (the old settings file's saved copy) before
-        // settings arrive, so it takes the lock first.
-        lock_state_root(&state_root)?;
-        match start_gated(&conn_path, &module_id, mock_provider_path).await? {
-            Some(started) => started,
-            None => return Ok(()),
-        }
-    } else {
-        broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
-        let settings = broca_module_serve::settings::Settings::read_file().map_err(ServeIoError)?;
-        (settings, None)
+    // The start writes into the state root (the old settings file's saved copy) before the
+    // settings arrive, so it takes the lock first.
+    lock_state_root(&state_root)?;
+    let (settings, gated) = match start_gated(&conn_path, &module_id, mock_provider_path).await? {
+        Some(started) => started,
+        None => return Ok(()),
     };
     settings.log_conversion();
     let service_tier = broca_module_serve::config::ServiceTierConfig::from_settings(&settings)
@@ -199,18 +193,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let workers_ai_base_url = provider_overrides
         .base_url(broca_module_serve::system_one::workers_ai::PROVIDER_ID)
         .map(str::to_owned);
-    let wal_recovery = broca_module_serve::config::WalRecoveryConfig::from_settings(&settings)
-        .map_err(ServeIoError)?;
     let stop_signal = shutdown_signal()?;
-    // Without the settings gate the lock follows the settings checks, so a malformed file
-    // refuses the start before the state root is touched; under it the lock came first.
-    if !SETTINGS_GATE {
-        lock_state_root(&state_root)?;
-    }
     // Refuse unsupported markers before the stall log or any durable store is opened.
     let wal_decision = state_format::prepare(&state_root).map_err(ServeIoError)?;
-    let mut wal_config = wal_decision.config();
-    wal_config.recovery = wal_recovery;
+    let wal_config = wal_decision.config();
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
     // When unset, the run's model id is resolved through the catalog.
@@ -266,25 +252,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let account_limit_pause =
         broca_module_serve::config::AccountLimitPauseConfig::from_settings(&settings)
             .map_err(ServeIoError)?;
-    let consumer_routes = ConsumerRoutes::resolve(
-        std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
-            .ok()
-            .as_deref(),
-        !mock_provider_path,
-    )
-    .with_account_selection(&account_selection)
-    .with_bus_events(bus_event_config.enabled || gated.is_some());
-    if let Some(registered) = &gated {
-        // HELLO already fixed what broca consumes, before the settings were known.
-        if consumer_routes != registered.consumer_routes {
-            return Err(ServeIoError(
-                "under the settings gate broca finds its routing module by discovery; remove \
-                 account_selection's routing module from the settings"
-                    .into(),
-            )
-            .into());
-        }
-    }
+    // HELLO already fixed what broca consumes, before the settings were known.
+    let consumer_routes = gated.consumer_routes.clone();
     // How long an idle lineage holds its lease before the coordinator closes it. A real
     // operational parameter: a server hosting many sessions wants a short value to free leases
     // quickly; a desktop wants longer to avoid the cost of restarting a closed session.
@@ -1068,13 +1037,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     };
-    let (read_half, write_half, registered) = match gated {
-        Some(gated) => (gated.read_half, gated.write_half, Some(gated.registration)),
-        None => {
-            let (read_half, write_half) = tokio::io::split(connect(&conn_path).await?);
-            (read_half, write_half, None)
-        }
-    };
+    let (read_half, write_half, registered) =
+        (gated.read_half, gated.write_half, Some(gated.registration));
     let serving = broca_module_serve::serve::serve_connection_with_llm_tools(
         read_half,
         write_half,
@@ -1274,9 +1238,6 @@ fn lock_state_root(state_root: &std::path::Path) -> Result<(), ServeIoError> {
     }
 }
 
-/// Whether broca registers through the settings gate (`settings::gate`); a build switch.
-const SETTINGS_GATE: bool = cfg!(feature = "settings-gate");
-
 /// The module connection registered unready, waiting to serve once broca is built.
 struct Gated {
     read_half: tokio::io::ReadHalf<TcpStream>,
@@ -1346,26 +1307,31 @@ async fn start_gated(
     conn_path: &PathBuf,
     module_id: &str,
     mock_provider_path: bool,
-) -> Result<Option<(broca_module_serve::settings::Settings, Option<Gated>)>, ServeIoError> {
+) -> Result<Option<(broca_module_serve::settings::Settings, Gated)>, ServeIoError> {
     use broca_module_serve::settings::{gate, Settings};
-    // What the settings could make broca consume, named before they are known: the bus, and
-    // routing by discovery.
+    // The routes broca consumes are named before its settings are known; no setting changes them.
     let consumer_routes = ConsumerRoutes::resolve(
         std::env::var(broca_module_serve::consumer_routes::TOOL_MODULE_ENV)
             .ok()
             .as_deref(),
         !mock_provider_path,
     )
-    .with_account_selection(&Default::default())
     .with_bus_events(true);
-    let old_file = match broca_module_serve::config_home::config_file(
-        broca_module_serve::cache_routing::CONFIG_PATH_ENV,
-        "broca.jsonc",
-    ) {
-        broca_module_serve::config_home::ConfigHome::Resolved { path, .. } => Some(path),
-        broca_module_serve::config_home::ConfigHome::Unresolvable => None,
+    const CONFIG_PATH_ENV: &str = broca_module_serve::cache_routing::CONFIG_PATH_ENV;
+    let (old_file, explicit) =
+        match broca_module_serve::config_home::config_file(CONFIG_PATH_ENV, "broca.jsonc") {
+            broca_module_serve::config_home::ConfigHome::Resolved { path, explicit } => {
+                (Some(path), explicit)
+            }
+            broca_module_serve::config_home::ConfigHome::Unresolvable => (None, false),
+        };
+    // A file named by BROCA_CONFIG_PATH is read where it is and never copied into the config
+    // home, so a test or a one-off start pointed at its own file can't replace the user's
+    // settings. The daemon's gate reads only its own path, so such a start refuses under it.
+    let user_file = match (&old_file, explicit) {
+        (Some(path), true) => path.clone(),
+        _ => move_settings_file(old_file.as_deref(), conn_path)?,
     };
-    let user_file = move_settings_file(old_file.as_deref(), conn_path)?;
     let (mut read_half, mut write_half) = tokio::io::split(connect(conn_path).await?);
     let ack = broca_module_serve::serve::register_unready(
         &mut read_half,
@@ -1379,6 +1345,16 @@ async fn start_gated(
         .iter()
         .any(|capability| capability == subc_protocol::config::CONFIG_GATE_CAPABILITY);
     let (settings, gate) = if gated {
+        if explicit {
+            return Err(ServeIoError(format!(
+                "{CONFIG_PATH_ENV} names {}, but the daemon manages broca's settings and reads \
+                 them only from {}; unset {CONFIG_PATH_ENV}",
+                user_file.display(),
+                broca_module_serve::settings::rewrite::daemon_settings_file()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|error| error),
+            )));
+        }
         let user_file = user_file.display().to_string();
         match gate::wait_for_settings(
             &mut read_half,
@@ -1403,12 +1379,12 @@ async fn start_gated(
     let registration = broca_module_serve::serve::GatedRegistration { ack, gate };
     Ok(Some((
         settings,
-        Some(Gated {
+        Gated {
             read_half,
             write_half,
             registration,
             consumer_routes,
-        }),
+        },
     )))
 }
 

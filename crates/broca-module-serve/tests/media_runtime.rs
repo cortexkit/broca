@@ -4,6 +4,8 @@ mod delivery_rig;
 mod refusals;
 #[path = "media_runtime/tool_outputs.rs"]
 mod tool_outputs;
+#[path = "common/ungated_daemon.rs"]
+mod ungated_daemon;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_core::tool_plane::{BatchCtx, DispatchResult, ToolPlane};
@@ -706,50 +708,68 @@ async fn media_read_boundaries(rig: &mut Rig) {
     assert_eq!(refusal(&reply)["code"], "unknown_media");
 }
 
-// Under the settings gate broca takes its settings from the daemon after connecting, which
-// reviews them; it reads no broca.jsonc at boot, so this boot-time refusal doesn't happen.
-#[cfg(not(feature = "settings-gate"))]
-#[test]
-fn obsolete_media_does_not_refuse_boot_before_connecting() {
+/// An old file's `media` key, whatever its value, is removed with one note when broca reads its
+/// settings, and never refuses the start. broca reads the file once it has registered with a
+/// daemon that doesn't manage its settings, here a stand-in that answers only its HELLO.
+#[tokio::test]
+async fn obsolete_media_does_not_refuse_boot() {
     let root =
         broca_test_support::scratch_root().join(format!("media-boot-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let config = root.join("broca.jsonc");
+    let connection = root.join("subc-connection.json");
+    let daemon = ungated_daemon::spawn(&connection).await;
     for text in [
         r#"{"media":{"enabeld":true}}"#,
         r#"{"media":{"enabled":"yes"}}"#,
         r#"{"media":null}"#,
     ] {
         std::fs::write(&config, text).unwrap();
-        let data_home = root.join(format!("data-{}", digest(text.as_bytes())));
+        let tag = digest(text.as_bytes());
+        let data_home = root.join(format!("data-{tag}"));
         let logs = data_home.join("cortexkit/broca/logs");
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ck-broca"))
-            .args(["--subc", "missing-connection.json"])
+        let stderr = root.join(format!("stderr-{tag}.log"));
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ck-broca"))
+            .arg("--subc")
+            .arg(&connection)
             .env("BROCA_CONFIG_PATH", &config)
-            .env("BROCA_STATE_ROOT", root.join("state"))
+            .env("BROCA_STATE_ROOT", root.join(format!("state-{tag}")))
             .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_CONFIG_HOME", root.join("config"))
             .env("HOME", root.join("home"))
             .env_remove("SUBC_LAUNCH_NONCE_FD")
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("SUBC_MODULE_ID")
-            .output()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .kill_on_drop(true)
+            .spawn()
             .unwrap();
-        assert!(!output.status.success());
-        let error = String::from_utf8_lossy(&output.stderr);
+        let note = "broca.jsonc in an older shape: removed media:";
+        let read_logs = || {
+            std::fs::read_dir(&logs)
+                .map(|entries| {
+                    entries
+                        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        };
+        broca_test_support::wait_until("broca to read its settings", || async {
+            if read_logs().contains(note) {
+                Ok(())
+            } else {
+                Err(std::fs::read_to_string(&stderr).unwrap_or_default())
+            }
+        })
+        .await;
+        let _ = child.kill().await;
+        let error = std::fs::read_to_string(&stderr).unwrap_or_default();
         assert!(!error.contains("parse media"), "{error}");
-        assert!(error.contains("missing-connection.json"), "{error}");
-        let log_text = std::fs::read_dir(&logs)
-            .unwrap()
-            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
-            .collect::<String>();
-        assert_eq!(
-            log_text
-                .matches("broca.jsonc in an older shape: removed media:")
-                .count(),
-            1,
-            "{log_text}"
-        );
+        let log_text = read_logs();
+        assert_eq!(log_text.matches(note).count(), 1, "{log_text}");
     }
+    daemon.abort();
     std::fs::remove_dir_all(root).unwrap();
 }
 

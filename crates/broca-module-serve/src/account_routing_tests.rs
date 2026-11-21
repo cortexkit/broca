@@ -2223,9 +2223,8 @@ fn the_removed_break_glass_and_any_unknown_key_are_refused() {
 fn routing_config_preserves_explicit_ids_including_the_legacy_default() {
     for text in ["{}", r#"{"account_selection":{}}"#] {
         let config = AccountSelectionConfig::parse(text).unwrap();
-        assert_eq!(config.routing_module, None);
-        assert!(
-            config.routing_modules().is_empty(),
+        assert_eq!(
+            config.routing_module, None,
             "the default is discovered, not named"
         );
     }
@@ -2235,7 +2234,6 @@ fn routing_config_preserves_explicit_ids_including_the_legacy_default() {
         )
         .unwrap();
         assert_eq!(config.routing_module.as_deref(), Some(id));
-        assert_eq!(config.routing_modules(), vec![id]);
     }
 }
 

@@ -102,15 +102,9 @@ fn a_fresh_machine_boots_past_the_state_root() {
     // looking for paths in the message.
     let stderr = String::from_utf8_lossy(&output.stderr).replace("\\\\", "\\");
     assert!(!output.status.success(), "{stderr}");
-    // Under the settings gate broca connects first, to take its settings; without it, the tool
-    // plane's connection is the first.
-    let connect = if cfg!(feature = "settings-gate") {
-        "connection file open failed"
-    } else {
-        "tool-plane consumer connect"
-    };
+    // broca's first connection is the one it registers on, to take its settings.
     assert!(
-        stderr.contains(connect),
+        stderr.contains("connection file open failed"),
         "a fresh machine must reach the subc connection, not stop at the state root: {stderr}"
     );
     assert!(!stderr.contains("state root"), "{stderr}");
@@ -208,9 +202,6 @@ fn only_the_shared_resolver_names_the_state_root() {
 }
 
 /// Boot a child through each command builder and observe its writes beneath the selected root.
-// Under the settings gate broca opens its storage only after the daemon's settings arrive, and
-// this stand-in daemon offers none.
-#[cfg(not(feature = "settings-gate"))]
 #[tokio::test]
 async fn every_broca_spawn_site_pins_its_state_root() {
     let wrappers = [
@@ -223,62 +214,10 @@ async fn every_broca_spawn_site_pins_its_state_root() {
     for wrapper in wrappers {
         for explicit in [false, true] {
             let machine = Machine::new(&format!("{wrapper}-{explicit}"));
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let key = vec![0x51; 32];
-            let daemon_id = [0x15; 16];
-            subc_transport::connection_file::write_atomic(
-                machine.connection_file(),
-                &subc_transport::connection_file::ConnectionInfo {
-                    schema: subc_transport::connection_file::SCHEMA_VERSION,
-                    wire_version: None,
-                    endpoints: vec![subc_transport::connection_file::Endpoint {
-                        host: "127.0.0.1".into(),
-                        port: listener.local_addr().unwrap().port(),
-                    }],
-                    key: key.clone(),
-                    daemon_id,
-                    pid: std::process::id(),
-                    daemon_ver: "isolation".into(),
-                },
-            )
-            .unwrap();
-            // Authentication lets boot reach its storage initialization. The stand-in
-            // offers no modules or providers, so it cannot authorize any application work.
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                subc_transport::authenticate_server(
-                    &mut stream,
-                    &key,
-                    &daemon_id,
-                    "isolation",
-                    broca_test_support::STAND_IN_AUTH_DEADLINE,
-                )
-                .await
-                .unwrap();
-                while let Ok(Some(frame)) = subc_transport::read_frame(&mut stream).await {
-                    let (ty, body) = match frame.header.ty {
-                        subc_protocol::FrameType::Request => (subc_protocol::FrameType::Error,
-                            br#"{"code":"unknown_method","message":"no services in the isolation stand-in"}"#.to_vec()),
-                        subc_protocol::FrameType::Ping => (subc_protocol::FrameType::Pong, vec![]),
-                        _ => continue,
-                    };
-                    let reply = subc_protocol::Frame::build(
-                        ty,
-                        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
-                        frame.header.channel,
-                        frame.header.epoch,
-                        frame.header.corr,
-                        body,
-                    )
-                    .unwrap();
-                    if subc_transport::write_frame(&mut stream, &reply)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
+            // Answers broca's HELLO without the settings gate, so boot reads its (absent)
+            // settings file and goes on to its storage. It offers no modules or providers, so it
+            // cannot authorize any application work.
+            let server = super::ungated_daemon::spawn(&machine.connection_file()).await;
             let binary =
                 broca_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-broca"), &machine.0);
             let mut command: tokio::process::Command = match wrapper {

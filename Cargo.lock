@@ -478,6 +478,7 @@ dependencies = [
  "libc",
  "nkeys",
  "os_info",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

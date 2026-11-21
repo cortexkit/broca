@@ -82,10 +82,6 @@ fn the_schema_defaults_are_the_readers_defaults() {
             empty_tools.private_content_providers
         ),
     );
-    assert_eq!(
-        crate::config::WalRecoveryConfig::from_settings(&from_schema).unwrap(),
-        crate::config::WalRecoveryConfig::from_settings(&empty).unwrap(),
-    );
 }
 
 #[test]

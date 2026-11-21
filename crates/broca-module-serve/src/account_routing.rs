@@ -180,10 +180,6 @@ impl AccountSelectionConfig {
         };
         Ok(Self { routing_module })
     }
-
-    pub fn routing_modules(&self) -> Vec<String> {
-        self.routing_module.iter().cloned().collect()
-    }
 }
 
 // ------------------------------------------------------------------------------------------

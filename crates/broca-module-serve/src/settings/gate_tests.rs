@@ -327,11 +327,15 @@ struct Served {
 }
 
 impl Served {
-    async fn request(&mut self, op: &str) -> (u64, Value) {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), self.sent.recv())
+    async fn next(&mut self) -> Frame {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.sent.recv())
             .await
             .expect("the gate sent nothing")
-            .unwrap();
+            .unwrap()
+    }
+
+    async fn request(&mut self, op: &str) -> (u64, Value) {
+        let frame = self.next().await;
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["op"], op, "{body}");
         (frame.header.corr, body)
@@ -444,4 +448,284 @@ async fn the_gate_makes_broca_ready_then_applies_only_in_place_changes() {
     );
     changed.await.unwrap().unwrap();
     assert!(served.sent.try_recv().is_err(), "nothing is acknowledged");
+}
+
+/// On an install with no approval stamp every view is generation 0 with no attempt, and the
+/// daemon restarts nothing. A change (always pushed as generation 0) makes broca read the view
+/// again: a field read at start that changed is named in broca's health as waiting for its next
+/// start, a view with the same settings changes nothing, and a view broca's checks refuse is
+/// kept out and named. Nothing is ever acknowledged.
+#[tokio::test]
+async fn an_unstamped_change_is_compared_by_its_settings_and_never_acknowledged() {
+    let (mut daemon, mut read, mut write) = connected();
+    let broca = tokio::spawn(async move {
+        wait_for_settings(
+            &mut read,
+            &mut write,
+            subc_protocol::PROTOCOL_VERSION,
+            "/config/broca.jsonc",
+        )
+        .await
+    });
+    let get = daemon.accept_declaration().await;
+    // `chatgpt_force_https` stays true throughout: the policy it sets is process-wide, and the
+    // test above asserts it true.
+    let started = json!({"service_tier": {"enabled": true}, "chatgpt_force_https": true});
+    let unstamped = |effective: Value| {
+        ConfigView::new(
+            0,
+            effective,
+            Default::default(),
+            Vec::new(),
+            ConfigStatus::Unstamped,
+        )
+    };
+    daemon
+        .send(
+            FrameType::Response,
+            get,
+            get_reply(Some(unstamped(started.clone())), None),
+        )
+        .await;
+    let GateStart::Settings(_, gate) = broca.await.unwrap().unwrap() else {
+        panic!("broca did not start");
+    };
+    let (tx, sent) = tokio::sync::mpsc::channel(8);
+    let mut served = Served { gate, sent };
+    let ready = tokio::spawn({
+        let gate = served.gate.clone();
+        async move { gate.finish_start(tx.into(), Vec::new()).await }
+    });
+    let (corr, _) = served.request("catalog.update").await;
+    served.answer(corr, json!({"op": "catalog.update"}));
+    ready.await.unwrap().unwrap();
+    assert!(served.sent.try_recv().is_err(), "nothing to acknowledge");
+
+    let push = serde_json::to_vec(&json!({"op": "config.changed", "generation": 0, "fields": []}))
+        .unwrap();
+    let change = |served: &Served| {
+        let gate = served.gate.clone();
+        let push = push.clone();
+        tokio::spawn(async move { gate.on_changed(&push).await })
+    };
+    let mut edited = started.clone();
+    edited["service_tier"]["enabled"] = json!(false);
+    for (offered, waiting, refused_at) in [
+        // A field read at start changes: it waits for the next start.
+        (
+            edited.clone(),
+            json!(["/service_tier/enabled"]),
+            json!(null),
+        ),
+        // The same settings again: nothing changes.
+        (
+            edited.clone(),
+            json!(["/service_tier/enabled"]),
+            json!(null),
+        ),
+        // A view broca refuses is kept out, and broca keeps the settings it runs on.
+        (
+            json!({"providers": {"deepseek": {"base_url": "not-a-url"}}}),
+            json!(["/service_tier/enabled"]),
+            json!("/providers"),
+        ),
+        // Back to the settings it started from: nothing waits any more.
+        (started.clone(), json!([]), json!(null)),
+    ] {
+        let changed = change(&served);
+        let (corr, _) = served.request("config.get").await;
+        served.answer(corr, get_reply(Some(unstamped(offered)), None));
+        changed.await.unwrap().unwrap();
+        let health = served.gate.health().unwrap();
+        assert_eq!(
+            (
+                &health["generation"],
+                &health["waiting_restart"],
+                &health["refused_at"]
+            ),
+            (&json!(0), &waiting, &refused_at),
+            "{health}"
+        );
+        assert!(served.sent.try_recv().is_err(), "nothing is acknowledged");
+    }
+}
+
+/// What broca sends the daemon through the gate, byte for byte, for the daemon's readers to
+/// check: the declaration, the request for the view, three reviews (no base yet, a change on a
+/// base, and a value the schema refuses) and the update that makes broca ready. The view is an
+/// unstamped install's, which has no attempt, so broca acknowledges nothing. The requests the
+/// daemon sends are built with the protocol crate's own types. With
+/// `BROCA_SETTINGS_SAMPLES_DIR` set, every frame body is written there under its step and op.
+#[tokio::test]
+async fn the_frames_the_gate_exchanges_are_what_readers_were_shown() {
+    const USER_FILE: &str = "/home/user/.config/cortexkit/broca.jsonc";
+    let out = std::env::var_os("BROCA_SETTINGS_SAMPLES_DIR").map(std::path::PathBuf::from);
+    let save = |name: &str, body: &[u8]| {
+        if let Some(dir) = &out {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+    };
+    let (mut daemon, mut read, mut write) = connected();
+    let broca = tokio::spawn(async move {
+        wait_for_settings(
+            &mut read,
+            &mut write,
+            subc_protocol::PROTOCOL_VERSION,
+            USER_FILE,
+        )
+        .await
+    });
+
+    let declare = daemon.next().await;
+    let body: Value = serde_json::from_slice(&declare.body).unwrap();
+    assert_eq!(
+        (&body["op"], &body["user_file"]),
+        (&json!("config.declare"), &json!(USER_FILE))
+    );
+    assert!(body["schema"]["properties"].get("wal_recovery").is_none());
+    save("01-config.declare.request.json", &declare.body);
+    daemon
+        .send(
+            FrameType::Response,
+            declare.header.corr,
+            json!({"op": "config.declare"}),
+        )
+        .await;
+    let get = daemon.next().await;
+    save("02-config.get.request.json", &get.body);
+
+    let user = br#"{
+  // broca.jsonc after the one-time conversion
+  "service_tier": {"enabled": true},
+  "chatgpt_force_https": true,
+}
+"#;
+    let user_layer = |bytes: &[u8]| {
+        vec![ConfigLayerSnapshot::file(
+            "broca",
+            ConfigLayer::User,
+            USER_FILE,
+            Some(bytes.to_vec()),
+        )]
+    };
+    // The view the daemon serves from that file, built as the daemon builds it: the reviewed
+    // tuple's effective settings and sources, and the file it came from.
+    let user_value: Value =
+        serde_json::from_str(r#"{"service_tier": {"enabled": true}, "chatgpt_force_https": true}"#)
+            .unwrap();
+    let tuple = super::super::schema()
+        .review_tuple(
+            &[subc_config::LayerValue::new(
+                subc_config::Layer::User,
+                user_value,
+            )],
+            &subc_config::ValidationContext::new("broca", None),
+        )
+        .unwrap();
+    // A retained base as the daemon sends it: generation 1, pending until activated, and with
+    // no delivery attempt.
+    let base = ConfigView::new(
+        1,
+        tuple.effective.clone(),
+        tuple.sources.clone(),
+        user_layer(user),
+        ConfigStatus::Pending,
+    );
+    let reviews = [
+        (
+            "03-config.review.first",
+            ConfigReviewRequest::new(0, user_layer(user), None),
+        ),
+        (
+            "04-config.review.on-a-base",
+            ConfigReviewRequest::new(
+                1,
+                user_layer(
+                    br#"{"service_tier": {"enabled": false}, "chatgpt_force_https": false}"#,
+                ),
+                Some(base.clone()),
+            ),
+        ),
+        (
+            "05-config.review.refused",
+            ConfigReviewRequest::new(
+                0,
+                // Well formed, so the daemon sends it, but not a URL broca can use.
+                user_layer(br#"{"providers": {"deepseek": {"base_url": "not-a-url"}}}"#),
+                None,
+            ),
+        ),
+    ];
+    let mut replies = Vec::new();
+    for (corr, (step, request)) in (20u64..).zip(reviews) {
+        let body = serde_json::to_vec(&request).unwrap();
+        save(&format!("{step}.request.json"), &body);
+        let flags = subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false);
+        let frame = Frame::build(FrameType::Request, flags, 0, 0, corr, body).unwrap();
+        write_frame(&mut daemon.write, &frame).await.unwrap();
+        let reply = daemon.next().await;
+        assert_eq!(
+            (reply.header.ty, reply.header.corr),
+            (FrameType::Response, corr)
+        );
+        save(&format!("{step}.reply.json"), &reply.body);
+        replies.push(serde_json::from_slice::<Value>(&reply.body).unwrap());
+    }
+    assert_eq!(replies[0]["refusals"], json!([]), "{}", replies[0]);
+    assert_eq!(replies[1]["refusals"], json!([]), "{}", replies[1]);
+    assert_eq!(
+        replies[2]["refusals"][0]["paths"],
+        json!(["/providers"]),
+        "{}",
+        replies[2]
+    );
+
+    // On an install with no approval stamp the daemon serves the file's view as the active one,
+    // at generation 0 (no generation assigned yet) and with no delivery attempt; broca builds
+    // from it, and has nothing to acknowledge.
+    let unstamped = ConfigView::new(
+        0,
+        tuple.effective,
+        tuple.sources,
+        user_layer(user),
+        ConfigStatus::Unstamped,
+    );
+    let get_reply = get_reply(Some(unstamped), None);
+    save(
+        "02-config.get.reply.json",
+        &serde_json::to_vec(&get_reply).unwrap(),
+    );
+    daemon
+        .send(FrameType::Response, get.header.corr, get_reply)
+        .await;
+    let GateStart::Settings(_, gate) = broca.await.unwrap().unwrap() else {
+        panic!("broca did not start");
+    };
+    let (tx, mut sent) = tokio::sync::mpsc::channel(8);
+    // The roles broca really registers with: the daemon refuses an update that empties them.
+    let provides = crate::serve::hello_manifest(
+        "broca",
+        &crate::consumer_routes::ConsumerRoutes::default(),
+        false,
+    )
+    .provides;
+    assert!(!provides.is_empty());
+    let ready = tokio::spawn({
+        let gate = gate.clone();
+        async move { gate.finish_start(tx.into(), provides).await }
+    });
+    let update = tokio::time::timeout(std::time::Duration::from_secs(5), sent.recv())
+        .await
+        .expect("the gate sent nothing")
+        .unwrap();
+    save("06-catalog.update.request.json", &update.body);
+    let served = Served { gate, sent };
+    served.answer(update.header.corr, json!({"op": "catalog.update"}));
+    ready.await.unwrap().unwrap();
+    let mut sent = served.sent;
+    assert!(
+        sent.try_recv().is_err(),
+        "an unstamped view has no attempt to acknowledge"
+    );
 }

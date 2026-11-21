@@ -1,8 +1,36 @@
-//! Malformed runtime policy refuses startup before a subconscious daemon connection is attempted.
+//! Malformed runtime policy in broca's settings file refuses startup by name. broca reads the file
+//! once it has registered with a daemon that doesn't manage its settings, so each boot here runs
+//! against a stand-in daemon that answers only broca's HELLO.
 
-// Under the settings gate broca takes its settings from the daemon after connecting, which
-// reviews them; it reads no broca.jsonc at boot, so this boot-time refusal doesn't happen.
-#[cfg(not(feature = "settings-gate"))]
+/// Boots the real binary against a fresh stand-in daemon, with `configure` adding its settings
+/// file and homes, and returns its output once it exits.
+fn boot(tag: &str, configure: impl FnOnce(&mut std::process::Command)) -> std::process::Output {
+    let connection = broca_test_support::scratch_root()
+        .join(format!("broca-boot-{tag}-{}", std::process::id()))
+        .join("subc-connection.json");
+    std::fs::create_dir_all(connection.parent().unwrap()).unwrap();
+    let mut command = broca_test_support::ckdev_command(
+        env!("CARGO_BIN_EXE_ck-broca"),
+        broca_test_support::scratch_root(),
+    );
+    command.arg("--subc").arg(&connection);
+    configure(&mut command);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let output = runtime.block_on(async {
+        let daemon = super::ungated_daemon::spawn(&connection).await;
+        let output = tokio::task::spawn_blocking(move || {
+            broca_test_support::retry_executable_file_busy(|| command.output())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        daemon.abort();
+        output
+    });
+    let _ = std::fs::remove_dir_all(connection.parent().unwrap());
+    output
+}
+
 #[test]
 fn malformed_service_tier_switch_refuses_boot_by_name() {
     let root = broca_test_support::scratch_root()
@@ -14,37 +42,36 @@ fn malformed_service_tier_switch_refuses_boot_by_name() {
         serde_json::json!({"enabled":"yes"}),
     ] {
         std::fs::write(&path, serde_json::json!({"service_tier":value}).to_string()).unwrap();
-        let output = broca_test_support::retry_executable_file_busy(|| {
-            broca_test_support::ckdev_command(
-                env!("CARGO_BIN_EXE_ck-broca"),
-                broca_test_support::scratch_root(),
-            )
-            .args(["--subc", "unused-connection.json"])
-            .env("BROCA_CONFIG_PATH", &path)
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("BROCA_STATE_ROOT", root.join("state"))
-            .output()
-        })
-        .unwrap();
+        let output = boot("service-tier", |command| {
+            command
+                .env("BROCA_CONFIG_PATH", &path)
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("BROCA_STATE_ROOT", root.join("state"));
+        });
         assert!(!output.status.success());
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(error.contains("service_tier.enabled"), "{error}");
-        assert!(
-            !root.join("state").exists(),
-            "refuse malformed policy before opening state"
-        );
+        // broca locks its state root before it connects, but opens no session store until its
+        // settings are good.
+        for store in [
+            "session-store",
+            "session-store-durable",
+            "session-store-ephemeral",
+        ] {
+            assert!(
+                !root.join("state").join(store).exists(),
+                "refuse malformed policy before opening {store}"
+            );
+        }
     }
     std::fs::remove_dir_all(root).unwrap();
 }
 
-// Under the settings gate broca takes its settings from the daemon after connecting, which
-// reviews them; it reads no broca.jsonc at boot, so this boot-time refusal doesn't happen.
-#[cfg(not(feature = "settings-gate"))]
 #[test]
 fn malformed_provider_url_refuses_boot_with_provider_and_value() {
     let path = broca_test_support::scratch_root()
         .join(format!("broca-provider-boot-{}.jsonc", std::process::id()));
-    // Valid --subc arguments let startup reach config validation without connecting.
     // The logger runs first and may prune log segments, so isolate the data home to
     // avoid touching the operator's logs. Do not pin a module id to make logging work:
     // unsupervised startup must still support the binary's fallback identity, allowing
@@ -60,20 +87,15 @@ fn malformed_provider_url_refuses_boot_with_provider_and_value() {
             .to_string(),
         )
         .unwrap();
-        let output = broca_test_support::retry_executable_file_busy(|| {
-            broca_test_support::ckdev_command(
-                env!("CARGO_BIN_EXE_ck-broca"),
-                broca_test_support::scratch_root(),
-            )
-            .args(["--subc", "unused-connection.json"])
-            .env("BROCA_CONFIG_PATH", &path)
-            .env("XDG_DATA_HOME", &data_home)
-            // broca's state root defaults to that data home unless BROCA_STATE_ROOT is
-            // inherited, which would point this spawn at the operator's real state.
-            .env_remove("BROCA_STATE_ROOT")
-            .output()
-        })
-        .unwrap();
+        let output = boot("provider-url", |command| {
+            command
+                .env("BROCA_CONFIG_PATH", &path)
+                .env("XDG_DATA_HOME", &data_home)
+                .env("XDG_CONFIG_HOME", data_home.join("config"))
+                // broca's state root defaults to that data home unless BROCA_STATE_ROOT is
+                // inherited, which would point this spawn at the operator's real state.
+                .env_remove("BROCA_STATE_ROOT");
+        });
         assert!(!output.status.success());
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(error.contains("providers.deepseek.base_url"), "{error}");
@@ -89,9 +111,6 @@ fn malformed_provider_url_refuses_boot_with_provider_and_value() {
 ///
 /// Without this, someone tidying the env lines would see three `.env` calls, judge one redundant
 /// with the config path, and silently restore a test that writes to production.
-// Under the settings gate broca takes its settings from the daemon after connecting, which
-// reviews them; it reads no broca.jsonc at boot, so this boot-time refusal doesn't happen.
-#[cfg(not(feature = "settings-gate"))]
 #[test]
 fn the_spawned_binary_writes_its_logs_under_the_pinned_data_home() {
     let data_home =
@@ -105,18 +124,13 @@ fn the_spawned_binary_writes_its_logs_under_the_pinned_data_home() {
     )
     .unwrap();
 
-    let output = broca_test_support::retry_executable_file_busy(|| {
-        broca_test_support::ckdev_command(
-            env!("CARGO_BIN_EXE_ck-broca"),
-            broca_test_support::scratch_root(),
-        )
-        .args(["--subc", "unused-connection.json"])
-        .env("BROCA_CONFIG_PATH", &path)
-        .env("XDG_DATA_HOME", &data_home)
-        .env_remove("BROCA_STATE_ROOT")
-        .output()
-    })
-    .unwrap();
+    let output = boot("logs", |command| {
+        command
+            .env("BROCA_CONFIG_PATH", &path)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_CONFIG_HOME", data_home.join("config"))
+            .env_remove("BROCA_STATE_ROOT");
+    });
     assert!(!output.status.success(), "the boot must still refuse");
 
     // NON-VACUITY: the binary has to have reached the logger at all, or this test passes by

@@ -1865,6 +1865,9 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // This library-only rig publishes no new-storage slot or deployment key. The metric
         // remains present as null, without degrading the healthy process.
         "store",
+        // This rig's daemon doesn't manage broca's settings (broca reads its own file), so
+        // `settings` is present as null.
+        "settings",
         // No converter engine is published by this rig; its health remains present and idle.
         "catalog_age_ms",
         "catalog_source",
@@ -2019,6 +2022,11 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         metrics["store"],
         serde_json::Value::Null,
         "a process without a published new-storage slot reports no deployment-key state"
+    );
+    assert_eq!(
+        metrics["settings"],
+        serde_json::Value::Null,
+        "a process serving without the settings gate reports no daemon settings view"
     );
     assert_eq!(
         metrics["usage_observe"],

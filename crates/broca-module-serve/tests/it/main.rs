@@ -41,6 +41,8 @@ mod step_transform_rig;
 mod store_exec;
 #[path = "../common/stored_log.rs"]
 mod stored_log;
+#[path = "../common/ungated_daemon.rs"]
+mod ungated_daemon;
 
 mod account_selection_real_daemon;
 mod anthropic_default_cache_render;

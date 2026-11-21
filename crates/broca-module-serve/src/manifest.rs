@@ -1295,57 +1295,6 @@ mod consumes_tests {
         expected.extend(routes.vault_module.clone());
         assert_eq!(services, expected);
         assert_eq!(services, vec!["fusiform", "claustrum"]);
-
-        // The routing module, under the id `account_selection` configures, is declared beside
-        // the vault whenever account selection is active.
-        let selection = crate::account_routing::AccountSelectionConfig::parse(
-            r#"{"account_selection":{"routing_module":"routing-b"}}"#,
-        )
-        .unwrap();
-        let routes =
-            ConsumerRoutes::resolve(Some("custom"), true).with_account_selection(&selection);
-        let (_, services) = declared(&routes);
-        assert_eq!(routes.routing_modules, vec!["routing-b"]);
-        assert_eq!(services, vec!["fusiform", "claustrum", "routing-b"]);
-
-        let selection = crate::account_routing::AccountSelectionConfig::parse(
-            r#"{"account_selection":{"routing_module":"prefrontal-routing"}}"#,
-        )
-        .unwrap();
-        let (_, services) =
-            declared(&ConsumerRoutes::resolve(None, true).with_account_selection(&selection));
-        assert_eq!(
-            services,
-            vec!["fusiform", "claustrum", "prefrontal-routing"]
-        );
-    }
-
-    /// Only an explicit routing id can be named at boot; a catalog-discovered provider is not
-    /// known yet. Without the vault, mock providers resolve no accounts and need no routing id.
-    /// The removed `legacy_static` switch remains refused.
-    #[test]
-    fn only_explicit_routing_modules_are_declared_alongside_the_vault() {
-        assert!(crate::account_routing::AccountSelectionConfig::parse(
-            r#"{"account_selection":{"routing_module":"routing-b","legacy_static":true}}"#,
-        )
-        .unwrap_err()
-        .contains("unknown field `legacy_static`"));
-
-        let active = crate::account_routing::AccountSelectionConfig::default();
-        let (_, services) =
-            declared(&ConsumerRoutes::resolve(None, false).with_account_selection(&active));
-        assert_eq!(services, vec!["fusiform"]);
-
-        let (_, services) =
-            declared(&ConsumerRoutes::resolve(None, true).with_account_selection(&active));
-        assert_eq!(services, vec!["fusiform", "claustrum"]);
-
-        let explicit = crate::account_routing::AccountSelectionConfig {
-            routing_module: Some("routing-b".into()),
-        };
-        let (_, services) =
-            declared(&ConsumerRoutes::resolve(None, false).with_account_selection(&explicit));
-        assert_eq!(services, vec!["fusiform"]);
     }
 
     /// Each configuration-dependent entry appears and disappears with its knob.

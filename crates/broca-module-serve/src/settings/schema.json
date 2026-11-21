@@ -567,19 +567,6 @@
         "user"
       ]
     },
-    "wal_recovery": {
-      "type": "string",
-      "description": "What to do with a damaged session log: repair it, or refuse to open it.",
-      "default": "repair",
-      "x-ck-apply": "module_restart",
-      "x-ck-layers": [
-        "user"
-      ],
-      "enum": [
-        "repair",
-        "refuse"
-      ]
-    },
     "context_management": {
       "type": "object",
       "description": "How a session's prompt is kept inside the model's context window.",

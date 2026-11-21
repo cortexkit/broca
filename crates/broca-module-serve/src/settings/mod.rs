@@ -154,12 +154,11 @@ impl Settings {
     }
 }
 
-/// The schema broca declares to the daemon's managed settings ([`gate`]). Only builds with the
-/// `settings-gate` switch declare it: several keys take a new shape or meaning in it
-/// (`max_same_account_wait`, `tool_name_aliases`, `cache.provider_ttl`, `billing.charge_basis`,
-/// `context_management`, `import.roots`, `account_selection.routing_module`), and declaring it
-/// would refuse every `broca.jsonc` written in today's shapes until the daemon can convert an
-/// old file.
+/// The schema broca declares to the daemon's managed settings ([`gate`]). Several keys have a
+/// new shape or meaning in it (`max_same_account_wait`, `tool_name_aliases`,
+/// `cache.provider_ttl`, `billing.charge_basis`, `context_management`, `import.roots`,
+/// `account_selection.routing_module`); broca rewrites a file in the older shapes once at start
+/// (`rewrite`), so the daemon only ever reads these.
 const SCHEMA: &str = include_str!("schema.json");
 
 /// broca's settings schema, as `config.declare` proposes it to the daemon.

@@ -385,61 +385,6 @@ mod compaction_signals_config_tests {
     }
 }
 
-/// Physical recovery policy for overhaul logs. Legacy log policy is unaffected.
-pub struct WalRecoveryConfig;
-
-impl WalRecoveryConfig {
-    pub fn parse(text: &str) -> Result<broca_wal::recovery::RecoveryPolicy, String> {
-        let text = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        let file: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("parse wal_recovery: {e}"))?;
-        match file.get("wal_recovery") {
-            None => Ok(broca_wal::recovery::RecoveryPolicy::Repair),
-            Some(value) if value == "repair" => Ok(broca_wal::recovery::RecoveryPolicy::Repair),
-            Some(value) if value == "refuse" => Ok(broca_wal::recovery::RecoveryPolicy::Refuse),
-            Some(value) => Err(format!(
-                "wal_recovery accepts only \"repair\" or \"refuse\"; got {value}"
-            )),
-        }
-    }
-    /// Its section of broca's settings.
-    pub fn from_settings(
-        settings: &crate::settings::Settings,
-    ) -> Result<broca_wal::recovery::RecoveryPolicy, String> {
-        Self::parse(settings.text())
-    }
-}
-
-#[cfg(test)]
-mod wal_recovery_config_tests {
-    use super::*;
-    #[test]
-    fn wal_recovery_config_defaults_and_refuses_unknown_values_by_name() {
-        use broca_wal::recovery::RecoveryPolicy;
-        assert_eq!(
-            WalRecoveryConfig::parse("{}").unwrap(),
-            RecoveryPolicy::Repair
-        );
-        assert_eq!(
-            WalRecoveryConfig::parse("{\"wal_recovery\":\"repair\"}").unwrap(),
-            RecoveryPolicy::Repair
-        );
-        assert_eq!(
-            WalRecoveryConfig::parse("{\"wal_recovery\":\"refuse\"}").unwrap(),
-            RecoveryPolicy::Refuse
-        );
-        for value in ["null", "true", "0", "\"repairs\"", "{}"] {
-            assert!(
-                WalRecoveryConfig::parse(&format!("{{\"wal_recovery\":{value}}}"))
-                    .unwrap_err()
-                    .contains("wal_recovery")
-            );
-        }
-    }
-}
-
 /// The `anthropic_fallbacks` key of `broca.jsonc`: the operator switches for content-filter
 /// fallback on Anthropic OAuth runs.
 ///

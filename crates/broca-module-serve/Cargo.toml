@@ -92,6 +92,8 @@ futures.workspace = true
 clap = { version = "4", features = ["derive"] }
 # The daemon's settings contract: broca's settings schema and the review of a proposed view.
 subc-config = { workspace = true }
+# The settings schema's pattern properties, matched as subc-config matches them.
+regex = "1"
 cortexkit-store-types = "=0.2.2"
 subc-jsonc = { workspace = true }
 
@@ -162,7 +164,3 @@ test-clock = ["broca-module/test-clock", "broca-core/test-clock"]
 # Real-daemon rigs only (the native release suites turn it on): credentials may also reach the
 # local machine, where the rigs' stand-in providers listen. See broca-provider's feature.
 test-loopback-credentials = ["broca-provider/test-loopback-credentials"]
-# broca takes its settings from the daemon's managed settings when the daemon offers them,
-# instead of reading broca.jsonc (src/settings/gate.rs). Off until the daemon converts old
-# broca.jsonc files itself.
-settings-gate = []

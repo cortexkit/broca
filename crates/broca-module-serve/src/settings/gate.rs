@@ -16,6 +16,12 @@
 //! Later views: one that changes only fields applied in place (today `chatgpt_force_https`) is
 //! applied and acknowledged. One that changes a field read at start is left alone: the daemon
 //! restarts broca once it approves that view, and the new process starts from it.
+//!
+//! An install with no approval stamp is different. Every view there is generation 0 with no
+//! delivery attempt, so the generation orders nothing and there is nothing to acknowledge, and
+//! the daemon never restarts broca over a file edit. So on each change broca reads the view
+//! again and compares its settings with what it runs on: it applies the fields applied in
+//! place, keeps the others until its next start, and names those in its health.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -157,11 +163,20 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
-/// The settings view broca was started from.
+/// The settings view broca runs on.
 struct Applied {
+    /// The settings of the newest view broca took: in-place fields come from it.
     effective: Value,
     generation: u64,
     attempt: Option<u64>,
+    /// The settings broca started from, which fields read at start still follow.
+    started: Value,
+    /// Fields read at start whose newer value waits for broca's next start (unstamped installs,
+    /// where the daemon restarts nothing), as JSON pointers.
+    waiting_restart: Vec<String>,
+    /// Where the newest unstamped view broca refused fails its checks, while broca keeps the
+    /// settings it runs on.
+    refused_at: Option<String>,
 }
 
 /// broca's side of the settings gate on one module connection.
@@ -269,6 +284,9 @@ where
                                 effective: view.effective.clone(),
                                 generation: view.generation,
                                 attempt: view.attempt,
+                                started: view.effective.clone(),
+                                waiting_restart: Vec::new(),
+                                refused_at: None,
                             })),
                         };
                         return Ok(GateStart::Settings(settings, Arc::new(gate)));
@@ -474,7 +492,9 @@ impl Gate {
                 .as_ref()
                 .is_some_and(|applied| generation > applied.generation)
         };
-        if !newer(changed.generation) {
+        // An unstamped install sends every change as generation 0 (as it does after a stamp is
+        // removed), so only reading the view again tells whether anything changed.
+        if changed.generation != 0 && !newer(changed.generation) {
             return Ok(());
         }
         let view = match view_from(self.calls.call(&ConfigGetRequest::new()).await?) {
@@ -485,6 +505,10 @@ impl Gate {
                 return Ok(());
             }
         };
+        if view.generation == 0 {
+            self.apply_unstamped(view);
+            return Ok(());
+        }
         let restart = {
             let applied = self.applied.lock().unwrap();
             let Some(applied) = applied
@@ -502,16 +526,62 @@ impl Gate {
             return Ok(());
         }
         crate::transport_config::set_managed(force_https(&view.effective));
-        *self.applied.lock().unwrap() = Some(Applied {
-            effective: view.effective.clone(),
-            generation: view.generation,
-            attempt: view.attempt,
-        });
+        if let Some(applied) = self.applied.lock().unwrap().as_mut() {
+            applied.effective = view.effective.clone();
+            applied.generation = view.generation;
+            applied.attempt = view.attempt;
+            applied.refused_at = None;
+        }
         if let Some(attempt) = view.attempt {
             self.acknowledge(view.generation, attempt).await?;
         }
         tracing::info!(target: "config", generation = view.generation, "applied changed settings in place");
         Ok(())
+    }
+
+    /// Takes an unstamped view (generation 0, no attempt): applies its in-place fields when its
+    /// settings differ from the newest broca took and pass broca's checks, and records which
+    /// fields read at start now wait for broca's next start. Nothing is acknowledged.
+    fn apply_unstamped(&self, view: ConfigView) {
+        let mut applied = self.applied.lock().unwrap();
+        let Some(applied) = applied.as_mut() else {
+            return;
+        };
+        if view.effective == applied.effective {
+            return;
+        }
+        if let Err(path) = start_settings(&view) {
+            tracing::warn!(target: "config", %path,
+                "the changed settings are refused; broca keeps the settings it runs on");
+            applied.refused_at = Some(path);
+            return;
+        }
+        crate::transport_config::set_managed(force_https(&view.effective));
+        applied.waiting_restart =
+            restart_fields_changed(self.schema, &applied.started, &view.effective);
+        applied.effective = view.effective;
+        applied.generation = 0;
+        applied.attempt = None;
+        applied.refused_at = None;
+        if applied.waiting_restart.is_empty() {
+            tracing::info!(target: "config", "applied changed settings in place");
+        } else {
+            tracing::info!(target: "config", waiting = ?applied.waiting_restart,
+                "applied changed settings in place; the rest take effect at broca's next start");
+        }
+    }
+
+    /// What `health.check` shows of broca's settings: the generation it runs on, the fields
+    /// whose change waits for its next start, and where a refused changed view fails. `None`
+    /// when broca read its settings file.
+    pub fn health(&self) -> Option<Value> {
+        self.applied.lock().unwrap().as_ref().map(|applied| {
+            serde_json::json!({
+                "generation": applied.generation,
+                "waiting_restart": applied.waiting_restart,
+                "refused_at": applied.refused_at,
+            })
+        })
     }
 
     async fn acknowledge(&self, generation: u64, attempt: u64) -> Result<(), ServeIoError> {
@@ -531,10 +601,17 @@ impl Gate {
 
 /// Whether any field read only at start differs between `old` and `new`.
 fn restart_fields_differ(schema: &Schema, old: &Value, new: &Value) -> bool {
+    !restart_fields_changed(schema, old, new).is_empty()
+}
+
+/// The fields read at start whose value differs between `old` and `new`, as JSON pointers.
+fn restart_fields_changed(schema: &Schema, old: &Value, new: &Value) -> Vec<String> {
     super::review::fields(schema)
         .into_iter()
         .filter(|(_, kind)| *kind != subc_config::ApplyKind::Live)
-        .any(|(pointer, _)| old.pointer(&pointer) != new.pointer(&pointer))
+        .filter(|(pointer, _)| old.pointer(pointer) != new.pointer(pointer))
+        .map(|(pointer, _)| pointer)
+        .collect()
 }
 
 fn force_https(effective: &Value) -> bool {

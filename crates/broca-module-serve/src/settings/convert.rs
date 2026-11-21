@@ -31,6 +31,10 @@ const REMOVED: &[(&str, &str)] = &[
         "sessions keep no logs to archive; the new storage seals history itself",
     ),
     (
+        "wal_recovery",
+        "the session store checks each log itself; no setting changes what it does with damage",
+    ),
+    (
         "session_conversion",
         "every session is in the new storage, so nothing is left to convert",
     ),

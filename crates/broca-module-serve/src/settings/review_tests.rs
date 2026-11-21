@@ -175,6 +175,76 @@ mod requests {
         }
     }
 
+    /// The daemon checks a reply's paths against the leaves of its views: a map's entries and a
+    /// tagged choice's members, never the object above them, and an empty map at its own path.
+    #[test]
+    fn fields_are_the_leaves_the_views_name() {
+        let reply = review_request(
+            &schema(),
+            &ConfigReviewRequest::new(0, vec![user_file(None)], None),
+        );
+        let paths = changed_paths(&reply);
+        for leaf in [
+            "/max_same_account_wait/kind",
+            "/max_same_account_wait/minutes",
+            "/context_management/default/kind",
+            "/anthropic_fallbacks/refusal_resend/models/claude-opus-5",
+            "/providers",
+        ] {
+            assert!(paths.contains(&leaf), "{leaf} missing from {paths:?}");
+        }
+        for path in &paths {
+            assert!(
+                !paths
+                    .iter()
+                    .any(|other| other.starts_with(&format!("{path}/"))),
+                "{path} is an object above other fields"
+            );
+        }
+    }
+
+    /// A change inside a map or a tagged choice is reported at the leaves it changes, with the
+    /// apply kind of the setting they belong to; a member the new choice drops reads null, and
+    /// map entries the file doesn't name keep their defaults.
+    #[test]
+    fn changes_inside_maps_and_choices_name_their_leaves() {
+        let request = ConfigReviewRequest::new(
+            1,
+            vec![user_file(Some(
+                r#"{"max_same_account_wait": {"kind": "max"},
+                    "anthropic_fallbacks": {"refusal_resend": {"models": {"claude-opus-5": "claude-opus-4-8", "claude-haiku-5-5": "claude-opus-4-8"}}}}"#,
+            ))],
+            Some(approved(json!({}))),
+        );
+        let reply = review_request(&schema(), &request);
+        assert!(reply.refusals.is_empty(), "{:?}", reply.refusals);
+        let field = |path: &str| {
+            reply
+                .fields
+                .iter()
+                .find(|field| field.path == path)
+                .unwrap_or_else(|| panic!("{path} missing from {:?}", changed_paths(&reply)))
+        };
+        let kind = field("/max_same_account_wait/kind");
+        assert_eq!(kind.apply, ApplyKind::ModuleRestart);
+        assert_eq!(kind.new_source, Layer::User);
+        let minutes = field("/max_same_account_wait/minutes");
+        assert_eq!(
+            serde_json::to_value(&minutes.new).unwrap(),
+            serde_json::to_value(subc_config::RecordedValue::new(Value::Null)).unwrap()
+        );
+        let added = field("/anthropic_fallbacks/refusal_resend/models/claude-haiku-5-5");
+        assert_eq!(added.apply, ApplyKind::ModuleRestart);
+        assert_eq!(added.old_source, Layer::Default);
+        // The entry the file repeats changes only its source; the others aren't fields at all.
+        assert_eq!(
+            field("/anthropic_fallbacks/refusal_resend/models/claude-opus-5").new_source,
+            Layer::User
+        );
+        assert!(!changed_paths(&reply)
+            .contains(&"/anthropic_fallbacks/refusal_resend/models/claude-fable-5"));
+    }
+
     #[test]
     fn a_file_in_an_older_shape_is_refused_not_converted() {
         let request = ConfigReviewRequest::new(

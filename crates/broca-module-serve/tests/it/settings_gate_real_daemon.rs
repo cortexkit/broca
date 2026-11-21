@@ -4,9 +4,9 @@
 //!
 //! It needs a `ck-subc` built with subc's `test-support` feature, named by `SUBC_GATE_CORE_BIN`:
 //! that build lets `SUBC_TEST_CONFIG_GATE=1` turn the gate on with an isolated config store, never
-//! the operator's. The rig ck-subc the other suites use is built without it, so this file is its
-//! own suite, compiled only with broca's `settings-gate` feature.
-#![cfg(all(unix, feature = "settings-gate"))]
+//! the operator's. The rig ck-subc the other suites use is built without it, so under them broca
+//! reads its file as under any daemon that doesn't manage its settings.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
