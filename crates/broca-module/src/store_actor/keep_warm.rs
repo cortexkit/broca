@@ -1,19 +1,17 @@
-//! Keep-warm on a session kept in the session store: while a run whose keep-warm is `auto` waits on
-//! tool calls, today's scheduler (`broca_core::keep_warm_wait`) re-sends the run's last request
-//! to keep the provider's cached prefix alive, through the driver here, by the rules today's
-//! driver (`crate::keep_warm::AutomaticWarmer`) follows on a session whose log doesn't reserve
-//! each warm's billing before sending it (a log not in the overhaul format): the session's cache
-//! policy schedules it, the executor prices it and checks the account's quota, and a warm the
-//! provider answered is recorded and dates the cache.
+//! Keep-warm on a session kept in the session store: while a run whose keep-warm is `auto` waits
+//! on tool calls, `broca_core::keep_warm_wait` re-sends the run's last request through this
+//! driver to keep the provider's cached prefix alive. The session's cache policy schedules
+//! warms; the executor prices them and checks the account's quota. A warm answered by the
+//! provider is recorded and dates the cache.
 //!
 //! The request warmed is the bytes the run's transport last started sending. Before the first
 //! send after a restart, the driver instead rebuilds the recorded step's request from the view
-//! before its tool turn, waits for media readiness, and checks its recorded digest before sending.
+//! before its tool turn, waits for media readiness, and checks its recorded digest before
+//! sending.
 //!
 //! The run's writer is busy with the tool wait, so a warm's record goes to the actor, which
-//! appends it as its own record: it is queued before the driver awaits anything, so a warm the
-//! tool results cut short still has its record written, as today's queues it in the session's
-//! log before it waits for the log's barrier.
+//! appends it as its own record. It is queued before the driver awaits anything, so a warm cut
+//! short by tool results still has its record written.
 
 use std::sync::{Arc, Mutex};
 
@@ -59,7 +57,7 @@ pub(super) struct RunWarming {
 
 impl RunWarming {
     /// Keeps the driver's copy of the run's config current: the config the run's start froze,
-    /// with the refreezes recorded since applied, as today's driver is handed it.
+    /// with the refreezes recorded since applied.
     pub(super) fn refresh(
         &self,
         run: &broca_session_store::fold::operations::Run,
@@ -82,7 +80,7 @@ impl RunWarming {
 /// Reads a run's cache policy from its config, as the module's registry declares it.
 type Declare = Arc<dyn Fn(&RunConfig) -> Option<CacheDeclaration> + Send + Sync>;
 
-/// A run's keep-warm driver, which today's scheduler calls with the run's admission.
+/// A run's keep-warm driver, called by the scheduler with the run's admission.
 pub(super) struct StoreWarmer {
     session: BindIdentity,
     executor: Arc<dyn RunExecutor>,
@@ -257,7 +255,7 @@ impl KeepWarmDriver<Admission> for StoreWarmer {
 }
 
 impl StoreWarmer {
-    /// One warm of run `run_id`'s cache, as today's driver sends it.
+    /// One warm of run `run_id`'s cache.
     pub(super) async fn warm_run(&self, run_id: &RunId) -> WarmTick {
         let Some(_permit) = self.slot.acquire() else {
             return WarmTick::Skipped;
@@ -278,8 +276,8 @@ impl StoreWarmer {
         if let Err(code) = self.executor.warm_quota(&config, &headers).await {
             return stop("quota", code);
         }
-        // As today's driver checks it after the quota query, which may outlast the cached
-        // prompt: a warm too close to the cache's expiry would write the prefix again in full.
+        // Check the margin after the quota query, which may outlast the cached prompt: a warm too
+        // close to cache expiry would write the prefix again in full.
         let margin = 5_000.min(timing.ttl_ms / 10);
         if timing.after_send_ms.is_none()
             && self.clock.read().is_none_or(|reading| {
@@ -396,8 +394,7 @@ impl StoreWarmer {
 }
 
 /// The record of a keep-warm of step `step_id` of run `run_id`, whose request had the digest
-/// `request_body_sha256`, as today's driver records it on a log that doesn't reserve a warm's
-/// billing before sending it: the provider answered it, so it reached the cache.
+/// `request_body_sha256`: the provider answered the request, so it reached the cache.
 pub(super) fn warmed(
     run_id: &RunId,
     step_id: u64,
@@ -681,7 +678,7 @@ mod tests {
     }
 
     /// With neither an in-process send nor a recorded request, a warm stops before rendering or
-    /// sending anything, as today's driver does when both sources are absent.
+    /// sending anything.
     #[tokio::test]
     async fn a_run_that_sent_nothing_yet_warms_nothing() {
         let executor = Arc::new(Counting::default());

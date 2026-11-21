@@ -2,13 +2,12 @@
 //!
 //! A run's end makes its billing owed: the operational fold lists it in `billing_owed`. The
 //! store actor bills every owed run after a run ends and when it opens the session, before it
-//! takes a command: it rebuilds the records today's billing reads
+//! takes a command: it rebuilds the records read by billing
 //! ([`broca_session_loop::billing`]) with the run's model attempts, hands them to the export
 //! index's `emit_run_with_attempts`, which writes the run's segment facts and a fact per
-//! attempt, and only once that insert has committed appends a `Billed` record, which settles the
-//! run. The insert keeps a fact already stored under the same id
-//! unchanged, so billing a run twice (after a crash between the insert and its `Billed`) writes
-//! nothing new.
+//! attempt, and only once that insert has committed appends a `Billed` record, which settles
+//! the run. The insert keeps a fact already stored under the same id unchanged, so billing
+//! a run twice (after a crash between the insert and its `Billed`) writes nothing new.
 
 use std::sync::Arc;
 
@@ -20,7 +19,7 @@ use broca_session_store::backend::SessionBackend;
 use broca_session_store::session::Session;
 
 /// Where a session's spend facts are written: the deployment's usage export, and the
-/// charge-basis resolver today's runs are billed with.
+/// charge-basis resolver used to bill runs.
 #[derive(Clone)]
 pub struct StoreBilling {
     pub index: Arc<dyn ExportIndex>,

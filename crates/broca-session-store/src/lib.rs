@@ -5,9 +5,8 @@
 //! of older history, and shared setup parts, behind a backend interface. Sessions are encrypted
 //! unless the deployment chose plain mode for them when they were created (see `keys`).
 //!
-//! This crate is built standalone. It depends on none of today's storage crates (`broca-wal`,
-//! `broca-store`) or on the run loop, and it never will: the converter crate is the only code
-//! that reads both formats. Where the two would meet, callers adapt to this crate's state.
+//! This crate is built standalone. It does not depend on the run loop, and it never will:
+//! callers adapt to this crate's state.
 //!
 //! Modules so far:
 //! - `codec`: the tagged binary encoding every record, page and part is written in.

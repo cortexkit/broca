@@ -1,9 +1,9 @@
-//! The session's owner facts in the form today's admission rules read them.
+//! The session's owner facts in the form used by the admission rules.
 //!
 //! The store's operational fold keeps the owner summary its run starts recorded
 //! ([`Owner`]); `broca_core::scope_admission` decides who may send to, cancel or retract a
-//! session from a `SessionOwnershipV1`. This builds that summary from the fold, so a session in
-//! the session store is judged by the same rules as one in today's.
+//! session from a `SessionOwnershipV1`. This builds that summary from the fold so a session
+//! in the session store is judged by the rules in `broca_core::scope_admission`.
 
 use broca_core::admission::SessionOwnershipV1;
 use broca_session_store::fold::operations::Owner;
@@ -67,9 +67,9 @@ pub fn ownership_with_first_episode(
     Ok(summary)
 }
 
-/// [`ownership_with_first_episode`] plus the sender policy the session's latest accepted refresh
-/// set (`sender_admission`), as today's summary carries it from the refresh's acceptance: the
-/// senders every sender check reads ([`crate::plan::senders`]).
+/// [`ownership_with_first_episode`] plus the sender policy the session's latest accepted
+/// refresh set (`sender_admission`), as recorded when the refresh was accepted: the senders
+/// every sender check reads ([`crate::plan::senders`]).
 pub fn ownership_with_plan(
     operations: &broca_session_store::fold::operations::Operations,
     parts: &dyn crate::parts::Parts,

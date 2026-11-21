@@ -1,20 +1,18 @@
 //! Sends whose `delivery` is an ordered list of modes, on a session kept in the session store.
 //!
-//! Admission follows today's actor (`string_sender`, `ordered_sender`,
-//! `render_ordered_template` and `queue_ordered_submission` in `crate::actor`), built from the
-//! same shared rules: the owner check (`broca_core::scope_admission::decide_owner_access`), the
-//! plan's current senders (`broca_session_loop::plan::senders`), llm-runner's `admit_delivery`,
-//! `legacy_equivalent` and `render`, and broca-core's `OrderedSend::replaced_by` and
-//! `DeliveryOrder::expired_at`.
+//! Admission checks owner access with `broca_core::scope_admission::decide_owner_access`, uses
+//! the plan's current senders from `broca_session_loop::plan::senders`, and applies
+//! llm-runner's `admit_delivery`, `legacy_equivalent` and `render`, plus broca-core's
+//! `OrderedSend::replaced_by` and `DeliveryOrder::expired_at`.
 //!
-//! An admitted send is written as `DeliveryOrdered` then `QueuedSend`, durable before the reply,
-//! in one batch with the `SendEnded` of the send it supersedes (first) and its own `SendEnded`
-//! when it arrives expired (last). It then waits in the session's queue, which the records
-//! build (`Operations::queue`): the running run reads it at each boundary and delivers it in the
-//! first mode of its list possible there, the same protocol steers use. An order naming
-//! `idle_start` starts a run on an idle session, as the queue drains.
-//! An order without one never starts a run, and stays queued across runs until a boundary
-//! delivers it or a drain finds it expired.
+//! An admitted send is written as `DeliveryOrdered` then `QueuedSend`, durable before the
+//! reply, in one batch with the `SendEnded` of the send it supersedes (first) and its own
+//! `SendEnded` when it arrives expired (last). It waits in the session's queue, built by
+//! `Operations::queue`: the running run reads it at each boundary and delivers it in the
+//! first mode in its list that is possible there, using the same protocol as steers. An order
+//! naming `idle_start` starts a run on an idle session as the queue drains. An order without
+//! one never starts a run and stays queued across runs until a boundary delivers it or a drain
+//! finds it expired.
 
 use broca_protocol::{BindPrincipal, DeliveryMode, DeliveryOrder, SubmissionId, SubmissionRequest};
 use broca_session_loop::queue;
@@ -35,7 +33,7 @@ pub(super) struct QueuedOrder {
     pub submission_id: String,
     pub order: DeliveryOrder,
     /// Whose dedupe key it carries: the plan-named sender its order names, else the principal
-    /// it was queued under, as today's queue reads it (`OrderedSend::from_pending`).
+    /// it was queued under.
     pub principal: Option<BindPrincipal>,
 }
 
@@ -54,7 +52,7 @@ fn ended(submission_id: &str, reason: &SendEndReason) -> Result<Record, String> 
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// The session's owner summary for the owner check, with the sender policy its latest
-    /// accepted refresh set, as today's summary carries it.
+    /// accepted refresh set.
     fn sender_ownership(&self) -> Result<broca_core::SessionOwnershipV1, SendOutcome> {
         broca_session_loop::owner::ownership_with_plan(self.session.operations(), &self.parts)
             .map_err(|error| {
@@ -65,8 +63,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// The modules other than the owner whose sends the session admits, from its current plan
-    /// (the latest accepted refresh's, else the first run's), and whether a refresh set them, as
-    /// today's actor reads them (`effective_plan_senders`): every sender read goes through here.
+    /// (the latest accepted refresh's, else the first run's), and whether a refresh set them.
+    /// Every sender read goes through here.
     fn plan_senders(&self) -> Result<PlanSenders, SendOutcome> {
         let operations = self.session.operations();
         Ok(PlanSenders {
@@ -111,12 +109,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
     }
 
-    /// How a send with a string `delivery` is admitted, as today's actor admits it
-    /// (`string_sender`): from the owner, or a caller the owner check decides on, unchanged; from
-    /// a module the plan names, `queue` and `steer` as the lists they stand for (`[idle_start]`
-    /// and `[steer, idle_start]`) and `interrupt` on its grant, continuing under the session's
-    /// frozen principal, each as its grants allow (`admit_delivery`). Once a refresh set the
-    /// session's senders, a module it doesn't name is refused.
+    /// How a send with a string `delivery` is admitted: the owner, or a caller allowed by the
+    /// owner check, keeps its delivery unchanged. For a plan-named module, `queue` and `steer`
+    /// map to the lists they represent (`[idle_start]` and `[steer, idle_start]`);
+    /// `interrupt` continues under the session's frozen principal. Each is allowed only by its
+    /// grant (`admit_delivery`). Once a refresh has set the session's senders, a module it
+    /// doesn't name is refused.
     pub(super) fn string_sender(
         &self,
         request: &SubmissionRequest,
@@ -137,7 +135,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         let PlanSenders { senders, refreshed } = self.plan_senders()?;
         // Without a sender policy from a refresh, a module the plan doesn't name is left to the
-        // owner check further on, as today's actor leaves it.
+        // owner check further on.
         if !senders
             .iter()
             .any(|sender| broca_protocol::same_module(&sender.module, module_id))
@@ -189,8 +187,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Whether an ordered send comes from the session's owner (`Ok(None)`), from a plan-named
     /// sender (`Ok(Some(the session's frozen principal))`, which the send continues under), or
-    /// is refused, as today's actor decides it: the sender is the route's attested principal,
-    /// and only a sender the plan grants `idle_start` may send a list naming it.
+    /// is refused: the sender is the route's attested principal, and only a sender the plan
+    /// grants `idle_start` may send a list naming it.
     pub(super) fn ordered_sender(
         &self,
         request: &SubmissionRequest,
@@ -259,11 +257,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         frozen_principal(&ownership).map(Some)
     }
 
-    /// Renders the send's template once, at admission, from the attested sender's plan entry,
-    /// as today's actor renders it: the queued request carries the text, so a later boundary
-    /// places those bytes and never renders the slots again. A `part_tag` slot renders the
-    /// number the session's next request shows for the part it names ([`Self::shown_numbers`]);
-    /// a part that request doesn't show ends the send `template_part_gone`, naming the slot.
+    /// Renders the send's template once, at admission, from the attested sender's plan entry.
+    /// The queued request carries the text, so a later boundary places those bytes without
+    /// rendering the slots again. A `part_tag` slot renders the number the session's next
+    /// request shows for the part it names ([`Self::shown_numbers`]); a part that request
+    /// doesn't show ends the send `template_part_gone`, naming the slot.
     pub(super) async fn render_ordered_template(
         &self,
         request: &mut SubmissionRequest,
@@ -435,9 +433,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(orders)
     }
 
-    /// Whether the queue holds a send that starts a run once the session is idle, as today's
-    /// actor counts it (`has_pending`): every plain send does, and an ordered one only when its
-    /// list names `idle_start`.
+    /// Whether the queue holds a send that starts a run once the session is idle: every plain
+    /// send does, and an ordered one only when its list names `idle_start`.
     pub(super) async fn queue_starts_runs(&self) -> Result<bool, String> {
         for pending in self.session.operations().queue.clone() {
             if !pending.ordered {
@@ -454,8 +451,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(false)
     }
 
-    /// Ends every queued ordered send whose expiry has passed, durably, as today's actor does
-    /// before its queue drains (`expire_ordered_sends`).
+    /// Ends every queued ordered send whose expiry has passed, durably, before the queue drains.
     pub(super) async fn expire_ordered(&mut self) -> Result<(), String> {
         let now = now_ms();
         let mut records = Vec::new();
@@ -476,13 +472,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(())
     }
 
-    /// Queues `start`, an ordered send, as today's actor queues one: a retry of a send still
-    /// queued is answered from its record; otherwise its input goes through the session's
-    /// `pre_user` transforms, and its records are written durably, superseding the undelivered
-    /// send from the same sender under the same dedupe key. A send expired on arrival is
-    /// answered ended. On an idle session a list naming `idle_start` starts its run now, and the
-    /// sender hears `active` once the run's start is durable. `ordered_by` is the plan-named
-    /// sender, when it isn't the owner.
+    /// Queues `start`, an ordered send. A retry of a send still queued is answered from its
+    /// record; otherwise, its input goes through the session's `pre_user` transforms, and its
+    /// records are written durably, superseding the undelivered send from the same sender under
+    /// the same dedupe key. A send expired on arrival is answered as ended. On an idle session,
+    /// a list naming `idle_start` starts its run now, and the sender hears `active` once the
+    /// run's start is durable. `ordered_by` is the plan-named sender, when it isn't the owner.
     pub(super) async fn queue_ordered(
         &mut self,
         start: Start,
@@ -684,12 +679,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
-    /// Stages the attachments an ordered send's `content` names into its input and checks them,
-    /// as today's actor does for an ordered send (`queue_ordered_submission`): against the
-    /// running run's media, as its start froze them, when the list may steer into that run, else
-    /// against the profile the executor quotes for the send's model. A send holding media whose
-    /// list names neither `steer` nor `idle_start` is refused as media its carrier can't take:
-    /// a tool result carries text only, and turn-scoped system text is a template's text.
+    /// Stages the attachments an ordered send's `content` names into its input and checks them
+    /// against the running run's media, as its start froze them, when the list may steer into
+    /// that run; otherwise, it checks them against the profile the executor quotes for the
+    /// send's model. A send holding media whose list names neither `steer` nor `idle_start` is
+    /// refused as media its carrier can't take: a tool result carries text only, and
+    /// turn-scoped system text is a template's text.
     async fn stage_ordered_media(
         &self,
         request: &mut SubmissionRequest,
@@ -747,8 +742,8 @@ fn frozen_principal(
         })
 }
 
-/// Whether a send that leaves its model to the session may take the model of the run it joins,
-/// as today's actor lets one whose list names a mode delivered into a running run.
+/// Whether a send that leaves its model to the session may take the model of the run it joins:
+/// it may do so when its list names a mode delivered into a running run.
 pub(super) fn joins_a_run(order: &DeliveryOrder) -> bool {
     order.modes.iter().any(|mode| {
         matches!(

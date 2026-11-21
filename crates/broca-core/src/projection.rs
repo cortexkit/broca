@@ -225,7 +225,7 @@ pub struct ProjectedNotice {
 }
 
 /// The lifecycle event of message `mid`: started, or finished. With no message, a reset.
-/// Shared by today's projection and the projection of a session kept in the session store.
+/// Shared by the projection of a session in the session store.
 pub fn message_lifecycle_event(
     mid: Option<String>,
     finished: bool,
@@ -436,7 +436,7 @@ pub fn run_started_unit(
 
 /// What a run's end tells about it besides its reason: what the run did before it ended.
 pub struct RunEndFacts<'a> {
-    /// The run, which today's end record doesn't name.
+    /// The run.
     pub run_id: Option<&'a RunId>,
     pub reason: RunFinishReason,
     pub usage: broca_protocol::Usage,

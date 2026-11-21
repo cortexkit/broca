@@ -1,9 +1,8 @@
-//! A send's service tier level, admitted before anything is written: a level the runner doesn't know,
-//! or one the send's model can't be sent at, is refused; a running or paused run keeps the level
-//! it froze; and with no level of its own, a session's first run takes the one its plan's model
-//! selection names. The send then carries the level it was admitted at: into the run it starts,
-//! whose admission applies it as today's executor applies a queued send's level, or into the
-//! queue with it.
+//! A send's service tier level, admitted before anything is written: a level the runner doesn't
+//! know, or one the send's model can't be sent at, is refused; a running or paused run keeps
+//! the level it froze; and with no level of its own, a session's first run takes the one its
+//! plan's model selection names. The send carries its admitted level into the run it starts,
+//! where admission applies it, or into the queue to be applied when its run starts.
 
 use broca_protocol::request::SubmissionRequest;
 use broca_session_loop::writer::Writer as _;
@@ -14,7 +13,7 @@ use crate::actor::SendOutcome;
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Admits `request`'s service tier level, leaving it at the level its run is sent at, or
-    /// answers today's refusal. `manifest` is the plan a session's first send fetched, whose
+    /// answers with the refusal. `manifest` is the plan a session's first send fetched, whose
     /// model selection a first run follows.
     pub(super) fn admit_service_tier(
         &self,

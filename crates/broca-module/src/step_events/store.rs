@@ -299,7 +299,7 @@ impl Observer {
                     return;
                 };
                 // request_body_len is canonical, not the physical (possibly compressed) body
-                // length that today's reservation records for this event field.
+                // length.
                 event.work_class.clone_from(&run.work_class);
                 event.context_limit = run.context_limit;
                 event.route_decision_id.clone_from(&run.route_decision_id);

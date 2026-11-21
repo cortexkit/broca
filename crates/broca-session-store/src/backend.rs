@@ -31,8 +31,7 @@ use crate::codec::{hex, Id128};
 /// A head version: it only grows, and it is the compare-and-swap version and the fencing token.
 pub type Version = u64;
 
-/// A session's storage address: the hash of its (project root, harness, session) triple, as
-/// today's log file names use.
+/// A session's storage address: the hash of its (project root, harness, session) triple.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionAddr(pub String);
 

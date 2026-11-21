@@ -45,7 +45,7 @@ pub fn refusal(model: &str, kind: MediaKind, reason: MediaMarkerReason) -> Media
 }
 
 /// False and unknown catalog facts both fail closed. A missing frozen profile is
-/// an older text-only admission, not permission to consult today's catalog.
+/// an older text-only admission, not permission to consult the current catalog.
 pub fn check_item(
     profile: Option<&MediaProfile>,
     model: &str,

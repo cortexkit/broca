@@ -4162,7 +4162,7 @@ pub struct AuthSelection {
     /// The parameters broca sent on the vault `credential.get` that resolved this selection,
     /// recorded from the call itself so the vault's own record of that request (served,
     /// refreshed, refused) can be joined to what broca ASKED for. Recorded per run rather than
-    /// read from today's build: a later change to broca's defaults must not silently rewrite
+    /// read from the current build: a later change to broca's defaults must not silently rewrite
     /// what an older run asked.
     ///
     /// PRESENT IFF THE VAULT'S REPLY WAS RECEIVED -- a token, or any answer the vault itself
@@ -4311,8 +4311,7 @@ pub struct VaultRequest {
     pub force_refresh: Option<bool>,
     /// The vault operation this request was sent as. A consumer joining against the vault's
     /// `auth_events` looks for this operation. Written on every request recorded since the
-    /// operation name was added; absent on older records, which were all `credential.get`
-    /// (see [`VaultRequest::op_or_legacy`]).
+    /// operation name was added; absent on older records, which were all `credential.get`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op: Option<VaultReadOp>,
 }

@@ -15,8 +15,7 @@ pub struct MemoryReportParams {}
 /// Sizes and counts only: it never carries content, message ids or anything else from a
 /// transcript. A session is named by its store address.
 ///
-/// "The session store" is the session store of `broca-session-store`; "today's storage" is the
-/// write-ahead log the older runner keeps sessions in, which the report counts and doesn't size.
+/// Sessions still open in the old write-ahead log are counted but not sized by this report.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryReport {
     /// Every session open in the session store (`broca-session-store`), largest first.
@@ -28,7 +27,7 @@ pub struct MemoryReport {
     /// counted, not sized.
     #[serde(default)]
     pub unanswered_sessions: u64,
-    /// Sessions open on today's storage (the write-ahead log), which the report doesn't size.
+    /// Sessions still open in the old write-ahead log are counted but not sized.
     pub legacy_sessions: u64,
     /// The sizes of every session in `sessions` added up, by holder.
     pub totals: MemoryHolders,

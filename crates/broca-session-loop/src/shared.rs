@@ -148,8 +148,8 @@ pub struct ActorWriter {
     next_seq: u64,
     message_id_prefix: String,
     media: Option<Arc<dyn MediaCapture>>,
-    /// The seq of the session's last record known durable, as today's WAL writer's durable
-    /// head counts it, for reporters that must name only durable records.
+    /// The seq of the session's last record known durable, for reporters that must name only
+    /// durable records.
     durable_head: Arc<AtomicU64>,
     /// Where the run's transcript handle goes for the actor's memory report, when it asks for one
     /// (see [`ActorWriter::sharing_window`]).

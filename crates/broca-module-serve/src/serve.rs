@@ -2912,8 +2912,8 @@ where
             )
             .await;
         }
-        // Establish storage ownership before authorization or dispatch can answer from today's
-        // WAL. Without a store runtime the rollback guard refuses every op; with one, only ops
+        // Establish storage ownership before authorization or dispatch handles the request.
+        // Without a store runtime the rollback guard refuses every op; with one, only ops
         // implemented for the session store may proceed.
         match handler.kept_in_new_storage(&session) {
             Ok(true) if !served_on_new_storage(method, params) => {
@@ -3771,8 +3771,9 @@ where
             }
         }
         OP_IMPORT if req.params.get("source").is_some() => {
-            // A head's history read from a file another host exported, into a session the new
-            // storage creates. An import carrying its messages inline is today's import, below.
+            // A head's history is read from a file exported by another host into a session
+            // created by the session store. An import carrying its messages inline is handled
+            // by the inline import below.
             let params: broca_wire::head_import::FileImportParams =
                 match serde_json::from_value(req.params) {
                     Ok(params) => params,
@@ -5040,7 +5041,6 @@ where
                             None => break, // the coordinator's subscriber task ended (sink closed)
                         },
                     };
-                    // Today's storage never accepts reader policies; its stream behavior is unchanged.
                     let admission = match handler.kept_in_new_storage(&session) {
                         Ok(true) => handler.authorize_session_read(&session, &read_access).await,
                         Ok(false) => Ok(()),
@@ -5676,13 +5676,13 @@ fn restore_all(params: &serde_json::Value) -> Result<bool, String> {
 /// The refusal of an op that has no implementation yet for a session kept in the session store.
 const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 
-/// The refusal of an op that serves only sessions kept in the session store, for a session today's
-/// storage keeps. Permanent while the session stays there.
+/// The refusal of an op only the session store serves, from a handler that has no session
+/// store. Only test handlers lack one.
 const NOT_SERVED_ON_OLD_STORAGE: &str = "not_served_on_old_storage";
 
-/// Whether `method` is served for a session kept in the session store. Every other op is refused
-/// `not_served_on_new_storage` for such a session, so none can fall through to today's WAL
-/// reads. An op joins this list in the change that gives it a store implementation.
+/// Whether `method` is served for a session in the session store. Every other op is refused
+/// with `not_served_on_new_storage` for such a session. An op joins this list in the change
+/// that gives it a store implementation.
 ///
 /// The list covers the session's own route. A `compaction-runner/v1` route (`bind`,
 /// `session.entries`, `session.applied_view`, `session.apply_view`) is dispatched by its role
@@ -5704,8 +5704,8 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         OP_RUN_TOOL_CALLS => true,
         // The store actor serves sends, cancels and retractions.
         OP_SEND | OP_CANCEL | OP_RETRACT => true,
-        // Plan refreshes, through today's preflight, decided and written by the store actor,
-        // and the baseline they are checked against (`store_plan_change::baseline`).
+        // Plan refreshes go through the current preflight, are decided and written by the store
+        // actor, and are checked against the baseline (`store_plan_change::baseline`).
         OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX | OP_BASELINE => true,
         // Both file and inline imports write one seeded batch through the store actor.
         OP_IMPORT => true,
@@ -5722,7 +5722,7 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         // cache clock (`store_actor::warm`).
         OP_WARM => true,
         // Forks of a head read it without an actor and write only their own sessions
-        // (`broca_module::fork_answer`); a session on today's storage refuses them by name.
+        // (`broca_module::fork_answer`).
         cortexkit_role_llm_runner::ops::SESSION_FORK_PREPARE
         | cortexkit_role_llm_runner::ops::SESSION_FORK_ASK
         | cortexkit_role_llm_runner::ops::SESSION_FORK_END => true,
@@ -6142,9 +6142,8 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     match plan_state {
         broca_module::serve::PlanState::Admitted { frozen } => {
             // While a change is pending, a send whose plan is the effective plan or the latest
-            // accepted one is not drift. That replaces today's plain different-plan refusal for
-            // sessions with session_change state. Sessions that never received a refresh keep
-            // today's rule exactly.
+            // accepted one is not drift. Sessions that have never received a refresh still
+            // refuse a send with a different plan.
             if let Some((effective, accepted)) = handler.session_change_identities(session).await {
                 cortexkit_role_llm_runner::session_change::check_send_drift(
                     effective.as_deref(),

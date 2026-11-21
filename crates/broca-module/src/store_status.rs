@@ -3,35 +3,31 @@
 //! The no-run `status` stays on the registry's own path (`route_status`), which asks the
 //! session's store actor, opening it when the session needs recovering.
 //!
-//! A reply equals today's for the same history. It is built from the session read-only (see
-//! `store_reads`, which serves it from the session's actor or from a kept view): the operational
-//! fold for the latest run, and for any run the run's own
-//! records, found through the id index and read from its start to its end. Today's reconciliation
-//! (`broca_core::reconcile_run_state`) walks today's records; the walk here is the same walk over
-//! the store's records, and every rule it applies to values (the step's normalized finish, the
-//! structured-output result of an ended run, the run's usage arithmetic, the indeterminate-call
-//! tracking) is the one function both walks call.
+//! Replies are built read-only from the session (see `store_reads`, which serves them from the
+//! session's actor or from a kept view): the operational fold for the latest run, and each
+//! run's own records, found through the id index and read from its start to its end.
+//! `broca_core::reconcile_run_state` applies the rules for a step's normalized finish, the
+//! structured-output result of an ended run, run usage arithmetic, and indeterminate-call
+//! tracking.
 //!
-//! Differences from today's reply, by design:
-//! - an active run's `step` (the in-flight model step) is served only when the session's store
-//!   actor answers the read: it is a live hint the actor keeps in memory, as today's actor does,
-//!   and nothing durable holds it;
+//! Read behavior:
+//! - An active run's `step` (the in-flight model step) is served only when the session's store
+//!   actor answers the read: it is a live hint the actor keeps in memory, and nothing durable
+//!   holds it;
 //! - `awaiting_approval` is always absent: the session store takes no approval questions;
 //! - a final message's `mid` is the id the session stored when it placed the message;
-//! - a final message's text is cleaned of tag notation whenever the message's entry facts say its
-//!   run cleans replies, as `session.entries` serves it. Today's `run.result` cleans by the run's
-//!   own tag rules only, and so serves the notation on a run that the compaction view showed tag
-//!   numbers while its own `render_tags` was off.
+//! - a final message's text is cleaned of tag notation whenever the message's entry facts say
+//!   its run cleans replies, as `session.entries` serves it.
 //!
-//! A run that the fold shows unfinished on a session no store actor holds was cut off by a crash,
-//! and the session's next open records its end (`store_actor::recovery_mode`). A read serves
-//! that end only when the fold alone decides it, so a terminal state served here never changes
-//! later; any other such run is refused by name, `run_end_unrecorded`, until the open records it.
+//! A run that the fold shows unfinished on a session no store actor holds was cut off by a
+//! crash, and the session's next open records its end (`store_actor::recovery_mode`). A read
+//! serves that end only when the fold alone decides it, so a terminal state served here never
+//! changes later; any other such run is refused by name, `run_end_unrecorded`, until the open
+//! records it.
 //!
-//! Facts this storage can't serve yet are refused by name, permanently, never guessed: a
+//! Facts the session store can't serve yet are refused by name, permanently, never guessed: a
 //! completed run whose final message a revert has since removed (`final_message_reverted`).
-//! `run.tool_calls` isn't served
-//! here.
+//! `run.tool_calls` isn't served here.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -53,7 +49,7 @@ pub enum StatusError {
     Session(SessionError),
     /// The session's records contradict each other, or name a value no build writes.
     Damaged(String),
-    /// Today's reply carries a fact this storage can't serve yet. Permanent: `code` names it.
+    /// The reply carries a fact the session store can't serve yet. Permanent: `code` names it.
     Unserved { code: &'static str, message: String },
     /// The run's end isn't recorded, and only the session's next open decides it. Transient.
     EndUnrecorded { run_id: String },
@@ -114,7 +110,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T
     serde_json::from_value(value.clone()).map_err(|error| damaged(format!("{what}: {error}")))
 }
 
-/// What the store says about one run, as today's reconciliation reports it.
+/// What the store says about one run.
 #[derive(Debug, Clone)]
 pub struct RunFacts {
     pub wait: crate::store_awaits::RunWait,
@@ -330,7 +326,7 @@ impl Default for SettledRuns {
     }
 }
 
-/// A run state with nothing known yet but `state`, as today's reconciliation starts one.
+/// A run state with nothing known yet but `state`.
 fn fresh_state(state: RunIndexState) -> ReconciledRunState {
     ReconciledRunState {
         finish: None,
@@ -379,9 +375,8 @@ struct End {
     error: Option<broca_protocol::ProviderError>,
 }
 
-/// One run's own records walked in seq order, as `broca_core::reconcile_run_state` walks today's
-/// records for it. Records of other runs inside the range are walked too, by the same rules, so a
-/// run id that names several starts reads as today's does.
+/// One run's own records walked in seq order. Records of other runs inside the range are walked
+/// too, by the same rules, so a run id that names several starts is read using those rules.
 struct Walk<'a> {
     run_id: &'a str,
     parts: &'a dyn Parts,
@@ -699,7 +694,8 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    /// Records of today's that the new format keeps whole, by today's record name.
+    /// Records converted from the old log format that the session store keeps whole, under
+    /// their old record names.
     fn event(&mut self, event: &broca_session_store::record::Event) -> Result<(), StatusError> {
         let ours = self.ours();
         let body = event.body.as_ref().unwrap_or(&Value::Null);
@@ -809,7 +805,7 @@ impl<'a> Walk<'a> {
         self.found = Some(state);
     }
 
-    /// The run's state once every record is walked, as today's reconciliation finishes it.
+    /// The run's state once every record is walked.
     fn finish(self) -> Option<(ReconciledRunState, WalkRest)> {
         let rest = WalkRest {
             interrupt_reason: self.interrupt_reason,
@@ -871,8 +867,8 @@ fn receipt_title(receipt: Option<&Value>) -> Option<String> {
     receipt?.get("title")?.as_str().map(str::to_owned)
 }
 
-/// The state of a run whose queued send failed its admission, as today's reconciliation reads
-/// its `Retracted` record with a failure: an error, with no steer left undelivered.
+/// The state of a run whose queued send failed admission: an error, with no steer left
+/// undelivered.
 fn admission_failed(error: broca_protocol::ProviderError) -> ReconciledRunState {
     let mut state = fresh_state(RunIndexState::Error);
     state.undelivered_steers = Some(Vec::new());
@@ -884,7 +880,7 @@ fn admission_failed(error: broca_protocol::ProviderError) -> ReconciledRunState 
 #[derive(Debug, Clone)]
 pub enum FinalError {
     /// A revert removed the run's messages from the transcript, so the message the run ended
-    /// with is no longer the one at its place. Today's storage still reads it from its log.
+    /// with is no longer the one at its place.
     Reverted,
     Damaged(String),
 }
@@ -1116,11 +1112,12 @@ fn close_open_batch<B: SessionBackend>(
 /// last assistant message of the transcript as it stood when the run ended. `cleans_text` says
 /// whether the run's tag rules clean the text of the messages it wrote.
 ///
-/// A run that placed no message of its own, as an import's seeded run, ended with the transcript
-/// as the run-less messages placed while it was active (`unattributed`) left it, and today's
-/// storage serves that transcript's last assistant message, which the run didn't write. Only
-/// those messages are searched: a run that placed messages of its own is answered from them
-/// alone, as before, and the search never reaches a message placed before the run started.
+/// A run that placed no message of its own, as an import's seeded run, ended with the
+/// transcript as the run-less messages placed while it was active (`unattributed`) left it.
+/// Its final message is the transcript's last assistant message among those messages, which
+/// the run did not write. Only those messages are searched: a run that placed messages of its
+/// own is answered from them alone, and the search never reaches a message placed before the
+/// run started.
 async fn final_message<B: SessionBackend>(
     session: &Session<B>,
     placed: &std::collections::BTreeMap<u64, String>,
@@ -1333,9 +1330,9 @@ impl StoreRead<'_> {
         }
     }
 
-    /// `session.baseline`, answered only to the session's owner as today's handler answers it:
-    /// `not_yet` before the session's first run, else what it froze and the plan changes it
-    /// took since, with the first run's prompt-cache declaration.
+    /// `session.baseline`, answered only to the session's owner: `not_yet` before the session's
+    /// first run, else what it froze and the plan changes it took since, with the first run's
+    /// prompt-cache declaration.
     pub async fn baseline(
         &self,
         principal: Option<&broca_protocol::BindPrincipal>,
@@ -1388,8 +1385,8 @@ pub struct Reader<'a> {
     pub settled: Option<(&'a SettledRuns, &'a str)>,
     /// The session's id, which a reply too large to send names.
     pub session_name: &'a str,
-    /// The in-flight model step of the run the session's actor is running, which an active
-    /// run's status serves as today's does. `None` where no actor answers.
+    /// The in-flight model step of the run the session's actor is running, served as `step` for
+    /// an active run. `None` where no actor answers.
     pub live_step: Option<&'a crate::store_reads::LiveStep>,
 }
 
@@ -1582,7 +1579,7 @@ impl Reader<'_> {
     }
 }
 
-/// A run's `run.status` from its facts, as today's builder answers it. `live_step` is the
+/// A run's `run.status` from its facts. `live_step` is the
 /// in-flight step an active run serves, from the actor running it.
 pub(crate) fn status_response(
     facts: Option<RunFacts>,
@@ -1645,9 +1642,8 @@ pub(crate) fn status_response(
 }
 
 /// What became of the queued send minted from `run_id` (submission `sub-<run_id>`), from the
-/// records naming that submission, as `broca_core::delivery_order::queued_send_fate` reads
-/// today's: the first record that settles it wins. `None` when no queued send has that
-/// submission.
+/// records naming that submission: the first record that settles it wins. `None` when no queued
+/// send has that submission.
 pub async fn queued_send_fate<B: SessionBackend>(
     session: &Session<B>,
     run_id: &str,
@@ -1703,9 +1699,8 @@ pub async fn queued_send_fate<B: SessionBackend>(
     Ok(fate)
 }
 
-/// The records `send.status` reads a send's fate from, looked up by id as they are needed, as
-/// `crate::send_fate` reads today's: a send's queued submission, the run it started, and a steer
-/// sent under its key.
+/// The records `send.status` reads a send's fate from, looked up by id as they are needed: a
+/// send's queued submission, the run it started, and a steer sent under its key.
 struct SendLookup<'a, B: SessionBackend> {
     session: &'a Session<B>,
 }
@@ -1754,9 +1749,9 @@ pub(crate) async fn sender_send_run_id<B: SessionBackend>(
         .map_err(|error| format!("{error:?}"))?
 }
 
-/// The key of the call `call` in `step`, a step's records from its assistant message on, as
-/// today's reads key the call a tool-result delivery rode on: the last copy of the call's id the
-/// step dispatched or answered, keyed by its intent, or by its outcome when it had no intent.
+/// The key of the call `call` in `step`, whose records begin at its assistant message: the last
+/// copy of the call's id the step dispatched or answered, keyed by its intent, or by its
+/// outcome when it had no intent.
 fn carrier_key(step: &[(u64, Record)], call: &broca_protocol::ToolCallId) -> Option<String> {
     let mut key = None;
     for (_, record) in step {
@@ -1795,10 +1790,9 @@ impl<B: SessionBackend> SendLookup<'_, B> {
             .await?)
     }
 
-    /// The call key the delivery of the submission minted from `run`, delivered as `mode`,
-    /// names, by the rule today's reads take (`send_fate::delivered_call_key`): the key of the
-    /// ride envelope its text was appended with, else, for a tool-result delivery recorded
-    /// before envelopes existed, the key of the call whose result carried it.
+    /// The call key named by `mode` for the delivery of the submission minted from `run`: the
+    /// key of the ride envelope with which its text was appended, or, for a tool-result delivery
+    /// recorded before envelopes existed, the key of the call whose result carried it.
     async fn delivered_call_key(
         &self,
         run: &RunId,
@@ -1925,9 +1919,8 @@ impl<B: SessionBackend> SendLookup<'_, B> {
         Ok(None)
     }
 
-    /// Where the steer at `seq`, which joined `joined`, was delivered, as
-    /// `crate::actor::steer_delivery` reads today's records: the first model step after it
-    /// rendered it, in the run it joined (`step`) or a later one (`turn`). `None` while no step
+    /// Where the steer at `seq`, which joined `joined`, was delivered: the first model step after
+    /// it rendered, in the run it joined (`step`) or a later one (`turn`). `None` while no step
     /// has.
     async fn steer_delivery(
         &self,
@@ -2158,7 +2151,7 @@ fn principal_of(
 impl Reader<'_> {
     /// `send.status` and `session.send_status`: what became of the send `send_id`, whose run id
     /// the serve layer derived as `own_run`, asked by `principal`. A send recorded under another
-    /// sender reads as unknown, as today's does.
+    /// sender reads as unknown.
     pub async fn send_status<B: SessionBackend>(
         &self,
         session: &Session<B>,
@@ -2255,8 +2248,8 @@ impl Reader<'_> {
     }
 
     /// The recorded fate of the send `send_id` whose own run id is `own_run`, as
-    /// `send_fate::recorded_send_outcome` reads it from today's records. `None` when the session
-    /// holds no such send.
+    /// `send_fate::recorded_send_outcome` reads it from the session's records. `None` when the
+    /// session holds no such send.
     async fn send_outcome<B: SessionBackend>(
         &self,
         session: &Session<B>,
@@ -2321,8 +2314,8 @@ impl Reader<'_> {
     }
 
     /// A recorded send's outcome from the state of the run carrying it, as `send_fate`'s
-    /// `run_outcome` reads it: today's reconciliation, which reports an unfinished run as
-    /// active (or paused, when `report_pause`), whether or not anything runs it.
+    /// `run_outcome` reads it. Reconciliation reports an unfinished run as active (or paused
+    /// when `report_pause`), whether or not anything is running it.
     async fn run_outcome<B: SessionBackend>(
         &self,
         session: &Session<B>,
@@ -2331,8 +2324,7 @@ impl Reader<'_> {
         report_pause: bool,
     ) -> Result<crate::actor::SendOutcome, StatusError> {
         use crate::actor::SendOutcome;
-        // Today's reconciliation reads an unfinished run as running whether or not anything
-        // runs it.
+        // Reconciliation reads an unfinished run as running, whether or not anything runs it.
         let reader = Reader {
             live: true,
             ..self.clone()

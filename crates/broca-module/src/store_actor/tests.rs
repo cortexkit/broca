@@ -495,8 +495,8 @@ impl RunExecutor for LoopExecutor {
                 bind: req.session.clone(),
                 out: Some(&out),
                 cancel: control.cancel.clone().unwrap_or_default(),
-                // A test asks a run to stop for a restart through its control, as the module's
-                // stop asks today's runs.
+                // A test asks a run to stop for a restart through its control, as the module does
+                // on stop.
                 stop: control.stop_requested.clone().unwrap_or_default(),
                 held: None,
                 approval: &approval,
@@ -1148,7 +1148,7 @@ async fn a_retained_send_records_its_policy() {
 }
 
 /// A send attaching an upload to an actor that can't read uploads is refused before anything is
-/// written, as today's actor refuses it, never run with its attachment dropped.
+/// written; it is never run with its attachment dropped.
 #[tokio::test]
 async fn a_send_attaching_an_upload_without_upload_staging_is_refused() {
     let (commands, served, _) = actor(executor(vec![text_step("a1", "never sent")], None)).await;
@@ -1464,8 +1464,8 @@ async fn a_sign_in_pause_resumes_on_its_retry() {
     );
 }
 
-/// While a run is running, a send naming another routing decision is refused as today's actor
-/// refuses it, before its key is looked at.
+/// While a run is running, a send naming another routing decision is refused before its key is
+/// looked at.
 #[tokio::test]
 async fn a_running_runs_routing_decision_is_fixed() {
     let gate = Arc::new(Notify::new());
@@ -1796,9 +1796,8 @@ async fn appended_after_reopen(session: &Session<&'static MemoryBackend>) -> Vec
         .collect()
 }
 
-/// A run a crashed process left running is ended `Interrupted` when the session opens, as
-/// today's startup pass seals it: no model call, the crash named on the run's end. The send
-/// queued behind it then runs.
+/// A run a crashed process left running is ended `Interrupted` when the session opens: no model
+/// call is made, and the crash is named on the run's end. The send queued behind it then runs.
 #[tokio::test]
 async fn a_crashed_run_ends_interrupted_on_open_and_the_queue_drains() {
     let (backend, parts) = crashed_with_a_queued_send().await;
@@ -1830,8 +1829,7 @@ async fn a_crashed_run_ends_interrupted_on_open_and_the_queue_drains() {
 }
 
 /// A run left running with a boundary cancel pending resumes when the session opens, so the
-/// cancel ends it at its next boundary, as today's recovery carries out a pending cancel. The
-/// send queued behind it then runs.
+/// cancel ends it at its next boundary. The send queued behind it then runs.
 #[tokio::test]
 async fn a_running_run_with_a_cancel_pending_resumes_to_its_cancel_on_open() {
     let parts = SharedParts::new(Box::new(MemoryParts::default()));
@@ -2500,9 +2498,9 @@ async fn setup_parts_are_stored_before_the_records_naming_them() {
     assert_eq!(names, ["read", "edit"]);
 }
 
-/// A run still running when the actor stops, as at a module stop, ends `Interrupted` with
-/// today's shutdown seal: no further model call, and never `Cancelled`, which records a
-/// caller's decision nobody made. Nothing queued starts after it.
+/// A run still running when the actor stops, as at a module stop, ends `Interrupted`: no further
+/// model call is made, and it is never `Cancelled`, which records a caller's decision nobody
+/// made. Nothing queued starts after it.
 #[tokio::test]
 async fn a_run_running_at_a_stop_ends_interrupted_by_the_shutdown_seal() {
     let gate = Arc::new(Notify::new());

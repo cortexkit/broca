@@ -1,16 +1,15 @@
-//! Today's record form rebuilt from the new records, for the records billing reads.
+//! Billing record form rebuilt from session-store records.
 //!
-//! The usage export is built by today's builder (`broca_core::billing`) from today's records
-//! (`broca_wal::WalRecord`). A run kept in the session store is billed by rebuilding those records
-//! from its new ones and calling the same builder, so its facts can't differ from a run's on
-//! today's storage. Each function here rebuilds one kind of today's record as JSON, the form the
-//! converter's inverse (`broca-session-convert`) compares with today's logs; that comparison
-//! is what proves them exact. The converter uses these same functions, so the copy billing reads
-//! is the copy that comparison checks.
+//! The usage export is built by the billing builder (`broca_core::billing`) from
+//! `broca_wal::WalRecord` records. A run kept in the session store is billed by rebuilding
+//! those records from its session-store records and calling the same builder.
 //!
-//! The JSON leaves out the members today's record holds as null or absent alike, as the
-//! forward conversion does. A run start's `session` is left out too: the new format keeps the
-//! session's identity once, in its head, and a caller that needs the record whole adds it.
+//! Each function here rebuilds one kind of record as JSON. The conversion of old sessions used
+//! these same functions, and checked every converted log against them.
+//!
+//! The JSON leaves out members whose values are null or absent, as the forward conversion
+//! does. A run start's `session` is left out too: the session store keeps the session's
+//! identity once, in its head, and a caller that needs the whole record adds it.
 
 use broca_session_store::codec::Digest;
 use broca_session_store::record::{
@@ -47,7 +46,7 @@ pub fn text_members(
     members(payload.map(broca_protocol::json::Json::parse).as_ref())
 }
 
-/// A digest as today's records spell it: 64 lowercase hex characters.
+/// A digest's text form: 64 lowercase hex characters.
 pub fn hex(digest: &Digest) -> String {
     digest.0.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -99,7 +98,7 @@ pub fn tags(entries: impl Iterator<Item = Option<Value>>) -> Option<Value> {
     })
 }
 
-/// Today's `run_started`, from a run's start, the input entries that follow it, and the setup
+/// Builds `run_started` from a run's start, the input entries that follow it, and the setup
 /// parts it names, which `part` reads.
 pub fn run_started(
     start: &RunStart,
@@ -165,7 +164,7 @@ pub fn run_started(
     Ok(Value::Object(object))
 }
 
-/// Today's `model_step_finished`, from a step's end and its assistant message.
+/// Builds the `model_step_finished` event from a step's end and its assistant message.
 pub fn model_step_finished(assistant: &Assistant, end: &StepEnd) -> Result<Value, String> {
     let mut object = text_members(end.fallback.as_ref())?;
     object.insert("type".into(), json("model_step_finished"));
@@ -189,7 +188,7 @@ pub fn model_step_finished(assistant: &Assistant, end: &StepEnd) -> Result<Value
     Ok(Value::Object(object))
 }
 
-/// Today's `run_finished`.
+/// Builds the `run_finished` event.
 pub fn run_finished(end: &RunEnd) -> Value {
     let mut object = Map::new();
     object.insert("type".into(), json("run_finished"));
@@ -206,7 +205,7 @@ pub fn run_finished(end: &RunEnd) -> Value {
     Value::Object(object)
 }
 
-/// Today's `run_paused`.
+/// Builds the `run_paused` event.
 pub fn run_paused(pause: &Pause) -> Value {
     let mut object = Map::new();
     object.insert("type".into(), json("run_paused"));
@@ -218,7 +217,7 @@ pub fn run_paused(pause: &Pause) -> Value {
     Value::Object(object)
 }
 
-/// Today's `model_step_refused`.
+/// Builds the `model_step_refused` event.
 pub fn model_step_refused(refused: &StepRefused) -> Value {
     let mut object = Map::new();
     object.insert("type".into(), json("model_step_refused"));
@@ -236,7 +235,7 @@ pub fn model_step_refused(refused: &StepRefused) -> Value {
     Value::Object(object)
 }
 
-/// Today's `run_config_refrozen`.
+/// Builds the `run_config_refrozen` event.
 pub fn run_config_refrozen(refrozen: &ConfigRefrozen) -> Value {
     let mut object = Map::new();
     object.insert("type".into(), json("run_config_refrozen"));
@@ -249,7 +248,7 @@ pub fn run_config_refrozen(refrozen: &ConfigRefrozen) -> Value {
     Value::Object(object)
 }
 
-/// Today's `run_auth_refrozen`.
+/// Builds the `run_auth_refrozen` event.
 pub fn run_auth_refrozen(refrozen: &AuthRefrozen) -> Value {
     let mut object = Map::new();
     object.insert("type".into(), json("run_auth_refrozen"));
@@ -258,7 +257,7 @@ pub fn run_auth_refrozen(refrozen: &AuthRefrozen) -> Value {
     Value::Object(object)
 }
 
-/// Today's `cache_warmed`.
+/// Builds the `cache_warmed` event.
 pub fn cache_warmed(warmed: &Warmed) -> Result<Value, String> {
     let mut object = text_members(warmed.billing.as_ref())?;
     object.insert("type".into(), json("cache_warmed"));

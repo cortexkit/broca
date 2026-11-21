@@ -1,15 +1,14 @@
 //! What a fork attempt's model call spent, written to the usage export (llm-runner 0.8.42 §9.20
 //! `fork_answer.spend`).
 //!
-//! An ordinary run's spend facts come from today's records of the run, handed to
+//! Ordinary run spend facts come from run records, handed to
 //! `broca_core::billing::compute_segments_for_run` through the export writer's `emit_run`. A fork
-//! attempt is billed by the same builder, through the same writer: it is handed the records a
-//! one-step run would have written, under the attempt's own run identity
-//! (`ForkCallJob::run_id`) and the fork's own session. Nothing names the head's runs or session,
-//! so billing never pairs the fact with them. The run's config is the head's config at the
-//! fork's base, so the charge basis and the account come from the credential the fork is pinned
-//! to. Neither the fact nor the attempt's step event names the fork: its own session and run
-//! keep its spend apart.
+//! attempt is billed by the same builder and writer, using the records a one-step run would
+//! write, under the attempt's own run identity (`ForkCallJob::run_id`) and the fork's own
+//! session. The head's runs and session are not used for billing. The run's config is the
+//! head's config at the fork's base, so the charge basis and account come from the credential
+//! the fork is pinned to. Neither the fact nor the attempt's step event names the fork; its
+//! own session and run keep its spend apart.
 
 use broca_core::billing::{compute_segments_for_run, SpendSegment};
 use broca_core::ChargeBasisResolver;
@@ -66,7 +65,7 @@ impl AttemptSpend<'_> {
     }
 
     /// The records of a one-step run that made this attempt's model call: its start, its step and
-    /// its end, in today's form.
+    /// its end.
     pub fn records(&self) -> Vec<FramedRecord> {
         let frame = |seq, record| FramedRecord {
             seq,

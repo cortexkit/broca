@@ -2,10 +2,10 @@
 //!
 //! A request on the current compaction contract renders from the compaction provider's view,
 //! which reads the stored prompt message by message beside the transcript's entries
-//! (`compaction::prepare`). The stored prompt is the window's messages as today's loop holds
-//! them: each with the repetition warnings its run's steps earn, its position in the session and
-//! its part numbers, with an empty placeholder in place of each global system message an
-//! enrollment suppressed ([`contract_prompt`]). Deriving it copies every window message, so a compacted run keeps it
+//! (`compaction::prepare`). The stored prompt contains the window's messages: each with the
+//! repetition warnings its run's steps earn, its position in the session and its part numbers,
+//! with an empty placeholder in place of each global system message an enrollment suppressed
+//! ([`contract_prompt`]). Deriving it copies every window message, so a compacted run keeps it
 //! and at each step takes in only the messages placed since the last one. A placed message
 //! changes only when delivered text is joined into it, which the conversation fold records
 //! (`Conversation::changes`); that, a new window start, a new enrollment or a new list of the

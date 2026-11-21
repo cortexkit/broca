@@ -93,8 +93,8 @@ impl IdKind {
 /// The ids `record` names. Only ledger records are indexed: every id a transcript record names
 /// is also named by a ledger record of the same run or send.
 ///
-/// Fields owned by other components (a steer's receipt, an event's body) are read only for the
-/// idempotency keys this list names, by their field names in today's records.
+/// Fields owned by other components (a steer's receipt, an event's body) are read only for
+/// the idempotency keys this list names, using their field names in the records.
 pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
     let mut ids = Vec::new();
     let mut push = |kind: IdKind, id: Option<&str>| {

@@ -173,7 +173,7 @@ pub enum AuthMode {
     /// this synchronous resolver only shapes the supplied secret.
     Secret(String),
     /// A company AI gateway's key, sent to the gateway in the header the vault names with the
-    /// gateway's fixed headers (see [`GatewayEndpoint::auth_headers`]).
+    /// gateway's fixed headers (see [`broca_protocol::gateway::GatewayEndpoint::auth_headers`]).
     Gateway {
         key: String,
         endpoint: broca_protocol::gateway::GatewayEndpoint,
@@ -492,7 +492,7 @@ pub fn resolve_chatgpt_pause_episode_with_client(
 /// Unlike resolving the episode again, nothing about the config is re-derived from the catalog,
 /// so the provider renders exactly the bytes the recorded config pins: what re-sending a recorded
 /// request (a prompt-cache warm) needs. Auth follows the frozen route's family and opaque-endpoint
-/// distinction, not today's catalog.
+/// distinction, not the current catalog.
 // The credential, its method and both account references are separate inputs on purpose: the
 // caller resolved them, and grouping them would only rename the same values.
 #[allow(clippy::too_many_arguments)]
@@ -596,7 +596,7 @@ pub struct EpisodeRenderConfig<'a> {
     /// The OpenCode Go session header is transport metadata and is restored separately.
     pub recorded_config: Option<&'a FrozenRenderConfig>,
     /// Preserve a recorded OpenCode Go protocol when the model's current per-model pin changes.
-    /// `None` means a fresh run should use today's catalog selection.
+    /// `None` means a fresh run should use the current catalog selection.
     pub wire_family: Option<WireFamilyId>,
     /// OpenCode Go's session header is derived from the bind identity on every admission and
     /// resume. It is transport metadata, so it does not enter the frozen request-body blob.
@@ -657,7 +657,7 @@ pub struct EpisodeRenderConfig<'a> {
     /// frozen-config drift guard does not refuse it for a catalog quirk that moved since.
     pub reasoning_content_required: Option<bool>,
     /// A resume supplies `Some(recorded_policy)`, including `Some(None)` for pre-policy runs.
-    /// New admissions use `None` to select today's catalog policy.
+    /// New admissions use `None` to select the current catalog policy.
     pub reasoning_echo: Option<Option<broca_provider::policy::ReasoningEchoPolicy>>,
     /// Restore the recorded `provider_text_state` choice on resume. `None`, a newly admitted
     /// episode, keeps what the family resolved (on for the Responses and Gemini families). An
@@ -983,7 +983,7 @@ fn resolve_provider_inner(
         // honor them refuses before core can refreeze the episode or send a changed body.
         validate_recorded_fallback_auth(provider_id, auth_method, &frozen)?;
         apply_auth_method_quirks(provider_id, opts.auth_method, &mut frozen);
-        // The provider represents today's code. Core checks the family's compatibility table
+        // The provider represents the current code. Core checks the family's compatibility table
         // before comparing a blob restamped to the recorded version.
         frozen.renderer_version = match family {
             WireFamilyId::AnthropicMessages => {

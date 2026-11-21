@@ -1,39 +1,39 @@
-//! What the compaction provider and history readers read from a session kept in the session store
-//! (`broca_session_store`): the `compaction-runner/v1` route's operations and `session.history`.
+//! What the compaction provider and history readers read from a session kept in the session
+//! store (`broca_session_store`): the `compaction-runner/v1` route's operations and
+//! `session.history`.
 //!
-//! Every read loads the session read-only (`StoreRuntime::view`): no lease, no actor, no WAL. A
-//! reply here equals the reply today's storage builds for the same history, apart from the
-//! differences the session store has by design: no WAL lineage, the store's incarnation and
-//! history version, no subscribe cursor, and the store's message ids.
+//! Every read loads the session read-only (`StoreRuntime::view`): no lease and no actor.
+//! Replies use the store's incarnation and history version and its message ids; they do not
+//! include a subscribe cursor.
 //!
 //! The `compaction-runner/v1` route on a store session:
-//! - `bind` admits only the session's frozen compaction provider: the provider named by the plan
-//!   its latest run froze, else by its first run's plan, read back from the setup parts each
-//!   run's start names ([`frozen_provider`]). The session must be on the current compaction
-//!   contract (its first run froze a compaction plan version). Refusals are today's
-//!   (`compaction_not_permitted` with the same reasons). Admission is all `bind` does here: it
-//!   doesn't push a Setup to the provider when it binds, as today's actor does once per actor
-//!   life, because nothing on this storage holds the provider's per-session compaction state
-//!   between runs. The next run sends its own Setup when it starts.
+//! - `bind` admits only the session's frozen compaction provider: the provider named by the
+//!   plan its latest run froze, else by its first run's plan, read back from the setup parts
+//!   each run's start names ([`frozen_provider`]). The session must be on the current
+//!   compaction contract (its first run froze a compaction plan version). Refusals use
+//!   `compaction_not_permitted` with the applicable reasons. Admission is all `bind` does
+//!   here: it doesn't push a Setup to the provider when it binds, because the session store
+//!   holds no provider's per-session compaction state between runs. The next run sends its
+//!   own Setup when it starts.
 //! - `session.entries` serves the compaction entries `Session::entries` stores, projected by
-//!   `broca_session_loop::entries::project`, whose output the converter's `entries` command
-//!   compares, entry by entry, with today's projection of the same live logs.
-//! - `session.applied_view` serves the view the session's latest step applied, rebuilt from the
-//!   open log by the same fold the run loop restores its compaction state with, and the provider
-//!   that handed it over (`applied_by`), as today's actor names it.
-//! - `session.apply_view` writes an accepted view, which only the session's writer may do. The
-//!   store actor doesn't take one yet, so it is refused by name (`not_served_on_new_storage`).
+//!   `broca_session_loop::entries::project`.
+//! - `session.applied_view` serves the view the session's latest step applied, rebuilt from
+//!   the open log by the same fold the run loop restores its compaction state with, and the
+//!   provider that handed it over (`applied_by`).
+//! - `session.apply_view` writes an accepted view, which only the session's writer may do.
+//!   The store actor doesn't take one yet, so it is refused by name
+//!   (`not_served_on_new_storage`).
 //!
 //! `session.history` on a store session (`crate::history::read`) takes its head facts from
-//! [`history_head`] and its pages from `session.read` with display facts, which a store session
-//! serves from the store, so the raw form carries each message's sender as today's does. Message
-//! ids name the store's own ids, which only the store resolves. The display form's output
-//! references find a named part and the compaction view its writing request rendered under from
-//! facts recorded beside each message (`crate::store_output_refs`).
+//! [`history_head`] and its pages from `session.read` with display facts. The raw form
+//! includes each message's sender. Message ids name the store's own ids, which only the store
+//! resolves. The display form's output references find a named part and the compaction view
+//! its writing request rendered under from facts recorded beside each message
+//! (`crate::store_output_refs`).
 //!
-//! A read cleans tag notation out of a reply wherever the run that wrote it cleans, as today's
-//! read does: [`attach_part_tags`] numbers each message, and marks it for cleaning, by the tag
-//! rules its run froze.
+//! A read cleans tag notation out of a reply wherever the run that wrote it cleans:
+//! [`attach_part_tags`] numbers each message, and marks it for cleaning, by the tag rules its
+//! run froze.
 
 use broca_core::compaction_v2::protocol::{
     read::{Cursor, Entry, Head, ReadPage, ReadRequest, Select},
@@ -72,10 +72,9 @@ pub fn on_contract<B: SessionBackend>(session: &Session<B>) -> bool {
 }
 
 /// The compaction provider in force: the one the plan of the session's latest run names, or,
-/// when that run froze no plan, the one its first run's plan names. That is the rule today's
-/// ownership summary keeps (`SessionOwnershipV1::latest_manifest`, else the first episode's
-/// manifest), read here from the setup parts each run's start names. `None` for a session with
-/// no run, or whose plan in force names no compaction item.
+/// when that run froze no plan, the one its first run's plan names. This is the ownership
+/// rule, read here from the setup parts each run's start names. `None` for a session with no
+/// run, or whose plan in force names no compaction item.
 pub fn frozen_provider<B: SessionBackend>(
     parts: &dyn Parts,
     session: &Session<B>,
@@ -293,8 +292,8 @@ pub async fn serve_compaction<B: SessionBackend>(
             let answer = match state.applied_received() {
                 Some(view) => {
                     let mut answer = serde_json::json!({ "view": view });
-                    // Named as today's actor names it: the provider that handed the applied
-                    // view over, absent for a view a run's step accepted.
+                    // The provider that handed the applied view over, absent for a view a run's
+                    // step accepted.
                     if let Some(module) = state.applied_by() {
                         answer["applied_by"] = serde_json::json!(module);
                     }
@@ -323,8 +322,7 @@ fn admit<'s, B: SessionBackend>(
     session: Option<&'s Session<B>>,
     caller: Option<&str>,
 ) -> Result<&'s Session<B>, Refusal> {
-    // A session whose creation never committed holds no run, so it isn't on the contract, as
-    // today's storage reads a session with no log.
+    // A session whose creation never committed holds no run, so it isn't on the contract.
     let Some(session) = session else {
         return Err(Refusal::compaction_not_permitted(
             not_permitted_reasons::SESSION_NOT_HELD,
@@ -341,8 +339,8 @@ fn admit<'s, B: SessionBackend>(
 }
 
 /// `session.apply_view` on the route, for the session `key` kept in the session store: admitted
-/// and read as today's route reads it, then applied by the session's actor, which records the
-/// view and sets it in the compaction state it hands to every run (`StoreCommand::ApplyView`).
+/// and read by the route, then applied by the session's actor, which records the view and
+/// sets it in the compaction state it hands to every run (`StoreCommand::ApplyView`).
 pub async fn apply_view(
     registry: &crate::registry::LineageRegistry,
     store: &StoreRuntime,
@@ -404,10 +402,10 @@ pub async fn all_entries<B: SessionBackend>(session: &Session<B>) -> Result<Vec<
         .collect()
 }
 
-/// A `session.entries` page, as today's storage pages its whole transcript
-/// (`broca_core::compaction_v2::views::page`) with the newest entry and the applied view as its
-/// head. An `after` read loads only the entries from the ordinal it names, one past its limit so
-/// the page knows whether more follow; a read by ids or tags looks at every entry.
+/// A `session.entries` page over the whole transcript (`broca_core::compaction_v2::views::page`)
+/// with the newest entry and the applied view as its head. An `after` read loads only the
+/// entries from the ordinal it names, one past its limit so the page knows whether more
+/// follow; a read by ids or tags looks at every entry.
 pub async fn entries_page<B: SessionBackend>(
     session: &Session<B>,
     request: &ReadRequest,
@@ -469,8 +467,8 @@ fn cursor(entry: &Entry) -> Cursor {
     Cursor::new(entry.ordinal, &entry.mid, &entry.digest)
 }
 
-/// What `session.history` reads about a session kept in the session store besides its pages,
-/// which today's storage answers from `session.head` and from the WAL form of a message id.
+/// What `session.history` reads about a session kept in the session store besides its pages:
+/// head facts from `session.head` and the session store's message ids.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryHead {
     /// The identity a history cursor is bound to: the store's incarnation, or `unwritten` for a
@@ -480,7 +478,7 @@ pub struct HistoryHead {
     /// The newest message's ordinal, counting from 1; `None` for an empty transcript.
     pub last_ordinal: Option<u64>,
     /// The ordinal (from 1) of the message the read names by id, when the session holds one by
-    /// that id. Only the store resolves its own ids: they aren't positions, as today's are.
+    /// that id. Only the store resolves its own ids: they aren't positions.
     pub mid_ordinal: Option<u64>,
 }
 
@@ -531,18 +529,17 @@ pub async fn history_head_of<B: SessionBackend>(
     })
 }
 
-/// Attaches to each message of a read page the part numbers today's read attaches, from the
-/// computed tag rules each run froze (`broca_core::tags::computed_rules` over its run config),
-/// read back from the run's start and the setup parts it names, once per run on the page.
+/// Attaches to each message of a read page the part numbers from the computed tag rules each
+/// run froze (`broca_core::tags::computed_rules` over its run config), read back from the
+/// run's start and the setup parts it names, once per run on the page.
 ///
 /// A message in `numbering` (by zero-based ordinal: the run that numbered it and the number
-/// before its first part, `EntryFacts::runner_tag_base`) is numbered from that base under its
-/// run's rules, as today's replay numbers it, so output references find the parts a request
-/// showed by the numbers it showed them with. Every other model-written message is marked only
-/// for reply cleaning, where its run cleans, so every exposure
-/// (`broca_protocol::tags::exposed_message`) cleans tag notation out of the reply text exactly
-/// where today's does. A message no run wrote (an import) is neither numbered nor cleaned, as
-/// today's isn't.
+/// before its first part, `EntryFacts::runner_tag_base`) is numbered from that base under
+/// its run's rules, so output references find the parts a request showed by the numbers it
+/// showed them with. Every other model-written message is marked only for reply cleaning,
+/// wherever its run cleans, so every exposure (`broca_protocol::tags::exposed_message`)
+/// cleans tag notation out of the reply text exactly where that run cleans. A message no run
+/// wrote (an import) is neither numbered nor cleaned.
 pub async fn attach_part_tags<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,

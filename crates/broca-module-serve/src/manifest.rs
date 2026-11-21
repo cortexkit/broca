@@ -34,8 +34,6 @@ pub const OP_IMPORT: &str = "session.import";
 /// session's first step.
 pub const OP_INSTALL_VIEW: &str = broca_wire::head_import::OP_SESSION_INSTALL_VIEW;
 pub const OP_RETRACT: &str = "session.retract";
-/// Move a live, idle session from today's storage into the session store. Only the operator calls
-/// it, through `broca-session move-to-store`.
 /// Restore a session kept in the session store, or every such session, from the files its store
 /// holds after a backup came back. Only the operator calls it, through `broca-session
 /// restore-from-backup`.

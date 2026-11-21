@@ -3,14 +3,14 @@
 //! Prefrontal, Magic Context and Colliculus learn that a run started, paused, consumed a steer or
 //! ended from these events, and fall back to polling while none arrive. Each event is derived
 //! from one of the session's records once a barrier has made that record durable, so no event
-//! ever names a record a crash could take back. The events keep the bodies, subjects and
-//! publication ids the events of today's storage have, so a reader needs no change:
+//! ever names a record a crash could take back. Each event carries a body, a subject and a
+//! publication id:
 //!
-//! - `seq` is the record's seq, and `epoch` the session's incarnation in hex, the `incarnation`
-//!   reads serve. Readers dedupe on `(epoch, run_id, seq)`.
+//! - `seq` is the record's seq, and `epoch` the session's incarnation in hex, the
+//!   `incarnation` reads serve. Readers dedupe on `(epoch, run_id, seq)`.
 //! - `at_ms` is the record's own timestamp, or the wall clock when the record has none.
 //! - A steer accepted into a running run is reported when the step that places it starts
-//!   (`run.steer_consumed`), as today's projection reports it.
+//!   (`run.steer_consumed`).
 //! - A run seeded by an import or a fork never calls a provider and nobody waits on it, so it
 //!   has no events.
 //!
@@ -66,7 +66,7 @@ fn hex(bytes: &[u8]) -> String {
 struct PendingSteers {
     count: u64,
     send_ids: Vec<String>,
-    /// Whether a send id was left out, keeping the ids within today's 512-byte prefix.
+    /// Whether a send id was left out to keep ids within the 512-byte prefix.
     truncated: bool,
     last_at_ms: Option<u64>,
 }

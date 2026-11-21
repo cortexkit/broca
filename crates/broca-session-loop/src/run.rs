@@ -127,10 +127,9 @@ pub struct Admission {
     /// The window the run's model may use, in tokens; compaction states its conditions from it,
     /// and a run on a plan with a compaction provider needs one.
     pub context_limit: Option<u64>,
-    /// For a session's first run: the compaction plan version the session starts under, so it
-    /// records and renders under the current compaction contract; `None` keeps the established
-    /// layout. Today's actor asks for it when the plan names a compaction provider. A later run
-    /// keeps its session's layout whatever this says.
+    /// For a session's first run, this is the compaction plan version to start under, so it
+    /// records and renders under the current compaction contract. `None` keeps the established
+    /// layout. A later run keeps its session's layout regardless of this value.
     pub compaction_plan_version: Option<u32>,
     /// Whether the run froze part numbers into the model's view. A caller leaves it false: a new
     /// run takes it from its plan. A run read back from its start carries what the start froze.
@@ -140,13 +139,13 @@ pub struct Admission {
     /// input-token cap is refused for now.
     pub budget: Option<broca_protocol::request::BudgetConfig>,
     /// Whether the run keeps the prompt cache warm while it waits on tool calls. Absent is
-    /// off, as today's run start reads it.
+    /// off.
     pub keep_warm: Option<broca_protocol::request::KeepWarm>,
     /// The provider account the run was admitted to, frozen so a resume uses the same one.
     pub auth_selection: Option<broca_wal::AuthSelection>,
     /// Whether the run may pause on its own account when the provider says the account's limit
-    /// is reached and resets soon, rather than end, as today's admission freezes it from the
-    /// boot setting.
+    /// is reached and resets soon, rather than end. Admission freezes this from the boot
+    /// setting.
     pub account_limit_pause: bool,
     /// The routing decision the run was admitted under.
     pub route_decision_id: Option<String>,
@@ -181,7 +180,7 @@ pub struct Admission {
     /// Set when something decided before the run that it must not reach the model: a
     /// `pre_user` input transform refused the run's input, or routing refused the caller's
     /// decision. The run's start is still written, so the send has a run to report, and the run
-    /// then ends with this error before any step, as today's loop ends it. Unlike every other
+    /// then ends with this error before any step. Unlike every other
     /// field it isn't frozen into the start, and a run read back from its start has none.
     pub pre_model_error: Option<ProviderError>,
     /// The pending plan change this run applies by freezing its manifest, recorded after the
@@ -194,7 +193,7 @@ pub struct Admission {
     pub head_turn: bool,
 }
 
-/// What the send that started a run recorded about itself, as today's run start records it.
+/// What the send that started a run recorded about itself.
 #[derive(Debug, Clone, Default)]
 pub struct SendFacts {
     /// The queued send the run consumes, when it started from the queue.
@@ -236,31 +235,30 @@ pub struct Seams<'a, P, T> {
     /// pauses or ends interrupted as its restart policy says.
     pub stop: CancellationToken,
     /// The late-result runtime's waiting slots for calls a provider holds. Without it a held
-    /// call is never answered, as in today's loop, and its run pauses.
+    /// call is never answered, and its run pauses.
     pub held: Option<&'a dyn ProviderHeldLifecycle>,
     /// Decides each valid call before it is sent: allow it, narrow its input, or deny it.
     pub approval: &'a dyn ApprovalPolicy,
     /// Calls the hooks a frozen plan declares. A run whose plan declares hooks refuses to start
-    /// or resume without it, as today's loop does.
+    /// or resume without it.
     pub hook_plane: Option<Arc<dyn broca_core::hooks::HookPlane>>,
     /// Milliseconds since the epoch, for the times records carry.
     pub now_ms: &'a (dyn Fn() -> u64 + Sync),
     /// The session's address, given to the provider for its diagnostics only.
     pub session_address: Option<String>,
     /// The compaction provider's calls, for a run whose plan names one. Without it every call
-    /// fails as unavailable, as today's loop's do without a plane.
+    /// fails as unavailable.
     pub compaction_plane: Option<&'a dyn broca_core::CompactionPlane>,
-    /// The session's compaction state, kept for the session's life by whoever owns the session
-    /// (today's actor keeps it per session). Without it a run starts from the session's log.
+    /// The session's compaction state, kept for the session's life by whoever owns the session.
+    /// Without it a run starts from the session's log.
     pub compaction_session: Option<Arc<broca_core::compaction_v2::session::Session>>,
     /// Whether the run tells the session's compaction provider about the session's changes
-    /// outside its own steps, at the points today's actor has today's loop tell it
-    /// (`RunControl::compaction_changes`; see [`crate::compaction::Changes`]). Without it the
-    /// provider hears of them at the next step's notice, as from today's loop run without that
-    /// control.
+    /// outside its own steps, at the points controlled by
+    /// `RunControl::compaction_changes` (see [`crate::compaction::Changes`]). Without it the
+    /// provider hears of them at the next step's notice.
     pub compaction_changes: bool,
     /// Sends the warms that keep the prompt cache alive while a run whose keep-warm is `auto`
-    /// waits on tool calls, scheduled by today's keep-warm scheduler. Without it no run warms.
+    /// waits on tool calls. Without it no run warms.
     pub keep_warm: Option<Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>>,
     /// Receives what the run saw about its provider account, for account routing: the run's
     /// start once it is durable, and each provider attempt as its record is appended.
@@ -271,9 +269,9 @@ pub struct Seams<'a, P, T> {
     /// The account routing gives the session now. A run paused on its account resumes only
     /// on the account it froze; `None` when the caller didn't route one.
     pub auth_selection: Option<broca_wal::AuthSelection>,
-    /// Where the run publishes its in-flight model step while the provider call runs, as
-    /// today's loop does (`RunControl::step_progress`): the session's owner serves it as an
-    /// active run's `step`. It is cleared when the step's call ends. Never a durability input.
+    /// Where the run publishes its in-flight model step while the provider call runs: the
+    /// session's owner serves it as an active run's `step`. It is cleared when the step's call
+    /// ends. Never a durability input.
     pub step_progress: Option<broca_core::provider::LiveStepProgress>,
     /// What each model call waits for before the provider is asked to render and send it, such
     /// as the media its requests are rendered with while they are still being prepared. Each
@@ -338,12 +336,11 @@ pub trait ModelCallReady: Send + Sync {
     async fn ready(&self) -> Result<(), ProviderError>;
 }
 
-/// The run loop's account reports, as today's `broca_core::AccountReporter` receives them. Each
-/// names the record it reports by `event_id`, the session's id and the record's seq. The hooks
-/// must not block: a reporter queues the event and returns. An attempt's record is appended
-/// without a barrier unless the attempt failed, so a reporter that must only report durable
-/// records waits for the session's durable bound to reach `seq`, as today's reporter waits for
-/// the log's durable head.
+/// The run loop's account reports. Each names the record it reports by `event_id`, the
+/// session's id and the record's seq. The hooks must not block: a reporter queues the event
+/// and returns. An attempt's record is appended without a barrier unless the attempt failed,
+/// so a reporter that must only report durable records waits for the session's durable bound
+/// to reach `seq`.
 pub trait AccountReports: Send + Sync {
     /// A fresh run's start, at `seq`, is durable. Not called on a resume, which writes no
     /// start.
@@ -382,7 +379,7 @@ pub struct Finished {
     pub usage: Option<Usage>,
     pub retries_used: u32,
     /// Why the run paused, when it paused rather than ended. A paused run reports
-    /// `Interrupted` as its reason, as today's loop does, and resumes as the same run.
+    /// `Interrupted` as its reason and resumes as the same run.
     pub paused: Option<PauseReason>,
     /// In-memory routing outcome for scheduling this actor's next sign-in re-check.
     pub sign_in: Option<crate::account_move::SignInOutcome>,
@@ -397,9 +394,8 @@ pub enum LoopError {
     /// The tool plane refused something the run can't go on without, such as registering a
     /// batch's call keys for late results.
     Tools(String),
-    /// A rule in `broca_core::fresh_start`, which the run loop on today's storage calls too,
-    /// refused the run before anything was written: for example system text other than the
-    /// session's, or a plan whose hooks can't run.
+    /// A rule in `broca_core::fresh_start` refused the run before anything was written: for
+    /// example system text other than the session's, or a plan whose hooks can't run.
     Refused(broca_core::RunError),
 }
 
@@ -436,7 +432,7 @@ where
     refuse_first_protocol_compaction(writer)?;
     refuse_unbuilt(&admission)?;
     // A session on the current compaction contract stays on it, and a new run on it freezes the
-    // view library's current plan version, as today's loop does. A session that ran outside it
+    // view library's current plan version. A session that ran outside it
     // moves onto it at the first run whose plan names a compaction provider: that run enrolls
     // it (see `crate::enroll`).
     let mut admission = admission;
@@ -478,9 +474,8 @@ where
     }
     admission.input = input;
     // The run numbers its messages' parts by its own computed rules, after the highest number
-    // the session has shown, as its start freezes them. On the compaction contract its
-    // requests show the projection's numbers instead, but today's reads still number the run's
-    // messages by these rules, so they are recorded alike.
+    // the session has shown, as its start freezes them. On the compaction contract, requests
+    // show the projection's numbers instead, but the run's numbering rules are still recorded.
     let checkpoint = shown_high(&*writer, &*parts).await?;
     // The enrolling run decides what the session serves about the messages placed before it,
     // numbered after the highest number any earlier request showed, and stores the decisions
@@ -561,8 +556,8 @@ where
             None => drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await?,
         },
     };
-    // Every end a run writes is followed by a notice of the session's changes, as today's
-    // loop follows each of its ends; a pause isn't an end.
+    // Every end a run writes is followed by a notice of the session's changes; a pause isn't
+    // an end.
     if finished.paused.is_none() {
         let floor = signed_floor(&placed, parts, &mut ToolSetCache::default()).await?;
         if let Some(changes) = crate::compaction::Changes::of(&admission, seams, floor)
@@ -658,8 +653,7 @@ where
         .as_ref()
         .is_some_and(|run| run.finished.is_none());
     let finished = resume_run(writer, parts, seams).await?;
-    // A resume that wrote the run's end is followed by a notice of the session's changes, as
-    // today's loop follows each of its ends.
+    // A resume that wrote the run's end is followed by a notice of the session's changes.
     if unfinished && finished.paused.is_none() {
         if let Some(Ok(admission)) = writer
             .operations()
@@ -706,9 +700,8 @@ where
             .as_ref()
             .is_some_and(|batch| batch.calls.iter().any(|call| call.held.is_some()));
     // A cancel tripped before a paused run resumes ends it `Cancelled` before anything else a
-    // resume does, as today's loop lets a cancel while paused win: nothing is refrozen, no
-    // resume is recorded, an account limit isn't waited on, and no model is called. A session's
-    // actor ends a paused run this way for an interrupt queued behind it.
+    // resume does: nothing is refrozen, no resume is recorded, an account limit isn't waited
+    // on, and no model is called. An interrupt queued behind a paused run ends it this way.
     if matches!(resolution, Resolution::Paused(_))
         && seams.cancel.is_cancelled()
         && !cancelling_held
@@ -795,7 +788,7 @@ where
         resolution
     };
     // A run paused on its account's limit resumes on that same account, and only once the
-    // account has reset, as today's resume decides it. Until then nothing is written and the
+    // account has reset. Until then nothing is written and the
     // run stays paused; on another account it ends interrupted, saying why.
     if resolution == Resolution::Paused(PauseReason::AccountLimit) && !cancelling_held {
         let frozen = admission.auth_selection.as_ref();
@@ -849,8 +842,8 @@ where
         }
     }
     // A resume that will call the provider again first confirms the provider still renders the
-    // run's requests byte for byte, as today's does: a changed renderer or render config would
-    // bust the prompt cache, or make the conversation invalid for the provider.
+    // run's requests byte for byte. A changed renderer or render config would bust the prompt
+    // cache or make the conversation invalid for the provider.
     let drift = match resolution {
         _ if cancelling_held || seams.pause_for_auth_at_start.is_some() => None,
         Resolution::Resume | Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
@@ -1099,8 +1092,8 @@ const NOT_RUN_INTERRUPTED: &str =
 /// if a provider holds it), and the batch and the run's end are durable together. No call is
 /// sent. Each provider still holding a call is asked to withdraw it once the end is durable.
 ///
-/// A resume that refuses to go on passes the error the run ends with, and its own record, which
-/// today's writes after the batch closes and before the run's end.
+/// A resume that refuses to go on passes the error the run ends with and its own record, which
+/// is written after the batch closes and before the run's end.
 async fn close_interrupted<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -1128,8 +1121,8 @@ async fn close_interrupted<W: Writer, P, T>(
 }
 
 /// Ends the session's unfinished latest run `Interrupted`, sending nothing, with the records
-/// today's seal writes for the same run (`broca_core::resume::interrupted_seal`): on a graceful
-/// stop (`SealCause::Shutdown`), or when a session opens on a run a crashed process left running
+/// produced by `broca_core::resume::interrupted_seal` for the same run: on a graceful stop
+/// (`SealCause::Shutdown`), or when a session opens on a run a crashed process left running
 /// (`SealCause::CrashOrphan`), which first records the resume and names the crash on the run's
 /// end.
 ///
@@ -1192,8 +1185,8 @@ where
         resumed.redone.clear();
         records.push(Record::Resumed(resumed));
     }
-    // As today's seal chooses: an open batch closes, whatever its calls' state; only with no
-    // open batch is a never-dispatched tool turn kept.
+    // An open batch closes regardless of its calls' state; only when there is no open batch is
+    // a never-dispatched tool turn kept.
     let (close_out, withdrawn) =
         open_batch_close_out(writer, &run_id, now, RunFinishReason::Interrupted);
     if close_out.is_empty() {
@@ -1535,8 +1528,8 @@ fn frozen_admission(
     if let Some(selection) = &run.refrozen_auth {
         admission.auth_selection = decode(Some(selection.clone()))?;
     }
-    // A run whose strict schema was downgraded renders downgraded from then on, as today's
-    // resume rebuilds its provider from the downgraded config.
+    // A run whose strict schema was downgraded renders downgraded from then on; its provider is
+    // rebuilt from the downgraded config.
     if run.structured_downgraded {
         downgrade_render_config(&mut admission.render_config);
     }
@@ -1690,8 +1683,7 @@ pub fn refresh_applied(
 }
 
 /// A session compacted under the first compaction protocol keeps rendering under that protocol's
-/// last view, which only today's run loop applies, so the new loop refuses it rather than send
-/// different bytes.
+/// last view; the run loop refuses it rather than send different bytes.
 fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopError> {
     if writer.conversation().first_protocol_compaction
         || writer.operations().first_protocol_compaction
@@ -1703,9 +1695,9 @@ fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopErr
     Ok(())
 }
 
-/// Refuses, by name, a run that needs a part of today's run loop the new loop hasn't built yet,
-/// rather than running it without that part: an input-token budget (no live session has one),
-/// and the client-side refusal fallback. Each is read from what the run froze.
+/// Refuses, by name, a run that needs a part of the run loop not built yet, rather than running
+/// it without that part: an input-token budget (no live session has one), or the client-side
+/// refusal fallback. Each is read from what the run froze.
 fn refuse_unbuilt(admission: &Admission) -> Result<(), LoopError> {
     if admission
         .budget
@@ -1759,10 +1751,10 @@ fn frozen_tags(start: &RunStart) -> Result<FrozenTags, LoopError> {
 }
 
 /// Each window run's frozen part-number rules, read from its start record: whether it renders
-/// numbers, the number it continues after, and its render config, combined by today's
-/// `rules_for`, the same function today's loop numbers a run's messages with. A run's start is
-/// read once and kept in `cache` (see [`TagRulesCache`]); the render config and the run's place
-/// in the prompt are read from `episodes` at every call, as before.
+/// numbers, the number it continues after, and its render config, combined by `rules_for`,
+/// which numbers the run's messages. A run's start is read once and kept in `cache` (see
+/// [`TagRulesCache`]); the render config and the run's place in the prompt are read from
+/// `episodes` at every call.
 async fn run_tag_rules<W: Writer>(
     writer: &W,
     episodes: &[EpisodeRenderInput],
@@ -1937,9 +1929,9 @@ async fn offline_request_for<W: Writer>(
 }
 
 /// Disables tool calls on the budget's finalize step, and says whether the step is one. The step
-/// keeps the declared tools byte for byte and disables calls through the tool choice, as today's
-/// loop does: dropping the tools would change the request's cached prefix on the run's last
-/// step. A step's live request and its offline rebuild both take it from here.
+/// keeps the declared tools byte for byte and disables calls through the tool choice; dropping
+/// the tools would change the request's cached prefix on the run's last step. A step's live
+/// request and its offline rebuild both take it from here.
 fn finalize_tool_choice<W: Writer>(writer: &W, opts: &mut CallOptions) -> bool {
     let finalizing = crate::budget::finalizing(writer.operations());
     if finalizing {
@@ -2155,8 +2147,8 @@ where
     let rendered = broca_core::compaction_v2::render::RenderCache::default();
     let tools = Arc::clone(&admission.tools);
     // The run's frozen plan says which preset each tool provider's calls carry, which providers
-    // were fetched and what they declared, as today's loop reads it from the same plan. A call
-    // without its preset is refused by a provider whose route is bound under a scope.
+    // were fetched, and what they declared. A call without its preset is refused by a provider
+    // whose route is bound under a scope.
     let mut manifest = ToolManifest::from_shared_tools(Arc::clone(&admission.tools));
     if let Some(plan) = admission.manifest.as_deref() {
         manifest = manifest
@@ -2164,9 +2156,10 @@ where
             .map_err(|error| LoopError::Parts(format!("the run's frozen plan: {error}")))?;
     }
     manifest = manifest.with_run_transport(&admission.transport);
-    // As today's loop asks once per run: a provider whose media renderer tags its own copy of
-    // each request takes the run's tag choice here, and the loop leaves media-holding messages
-    // untagged, since preparing their media needs the parts where the model put them.
+    // Once per run, the run asks whether the provider's media renderer tags its own copy of each
+    // request. If it does, the provider takes the run's tag choice here, and the run leaves
+    // media-holding messages untagged, since preparing their media needs the parts where the
+    // model put them.
     let defer_media_tags = seams
         .provider
         .defer_media_tags(frozen_render_tags(admission));
@@ -2288,10 +2281,9 @@ where
         // A step entered again after a move at a wall started already: it writes no boundary,
         // and what is steered or delivered meanwhile waits for the next one.
         let entering = reentry.take();
-        // A crash can keep a tool turn durable and lose the budget firings its barrier carried,
-        // since today's log writes them record by record. Any firing the durable call count
-        // makes due is written here, before anything else at this boundary, as today's loop
-        // derives it again before its next request.
+        // A crash can leave a tool turn durable without the budget firings its barrier carried.
+        // Any firing the durable call count makes due is written here, before anything else at
+        // this boundary; the run loop derives it again before its next request.
         if entering.is_none() {
             writer
                 .append_with(
@@ -2303,7 +2295,7 @@ where
                 .await?;
         }
         let completed_steps = run_state(writer).completed_steps;
-        // Step ids count from 1 within a run, as today's loop numbers them.
+        // Step ids count from 1 within a run.
         let step_id = completed_steps + 1;
         debug_assert!(entering
             .as_ref()
@@ -2333,8 +2325,8 @@ where
             account_limit: None,
         }));
         let resumes = admission.on_restart == Some(OnRestart::Resume);
-        // A view the compaction provider handed over applies here, before the step starts, as
-        // in today's loop; a boundary that ends the run applies none.
+        // A view the compaction provider handed over applies here, before the step starts; a
+        // boundary that ends the run applies none.
         let ending = cancelled_now
             || stopping
             || writer
@@ -2386,10 +2378,10 @@ where
                             return batch;
                         }
                         // A step starts: ordered sends whose first possible mode here is `steer` or
-                        // `turn_system` are delivered, and expired ones end, in queue order, by
-                        // today's rules (`broca_core::delivery_order`). Their records come first,
-                        // then every waiting message's copy (steers before deliveries), then the
-                        // step's start.
+                        // `turn_system` are delivered, and expired ones end, in queue order,
+                        // according to `broca_core::delivery_order`. Their records come first, then
+                        // every waiting message's copy (steers before deliveries), then the step's
+                        // start.
                         let mut batch = Vec::new();
                         let mut delivered = Vec::new();
                         let queued: Vec<_> = operations
@@ -2404,9 +2396,9 @@ where
                             .collect();
                         // A turn-scoped system message is possible only where the route takes one:
                         // after the message it would follow (the last one placed here so far, else
-                        // the last steered, else the conversation's last) and, on a route that needs
-                        // it last, with no user message to follow it in this request. As in today's
-                        // loop, any later send that may steer counts as one.
+                        // the last steered, else the conversation's last) and, on a route that
+                        // needs it last, with no user message to follow it in this request. Any
+                        // later send that may steer counts as a user message following it.
                         let mut preceding: Option<Message> = run
                             .pending_steers
                             .iter()
@@ -2540,7 +2532,7 @@ where
             whole.as_ref(),
         )?;
         drop(whole);
-        // The step names the account routing gives the run now, as today's does.
+        // The step names the account routing gives the run now.
         if let Some(context) = opts.step_context.as_mut() {
             let selection = run_selection(seams, admission);
             context.credential_id = selection.map(|selection| selection.credential_id.clone());
@@ -2600,7 +2592,7 @@ where
                     return compaction_unavailable(writer, seams, admission, &message).await;
                 }
                 crate::compaction::Send::Ceiling(detail) => {
-                    // Written with the run's end, which is durable, as today's loop writes it.
+                    // Written with the run's end, which is durable.
                     writer
                         .append(
                             &[Record::CeilingDecided(CeilingDecided {
@@ -2648,10 +2640,9 @@ where
                 }
             }
         }
-        // Once a refresh applied, the model sees the system text of the plan the run froze in
-        // place of the session's original system message, as a view of the request only, as
-        // today's loop shows it. A session on the current compaction contract renders its
-        // system text from its entries instead.
+        // Once a refresh is applied, the model sees the system text of the plan the run froze in
+        // place of the session's original system message, as a view of the request only. A session
+        // on the current compaction contract renders its system text from its entries instead.
         if admission.compaction_plan_version.is_none()
             && writer
                 .operations()
@@ -2676,9 +2667,9 @@ where
         // copy of the whole request kept for it.
         let prepared = (opts.target_model.clone(), opts.step_context.clone());
         let mut opts = Arc::new(reserve_for(writer, step_id, opts, &route));
-        // The step a timed account pause resumes is sent again only if it renders the request
-        // the provider refused, byte for byte, as today's resume checks it: anything else ends
-        // the run interrupted rather than send a request the pause wasn't for.
+        // A step resumed after a timed account pause is sent again only if it renders the request
+        // the provider refused byte for byte; otherwise, the run ends interrupted rather than
+        // sending a request the pause wasn't for.
         if let Some(pause) = account_limit_replay.take().filter(|_| call_ready) {
             use sha2::Digest as _;
             let bytes = seams
@@ -2702,8 +2693,8 @@ where
         }
         // A strict structured-output schema the provider refuses as too large a grammar is
         // downgraded once: the downgrade is durable, the provider renders without the strict
-        // flag, and the same step is sent again, its retries counting the refused attempt's, as
-        // today's loop does.
+        // flag, and the same step is sent again, with the refused attempt counting toward its
+        // retries.
         let mut downgraded_now = false;
         // A step entered again after a move counts the retries its refused attempts used, and
         // records its attempts after theirs.
@@ -2836,8 +2827,7 @@ where
                 return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await;
             }
             Err(StepFailure::Error(error, retries, limited)) => {
-                // The error names the run's account or credential where it is scoped to one, as
-                // today's does before deciding anything on it.
+                // The error names the run's account or credential where it is scoped to one.
                 let selection = run_selection(seams, admission);
                 let error = Box::new(broca_core::provider_errors::stamp_credential(
                     *error,
@@ -3035,7 +3025,7 @@ where
                 }
                 // The provider refused the account's limit, which resets soon enough that the
                 // session's cache on that account outlives the wait: the run pauses on the same
-                // account until then, as today's loop decides it.
+                // account until then.
                 if let Some(pause_on) = limited.as_deref().and_then(|limited| {
                     account_limit_pause(seams, admission, step_id, limited, &error)
                 }) {
@@ -3165,8 +3155,8 @@ where
             Some(runtime) => post_assistant(runtime, step_id, &mut step.message).await,
             None => None,
         };
-        // A cut call on a budget's finalize step or in a structured run takes paths of today's
-        // loop the new one hasn't built; refused by name rather than run without them.
+        // A cut call on a budget's finalize step or in a structured run needs handling the run
+        // loop hasn't built, so it is refused by name rather than run without it.
         if !step.cuts.is_empty() && (finalizing || structured.is_some()) {
             return Err(LoopError::Unsupported(
                 "a cut tool call on a finalize step or in a structured-output run",
@@ -3189,7 +3179,7 @@ where
             restream(seams.out, &step.message, mid.as_deref(), live_display).await;
         }
         // What the step records about the refusal fallback. A refusal after a completed tool
-        // call commits as a tool step and arms the schedule, as today's loop commits it.
+        // call commits as a tool step and arms the schedule.
         let refusal = route.committed(
             writer,
             &admission.model,
@@ -3214,9 +3204,9 @@ where
             route.model(&admission.model).clone(),
         );
         // The step's whole usage, over every model that ran when the provider handed the
-        // request on itself, as today's loop records it on both the message and the step.
+        // request on itself.
         let whole = step.served.total(step.usage);
-        // A call whose arguments the provider cut is answered with today's error in the step's
+        // A call whose arguments the provider cut is answered with an error in the step's
         // own batch, before anything is sent; the batch then runs the other calls.
         let batch_id = format!("{}-b{step_id}", admission.run_id);
         let mut cut = Vec::new();
@@ -3283,8 +3273,7 @@ where
                         fallback: (step.served.members(refusal)?).map(Into::into),
                         hooks: (step_hooks).map(Into::into),
                         budget_finalize: finalizing.then_some(true),
-                        // As the converter fills it from today's record: what the iterations
-                        // add up to, when that differs from the recorded usage.
+                        // The total across iterations, when it differs from the recorded usage.
                         total_usage: Some(step.served.total(whole)).filter(|total| *total != whole),
                         stop_met: stop.is_some().then_some(true),
                         limiting_stop_met: limiting.then_some(true),
@@ -3354,7 +3343,7 @@ where
             return Ok(finished(writer, RunFinishReason::Completed));
         }
         // A `submit_tool` run ends at the step that calls `submit_result`, before anything is
-        // dispatched or a stop condition is weighed, as today's loop ends it.
+        // dispatched or a stop condition is weighed.
         if let Some(frozen) = structured.as_ref() {
             if let Some(submit) =
                 broca_core::structured_output::counted_submit(frozen, &step.message, &[])
@@ -3429,7 +3418,7 @@ fn to_value<T: serde::Serialize>(value: Option<&T>) -> Result<Option<Value>, Loo
 }
 
 /// The session's refusal-fallback schedule the run carries: only under the same model and within
-/// a day of its last change, as today's admission decides it.
+/// a day of its last change.
 fn refusal_schedule<W: Writer>(
     writer: &W,
     admission: &Admission,
@@ -3563,7 +3552,7 @@ async fn admit<W: Writer>(
     if frozen_render_tags(admission) {
         config.insert("render_tags".into(), json!(true));
     }
-    // Today's computed tag rules, starting after the highest number the session has shown.
+    // Computed tag rules start after the highest number the session has shown.
     config.insert("computed_tags".into(), json!({ "checkpoint": checkpoint }));
     config.insert("context_epoch".into(), json!(0));
     if !admission.stop_when.is_empty() {
@@ -3575,7 +3564,7 @@ async fn admit<W: Writer>(
     if admission.account_limit_pause {
         config.insert("account_limit_pause".into(), json!(true));
     }
-    // The members today's run config serializes only when set.
+    // The members the current run config serializes only when set.
     for (key, value) in [
         (
             "turn_directives_v1",
@@ -3709,7 +3698,7 @@ async fn admit<W: Writer>(
 }
 
 /// The highest part number the session's requests have shown, which a new run's numbering
-/// continues after: today's `high_after` over the prompt, each message numbered under the rules
+/// continues after: `high_after` over the prompt, with each message numbered under the rules
 /// of the run that placed it. Only a run that renders numbers counts anything, so a session
 /// that has never rendered stays at 0.
 ///
@@ -3788,8 +3777,8 @@ fn render_episodes<W: Writer>(
         .iter()
         .chain(&conversation.episodes)
         .map(|episode| {
-            // Positions count from the session's first message, as today's: once history is
-            // sealed at a cut, the window's first message keeps its place.
+            // Positions count from the session's first message: once history is sealed at a cut,
+            // the window's first message keeps its place.
             let index = |ordinal: u64| (ordinal - 1) as usize;
             Ok(EpisodeRenderInput {
                 prompt_start: index(episode.start),
@@ -3804,10 +3793,10 @@ fn render_episodes<W: Writer>(
 }
 
 /// The request history every step of a run carries: [`render_episodes`], and the signed floor
-/// folded from the same runs' starts (`broca_core::signed_floor`), with the rule today's loop
-/// folds its `RunStarted` records by.
+/// folded from the same runs' starts (`broca_core::signed_floor`), using their `RunStarted`
+/// records.
 ///
-/// Past the window the conversation keeps only the runs whose render key changes (what renderers
+/// Past the window, the conversation keeps only the runs whose render key changes (what renderers
 /// read from a run's render config to render another run's messages: the wire family, model and
 /// reasoning effort; see `episode_render_key`), so a run that changed only the tool set can be
 /// missing there and the fold may find a different change point than one over every run. That
@@ -3824,8 +3813,8 @@ async fn render_history<W: Writer>(
 }
 
 /// The session's signed floor (`broca_core::signed_floor::SignedFloor::floor`), folded from its
-/// runs' starts by the rule today's loop folds its `RunStarted` records by. [`render_history`]
-/// says how far past the window that fold reaches.
+/// runs' starts using `RunStarted` records. [`render_history`] says how far past the window that
+/// fold reaches.
 pub async fn signed_floor<W: Writer>(
     writer: &W,
     parts: &dyn Parts,
@@ -3867,8 +3856,7 @@ pub struct ToolSetCache {
 }
 
 /// The [`broca_core::signed_floor::tool_set_digest`] of the tools and render config `start`
-/// froze, read as [`admission_of_start`] reads them; `None` for a seeded run, as today's replay
-/// leaves an import's seeded `RunStarted` out of the fold.
+/// froze, read as [`admission_of_start`] reads them; `None` for a seeded run.
 fn tool_set_of_start(start: &RunStart, parts: &dyn Parts) -> Result<Option<String>, LoopError> {
     if start.seeded == Some(true) {
         return Ok(None);
@@ -3889,7 +3877,7 @@ fn tool_set_of_start(start: &RunStart, parts: &dyn Parts) -> Result<Option<Strin
 }
 
 /// The request for step `step_id`: the conversation as the folds hold it, under the run's
-/// frozen settings, with the render inputs today's loop gives a request: each message's
+/// frozen settings, with the render inputs the run loop gives a request: each message's
 /// position, its part numbers under the run's tag rules, and the run's place in the prompt.
 /// `enrollment` is what the session's move onto the current compaction contract decided about
 /// the messages placed before it, which a request on the contract renders them by. A compacted
@@ -3945,9 +3933,8 @@ fn call_options<W: Writer>(
                 .iter()
                 .map(|message| Message::clone(message))
                 .collect();
-            // Off the compaction contract a ride renders into its result's copy here, before
-            // anything else edits the results, where today's replay joins it as it reads the
-            // ride's record. On the contract the entries render it.
+            // Off the compaction contract, a ride renders into its result's copy here, before
+            // anything else edits the results. On the contract, the entries render it.
             crate::entries::render_rides(
                 &mut prompt,
                 writer.conversation(),
@@ -3969,8 +3956,7 @@ fn call_options<W: Writer>(
                 message.ordinal = Some(first + index as u64);
             }
             // A session on the established layout numbers each run's messages by that run's
-            // frozen rules, in the order they were placed, as today's loop numbers them, and
-            // renders them in place.
+            // frozen rules, in the order they were placed, and renders them in place.
             for (at, run) in run_rules.iter().enumerate() {
                 let end = run_rules
                     .get(at + 1)
@@ -4021,7 +4007,7 @@ fn call_options<W: Writer>(
         }
     } else if !contract && frozen_render_tags(admission) {
         // A run frozen with part numbers in the model's view sends user and tool-result text with
-        // its numbers in front, as today's loop renders it.
+        // its numbers in front.
         render_tags_into(
             &mut prompt,
             TagRendering::for_render_config(&admission.render_config),
@@ -4057,11 +4043,11 @@ fn call_options<W: Writer>(
     if !contract || compacted {
         return Ok(opts);
     }
-    // On the current compaction contract a request renders from the entries, as today's loop
-    // renders one: text delivered with a tool result is added to the result's copy, and the
-    // system text goes above the conversation. This render copies the stored prompt rather than
-    // rendering through a view's plan, so the placeholders the prompt holds for the global system
-    // messages an enrollment suppressed (`compaction::prompt::contract_prompt`) come out of it.
+    // On the current compaction contract, a request renders from the entries: text delivered with
+    // a tool result is added to the result's copy, and the system text goes above the conversation.
+    // This render copies the stored prompt rather than rendering through a view's plan, so the
+    // placeholders the prompt holds for the global system messages an enrollment suppressed
+    // (`compaction::prompt::contract_prompt`) come out of it.
     let conversation = writer.conversation();
     let entries = broca_session_store::session::EnrollmentOverlay::serve(
         enrollment,
@@ -4107,7 +4093,7 @@ struct Step {
 #[derive(Default)]
 struct Served {
     /// The provider's own terminal token. A token longer than 64 bytes is left out rather than
-    /// cut, as today's loop does.
+    /// cut.
     raw_finish_reason: Option<String>,
     service_tier_used: Option<String>,
     speed_used: Option<String>,
@@ -4118,9 +4104,8 @@ struct Served {
 }
 
 impl Served {
-    /// The step end's `fallback` members, as the converter carries today's record's remaining
-    /// members: these facts and what the step records about the refusal fallback, in today's
-    /// own `StepFallback` shape. `None` when there are none.
+    /// The step end's `fallback` members: the facts the step records about the refusal fallback,
+    /// in the `StepFallback` shape. `None` when there are none.
     fn members(&self, refusal: crate::refusal::Committed) -> Result<Option<Value>, LoopError> {
         let fallback = broca_wal::StepFallback {
             served_model: self.served_model.clone(),
@@ -4142,9 +4127,9 @@ impl Served {
         Ok((!members.is_empty()).then_some(Value::Object(members)))
     }
 
-    /// The step's usage split by the model each part counts under, by today's own rule
-    /// (`StepServing::usage_by_model`), as `StepEnd::by_model` and `StepRefused::by_model`
-    /// record it: `route_model` is the refusal fallback's model when the step was routed there.
+    /// The step's usage split by the model each part counts under, using
+    /// `StepServing::usage_by_model`, as `StepEnd::by_model` and `StepRefused::by_model` record it:
+    /// `route_model` is the refusal fallback's model when the step was routed there.
     fn shares(
         &self,
         admission: &Admission,
@@ -4180,7 +4165,7 @@ impl Served {
 }
 
 /// The error a step fails with when the provider's stream ends without an answer and its final
-/// `Finished`, as today's loop records it.
+/// `Finished`.
 fn incomplete_stream() -> ProviderError {
     ProviderError {
         provider_details: None,
@@ -4219,11 +4204,11 @@ enum StepFailure {
 use broca_core::account_limit_pause::FailedAccountLimitAttempt;
 
 /// Runs one model call and assembles its answer. Display events go straight to the listener.
-/// Asks the provider for one step. Each HTTP attempt's evidence is appended as the attempt
-/// ends, without a barrier, as today's loop records it: billing and cache evidence read it.
-/// The outer error is the store's; the inner one is the step's. `first_attempt` is the ordinal
-/// the call's first attempt is recorded with: zero, or after the attempts a step entered again
-/// after an account move already recorded.
+/// Asks the provider for one step. Each HTTP attempt's evidence is appended as the attempt ends,
+/// without a barrier; billing and cache evidence read it. The outer error is the session store's;
+/// the inner one is the step's. `first_attempt` is the ordinal the call's first attempt is
+/// recorded with: zero, or after the attempts a step entered again after an account move already
+/// recorded.
 #[allow(clippy::too_many_arguments)]
 async fn model_step<W: Writer, P: Provider, T>(
     writer: &mut W,
@@ -4239,7 +4224,7 @@ async fn model_step<W: Writer, P: Provider, T>(
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
     // The step is in flight from here until the call's stream ends: published for the session's
-    // owner, and cleared however the call ends, as today's loop publishes it.
+    // owner, and cleared however the call ends.
     struct InFlight<'a>(Option<&'a broca_core::provider::LiveStepProgress>);
     impl Drop for InFlight<'_> {
         fn drop(&mut self) {
@@ -4250,7 +4235,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     }
     let _in_flight = InFlight(seams.step_progress.as_ref());
     // A run's keep-warm may ask its calls to note each request their transport sends on its
-    // seal, so a warm re-sends those bytes, as today's loop notes them on its shutdown seal.
+    // seal, so a warm re-sends those bytes.
     let send_seal = seams
         .keep_warm
         .as_ref()
@@ -4290,8 +4275,8 @@ async fn model_step<W: Writer, P: Provider, T>(
         first_attempt,
         attempt_hook: None,
     };
-    // A cancel drops the call while it hasn't returned its stream yet, as today's loop drops its
-    // step future, so a call slow to answer never holds the run's end back.
+    // A cancel drops the call while it hasn't returned its stream, so a call slow to answer
+    // never holds the run's end back.
     let mut events = tokio::select! {
         biased;
         _ = seams.cancel.cancelled() => return Ok(Err(StepFailure::Cancelled)),
@@ -4301,7 +4286,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     };
     let mut message = None;
     // The provider's `StepFinished` usage wins; its final `Finished` fills it only when the
-    // step reported none, as today's loop takes them.
+    // step reported none.
     let mut step_usage = Usage::default();
     let mut served = Served::default();
     let mut cuts = Vec::new();
@@ -4375,8 +4360,7 @@ async fn model_step<W: Writer, P: Provider, T>(
                         limited,
                     ));
                 };
-                // The request's measured input labels its send, which a warm's price reads, as
-                // today's loop labels it once its step ends.
+                // The request's measured input labels its send, which a warm's price reads.
                 if let Some(seal) = &send_seal {
                     seal.note_usage(StepId(step_id), usage);
                 }
@@ -4650,7 +4634,7 @@ where
         let intent = match plan {
             CallPlan::Dispatch(_) if known_of(call).is_none() => {
                 // Arguments are stored again only when they differ from the input the message
-                // last gave this call id, as today's converted records hold them.
+                // last gave this call id.
                 let last = planned
                     .iter()
                     .rev()
@@ -4777,7 +4761,7 @@ where
                         batch_id: batch_id.clone(),
                     }));
                     // Queued sends ride on the batch's results in the barrier that closes it,
-                    // after its end, as today's loop records them.
+                    // after its end.
                     let rides = tool_batch_deliveries(
                         conversation,
                         operations,
@@ -4790,7 +4774,7 @@ where
                     );
                     records.extend(rides);
                     // The budget firings the step's calls made due go in the barrier that
-                    // closes its batch, as today's loop writes them.
+                    // closes its batch.
                     let placing = closing_places(conversation);
                     let firings = crate::budget::due(
                         conversation,
@@ -4871,9 +4855,8 @@ where
         step_id,
         changes,
     };
-    // While the calls run, the run's keep-warm refreshes the prompt cache, as today's loop
-    // does around the same wait. A wait resumed after a restart counts the warms it already
-    // sent toward its caps.
+    // While the calls run, the run's keep-warm refreshes the prompt cache. A wait resumed after
+    // a restart counts the warms it already sent toward its caps.
     let spend = warming.map_or(0.0, |warming| warming.spent(writer.operations(), step_id));
     let sent = warming.map_or(0, |_| warm_count(writer.operations(), step_id));
     let dispatched = broca_core::keep_warm_wait::wait_tools_with_spend(
@@ -4949,9 +4932,9 @@ where
         run_id: run_id.into(),
         batch_id,
     }));
-    // The budget firings the step's calls made due go in the barrier that closes its batch, as
-    // today's loop writes them; a batch that closed held calls on a cancel makes none. Queued
-    // sends ride on its results in the same barrier, after its end, read as it closes.
+    // Budget firings caused by the step's calls go in the barrier that closes its batch; a batch
+    // that closes held calls on a cancel makes none. Queued sends ride on its results in the same
+    // barrier, after its end, read as it closes.
     let ordered = Box::pin(ordered_sends(writer)).await?;
     let closed_at = (seams.now_ms)();
     let mut records = Some(records);
@@ -5003,7 +4986,7 @@ where
     })
 }
 
-/// A call that was never sent: today's no-dispatch result in the transcript and its reason in
+/// A call that was never sent: its no-dispatch result in the transcript and its reason in
 /// the ledger.
 fn no_dispatch(
     records: &mut Vec<Record>,
@@ -5080,7 +5063,7 @@ fn terminal(
 }
 
 /// `terminal`, with the reason code the outcome records, such as why a held call was closed.
-/// A terminal today's loop writes without a time, such as a synthesized one, has none here.
+/// A terminal written without a time, such as a synthesized one, has none here.
 fn terminal_with_reason(
     records: &mut Vec<Record>,
     run_id: &str,
@@ -5130,8 +5113,7 @@ fn structured_of(
     ))
 }
 
-/// The account the run uses: the one routing gives it now, else the one it froze at admission,
-/// as today's loop chooses it.
+/// The account the run uses: the one routing gives it now, else the one it froze at admission.
 pub(crate) fn run_selection<'a, P, T>(
     seams: &'a Seams<'_, P, T>,
     admission: &'a Admission,
@@ -5254,10 +5236,10 @@ pub async fn end_restart_resume_refused<W: Writer>(
     Ok(finished(writer, RunFinishReason::Interrupted))
 }
 
-/// The timed pause on the run's own account that `limited`, the step's attempt the provider
-/// refused for the account's limit, allows, as today's loop decides it: only for a transient
-/// error, only when the run consented at admission, and only when the account resets before
-/// the session's cache on it expires and within the boot cap.
+/// The timed pause on the run's own account that `limited`, the step's attempt the provider refused
+/// for the account's limit, allows: only for a transient error, only when the run consented at
+/// admission, and only when the account resets before the session's cache on it expires and within
+/// the boot cap.
 fn account_limit_pause<P: Provider, T>(
     seams: &Seams<'_, P, T>,
     admission: &Admission,
@@ -5286,9 +5268,8 @@ fn account_limit_pause<P: Provider, T>(
     limited.pause(StepId(step_id), (seams.now_ms)(), error, selection, &budget)
 }
 
-/// The cache lifetime the run's requests ask the provider for, when they ask for one it
-/// honours, as today's cache declaration reads it from the run's frozen render config. Only
-/// this lifetime can prove the cache expired.
+/// The cache lifetime the run's requests ask the provider for, when they ask for one it honours, is
+/// read from the run's frozen render config. Only this lifetime can prove the cache expired.
 pub(crate) fn requested_cache_ttl(admission: &Admission) -> Option<u64> {
     let frozen: broca_provider::wire::FrozenRenderConfig =
         serde_json::from_value(Value::clone(&admission.render_config)).ok()?;
@@ -5307,9 +5288,8 @@ fn closing_places(conversation: &broca_session_store::fold::conversation::Conver
 
 /// What a resume finds of a submit the crash stopped before the run's end: the open turn's
 /// step, its calls, the counted `submit_result` call, and whether the turn's batch already
-/// started with the calls already answered. Today's loop writes a submit's result, batch and
-/// end in one barrier, so a started batch here is a torn write of that barrier; its answered
-/// calls keep their results, and a call that has one isn't counted as the submit.
+/// started with the calls already answered. The answered calls keep their results, and a call
+/// that has one isn't counted as the submit.
 struct PendingSubmit {
     step_id: u64,
     calls: Vec<ToolCall>,
@@ -5361,7 +5341,7 @@ fn structured_result(
 /// A `submit_tool` run's step called `submit_result`. None of the step's calls is dispatched:
 /// the counted submit gets the runner's own result, each other call a never-run
 /// `skipped_after_submit` result, and the run's structured result is written with them and the
-/// run's end, in one barrier, as today's loop writes them.
+/// run's end, in one barrier.
 async fn submitted<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -5452,7 +5432,7 @@ async fn submitted<W: Writer, P, T>(
 struct OrderedSend {
     order: DeliveryOrder,
     /// The user messages a `steer` or `turn_system` delivery places: the input after the send's
-    /// `pre_user` hooks, without system messages, as today's queue holds it.
+    /// `pre_user` hooks, without system messages.
     input: Vec<Message>,
     written_at_ms: Option<u64>,
     /// The send's id as a ride names it: the caller's `send_id`, else its submission id.
@@ -5489,7 +5469,7 @@ impl OrderedSend {
     }
 }
 
-/// The module a principal names, else `broca`, as today's ride envelope names a sender.
+/// The module a principal names, or `broca` if there is none.
 fn module_or_broca(principal: Option<&broca_protocol::BindPrincipal>) -> String {
     match principal {
         Some(broca_protocol::BindPrincipal::Reserved { module_id }) => module_id.clone(),
@@ -5497,8 +5477,8 @@ fn module_or_broca(principal: Option<&broca_protocol::BindPrincipal>) -> String 
     }
 }
 
-/// The queue's sends that carry a delivery order, read from their records, with what today's
-/// loop reads about each: the order, the input, who sent it and the time it was accepted.
+/// The queue's sends that carry a delivery order, read from their records: the order, the input,
+/// who sent each send, and when it was accepted.
 async fn ordered_sends<W: Writer>(
     writer: &mut W,
 ) -> Result<std::collections::BTreeMap<String, OrderedSend>, LoopError> {
@@ -5548,8 +5528,8 @@ async fn ordered_sends<W: Writer>(
         let receipt = |name: &str| receipt_value.as_ref().and_then(|receipt| receipt.get(name));
         let queued_by = principal(receipt("sent_by"))?;
         let queued_as = principal(receipt("principal"))?;
-        // A ride names the module its queued record says sent it, as today's ride ledger reads
-        // it; the notice names the one its order says, as today's projection reads it.
+        // A ride names the module its queued record says sent it; the notice names the one its
+        // order says.
         let ride_sender = module_or_broca(
             queued_by
                 .as_ref()
@@ -5599,15 +5579,14 @@ async fn ordered_sends<W: Writer>(
     Ok(sends)
 }
 
-/// The records that deliver queued sends at the close of a tool batch, as today's loop decides
-/// them under its inbox lock when the batch commits: an expired send ends, and one whose first
-/// possible mode here is `tool_result` rides on the batch's carrier result (`ResultAppend` with
-/// its envelope, then `Delivery`), in queue order. Every other send waits for the next boundary.
-/// `batch` is the closing batch so far, whose replies place the turn's results unless an earlier
-/// batch placed them; `system_after_results` is whether the run's route would take a
-/// turn-scoped system message right after them, which a send listing `turn_system` first waits
-/// for. On the compaction contract the carrier is the batch's last result, whatever it holds;
-/// off it, the last text or error result.
+/// The records that deliver queued sends at the close of a tool batch: an expired send ends, and
+/// one whose first possible mode here is `tool_result` rides on the batch's carrier result
+/// (`ResultAppend` with its envelope, then `Delivery`), in queue order. Every other send waits for
+/// the next boundary. `batch` is the closing batch so far, whose replies place the turn's results
+/// unless an earlier batch placed them; `system_after_results` is whether the run's route would
+/// take a turn-scoped system message right after them, which a send listing `turn_system` first
+/// waits for. On the compaction contract the carrier is the batch's last result, whatever it
+/// holds; off it, the last text or error result.
 #[allow(clippy::too_many_arguments)]
 fn tool_batch_deliveries(
     conversation: &broca_session_store::fold::conversation::Conversation,
@@ -5689,8 +5668,8 @@ fn tool_batch_deliveries(
             run_id: run_id.into(),
             tool_call_id: carrier.clone(),
             text: text.clone(),
-            // Who the text came from is an entry fact of the compaction contract, as today's
-            // projection keeps it; off the contract the envelope alone names the sender.
+            // Who the text came from is an entry fact of the compaction contract; outside the
+            // contract, the envelope alone names the sender.
             notice: contract.then(|| send.notice.clone()),
             written_at_ms: send.written_at_ms,
             send_id: Some(send.send_id.clone()),
@@ -5710,8 +5689,7 @@ fn tool_batch_deliveries(
                     })
                     .collect(),
                 form: RideForm::Append,
-                // The agent the queued send's marks say its module spoke for, as today's
-                // envelope takes it from the queued record.
+                // The agent its module spoke for, according to the queued send's marks.
                 speaks_for: pending
                     .message_marks
                     .as_ref()
@@ -5738,13 +5716,13 @@ fn tool_batch_deliveries(
 }
 
 /// Whether the run's route would take a turn-scoped system message right after a tool batch's
-/// results, as today's loop asks its provider before a batch commits.
+/// results; queried from the provider before a batch commits.
 fn system_after_results<P: Provider>(provider: &P) -> bool {
     provider.turn_system_possible(Some(&Message::new(Role::Tool, Vec::new())), false)
 }
 
 /// The messages a `turn_system` delivery of `send` places: its text as turn-scoped system text,
-/// frozen as today's loop freezes it (`broca_core::delivery_order::system_delivered`).
+/// using `broca_core::delivery_order::system_delivered`.
 fn turn_system_input(send: &OrderedSend, submission_id: &str, run_id: &str) -> Vec<Message> {
     let core = broca_core::delivery_order::OrderedSend {
         admitted_at_ms: send.written_at_ms,
@@ -5848,7 +5826,7 @@ enum Dispatched {
 }
 
 /// Dispatches every call, in parallel unless one of them must run alone, and collects their
-/// answers, matching today's held-batch scheduling:
+/// answers:
 /// - each call carries its key and the batch's held-reply recorder; a held reply is appended,
 ///   durably, while the other calls keep running;
 /// - every call's answer is appended as soon as it arrives, so a reader sees it while the
@@ -5957,8 +5935,7 @@ async fn dispatch_all<W: Writer, P, T: ToolPlane>(
             return Ok(Dispatched::All { answers, closed });
         }
         if !tripped && !open_held.is_empty() && jobs.len() == open_held.len() {
-            // Only held calls wait. Anything already answered is taken first, as today's
-            // loop does, then the run pauses.
+            // Only held calls wait. Anything already answered is taken first, then the run pauses.
             if let Some(Some((index, answer))) = futures::FutureExt::now_or_never(jobs.next()) {
                 settle(
                     writer,
@@ -6227,9 +6204,9 @@ async fn answered(
 }
 
 /// A completed result keeps only the media the batch's capture holds for that exact call; every
-/// other media part becomes a provenance marker, before hooks or the record see the result. A
+/// other media part becomes a provenance marker before hooks or the record see the result. A
 /// reference to stored bytes, or one with the right digest and other metadata, isn't evidence
-/// that this call produced them. Today's loop does the same in `resolve`.
+/// that this call produced them.
 fn checked(ctx: &BatchCtx, mut answer: DispatchResult) -> DispatchResult {
     if let DispatchResult::Completed(result) | DispatchResult::Yielded { result, .. } = &mut answer
     {
@@ -6281,9 +6258,9 @@ async fn post_assistant(
         .map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes"))
 }
 
-/// A provider's result through the post-tool hooks subscribed for its tool, as today's loop
-/// runs them: a JSON result stays hookless, and a hook may edit the text or, when it was
-/// required and unavailable, withhold the result.
+/// A provider's result through the post-tool hooks subscribed for its tool: a JSON result stays
+/// hookless, and a hook may edit the text or, when it was required and unavailable, withhold the
+/// result.
 async fn post_tool(
     hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
     step_id: u64,
@@ -6367,8 +6344,8 @@ fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, CallOutcome)
 
 /// The run's state as the operational fold holds it. Admission appended its start, so it
 /// exists for the whole run.
-/// Ends the run as today's loop does when its compaction provider can't serve it: an error
-/// with code `compaction_unavailable`, before any model call of the step.
+/// Ends the run when its compaction provider can't serve it: an error with code
+/// `compaction_unavailable`, before any model call of the step.
 async fn compaction_unavailable<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -6394,8 +6371,8 @@ async fn compaction_unavailable<W: Writer, P, T>(
 
 /// The compaction state and plane a run uses, when its session is on the current compaction
 /// contract and its plan names a compaction provider. The state is rebuilt from the open log
-/// the first time a session uses it, then kept by whoever owns the session, as today's actor
-/// keeps it; a fresh run starts its step history again.
+/// the first time a session uses it, then kept by whoever owns the session; a fresh run starts
+/// its step history again.
 async fn compaction_ctx<W: Writer, P, T>(
     writer: &W,
     parts: &dyn Parts,
@@ -6461,7 +6438,7 @@ pub(crate) fn run_state<W: Writer>(writer: &W) -> &broca_session_store::fold::op
 /// The run's end record. Its usage is the run's total, present once a step completed.
 fn run_end<W: Writer>(writer: &W, run_id: &str, reason: RunFinishReason, now: u64) -> Record {
     let run = run_state(writer);
-    // Today's end record always carries the run's usage, empty when it took no step.
+    // The end record always carries the run's usage, empty when it took no step.
     Record::RunEnd(RunEnd {
         run_id: run_id.into(),
         reason,
@@ -6557,7 +6534,7 @@ async fn finish_in_doubt<W: Writer, P, T>(
 
 /// Appends `records`, which end with the run's end, as one durable batch. Messages steered or
 /// delivered since the last boundary enter the conversation just before the end: the run ends
-/// with them in its conversation, as today's loop leaves them.
+/// with them in its conversation.
 async fn append_end<W: Writer>(
     writer: &mut W,
     run_id: &str,

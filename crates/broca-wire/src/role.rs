@@ -416,10 +416,9 @@ pub fn broca_role_describe_with_writers(
         "fetch-plan-optional-tools/v1",
         SEND_TOOL_REPLY_BOUND_CAPABILITY,
         "session_class",
-        // Served in the session store, where every head lives; a session still kept in today's
-        // storage refuses the read by name until it is converted.
+        // Served in the session store, where every head lives.
         cortexkit_role_llm_runner::capabilities::PLAN_VIEW,
-        // Reader policies are served in the session store; today's storage refuses plan.readers.
+        // Reader policies are served in the session store.
         cortexkit_role_llm_runner::capabilities::APP_READERS,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
         cortexkit_role_llm_runner::capabilities::SEND_STATUS,

@@ -690,8 +690,7 @@ fn the_owed_set_is_declared_as_open_work() {
 }
 
 /// The session's title is the newest one a send carried, on a run start or in a queued send's
-/// or a steer's receipt, and a later send without one leaves it, as today's head reads the
-/// newest titled record of its log.
+/// or a steer's receipt, and a later send without one leaves it.
 #[test]
 fn the_title_is_the_newest_one_any_send_carried() {
     let titled_start = |title: Option<&str>| {

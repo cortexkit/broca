@@ -294,8 +294,8 @@ pub struct StoreRunJob {
     /// handed back in [`StoreRunEnd`].
     pub parts: Box<dyn broca_session_loop::parts::Parts>,
     pub mode: StoreRunMode,
-    /// What the run renders media from, as today's runs render it (see `store_media`), sent
-    /// once the session's image index is ready. `None` for a seal, which calls no model.
+    /// What the run renders media from (see `store_media`), sent once the session's image index is
+    /// ready. `None` for a seal, which calls no model.
     pub media: Option<crate::store_media::StoreRunMediaWait>,
     /// The abstract service tier level the send admitted: routing may choose another, and a fresh
     /// run's admission applies it to the request it freezes.
@@ -318,8 +318,8 @@ pub enum StoreRunMode {
     RecheckSignIn,
     /// At actor open, inspect sign-in and ask routing only; never resume the original account.
     ProbeSignIn,
-    /// End the session's unfinished run `Interrupted` without calling the model, writing what
-    /// today's seal writes (`broca_core::resume::interrupted_seal`): `broca_session_loop::seal`.
+    /// End the session's unfinished run `Interrupted` without calling the model:
+    /// `broca_session_loop::seal`.
     Seal(broca_core::seal::SealCause),
 }
 

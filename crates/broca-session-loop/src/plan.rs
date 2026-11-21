@@ -1,10 +1,10 @@
 //! What a session's fetch plan decides now, read from the store's operational fold
-//! (`Operations::plan`) and the setup parts its manifests are stored as: the senders the session
-//! admits and the model a send that leaves its model to the session runs on. Both follow the
-//! session's latest accepted refresh from its acceptance, before any run applies it, by the
-//! rules today's head and ownership summary fold (`broca_core::head::HeadProjection`,
-//! `SessionOwnershipV1::effective_senders`). Every reader in the session store asks here, never
-//! the first run's manifest.
+//! (`Operations::plan`) and the setup parts its manifests are stored as: the senders the
+//! session admits and the model a send that leaves its model to the session runs on. Both
+//! follow the session's latest accepted refresh from its acceptance, before any run applies
+//! it, according to `broca_core::head::HeadProjection` and
+//! `SessionOwnershipV1::effective_senders`. Every reader in the session store asks here,
+//! never the first run's manifest.
 
 use std::sync::Arc;
 
@@ -59,8 +59,9 @@ pub fn selection(operations: &Operations, parts: &dyn Parts) -> Result<Option<Pl
         .and_then(broca_core::head::manifest_selection))
 }
 
-/// The model `manifest`'s plan chooses, as a refresh records it (`SessionRefresh::selection`):
-/// today's reading of the plan's `model` (`broca_core::head::manifest_selection`).
+/// The model selected by the `manifest`'s plan, as recorded by a refresh
+/// (`SessionRefresh::selection`), using `broca_core::head::manifest_selection` to read the
+/// plan's `model`.
 pub fn recorded_selection(manifest: &broca_wal::PlanManifest) -> Option<Value> {
     broca_core::head::manifest_selection(manifest)
         .map(|selection| serde_json::to_value(selection).expect("a plan model encodes"))

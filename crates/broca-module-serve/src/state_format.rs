@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-/// A marker is never permission to reinterpret an unsupported root as today's format.
+/// A marker is never permission to reinterpret an unsupported root as the current format.
 pub(crate) fn prepare(
     root: &Path,
 ) -> Result<broca_wal::state_format::StateRootDecision<'_>, String> {

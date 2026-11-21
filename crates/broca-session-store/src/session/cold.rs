@@ -38,7 +38,7 @@ pub enum Cold {
 impl<B: SessionBackend> Session<B> {
     /// Runs the cold step if the session has had no activity for `idle_ms`. It seals the ledger,
     /// so a session with compaction views passes copies of them in `carry` (see
-    /// [`Carry::records`]).
+    /// [`Carry::records`](crate::session::Carry::records)).
     pub async fn cold(
         &mut self,
         now_ms: u64,

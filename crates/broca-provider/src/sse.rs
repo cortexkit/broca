@@ -699,7 +699,7 @@ mod tests {
     ///
     /// All three endings are asserted EQUAL to each other rather than to a literal, so
     /// the property is "framing does not change the payload" rather than a transcription
-    /// of today's output. Split at every byte boundary, because the decoder is
+    /// of the current output. Split at every byte boundary, because the decoder is
     /// incremental and a terminator arriving alone is the interesting case.
     #[test]
     fn a_field_before_data_survives_every_line_ending() {

@@ -7,8 +7,8 @@ pub(crate) fn next_tag(records: &[(u64, Record)]) -> Result<Option<u64>, String>
     let mut first = None;
     for (_, record) in records {
         if let Record::RunStart(start) = record {
-            // Today's LineageTags switches to Computed on such a start and then carries no
-            // next ledger tag, even if earlier runs in the same session stamped ledger tags.
+            // LineageTags switches to Computed on such a start and then carries no next ledger
+            // tag, even if earlier runs in the same session stamped ledger tags.
             if start
                 .run_choices
                 .as_ref()

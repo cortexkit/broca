@@ -51,9 +51,9 @@ impl OpenLogIndex {
     pub fn note(&mut self, seq: u64, record: &Record) {
         if seq >= self.activity_from_seq {
             if let Record::Moved(moved) = record {
-                // Today's head can prefer the WAL file's time to a later recorded time. The move
-                // freezes that served value, so times in the converted prefix must not outrank it.
-                // Only records after this boundary can advance the session's activity again.
+                // The move freezes the served activity time, so times in records converted from
+                // the old log format must not outrank it. Only records after this boundary can
+                // advance the session's activity again.
                 self.newest_activity_ms = Some(moved.source_activity_ms);
             } else if let Some(at) = record.activity_ms() {
                 self.newest_activity_ms =

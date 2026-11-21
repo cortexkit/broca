@@ -30,16 +30,15 @@ pub enum SetupParts {
     RenderConfig,
 }
 
-/// A run start's frozen config as today's `RunStarted` record spells it, the members of its
-/// `config` object, and the setup parts of the run's plan manifest, in order. `part` reads a
-/// setup part's value; `wanted` says which parts to read at all.
+/// A run start's frozen config: the members of its `config` object and the setup parts of its
+/// plan manifest, in order. `part` reads a setup part's value; `wanted` says which parts to read
+/// at all.
 ///
-/// The inverse conversion (`today.rs`) rebuilds today's record from this, and the serve
-/// executor rebuilds the config a new run's admission reads (`run_config_of_start`), so both
-/// read a run's start the same way. The config's parts come first (its tools, then the
-/// response format every run config has, then its global system text and render config), then
-/// the manifest's. So a tools part before the response format is the config's, and one after
-/// it is the manifest's.
+/// The inverse conversion (`today.rs`) rebuilds the record from this, and the serve executor
+/// rebuilds the config a new run's admission reads (`run_config_of_start`), so both read a run's
+/// start the same way. The config's parts come first (its tools, then the response format every
+/// run config has, then its global system text and render config), then the manifest's. So a
+/// tools part before the response format is the config's, and one after it is the manifest's.
 pub fn run_config_members<E>(
     start: &broca_session_store::record::RunStart,
     wanted: SetupParts,

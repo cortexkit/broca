@@ -1,29 +1,27 @@
 //! `run.tool_calls` for a session kept in the session store: the run's calls in the order its
-//! steps made them, each with its outcome, key, dispatch module and result size, paged as
-//! today's storage pages them (`serve::run_tool_calls_answer`).
+//! steps made them, each with its outcome, key, dispatch module and result size, paged by
+//! `serve::run_tool_calls_answer`.
 //!
-//! Today's answer walks the run's WAL records (`serve::indexed_run_tool_calls`). This walks the
-//! store's records of the run with the same rules, record for record:
+//! The run's records are walked with these rules:
 //!
 //! - **A step's calls:** the assistant message's tool calls, at the ordinal the message's entry
 //!   facts give it. A new step drops calls of an earlier one that never got a batch.
 //! - **A dispatch intent:** the first copy of the call's id with no intent and no outcome takes
 //!   the intent's arguments (the call's own input when the intent stored none), its module and
 //!   its key.
-//! - **An outcome:** a call never dispatched (`NotDispatched`, today's `tool_no_dispatch`) is
-//!   refused, and carries no result size. Any other outcome is read with its reply as today's
-//!   `tool_result` is (`serve::run_tool_call_outcome`), and carries the size of the stored
-//!   result. A call with no key yet takes the key the outcome recorded.
+//! - **An outcome:** a call never dispatched (`NotDispatched`) is refused, and carries no result
+//!   size. Any other outcome is read with its reply, and carries the size of the stored result.
+//!   A call with no key yet takes the key the outcome recorded.
 //! - **The batch's end:** every call of the batch is listed, its results at the next ordinal. A
 //!   call with an intent and no outcome is indeterminate; one with neither isn't listed.
 //! - **A run still running:** the open batch's calls are listed as they stand. A call's result
 //!   is written as soon as it comes back, before the rest of its batch, so a call with an
 //!   outcome lists its result ordinal already: the contract wants it on every finished call.
 //!
-//! The keys are the ones the store recorded: a moved session keeps today's keys, and a session
-//! the session store started has its own. A cursor carries the store's seqs and names the
-//! session's log incarnation, so a cursor today's storage issued, or one from a session that was
-//! created again, is refused naming `after`.
+//! The keys are the ones the store recorded: a moved session keeps its existing keys, and a
+//! session the session store started has its own. A cursor carries the store's seqs and names
+//! the session's log incarnation, so a cursor from a session that was created again is refused
+//! naming `after`.
 
 use broca_protocol::content::ContentBlock;
 use broca_session_store::backend::SessionBackend;

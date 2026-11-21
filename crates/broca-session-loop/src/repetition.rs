@@ -65,13 +65,13 @@ pub(crate) fn first_answer(
     None
 }
 
-/// Adds today's repetition guidance to the copies of tool results the request sends, never to
-/// what's stored: each run's model steps (from its first answer up to the next run's input) are
-/// folded with fresh counters, as today's loop counts within one run.
-/// Adds each run's repetition warnings to its window messages. `prompt` holds the window, whose
-/// first message has session position `first`, while each run's place is a session position. A
-/// run that started before the window counts on from `spanning`, the counters the latest cut kept
-/// for its sealed steps; without them none of its steps were sealed.
+/// Adds repetition guidance to copies of tool results sent in the request, never to stored
+/// results. Each run's model steps (from its first answer up to the next run's input) are
+/// folded with fresh counters, independently per run.
+/// Adds each run's repetition warnings to its window messages. `prompt` holds the window,
+/// whose first message has session position `first`, while each run's place is a session
+/// position. A run that started before the window counts on from `spanning`, the counters
+/// the latest cut kept for its sealed steps; without them none of its steps were sealed.
 pub(crate) fn repetition_guidance(
     prompt: &mut [Message],
     episodes: &[EpisodeRenderInput],

@@ -1,12 +1,11 @@
 //! A queued send in the store's shape: built from the request a caller sent, and rebuilt into
-//! that request when the send drains into a run or a retry is compared with it. Also a steer's
-//! record, which keeps its messages and a receipt the same way.
+//! that request when the send drains into a run or a retry is compared with it. Also a
+//! steer's record, which keeps its messages and a receipt the same way.
 //!
-//! The record splits the request the way the converter splits today's `Queued` record, so a
-//! send queued by the store actor and one converted from today's log are the same record:
-//! its messages are typed, its tool list is a setup part, and the rest of the request is kept
-//! whole. What today's record keeps beside the request (who sent it, its title, its identity
-//! digest and so on) is the record's receipt.
+//! A send queued by the store actor and one converted from the old log format's `Queued`
+//! record are the same record: its messages are typed, its tool list is a setup part, and the rest of
+//! the request is kept whole. The receipt holds what accompanies the request, such as who
+//! sent it, its title and its identity digest.
 
 use broca_protocol::request::SubmissionRequest;
 use broca_session_store::record::{PartKind, QueuedSend, Steer};
@@ -15,8 +14,8 @@ use serde_json::Value;
 
 use crate::parts::Parts;
 
-/// Today's `Queued` record's fields that have no typed home in [`QueuedSend`], under the same
-/// names. Each is left out when absent, as today's record leaves it out.
+/// The `Queued` record's fields that have no typed home in [`QueuedSend`], under the same
+/// names. Each is left out when absent.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Receipt {
     /// A class an unlabelled session may adopt when this queued send starts its run.
@@ -85,8 +84,7 @@ pub fn queued_send(
         },
         None => None,
     };
-    // Stored as today's `Queued` record stores them, so the drained run's start, a ride's notice
-    // and the reads serve them alike.
+    // Stored so the drained run's start, a ride's notice and reads serve them alike.
     let message_marks = message_marks
         .map(serde_json::to_value)
         .transpose()
@@ -132,8 +130,8 @@ pub fn request_of(send: &QueuedSend, parts: &dyn Parts) -> Result<SubmissionRequ
     serde_json::from_value(Value::Object(request)).map_err(json)
 }
 
-/// Today's `Steered` record's fields beside its messages, time and part numbers, under the same
-/// names. Each is left out when absent, as today's record leaves it out.
+/// The `Steered` record's fields beside its messages, time and part numbers, under the same
+/// names. Each is left out when absent.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SteerReceipt {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,7 +165,7 @@ pub fn steer(
         Value::Object(receipt) if receipt.is_empty() => None,
         receipt => Some(receipt),
     };
-    // Stored as today's `Steered` record stores them.
+    // Stored on the steer record.
     let message_marks = message_marks
         .map(serde_json::to_value)
         .transpose()

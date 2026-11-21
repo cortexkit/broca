@@ -1,12 +1,11 @@
 //! A run's spend facts, for a session kept in the session store.
 //!
-//! The usage export holds the facts today's builder writes
-//! (`broca_core::billing::compute_segments_for_run`), and its readers read nothing else. That
-//! builder's rules are many: segments, refreezes, refusal-fallback routing, warms billed under
-//! the run whose request they re-sent. So a run kept here isn't billed by a second copy of them.
-//! The records the builder reads are rebuilt in today's form ([`crate::today`]) and handed to
-//! the same builder, through the export writer today's runs use. Which records are handed over
-//! is the one thing decided here.
+//! The usage export holds the facts computed by
+//! [`broca_core::billing::compute_segments_for_run`], and its readers read nothing else. That
+//! builder handles segments, refreezes, refusal-fallback routing and warms billed under the run
+//! whose request they re-sent, so runs stored here use the same rules rather than a second copy.
+//! The builder's input records are rebuilt by [`crate::today`] and handed to the same builder
+//! through the usage export writer. This code decides which records are handed over.
 //!
 //! For one run, the builder reads:
 //! - the run's start;
@@ -22,7 +21,7 @@
 //! config so that a warm is billed under the run it names, but a warm naming an earlier run
 //! yields that run's facts, never this one's.
 //!
-//! The rebuilt records carry the store's seqs. Today's builder reads a seq only as a warm fact's
+//! The rebuilt records carry the store's seqs. The builder reads a seq only as a warm fact's
 //! segment ordinal and in its fact id, and a store seq never repeats within a session, so warm
 //! fact ids stay unique.
 
@@ -38,9 +37,10 @@ use serde_json::Value;
 use crate::parts::Parts;
 use crate::today;
 
-/// Today's records the builder reads for `run_id`, rebuilt from `records`: the session's records
-/// in seq order, both streams, from the run's first start on or from earlier. `session` is the
-/// session's identity, which today's run starts repeat and the new format keeps once.
+/// The builder's input records for `run_id`, rebuilt from `records`: the session's records
+/// in seq order, both streams, from the run's first start or earlier. `session` is the
+/// session's identity: builder-format run starts repeat it, while the session store keeps it
+/// once.
 pub fn today_records(
     records: &[(u64, Record)],
     run_id: &str,
@@ -63,7 +63,7 @@ pub fn today_records(
                 own = true;
                 ended = false;
                 assistant = None;
-                // Its input entries follow it, as today's record holds them.
+                // Its input entries follow it.
                 let inputs: Vec<&Input> = records[index + 1..]
                     .iter()
                     .map_while(|(_, record)| match record {
@@ -132,7 +132,7 @@ pub fn today_records(
     Ok(out)
 }
 
-/// Today's `run_started` for `start`, under the session's identity.
+/// The `run_started` record for `start`, under the session's identity.
 fn run_started(
     start: &broca_session_store::record::RunStart,
     inputs: &[&Input],
@@ -167,7 +167,7 @@ pub async fn session_records<B: SessionBackend>(
         .map_err(|error| format!("the run's records could not be read: {error:?}"))
 }
 
-/// Today's records the builder reads for `run_id`, read from `session` and rebuilt.
+/// Records for `run_id`, read from `session` and rebuilt.
 pub async fn run_records<B: SessionBackend>(
     session: &Session<B>,
     run_id: &str,
@@ -178,8 +178,8 @@ pub async fn run_records<B: SessionBackend>(
     today_records(&records, run_id, bind, parts)
 }
 
-/// What the usage export needs to bill `run_id`: today's records the builder reads, and the
-/// run's model attempts in seq order, each with its usage fact
+/// What the usage export needs to bill `run_id`: the builder's input records and the run's model
+/// attempts in seq order, each with its usage fact
 /// ([`broca_core::billing::attempt`]).
 pub async fn run_billing_inputs<B: SessionBackend>(
     session: &Session<B>,

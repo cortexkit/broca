@@ -118,7 +118,7 @@ pub fn cache_lifetime(
                 ) =>
         {
             match retention.as_deref() {
-                // GPT-5.6 and later treat today's 24h request as 30m; report the frozen request for now.
+                // GPT-5.6 and later treat a 24h request as 30m; report the frozen request for now.
                 Some("24h") => Some(CacheLifetime::Explicit(86_400_000)),
                 None | Some("in_memory") => Some(CacheLifetime::Implicit),
                 _ => None,
@@ -283,7 +283,7 @@ pub struct FrozenRenderConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reasoning_content_required: bool,
     /// Which reasoning field and representation to echo on which assistant turns. Frozen at
-    /// run start rather than re-derived from today's catalog when an episode resumes.
+    /// run start rather than re-derived from the current catalog when an episode resumes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_echo: Option<crate::policy::ReasoningEchoPolicy>,
     /// Whether the provider requires a string `content` (not JSON null) on tool-call-only

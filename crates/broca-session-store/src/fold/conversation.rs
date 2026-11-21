@@ -221,8 +221,8 @@ state! {
             reset: "a cut",
             bound: Bound::PerRun("one count per distinct failing call"),
         },
-        /// The transcript holds a message of the first compaction protocol, which only today's
-        /// run loop renders, so the new run loop refuses the session.
+        /// The transcript holds a message of the first compaction protocol, which the run loop
+        /// does not render, so the run loop refuses the session.
         14 req pub first_protocol_compaction: bool => {
             owner: "compaction",
             reset: "never",

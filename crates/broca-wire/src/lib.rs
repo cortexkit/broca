@@ -4182,10 +4182,10 @@ mod status_params_strictness {
 
     /// THE COUNTER-ARM: the growing structs must stay lenient, or a rolling upgrade breaks.
     ///
-    /// `work_class` landed on SendParams hours ago. A caller built against today's wire, talking
-    /// to a daemon that predates it, must have the field IGNORED rather than fail the call. This
-    /// asserts the split is deliberate -- someone applying `deny_unknown_fields` uniformly across
-    /// this file reddens here and reads why.
+    /// `work_class` landed on SendParams hours ago. A caller built against the current wire,
+    /// talking to a daemon that predates it, must have the field IGNORED rather than fail the call.
+    /// This asserts the split is deliberate -- someone applying `deny_unknown_fields` uniformly
+    /// across this file reddens here and reads why.
     #[test]
     fn send_params_stay_lenient_so_a_newer_caller_degrades_rather_than_fails() {
         let body = serde_json::json!({

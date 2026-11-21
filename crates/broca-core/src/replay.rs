@@ -2627,7 +2627,7 @@ fn replay_seeded_with_compaction<'a>(
     // A torn import's repair truncates the prompt; a turn past the end no longer exists.
     committed_tool_turns.retain(|(prompt_index, _)| *prompt_index < prompt.len());
     // No shipping session waits for a numbering checkpoint from its compaction provider:
-    // sessions on today's compaction protocol number tags with broca's own markers, and
+    // sessions on the current compaction protocol number tags with broca's own markers, and
     // sessions compacted under the earlier protocol keep the numbers their records froze.
     let tags_await_setup = false;
     Ok(ReplayState {
@@ -2716,7 +2716,7 @@ pub struct ReconciledRunState {
     pub error: Option<ProviderError>,
     /// Why the run is paused, taken from its `RunPaused`. Set only when `state` is `Paused`.
     pub pause_reason: Option<PauseReason>,
-    /// Authentication selection from this run's durable start, never from today's routing.
+    /// Authentication selection from this run's durable start, never from current routing.
     pub auth_selection: Option<broca_wal::AuthSelection>,
     /// The caller's title recorded for this run: its `RunStarted`'s, or, for a queued send that
     /// never started, its `Queued` record's. `None` when the send carried none.

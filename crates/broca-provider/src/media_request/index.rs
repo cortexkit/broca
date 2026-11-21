@@ -79,10 +79,9 @@ impl MediaIndex {
         self.step_open
     }
 
-    /// Applies one event, with the transitions today's fold of the old records makes
-    /// ([`MediaAging::fold_media_event`]). The first media limits an index learns are taken as
-    /// the ones in force from the start, as today's renderer takes the run's own limits: nothing
-    /// was aged under others. Without limits, the engine's state moves and aging isn't tracked.
+    /// Applies one event. The first media limits an index learns are taken as the ones in force
+    /// from the start: nothing was aged under others. Without limits, state still moves, but
+    /// aging is not tracked.
     pub fn apply(&mut self, event: &MediaEvent) -> Result<(), String> {
         if self.profile.is_none() {
             let limits = match event {

@@ -13,10 +13,10 @@
 //! Kind numbers are stored in every frame header and must never be reused. Transcript kinds use
 //! 1-63 and ledger kinds 64 and up, so a kind number alone names its stream.
 //!
-//! Some members are **owned payloads**: JSON values whose structure belongs to the component that
-//! reads them (the provider's frozen render config, the vault's auth selection, billing
-//! envelopes). The store carries them without interpreting them, as today's log already does for
-//! the render config. Everything the store or its folds read is a typed field.
+//! Some members are **owned payloads**: JSON values whose structure belongs to the component
+//! that reads them (the provider's frozen render config, the vault's auth selection, billing
+//! envelopes). The store carries them without interpreting them. Everything the store or its
+//! folds read is a typed field.
 //!
 //! This is the first slice of the record set: the kinds that carry nearly all of a session's bytes
 //! and that loading and appending exercise. The remaining kinds (queue, approvals, held calls,
@@ -272,8 +272,7 @@ values! {
 }
 
 message! {
-    /// What a ride carries besides its text and its send's id, as today's `SendDelivered`
-    /// record holds it in its `ride` member.
+    /// What a ride carries besides its text and its send's id.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub struct RideEnvelope {
         /// The key of the tool call whose result carries the ride, recorded at delivery and
@@ -383,7 +382,7 @@ message! {
         8 req render_tags: bool,
         9 req clean_reply: bool,
         /// The message's id, which never repeats in the session, across reverts. A message
-        /// converted from today's storage keeps today's id. A new message's id is minted from
+        /// converted from the old log format keeps its id. A new message's id is minted from
         /// the writer generation and the seq this record takes (`Session::message_id`).
         10 req mid: String,
         /// The run that placed the message. Absent when no run owns it, such as an imported
@@ -409,9 +408,9 @@ message! {
         /// The send's display marks, as llm-runner's `MessageMarks` JSON: `speaks_for` and a
         /// true `notice`. Held once per process for every message with the same marks.
         17 opt marks: SharedJson,
-        /// The message was converted from a log of today's storage that had no lineage, so
-        /// today's read serves it none of what an `include_display_facts` read adds, and nor does
-        /// the session store's. Absent for every message broca places itself.
+        /// For a message converted from the old log format without lineage, reads do not serve
+        /// the display facts that an `include_display_facts` read adds. Absent for every
+        /// message broca places itself.
         18 opt no_display_facts: bool,
         /// For an assistant message: the summaries its reasoning blocks carry, in the order of
         /// its content blocks, as `session.read` serves them with display facts. Recorded when
@@ -425,8 +424,8 @@ message! {
         /// The highest part number the runner's own numbering (llm-runner's tags: stamped on a
         /// v1 run's records, computed by `broca_protocol::tags::number_message` from each later
         /// run's checkpoint) shows before this message. The message's numbered parts take the
-        /// numbers after it, under its run's rules. It is the numbering today's read attaches to
-        /// each message and output references resolve a reply's `$$tc(N)` against; on the
+        /// numbers after it, under its run's rules. The current read attaches this numbering to
+        /// each message, and output references resolve a reply's `$$tc(N)` against it; on the
         /// compaction contract the model is shown `tag_base`'s numbering instead. Absent on
         /// sessions written before it was recorded.
         21 opt runner_tag_base: u64,
@@ -922,7 +921,7 @@ message! {
         /// schema pin the call was dispatched under.
         11 opt schema_pin: broca_protocol::json::Json,
         12 opt hooks: broca_protocol::json::Json,
-        /// The converter derived `call_key` from today's log: today's intent stores no key, and
+        /// The converter derived `call_key` from the old log format: intents store no key, and
         /// the runner sent `<log lineage id>:<intent's position>`, which the provider keys the
         /// call's late result, approval and withdrawal on. The key is stored so it never has to
         /// be derived from a position again; this marks it as derived, so the record converts
@@ -967,11 +966,11 @@ message! {
         9 opt detail: broca_protocol::json::Json,
         10 opt hooks: broca_protocol::json::Json,
         /// The key of a call answered without a dispatch intent (denied, invalid, synthetic, or
-        /// refused with its batch), which no intent holds: the new loop mints it from this
-        /// record's writer generation and seq, in the form of the store's ids, and a converted
-        /// call keeps today's key, made from the log's lineage and its terminal record's seq.
-        /// Absent for a dispatched call, whose key is its intent's, and on outcomes written
-        /// before it was recorded.
+        /// refused with its batch), which no intent holds: the run loop mints it from this
+        /// record's writer generation and seq, in the form of the session store's ids, and a
+        /// converted call keeps its key, made from the old log's lineage and its terminal
+        /// record's seq. Absent for a dispatched call, whose key is its intent's, and on
+        /// outcomes written before it was recorded.
         11 opt call_key: String,
         /// Owned by the tool router: the provider a call was handed back from for the person's
         /// steer (llm-runner `call_yield`), whose later terminal for it becomes a notice. Absent
@@ -1159,7 +1158,7 @@ message! {
     pub struct Moved {
         /// The move that wrote it, `store-move:<uuid>`.
         1 req move_id: String,
-        /// When the session last changed, as today's `session.head` served it (`updated_at`).
+        /// When the session last changed, as the current `session.head` serves it (`updated_at`).
         2 req source_activity_ms: u64,
         /// The source WAL's lineage, retained as the session's output-reference namespace.
         /// Readers must preserve it so references handed out before conversion still resolve.
@@ -1417,7 +1416,7 @@ message! {
         1 req run_id: String,
         2 req firing: BudgetFiring,
         3 req threshold: u64,
-        /// The conversation position the message took, as today's log recorded it.
+        /// The conversation position the message took.
         4 req ordinal: u64,
         /// The text the record stored; older records didn't store it.
         5 opt caller_text: String,

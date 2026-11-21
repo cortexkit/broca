@@ -812,7 +812,7 @@ impl CatalogSnapshot {
         self.0.catalog.providers.contains_key(provider_id)
     }
 
-    /// Resolve a model using a previously recorded family instead of today's overlay pin.
+    /// Resolve a model using a previously recorded family instead of the current overlay pin.
     pub(crate) fn model_for_serving_with_family(
         &self,
         provider_id: &str,

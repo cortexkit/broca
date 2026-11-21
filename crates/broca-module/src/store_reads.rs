@@ -222,8 +222,8 @@ pub enum StoreReadOutcome {
     Reopen,
 }
 
-/// The in-flight model step of the run `run_id`, as the actor running it knows it: what today's
-/// `run.status` serves as an active run's `step`.
+/// The in-flight model step of the run `run_id`, as known by the actor running it; the `step`
+/// served for an active run.
 #[derive(Debug, Clone)]
 pub struct LiveStep {
     pub run_id: String,

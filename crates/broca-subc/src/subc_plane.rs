@@ -3160,7 +3160,7 @@ impl SubcToolPlane {
             self.default_module_id.as_deref(),
         );
         if resolved.values().any(|route| route.module().is_none()) {
-            // A cached snapshot must never turn a call that would resolve against today's
+            // A cached snapshot must never turn a call that would resolve against the current
             // catalog into a failure. A provider can appear after the snapshot was captured,
             // and ambiguity can disappear when one provider unregisters, so every resolution
             // failure gets exactly one fresh catalog fetch before its result is frozen.

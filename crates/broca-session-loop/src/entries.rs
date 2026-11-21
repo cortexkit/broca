@@ -1,11 +1,9 @@
 //! Entry facts: what `session.entries` serves about each message, decided once when the message
 //! is placed.
 //!
-//! Today's loop leaves these for its projection to work out again on every read, by folding the
-//! whole log (`broca_core::compaction_v2::metadata`). The new loop writes an `EntryFacts`
-//! transcript record right after the records that place (or reserve) a message, as the
-//! converter does for a converted session, so both kinds of session read the same way. The rules
-//! are today's:
+//! The run loop writes an `EntryFacts` transcript record right after the records that place (or
+//! reserve) a message. Sessions converted from the old log format got the same facts from the
+//! conversion, so both kinds of session read the same way. The rules are:
 //! - **Part numbers:** a message's numbered parts take the numbers after the highest one before
 //!   it (`tag_base`). A tool-results message has none of its own.
 //! - **Notice:** a user message names the module that sent it, when one did.
@@ -106,11 +104,11 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// The terminal the reply `reply` and its outcome `outcome`, at `seq`, record. A call its tool
-    /// answered has its answer's time; any other has why it has no answer, by today's rules:
-    /// a refusal or a policy block is `denied`, a call that was never sent or failed validation
-    /// is `not_executed`, one abandoned or sent without an answer back is `interrupted`, and one
-    /// a step limit stopped is `cancelled`.
+    /// The terminal facts for reply `reply` and outcome `outcome` at `seq`.
+    /// A call answered by its tool has its answer's time; otherwise, the record states why it has
+    /// no answer: a refusal or policy block is `denied`, a call that was never sent or failed
+    /// validation is `not_executed`, one abandoned or sent without an answer is `interrupted`, and
+    /// one stopped by a step limit is `cancelled`.
     pub fn of(reply: &ToolReply, outcome: &ToolOutcome, seq: u64) -> Self {
         use broca_protocol::content::ToolOutput;
         let unanswered = match outcome.outcome {
@@ -260,8 +258,8 @@ impl<W: Writer> Placed<'_, W> {
     }
 }
 
-/// The view a model-written message was written under, as today's projection decides it: the
-/// newest view a step applied, which the step that writes the message applied or kept.
+/// The view under which a model-written message was written: the newest view applied by the
+/// step that writes the message, whether that step applied or kept it.
 fn written_under(operations: &Operations) -> Option<ViewRef> {
     operations.view_applied.as_ref().map(|applied| ViewRef {
         version: applied.view.version,
@@ -528,9 +526,9 @@ impl Tags {
         }
     }
 
-    /// Today's rules for a run on the current compaction contract: numbers render when the plan
-    /// asks for them or names a compaction item, and replies are cleaned when they render, except
-    /// a structured-output run's final text.
+    /// For runs on the current compaction contract, numbers render when the plan asks for them
+    /// or names a compaction item, and replies are cleaned when they render, except for a
+    /// structured-output run's final text.
     pub fn for_run(
         manifest: Option<&broca_wal::PlanManifest>,
         render_config: &serde_json::Value,
@@ -578,7 +576,7 @@ pub struct Placing<'a> {
 /// a run of input messages together with the step start or run end that places them, as the
 /// converter places them for a converted session. The batch that places a tool turn's results
 /// also gets the turn's facts after them ([`turn_facts`]); a run's end as cancelled restates its
-/// last turn's facts with the calls it abandoned as cancelled, as today's reads state them.
+/// last turn's facts with the calls it abandoned as cancelled.
 pub fn with_facts(batch: Vec<Record>, at: &Placing<'_>) -> Result<Vec<Record>, String> {
     with_facts_and_messages(batch, at).map(|(records, _)| records)
 }
@@ -668,16 +666,15 @@ pub fn with_facts_and_messages(
     let mut results_mid = run
         .and_then(|run| run.open_batch.as_ref())
         .and_then(|batch| batch.results_mid.clone());
-    // Who sent the input of a run started in this batch, read from its start as today's entry
-    // metadata reads it from the run's start, and the send display facts of that input.
+    // Who sent the input of a run started in this batch, read from its start, and the send
+    // display facts of that input.
     let mut run_sender = None;
     let mut run_send = SendFacts::default();
     // Whether a run started in this batch takes its input from a queued send delivered by its
-    // `idle_start` mode, whose messages today's reads name as delivered that way.
+    // `idle_start` mode.
     let mut run_idle_start = false;
-    // Text a send delivered on a tool result without an envelope names the results message as
-    // delivered that way, as today's reads keep naming such deliveries. A ride with an envelope
-    // belongs to its call, never to the message.
+    // Text delivered on a tool result without an envelope is attributed to the results message.
+    // A ride with an envelope belongs to its call, never to the message.
     let riding: Option<ToolCallId> = batch.iter().rev().find_map(|record| match record {
         Record::ResultAppend(append) if append.ride.is_none() => Some(append.tool_call_id.clone()),
         _ => None,
@@ -741,7 +738,7 @@ pub fn with_facts_and_messages(
     }
     // The key of each call of the open turn, by call id, which a ride names its carrier by: the
     // open batch's calls, then this batch's intents and the outcomes of calls answered without
-    // one. A call id's first key is the call's, as today's reads take it.
+    // one. A call id's first key is the call's.
     let mut key_of: std::collections::HashMap<ToolCallId, String> = Default::default();
     for call in open_batch.iter().flat_map(|batch| &batch.calls) {
         if let Some(key) = &call.key {
@@ -797,14 +794,13 @@ pub fn with_facts_and_messages(
             // A step or batch start announces the id of the message it will write, minted from
             // the writer generation and the seq this record takes.
             Record::StepStart(start) => {
-                // A step started again after an attempt that wrote no message (a pause, a
-                // refusal, a crash) writes the message that attempt announced, under the id
-                // today's storage gives it. A minted id names the record that announced it, so
-                // the retried step reuses it wherever its message lands. A position id (a
-                // converted `m<position>`, or `m<lineage>.<position>` on the compaction
-                // contract) is a function of the message's ordinal, as today's storage numbers
-                // it, so it is derived again from the ordinal the message takes now: a
-                // delivery placed at the retried step's boundary moves the message on.
+                // A step restarted after an attempt that wrote no message (a pause, a refusal, or
+                // a crash) writes the message that attempt announced.
+                // A minted id names the record that announced it, so the retried step reuses it
+                // wherever its message lands. A position id (a converted `m<position>`, or
+                // `m<lineage>.<position>` on the compaction contract) is a function of the
+                // message's ordinal, so it is derived again from the ordinal the message takes
+                // now: a delivery placed at the retried step's boundary moves the message on.
                 let retried = step_mid
                     .take()
                     .filter(|mid| !step_placed && !newest_assistant_is(at.conversation, mid))
@@ -910,7 +906,7 @@ pub fn with_facts_and_messages(
                 // The message a step or batch announced takes the id it announced: a step's
                 // assistant message, and the tool-results message a batch's last reply places.
                 // A position id a step announced but hasn't placed names an ordinal, not a
-                // message: any message that lands there takes it, as today's storage numbers it.
+                // message: any message that lands there takes it.
                 let announced = match &record {
                     Record::Assistant(_) => step_mid.clone(),
                     Record::ToolReply(_) if ordinal == now_known => results_mid.clone(),
@@ -931,9 +927,9 @@ pub fn with_facts_and_messages(
                 } else {
                     own.filter(|at| *at != 0)
                 };
-                // A results message text without an envelope was delivered on, and the input of a
-                // run an `idle_start` delivery started, are named as delivered that way, as
-                // today's reads name them.
+                // Text delivered on a tool result without an envelope is attributed to the
+                // results message, and the input of a run an `idle_start` delivery started is
+                // named as delivered that way.
                 let (delivery_mode, delivery_tool_call_id) = match (&record, &riding) {
                     (Record::ToolReply(_), Some(call)) => {
                         (Some("tool_result".to_owned()), Some(call.0.clone()))
@@ -1080,16 +1076,15 @@ impl CallEvent {
 }
 
 /// The facts of the tool turn whose assistant message, at `ordinal`, made the calls in
-/// `assistant`, from what its calls recorded (`events`), by today's display rules
-/// (`broca_core::display_facts` and `broca_core::call_identity`), so a read serves each call as
-/// today's read serves it:
+/// `assistant`, from what its calls recorded (`events`), using `broca_core::display_facts` and
+/// `broca_core::call_identity`:
 ///
 /// - Each copy of a call id has its own identity: an intent takes the first copy not yet sent or
 ///   closed, a refusal the first without a key, and a result the first not yet closed. A copy
 ///   that took no intent takes the key its outcome recorded (`ToolOutcome::call_key`). A copy
 ///   with neither has no facts.
 /// - Times and why a call has no answer go to the first copy of its id, each later record
-///   overwriting what an earlier one set, as today's read keeps them.
+///   overwriting what an earlier one set.
 pub fn turn_facts(ordinal: u64, assistant: &Message, events: &[CallEvent]) -> TurnFacts {
     struct Slot<'a> {
         id: &'a ToolCallId,
@@ -1238,7 +1233,7 @@ pub fn served_schema_pin(tool_name: &str, pin: &serde_json::Value) -> Option<Str
 }
 
 /// The facts of the conversation's newest assistant message, when it made tool calls that have
-/// all been answered: the turn today's reads restate when its run ends cancelled.
+/// all been answered: the turn to restate if its run ends cancelled.
 fn newest_turn(conversation: &Conversation) -> Option<TurnFacts> {
     if conversation.open_tool_turn().is_some() {
         return None;
@@ -1252,8 +1247,8 @@ fn newest_turn(conversation: &Conversation) -> Option<TurnFacts> {
         .and_then(|(_, entry)| entry.turn.as_deref().cloned())
 }
 
-/// `turn` with each call abandoned as interrupted restated as cancelled, as today's reads state
-/// a run's last turn once the run ends cancelled; `None` when none was.
+/// Restates `turn`, changing each call abandoned as interrupted to cancelled; returns `None` if
+/// no call was changed.
 fn cancelled(mut turn: TurnFacts) -> Option<TurnFacts> {
     let mut changed = false;
     for call in &mut turn.calls {
@@ -1265,9 +1260,8 @@ fn cancelled(mut turn: TurnFacts) -> Option<TurnFacts> {
     changed.then_some(turn)
 }
 
-/// Who sent the send that placed a message, the `client_message_id` it carried, and its display
-/// marks, as today's display facts name them for every message of a run's input or of a steer
-/// or delivered send.
+/// The sender of the send that placed a message, the `client_message_id` it carried, and its
+/// display marks, for a message of a run's input, a steer, or a delivered send.
 #[derive(Debug, Clone, Default)]
 struct SendFacts {
     send_id: Option<String>,
@@ -1277,11 +1271,11 @@ struct SendFacts {
     marks: Option<serde_json::Value>,
 }
 
-/// The send facts of the input of the run `start` starts, by today's rules: for a fresh run, the
-/// queued send it consumes names them (`operations` holds it in its queue until the run starts),
-/// else the run's own start: its sender's module (whoever sent on the owner's behalf, else the
-/// run's principal), and the `client_message_id` its request identity carries. The marks are the
-/// run's start's own, else the queued send's. A run that isn't fresh has none.
+/// The send facts of the input of the run `start` starts: for a fresh run, the queued send it
+/// consumes provides them (`operations` holds it in its queue until the run starts); otherwise,
+/// the run's own start provides its sender's module (whoever sent on the owner's behalf, or the
+/// run's principal) and the `client_message_id` carried by its request identity. The marks come
+/// from the run's start, or from the queued send. A run that isn't fresh has none.
 fn run_send_facts(
     start: &broca_session_store::record::RunStart,
     operations: &Operations,
@@ -1413,11 +1407,11 @@ pub fn call_ids(message: &Message) -> Vec<ToolCallId> {
         .collect()
 }
 
-/// The notice `session.read` serves for the send `append` delivered riding on a result of a tool
-/// results message, whose assistant message made the calls `calls`, as today's display facts
-/// name it (`broca_core::display_facts`): the result's place is its call's last place among
-/// `calls`. Only a ride delivered with its envelope has one, and only text set apart from the
-/// result by a blank line, which belongs to rendering and isn't part of the notice.
+/// The notice `session.read` serves for send `append`, delivered as a ride on a tool-results
+/// message whose assistant message made calls `calls`. Using `broca_core::display_facts`, the
+/// result's place is its call's last place among `calls`. Only a ride delivered with its envelope
+/// has a notice, and only text set apart from the result by a blank line is included; the blank
+/// line belongs to rendering and is not part of the notice.
 pub fn ride_notice(append: &ResultAppend, calls: &[ToolCallId]) -> Option<RideNotice> {
     let ride = append.ride.as_ref()?;
     let text = append.text.strip_prefix("\n\n")?;
@@ -1435,9 +1429,9 @@ pub fn ride_notice(append: &ResultAppend, calls: &[ToolCallId]) -> Option<RideNo
 
 /// `facts`, the facts of the tool results message a ride landed on, restated with the ride's
 /// `notice` added. The message keeps its own delivery attribution: a ride with an envelope belongs
-/// to its call, not to the message, so today's reads attribute no delivery to the message it
-/// took. The converter and the run loop both write one right after each ride, so a session reads
-/// the same whichever wrote it.
+/// to its call, not to the message, so the message has no delivery attribution for the ride. The
+/// run loop writes one right after each ride, as the conversion of old sessions did, so every
+/// session reads the same notice.
 pub fn with_ride(facts: &EntryFacts, notice: RideNotice) -> EntryFacts {
     let mut facts = facts.clone();
     facts.notices.push(notice);
@@ -1488,10 +1482,10 @@ fn restate_for_ride(
     Ok(Some(with_ride(facts, notice)))
 }
 
-/// The id a message converted from today's storage takes at `position` (its ordinal less one),
-/// in the form of `announced`: `m<position>`, or `m<lineage>.<position>` on the compaction
-/// contract, as `broca_core::message_mid` writes them and `Session::find_message` reads them.
-/// `None` when `announced` is no position id: a minted id, or an imported one.
+/// The id a message converted from the old log format takes at position `position` (its ordinal
+/// less one), in the form of `announced`: `m<position>`, or `m<lineage>.<position>` on the
+/// compaction contract, as `broca_core::message_mid` writes them and `Session::find_message`
+/// reads them. `None` when `announced` is no position id: a minted id, or an imported one.
 fn positioned(announced: &str, position: u64) -> Option<String> {
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     let rest = announced.strip_prefix('m')?;
@@ -1525,11 +1519,10 @@ fn flush(out: &mut Vec<Record>, pending: &mut Vec<EntryFacts>, at: &Placing<'_>)
     }
 }
 
-/// The sender of a run's user input, as today's entry metadata names it: for a fresh run, the
-/// module that sent on the owner's behalf, else the run's principal, when that is a module
-/// (`delivery_sender`). A person's input has none. A run that consumes a queued send takes that
-/// send's origin instead, which needs the queued send's records: not built yet, so such a run's
-/// input names no sender.
+/// The sender of a run's user input: for a fresh run, the module that sent on the owner's behalf,
+/// or the run's principal when that is a module (`delivery_sender`). A person's input has none.
+/// A run that consumes a queued send takes that send's origin instead; that needs the queued
+/// send's records, which are not built yet, so such a run's input names no sender.
 pub(crate) fn input_sender(start: &broca_session_store::record::RunStart) -> Option<Notice> {
     let fresh = start
         .origin
@@ -1637,8 +1630,7 @@ fn describe<'r>(
     run_send: &SendFacts,
 ) -> Result<(Option<&'r Message>, Described), String> {
     Ok(match record {
-        // A budget reminder is the runner's own message, sent as a notice from broca, as
-        // today's entries describe it.
+        // A budget reminder is the runner's own message, sent as a notice from broca.
         Record::Input(input) if input.placement == Placement::BudgetNudge => (
             Some(&input.message),
             Described {
@@ -1890,10 +1882,9 @@ fn last_time(conversation: &Conversation) -> Option<u64> {
         .and_then(|facts| facts.written_at_ms)
 }
 
-/// The compaction entry for a message the new format stored, built only from what it stored:
-/// the message, the message after it, its entry facts and the text delivered with its calls.
-/// Projected with today's projection function, so the result can be compared with today's
-/// entry.
+/// The compaction entry for a message stored by the session store, built only from stored data:
+/// the message, the message after it, its entry facts, and the text delivered with its calls,
+/// projected by `broca_core::compaction_v2::entries::project`.
 pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
     use broca_core::compaction_v2::entries::{project, Deliveries, EntryFacts as Facts};
     let facts = stored
@@ -1932,9 +1923,8 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         facts.sender.as_deref(),
         facts.marks.as_deref(),
     )?;
-    // As today's projection attributes them: on the user messages of a marked send, read from
-    // the marks stored with each message, so entries placed before attribution was projected
-    // carry it too.
+    // The projection attributes them to user messages of a marked send by reading the marks
+    // stored with each message, so entries placed before attribution was projected carry it too.
     let speaks_for = if stored.message.role == Role::User {
         stored_speaks_for(facts.marks.as_deref())?
     } else {
@@ -1983,8 +1973,8 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
             .strip_prefix("\n\n")
             .unwrap_or(&delivered.text);
         let mut out = cortexkit_role_compaction::part::Delivered::new(&notice.sender, text);
-        // A ride's part carries its envelope, as today's projection attaches it from the
-        // ride's record; the template comes from the send's order either way.
+        // A ride's part carries its envelope, attached from the ride's record; the template comes
+        // from the send's order either way.
         broca_core::compaction_v2::entries::attach_ride_envelope(
             &mut out,
             ride_metadata(delivered).as_ref(),
@@ -2001,8 +1991,8 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
         .ok_or_else(|| "empty projection".into())
 }
 
-/// The envelope today's `SendDelivered` record holds for a ride the fold kept, or `None` for
-/// text delivered before envelopes existed.
+/// The envelope in the `SendDelivered` record for a ride, or `None` for text delivered before
+/// envelopes existed.
 pub fn ride_metadata(delivered: &Delivered) -> Option<broca_wal::record::RideMetadata> {
     let ride = delivered.ride.as_ref()?;
     Some(broca_wal::record::RideMetadata {
@@ -2013,7 +2003,7 @@ pub fn ride_metadata(delivered: &Delivered) -> Option<broca_wal::record::RideMet
         form: match ride.form {
             RideForm::Append => broca_wal::record::RideForm::Append,
         },
-        // The envelope keeps the agent the sending module spoke for, as today's does.
+        // The envelope keeps the agent the sending module spoke for.
         speaks_for: ride
             .speaks_for
             .as_ref()
@@ -2059,11 +2049,10 @@ pub fn forget_rides(
     }
 }
 
-/// Renders each ride of the window after the result that carries it, as today's loop renders a
-/// ride recorded with its envelope: through the runner's own ride rules
-/// (`broca_core::delivery_order::append_ride`), never joined here. `prompt` holds the window's
-/// messages in order. Text delivered without an envelope was joined into its result when it was
-/// recorded, on the layout that stores it there, and is left alone.
+/// Renders each ride of the window after the result that carries it through the runner's own ride
+/// rules (`broca_core::delivery_order::append_ride`), never joined here. `prompt` holds the
+/// window's messages in order. Text delivered without an envelope is joined into its result when
+/// recorded and is left alone.
 ///
 /// With `after_results` (a probe placement, see `crate::run::rides_after_results`), each ride's
 /// text is held beside its tool message instead, for the renderer to show as its own text block
@@ -2088,8 +2077,7 @@ pub fn render_rides(prompt: &mut [Message], conversation: &Conversation, after_r
             else {
                 continue;
             };
-            // A ride selects the last result for its call, as today's live and replayed
-            // renderers select it.
+            // A ride selects the last result for its call.
             let carrier = results
                 .content
                 .iter_mut()

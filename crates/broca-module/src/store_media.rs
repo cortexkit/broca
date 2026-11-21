@@ -651,8 +651,8 @@ impl RunMedia {
                 index.render_with_provenance(config, opts, render_tags, provenance)
             }
             // The session captured no media, so no medium the prompt names is one of its own: a
-            // compaction view's inserted image, say. Each renders as an index holding nothing
-            // places it, as its provenance marker, the way today's storage renders it.
+            // compaction view's inserted image, say. Each renders as its provenance marker, as an
+            // index holding nothing places it.
             (None, None) => uncaptured()
                 .map_err(|reason| Box::new(refusal(reason)))?
                 .render_with_provenance(config, opts, render_tags, provenance),
@@ -1040,8 +1040,8 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
 /// The request a run of `session` sends for its step `step_id`, built offline: the prompt as the
 /// run loop builds it for a provider that renders media (`offline_media_request`), rendered
 /// through an index built from every record of `session` and its own media objects, read over
-/// `reader`, under `frozen` with `max_output_tokens` as the step's cap. For checking a session in
-/// the session store against the request today's storage renders for it.
+/// `reader`, under `frozen` with `max_output_tokens` as the step's cap. It is used to check a
+/// session in the session store against the request rendered for it.
 #[allow(clippy::too_many_arguments)]
 pub async fn offline_render<B, R>(
     session: &Session<B>,

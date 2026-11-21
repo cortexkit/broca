@@ -9,15 +9,15 @@ use broca_session_store::record::{Attempt, Record};
 
 use super::{hex_digest, LoopError};
 
-/// One HTTP attempt's record, from the provider's evidence. Billing and the session's folded state read the typed
-/// fields; every other field the provider measured is kept as diagnostics telemetry under the
-/// name it has on the provider's evidence. Billing details are absent: no attempt in this loop
-/// is billed through a reservation yet.
+/// One HTTP attempt's record, from the provider's evidence. Billing and the session's folded
+/// state read the typed fields; every other field the provider measured is kept as diagnostics
+/// telemetry under the name it has on the provider's evidence. Billing details are absent: no
+/// attempt in this loop is billed through a reservation yet.
 /// `requested_ttl_ms` is the cache lifetime the run's requests ask for, recorded on an attempt
 /// that reached the cache.
 /// `account_limit_pause` is the run's frozen consent to a timed same-account pause: with it, an
 /// attempt the provider refused for the account's limit records that limit's disposition, as
-/// today's `account_limit_pause::attempt_record` does.
+/// `account_limit_pause::attempt_record` does.
 pub(super) fn attempt_record(
     run_id: &str,
     step_id: u64,

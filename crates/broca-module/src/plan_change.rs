@@ -1,8 +1,7 @@
 //! The rules of a session's plan changes: what `session.refresh`, `session.refresh_policy` and
 //! `session.flush_prefix` decide, which manifest a new run freezes, and which plan a later send
-//! may carry. The session actor on today's storage applies them, and so does an actor that keeps
-//! its sessions in another storage: each reads what a rule asks about the session its own way,
-//! as [`ChangeFacts`], and both decide alike.
+//! may carry. The session actor reads the session facts each rule needs as [`ChangeFacts`] and
+//! applies the rules.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -44,9 +43,8 @@ pub(crate) struct ChangeFacts {
     /// The flush recorded under the request's `send_id`, with the pending generation it
     /// reported.
     pub flush_send: Option<Option<u64>>,
-    /// What the rules for adding a compaction provider read about a session in the new
-    /// storage, which can gain one at its next run (`broca_session_loop::enroll`); `None` on
-    /// today's storage, which refuses a refresh that adds one.
+    /// What the rules for adding a compaction provider read about a session in the session
+    /// store, which can gain one at its next run (`broca_session_loop::enroll`).
     pub enrollment: Option<EnrollmentFacts>,
 }
 
@@ -762,8 +760,8 @@ mod tests {
     }
 
     /// Only a session in the session store takes a refresh that adds a compaction provider, and
-    /// only while it can enroll; every other change to the item is refused with today's bytes, on
-    /// either storage, against the latest accepted plan: the pending one once there is one.
+    /// only while it can enroll. Every other change to the item is refused against the latest
+    /// accepted plan: the pending one once there is one.
     #[test]
     fn only_the_new_storage_adds_a_compaction_provider_and_only_when_it_can_enroll() {
         use broca_session_loop::enroll::Refusal;

@@ -1,9 +1,8 @@
-//! What output references read of a session kept in the session store, as today's read of the
-//! session's log answers it: where a part number sits, and the compaction view the request of
-//! the model step that wrote a message was rendered under. Both are read from facts recorded
-//! when each message was placed (`EntryFacts::runner_tag_base`, `EntryFacts::legacy_view_seq`),
-//! never by replaying the session, so either read costs a bounded number of lookups whatever
-//! the session's length.
+//! What output references read from a session kept in the session store: where a part number sits,
+//! and the compaction view under which the request for the model step that wrote a message was
+//! rendered. Both are read from facts recorded when each message was placed
+//! (`EntryFacts::runner_tag_base`, `EntryFacts::legacy_view_seq`), never by replaying the session,
+//! so either read costs a bounded number of lookups whatever the session's length.
 
 use broca_core::compaction_provider::view::CompactionView;
 use broca_session_loop::parts::Parts;
@@ -11,8 +10,8 @@ use broca_session_store::backend::SessionBackend;
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
 
-/// The type name a first-protocol compaction view keeps as a ledger event on a converted
-/// session (today's `CompactionViewApplied` record).
+/// The type name a first-protocol compaction view keeps as a ledger event on a session converted
+/// from the old log format (`CompactionViewApplied` record).
 const LEGACY_VIEW_EVENT: &str = "compaction_view_applied";
 
 /// The computed part-number rules run `run_id` froze (`broca_core::tags::computed_rules` over
@@ -37,10 +36,10 @@ pub async fn run_rules<B: SessionBackend>(
 
 /// Where part number `tag` sits as the run that numbered it showed it: the message whose
 /// numbered parts take it (`Session::tagged_entry`), numbered under its run's rules from its
-/// recorded base as today's read numbers it, and the part that takes `tag`, as `(zero-based
-/// ordinal, block index)`. `found` is `None` when no part takes the number. The store answers
-/// for every message it holds, so the location says it covers them all (`indexed_through`), and
-/// a caller never scans the transcript for a number the store doesn't hold.
+/// recorded base, and the part that takes `tag`, as `(zero-based ordinal, block index)`. `found`
+/// is `None` when no part takes the number. The store answers for every message it holds, so the
+/// location says it covers them all (`indexed_through`), and a caller never scans the transcript
+/// for a number the store doesn't hold.
 pub async fn tag_location<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
@@ -109,7 +108,8 @@ pub async fn writing_view<B: SessionBackend>(
     if event.name != LEGACY_VIEW_EVENT {
         return Err(damaged(&format!("is a {} event", event.name)));
     }
-    // Today's record holds the view as the JSON text the provider returned.
+    // A record converted from the old log format holds the view as the JSON text the provider
+    // returned.
     let view = match event.body.as_ref().and_then(|body| body.get("view")) {
         Some(serde_json::Value::String(text)) => serde_json::from_str(text),
         Some(value) => serde_json::from_value(value.clone()),

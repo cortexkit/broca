@@ -51,7 +51,7 @@ pub enum CompactionItemChange {
 
 /// How `next`'s compaction item compares with `latest`'s: the latest plan the session accepted,
 /// which is its pending refresh's when one waits to apply, else the one its latest run froze.
-/// Each storage decides which changes it takes; [`check_compaction_item`] is today's.
+/// The session store's change policy is [`check_compaction_item`].
 pub fn compaction_item_change(
     latest: Option<&PlanManifest>,
     next: &serde_json::Value,
@@ -78,16 +78,14 @@ pub fn compaction_item_change(
     })
 }
 
-/// The refusal of a refresh that changes or removes the session's compaction item, and on
-/// today's storage of one that adds an item: compaction authority and preset state are
-/// session-lived.
+/// The refusal of a refresh that changes, removes, or adds the session's compaction item:
+/// compaction authority and preset state are session-lived.
 pub fn compaction_item_refusal() -> crate::Refusal {
     crate::Refusal::invalid("plan.compaction_item")
 }
 
-/// Today's storage's rule: compaction authority and preset state are session-lived, so a
-/// refresh may change composition, tools and system text, but never the compaction item itself,
-/// and can't add one either.
+/// Compaction authority and preset state are session-lived, so a refresh may change composition,
+/// tools and system text, but never the compaction item itself, and can't add one either.
 pub fn check_compaction_item(
     latest: Option<&PlanManifest>,
     next: &serde_json::Value,
@@ -146,7 +144,7 @@ pub use broca_protocol::session_change::{
     applies_at_run_start, model_key, Applying, Pending, Transitions,
 };
 
-/// A pending change as today's fold holds it, with its manifest.
+/// A pending change with its manifest.
 pub type PendingState = Pending<Arc<PlanManifest>>;
 /// The latest applied change.
 #[derive(Debug, Clone, PartialEq)]
@@ -241,8 +239,8 @@ mod tests {
         assert!(check_compaction_item(None, &plan).is_err());
     }
 
-    /// The classifier names each change against the latest accepted plan, and today's rule
-    /// refuses every one but keeping the item, an added one included, with the same refusal.
+    /// The classifier names each change against the latest accepted plan; every change except
+    /// keeping the item, including adding one, receives the same refusal.
     #[test]
     fn a_refresh_keeps_adds_removes_or_changes_the_compaction_item() {
         let item = serde_json::json!({"provider":"ck-mc","preset":"head","params":{"n":1}});

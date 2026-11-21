@@ -708,7 +708,7 @@ crate::message! {
         /// deliver it at a boundary, by the first mode in its order possible there.
         3 req ordered: bool,
         /// The attested module id of the send's sender, when a module sent it: the principal
-        /// its receipt names as sender, else as owner, as today's reads name it.
+        /// its receipt names as sender, else as owner.
         4 opt sender: String,
         /// The send's request identity digest, as its receipt kept it.
         5 opt request_identity_digest: String,
@@ -839,9 +839,9 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
-        /// The ledger holds a record of the first compaction protocol (its notices, waits and
-        /// applied views stay generic events under their old names; the current contract's are
-        /// typed). Only today's run loop renders such a session, so the new run loop refuses it.
+        /// The ledger holds a record of the first compaction protocol: its notices, waits and
+        /// applied views are generic events, while the current contract represents them as
+        /// typed records. The run loop does not render such a session, so it refuses it.
         15 req pub first_protocol_compaction: bool => {
             owner: "compaction",
             reset: "never",
@@ -865,7 +865,7 @@ state! {
         },
         /// The request digest of the newest attempt that reached the cache. A warm of the
         /// source model's cache counts as reaching the cache only when it refreshed that
-        /// request, as today's cache clock reads it.
+        /// request.
         18 opt pub last_cache_attempt_digest: crate::codec::Digest => {
             owner: "compaction",
             reset: "never",
@@ -899,18 +899,16 @@ state! {
             bound: Bound::Fixed,
         },
         /// The newest title a send to the session carried: on a run start, or in a queued
-        /// send's or a steer's receipt, whichever came last. `session.head` serves it, as
-        /// today's head serves the newest title its log holds on those three records. A later
+        /// send's or a steer's receipt, whichever came last. `session.head` serves it. A later
         /// send without a title leaves it.
         23 opt pub title: String => {
             owner: "admission",
             reset: "never",
             bound: Bound::Fixed,
         },
-        /// The session's plan changes and the manifests in force, as today's
-        /// `SessionChangeState` folds them: absent until the session's first run start or
-        /// refresh. Only fixed-size facts are kept; what was recorded under one generation or
-        /// one `send_id` is found by looking up that id.
+        /// The session's plan changes and the manifests in force: absent until the session's
+        /// first run start or refresh. Only fixed-size facts are kept; what was recorded under
+        /// one generation or one `send_id` is found by looking up that id.
         24 opt pub plan: Plan => {
             owner: "admission",
             reset: "never",
@@ -1048,9 +1046,9 @@ state! {
 }
 
 state! {
-    /// The session's plan changes, folded by the transitions today's fold makes
-    /// (`broca_protocol::session_change::Transitions`): what was accepted and applied, the change
-    /// still pending, and the manifests the latest run and the latest prefix rebuild froze.
+    /// The session's plan changes, folded by `broca_protocol::session_change::Transitions`: what
+    /// was accepted and applied, the change still pending, and the manifests the latest run and
+    /// the latest prefix rebuild froze.
     #[derive(Debug, Clone, Default, PartialEq)]
     pub struct Plan {
         1 req pub accepted_generation: u64 => {
@@ -1105,7 +1103,7 @@ state! {
             bound: Bound::Fixed,
         },
         /// The latest accepted refresh's manifest, applied or not: the session's senders follow
-        /// it from its acceptance, as today's head and sender checks do.
+        /// it from its acceptance.
         10 opt pub accepted: ManifestRef => {
             owner: "admission",
             reset: "session_refresh",
@@ -1194,8 +1192,8 @@ impl Plan {
     }
 
     /// Folds one ledger record's effect on the session's plan changes. A run start that applied
-    /// the pending change is followed in its batch by a `RefreshApplied` naming it, which applies
-    /// it after the start's own transitions, as today's fold applies it at the start.
+    /// the pending change is followed in its batch by a `RefreshApplied` naming it, which
+    /// applies it after the start's own transitions.
     fn apply(plan: &mut Option<Plan>, record: &Record) {
         let changes_plan = match record {
             Record::Event(event) => event.name == FIRST_PROTOCOL_VIEW_APPLIED,
@@ -1259,15 +1257,14 @@ impl Plan {
     }
 }
 
-/// The name the first compaction protocol's applied view keeps as a generic ledger event. Today's
-/// fold counts it as a prefix rebuild, as it counts the current contract's.
+/// Name retained by the first compaction protocol's applied view for a generic ledger event.
+/// The fold counts it as a prefix rebuild, as it does the current contract's applied event.
 const FIRST_PROTOCOL_VIEW_APPLIED: &str = "compaction_view_applied";
 
 state! {
     /// The session's usage summed over every step, as the runner contract's `SessionUsage`
     /// serves it on `session.head`: one count per `by_model` entry a step records, so a step
-    /// two models shared counts once under each and twice in the totals, as today's head
-    /// counts it.
+    /// two models shared counts once under each and twice in the totals.
     #[derive(Debug, Clone, Default, PartialEq)]
     pub struct SessionUsage {
         /// The run of the first counted step.
@@ -1400,8 +1397,8 @@ impl SessionUsage {
 }
 
 state! {
-    /// The owner facts the session's run starts recorded, as today's admission summarises them
-    /// (`SessionOwnershipV1`). Principals and scopes stay in the run start's own JSON form.
+    /// The owner facts recorded by the session's run starts, summarized by `SessionOwnershipV1`.
+    /// Principals and scopes stay in the run start's own JSON form.
     #[derive(Debug, Clone, Default, PartialEq)]
     pub struct Owner {
         /// How many runs have started.
@@ -1422,9 +1419,9 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
-        /// The first two distinct principals the runs recorded, in the order each first
-        /// appeared. Today's summary keeps every distinct one, but its only reader asks for the
-        /// first that differs from one given principal, and the first two always answer that.
+        /// The first two distinct principals recorded by runs, in the order each first appeared.
+        /// The only reader asks for the first that differs from a given principal, and the first
+        /// two always answer that.
         4 rep pub principals: serde_json::Value => {
             owner: "admission",
             reset: "never",
@@ -1553,7 +1550,7 @@ state! {
     }
 }
 
-/// The title a queued send's or a steer's receipt holds, under the name today's records give it.
+/// The title held in a queued send's or a steer's receipt.
 fn receipt_title(receipt: Option<&serde_json::Value>) -> Option<String> {
     receipt?.get("title")?.as_str().map(str::to_owned)
 }
@@ -1750,9 +1747,9 @@ impl Operations {
                 }
             }
             Record::Warmed(warmed) => {
-                // A warm that reached the cache restarts its lifetime, as today's cache clock
-                // dates it; a warm of the source model's cache only if it refreshed the newest
-                // request that reached the cache.
+                // A warm that reached the cache restarts its lifetime; a warm of the source
+                // model's cache does so only if it refreshed the newest request that reached
+                // the cache.
                 let refreshed_newest = warmed.trigger.as_deref() != Some("source_keep_warm")
                     || self
                         .last_cache_attempt_digest
@@ -1813,7 +1810,6 @@ impl Operations {
     /// A step's end measures its input when the provider reported it, an attempt's body length
     /// is known and the model that served the measured call is: the model the step was routed
     /// to, else the run's, with a server-side handoff measured on the last model that served it.
-    /// Today's `OutputReservationHistory::note_served_step` decides the same.
     fn measure_step(&mut self, step: &crate::record::StepEnd) {
         let bytes = self.output_attempt_bytes.take();
         let fallback = step
@@ -2161,11 +2157,11 @@ impl Operations {
                     run.open_batch = None;
                 }
             }
-            // Today's replay keeps the latest decision of the run still going.
+            // Replay keeps the latest decision for a run that is still going.
             Record::CeilingDecided(decided) if run.finished.is_none() => {
                 run.context_ceiling = decided.detail.clone();
             }
-            // The refused call was billed: today's replay counts it toward the run.
+            // The refused call was billed and counts toward the run.
             Record::StepRefused(refused) if refused.run_id == run.run_id => {
                 run.usage.accumulate(&refused.usage);
                 run.refused_step = Some(refused.step_id);

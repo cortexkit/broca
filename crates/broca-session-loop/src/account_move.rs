@@ -18,13 +18,13 @@
 //! If the records of step 3 can't be written, the prepared provider is dropped with the error,
 //! so nothing is left that would send on the new account.
 //!
-//! A run asks only where it would otherwise end: a wall that today's rule answers with a timed
-//! pause on the same account keeps that pause, and a hold, a refusal, an answer that doesn't
-//! arrive or an offer the loop can't accept all end the run as before, with routing's answer on
-//! the error where there was one.
+//! A run asks only where it would otherwise end: a wall that calls for a timed pause on the same
+//! account keeps that pause, and a hold, a refusal, an answer that doesn't arrive or an offer
+//! the loop can't accept all end the run, with routing's answer on the error where there was
+//! one.
 //!
 //! Sign-in failures reuse the offer checks and durable move. Without an offer they retain
-//! the auth pause; a typed in-memory outcome tells the actor when that pause may ask again.
+//! the auth pause; a typed in-memory outcome tells the run loop when that pause may ask again.
 
 use broca_core::account_limit_pause::FailedAccountLimitAttempt;
 use broca_protocol::error::AccountContinueAnswer;

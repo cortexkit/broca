@@ -13,8 +13,6 @@ use broca_wal::{FramedRecord, PlanManifest, RunConfig, WalRecord};
 use cortexkit_compaction_view::rules::Floor;
 
 /// What a send's compaction conditions and context read from its run's frozen configuration.
-/// Today's loop takes it from the run's `RunConfig` ([`Frozen::of`]); a loop that keeps its
-/// frozen choices in another shape builds it from those.
 pub struct Frozen<'a> {
     pub model: &'a broca_protocol::request::ModelHandle,
     pub variant: Option<&'a str>,
@@ -80,8 +78,8 @@ pub fn conditions(
     newest_step_fill: Option<(&str, u64)>,
     signed_floor: Option<&str>,
 ) -> Result<Conditions, String> {
-    // Today's loop doesn't tie its reading to the view its request was rendered under, so its
-    // conditions never name one (`last_prompt_view` stays absent).
+    // Conditions are not tied to the view the request was rendered under (`last_prompt_view` stays
+    // absent).
     conditions_of(
         &Frozen::of(config),
         entries,
@@ -193,7 +191,7 @@ pub fn conditions_of(
     Ok(conditions)
 }
 
-/// [`last_prompt_tokens`], with the entry whose usage gave it.
+/// The newest measured prompt size among `entries`, with the entry whose usage gave it.
 pub fn last_prompt<'e>(
     entries: &'e [Entry],
     newest_step_fill: Option<(&str, u64)>,

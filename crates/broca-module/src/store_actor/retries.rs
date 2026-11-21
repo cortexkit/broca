@@ -1,9 +1,7 @@
-//! Keyed retries of sends that never started a run of their own, on a session kept in the new
-//! storage: a steer, and a queued send since withdrawn, ended undelivered, delivered into a
-//! running run, or refused when it drained. Each is answered from the session's records as
-//! today's actor answers it (`send_order_differs`, `answer_steer_retry` and
-//! `send_fate::recorded_send_outcome` in `crate::actor`), by the reads `send.status` serves
-//! (`crate::store_status`).
+//! Keyed retries of sends that never started a run of their own, on a session in the
+//! session store: a steer, and a queued send since withdrawn, ended undelivered, delivered into a
+//! running run, or refused when it drained. Each is answered from the session's records by
+//! the reads `send.status` serves (`crate::store_status`).
 
 use broca_protocol::{DeliveryOrder, RunId, SubmissionRequest};
 use broca_session_store::backend::SessionBackend;
@@ -23,21 +21,20 @@ pub(super) struct KeyedSend<'a> {
     pub conversation_key: Option<&'a str>,
     pub order: Option<&'a DeliveryOrder>,
     /// Whether a steer the session's owner sent under the same `send_id` answers for the key:
-    /// not for a module the session's plan names as a sender, as in today's actor.
+    /// not for a module the session's plan names as a sender.
     pub legacy_steers: bool,
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
-    /// A keyed send no run started under, whose key the session's records already hold
-    /// (`holders`) and whose send no longer waits in the queue, answered as today's actor
-    /// answers it, in its order:
+    /// A keyed send that did not start a run, whose key the session's records already hold
+    /// (`holders`) and whose send no longer waits in the queue, is answered in this order:
     /// - a send whose earlier order differs (a plain send retried as an ordered one, the reverse,
     ///   or another list) is refused naming `delivery`;
     /// - a steer under the key is answered by the run it joined, once the retry's payload is the
     ///   steer's, and refused naming what differs otherwise;
     /// - any other send is answered with what became of it: retracted, ended undelivered,
     ///   delivered into a run, or ended by its refusal when it drained. Its payload isn't
-    ///   compared, as today's actor doesn't compare it.
+    ///   compared.
     ///
     /// A key whose records name no such send starts a run.
     pub(super) async fn unstarted_retry(
@@ -129,8 +126,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// What became of the send `send_id` whose own run id is `own_run`, as `send.status` reads
     /// it from the session's records (`store_status::Reader::recorded_send_outcome`). The
-    /// records are made durable first, as today's actor syncs its log before it reads a
-    /// receipt: a crash can't then take back a step the answer counted.
+    /// records are made durable first, so a crash can't then take back a step the answer
+    /// counted.
     async fn recorded_outcome(
         &mut self,
         own_run: &RunId,

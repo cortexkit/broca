@@ -182,8 +182,7 @@ fn kinds(records: &[FramedRecord]) -> Vec<String> {
         .collect()
 }
 
-/// What billing feeds today's builder for `run`: only what the builder reads for that run,
-/// never the whole history.
+/// For `run`, billing feeds only what that run reads, never the whole history.
 fn fed(run: &str) -> Vec<String> {
     block_on(async {
         let backend = MemoryBackend::default();
@@ -231,9 +230,8 @@ fn a_later_run_is_fed_nothing_from_before_it() {
     );
 }
 
-/// A run another run's start follows without its end is fed that start, which closes the run's
-/// last segment as today's builder closes it, and nothing else of the later run but warms naming
-/// the earlier one.
+/// If another run starts before a run ends, that run is fed the later start to close its last
+/// segment and no other records from the later run except warms naming the earlier run.
 #[test]
 fn an_unended_run_is_fed_the_start_that_closes_it() {
     block_on(async {

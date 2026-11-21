@@ -1,7 +1,6 @@
-//! Sends that reach a session kept in the session store while its latest run is paused, as
-//! today's actor takes them (`interrupt_submission`, `end_paused_run_for_interrupt` and
-//! `steer_submission` in `crate::actor`): an interrupt ends the paused run and starts after it,
-//! and a steer into a run paused for a restart waits for that run's resume.
+//! Sends that reach a session kept in the session store while its latest run is paused: an
+//! interrupt ends the paused run and starts after it, while a steer into a run paused for a
+//! restart waits for that run to resume.
 
 use broca_protocol::{Delivery, PauseReason, RunId};
 use broca_session_loop::queue;
@@ -15,11 +14,11 @@ use crate::actor::SendOutcome;
 use crate::executor::StoreRunMode;
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
-    /// An interrupt on a session whose latest run is paused for anything but calls a provider
-    /// holds, in today's order: the interrupt is queued first, ahead of every plain send and
-    /// durable before the reply, which is `pending`; then the paused run ends `Cancelled`, and
-    /// its end drains the interrupt. A process that stops in between leaves the interrupt queued
-    /// behind the paused run, which the session's next open ends (`recover`).
+    /// An interrupt on a session whose latest run is paused for anything but held calls (calls
+    /// whose provider answers later) is queued first, ahead of every plain send, and durably before
+    /// the `pending` reply. The paused run then ends `Cancelled`, and its end drains the interrupt.
+    /// If the process stops in between, the interrupt remains queued behind the paused run; the
+    /// session's next open ends the paused run (`recover`).
     pub(super) async fn interrupt_paused(
         &mut self,
         start: Start,
@@ -33,17 +32,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// Whether the queue's first send is an interrupt while the session's latest run is paused
-    /// for anything but calls a provider holds: that run has to end before the interrupt runs.
+    /// for anything but held calls: that run has to end before the interrupt runs.
     /// Interrupts drain ahead of every other send, so one waiting is first in the queue.
     pub(super) fn interrupt_waits_on_pause(&self) -> bool {
         super::pause_interrupt_waits(&self.session.operations)
     }
 
-    /// Ends the session's paused run `Cancelled`, as today's actor ends one for an interrupt:
-    /// the run is resumed under a cancel already tripped, which the loop checks before anything
-    /// else a resume does, so the run's end is all it writes and no model is called. The end
-    /// drains the queue (`finish_run`). A run that can't be read back stays paused, and the
-    /// session's next open tries again.
+    /// Ends the session's paused run `Cancelled`: the run is resumed with cancellation already
+    /// tripped, and the run loop checks this before any other resume work, so the run's end is
+    /// all it writes and no model is called. The end drains the queue (`finish_run`). A run
+    /// that can't be read back stays paused, and the session's next open tries again.
     pub(super) async fn end_paused(&mut self) {
         let Some(run) = self
             .session
@@ -71,15 +69,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
     }
 
-    /// A steer into the session's run `paused` for a restart, as today's actor takes one: its
-    /// attachments are checked against the media the run's start froze, its input goes through
-    /// the session's `pre_user` transforms, and its record is written, durable before the
-    /// reply, which names the paused run. The run places its messages at its resume's first
-    /// boundary. As in today's actor, the steer's settings aren't compared with the run's: the
-    /// run resumes as it froze them.
+    /// A steer into the session's run `paused` for a restart: its attachments are checked against
+    /// the media the run's start froze, its input goes through the session's `pre_user`
+    /// transforms, and its record is written durably before the reply, which names the paused
+    /// run. The run places its messages at its resume's first boundary. The steer's settings
+    /// aren't compared with the run's: the run resumes with the settings it froze.
     ///
-    /// Today's actor also freezes an input-token cap a steer names into the paused run. A run on
-    /// this storage takes no input-token budget, so a steer naming one is refused by name.
+    /// A run on the session store takes no input-token budget, so a steer naming one is refused
+    /// by name.
     pub(super) async fn steer_restart_paused(
         &mut self,
         mut start: Start,

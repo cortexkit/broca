@@ -1,40 +1,43 @@
 //! The `session.subscribe` stream of a session kept in the session store.
 //!
-//! Its control lane keeps today's meaning: a subscriber gets every unit after its attach point
-//! exactly once, first from a catch-up over the session's stored records, then from the live
-//! projection, and its display lane is today's lossy one.
+//! Its control lane delivers every unit after its attach point exactly once, first from a
+//! catch-up over the session's stored records, then from the live projection; its display
+//! lane is lossy.
 //!
-//! - **The barrier.** The actor registers the subscriber's live receiver and takes the session's
-//!   durable end H in one step between appends: its last seq, short of a batch appended without
-//!   a barrier, which is published once a barrier makes it durable. A task then projects the
-//!   stored records through H for a cursor attach. A live attach instead takes the open step's
-//!   retained durable controls at H, before the display snapshot. Both deliver live units only past H
-//!   ([`crate::fanout::deliver_from_ring`]), so a unit in both is delivered once.
+//! - **The barrier.** The actor registers the subscriber's live receiver and takes the
+//!   session's durable end H in one step between appends: its last seq, except for a batch
+//!   appended without a barrier, which is published once a barrier makes it durable. A task
+//!   then projects the stored records through H for a cursor attach. A live attach instead
+//!   takes the open step's retained durable controls at H, before the display snapshot. Both
+//!   deliver live units only past H ([`crate::fanout::deliver_from_ring`]), so a unit in both
+//!   is delivered once.
 //! - **Live.** The session calls [`Publisher::appended`] right after each append returns; each
-//!   batch is projected once, when durable, and its units published on a bounded broadcast. A
-//!   subscriber that falls behind is detached and resumes from its last cursor. The actor seeds
-//!   the live projection in the background when it opens, from the open log's checkpoint through
-//!   H, and again after the projection loses continuity; batches made durable meanwhile wait for
-//!   it. The projection keeps its state and the cursor of the stream's last unit, which actor
-//!   reads serve as `session.read`'s `head` from memory. Only the open step's visible controls are
-//!   retained for live attaches; a queued attach is answered exactly when seeding reaches its H.
-//! - **Cursors.** `wal_seq` is the store record's seq and `sub_index` the unit's index among that
-//!   record's units. `incarnation` is the session head's incarnation in hex, as `session.read`
-//!   serves it, and `digest` the first 8 bytes of HMAC-SHA256 over the record's canonical
-//!   encoding, keyed from the session's data key ([`broca_session_store::keys::CursorKey`]).
-//! - **Resume.** A cursor is checked against the record it names, as the session holds it now,
-//!   before notice visibility filters that record's units: another incarnation, a seq past the
-//!   durable end, a record a revert removed when it replaced the session's history, another
-//!   digest, or a `sub_index` the record doesn't yield is refused `cursor_expired`. A
-//!   position-only cursor resumes after its position unchecked, as today.
-//! - **Catch-up cost.** A catch-up starts from the checkpoint of the log holding its cursor and
-//!   folds forward from there, never from the session's start.
-//! - **Display.** The run's provider output feeds today's [`DisplaySender`]: a current-step
-//!   replay at attach, then live deltas, with gaps reported in band. The step a delta belongs to
+//!   batch is projected once, when durable, and its units published on a bounded broadcast.
+//!   A subscriber that falls behind is detached and resumes from its last cursor. The actor
+//!   seeds the live projection in the background when it opens, from the open log's
+//!   checkpoint through H, and again after the projection loses continuity; batches made
+//!   durable meanwhile wait for it. The projection keeps its state and the cursor of the
+//!   stream's last unit, which actor reads serve as `session.read`'s `head` from memory. Only
+//!   the open step's visible controls are retained for live attaches; a queued attach is
+//!   answered exactly when seeding reaches its H.
+//! - **Cursors.** `wal_seq` is the store record's seq and `sub_index` the unit's index among
+//!   that record's units. `incarnation` is the session head's incarnation in hex, as
+//!   `session.read` serves it, and `digest` the first 8 bytes of HMAC-SHA256 over the record's
+//!   canonical encoding, keyed from the session's data key
+//!   ([`broca_session_store::keys::CursorKey`]).
+//! - **Resume.** A cursor is checked against the record it names in the session's current
+//!   history, before notice visibility filters that record's units: another incarnation, a
+//!   seq past the durable end, a record a revert removed when it replaced the session's
+//!   history, another digest, or a `sub_index` the record doesn't yield is refused
+//!   `cursor_expired`. A position-only cursor resumes after its position without validation.
+//! - **Catch-up cost.** A catch-up starts from the checkpoint of the log holding its cursor
+//!   and folds forward from there, never from the session's start.
+//! - **Display.** The run's provider output feeds [`DisplaySender`]: a replay of the current
+//!   step at attach, then live deltas, with gaps reported in band. The step a delta belongs to
 //!   is taken from the records: a step's start resets the replay and names the message its
 //!   deltas belong to.
-//! - **Read access.** Access is checked for a stream's whole life: a change that takes it away
-//!   ends the streams at that change (see [`StoreFanout::end_read_access`]).
+//! - **Read access.** Access is checked for a stream's whole life: a change that takes it
+//!   away ends the streams at that change (see [`StoreFanout::end_read_access`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -217,8 +220,7 @@ impl Publisher {
         }
     }
 
-    /// Starts and ends display steps at the records that start and end model steps, as today's
-    /// output drain does at a step's display context and its end.
+    /// Starts and ends display steps at the records that start and end model steps.
     fn display_context(&self, records: &[Record]) {
         for record in records {
             match record {

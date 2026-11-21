@@ -151,11 +151,9 @@ pub struct RunRequest {
 
 impl RunRequest {
     /// Rebuild a `RunRequest` from a queued submission's request + the coordinator-assigned
-    /// identity (a fresh `run_id`, the session, and the `submission_id` consume-link). The
-    /// inverse of [`to_submission`]; the round trip is identity on the byte-affecting fields,
-    /// so a drained run renders the same bytes as the identical request sent when idle.
-    ///
-    /// [`to_submission`]: RunRequest::to_submission
+    /// identity (a fresh `run_id`, the session, and the `submission_id` consume-link). Every
+    /// field that shapes the rendered request carries over unchanged, so a drained run renders
+    /// the same bytes as the identical request sent when idle.
     pub fn from_submission(
         req: SubmissionRequest,
         run_id: RunId,

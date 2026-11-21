@@ -337,7 +337,7 @@ impl VaultAddressing {
     }
 
     /// Frozen vault ids are authoritative even before the listing is loaded. Older selections
-    /// without one resolve their frozen key, never today's default method.
+    /// without one resolve their frozen key, never the current default method.
     pub fn vault_id_for_selection(
         &self,
         selection: &broca_wal::AuthSelection,

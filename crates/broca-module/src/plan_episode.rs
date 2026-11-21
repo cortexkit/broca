@@ -103,12 +103,10 @@ pub(crate) fn freeze_manifest(
 
 /// The compaction plan version a run admitted under `manifest` asks for: the current one
 /// (`compaction_v2::PLAN_VERSION`) when the plan names a compaction provider, so the run records
-/// and renders under the current compaction contract, and `None` otherwise. Each run loop decides
-/// from it with the session's own mode:
-/// - Today's loop reads it only for a brand-new log. An existing log keeps the mode its first
-///   run recorded, and a refresh can't add a compaction provider there.
-/// - The session store's loop reads it for every run (`broca_session_loop::admit::session_contract`).
-///   A session already on the contract stays on it. A session that ran outside it moves onto it
+/// and renders under the current compaction contract, and `None` otherwise. The run loop
+/// decides from it using the session's own mode:
+/// - The run loop reads it for every run (`broca_session_loop::admit::session_contract`). A
+///   session already on the contract stays on it. A session that ran outside it moves onto it
 ///   at the first run whose plan names a compaction provider.
 pub(crate) fn plan_compaction_version(manifest: Option<&PlanManifest>) -> Option<u32> {
     manifest

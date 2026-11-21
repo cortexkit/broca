@@ -5,9 +5,8 @@
 //! was loaded (see `store_reads`). A view never takes the lease or writes, a torn tail reads as
 //! not yet written, and a log that needs a recovery refuses until a writer repairs it. Each reply
 //! is built from what the session decided when it placed each message (`EntryFacts`) and from its
-//! operational fold, never from a replay. A reply here equals the reply today's reader builds from
-//! a WAL for the same history, except that it has no WAL lineage, its cursors use the store's
-//! own record seqs, and the replies and history version are exposed as `store_exposure` says.
+//! operational fold, never from a replay. Cursors use the store's own record seqs, and the
+//! replies and history version are exposed as `store_exposure` says.
 
 use std::collections::BTreeMap;
 
@@ -30,8 +29,8 @@ mod model_fallback;
 pub enum StoreReadError {
     /// The session couldn't be read: missing, damaged, or a backend failure.
     Session(SessionError),
-    /// A message has no entry facts, so the page can't say what today's read says about it.
-    /// Only a session converted from today's storage without them can hold one.
+    /// A message has no entry facts, so the page cannot provide the information those facts
+    /// supply. Only a session converted from the old log format without entry facts can hold one.
     NoFacts { ordinal: u64 },
     /// A message's entry facts name a value no build of this format writes.
     BadFact { ordinal: u64, field: &'static str },
@@ -56,8 +55,8 @@ pub fn transcript_len<B: SessionBackend>(session: &Session<B>) -> u64 {
 /// Whether the newest placed message holds the results of a tool batch that hasn't closed. The
 /// session places a turn's results once every call has one, but its batch closes after: as it
 /// closes, a delivered note may still join the last result, and the note's facts land with it.
-/// Reads serve such results only once the batch is closed, as today's do, so no entry they
-/// served changes afterwards; until then the turn reads as still running.
+/// Reads serve such results only once the batch is closed, so no entry they served changes
+/// afterwards; until then the turn reads as still running.
 pub fn results_await_close<B: SessionBackend>(session: &Session<B>) -> bool {
     let conversation = &session.conversation;
     let Some(batch) = session
@@ -196,9 +195,9 @@ pub struct StorePage {
     pub clean_replies: std::collections::BTreeSet<u64>,
 }
 
-/// A `session.read` page: up to `limit` messages from `from_ordinal` (counting from 0, as
-/// today's page builder takes it), or the newest `limit` without one. Its dispatch facts, head
-/// cursor and lineage id are left to the caller.
+/// A `session.read` page: up to `limit` messages from `from_ordinal` (counting from 0), or the
+/// newest `limit` without one. Its dispatch facts, head cursor and lineage id are left to the
+/// caller.
 pub async fn read_page<B: SessionBackend>(
     session: &Session<B>,
     from_ordinal: Option<u64>,
@@ -397,11 +396,11 @@ async fn imported_notices<B: SessionBackend>(
     Ok(notices)
 }
 
-/// Serves `session.read` for a session kept in the session store. The reply is today's for the
-/// same history, built from the session's head, its folds and its entry facts, never from a WAL.
+/// Serves `session.read` for a session kept in the session store. The reply is built from the
+/// session's head, its folds and its entry facts.
 ///
-/// A late-approval cursor is refused by name: the session store takes no approval questions, so no
-/// cursor names one.
+/// A late-approval cursor is refused by name because the session store takes no approval
+/// questions.
 pub async fn serve_read(
     registry: &crate::LineageRegistry,
     store: &crate::store_open::StoreRuntime,
@@ -811,7 +810,7 @@ fn refused(error: StoreReadError) -> crate::serve::ServeError {
 /// The tool list an `include_tools` read serves: the one the session's latest run was frozen
 /// with, which its start names as a setup part, with that run's id. `None` before any run.
 /// A resumed run continues its run without a new start, so the latest start is the current
-/// episode's, as today's read takes the last `RunStarted`.
+/// episode's.
 pub fn latest_tools<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
@@ -1015,7 +1014,7 @@ pub struct DisplayFacts {
     /// For a user message: the `client_message_id` of the send that placed it.
     pub client_message_id: Option<String>,
     /// The attested module id of the sender of the send that placed the message: every message
-    /// of a run's input or of a steer, as today's read names it.
+    /// of a run's input or of a steer.
     pub sender: Option<String>,
     /// The send's `speaks_for` mark, as stored.
     pub speaks_for: Option<serde_json::Value>,
@@ -1186,10 +1185,11 @@ pub fn facts_by_call<'t>(
 }
 
 impl DisplayFacts {
-    /// What an `include_display_facts` read serves from these facts, in the form today's read
-    /// builds for a page message (`crate::serve::apply_display_facts`): the sender and the send's
-    /// marks, for a user message the send's `client_message_id`, each tool call's facts, and for a
-    /// tool results message the notices of the sends that rode on its results.
+    /// What an `include_display_facts` read serves from these facts, in the form
+    /// `crate::serve::apply_display_facts` builds for a page message: the sender and the
+    /// send's marks, for a user message the send's `client_message_id`, each tool call's
+    /// facts, and for a tool results message the notices of the sends that rode on its
+    /// results.
     pub fn served(&self) -> broca_core::display_facts::DisplayFacts {
         broca_core::display_facts::DisplayFacts {
             send_id: self.send_id.clone(),
@@ -1210,8 +1210,8 @@ impl DisplayFacts {
         }
     }
 
-    /// The send's marks as today's display facts hold them: absent when the send carried
-    /// neither a `speaks_for` nor a true `notice`.
+    /// The send's marks are absent when the send carried neither a `speaks_for` nor a true
+    /// `notice`.
     fn message_marks(&self) -> Option<broca_protocol::MessageMarks> {
         let speaks_for = speaks_for(self.speaks_for.as_ref());
         if speaks_for.is_none() && !self.notice {

@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Admission, Seams};
 
-/// A run's keep-warm: today's scheduler warms the prompt cache while the run waits on tool
+/// A run's keep-warm: the scheduler warms the prompt cache while the run waits on tool
 /// calls, through the driver the caller gave, for a run whose keep-warm is not off.
 pub(crate) struct Warming<'a> {
     driver: &'a Arc<dyn broca_core::keep_warm_wait::KeepWarmDriver<Admission>>,
@@ -82,11 +82,11 @@ pub fn warm_count(
     })
 }
 
-/// What a run's keep-warm already spent warming during the wait after step `step_id`, priced as
-/// today's loop prices it after a restart (`broca_core::keep_warm_wait::batch_spend`): a warm
-/// that reached the cache at its recorded price, a failed one that was sent and reported usage
-/// at its measured price, any other at nothing. A warm the driver can't price counts as
-/// unaffordable, so the wait sends no more.
+/// What a run's keep-warm already spent warming during the wait after step `step_id`, priced
+/// after a restart by `broca_core::keep_warm_wait::batch_spend`: a warm that reached the cache
+/// at its recorded price, a failed one that was sent and reported usage at its measured price,
+/// any other at nothing. A warm the driver can't price counts as unaffordable, so the wait
+/// sends no more.
 pub fn warm_spend<C: ?Sized + Sync>(
     driver: &dyn broca_core::keep_warm_wait::KeepWarmDriver<C>,
     config: &C,

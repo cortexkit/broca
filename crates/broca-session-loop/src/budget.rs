@@ -30,8 +30,7 @@ pub fn frozen(operations: &Operations) -> Option<BudgetConfig> {
 /// `first_seq` is the seq of that batch's first record and `before` how many of its records
 /// come before these. `placing` is how many messages the batch's own records place before
 /// these: a batch that closes a tool turn places the assistant message and its results.
-/// Each reminder takes the next conversation position, counted from 0 as today's records count
-/// it.
+/// Each reminder takes the next conversation position, counted from 0.
 pub fn due(
     conversation: &Conversation,
     operations: &Operations,

@@ -1,9 +1,9 @@
 //! The plan-change facts of a session kept in the session store, which the plan-change rules
-//! (`crate::plan_change`) decide from as they decide from today's fold. The operational fold
-//! holds the session's change counters, its pending change and the manifests its latest run and
-//! latest refresh froze (`Operations::plan`). What a request's own generation or `send_id`
-//! recorded is looked up in the session's id index and read from that one record, so a lookup
-//! costs the same however many refreshes the session took.
+//! (`crate::plan_change`) decide from. The operational fold holds the session's change counters,
+//! its pending change and the manifests its latest run and latest refresh froze
+//! (`Operations::plan`). What a request's own generation or `send_id` recorded is looked up in
+//! the session's id index and read from that one record, so a lookup costs the same however
+//! many refreshes the session took.
 
 use std::sync::Arc;
 
@@ -147,8 +147,8 @@ pub(crate) async fn change_read<B: SessionBackend>(
             ))
         })
         .transpose()?;
-    // The owner fold keeps the scope of the latest run that recorded one, which is the run
-    // today's preflight reads the opener from.
+    // The owner fold keeps the scope of the latest run that recorded one; preflight reads the
+    // opener from that scope.
     let opener =
         decode::<broca_protocol::SessionScope>(owner.scope.as_ref(), "the session's scope")?
             .as_ref()
@@ -221,10 +221,10 @@ pub struct BaselineFacts {
 }
 
 /// The baseline facts of `session`, read from its owner and plan folds and the parts its first
-/// run named: `None` before the session's first run. Built as today's handler builds them: the
-/// first run's manifest (or its tools, without one), replaced by the latest prefix rebuild's
-/// manifest once there is one, with the change counters, the pending and effective changes and
-/// the rungs this runner supports.
+/// run named: `None` before the session's first run. It uses the first run's manifest (or its
+/// tools, without one), replaced by the latest prefix rebuild's manifest once there is one,
+/// together with the change counters, the pending and effective changes and the rungs this
+/// runner supports.
 pub(crate) fn baseline<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
@@ -285,8 +285,7 @@ pub(crate) fn baseline<B: SessionBackend>(
     }))
 }
 
-/// The newest record the session's id index names under `kind` and `id`, as today's fold keeps
-/// the last record it folded under the same key.
+/// The newest record the session's id index names under `kind` and `id`.
 async fn latest<B: SessionBackend>(
     session: &Session<B>,
     kind: IdKind,

@@ -89,7 +89,7 @@ impl MediaAging {
     /// Rebuild from durable records, without hydrating historical requests or writing an
     /// aging record. Compaction changes re-select reference metadata; unchanged steps fold
     /// only their new media. The caller supplies the current episode's frozen profile, not
-    /// today's catalog. A changed recorded profile reselects metadata under its new costs;
+    /// the current catalog. A changed recorded profile reselects metadata under its new costs;
     /// another episode with the same profile keeps the aging prefix.
     pub fn replay_wal(
         profile: &MediaProfile,

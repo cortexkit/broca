@@ -914,8 +914,7 @@ struct PriorRunView {
     records_account_change: bool,
 }
 
-/// What a run's admission takes from its job, for a session on today's WAL or in the new
-/// storage.
+/// What a run's admission takes from its job.
 struct EpisodeJob<'a> {
     req: &'a broca_core::RunRequest,
     kind: RunKind,
@@ -1066,12 +1065,11 @@ fn store_seams<'a, P: broca_core::provider::Provider>(
         now_ms: now,
         session_address: Some(broca_core::session_addr(&req.session)),
         compaction_plane,
-        // The session's compaction state, which its actor keeps for the session's life, as
-        // today's actor does; without it a run restores the state from the session's records.
+        // The session's actor keeps its compaction state for the session's life; without it,
+        // a run restores the state from the session's records.
         compaction_session: control.compaction_session.clone(),
-        // Today's actor has every run tell the session's compaction provider of the
-        // session's changes outside its steps (`RunControl::compaction_changes`); a store
-        // run does the same.
+        // Every run tells the session's compaction provider about changes to the session outside
+        // its steps (`RunControl::compaction_changes`).
         compaction_changes: true,
         // A run's keep-warm, which the session's actor builds for a run whose keep-warm is
         // `auto`, is set by the caller.
@@ -2335,9 +2333,8 @@ impl LiveLoopExecutor {
     /// routing client asks; a resume reuses its frozen decision and never asks again.
     /// Decides everything a run's admission freezes before the run's start is written: its
     /// context management, the credential and account (routing included), the cache policy
-    /// and key, a Claude Code persona and the provider's resolved render config. `history`
-    /// says what the session holds, so the same decision serves a session on today's WAL
-    /// and one in the session store. An error means nothing was written and no model was
+    /// and key, a Claude Code persona and the provider's resolved render config. The session's
+    /// `history` says what it holds. An error means nothing was written and no model was
     /// called; the caller answers the admission with it.
     async fn admit_episode(
         &self,
@@ -2582,8 +2579,8 @@ impl LiveLoopExecutor {
                 }
             }
         };
-        // A resolve supplies today's token evidence, not a replacement for frozen billing facts.
-        // A moved run's resume that routing gave another credential is a credential change:
+        // A resolve supplies current token evidence, not a replacement for frozen billing facts.
+        // If routing gives a resumed run a different credential, that is a credential change:
         // the recorded `billing_vault_facts` (the vault's billing metadata for the credential,
         // which usage export bills by) describe the old credential, so the selection keeps the
         // facts this resolve read from the vault for the new one. A credential changed after a
@@ -2833,7 +2830,7 @@ impl LiveLoopExecutor {
                 return Err(RunError::Config(error));
             }
         };
-        // Endpoint, renderer and backend ids are admission inputs. Re-reading today's
+        // Endpoint, renderer and backend ids are admission inputs. Re-reading the current
         // catalog would move or refuse an already admitted run after an upstream change.
         let recorded_render_config = prior_run
             .as_ref()
@@ -3147,9 +3144,9 @@ impl LiveLoopExecutor {
         }
     }
 
-    /// [`RunExecutor::execute_on_store`]'s run. A seal writes what today's seal writes and
-    /// calls no model. A fresh run and a resume make `execute`'s admission decisions, with
-    /// the session's latest run, its config and the persona's history read from the folds.
+    /// [`RunExecutor::execute_on_store`]'s run. A seal calls no model. A fresh run and a resume
+    /// make `execute`'s admission decisions, with the session's latest run, its config and the
+    /// persona's history read from the folds.
     #[allow(clippy::too_many_arguments)]
     async fn run_on_store(
         &self,
@@ -3340,8 +3337,8 @@ impl LiveLoopExecutor {
         let mut model_call_ready = None;
         let mut media_renderer = None;
         if resolved.provider.supports_media_renderer() && (holds_media || !req.tools.is_empty()) {
-            // As `execute` installs today's renderer for a run that may carry media: the
-            // same engine, kept by the session's actor as the session's image index (see
+            // Use the renderer installed by `execute` for a run that may carry media: the
+            // engine kept by the session's actor as the session's image index (see
             // `broca_module::store_media`), reading the session's own media objects. The
             // session's first such run may still be waiting for the index to be built; each
             // model call waits for it first, and a request whose media can't be rendered is
@@ -3365,8 +3362,8 @@ impl LiveLoopExecutor {
             .next()
             .is_some()
         {
-            // As today's executor admits a send's attachments: against the media the
-            // resolved model takes, as its frozen render config states them.
+            // Admit a send's attachments against the media the resolved model takes, as its
+            // frozen render config states them.
             let frozen = serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(
                 resolved.provider.render_config_blob(),
             )

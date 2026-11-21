@@ -55,11 +55,11 @@ pub enum WarmTick {
 
 /// The returned future must own the provider request so dropping it when tools finish stops
 /// the request instead of leaving it running. Once a warm reports usage, queue `CacheWarmed`
-/// (the warm and its usage in the session's write-ahead log) before any further await, so
-/// cancellation cannot lose the reported usage.
+/// with that warm and usage in the session store before any further await, so cancellation
+/// cannot lose the reported usage.
 ///
-/// `C` is what the driver reads a run's frozen request from: today's run loop hands it the
-/// run's `RunConfig`; another run loop may hand it its own frozen admission.
+/// `C` is what the driver reads a run's frozen request from: the run loop hands it the run's
+/// `RunConfig`; another run loop may hand it its own frozen admission.
 #[async_trait::async_trait]
 pub trait KeepWarmDriver<C: ?Sized + Sync = RunConfig>: Send + Sync {
     fn timing(&self, config: &C) -> Result<WarmTiming, String>;
@@ -75,8 +75,7 @@ pub trait KeepWarmDriver<C: ?Sized + Sync = RunConfig>: Send + Sync {
     fn note_stop(&self, _run_id: &RunId, _reason: &str) {}
     /// The seal a run's model calls note each request on as their transport starts sending it,
     /// for a run loop that gives its calls no seal of its own: a warm re-sends those bytes, and
-    /// their send and usage date the cache. `None` when the loop's own seal already does, as
-    /// today's run loop's shutdown seal does.
+    /// their send and usage date the cache. `None` when the loop's own seal already does.
     fn step_seal(&self) -> Option<crate::ShutdownSeal> {
         None
     }

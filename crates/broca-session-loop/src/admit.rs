@@ -1,7 +1,5 @@
-//! A new run's admission, decided from its send's request and run control by the rules in
-//! `broca_core::fresh_start`. The run loop on today's storage (`broca_core::run`) calls the same
-//! rules at the same point, so a new run starts alike on either storage. Nothing here is written:
-//! a refusal leaves the session as it was.
+//! Admission for a new run is decided from its send's request and run control using the rules in
+//! `broca_core::fresh_start`. Nothing here is written: a refusal leaves the session as it was.
 
 use std::sync::Arc;
 

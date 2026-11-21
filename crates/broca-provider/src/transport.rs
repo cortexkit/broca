@@ -10364,7 +10364,7 @@ mod tests {
 
     #[test]
     fn openrouter_credit_402_is_credit_insufficient_with_the_affordable_max_tokens() {
-        // Today's code before this classification: a plain permanent with no provider code.
+        // Before this classification, the error is a plain permanent with no provider code.
         let unclassified = classify_http_error(402, OPENROUTER_CREDIT_402_BODY, None, None);
         assert_eq!(unclassified.provider_code, None);
         let error = classify_openrouter(402, OPENROUTER_CREDIT_402_BODY);
@@ -11762,7 +11762,7 @@ mod tests {
         }
     }
 
-    /// Every family other than the two OpenAI Responses families keeps today's schedule: a
+    /// Every family other than the two OpenAI Responses families uses this retry schedule: a
     /// `Retry-After` is capped at 120 s, and a 429 without one is still retried on the 2 s
     /// doubling backoff.
     #[tokio::test]
@@ -13176,7 +13176,7 @@ mod output_ceiling_tests {
         assert_eq!(outcome.attempt_outcomes(), vec![decode_outcome]);
     }
 
-    /// The control: today's parse failure, its transient class, and its single decode retry.
+    /// The control case: a parse failure classified as transient, with one decode retry.
     fn assert_parse_failure(outcome: &Outcome, decode_outcome: AttemptOutcome) {
         let error = outcome.error();
         assert_eq!(error.class, ErrorClass::Transient, "{}", error.message);

@@ -1,10 +1,9 @@
 //! Opening a session kept in the session store (`broca_session_store`) as the module's actor for
 //! it.
 //!
-//! The opener takes the session lease as it does for any session, then hands the session here
-//! when the session's head exists, or, for a session that exists in neither storage, when the
-//! registry marked the send creating it as one the store actor serves. Every other session stays
-//! on today's storage, which refuses a session kept here by name.
+//! The opener takes the session lease, then hands the session here when its head exists. For a
+//! session that exists in neither store, it does so when the registry marked the creating send
+//! as one the session store serves.
 //!
 //! A session here is encrypted or plain, as its head says (see `broca_session_store::keys`). A
 //! plain session is served from the module's start; an encrypted one once the deployment key has
@@ -36,7 +35,7 @@ use crate::executor::RunExecutor;
 use crate::registry::{ActorHandle, OpenError, RegistryHandle};
 use crate::store_actor::{Lifecycle, StoreActor};
 
-/// The capacity of a store session's command channel, the same as today's actor's.
+/// The capacity of a store session's command channel.
 const COMMANDS: usize = 64;
 
 #[path = "store_expiry.rs"]
@@ -350,7 +349,7 @@ impl StoreRuntime {
     }
 
     /// Writes the spend facts of every run in the session store to `billing`, the deployment's
-    /// usage export, as today's runs are written.
+    /// usage export.
     pub fn with_billing(mut self, billing: crate::store_billing::StoreBilling) -> Self {
         self.billing = Some(billing);
         self
@@ -966,13 +965,12 @@ impl StoreRuntimeSetup {
     }
 }
 
-/// The session store as the opener sees it from the module's start. Whether a session is kept
-/// there needs only the state root, so such a session is told apart from today's from the first
-/// open. Its runtime is opened at the start without the deployment key
+/// The state root alone tells the opener whether a session is kept in the session store, from
+/// the first open. Its runtime is opened at the start without the deployment key
 /// ([`StoreSlot::open_without_key`]) and serves plain sessions from then on. Serving an encrypted
 /// session needs the deployment key, which comes from the vault and may load after the module has
 /// started; it is installed into the runtime once it has. Until then an encrypted session kept
-/// here is refused `key_unavailable`, a transient refusal, and never served from today's storage.
+/// here is refused `key_unavailable`, a transient refusal.
 pub struct StoreSlot {
     state_root: PathBuf,
     key_id: u16,
@@ -1035,9 +1033,9 @@ impl StoreSlot {
         self.runtime.get().cloned()
     }
 
-    /// The runtime a session that exists in neither storage is created in, when it can create
-    /// one now: a plain session from the module's start, an encrypted one once the key has
-    /// loaded. `None` leaves the session to today's storage.
+    /// The runtime used to create a session that exists in neither store, when creation is
+    /// possible: a plain session from the module's start, an encrypted one once the key has
+    /// loaded. `None` means this runtime does not create the session.
     pub fn creating_runtime(&self) -> Option<Arc<StoreRuntime>> {
         self.runtime
             .get()

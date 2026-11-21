@@ -3,7 +3,7 @@
 //!
 //! A state root holds a `state-format` file beside its `wal/` directory. The value
 //! `broca-state/2` marks an overhaul root, whose log frames are version 4: their headers carry
-//! `appended_ms` and `writer_id`. A root without the file is a legacy root and keeps today's
+//! `appended_ms` and `writer_id`. A root without the file is a legacy root and keeps its legacy
 //! frames byte for byte. Overhaul root creation writes the marker before any other file, so a
 //! root without one is a legacy root rather than a half-created overhaul root.
 //!
@@ -32,7 +32,7 @@ pub const WAL_DIRNAME: &str = "wal";
 /// Which frame format a state root's logs are written in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WalFormat {
-    /// Today's frames (versions 1 to 3), byte for byte what deployed readers expect.
+    /// Legacy frames (versions 1 to 3), byte for byte what deployed readers expect.
     #[default]
     Legacy,
     /// Version 4 frames, stamped with `appended_ms` and `writer_id` under `frame-stamps/v1`.
@@ -392,7 +392,7 @@ mod tests {
             );
             assert!(error.to_string().contains("symbolic link"), "{error}");
         }
-        // The same link on a legacy root is left alone: legacy roots keep today's behavior.
+        // A symlink on a legacy root is left alone.
         let root = scratch_root("legacy-symlinked-wal");
         std::os::unix::fs::symlink(&outside, root.join(WAL_DIRNAME)).unwrap();
         assert_eq!(classify_state_root(&root).unwrap(), WalConfig::LEGACY);

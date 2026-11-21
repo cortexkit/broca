@@ -33,7 +33,8 @@ pub fn governs(op: &str) -> bool {
     )
 }
 
-/// Validate before fetching or writing. The old storage never accepts a reader policy.
+/// Validate before fetching or writing. `supported` is false for a session the session store
+/// can't hold, which takes no reader policy.
 pub fn check_plan(plan: &Map<String, Value>, supported: bool) -> Result<(), ServeError> {
     let declared = if supported {
         &[cortexkit_role_llm_runner::capabilities::APP_READERS][..]
@@ -45,7 +46,7 @@ pub fn check_plan(plan: &Map<String, Value>, supported: bool) -> Result<(), Serv
         message: if supported {
             "plan.readers must be an array of distinct principal strings".into()
         } else {
-            "plan.readers is not supported for a session on today's storage".into()
+            "plan.readers is served only for a session the session store holds".into()
         },
     })
 }

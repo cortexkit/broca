@@ -1175,8 +1175,8 @@ impl VaultClient {
         decode_status_reply(&decode_reply_json(&reply)?)
     }
 
-    /// As [`Self::report_auth_failure`], for either address form. The `record_version` CAS is
-    /// the same on both. A credential-id address is refused locally when this process has no
+    /// Reports that a credential failed authentication, addressed by either form. The
+    /// `record_version` CAS is the same on both. A credential-id address is refused locally when this process has no
     /// consumer identity, exactly as on [`Self::get_scoped`].
     pub async fn report_auth_failure_at(
         &self,

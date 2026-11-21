@@ -530,15 +530,14 @@ impl DisplayTimes {
 pub type RecordedSummaries =
     std::collections::BTreeMap<u64, Vec<cortexkit_role_llm_runner::read::ReasoningSummary>>;
 
-/// What `include_display_facts` adds to each message of `response`, the same for both storages:
-/// its creation time; for an assistant message its completion time and reasoning summaries; the
-/// sender, message marks (`speaks_for`, `notice`), notices and per-call times `facts` holds for it (by zero-based ordinal), and for a
-/// user message its send's `client_message_id`. A message that makes tool calls and has no
-/// per-call facts names each call with no times.
+/// What `include_display_facts` adds to each message of `response`: its creation time; for an
+/// assistant message, its completion time and reasoning summaries; the sender, message marks
+/// (`speaks_for`, `notice`), notices and per-call times `facts` holds for it (by zero-based
+/// ordinal); and, for a user message, its send's `client_message_id`. A message that makes tool
+/// calls and has no per-call facts names each call with no times.
 ///
-/// Today's storage reads reasoning summaries from the message's reasoning blocks (`recorded` is
-/// `None`); the session store serves the ones it recorded when it placed the message, as a seal
-/// prunes the blocks they are read from.
+/// The session store serves the reasoning summaries it recorded when it placed the message, as
+/// a seal prunes the blocks they are read from.
 pub fn apply_display_facts(
     response: &mut SessionReadResponse,
     times: &DisplayTimes,
@@ -2001,8 +2000,8 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
-    /// Whether `session` is served from the session store. Refuses a session owned by the new
-    /// storage when this handler has no runtime for it, before dispatch can consult today's WAL.
+    /// Whether `session` is served from the session store. A session owned by the session store
+    /// but lacking a runtime here is refused before dispatch.
     fn kept_in_new_storage(&self, _session: &LineageKey) -> Result<bool, ServeError> {
         Ok(false)
     }
@@ -2122,9 +2121,7 @@ pub trait ServeHandler: Send + Sync {
 
     /// For a session kept in the session store, the compaction view the request of the model step
     /// that wrote message `ordinal` (counting from 0) was rendered under, which output references
-    /// check a named part against: `Some(None)` when no view applied. `None` for a session kept
-    /// on today's storage, whose views output references read from its log instead
-    /// ([`crate::output_refs::view_at_writing_step`]).
+    /// check a named part against: `Some(None)` when no view applied.
     async fn store_writing_view(
         &self,
         _session: &LineageKey,
@@ -2281,7 +2278,7 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// `session.history`'s head for a session kept in the session store, resolving `mid` when the
-    /// read names a message; `None` for a session on today's storage, which `head` answers.
+    /// read names a message.
     async fn store_history_head(
         &self,
         _session: &LineageKey,
@@ -2459,8 +2456,8 @@ pub trait ServeHandler: Send + Sync {
 
     /// The session-change identities for drift checks: the effective plan identity and the
     /// latest accepted plan identity, when the session has session-change state (it received
-    /// a refresh). `None` when the session never received one, keeping today's plain
-    /// different-plan refusal exactly.
+    /// a refresh). `None` when the session never received one, so a different plan follows the
+    /// plain different-plan refusal.
     async fn session_change_identities(
         &self,
         _session: &LineageKey,
@@ -2512,12 +2509,12 @@ pub trait ServeHandler: Send + Sync {
 impl crate::LineageRegistry {
     /// The preflight's check of a refresh's compaction item against the latest plan the session
     /// accepted (`ChangeFacts::latest_manifest`). Keeping the item is always fine; removing or
-    /// changing it is refused, and so is adding one on today's storage. On the session store a
-    /// session may gain one: the window must be whole, and a context limit must resolve for the
-    /// plan's model (`plan_model`), else the session's, since a run on the compaction contract
-    /// can't run without one and the provider can't be removed again. A limit resolution that
-    /// couldn't run refuses transiently, with its cause. The plan's system text is checked once
-    /// it's fetched, where the actor writes the refresh (`plan_change::accept_refresh`).
+    /// changing it is refused. On the session store a session may gain one: the window must be
+    /// whole, and a context limit must resolve for the plan's model (`plan_model`), else the
+    /// session's, since a run on the compaction contract can't run without one and the provider
+    /// can't be removed again. A limit resolution that couldn't run refuses transiently, with
+    /// its cause. The plan's system text is checked once it's fetched, where the actor writes
+    /// the refresh (`plan_change::accept_refresh`).
     async fn check_compaction_change(
         &self,
         facts: &crate::plan_change::ChangeFacts,

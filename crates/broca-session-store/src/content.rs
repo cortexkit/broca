@@ -113,7 +113,7 @@ string_newtype!(ToolCallId);
 /// as base64, either as the whole string (Anthropic signatures and Gemini thought signatures, in
 /// the standard alphabet) or as one long run inside a JSON item (OpenAI's `encrypted_content`, in
 /// the URL-safe alphabet). Base64 costs a third more than the bytes it encodes, and opaque
-/// reasoning is about a quarter of today's log, so the longest base64 run is stored as its bytes,
+/// reasoning is about a quarter of the log, so the longest base64 run is stored as its bytes,
 /// with the text before and after it kept as text:
 ///
 /// `text = before (field 1) + base64(bytes) (field 2 standard, field 4 URL-safe) + after (field 3)`

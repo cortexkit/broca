@@ -1,8 +1,8 @@
-//! Publishing a session written in a private staging folder into a class root of the new
-//! storage: its log and objects are renamed into place, then its head is written as the live
-//! head, the one point of no return. A move from today's storage publishes the session it staged
-//! where no head is (`broca-module-serve`'s `store_move`); an import publishes the session it
-//! staged over the empty session it created (`store_import_stage`).
+//! Publishing a session written in a private staging folder into a class root of the session
+//! store: its log and objects are renamed into place, then its head is written as the live head,
+//! the one point of no return. A move publishes the session it staged where no head exists
+//! (`broca-module-serve`'s `store_move`); an import publishes the session it staged over the
+//! empty session it created (`store_import_stage`).
 //!
 //! The staging folder is on the state root's filesystem, so each rename is atomic, and outside
 //! every class root, so nothing serves or backs up a half-staged session.

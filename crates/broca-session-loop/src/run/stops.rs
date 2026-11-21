@@ -136,7 +136,7 @@ pub(super) async fn stopped_batch_in<W: Writer, P, T>(
     }
     let mut seen = std::collections::HashSet::new();
     for call in calls {
-        // A repeated call id still gets today's duplicate error, not "not run".
+        // A repeated call id gets the duplicate error, not "not run".
         if !seen.insert(call.tool_call_id.clone()) {
             terminal_with_reason(
                 &mut records,

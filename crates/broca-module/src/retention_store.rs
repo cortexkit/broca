@@ -82,11 +82,10 @@ impl Drop for Deleting<'_> {
 
 /// The retention seconds, last activity and deadline of the session store's session whose records
 /// are `records`, every one of both streams in seq order; `None` for a session whose first run
-/// set no retention. The records today's rule reads keep their meaning in the session store: a run
-/// start carries its retention and time; a queued send its time, and in its receipt the retention
-/// it set; a steer both in its receipt; a run's end and pause their time. A send queued or steered
-/// by the store actor, and one converted from today's log, keep these under today's names
-/// (`broca_session_loop::queue`).
+/// set no retention. The records' retention rules are: a run start carries its retention and
+/// time; a queued send its time, and in its receipt the retention it set; a steer both in its
+/// receipt; a run's end and pause their time. A send queued or steered by the store actor, or
+/// converted from the old log format, uses these field names (`broca_session_loop::queue`).
 ///
 /// A fork's session (see [`crate::fork_state`]) has no run: its retention seconds, last activity
 /// and deadline come from its fork's records.
@@ -108,7 +107,7 @@ pub fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)
             ));
         }
     }
-    // Whether a session may keep content is fixed by its first run, as it is for today's.
+    // Whether a session may keep content is fixed by its first run.
     let first = records.iter().find_map(|(_, record)| match record {
         Record::RunStart(start) => Some(start.retention_secs),
         _ => None,
@@ -179,9 +178,9 @@ impl RetentionService {
         )
         .await
     }
-    /// Whether retention is deleting the session `key` from the session store now, holding its
-    /// lease. An open that finds the lease held waits for this, as it waits for today's deletion
-    /// of an expired session, rather than refusing the send.
+    /// Whether retention is deleting the session `key` from the session store now, while holding
+    /// its lease. An open that finds the lease held waits for this deletion rather than refusing
+    /// the send.
     pub(crate) fn store_deletion_in_flight(&self, key: &BindIdentity) -> bool {
         self.store
             .deleting
@@ -430,8 +429,7 @@ impl RetentionService {
         Ok(deadline)
     }
 
-    /// Counts the session at `addr` as unreadable, as today's retention counts a WAL it can't
-    /// read, and says why.
+    /// Counts the session at `addr` as unreadable and says why.
     fn unreadable_store_session(&self, addr: &SessionAddr, error: SessionError) -> String {
         self.mark_unreadable_address(addr.0.clone());
         format!("the session's records could not be read: {error:?}")
@@ -606,8 +604,8 @@ impl RetentionService {
     }
 
     /// Deletes the session `key` at `addr`, read as `view` and `records` at head version
-    /// `version`, under its lease: the expiry marker dated `deleted_at_ms`, then what a move from
-    /// today's storage left, then the session, then what the module caches of it.
+    /// `version`, under its lease: the expiry marker dated `deleted_at_ms`, then any artifacts
+    /// left by a move, then the session, then what the module caches of it.
     #[allow(clippy::too_many_arguments)]
     async fn remove_read_session(
         &self,
@@ -678,8 +676,7 @@ impl RetentionService {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&addr.0);
-        // Still under the lease, as today's deletion evicts, so no session created at the address
-        // afterwards loses its routes.
+        // Still under the lease, so no session created at the address afterwards loses its routes.
         if let Some(evict) = self.evict.get() {
             evict(key);
         }

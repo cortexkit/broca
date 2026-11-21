@@ -22,9 +22,9 @@ pub fn reserve(operations: &Operations, step_id: u64, mut opts: CallOptions) -> 
     opts
 }
 
-/// Today's history from the session's facts: the run's model, the newest measured step, the
-/// body length of an attempt no step's end has closed yet, and a cap the current run recorded
-/// for a step that hasn't ended.
+/// History from the session's facts: the run's model, the newest measured step, the body length
+/// of an attempt no step's end has closed yet, and a cap the current run recorded for a step
+/// that hasn't ended.
 pub fn history(operations: &Operations) -> OutputReservationHistory {
     let mut history = OutputReservationHistory::default();
     // A measured step is noted the way a step's end notes it: after the attempt that sent it.

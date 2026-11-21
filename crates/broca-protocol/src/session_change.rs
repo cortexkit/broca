@@ -1,9 +1,8 @@
 //! The transitions of a session's plan changes: what each `session.refresh`,
 //! `session.refresh_policy`, `session.flush_prefix`, applied compaction view and run start does
-//! to the session's change state. Both session storages fold their records through these:
-//! today's fold over a WAL (`broca_fetch_plan::session_change::SessionChangeState::fold`) and the
-//! new storage's operational fold. They live here because both folds' crates can depend on this
-//! one, so the two can't drift apart. Nothing here reads or writes anything.
+//! to the session's change state. The session store folds its records through these transitions.
+//! They live here so the session store's fold crate can depend on this one. Nothing here reads
+//! or writes anything.
 //!
 //! A change never applies inside a running run. The earliest it applies is the start of the next
 //! run, and the `immediately` rung means from the next run. The `on_prefix_rebuild` rung waits
@@ -16,10 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::request::ModelHandle;
 
 /// A pending change: the highest accepted generation not yet applied, with its latest policy and
-/// the manifest it will freeze when it applies, held as `M`. Today's fold holds the manifest
-/// itself. The session store's fold holds a reference to it instead: the setup parts the manifest
-/// is stored as (its plan, each provider's answer, its tools, its system text and its
-/// declarations) and the rest of its members, as a run start references the manifest it froze.
+/// the manifest it will freeze when it applies, held as `M`. The session store's fold holds a
+/// reference to the manifest: the setup parts it is stored as (its plan, each provider's
+/// answer, its tools, its system text and its declarations) and the rest of its members, as a
+/// run start references the manifest it froze.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pending<M> {
     pub generation: u64,
@@ -76,13 +75,13 @@ pub fn applies_at_run_start(
     applies.then_some(if rebuild { "fold" } else { "append" })
 }
 
-/// The session-change transitions both folds make, over a manifest held as `M`. Each method is
-/// one record's effect.
+/// The effects of session-change records over a manifest held as `M`. Each method is one
+/// record's effect.
 ///
 /// A run start is two steps. [`Self::run_started`] notes the run's model and manifest, and when
 /// the pending change applies at it, [`Self::applied`] applies it after. Whether it applies is
-/// decided before either, by [`Self::applying`]. The session store records that decision in the
-/// run start's batch; today's fold makes it again on replay.
+/// decided before either, by [`applies_at_run_start`]. The session store records that decision
+/// in the run start's batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transitions<M> {
     /// The highest change generation accepted. `0` before any.

@@ -1,11 +1,10 @@
-//! broca core — the agentic loop and its seams.
+//! broca core: the seams and shared rules the run loop (`broca-session-loop`) is built on.
 //!
-//! The [`run::run_loop`] (stop_when after every step), tool dispatch through the
-//! [`tool_plane::ToolPlane`] seam, the model-step [`provider::Provider`] seam, the
-//! capability manifest + approval gate, and the durable single-writer [`lease`].
-//! Provider display deltas are passed through; a changed post-assistant message is
-//! re-streamed after a display reset. Every seam is a trait so a deterministic stub
-//! can swap for the real implementation with no loop changes.
+//! The model-step [`provider::Provider`] seam, tool dispatch through the
+//! [`tool_plane::ToolPlane`] seam, the capability manifest and approval gate, the durable
+//! single-writer [`lease`], and the rules for admission, queued sends and steers, compaction,
+//! hooks, budgets, media and billing facts. Every seam is a trait, so a deterministic stub can
+//! stand in for the real implementation.
 #![forbid(unsafe_code)]
 
 /// The pinned role types and rules shared by compaction consumers without extra dependencies.
@@ -18,7 +17,7 @@ pub mod billing;
 pub mod budget_kernel;
 pub use budget_kernel::{next_due, DueFiring};
 pub mod cache_warm;
-/// Which copy of a tool call each durable record answers, and the key today's readers give it.
+/// Which copy of a tool call each durable record answers, and the key current readers give it.
 pub mod call_identity;
 pub mod capability;
 pub mod clock;

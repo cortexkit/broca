@@ -73,7 +73,7 @@ pub(super) fn open_batch_close_out<W: Writer>(
     (records, withdrawn)
 }
 
-/// The records that keep a tool turn whose calls were never dispatched, as today's
+/// The records that keep a tool turn whose calls were never dispatched, as
 /// `broca_core::close_out_pending_turn` writes them: the step's batch started if it wasn't, a
 /// never-run result for each call without one, and the batch's end. Nothing when the run's last
 /// step asked for no tools.

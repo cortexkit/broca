@@ -22,7 +22,7 @@ pub const LARGEST: usize = 10;
 pub enum MemoryAnswer {
     /// A session in the session store, sized.
     Store(Box<ActorMemory>),
-    /// A session on today's storage, which the report counts and doesn't size.
+    /// A session counted by the report but not sized.
     Legacy,
     /// An actor closing its session, which the report counts as unanswered.
     Closing,
@@ -49,8 +49,8 @@ pub struct SetupHeld {
     pub bytes: usize,
 }
 
-/// The report from the actors' answers, the count of sessions on today's storage and of those
-/// that didn't answer, and the store runtime's caches.
+/// The report from the actors' answers, the count of sessions and unanswered sessions, and the
+/// store runtime's caches.
 pub fn assemble(
     answers: Vec<ActorMemory>,
     legacy_sessions: u64,

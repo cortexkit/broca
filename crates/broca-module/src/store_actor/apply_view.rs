@@ -1,18 +1,18 @@
 //! `session.apply_view` on a session kept in the session store. The compaction provider hands
 //! over a view between steps (a background summary finishing while the session is idle, its
 //! answer to the notice after a run's last step, or its re-offer at Setup), and the session
-//! records it as the view it accepted. The next step applies it, as today's actor has today's
-//! loop do.
+//! records it as the view it accepted. The next step applies it.
 //!
-//! The view is checked against the session's entries by the same check the loop runs
-//! (`State::accept`), so it is refused, and answered again on a retry, exactly as today's. The
-//! accepted view is written as the session's `View` record and set in the compaction state the
-//! actor keeps for its whole life and hands to every run, in the same step, so a run already
-//! going or the next one applies it without reading the session again.
+//! The view is checked against the session's entries using `State::accept`, the same check
+//! used by the run loop. A view that is refused is answered again on retry. The accepted view
+//! is written as the session's `View` record and set in the compaction state the actor keeps
+//! for its whole life and hands to every run, in the same step, so a run already going or the
+//! next one applies it without reading the session again.
 //!
-//! A run holds that state while it writes a view of its own through this actor. A command
-//! that finds it held waits, kept by the actor, until the run lets it go: the actor goes on
-//! serving the run meanwhile, which waiting on the state there would stop.
+//! A run holds that state while it writes its own view through this actor. A command that
+//! finds the state held waits in the actor until the run lets it go. The actor continues
+//! serving the run while the command waits; waiting on the state there would stop that
+//! service.
 
 use broca_core::compaction_v2::{
     self as v2,
@@ -30,7 +30,7 @@ use crate::store_import::{ApplyViewCommand, ImportRefusal, StoreOutcome};
 
 /// Writes an accepted view through the actor's own session, keeping what it appended so a
 /// running run's copy of the session catches up with it. The view records the provider that
-/// handed it over, as today's journal records `session.apply_view`'s admitted caller.
+/// handed it over.
 struct ActorJournal<'s, B: SessionBackend> {
     session: tokio::sync::Mutex<&'s mut Session<B>>,
     applied_by: Option<&'s str>,
@@ -173,8 +173,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .await?
         {
             Ok(()) => {
-                // The state names the provider too, as today's actor sets it, so the step that
-                // applies the view, and a seal carrying it, keep who handed it over.
+                // The state names the provider too, so the step that applies the view and a seal
+                // carrying it keep who handed it over.
                 state.restore_accepted_by(command.caller.clone());
                 ApplyViewAnswer::Accepted
             }

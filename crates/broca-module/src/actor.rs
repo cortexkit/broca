@@ -140,9 +140,7 @@ pub(crate) fn inherit_frozen_parameters(
     }
 }
 
-/// The settings a running run froze that a joining steer must agree with. Today's actor reads
-/// them from the episode's `RunConfig`; an actor over another storage builds them from what it
-/// keeps of the run's start, so both refuse the same steers.
+/// The settings a running run froze that a joining steer must agree with.
 pub(crate) struct SteerFrozen<'a> {
     pub model: &'a broca_protocol::request::ModelHandle,
     pub variant: Option<&'a str>,

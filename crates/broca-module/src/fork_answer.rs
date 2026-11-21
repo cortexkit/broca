@@ -315,7 +315,7 @@ impl ForkManager {
         self.clock.now_ms()
     }
 
-    /// The head `key` as it stands now, read-only. A head on today's storage serves no fork.
+    /// The head `key` as it stands now, read-only.
     async fn head(&self, key: &BindIdentity) -> Result<Option<Head>, ForkError> {
         let class = self
             .runtime

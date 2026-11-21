@@ -1,8 +1,8 @@
-//! The client-side refusal fallback, run as today's loop runs it, with today's own schedule
-//! (`broca_core::refusal_fallback`). A run whose provider froze a fallback model sends a step
-//! there while a refusal's schedule says so. When the run's own model refuses a step with a
-//! content filter, the run re-sends that same step there once. A run without a frozen fallback
-//! never takes any of these paths, and its records stay exactly as before.
+//! The client-side refusal fallback follows the schedule in `broca_core::refusal_fallback`.
+//! A run whose provider froze a fallback model sends a step there while a refusal's schedule
+//! says so. When the run's own model refuses a step with a content filter, the run re-sends
+//! that same step there once. A run without a frozen fallback never takes any of these
+//! paths, and its records stay unchanged.
 
 use broca_core::provider::Provider;
 use broca_core::refusal_fallback::{self, CommittedStep, StepRoute};
@@ -27,8 +27,8 @@ pub(crate) struct Route {
 }
 
 impl Route {
-    /// Decides the step's route from the session's schedule, as today's loop does before each
-    /// step, and tells the provider which model it renders for.
+    /// Decides the step's route from the session's schedule before each step and tells the
+    /// provider which model it renders for.
     pub fn decide<W: Writer, P: Provider>(
         writer: &W,
         provider: &P,

@@ -444,7 +444,7 @@ fn insert_segment(
         .map_err(storage)?;
     // A DISAGREEMENT HAS TWO CAUSES AND ONLY ONE OF THEM NEEDS ANYONE.
     //
-    // A shipped fact is immutable, so re-deriving one always produces today's segment
+    // A shipped fact is immutable, so re-deriving one always produces the current segment
     // shape against yesterday's stored bytes. Every additive field since that fact was
     // written -- `usage_policy_version`, `account_ref`, `resolved_credential_id` -- makes
     // the comparison differ FOR A REASON THAT REQUIRES NO ACTION, and it differs again
@@ -697,8 +697,8 @@ fn classify_collision(stored: &str, current: &str) -> CollisionKind {
         match current.get(key) {
             Some(value) if value == stored_value => {}
             // Present in both with different answers, OR carried by the stored fact and dropped
-            // by the current segment. A dropped key is not the benign direction: it means today's
-            // derivation would ship LESS than what already shipped under this identity.
+            // by the current segment. A dropped key is not the benign direction: it means the
+            // current derivation would ship LESS than what already shipped under this identity.
             Some(_) | None => differing.push(key.clone()),
         }
     }
@@ -1750,7 +1750,7 @@ mod collision_tests {
     use super::{classify_collision, CollisionKind};
 
     /// The measured production case for the BENIGN arm: a fact predating an added field, where
-    /// the stored bytes are a strict subset of today's.
+    /// the stored bytes are a strict subset of the current segment.
     #[test]
     fn a_fact_predating_an_added_field_is_evolution_not_a_disagreement() {
         let stored = r#"{"fact_id":"a","input_tokens":13,"account_ref":"d4bc9dbc"}"#;
@@ -1809,7 +1809,7 @@ mod collision_tests {
         );
     }
 
-    /// A field the current segment NO LONGER emits is not the benign direction: today's
+    /// A field the current segment NO LONGER emits is not the benign direction: the current
     /// derivation would ship less than what already shipped under this identity.
     #[test]
     fn a_dropped_field_is_loud_because_shipping_less_is_not_evolution() {

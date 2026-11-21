@@ -278,7 +278,7 @@ pub fn resolve_credential_id(
 }
 
 /// Preserve a frozen key's method and account. Older runs without a frozen vault id still
-/// resolve that key against the rows, but never reselect its method from today's defaults.
+/// resolve that key against the rows, but never reselect its method from current defaults.
 pub fn select_credential_id(
     frozen: Option<&str>,
     provider: &str,

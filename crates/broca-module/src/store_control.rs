@@ -1,36 +1,35 @@
-//! The control stream of a session kept in the session store: its records projected to today's
+//! The control stream of a session kept in the session store: its records projected to
 //! `session.subscribe` payloads, unit for unit.
 //!
-//! Today's projection (`broca_core::project_control_with_mids`) walks WAL records; this one walks
-//! the session store's records, which split today's records into a transcript and a ledger. The
-//! payload of each unit is built by the same shared rules (`broca_core::projection`), so a unit's
-//! content can't differ between the two storages; only the walk that decides which units each
-//! record yields, and where, is new here.
+//! The projection walks the session store's records, which are split between a transcript
+//! and a ledger. The payload of each unit follows the shared rules
+//! (`broca_core::projection`); the traversal determines which units each record yields and
+//! where they appear.
 //!
-//! **Where units sit.** A unit's cursor names the record that yields it: its seq, and its index
-//! among that record's units. Units sit on ledger records and on `EntryFacts`, never on a record
-//! a seal may rewrite (an `Input` or `Assistant` loses its opaque payloads when it leaves the open
-//! log), so a cursor keeps naming the same bytes for the session's whole life:
+//! **Where units sit.** A unit's cursor names the record that yields it: its seq, and its
+//! index among that record's units. Units sit on ledger records and on `EntryFacts`, not on
+//! `Input` or `Assistant` records whose opaque payloads are removed when they leave the open
+//! log. Thus a cursor keeps naming the same bytes for the session's whole life:
 //! - a run's start, its end, a pause and a held call on their own records;
 //! - a step's start, which announces its assistant message by the id it records
 //!   (`StepStart::mid`), and its end, which carries the assistant message;
-//! - a batch's start, which announces the tool-results message (`BatchStart::mid`), each call's
-//!   dispatch and outcome, and the batch's end, which finishes that message;
-//! - an input message's lifecycle on the `EntryFacts` that names it, since only those facts carry
-//!   its id; a budget firing's units wait for its reminder's facts the same way.
+//! - a batch's start, which announces the tool-results message (`BatchStart::mid`), each
+//!   call's dispatch and outcome, and the batch's end, which finishes that message;
+//! - an input message's lifecycle on the `EntryFacts` that names it, since only those facts
+//!   carry its id; a budget firing's units wait for its reminder's facts the same way.
 //!
 //! **Ids.** Message ids come from the records (`StepStart::mid`, `BatchStart::mid`,
 //! `EntryFacts::mid`), never derived from positions, and are the ids `session.read` serves. A
-//! call's key and schema pin come from its `ToolIntent`; a call answered without one takes its
-//! key from its `ToolOutcome`.
+//! call's key and schema pin come from its `ToolIntent`; a call answered without one takes
+//! its key from its `ToolOutcome`.
 //!
 //! **State.** What a record needs from earlier records is the two folds' state (kept here as
-//! copies, the conversation without its window) plus a few facts of the current run, step and
-//! batch, which [`StoreControl::at_checkpoint`] rebuilds from the folds at a log's start.
+//! copies, the conversation without its window) plus a few facts of the current run, step
+//! and batch, which [`StoreControl::at_checkpoint`] rebuilds from the folds at a log's start.
 //!
 //! **Notices.** Text a send delivered with a tool result is a notice under the send id and
-//! sender its `ResultAppend` carries. One whose record names no send id is never shown: its unit
-//! exists, so a cursor naming it still resumes, but it is marked not visible.
+//! sender its `ResultAppend` carries. One whose record names no send id is never shown: its
+//! unit exists, so a cursor naming it still resumes, but it is marked not visible.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -624,9 +623,8 @@ impl StoreControl {
                 }
             }
             // A ride delivered with its envelope is a notice, once per ride, under the key, send
-            // id and sender its envelope recorded, and with the agent its sender spoke for, as
-            // today's control stream names it. Text delivered before envelopes existed is no
-            // notice, and yields nothing.
+            // id and sender its envelope recorded, with the agent its sender spoke for. Text
+            // delivered before envelopes existed is not a notice and yields nothing.
             Record::ResultAppend(append) => {
                 let carrier = self.carriers.get(&append.tool_call_id).cloned();
                 if let (Some((mid, part, _)), Some(ride), Some(send_id)) =
@@ -886,8 +884,8 @@ impl StoreControl {
         }
     }
 
-    /// A ledger event whose kind only converted sessions hold: today's record, carried whole
-    /// apart from what the conversion moved into transcript records.
+    /// A ledger event kind held only by sessions converted from the old log format; the event
+    /// is carried whole apart from data the conversion moved into transcript records.
     fn event(
         &mut self,
         event: &broca_session_store::record::Event,

@@ -1,11 +1,9 @@
 //! The rules that freeze a new episode's start: what a fresh run, or a new episode appended to
 //! an idle session, records in its `RunStarted` and refuses before writing anything.
 //!
-//! Today's run loop calls each rule at the point of admission it always had, and a session
-//! actor on another storage calls the same rules in the same order. That way one copy decides
-//! what a new episode freezes, whichever storage holds the session. Each rule reads only what
-//! it's given: the request, the run's control, and the few facts about the session so far that
-//! it names. Resumes keep what the episode froze and don't come here.
+//! At admission, each rule runs in order and decides what a new episode freezes. Each rule reads
+//! only what it's given: the request, the run's control, and the few facts about the session so
+//! far that it names. Resumes keep what the episode froze and don't come here.
 
 use std::sync::Arc;
 
@@ -103,7 +101,7 @@ fn admitted_generation<P: Provider>(
     let mut effective = generation.clone();
     // Only the effective value belongs in the run's existing generation member. Catalog facts
     // are admission inputs, not render inputs: resuming a run or rebuilding its provider
-    // request offline must not apply today's bounds again, including to older runs.
+    // request offline must not apply the current bounds again, including to older runs.
     effective.temperature = provider.admit_temperature(generation.temperature);
     Ok(effective)
 }

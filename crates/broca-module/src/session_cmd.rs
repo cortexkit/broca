@@ -132,9 +132,8 @@ pub enum LineageCmd {
         request: Box<broca_core::ImportRequest>,
         reply: oneshot::Sender<ImportOutcome>,
     },
-    /// A command only a session kept in the session store serves: a file-source import, or
-    /// installing the compaction provider's first view (see `store_import`). The legacy actor
-    /// refuses it: a session on today's storage already exists.
+    /// A command served only for a session in the session store: a file-source import, or
+    /// installing the compaction provider's first view (see `store_import`).
     Store {
         command: crate::store_import::StoreCommand,
         reply: oneshot::Sender<crate::store_import::StoreOutcome>,
@@ -196,9 +195,8 @@ pub enum LineageCmd {
     Status {
         reply: oneshot::Sender<LineageStatus>,
     },
-    /// Estimate what the session holds in memory, by holder, for `memory.report`: a store
-    /// actor answers with its sizes, walked now; an actor of today's storage answers that it is
-    /// one, and is counted only.
+    /// Estimate what the session holds in memory, by holder, for `memory.report`: the
+    /// session-store actor walks the holders now and answers with their sizes.
     MemoryReport {
         reply: oneshot::Sender<crate::memory_report::MemoryAnswer>,
     },

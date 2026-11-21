@@ -150,7 +150,7 @@ pub(super) async fn gate_hooked(
     ))))
 }
 
-/// The plan for a call a pre-tool hook refused: today's refusal result and reason code.
+/// The plan for a call a pre-tool hook refused: its refusal result and reason code.
 pub(super) fn hook_refused(
     call: &ToolCall,
     trace: &broca_core::hooks::Trace,
@@ -169,7 +169,7 @@ pub(super) fn hook_refused(
 }
 
 /// The run's hook plan, from its frozen manifest. A plan that declares hooks without a plane to
-/// call them refuses the run, as today's loop does; one whose hooks ask a person to approve a
+/// call them refuses the run; one whose hooks ask a person to approve a
 /// call isn't supported yet.
 pub(super) fn hook_plan<P, T>(
     admission: &Admission,

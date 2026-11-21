@@ -312,9 +312,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // default location is a contract with another module, not a local preference.
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
-    // Before the session store's class roots are created there, its first single-folder tree
-    // becomes the durable root, once: creating the durable root first would leave that tree
-    // where backups no longer capture it.
+    // A state root from before the session store had storage classes keeps every session in
+    // one folder tree. Before the class roots are created, that tree becomes the durable root,
+    // once: creating the durable root first would leave the old tree where backups no longer
+    // capture it.
     broca_module_serve::store_layout::class_single_folder_tree(&state_root).map_err(|error| {
         ServeIoError(format!(
             "the new storage's single-folder tree in {} couldn't be made its durable root: \
@@ -635,9 +636,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         );
         // INFO: the startup census. It answers "which credentials does this process hold",
         // which is a question asked when something is already wrong -- so it must be IN the log,
-        // and it is not itself a warning. A contributor proposed a per-call log line for the
-        // same purpose (issue #19); this line plus the durable resolved_credential_id on every
-        // export fact is what made that unnecessary.
+        // and it is not itself a warning. No per-call log line is needed for the same purpose:
+        // this line plus the durable resolved_credential_id on every export fact answers it.
         tracing::info!(
             target: "credentials",
             "auth source = vault (every credential is read by grant as {}; credentials resolved from listed rows)",
@@ -672,9 +672,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
     ));
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
-    // The session store. A session kept there is told apart from today's from the first
-    // open. Its runtime opens here, without the deployment key, and serves plain sessions from
-    // the start; encrypted sessions are served once the key has loaded from the vault (see
+    // The session store. Its runtime opens here, without the deployment key, and serves plain sessions from the
+    // start; encrypted sessions are served once the key has loaded from the vault (see
     // `store_key`). `session_storage.encryption` chooses the mode of the sessions it creates.
     let session_storage =
         broca_module_serve::config::SessionStorageConfig::from_settings(&settings)
@@ -688,7 +687,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     );
     broca_module_serve::store_key::publish(Arc::clone(&store_slot));
     // With run events on, a session in the session store hands the events of its durable records
-    // to the outbox the publisher drains, as a session in today's storage does from its WAL.
+    // to the outbox the publisher drains.
     let store_run_events = bus_event_config.enabled.then(|| {
         broca_module_serve::bus_events::StoreRunEvents::new(run_index.as_ref().unwrap().clone())
     });
@@ -699,8 +698,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         import_roots: broca_module_serve::config::ImportConfig::from_settings(&settings)
             .map_err(ServeIoError)?
             .roots,
-        // A run that ends on a session kept in the session store is billed into the usage export
-        // today's runs are billed into, under the same charge-basis table.
+        // A run that ends on a session in the session store is billed into the usage export
+        // under the charge-basis table.
         billing: run_index
             .as_ref()
             .map(|legacy| broca_module::store_billing::StoreBilling {

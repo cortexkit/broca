@@ -210,8 +210,8 @@ pub enum StoreOutcome {
     ViewApplied(String),
     Refused(ImportRefusal),
     /// An import refused by the scope reservation of the session it would create: a scope other
-    /// than the one whose stamped bind reserved the session's address. Answered with the bytes
-    /// today's owner check answers a send with.
+    /// than the one whose stamped bind reserved the session's address. Answered with the same
+    /// bytes as the owner check uses for a send.
     ScopeRefused(broca_core::ScopeRefusal),
     /// A dependency the command needs couldn't be read; retrying may succeed.
     Transient(String),
@@ -740,7 +740,7 @@ fn notice_of(message: &HeadMessage, owner: Option<&str>) -> Option<Notice> {
 
 /// The seeded run's start. It records the import's key and payload digest, so a retry is
 /// recognised; the route's principal and scope, which make the importer the session's owner;
-/// where the history came from; and the run settings today's import records on its seed
+/// where the history came from; and the run settings recorded on its seed
 /// (`broca_core::import`): the placeholder model `import/import`, the digest that marks the
 /// run as an import's, no tags rendered, and part numbers counting on from `floor`.
 fn seed_start(

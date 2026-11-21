@@ -3,9 +3,9 @@
 //! before a request is sent, asking for a newer view when something changed, such as the model
 //! or the cache expiring).
 //!
-//! The decisions are today's (`broca_core::compaction_v2`). Today's loop finds their inputs by
-//! folding the whole log on every step; here they come from the operational fold, which keeps
-//! each as a latest value (see `broca_session_store::fold::operations::Operations`).
+//! The decisions come from `broca_core::compaction_v2`. Their inputs come from the operational
+//! fold, which keeps each as a latest value (see
+//! `broca_session_store::fold::operations::Operations`).
 
 use std::sync::Arc;
 
@@ -36,8 +36,8 @@ thread_local! {
 
 /// What a run whose plan names a compaction provider needs for its calls to that provider.
 pub struct Ctx {
-    /// Today's per-session compaction state and call runtime, held for the session's life by
-    /// whoever owns the session, as today's actor holds it.
+    /// Per-session compaction state and call runtime, held for the session's life by whoever
+    /// owns the session.
     pub session: Arc<v2::session::Session>,
     /// The compaction provider's module and the preset the plan asks for.
     pub provider: String,
@@ -83,13 +83,13 @@ pub async fn earlier_context<W: Writer>(
     Ok(Some((run, Some(context))))
 }
 
-/// Today's compaction state, rebuilt from the open log's records (see
-/// `Session::open_log_records`) by today's fold: each accepted view rebuilt from its stored
-/// edits and checked against its checksum, the views steps applied, and the latest marker.
+/// Compaction state is rebuilt from the open log's records (see
+/// `Session::open_log_records`): each accepted view is rebuilt from its stored edits and checked
+/// against its checksum, alongside the views applied by steps and the latest marker.
 ///
 /// The operational fold names the accepted and applied views. Every seal carries whole copies of
-/// them into the new log (`carried_views`), and the store refuses a seal that doesn't, so a view
-/// the fold names but the open log doesn't hold means the log is damaged.
+/// them into the new log (`carried_views`), and the session store refuses a seal that doesn't,
+/// so a view the fold names but the open log doesn't hold means the log is damaged.
 pub fn restore(
     records: &[(u64, Record)],
     bind: &BindIdentity,
@@ -169,9 +169,8 @@ pub fn restore(
     Ok(state)
 }
 
-/// Today's compaction journal over the session's writer: an accepted view, the view a step
-/// applies and a marker are each appended durably before the call returns, as today's
-/// `WalJournal` syncs each. The marker names the session it was written for.
+/// The compaction journal appends an accepted view, an applied view and a marker durably before
+/// each call returns. The marker names the session it was written for.
 pub struct StoreJournal<'w, W> {
     writer: tokio::sync::Mutex<&'w mut W>,
     bind: &'w BindIdentity,
@@ -241,8 +240,8 @@ impl<W: Writer> v2::request::ReadBack for StoredReadBack<'_, '_, W> {
 }
 
 impl<W: Writer> Journal for StoreJournal<'_, W> {
-    /// A view a run's step accepted, which no provider handed over through
-    /// `session.apply_view`, so it names none, as today's loop journal records none.
+    /// A view a run's step accepted. No provider handed it over through `session.apply_view`,
+    /// so it records no provider.
     async fn accepted(
         &self,
         previous: Option<&ReceivedView>,
@@ -308,7 +307,7 @@ pub enum Send {
 }
 
 /// The error a run ends with when its compaction provider can't serve it: permanent, with code
-/// `compaction_unavailable`, the same error today's loop writes in that case.
+/// `compaction_unavailable`.
 pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
     broca_protocol::ProviderError {
         provider_details: None,
@@ -330,17 +329,16 @@ pub fn unavailable_error(message: &str) -> broca_protocol::ProviderError {
     }
 }
 
-/// What today's compaction code reads of the session's transcript: the entries, and the stored
+/// What the compaction code reads from the session's transcript: the entries and the stored
 /// messages they match position by position.
 ///
-/// The entries are the window's, in today's terms: the window, and the assistant message whose
-/// tool calls are still running. After a seal at a cut, the history before the window is sealed,
-/// but the views still name entries there: the cut's target, and the messages earlier edits drop,
-/// replace or anchor an insert before, which a provider may carry into every later view. Today's
-/// code checks each new view against the entries, and refuses one naming a message it doesn't
-/// hold, so each sealed entry the applied or the accepted view names is read back and put in
-/// front, with its message, as today's loop, which seals nothing, would hold it. Rendering
-/// changes nothing: every one of them is before the cut, which leaves it out.
+/// The entries are those in the window, plus the assistant message whose tool calls are still
+/// running. After a seal at a cut, history before the window is sealed, but views may still name
+/// entries there: the cut's target, and messages earlier edits drop, replace or anchor an insert
+/// before, which a provider may carry into every later view. Each new view is checked against
+/// the entries and rejected if it names a message the transcript does not hold. So each sealed
+/// entry named by the applied or accepted view is read back and put in front, with its message.
+/// Rendering changes nothing: each of these entries is before the cut, which leaves it out.
 pub struct Transcript {
     pub entries: Arc<Vec<cortexkit_role_compaction::read::Entry>>,
     /// The sealed messages put in front of the window's, for the stored prompt, with ordinals.
@@ -655,7 +653,7 @@ pub fn cut_to_seal<W: Writer>(writer: &W, ctx: &Ctx) -> Option<u64> {
 /// Seals the session's history before a cut the step just applied, and starts the new open log
 /// with full copies of both view slots: a seal moves the ledger out, and a stored view is a
 /// change against the views before it. The copies go applied view first, then the step that
-/// applied it, then the accepted view, so today's fold rebuilds both slots from them.
+/// applied it, then the accepted view, so the fold rebuilds both slots from them.
 pub async fn seal_at_cut<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -760,7 +758,7 @@ pub async fn offline_prompt<W: Writer>(
         &rides,
         view.as_ref().map_or(&[][..], |view| view.edits.as_slice()),
         // A view's inserted image isn't a medium the session captured, so the request shows
-        // its provenance marker in its place, as today's storage renders it; only its reference
+        // its provenance marker in its place; only its reference
         // is needed, checked as the view was when accepted.
         v2::host::image_reference,
     )
@@ -845,7 +843,7 @@ pub fn carried_views(state: &State, operations: &Operations) -> Result<Vec<Recor
 /// The `View` record of `view`, accepted after `previous`: its edits stored as their change
 /// against `previous`, its build metadata as the provider sealed it, and `applied_by`, the
 /// provider that handed it over through `session.apply_view` (`None` for a view a run's step
-/// accepted). Today's journal writes the same fields on its accepted-view record.
+/// accepted).
 pub fn view_record(
     previous: Option<&ReceivedView>,
     view: &ReceivedView,
@@ -961,9 +959,8 @@ fn spanning_repetition(
     }
 }
 
-/// The run's frozen choices in the shape today's compaction conditions read. Its model
-/// variant, service tier and account choice aren't in the new loop's admission yet, so they read
-/// as none.
+/// The run's frozen choices in the shape read by compaction conditions. The admission does not
+/// include the model variant, service tier, or account choice, so those read as none.
 pub fn frozen(admission: &Admission) -> v2::host::Frozen<'_> {
     v2::host::Frozen {
         model: &admission.model,
@@ -972,7 +969,7 @@ pub fn frozen(admission: &Admission) -> v2::host::Frozen<'_> {
         frozen_render_config: &admission.render_config,
         tools: &admission.tools,
         // A planned run's system text is its plan's, which the send context reads from the
-        // manifest; only an unplanned run's own system text counts here, as today's config holds.
+        // manifest; only an unplanned run's own system text counts here.
         global_system: (admission.manifest.is_none() && !admission.global_system.is_empty())
             .then_some(admission.global_system.as_slice()),
         auth_selection: admission.auth_selection.as_ref(),
@@ -1003,10 +1000,11 @@ fn previous<W: Writer>(
     }
 }
 
-/// The conditions a step's compaction calls state, by today's rule (`host::conditions_of`). On a
+/// The conditions a step's compaction calls state, as specified by `host::conditions_of`. On a
 /// session that enrolled in the current compaction contract, the messages placed before it
 /// report no usage, so until a step on the contract reports its own, the session's fill is the
-/// prompt size the newest step before the enrollment reported (`crate::enroll::last_prompt_tokens`).
+/// prompt size the newest step before the enrollment reported
+/// (`crate::enroll::last_prompt_tokens`).
 ///
 /// Each reading names the view its request was rendered under (`last_prompt_view`), so the
 /// provider can tell a reading taken before its newest view applied from one taken under it
@@ -1077,13 +1075,13 @@ pub async fn floor_through<W: Writer>(
         .and_then(|entry| entry.state.facts.as_ref().map(|facts| facts.mid.clone())))
 }
 
-/// The version of the view the request that `entry` reports the usage of was rendered under,
+/// The version of the view under which the request whose usage `entry` reports was rendered,
 /// `0` when it was rendered under none. The step that wrote the message recorded that view in
 /// the message's entry facts (`generated_under`, `crate::entries::written_under`), from the
 /// view applied when the message was placed: the step's own `ViewApplied` goes in before its
 /// request is sent, and no later step's can come before the message, so it is the view that
-/// request carried. A converted message's facts carry today's projection of the same rule,
-/// which names a view whenever one applied before the step.
+/// request carried. A message converted from the old log format carries facts projected by the
+/// same rule, naming a view whenever one applied before the step.
 ///
 /// A message with no view recorded was written under none, unless broca didn't write it: only
 /// an import places messages that carry usage broca didn't measure (another runner's, under
@@ -1113,8 +1111,8 @@ fn prompt_view(
         .then_some(0)
 }
 
-/// `prompt` with the run's settings, the rendering inputs and the system text above it, as
-/// today's `render::finish` completes a compacted prompt.
+/// Completes a compacted prompt from `prompt`, using the run's settings, the rendering inputs and
+/// the system text above it.
 fn finish(
     boundary: &broca_protocol::request::CallOptions,
     prompt: Vec<broca_protocol::Message>,
@@ -1125,8 +1123,8 @@ fn finish(
 }
 
 /// Applies at step `step`'s boundary the view the provider handed over, if it still fits the
-/// transcript, and finishes a marker a crash left owed, as today's loop does before the step
-/// starts. `Err` from the inner result means the run must end `compaction_unavailable`.
+/// transcript, and finishes a marker a crash left owed before the step starts. `Err` from the
+/// inner result means the run must end `compaction_unavailable`.
 pub async fn apply_boundary<W: Writer, P, T>(
     writer: &mut W,
     admission: &Admission,
@@ -1161,17 +1159,17 @@ pub async fn apply_boundary<W: Writer, P, T>(
     Ok(Ok(()))
 }
 
-/// Prepares step `step`'s request through today's compaction code: Setup when the provider
-/// needs it, a ride when something changed, the notices owed, and the prompt the applied view
-/// renders from the run's stored prompt, `stored`, brought up to date for the step. `opts`
-/// carries the request's settings; its own prompt is left empty. `rendered` keeps what the
-/// run's renders rendered of each entry, for the next to reuse.
+/// Prepares step `step`'s request: Setup when the provider needs it, a ride when something
+/// changed, the notices owed, and the prompt rendered from the run's stored prompt, `stored`,
+/// brought up to date for the step. `opts` carries the request's settings; its own prompt is
+/// left empty. `rendered` keeps what the run has rendered for each entry, for the next step to
+/// reuse.
 ///
 /// `moved_from` is set when the step is prepared again after the run moved to another account
 /// inside it: the run's last accepted request was sent under that admission, so the ride
-/// compares the current account with its account, and names the change. `overflow` is set when
-/// the step is prepared again after the model provider refused its request as too long: the
-/// step then rides `over_limit` for a smaller view.
+/// compares the current account with that admission's account, and names the change.
+/// `overflow` is set when the step is prepared again after the model provider refused its
+/// request as too long: the step then rides `over_limit` for a smaller view.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     writer: &mut W,
@@ -1211,8 +1209,8 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         scope: admission.send.scope.as_ref(),
     };
     let journal = StoreJournal::new(writer, &seams.bind);
-    // A ride renders by its envelope, as today's loop renders a ride recorded with one; text
-    // delivered before envelopes existed renders the way it always did.
+    // A ride renders by its envelope; text delivered before envelopes existed renders the way it
+    // always did.
     let rides = placed_rides(&transcript_rides, admission);
     #[cfg(test)]
     let rendered_before = rendered.rendered();
@@ -1243,7 +1241,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             current: &current,
             // Expiry counts from the last request that reached the cache, by the lifetime that
             // request asked the provider for; it's claimed only on a run whose own requests ask
-            // for one, as in today's loop.
+            // for one.
             cache_expired: v2::conditions::cache_proven_expired(
                 last_cache.as_ref().and_then(|send| send.requested_ttl_ms),
                 last_cache.as_ref().map(|send| send.sent_at_ms),
@@ -1258,7 +1256,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         },
         &read_back,
         // A view's inserted image isn't a medium the session captured, so the request shows
-        // its provenance marker in its place, as today's storage renders it; only its reference
+        // its provenance marker in its place; only its reference
         // is needed, checked as the view was when accepted.
         v2::host::image_reference,
         // The new loop never sizes a request before sending it: a byte count can't say what a
@@ -1341,8 +1339,8 @@ async fn release_unread<W: Writer>(
     Ok(())
 }
 
-/// Tells the compaction provider about entries written since its last notice, as today's loop
-/// does after each durable model step.
+/// Tells the compaction provider about entries written since its last notice. The run loop calls
+/// this after each durable model step.
 /// `signed_floor` is the session's signed floor ([`crate::run::signed_floor`]).
 pub async fn notice<W: Writer, P, T>(
     writer: &W,
@@ -1389,12 +1387,11 @@ pub async fn notice<W: Writer, P, T>(
     Ok(())
 }
 
-/// What a run tells its session's compaction provider about the session's changes outside its
-/// own steps: once the run's end is durable, once a tool batch's results are, and once a call a
-/// provider held has its result. Those are the points today's actor has today's loop tell it,
-/// through `RunControl::compaction_changes` (`compaction_v2::host::notice`). Like today's
-/// notice, it writes nothing, and one that can't be sent fails nothing: the provider hears of
-/// the same changes with the next notice.
+/// What a run tells its session's compaction provider about changes outside its own steps: once
+/// the run's end is durable, once a tool batch's results are, and once a call a provider held has
+/// its result. These changes are reported through `RunControl::compaction_changes`
+/// (`compaction_v2::host::notice`). This writes nothing, and failure to send it does not fail the
+/// run: the provider hears about the same changes with the next notice.
 pub struct Changes<'a> {
     admission: &'a Admission,
     ctx: Ctx,
@@ -1448,14 +1445,14 @@ impl<'a> Changes<'a> {
     }
 }
 
-/// What the loop gives today's compaction code as the next message's id. A new message's id is
+/// What the run loop gives the compaction code as the next message's id. A new message's id is
 /// minted from the seq its record takes, so before it's written there's none; the journal
 /// refuses a marker that would name it.
 pub const NEXT_MID: &str = "";
 
-/// The request-size history compaction's estimate reads, rebuilt from the fold's latest send
-/// facts the way today's `CompactionHistory` folds them: the newest step's usage, measured for
-/// the model that served it, and the request body lengths around it.
+/// The request-size history read by compaction's estimate is rebuilt from the fold's latest send
+/// facts: the newest step's usage, measured for the model that served it, and the request body
+/// lengths around it.
 pub fn history(estimate: &Estimate) -> CompactionHistory {
     let mut history = CompactionHistory {
         current_model: estimate.run_model.clone(),
@@ -1481,7 +1478,7 @@ pub fn history(estimate: &Estimate) -> CompactionHistory {
         .map(|route| &route.model)
         .or(estimate.step_model.as_ref());
     // One prompt measurement, not the sum of prompts sent to every model that served a
-    // server-side handoff, as today's history keeps it.
+    // server-side handoff.
     let native = requested.and_then(|requested| {
         broca_protocol::usage::model_usage(
             fallback

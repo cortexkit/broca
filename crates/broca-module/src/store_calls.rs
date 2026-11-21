@@ -1,21 +1,22 @@
-//! What `session.read` serves about each tool call of a message, for a session kept in the new
-//! storage: the call's key, the module it was dispatched to, and whether it may or may not have
-//! run (`indeterminate`). Today's read works these out from the WAL records after the step that
-//! made the calls (`broca_core::context::dispatches_of_turns`); the store decides them once:
+//! What `session.read` serves about each tool call of a message in a session kept in the
+//! session store: the call's key, the module it was dispatched to, and whether it may or may
+//! not have run (`indeterminate`). The store determines these facts once:
 //!
-//! - **A placed turn:** the facts its writer recorded in the batch that placed the turn's results
-//!   (`TurnFacts`). Every call of a placed turn has its result, so none is indeterminate.
-//! - **The open turn:** the assistant message whose calls are still running is served from the
-//!   operational fold's open batch: a call with a dispatch intent and no result is indeterminate,
-//!   whether or not a provider holds it, as today's rule reads (an intent and no result). Its
-//!   module is the one its intent recorded, found through the session's id lookup.
+//! - **A placed turn:** the facts its writer recorded in the batch that placed the turn's
+//!   results (`TurnFacts`). Every call of a placed turn has its result, so none is
+//!   indeterminate.
+//! - **The open turn:** the assistant message whose calls are still running is served from
+//!   the operational fold's open batch: a call with a dispatch intent and no result is
+//!   indeterminate, whether or not a provider holds it, because an intent and no result mean
+//!   it may have run. Its module is the one its intent recorded, found through the session's
+//!   id lookup.
 //! - **A turn no recorded step produced:** an imported turn's facts name keys another runner
-//!   minted (`CallFacts::carrier`), so each call retains its original key and carrier, without
-//!   inventing a broca dispatch.
+//!   minted (`CallFacts::carrier`), so each call retains its original key and carrier,
+//!   without inventing a broca dispatch.
 //!
-//! A call without an intent never left: it isn't indeterminate and has no module. Answered (denied,
-//! invalid, synthetic, or refused with its batch), it has the key its outcome recorded, as
-//! today's read keys it by the record that answered it.
+//! A call without an intent never left: it isn't indeterminate and has no module. An
+//! answered call (denied, invalid, synthetic, or refused with its batch) has the key its
+//! outcome recorded.
 //! A tool result delivered as a send's carrier names the carrier call's key (`delivered_as`).
 
 use broca_protocol::content::ContentBlock;
@@ -64,8 +65,8 @@ fn call_ids(message: &broca_protocol::Message) -> Vec<&str> {
         .collect()
 }
 
-/// The facts of a placed turn's call `id`, served as today's read serves them. The first facts
-/// naming the id are the call's.
+/// The facts of a placed turn's call `id`, served by `session.read`. The first facts naming
+/// the id are the call's.
 fn placed_call(turn: Option<&TurnFacts>, id: &str) -> SessionReadToolCall {
     served_call(
         turn.and_then(|turn| turn.calls.iter().find(|call| call.tool_call_id.0 == id)),
@@ -73,9 +74,8 @@ fn placed_call(turn: Option<&TurnFacts>, id: &str) -> SessionReadToolCall {
     )
 }
 
-/// The facts of the call at `index` among a placed turn's calls `ids`, served as today's read
-/// serves them: each copy of a repeated call id by its own facts, as today's read keys each copy
-/// (`crate::store_read::facts_by_call`).
+/// The facts of the call at `index` among a placed turn's calls `ids`: each copy of a
+/// repeated call id is represented by its own facts, using `crate::store_read::facts_by_call`.
 fn placed_turn_call(turn: Option<&TurnFacts>, ids: &[String], index: usize) -> SessionReadToolCall {
     let names: Vec<&str> = ids.iter().map(String::as_str).collect();
     let call = turn.and_then(|turn| crate::store_read::facts_by_call(&names, turn)[index]);
@@ -155,7 +155,7 @@ async fn open_call<B: SessionBackend>(
 }
 
 /// Fills each message's `tool_calls`, and the carrier call's key of a tool result delivered as a
-/// send, as today's read does. `turns` says, per message in order, what its calls are served
+/// send. `turns` says, per message in order, what its calls are served
 /// from ([`crate::store_read::StorePage::turns`]).
 pub async fn attribute_tool_calls<B: SessionBackend>(
     session: &Session<B>,

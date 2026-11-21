@@ -1,20 +1,17 @@
-//! Which storage owns a session: today's (a WAL) or the session store
-//! (`broca-session-store`), and where each storage places a new session.
+//! How sessions are placed and how the session store claims ownership.
 //!
-//! Both storages split their sessions into three backup classes ([`StorageClass`]), chosen once
-//! when a session is created by one rule ([`placement`]). Today's storage keeps them in `wal/`,
-//! `wal-durable/` and `wal-ephemeral/`; the session store in three complete stores,
+//! The session store places each new session in one of three backup classes ([`StorageClass`]),
+//! chosen once at creation by [`placement`]. It stores them in three complete stores,
 //! [`SESSION_STORAGE_DIR`], [`SESSION_STORAGE_DURABLE_DIR`] and
 //! [`SESSION_STORAGE_EPHEMERAL_DIR`]. Only the durable ones are backed up.
 //!
 //! The session store owns a session once its head exists in one of its roots
-//! ([`session_storage_class`]). A move of a live session from today's storage into the new one
-//! writes a journal naming the session ([`session_storage_move_journal`]) before it touches
-//! anything else, and deletes it last, so while a move is in flight the journal names the session
-//! too. Readers of today's storage that don't go through `FileWalStore::check_move` ask
-//! [`owned_by_store`] and skip or refuse a session it claims: otherwise they could expire a
-//! WAL, copy its records into the run index, or rewrite it while a move is copying it, or after
-//! the session store has already taken the session over.
+//! ([`session_storage_class`]). A move into the session store writes a journal naming the
+//! session ([`session_storage_move_journal`]) before touching anything else and deletes it last,
+//! so while a move is in flight the journal names the session too. A reader that does not
+//! otherwise check move ownership must ask [`owned_by_store`] and skip or refuse a session
+//! it claims; otherwise it could expire a session, copy its records into the run index, or
+//! rewrite it during the move or after the session store has taken ownership.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -275,7 +272,7 @@ pub struct FrozenPrefix {
 /// Who owns the session at an address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreOwnership {
-    /// Today's storage: no head and no move journal.
+    /// No session head or move journal.
     Today,
     /// The session store: the session's head exists.
     Held,
@@ -286,7 +283,7 @@ pub enum StoreOwnership {
 
 /// Who owns the session at `address` under `state_root`. Only a file found absent counts as
 /// absent: any other failure to check, or a journal that can't be read, is an error, so an
-/// unreadable folder never reads as today's.
+/// unreadable folder is never treated as unowned.
 pub fn store_ownership(state_root: &Path, address: &str) -> io::Result<StoreOwnership> {
     if session_storage_class(state_root, address)?.is_some() {
         return Ok(StoreOwnership::Held);
@@ -312,8 +309,8 @@ pub fn store_ownership(state_root: &Path, address: &str) -> io::Result<StoreOwne
 }
 
 /// Whether the session store owns the session at `address`, or a move into it is in
-/// flight: its head exists in one of its roots, or a move journal names it. A reader of today's
-/// storage that sees `true` skips the session or refuses it. Errors as [`store_ownership`].
+/// flight: its head exists in one of its roots, or a move journal names it. Readers must skip
+/// or refuse the session when this returns `true`. Errors as [`store_ownership`].
 pub fn owned_by_store(state_root: &Path, address: &str) -> io::Result<bool> {
     if session_storage_class(state_root, address)?.is_some() {
         return Ok(true);
@@ -375,7 +372,7 @@ mod tests {
                 move_id: "store-move:1".into()
             }
         );
-        // Another address stays today's.
+        // Another address is not claimed by the session store.
         assert!(!owned_by_store(&root, "00000000000000bb").unwrap());
 
         let head = session_storage_head(&root, StorageClass::Ordinary, address);
@@ -463,8 +460,8 @@ mod tests {
         assert_eq!(placement(true, true), StorageClass::Ephemeral);
     }
 
-    /// A journal written before the session store had classes names no class; its session moves
-    /// into the durable root, which the single folder it was written for became.
+    /// A journal from before the session store had storage classes names no class. Its session
+    /// moves into the durable root, which replaced the single folder of that layout.
     #[test]
     fn a_journal_without_a_class_moves_into_the_durable_root() {
         let mut old = serde_json::to_value(journal("store-move:1")).unwrap();

@@ -267,7 +267,7 @@ pub struct SpendSegment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_outcome: Option<broca_wal::record::BillingAttemptOutcome>,
     /// `true` when the run's usage is also exported one fact per model attempt
-    /// ([`crate::attempt_facts::AttemptFact`]), each share of which names its segment. A reader
+    /// ([`attempt::AttemptFact`]), each share of which names its segment. A reader
     /// prices the attempts and records a segment marked this way without pricing it, so no usage
     /// is counted twice. Absent on a run without attempt facts, whose segments price as before;
     /// a reader must not infer the rule from finding attempts, which it may read before or after

@@ -313,7 +313,7 @@ impl LateResultsIntake {
         *self.session_store.lock().expect("session store") = Some(runtime);
     }
 
-    /// Mark the store as being rebuilt (or done). See [`Self::rebuild_from_wals`].
+    /// Mark the store as being rebuilt (or done).
     pub fn set_rebuilding(&self, rebuilding: bool) {
         self.rebuilding
             .store(rebuilding, std::sync::atomic::Ordering::SeqCst);

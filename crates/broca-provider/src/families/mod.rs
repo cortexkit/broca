@@ -678,7 +678,7 @@ pub fn resolve_frozen(
 pub const ANTHROPIC_RENDERER_VERSION: u32 = 3;
 
 /// The Anthropic render ABI version a config with this opt-in freezes: v3 once the config asks
-/// for server-side fallback, v2 (today's version) otherwise.
+/// for server-side fallback, v2 (the current version) otherwise.
 ///
 /// The flag is the only way a v3 config differs from a v2 one, so recording v3 for a config
 /// without it would make a later rollback refuse to resume runs whose bytes are unchanged.

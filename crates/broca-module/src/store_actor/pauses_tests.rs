@@ -101,7 +101,7 @@ async fn run_story(session: &Session<&'static MemoryBackend>) -> Vec<String> {
 
 /// An interrupt queued behind a run paused for sign-in, by a process that stopped before the
 /// paused run ended: the session's next open ends the paused run `cancelled` and runs the
-/// interrupt, as today's drain does.
+/// interrupt.
 #[tokio::test]
 async fn an_interrupt_left_behind_a_paused_run_ends_it_on_the_next_open() {
     let parts = SharedParts::new(Box::new(MemoryParts::default()));
@@ -157,7 +157,7 @@ async fn an_interrupt_left_behind_a_paused_run_ends_it_on_the_next_open() {
 }
 
 /// A send arriving while a send that starts a run still waits in an idle session's queue is
-/// queued behind it and answered `pending`, as today's actor answers it. Here the waiting send
+/// queued behind it and answered `pending`. Here the waiting send
 /// can't be read back to start its run, so both stay queued.
 #[tokio::test]
 async fn a_send_behind_sends_queued_on_an_idle_session_is_queued() {

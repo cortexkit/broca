@@ -217,7 +217,7 @@ pub(super) async fn pause<W: Writer, P, T>(
     let mut pause = Some(Record::Pause(Pause {
         run_id: run_id.into(),
         reason,
-        // An account-limit pause is dated by when it decided to pause, as today's is.
+        // An account-limit pause is dated by when it decided to pause.
         ts_ms: Some(
             account_limit
                 .as_ref()

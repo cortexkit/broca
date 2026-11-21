@@ -100,7 +100,7 @@ const MAX_PENDING_REQUESTS: usize = 4096;
 /// stalls while still bounding memory when a consumer stops polling altogether.
 const SUBSCRIBE_STREAM_BUFFER: usize = 4096;
 /// The standard per-frame response deadline for request/response calls. Public so callers
-/// of the deadline-parameterized [`SubcConnection::route_unary`] can pass the default.
+/// of the deadline-parameterized [`SubcConnection::route_unary_bytes`] can pass the default.
 ///
 /// This is a liveness budget for fast local control RPCs, not a provider work budget.
 /// Credential refresh can perform an upstream exchange and uses an explicit longer wait.

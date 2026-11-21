@@ -8,10 +8,10 @@
 //!
 //! The module starts without waiting for the key. Until the key loads, an encrypted session kept
 //! in the session store is refused `key_unavailable`, a transient refusal, while plain sessions
-//! kept there and today's sessions are served as before. The read is retried with backoff until
-//! it succeeds, and the key is then installed with no restart. The key never reaches disk or a
-//! log: only its id is logged or reported, and the vault's reply is never echoed, since a reply
-//! that fails to decode can carry its value.
+//! in the session store are served. The read is retried with backoff until it succeeds, and the
+//! key is then installed with no restart. The key never reaches disk or a log: only its id is
+//! logged or reported, and the vault's reply is never echoed, since a reply that fails to decode
+//! can carry its value.
 
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;

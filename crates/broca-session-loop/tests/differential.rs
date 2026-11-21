@@ -2786,7 +2786,7 @@ async fn new_source(
     };
     let mut parts = MemoryParts::default();
     // The records the session already held, so the appended ones' message ids number on from
-    // theirs, as in today's whole log.
+    // theirs.
     let mut held = Vec::new();
     let resuming = match start {
         Some(cut) if reopened => {
@@ -8793,7 +8793,7 @@ async fn a_paused_run_on_a_changed_render_config_ends_on_resume() {
 }
 
 /// At every cut of a held call, a resume on a changed render config ends the run without
-/// sending anything: an open batch closes with what its calls hold, as today's does.
+/// sending anything: an open batch closes with what its calls hold.
 #[tokio::test]
 async fn every_cut_of_a_held_call_on_a_changed_render_config_ends_alike() {
     compare_drifted(compare_every_cut(Scenario {
@@ -10596,7 +10596,7 @@ async fn a_converted_session_with_a_joined_ride_enrolls_and_keeps_its_bytes() {
         // wrote it and the converter converted it.
         let converted = converted_fixture("joined-ride");
 
-        // The converted session joins delivered text into results, as today's storage did.
+        // The converted session joins delivered text into results.
         let backend = MemoryBackend::default();
         let mut session = Session::create(
             &backend,

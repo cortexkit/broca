@@ -309,10 +309,9 @@ pub trait LineageOpener: Send + Sync {
     fn step_events(&self) -> Option<Arc<crate::step_events::StepEvents>> {
         None
     }
-    /// The runtime when the session store keeps the session `key`, which then has no WAL; `None`
-    /// for a session on today's storage, or an opener without the session store. A session the new
-    /// storage keeps is refused `key_unavailable` while its deployment key hasn't loaded, never
-    /// read as one of today's. A head that can't be checked is an error, never `None`.
+    /// The runtime holding session `key`, if the session store keeps it; `None` when no runtime
+    /// holds it. A session held by the session store is refused `key_unavailable` while its
+    /// deployment key hasn't loaded. A head that can't be checked is an error, never `None`.
     fn store_holding(
         &self,
         _key: &LineageKey,
@@ -533,8 +532,7 @@ pub(crate) enum StoreCreation {
     /// durable whatever its label.
     Import,
     /// A send labelled [`HEAD_SESSION_CLASS`], placed as a send is. A head starts only in the
-    /// new storage: one the session store can't create now is refused, never started on today's
-    /// storage.
+    /// session store; if it can't be created there, it is refused.
     Head,
 }
 
@@ -2436,9 +2434,9 @@ impl LineageRegistry {
         }
     }
 
-    /// The session store's runtime when it keeps the session `key`, which then has no WAL; `None`
-    /// for a session on today's storage, or a module without the session store. A session it keeps
-    /// is refused `key_unavailable` while the deployment key hasn't loaded.
+    /// The session store's runtime when it keeps the session `key`; `None` when this module has
+    /// no session store runtime for it. A session it keeps is refused `key_unavailable` while
+    /// the deployment key hasn't loaded.
     pub(crate) fn store_holding(
         &self,
         key: &LineageKey,

@@ -1,19 +1,19 @@
-//! `session.warm` on a session kept in the session store: re-send the session's next model request
-//! shaped to generate nothing, keeping the provider's cached prefix alive, by today's rules.
+//! `session.warm` on a session in the session store: re-send the session's next model request
+//! shaped to generate nothing, keeping the provider's cached prefix alive.
 //!
 //! Every refusal is decided from what the actor holds before anything is sent, in this order: a
-//! lineage named, a running or paused run, no model step
-//! yet, an exhausted account, a cache the session's frozen config can't warm, and a cache whose
-//! estimated lifetime is spent. The cache's clock is the session's own: the operations fold's
-//! last request that reached the cache (`last_cache_send`), a warm included.
+//! lineage named, a running or paused run, no model step yet, an exhausted account, a cache the
+//! session's frozen config can't warm, and a cache whose estimated lifetime is spent. The
+//! cache's clock is the session's own: the operations fold's last request that reached the
+//! cache (`last_cache_send`), a warm included.
 //!
 //! The request warmed is the one the run loop would send for the latest run's next step, built
-//! from the session's state without any provider (`broca_session_loop::run::offline_request`), as
-//! the converter's render check builds a stored step's request. Its prefix is the prefix the
+//! from the session's state without any provider (`broca_session_loop::run::offline_request`).
+//! Its prefix is the prefix the
 //! session's last request cached. The actor renders it with the frozen config's wire family to
 //! learn its digest; the executor renders it again with the provider it builds and sends it
-//! only when the bytes match, as it checks a request rebuilt from today's log. A request
-//! holding media is refused by name: rendering media from the session's own objects isn't built.
+//! only when the bytes match. A request holding media is refused by name: rendering media from
+//! the session's own objects isn't built.
 
 use std::sync::Arc;
 
@@ -110,8 +110,8 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
         });
     }
 
-    /// Decides every refusal, in today's order, and builds the request to warm. Nothing is sent
-    /// or written here.
+    /// Decides every refusal, in order, and builds the request to warm. Nothing is sent or
+    /// written here.
     async fn prepare_warm(
         &mut self,
         lineage_id: Option<String>,
@@ -124,14 +124,13 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             )))
         };
         let now_ms = (self.now_ms)();
-        // A session in the session store has no write-ahead log, so it has no lineage: a warm
-        // naming one names a history this session isn't, as today's actor refuses a warm naming
-        // a lineage its log doesn't have.
+        // Lineage ids belonged to the old log format, so a session in the session store has
+        // none: a warm naming one names a history this session isn't.
         if let Some(requested) = lineage_id {
             return refuse(Refusal::LineageChanged { requested });
         }
-        // Today's actor warms a running run's in-flight request with the exact bytes its
-        // transport sent, which a run in the session store doesn't hand the actor yet.
+        // A running run's in-flight request could be warmed only with the exact bytes its
+        // transport sent, which a run doesn't hand the actor yet.
         if self.run.is_some() {
             return Err(Box::new(WarmOutcome::Error(unserved(
                 "a warm while a run is running",
@@ -309,8 +308,8 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
     }
 
     /// The warm's task ended: record a warm the provider answered, durable before its caller
-    /// hears of it, and answer the caller as today's actor does. The record moves the session's
-    /// cache clock: the operations fold dates the cache from it.
+    /// hears of it, and answer the caller. The record moves the session's cache clock: the
+    /// operations fold dates the cache from it.
     pub(super) async fn finish_warm(
         &mut self,
         result: Result<Result<broca_core::WarmSent, WarmError>, tokio::task::JoinError>,
@@ -423,7 +422,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 ratelimit_headers: ((!headers.is_empty())
                     .then(|| serde_json::to_value(&headers).expect("headers serialize")))
                 .map(Into::into),
-                // A warm answered without a billing envelope reached the cache, by today's rule
+                // A warm answered without a billing envelope reached the cache
                 // (`warm_reached_the_cache`).
                 reached_cache: Some(true),
                 requested_cache_ttl_ms: pending.requested_ttl_ms,
@@ -463,7 +462,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
 }
 
 /// The config `run` runs under: the one its start `start` froze, with the refreezes it recorded
-/// since applied, as today's `latest_episode_config` reads an episode's config from its log.
+/// since then applied.
 pub(crate) fn run_config(
     run: &broca_session_store::fold::operations::Run,
     start: &broca_session_store::record::RunStart,
@@ -484,9 +483,9 @@ pub(crate) fn run_config(
 }
 
 /// When the latest run ended or paused on an exhausted provider account whose reset is still in
-/// the future, that reset time, as today's `cache_warm::account_wall` reads the session's latest
-/// outcome. A later run starts with no error. Today a warm that reached the cache also clears it,
-/// but no warm is sent while it stands, so only a reset that has passed lifts it.
+/// the future, return that reset time. A later run starts with no error. A warm that reached
+/// the cache also clears it, but no warm is sent while it stands, so only a reset that has
+/// passed lifts it.
 fn account_wall(run: &broca_session_store::fold::operations::Run, now_ms: u64) -> Option<u64> {
     let error: broca_protocol::ProviderError =
         serde_json::from_value(run.end_error.clone()?).ok()?;

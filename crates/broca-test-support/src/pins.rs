@@ -95,7 +95,7 @@ fn render(entries: &[(String, String)]) -> String {
 }
 
 /// Checks `value` against this test's next pinned entry, labelled `label`. `crate_dir` is the
-/// calling crate's `CARGO_MANIFEST_DIR`; [`crate::expect_pinned`] passes it.
+/// calling crate's `CARGO_MANIFEST_DIR`; [`crate::pin!`] passes it.
 pub fn expect(crate_dir: &str, label: &str, value: &dyn Debug) {
     let name = test_name();
     let full = format!("{value:#?}");

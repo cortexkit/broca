@@ -134,7 +134,7 @@ pub fn service_tier_enabled() -> bool {
     SERVICE_TIER_ENABLED.get().copied().unwrap_or(false)
 }
 
-/// Recover the abstract applied level from the recorded request bytes, never today's catalog.
+/// Recover the abstract applied level from the recorded request bytes, not the current catalog.
 pub fn frozen_service_tier(render: &serde_json::Value) -> &'static str {
     match render
         .get("service_tier")

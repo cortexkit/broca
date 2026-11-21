@@ -1,27 +1,25 @@
 //! `session.head` for a session kept in the session store.
 //!
-//! The head is read from the session's head, its folds and the setup parts its run starts name,
-//! through a read-only load (`StoreRuntime::view`): no lease, no actor and no WAL. The reply
-//! equals the one today's head builds from a WAL for the same history, apart from what each
-//! storage keeps for itself: there is no WAL lineage; the incarnation and the history version
-//! are the store's; and there is no subscribe cursor until subscriptions are served from the
-//! store.
+//! The head is read from the session's head, its folds and the setup parts its run starts
+//! name, through a read-only load (`StoreRuntime::view`): no lease and no actor. The reply
+//! uses the store's incarnation and history version; it has no subscribe cursor until
+//! subscriptions are served from the store.
 //!
 //! Where each member comes from:
-//! - the model: the latest run start's model and variant, unless the session's plan chooses one
-//!   (`broca_session_loop::plan::selection`): the latest refresh that chooses one, else the
-//!   first run's plan;
-//! - the sender: today's rule ([`broca_core::head::head_sender`]) over the owner summary the
-//!   run starts folded and the senders the session admits (`broca_session_loop::plan::senders`):
-//!   the latest accepted refresh's, else the first run's plan's;
+//! - the model: the latest run start's model and variant, unless the session's plan chooses
+//!   one (`broca_session_loop::plan::selection`): the latest refresh that chooses one, else
+//!   the first run's plan;
+//! - the sender: the rule [`broca_core::head::head_sender`] applies over the owner summary
+//!   the run starts folded and the senders the session admits
+//!   (`broca_session_loop::plan::senders`): the latest accepted refresh's, else the first
+//!   run's plan's;
 //! - the usage: the session's usage by model, which the operational fold sums step by step;
 //! - the title: the newest title any send carried, which the operational fold keeps;
 //! - the latest run's state: as `session.read` reports it, except that a run still running
-//!   when no live actor holds the session reads as interrupted. The store actor owns a session
-//!   for as long as a run runs, so such a run was left by a process that stopped without
-//!   ending it, and opening the session ends it interrupted;
-//! - the input profile: as today's head decides it, from the latest run's frozen render config
-//!   or the catalog;
+//!   when no live actor holds the session reads as interrupted. The store actor owns a
+//!   session for as long as a run runs, so such a run was left by a process that stopped
+//!   without ending it, and opening the session ends it interrupted;
+//! - the input profile: from the latest run's frozen render config or the catalog;
 //! - `updated_at`: the newest time a record of the open log carries.
 
 use broca_core::{SessionReadLineageState, SessionReadReason, SessionReadStateKind};
@@ -49,7 +47,7 @@ pub enum InputSource {
 }
 
 /// The input source of a session whose latest run is in `last_run_state` (`None` without a
-/// run), by today's rule: an ended run quotes the catalog, any other reads what the run froze.
+/// run), by this rule: an ended run quotes the catalog, any other reads what the run froze.
 /// `frozen_media` is read only when the rule needs it.
 pub fn input_source<E>(
     last_run_state: Option<&str>,
@@ -144,9 +142,8 @@ pub struct HeadFacts {
     pub usage: Option<SessionUsage>,
     /// The newest title a send carried.
     pub title: Option<String>,
-    /// Whether the session is on the current compaction contract: for today's storage, whether
-    /// its first run froze a compaction plan version; for the session store, whether its latest
-    /// run did (`Operations::on_contract`).
+    /// Whether the session is on the current compaction contract: whether its latest run froze
+    /// a compaction plan version (`Operations::on_contract`).
     pub mode3: bool,
     /// When the session last changed.
     pub updated_at: Option<u64>,
@@ -155,9 +152,9 @@ pub struct HeadFacts {
     pub resume_not_before_ms: Option<u64>,
 }
 
-/// The `session.head` reply `facts` give, as today's head assembles it, without what each
-/// storage or the serving module adds: the incarnation and history version, the subscribe
-/// cursor, the input profile, the cache clock and the caller's sender grants.
+/// The `session.head` reply `facts` supply the head data assembled here; the store and serving
+/// module add the incarnation and history version, the subscribe cursor, the input profile,
+/// the cache clock and the caller's sender grants.
 pub fn head_reply(facts: HeadFacts) -> broca_wire::HeadResponse {
     let HeadFacts {
         lineage_state: state,
@@ -395,7 +392,7 @@ pub(crate) async fn serve_head(
     let built = match store.read(registry, key, StoreReadRequest::Head).await? {
         Some(StoreReadReply::Head(built)) => built?,
         Some(_) => return Err(crate::store_reads::mismatched()),
-        // The session's creation never committed, so it holds nothing: today's answer for a
+        // The session's creation never committed, so it holds nothing: this is the answer for a
         // session never written.
         None => return Ok(broca_wire::HeadResponse::default()),
     };
@@ -452,8 +449,8 @@ fn frozen_manifest(
         .map_err(|error| StoreHeadError::Setup(format!("run {}: {error:?}", start.run_id)))
 }
 
-/// The model a run start ran, with the variant its send named, as today's head reads it from
-/// the run's config: an empty variant is none.
+/// The model a run start ran, with the variant its send named, read from the run's config: an
+/// empty variant is none.
 fn run_model(start: &RunStart) -> HeadModel {
     let mut model = HeadModel::new(&start.model.provider_module_id, &start.model.model_id);
     model.variant = start
@@ -522,8 +519,8 @@ async fn recorded_interrupt_reason<B: SessionBackend>(
         .find_id(IdKind::RunId, run_id)
         .await
         .map_err(StoreHeadError::Session)?;
-    // Today's head takes the reason of the run's last interrupted end, even when that end
-    // recorded none.
+    // The head takes the reason of the run's last interrupted end, even when that end recorded
+    // none.
     Ok(records
         .into_iter()
         .rev()

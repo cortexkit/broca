@@ -96,7 +96,7 @@ pub enum RepetitionCheckpointTaken {
     /// An assistant's calls among the steps still wait for their results. A checkpoint keeps no
     /// call text to pair them with, so none can be taken there.
     CallsWaiting,
-    /// The seed doesn't read as a checkpoint under today's warning rules.
+    /// The seed doesn't read as a checkpoint under the current warning rules.
     SeedRejected,
 }
 
