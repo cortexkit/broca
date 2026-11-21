@@ -362,25 +362,39 @@ impl Rig {
             .expect("real health.check includes metrics")
     }
 
+    /// Binds the test session. A replacement broca answers health before it is ready, and until
+    /// it is the daemon refuses routes to it with `module_warming`, so that refusal is waited
+    /// out. Any other refusal fails the test with the rig's logs.
     async fn client(&self) -> broca_module_serve::SessionClient {
-        broca_module_serve::SessionClient::bind(
-            broca_subc::SubcConnection::connect(&self.connection_file)
-                .await
-                .unwrap(),
-            "broca",
-            broca_protocol::BindIdentity::new(self.dir.join("project"), "runner", "restart-run"),
-        )
-        .await
-        .unwrap_or_else(|error| {
-            eprintln!(
-                "{}",
-                super::session_client::rig_log_diagnostics(
-                    &self.dir.join("runtime/data-home/cortexkit"),
-                    &self.dir.join("runtime/broca-state"),
-                )
-            );
-            panic!("bind broca: {error:?}");
+        broca_test_support::wait_until("broca ready to bind the test session", || async {
+            let bound = broca_module_serve::SessionClient::bind(
+                broca_subc::SubcConnection::connect(&self.connection_file)
+                    .await
+                    .unwrap(),
+                "broca",
+                broca_protocol::BindIdentity::new(
+                    self.dir.join("project"),
+                    "runner",
+                    "restart-run",
+                ),
+            )
+            .await;
+            match bound {
+                Ok(client) => Ok(client),
+                Err(error) if error.code() == Some("module_warming") => Err(error.to_string()),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        super::session_client::rig_log_diagnostics(
+                            &self.dir.join("runtime/data-home/cortexkit"),
+                            &self.dir.join("runtime/broca-state"),
+                        )
+                    );
+                    panic!("bind broca: {error:?}");
+                }
+            }
         })
+        .await
     }
 
     async fn wait_for_tool(&self) {
@@ -400,12 +414,13 @@ impl Rig {
             .await;
     }
 
-    /// Wait up to `budget` for a routable replacement of `launch`. A restart drain may run
+    /// Wait up to `budget` for a replacement of `launch` that answers health. It may not be ready
+    /// to serve routes yet; [`Self::client`] waits for that. A restart drain may run
     /// until its ceiling, so a test that reads the drain verdict afterwards passes a budget past
     /// that ceiling: a drain held to its ceiling then fails on `drained=false`, which names the
     /// cause, instead of on a replacement wait that ran out first.
     async fn wait_for_replacement_within(&self, launch: &Value, budget: Duration) {
-        let description = format!("routable replacement of broca launch {launch}");
+        let description = format!("replacement of broca launch {launch}");
         self.observe_wait(format!("waiting for {description}; no health reply yet"));
         let replaced = tokio::time::timeout(budget, async {
             loop {
