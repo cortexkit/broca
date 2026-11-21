@@ -1,6 +1,5 @@
+use super::tests::{head_path, stored};
 use super::*;
-use broca_core::WalStore;
-use broca_protocol::ModelHandle;
 use rusqlite::Connection;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -28,21 +27,16 @@ fn fixture(tag: &str) -> (std::path::PathBuf, Arc<SqliteStore>) {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::SeqCst)
     ));
-    std::fs::create_dir_all(root.join("wal")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
     let store = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
-    // Seed SQLite ref rows for empty legacy WALs. This exercises census queue
-    // and coverage updates under SQLite write locks without payload decoding.
-    for i in 0..512 {
-        let session = BindIdentity::new("/project/legacy", "broca", format!("legacy-{i}"));
+    // Seed stored sessions the index already names. This exercises census queue and coverage
+    // updates under SQLite write locks without recording a candidate.
+    for i in 0..256 {
+        let session = BindIdentity::new("/project/indexed", "broca", format!("indexed-{i}"));
         store
             .record_session(&session_addr(&session), &session)
             .unwrap();
-        std::fs::write(
-            root.join("wal")
-                .join(format!("{}.wal", session_addr(&session))),
-            [],
-        )
-        .unwrap();
+        stored(&root, &session);
     }
     backfill(&store.conn.lock().unwrap()).unwrap();
     (root, store)
@@ -72,18 +66,7 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
         store: store.clone(),
         failures: AtomicUsize::new(0),
     });
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
-    wal.set_session_ref_index(index.clone());
     let session = BindIdentity::new("/project/new", "broca", "waiting-ref");
-    let mut writer = wal.open(&session).unwrap();
-    let record = crate::conformance::run_started(
-        1,
-        "waiting-run",
-        &session,
-        "hello",
-        ModelHandle::new("stub", "model"),
-    )
-    .record;
     let (census_started_tx, census_started_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let census_root = root.clone();
@@ -95,18 +78,15 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
                 receive(&resume_rx, "resume census");
             }))
         });
-        census::run(
-            &mut conn,
-            &broca_core::ReadOnlyWalReader::new(census_root),
-            None,
-            true,
-        )
-        .unwrap()
+        census::run(&mut conn, &StoredSessions::new(&census_root), None, true).unwrap()
     });
     receive(&census_started_rx, "active census");
     let connection = store.conn.lock().unwrap();
     let (waiting_tx, waiting_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let admitted = session.clone();
+    let admission_root = root.clone();
+    let admission_index = index.clone();
     let admission = std::thread::spawn(move || {
         REF_WAIT_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
@@ -114,7 +94,17 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
                 receive(&release_rx, "release serving connection");
             }))
         });
-        writer.append(1, &record, true).unwrap();
+        let admission = broca_core::record_candidate(
+            Some(admission_index.as_ref()),
+            &admission_root,
+            &session_addr(&admitted),
+            &admitted,
+        )
+        .unwrap();
+        assert!(
+            admission.is_none(),
+            "the ref was recorded, so no gap is held"
+        );
     });
     receive(&waiting_rx, "ref writer waiting on serving connection");
     drop(connection);
@@ -127,13 +117,7 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
     assert!(first.complete);
     assert!(first.addresses > 0);
     let mut conn = census_connection(&root.join("run-index.db"));
-    let second = census::run(
-        &mut conn,
-        &broca_core::ReadOnlyWalReader::new(&root),
-        None,
-        true,
-    )
-    .unwrap();
+    let second = census::run(&mut conn, &StoredSessions::new(&root), None, true).unwrap();
     assert!(second.complete);
     assert_eq!(
         (
@@ -206,19 +190,10 @@ fn interrupted_candidate_batch_is_replayed_before_census_completion() {
     let (root, store) = fixture("inflight");
     let session = BindIdentity::new("/project/interrupted", "broca", "candidate");
     let address = session_addr(&session);
-    let record = crate::conformance::run_started(
-        1,
-        "inflight-run",
-        &session,
-        "hello",
-        ModelHandle::new("stub", "model"),
-    )
-    .record;
-    let bytes = broca_wal::framing::encode(1, 1, &record).unwrap();
-    let path = root.join("wal").join(format!("{address}.wal"));
-    let mut corrupt = b"damaged prefix before intact frame".to_vec();
-    corrupt.extend_from_slice(&bytes);
-    std::fs::write(&path, &corrupt).unwrap();
+    stored(&root, &session);
+    let path = head_path(&root, &session);
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"damaged head").unwrap();
     store.record_session(&address, &session).unwrap();
     let mut conn = census_connection(&root.join("run-index.db"));
     conn.execute(
@@ -231,16 +206,10 @@ fn interrupted_candidate_batch_is_replayed_before_census_completion() {
         [&address],
     )
     .unwrap();
-    let unreadable = census::run(
-        &mut conn,
-        &broca_core::ReadOnlyWalReader::new(&root),
-        None,
-        false,
-    )
-    .unwrap();
+    let unreadable = census::run(&mut conn, &StoredSessions::new(&root), None, false).unwrap();
     assert!(
         !unreadable.complete && unreadable.unreadable == 1,
-        "a partial candidate is not proof that its WAL was completely read"
+        "a partial candidate is not proof that its session was read"
     );
     assert!(
         !store
@@ -249,13 +218,7 @@ fn interrupted_candidate_batch_is_replayed_before_census_completion() {
             .complete
     );
     std::fs::write(&path, &bytes).unwrap();
-    let counts = census::run(
-        &mut conn,
-        &broca_core::ReadOnlyWalReader::new(&root),
-        None,
-        false,
-    )
-    .unwrap();
+    let counts = census::run(&mut conn, &StoredSessions::new(&root), None, false).unwrap();
     assert!(counts.complete);
     assert_eq!(counts.not_represented, 1);
     assert_eq!(

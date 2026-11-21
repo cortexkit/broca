@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use broca_catalog::live::{AuthMode, CachePolicy};
-use broca_core::{AllowAll, FileWalStore, OutputEvent, RunError, RunSummary, WalStore};
+use broca_core::{AllowAll, OutputEvent, RunError, RunSummary};
 use broca_module::executor::{RunExecutor, RunKind};
 use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::error::{ErrorClass, ProviderError};
@@ -1363,8 +1364,8 @@ struct MovedCredential {
 /// offered credential read from the vault and checked to belong to the offered account, and
 /// a provider built from the run's recorded render config, with the Claude Code persona, when
 /// the config has one, refrozen for the new account.
-struct AccountMoves<'a, W> {
-    executor: &'a LiveLoopExecutor<W>,
+struct AccountMoves<'a> {
+    executor: &'a LiveLoopExecutor,
     req: &'a broca_core::RunRequest,
     clock: Option<&'a broca_core::Clock>,
     /// The media renderer the run's provider was given, which the new provider needs too.
@@ -1380,9 +1381,9 @@ struct AccountMoves<'a, W> {
     sent: Option<Arc<std::sync::Mutex<SentCredentials>>>,
 }
 
-impl<'a, W: ExecutorWalStore + 'static> AccountMoves<'a, W> {
+impl<'a> AccountMoves<'a> {
     fn new(
-        executor: &'a LiveLoopExecutor<W>,
+        executor: &'a LiveLoopExecutor,
         req: &'a broca_core::RunRequest,
         clock: Option<&'a broca_core::Clock>,
         media: Option<Arc<broca_module::store_media::LazyRenderer>>,
@@ -1561,9 +1562,8 @@ impl<'a, W: ExecutorWalStore + 'static> AccountMoves<'a, W> {
 }
 
 #[async_trait]
-impl<W: ExecutorWalStore + 'static>
-    broca_session_loop::account_move::AccountContinue<Box<dyn broca_core::provider::Provider>>
-    for AccountMoves<'_, W>
+impl broca_session_loop::account_move::AccountContinue<Box<dyn broca_core::provider::Provider>>
+    for AccountMoves<'_>
 {
     async fn ask(
         &self,
@@ -2165,8 +2165,10 @@ struct EpisodeAccountPreference<'a> {
 /// Drives the real agentic loop for each run: resolves the provider from the catalog
 /// (or a base_url override), dispatches tools through the shared `SubcToolPlane`, and
 /// threads the admission ack so the coordinator admits a run only once it's durable.
-pub struct LiveLoopExecutor<W = FileWalStore> {
-    wal_store: Arc<W>,
+pub struct LiveLoopExecutor {
+    /// broca's state root. It keeps the random seed this installation derives its Claude Code
+    /// and ChatGPT device ids from, so subscription requests name the same device every run.
+    state_root: PathBuf,
     /// The SHARED tool plane (one consumer connection, per-session routes). Shared so
     /// every session's tool dispatch rides one outbound subc connection.
     plane: Arc<SubcToolPlane>,
@@ -2217,27 +2219,14 @@ pub struct LiveLoopExecutor<W = FileWalStore> {
     unreleased_forks: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
-/// The executor also needs the file store's bounded prompt reader and installation path.
-/// Bulk record reads stay on `WalStore` so decorators can observe redundant history reads;
-/// `file_store` is only for bounded prompt counting and the installation path.
-pub trait ExecutorWalStore: WalStore {
-    fn file_store(&self) -> &FileWalStore;
-}
-
-impl ExecutorWalStore for FileWalStore {
-    fn file_store(&self) -> &FileWalStore {
-        self
-    }
-}
-
-impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
+impl LiveLoopExecutor {
     pub fn new(
-        wal_store: Arc<W>,
+        state_root: impl Into<PathBuf>,
         plane: Arc<SubcToolPlane>,
         provider_base_url: Option<String>,
     ) -> Self {
         Self {
-            wal_store,
+            state_root: state_root.into(),
             plane,
             hooks: None,
             compaction_plane: None,
@@ -2824,11 +2813,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
                 let seed = match &self.claude_code_install_id {
                     Some(seed) => seed.clone(),
                     None => broca_module_serve::claude_code_identity::load_or_create_install_id(
-                        self.wal_store
-                            .file_store()
-                            .root()
-                            .parent()
-                            .unwrap_or(self.wal_store.file_store().root()),
+                        &self.state_root,
                     )
                     .map_err(|error| {
                         format!("ChatGPT installation identity unavailable: {error}")
@@ -4079,7 +4064,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
     }
 }
 
-impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
+impl LiveLoopExecutor {
     fn selection_family(
         &self,
         selection: &cortexkit_role_llm_runner::head_selection::PlanModel,
@@ -4139,7 +4124,7 @@ impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
 include!("fork_executor.rs");
 
 #[async_trait]
-impl<W: ExecutorWalStore + 'static> RunExecutor for LiveLoopExecutor<W> {
+impl RunExecutor for LiveLoopExecutor {
     fn joining_temperature(
         &self,
         model: &broca_protocol::request::ModelHandle,

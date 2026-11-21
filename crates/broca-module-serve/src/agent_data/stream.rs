@@ -26,6 +26,10 @@ impl Driver {
         op: Op,
     ) -> Result<Incoming, CutReadFailure> {
         let metadata = (page.stream_end, page.digest.clone());
+        // Without its sealed digest a cut can't be checked; the door may still be sealing it.
+        if metadata.1.is_empty() {
+            return Err(unavailable("the door sent no sealed digest for the cut").into());
+        }
         let mut hash = Sha256::new();
         let mut offset = 0u64;
         let mut position = 0u64;
@@ -34,6 +38,7 @@ impl Driver {
         let mut remaining = 0u64;
         let mut keep = false;
         let mut newest = moves::STREAM.to_vec();
+        let mut frame_ends = Vec::new();
         loop {
             if (page.stream_end, &page.digest) != (metadata.0, &metadata.1)
                 || page.from_offset != offset
@@ -41,10 +46,11 @@ impl Driver {
             {
                 return Err(unavailable("sealed store metadata or page range changed").into());
             }
-            hash.update(&page.bytes);
+            // The page is hashed as it is consumed, so the digest at each frame's end is known.
             let mut bytes = page.bytes.as_slice();
             if magic.len() < moves::STREAM.len() {
                 let take = (moves::STREAM.len() - magic.len()).min(bytes.len());
+                hash.update(&bytes[..take]);
                 magic.extend_from_slice(&bytes[..take]);
                 bytes = &bytes[take..];
                 position += take as u64;
@@ -60,6 +66,7 @@ impl Driver {
             while !bytes.is_empty() {
                 if remaining == 0 {
                     let take = (40 - header.len()).min(bytes.len());
+                    hash.update(&bytes[..take]);
                     header.extend_from_slice(&bytes[..take]);
                     bytes = &bytes[take..];
                     position += take as u64;
@@ -85,12 +92,19 @@ impl Driver {
                     header.clear();
                 }
                 let take = remaining.min(bytes.len() as u64) as usize;
+                hash.update(&bytes[..take]);
                 if keep {
                     newest.extend_from_slice(&bytes[..take]);
                 }
                 bytes = &bytes[take..];
                 remaining -= take as u64;
                 position += take as u64;
+                if remaining == 0 && take > 0 {
+                    frame_ends.push((
+                        position,
+                        broca_session_store::codec::hex(&hash.clone().finalize()),
+                    ));
+                }
             }
             offset = page.end_offset;
             if offset == metadata.0 {
@@ -98,19 +112,22 @@ impl Driver {
                     return Err(unavailable("sealed store stream ends inside an export").into());
                 }
                 if broca_session_store::codec::hex(&hash.finalize()) != metadata.1 {
-                    return Err(refusal(
-                        "digest_mismatch",
-                        "store stream differs from sealed digest",
-                        Value::Null,
-                    )
-                    .into());
+                    // A fact about the cut, not a fault here: `diverged` answers it unknown.
+                    return Err(CutReadFailure {
+                        refusal: refusal(
+                            "digest_mismatch",
+                            "store stream differs from sealed digest",
+                            Value::Null,
+                        ),
+                        unknown_cause: Some("sealed SHA mismatch"),
+                    });
                 }
                 moves::last_export(&newest).map_err(broca_module::move_files::store::failure)?;
                 return Ok(Incoming {
                     bytes: newest,
                     end: metadata.0,
                     digest: metadata.1,
-                    store: true,
+                    frame_ends,
                 });
             }
             page = self
@@ -178,7 +195,6 @@ mod tests {
                         Arc::new(NoRuns),
                     ),
                 )),
-                wal: Arc::new(FileWalStore::new("target/scratch/wal")),
                 index: Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),
                 door: door.clone(),
             },

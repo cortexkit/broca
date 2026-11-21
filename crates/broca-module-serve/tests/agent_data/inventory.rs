@@ -30,16 +30,15 @@ impl SessionDoor for ParkDoor {
 }
 
 async fn cancelled_agent_data_request(connection_close: bool) {
-    let mut rig = Rig::new("inventory-route-cancel", Arc::new(FakeDoor::default()));
+    let mut rig = Rig::new("inventory-route-cancel", Arc::new(FakeDoor::default())).await;
     let door = Arc::new(ParkDoor::default());
     rig.service = Arc::new(AgentDataService::new(
         rig.root.clone(),
         rig.registry.as_ref().clone(),
-        rig.wal.clone(),
         rig.index.clone(),
         door.clone(),
     ));
-    rig.seed(&rig.session("held"), "run", true);
+    rig.seed(&rig.session("held"), true).await;
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     wire.send(
         7,
@@ -64,8 +63,8 @@ async fn cancelled_agent_data_request(connection_close: bool) {
     tokio::time::timeout(Duration::from_secs(5), door.dropped.notified())
         .await
         .expect("closed route must drop the in-flight agent-data handler");
-    assert!(!rig.root.join("wal-staging").exists());
-    assert!(rig.wal.wal_path(&rig.session("held")).exists());
+    assert_nothing_staged(&rig);
+    assert!(!rig.stored(&rig.session("held")).is_empty());
 }
 
 #[tokio::test]
@@ -107,21 +106,26 @@ impl SessionDoor for ParkExportDoor {
 
 async fn export_survives_closed_route(connection_close: bool) {
     let door = Arc::new(ParkExportDoor::default());
-    let mut rig = Rig::new("inventory-export-goodbye", Arc::new(FakeDoor::default()));
+    let mut rig = Rig::new("inventory-export-goodbye", Arc::new(FakeDoor::default())).await;
     rig.service = Arc::new(AgentDataService::new(
         rig.root.clone(),
         rig.registry.as_ref().clone(),
-        rig.wal.clone(),
         rig.index.clone(),
         door.clone(),
     ));
     let session = rig.session("held");
-    rig.seed(&session, "run", true);
-    let expected = rig.bytes(&session);
+    rig.seed(&session, true).await;
+    let stream = rig
+        .root
+        .join("session-store-moves/streams")
+        .join(broca_core::session_addr(&session));
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     let params = rig.params(CUT, &[session]);
     wire.call("prepare", params.clone()).await.unwrap();
-    assert_eq!(door.covered.load(Ordering::SeqCst), 1);
+    // Prepare asks how much the door holds when it plans, and again just before it freezes.
+    assert_eq!(door.covered.load(Ordering::SeqCst), 2);
+    // Export sends the stream prepare cached: the door has covered none of it.
+    let expected = std::fs::read(stream).unwrap();
     wire.send(
         7,
         1,
@@ -181,9 +185,11 @@ struct ParkPrepareDoor {
 #[async_trait::async_trait]
 impl SessionDoor for ParkPrepareDoor {
     async fn durable_offset(&self, _: &str) -> Result<u64, SessionDoorError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.covering.notify_one();
-        self.resume.notified().await;
+        // Only the first question parks: prepare asks again before it freezes.
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.covering.notify_one();
+            self.resume.notified().await;
+        }
         self.covers.fetch_add(1, Ordering::SeqCst);
         self.completed.notify_one();
         Ok(0)
@@ -198,18 +204,16 @@ impl SessionDoor for ParkPrepareDoor {
 
 async fn prepare_survives_closed_route(connection_close: bool) {
     let door = Arc::new(ParkPrepareDoor::default());
-    let mut rig = Rig::new("inventory-prepare-close", Arc::new(FakeDoor::default()));
+    let mut rig = Rig::new("inventory-prepare-close", Arc::new(FakeDoor::default())).await;
     rig.service = Arc::new(AgentDataService::new(
         rig.root.clone(),
         rig.registry.as_ref().clone(),
-        rig.wal.clone(),
         rig.index.clone(),
         door.clone(),
     ));
     let session = rig.session("held");
-    rig.seed(&session, "run", true);
-    let path = rig.wal.wal_path(&session).with_extension("moving");
-    let end_offset = rig.bytes(&session).len() as u64;
+    rig.seed(&session, true).await;
+    let path = rig.fence(&session).with_extension("moving");
     let params = rig.params(CUT, &[session]);
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     wire.send(
@@ -223,10 +227,9 @@ async fn prepare_survives_closed_route(connection_close: bool) {
     tokio::time::timeout(Duration::from_secs(5), door.covering.notified())
         .await
         .expect("prepare must reach cover");
-    let frozen = std::fs::read(&path).expect("prepare must freeze the WAL before awaiting cover");
-    let freeze: broca_wal::migration::Freeze = serde_json::from_slice(&frozen).unwrap();
-    assert_eq!(freeze.cut_id, CUT);
-    assert_eq!(freeze.end_offset, end_offset);
+    // Prepare asks the door how much of the session's stream it already holds before it
+    // freezes the session, so nothing is frozen while the question is open.
+    assert!(!path.exists());
     assert_eq!(door.covers.load(Ordering::SeqCst), 0);
     if connection_close {
         use tokio::io::AsyncWriteExt;
@@ -251,7 +254,20 @@ async fn prepare_survives_closed_route(connection_close: bool) {
     tokio::time::timeout(Duration::from_secs(5), door.completed.notified())
         .await
         .expect("prepare must finish cover after its route closes");
-    assert_eq!(std::fs::read(&path).unwrap(), frozen);
+    broca_test_support::wait_until(
+        "prepare to freeze the session after its route closed",
+        || async {
+            if path.exists() {
+                Ok(())
+            } else {
+                Err("no freeze yet".to_owned())
+            }
+        },
+    )
+    .await;
+    let frozen = std::fs::read(&path).unwrap();
+    let freeze: broca_wal::migration::Freeze = serde_json::from_slice(&frozen).unwrap();
+    assert_eq!(freeze.cut_id, CUT);
     let mut retry = Wire::new(&rig, entorhinal(), true).await;
     let reply = tokio::time::timeout(
         Duration::from_secs(5),
@@ -272,8 +288,8 @@ async fn prepare_survives_closed_route(connection_close: bool) {
     assert_eq!(replay, reply);
     assert_eq!(std::fs::read(cut_path).unwrap(), completed);
     assert_eq!(std::fs::read(path).unwrap(), frozen);
-    assert_eq!(door.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(door.covers.load(Ordering::SeqCst), 1);
+    assert_eq!(door.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(door.covers.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -286,171 +302,23 @@ async fn connection_eof_does_not_drop_prepare_between_freeze_and_cover() {
     prepare_survives_closed_route(true).await;
 }
 
-#[tokio::test]
-async fn lagging_projection_never_reports_absent() {
-    let rig = Rig::new("projection-lag", Arc::new(FakeDoor::default()));
-    let session = rig.session("just-admitted");
-    // Model a downgraded writer: its run row reaches disk without the new
-    // admission hook. The trigger must make missing refs unknown until repaired.
-    let old_writer = FileWalStore::new(rig.root.join("wal"));
-    old_writer
-        .open(&session)
-        .unwrap()
-        .append(1, &started(&session, "legacy-run"), true)
-        .unwrap();
-    let conn = rusqlite::Connection::open(rig.root.join("run-index.db")).unwrap();
-    conn.execute(
-        "INSERT INTO run_index(run_id,session,state) VALUES(?1,?2,'active')",
-        rusqlite::params!["legacy-run", serde_json::to_string(&session).unwrap()],
-    )
-    .unwrap();
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    let params = rig.params(CUT, std::slice::from_ref(&session));
-    assert_eq!(
-        wire.call("diverged", params.clone()).await.unwrap()["refs"][0]["state"],
-        "unknown"
-    );
-    assert_eq!(
-        wire.call("busy", json!({"refs":params["refs"]}))
-            .await
-            .unwrap()["refs"][0]["state"],
-        "unknown"
-    );
-    let repaired = rig.reopen();
-    let mut wire = Wire::new(&repaired, entorhinal(), true).await;
-    assert_eq!(
-        wire.call("busy", json!({"refs":params["refs"]}))
-            .await
-            .unwrap()["refs"][0]["state"],
-        "busy"
-    );
-}
-
-#[tokio::test]
-async fn admission_is_discoverable_before_sync_and_acknowledgment() {
-    let rig = Rig::new("inventory-admission", Arc::new(FakeDoor::default()));
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    let session = rig.session("new-session");
-    let mut wal = rig.wal.open(&session).unwrap();
-    wal.append(1, &started(&session, "new-run"), false).unwrap();
-    let reference = rig.params(CUT, std::slice::from_ref(&session))["refs"][0]["ref"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(
-        rig.index
-            .session_refs(std::iter::once(reference.as_str()))
-            .unwrap()
-            .sessions
-            .len(),
-        1
-    );
-    drop(wal);
-    let reply = wire
-        .call("busy", json!({"refs":rig.params(CUT, &[session])["refs"]}))
-        .await
-        .unwrap();
-    assert_eq!(reply["refs"][0]["state"], "busy");
-    assert_eq!(reply["refs"][0]["reason_code"], "run_active");
-}
-
-#[tokio::test]
-async fn archived_ref_survives_fold_and_extraction_through_store() {
-    let rig = Rig::new("inventory-fold", Arc::new(FakeDoor::default()));
-    let session = rig.session("folded");
-    rig.seed(&session, "folded-run", true);
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    let archive_dir = rig.root.join("wal-archive");
-    std::fs::create_dir_all(&archive_dir).unwrap();
-    let mut archive = broca_wal::archive::ArchiveWriter::create(archive_dir.join("fold-1.ark"))
-        .unwrap()
-        .without_feature_floor();
-    archive
-        .append(&broca_core::session_addr(&session), &rig.bytes(&session))
-        .unwrap();
-    archive.seal().unwrap();
-    std::fs::remove_file(rig.wal.wal_path(&session)).unwrap();
-    let params = json!({"refs":rig.params(CUT, std::slice::from_ref(&session))["refs"]});
-    assert_eq!(
-        wire.call("busy", params.clone()).await.unwrap()["refs"][0]["state"],
-        "idle"
-    );
-    assert!(!rig.wal.wal_path(&session).exists());
-    drop(rig.wal.open(&session).unwrap());
-    assert_eq!(
-        wire.call("busy", params).await.unwrap()["refs"][0]["state"],
-        "idle"
-    );
-    assert!(rig.wal.wal_path(&session).exists());
-}
-
-#[tokio::test]
-async fn rekeyed_wal_does_not_claim_its_historical_triple() {
-    let rig = Rig::new("inventory-rekey", Arc::new(FakeDoor::default()));
-    let old = rig.session("old");
-    let new = rig.session("new");
-    rig.seed(&old, "historical-run", true);
-    std::fs::rename(rig.wal.wal_path(&old), rig.wal.wal_path(&new)).unwrap();
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    let reply = wire
-        .call("diverged", rig.params(CUT, &[old]))
-        .await
-        .unwrap();
-    assert_eq!(reply["refs"][0]["state"], "at_cut");
-    assert_eq!(rig.door.calls.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn restart_preserves_eligible_identity_after_historical_runs() {
-    let mut rig = Rig::new("inventory-late-identity", Arc::new(FakeDoor::default()));
-    let old = rig.session("old");
-    let current = rig.session("current");
-    let mut wal = rig.wal.open(&current).unwrap();
-    wal.append(1, &started(&old, "old-run"), true).unwrap();
-    wal.append(1, &started(&current, "current-run"), true)
-        .unwrap();
-    drop(wal);
-    // Reopening the WAL store must use the durable projection, not append notifications.
-    rig.wal = Arc::new(FileWalStore::new(rig.root.join("wal")));
-    rig.service = Arc::new(AgentDataService::new(
-        rig.root.clone(),
-        rig.registry.as_ref().clone(),
-        rig.wal.clone(),
-        rig.index.clone(),
-        rig.door.clone(),
-    ));
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    assert_eq!(
-        wire.call("busy", json!({"refs":rig.params(CUT, &[current])["refs"]}))
-            .await
-            .unwrap()["refs"][0]["state"],
-        "busy"
-    );
-    assert_eq!(
-        rig.index
-            .session_refs(std::iter::once(
-                rig.params(CUT, &[old])["refs"][0]["ref"].as_str().unwrap()
-            ))
-            .unwrap()
-            .sessions
-            .len(),
-        0
-    );
-}
-
 #[cfg(unix)]
 #[tokio::test]
-async fn boot_error_names_legacy_cleanup_when_the_state_root_is_missing() {
-    let rig = Rig::new("boot-missing-root", Arc::new(FakeDoor::default()));
+async fn boot_error_names_its_step_when_the_state_root_is_missing() {
+    let rig = Rig::new("boot-missing-root", Arc::new(FakeDoor::default())).await;
     std::fs::rename(&rig.root, rig.root.with_extension("moved")).unwrap();
     let error = rig.service.reconcile_boot().await.unwrap_err();
-    assert!(error.message.starts_with("cleanup_legacy_inventory: "));
-    assert!(error.message.contains("No such file or directory"));
+    assert!(
+        error.message.starts_with("rebuild_fence_index: ")
+            && error.message.contains("No such file or directory"),
+        "{}",
+        error.message
+    );
 }
 
 #[tokio::test]
 async fn boot_error_names_fence_rebuild_when_a_cut_is_unreadable() {
-    let rig = Rig::new("boot-unreadable-cut", Arc::new(FakeDoor::default()));
+    let rig = Rig::new("boot-unreadable-cut", Arc::new(FakeDoor::default())).await;
     let cuts = rig.root.join("agent-data/cuts");
     std::fs::create_dir_all(&cuts).unwrap();
     std::fs::write(cuts.join("broken.json"), b"not json").unwrap();
@@ -460,7 +328,7 @@ async fn boot_error_names_fence_rebuild_when_a_cut_is_unreadable() {
 
 #[tokio::test]
 async fn activation_registers_installed_ref_before_acknowledgment() {
-    let (rig, params, bytes) = incoming_rig("projection-activation");
+    let (rig, params, _) = incoming_rig("projection-activation").await;
     let reference = params["refs"][0]["ref"].as_str().unwrap();
     assert!(rig
         .index
@@ -482,8 +350,9 @@ async fn activation_registers_installed_ref_before_acknowledgment() {
     let found = rig.index.session_refs([reference].into_iter()).unwrap();
     assert!(found.complete);
     let session = &found.sessions[reference].1;
-    assert_eq!(rig.wal.bytes_for_move(session).unwrap().unwrap(), bytes);
-    let reopened = rig.reopen();
+    rig.registry.check_move(session, true).unwrap();
+    assert!(!rig.stored(session).is_empty());
+    let reopened = rig.reopen().await;
     assert_eq!(
         reopened
             .index
@@ -495,27 +364,29 @@ async fn activation_registers_installed_ref_before_acknowledgment() {
     );
 }
 
+/// A session a move installs while the session-ref index can't take its row is unknown, never
+/// absent, until boot repairs the index; then it is found like any other.
 #[tokio::test]
 async fn locked_store_admission_is_unknown_until_boot_repairs_gap() {
-    let rig = Rig::new("store-outage", Arc::new(FakeDoor::default()));
-    let session = rig.session("admitted-during-outage");
+    let (rig, params, _) = incoming_rig("store-outage").await;
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
+    wire.call("import", params.clone()).await.unwrap();
     let blocker = rusqlite::Connection::open(rig.root.join("run-index.db")).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-    rig.seed(&session, "outage-run", false);
-    let params = rig.params(CUT, std::slice::from_ref(&session));
+    wire.call("activate", params.clone()).await.unwrap();
     assert!(rig
         .root
         .join(broca_core::SESSION_PROJECTION_INCOMPLETE)
         .exists());
+    let busy = json!({"refs":params["refs"]});
     assert_eq!(
-        wire.call("busy", json!({"refs":params["refs"]}))
-            .await
-            .unwrap()["refs"][0]["state"],
+        wire.call("busy", busy.clone()).await.unwrap()["refs"][0]["state"],
         "unknown"
     );
+    // A cut that never recorded the session finds it only through the index.
+    let unrecorded = json!({"cutId":BACK,"refs":params["refs"]});
     assert_eq!(
-        wire.call("diverged", params.clone()).await.unwrap()["refs"][0]["state"],
+        wire.call("diverged", unrecorded).await.unwrap()["refs"][0]["state"],
         "unknown"
     );
     blocker.execute_batch("ROLLBACK").unwrap();
@@ -535,68 +406,8 @@ async fn locked_store_admission_is_unknown_until_boot_repairs_gap() {
         },
     )
     .await;
-    let reply = wire
-        .call("busy", json!({"refs":params["refs"]}))
-        .await
-        .unwrap();
-    assert_eq!(reply["refs"][0]["state"], "busy");
-    assert_eq!(reply["refs"][0]["reason_code"], "run_active");
-}
-
-#[tokio::test]
-async fn activation_outage_holds_one_gap_lease_for_all_incoming_episodes() {
-    struct FirstWriteFails(AtomicUsize);
-    impl broca_core::SessionRefIndex for FirstWriteFails {
-        fn record_session(&self, _: &str, _: &BindIdentity) -> Result<(), String> {
-            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err("projection unavailable".into())
-            } else {
-                Ok(())
-            }
-        }
-    }
-    let door = Arc::new(FakeDoor::default());
-    let source = Rig::new("multi-episode-outage-source", door.clone());
-    let session = source.session("multi-episode");
-    source.seed(&session, "first-run", true);
-    source.seed(&session, "second-run", true);
-    let reference = broca_core::agent_session_ref(&session);
-    let bytes = source.bytes(&session);
-    door.plant(CUT, &reference, bytes.clone());
-    let rig = Rig::new("multi-episode-outage-receiver", door);
-    let index = Arc::new(FirstWriteFails(AtomicUsize::new(0)));
-    rig.wal.set_session_ref_index(index.clone());
-    let mut wire = Wire::new(&rig, entorhinal(), true).await;
-    let params = rig.params(CUT, std::slice::from_ref(&session));
-    wire.call("import", params.clone()).await.unwrap();
-    wire.call("activate", params).await.unwrap();
     assert_eq!(
-        index.0.load(Ordering::SeqCst),
-        1,
-        "a batch already protected by a durable gap must not acquire another gap lease"
+        wire.call("busy", busy).await.unwrap()["refs"][0]["state"],
+        "idle"
     );
-    assert!(rig
-        .root
-        .join(broca_core::SESSION_PROJECTION_INCOMPLETE)
-        .exists());
-    assert_eq!(rig.wal.bytes_for_move(&session).unwrap().unwrap(), bytes);
-    rig.service.reconcile_boot().await.unwrap();
-    broca_test_support::wait_until("multi-episode gap repair", || async {
-        if rig
-            .root
-            .join(broca_core::SESSION_PROJECTION_INCOMPLETE)
-            .exists()
-        {
-            Err("projection gap still present".to_owned())
-        } else {
-            Ok(())
-        }
-    })
-    .await;
-    assert!(rig
-        .index
-        .session_refs([reference.as_str()].into_iter())
-        .unwrap()
-        .sessions
-        .contains_key(&reference));
 }

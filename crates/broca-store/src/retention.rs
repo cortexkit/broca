@@ -206,7 +206,12 @@ mod sweep_work_tests {
         conn.execute("INSERT INTO run_index(run_id, session, state, lineage_id, withdrawals_owed) VALUES ('r', ?1, 'completed', 'l', 1)", [&session]).unwrap();
         conn.execute(
             "INSERT INTO retention_lineage VALUES ('l', ?1, 1, 0, 100, 20, NULL)",
-            [SqliteStore::key(&key)],
+            [format!(
+                "{}\u{1f}{}\u{1f}{}",
+                key.project_root.display(),
+                key.harness,
+                key.session
+            )],
         )
         .unwrap();
         let owed = || {

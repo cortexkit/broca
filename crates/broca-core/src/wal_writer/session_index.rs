@@ -1,7 +1,12 @@
 //! Durable session discovery boundary; WAL bytes remain authoritative.
 use super::*;
 
-fn record_candidate(
+/// Writes `session`'s row in the session-ref index under `address`. When the index can't take
+/// it, a durable marker under `root` (broca's state root) keeps the index marked incomplete
+/// until a census (a pass that lists every stored session and records the missing rows)
+/// repairs it, so a move asking meanwhile is told to retry rather than that the ref is
+/// unknown; the returned admission holds that marker.
+pub fn record_candidate(
     index: Option<&dyn SessionRefIndex>,
     root: &Path,
     address: &str,

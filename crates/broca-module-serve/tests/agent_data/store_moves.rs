@@ -6,55 +6,6 @@ use broca_session_store::{
 };
 use broca_wal::StorageClass;
 
-struct NoRuns;
-#[async_trait]
-impl broca_module::executor::RunExecutor for NoRuns {}
-
-async fn rig(path: PathBuf, door: Arc<FakeDoor>, key: DeploymentKey) -> Rig {
-    std::fs::create_dir_all(&path).unwrap();
-    broca_wal::migration::durable_dir(&path, &path.join("wal")).unwrap();
-    let runtime = Arc::new(
-        broca_module::store_open::StoreRuntime::open(
-            &path,
-            key,
-            Arc::new(NoRuns),
-            std::time::Duration::from_secs(60),
-        )
-        .await
-        .unwrap(),
-    );
-    let wal = Arc::new(FileWalStore::new(path.join("wal")));
-    let index = Arc::new(broca_store::SqliteStore::open(path.join("run-index.db")).unwrap());
-    broca_store::session_refs::migrate(
-        &path.join("run-index.db"),
-        &broca_core::ReadOnlyWalReader::new(&path),
-    )
-    .unwrap();
-    let registry = Arc::new(LineageRegistry::new(Arc::new(
-        broca_module::opener::DefaultOpener::new(
-            Arc::new(broca_core::FileLeaseStore::new(path.join("leases"))),
-            Arc::new(NoRuns),
-        )
-        .with_store_runtime(runtime),
-    )));
-    registry.set_session_address_inventory(index.clone());
-    let service = Arc::new(AgentDataService::new(
-        path.clone(),
-        registry.as_ref().clone(),
-        wal.clone(),
-        index.clone(),
-        door.clone(),
-    ));
-    Rig {
-        root: path,
-        wal,
-        index,
-        registry,
-        service,
-        door,
-    }
-}
-
 /// A rig whose new storage opens without its deployment key, as broca's does at boot before the
 /// vault answers, and the slot and setup that load the key later. With `open_late`, the storage
 /// opens only after the agent-data service is built, as when its first open failed at boot and
@@ -69,7 +20,6 @@ async fn rig_awaiting_key(
     broca_module::store_open::StoreRuntimeSetup,
 ) {
     std::fs::create_dir_all(&path).unwrap();
-    broca_wal::migration::durable_dir(&path, &path.join("wal")).unwrap();
     let slot = Arc::new(broca_module::store_open::StoreSlot::awaiting_key(&path, 7));
     let setup = broca_module::store_open::StoreRuntimeSetup {
         state_root: path.clone(),
@@ -83,11 +33,11 @@ async fn rig_awaiting_key(
     if !open_late {
         slot.open_without_key(&setup).await.unwrap();
     }
-    let wal = Arc::new(FileWalStore::new(path.join("wal")));
     let index = Arc::new(broca_store::SqliteStore::open(path.join("run-index.db")).unwrap());
+    // Boot's census: every session already stored here is in the session-ref index.
     broca_store::session_refs::migrate(
         &path.join("run-index.db"),
-        &broca_core::ReadOnlyWalReader::new(&path),
+        &broca_store::session_refs::StoredSessions::new(&path),
     )
     .unwrap();
     let registry = Arc::new(LineageRegistry::new(Arc::new(
@@ -101,7 +51,6 @@ async fn rig_awaiting_key(
     let service = Arc::new(AgentDataService::new(
         path.clone(),
         registry.as_ref().clone(),
-        wal.clone(),
         index.clone(),
         door.clone(),
     ));
@@ -110,145 +59,12 @@ async fn rig_awaiting_key(
     }
     let rig = Rig {
         root: path,
-        wal,
         index,
         registry,
         service,
         door,
     };
     (rig, slot, setup)
-}
-
-/// The session triple a session's log names, as broca derives it from its bind identity.
-fn triple(session: &BindIdentity) -> broca_session_store::head::SessionTriple {
-    broca_session_store::head::SessionTriple {
-        project_root: session.project_root.display().to_string(),
-        harness: session.harness.clone(),
-        session: session.session.clone(),
-    }
-}
-
-/// A session's records and setup parts, as the storage keeps them: a run started on a stub
-/// model, either finished after one answer (`finished.json`) or still running with nothing
-/// answered (`running.json`). The records name no session, so one history serves every one.
-struct Seed {
-    records: Vec<broca_session_store::record::Record>,
-    parts: std::collections::BTreeMap<broca_session_store::codec::Digest, Vec<u8>>,
-}
-
-fn seed_history(terminal: bool) -> Seed {
-    let text = if terminal {
-        include_str!("fixtures/finished.json")
-    } else {
-        include_str!("fixtures/running.json")
-    };
-    let fixture: Value = serde_json::from_str(text).unwrap();
-    let bytes = |value: &Value| -> Vec<u8> {
-        let text = value.as_str().unwrap();
-        (0..text.len())
-            .step_by(2)
-            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
-            .collect()
-    };
-    Seed {
-        records: fixture["records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|record| {
-                let kind = u32::try_from(record["kind"].as_u64().unwrap()).unwrap();
-                broca_session_store::record::Record::decode(kind, &bytes(&record["body"])).unwrap()
-            })
-            .collect(),
-        parts: fixture["parts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|part| {
-                let digest: [u8; 32] = bytes(&part[0]).try_into().unwrap();
-                (broca_session_store::codec::Digest(digest), bytes(&part[1]))
-            })
-            .collect(),
-    }
-}
-
-/// Stores `session` as binding it would, with its ref in the session-ref index.
-async fn seed(rig: &Rig, session: &BindIdentity, terminal: bool) {
-    store_session(rig, session, terminal).await;
-    // Binding a session records its ref in the index in production; moves find it there.
-    broca_core::SessionRefIndex::record_session(
-        rig.index.as_ref(),
-        &broca_core::session_addr(session),
-        session,
-    )
-    .unwrap();
-}
-
-/// Writes `session`'s records into the store, and nothing into the session-ref index.
-async fn store_session(rig: &Rig, session: &BindIdentity, terminal: bool) {
-    store_session_on(rig, session, terminal, false).await;
-}
-
-/// As [`store_session`], for a session on the compaction contract when `contract` is set: its
-/// runs carry a compaction plan version, so a message renders only with its `EntryFacts` record
-/// (its id, time and part numbers).
-async fn store_session_on(rig: &Rig, session: &BindIdentity, terminal: bool, contract: bool) {
-    store_session_in(rig, session, terminal, contract, StorageClass::Durable).await;
-}
-
-/// As [`store_session_on`], kept in storage class `class`.
-async fn store_session_in(
-    rig: &Rig,
-    session: &BindIdentity,
-    terminal: bool,
-    contract: bool,
-    class: StorageClass,
-) {
-    let runtime = rig.registry.store_runtime().unwrap();
-    let backend = LocalBackend::new(class.store_root(&rig.root));
-    let mut writer = Session::create(
-        &backend,
-        SessionAddr(broca_core::session_addr(session)),
-        triple(session),
-        runtime.deployment(),
-        false,
-    )
-    .await
-    .unwrap();
-    let mut seeded = seed_history(terminal);
-    if contract {
-        for record in &mut seeded.records {
-            if let broca_session_store::record::Record::RunStart(start) = record {
-                start.compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
-            }
-        }
-    }
-    let key = runtime
-        .deployment()
-        .setup_key_for(runtime.deployment().new_sessions())
-        .unwrap();
-    let store = broca_session_store::setup::SetupStore::new(&backend, &key);
-    for record in &seeded.records {
-        if let broca_session_store::record::Record::SetupStub(stub) = record {
-            for part in &stub.parts {
-                use broca_session_loop::parts::Parts as _;
-                store
-                    .put(part.kind, &seeded.parts[&part.digest])
-                    .await
-                    .unwrap();
-                runtime
-                    .parts_for(class, runtime.deployment().new_sessions())
-                    .clone()
-                    .put(
-                        part.kind,
-                        &serde_json::from_slice(&seeded.parts[&part.digest]).unwrap(),
-                    )
-                    .unwrap();
-            }
-        }
-    }
-    writer.append(&seeded.records, true).await.unwrap();
-    writer.close().await.unwrap();
 }
 
 /// A move finds a session through the session-ref index alone, never by searching the stored
@@ -446,9 +262,11 @@ async fn store_move_plain_and_encrypted_roundtrip_release_and_move_back() {
         to.call("prepare", back.clone()).await.unwrap();
         to.call("export", back.clone()).await.unwrap();
         door.seal("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        // The computer the session left holds nothing the cut moving it back lacks: that
+        // cut's stream starts with the one this computer sent.
         assert_eq!(
             from.call("diverged", back.clone()).await.unwrap()["refs"][0]["state"],
-            "advanced"
+            "at_cut"
         );
         from.call("import", back.clone()).await.unwrap();
         from.call("activate", back).await.unwrap();
@@ -521,11 +339,7 @@ async fn store_stream_recovers_crashes_before_and_during_admit_but_refuses_a_los
     );
     let refusal = assert_code(from.call("prepare", lost).await, "unavailable");
     assert!(refusal.to_string().contains("move_stream_lost"));
-    assert!(!source
-        .wal
-        .wal_path(&session)
-        .with_extension("moving")
-        .exists());
+    assert!(!source.fence(&session).with_extension("moving").exists());
 }
 
 #[tokio::test]
@@ -586,11 +400,7 @@ async fn store_busy_refuses_prepare_and_bad_verification_digests_refuse_before_s
     );
     let error = assert_code(from.call("prepare", params.clone()).await, "busy");
     assert!(error.to_string().contains("run_active"));
-    assert!(!source
-        .wal
-        .wal_path(&session)
-        .with_extension("moving")
-        .exists());
+    assert!(!source.fence(&session).with_extension("moving").exists());
 
     let session = source.session("bad-digests");
     seed(&source, &session, true).await;
@@ -926,4 +736,34 @@ async fn store_operation_crash_cuts_resume_and_abort_only_the_owned_freeze() {
     to.call("prepare", abort.clone()).await.unwrap();
     to.call("abort", abort).await.unwrap();
     receiver.registry.check_move(&session, true).unwrap();
+}
+
+/// As [`store_session`], for a session on the compaction contract when `contract` is set: its
+/// runs carry a compaction plan version, so a message renders only with its `EntryFacts` record
+/// (its id, time and part numbers).
+async fn store_session_on(rig: &Rig, session: &BindIdentity, terminal: bool, contract: bool) {
+    store_session_in(rig, session, terminal, contract, StorageClass::Durable).await;
+}
+
+/// As [`store_session_on`], kept in storage class `class`.
+async fn store_session_in(
+    rig: &Rig,
+    session: &BindIdentity,
+    terminal: bool,
+    contract: bool,
+    class: StorageClass,
+) {
+    let mut seeded = seed_history(terminal);
+    if contract {
+        for record in &mut seeded.records {
+            if let broca_session_store::record::Record::RunStart(start) = record {
+                start.compaction_plan_version = Some(broca_core::compaction_v2::PLAN_VERSION);
+            }
+        }
+    }
+    store_session_with(rig, session, seeded, class).await;
+}
+
+async fn seed(rig: &Rig, session: &BindIdentity, terminal: bool) {
+    rig.seed(session, terminal).await;
 }

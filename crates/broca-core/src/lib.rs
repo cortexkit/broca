@@ -175,7 +175,8 @@ pub use tool_results::outcome_unknown_result;
 pub use tool_results::{no_dispatch_result, not_dispatched_result};
 pub use wal_writer::ProjectionAdmission;
 pub use wal_writer::{
-    agent_session_ref, session_addr, FileWalStore, ReadOnlyWalReader, SessionRefIndex, WalStore,
+    agent_session_ref, record_candidate, session_addr, FileWalStore, ReadOnlyWalReader,
+    SessionRefIndex, WalStore,
 };
 pub use wal_writer::{
     session_projection_incomplete, ProjectionRepair, SESSION_PROJECTION_INCOMPLETE,

@@ -11,11 +11,10 @@ use std::{
     time::Duration,
 };
 
-use broca_core::FileWalStore;
 use broca_module::{
     cut_state::{refusal, CutStore},
     move_files::{FileCutArtifacts, MoveDriver, MoveObservation, MovePlans, PlannedSession},
-    move_install, LineageRegistry,
+    LineageRegistry,
 };
 use broca_protocol::BindIdentity;
 use broca_subc::session_door::{DoorRead, SessionDoorClient, SessionDoorError, MAX_CALL_BYTES};
@@ -94,45 +93,35 @@ impl SessionDoor for SessionDoorClient {
 }
 
 pub struct AgentDataService {
+    /// broca's state root, which keeps the move state under `agent-data/`.
+    root: PathBuf,
     cuts: CutStore,
     artifacts: FileCutArtifacts,
-    wal: Arc<FileWalStore>,
     inventory_readiness: Arc<dyn broca_module::registry::SessionInventoryReadiness>,
     op_counts: [AtomicU64; 10],
 }
 impl AgentDataService {
-    /// Construct with operational capabilities from one store. Boot must publish
-    /// and reconcile its WAL-derived rows before calling `reconcile_boot`.
-    /// Inventory repair uses the registry's shared, signalled readiness task.
+    /// Construct with operational capabilities from one store. Inventory repair uses the
+    /// registry's shared, signalled readiness task.
     pub fn with_ports(
         root: PathBuf,
         registry: LineageRegistry,
-        wal: Arc<FileWalStore>,
         index: Arc<dyn broca_core::SessionInventory>,
-        exclusions: Arc<dyn broca_core::ImportedRunExclusions>,
         door: Arc<dyn SessionDoor>,
     ) -> Self {
-        wal.set_session_ref_index(index.clone());
         let driver = Arc::new(Driver {
             registry: registry.clone(),
             root: root.clone(),
-            wal: wal.clone(),
             index: index.clone(),
             door,
         });
         let inventory_readiness = registry.set_session_inventory_readiness(Arc::new(
-            crate::session_inventory::SessionInventory::with_inventory(root.clone(), index),
+            crate::session_inventory::SessionInventory::with_inventory(root.clone(), index.clone()),
         ));
         Self {
             cuts: CutStore::new(&root),
-            artifacts: FileCutArtifacts::with_exclusions(
-                root,
-                registry,
-                wal.clone(),
-                exclusions,
-                driver,
-            ),
-            wal,
+            artifacts: FileCutArtifacts::new(root.clone(), registry, index, driver),
+            root,
             inventory_readiness,
             op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -141,15 +130,12 @@ impl AgentDataService {
     pub fn new(
         root: PathBuf,
         registry: LineageRegistry,
-        wal: Arc<FileWalStore>,
         index: Arc<broca_store::SqliteStore>,
         door: Arc<dyn SessionDoor>,
     ) -> Self {
-        wal.set_session_ref_index(index.clone());
         let driver = Arc::new(Driver {
             registry: registry.clone(),
             root: root.clone(),
-            wal: wal.clone(),
             index: index.clone(),
             door,
         });
@@ -158,28 +144,16 @@ impl AgentDataService {
         ));
         Self {
             cuts: CutStore::new(&root),
-            artifacts: FileCutArtifacts::new(
-                root.clone(),
-                registry,
-                wal.clone(),
-                index.clone(),
-                driver,
-            ),
-            wal,
+            artifacts: FileCutArtifacts::new(root.clone(), registry, index, driver),
+            root,
             inventory_readiness,
             op_counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
     pub async fn reconcile_boot(&self) -> Result<(), ErrorBody> {
-        broca_store::session_refs::cleanup_legacy_inventory(
-            self.wal.root().parent().unwrap_or(self.wal.root()),
-        )
-        .map_err(|error| unavailable(format!("cleanup_legacy_inventory: {error}")))?;
-        broca_wal::migration::rebuild_fence_index(
-            self.wal.root().parent().unwrap_or(self.wal.root()),
-        )
-        .map_err(|error| unavailable(format!("rebuild_fence_index: {error}")))?;
+        broca_wal::migration::rebuild_fence_index(&self.root)
+            .map_err(|error| unavailable(format!("rebuild_fence_index: {error}")))?;
         self.cuts
             .reconcile_boot(&self.artifacts)
             .await
@@ -300,7 +274,6 @@ struct Driver {
     /// open at boot can open later, when the key loader retries it.
     registry: LineageRegistry,
     root: PathBuf,
-    wal: Arc<FileWalStore>,
     index: Arc<dyn broca_core::SessionInventory>,
     door: Arc<dyn SessionDoor>,
 }
@@ -312,7 +285,10 @@ struct Incoming {
     bytes: Vec<u8>,
     end: u64,
     digest: String,
-    store: bool,
+    /// Where each export frame of the stream ends, with the digest of the stream up to there.
+    /// A copy whose own stream matches one of these is an ancestor of the cut: the stream only
+    /// grows, one export per move.
+    frame_ends: Vec<(u64, String)>,
 }
 
 #[derive(Default)]
@@ -328,7 +304,8 @@ struct SessionInventory {
 /// - a cut the door will serve once its import progresses (`cut_import_pending`, and
 ///   `not_found` from a door older than hub moves) is `cut_not_ready`, retried within the step;
 /// - a cut the door will never serve here (`cut_not_published`, `cut_takeover_closed`,
-///   `cut_range_not_local`) aborts the move, as `cut_unknown` or `participant_failed`;
+///   `cut_range_not_local`, and `cut_item_missing`: the cut's verified manifest doesn't list
+///   this session, and never will) aborts the move, as `cut_unknown` or `participant_failed`;
 /// - bytes that fail the door's own check (`verify_failed`) are `digest_mismatch`.
 ///
 /// `diverged` allows none of the aborting codes. A cut that cannot be compared there makes the
@@ -344,6 +321,7 @@ fn door_failure(op: Op, error: SessionDoorError) -> CutReadFailure {
         Some("cut_not_published") => (&ABORTS, Some("cut_not_published")),
         Some("cut_takeover_closed") => (&ABORTS, Some("cut_takeover_closed")),
         Some("cut_range_not_local") => (&ABORTS, Some("cut_range_not_local")),
+        Some("cut_item_missing") => (&ABORTS, Some("cut_item_missing")),
         _ => (&[], None),
     };
     const ABORTS: [&str; 2] = ["cut_unknown", "participant_failed"];
@@ -378,174 +356,39 @@ impl From<ErrorBody> for CutReadFailure {
     }
 }
 
-/// The door carries opaque WAL bytes, not a participant format. Inspect only the
-/// verified frame envelope here, before publishing staging or installing a WAL.
-/// Keeping this separate permits an advertised format to replace inspection later.
-fn wal_format(bytes: &[u8]) -> Result<(String, String), ErrorBody> {
-    use broca_wal::framing::{self, DecodeStep};
-    let mut cursor = bytes;
-    let mut version = framing::FRAMING_VERSION;
-    let mut features = BTreeSet::new();
-    let mut lineage = None;
-    while !cursor.is_empty() {
-        let consumed = match framing::decode_next(cursor) {
-            DecodeStep::Record { consumed, .. } => {
-                version = version.max(cursor[4]);
-                if cursor[4] == framing::GATED_FRAMING_VERSION {
-                    let envelope: Value =
-                        serde_json::from_slice(&cursor[framing::HEADER_LEN..consumed])
-                            .map_err(unavailable)?;
-                    let requires: Vec<String> =
-                        serde_json::from_value(envelope["requires"].clone())
-                            .map_err(unavailable)?;
-                    features.extend(requires);
-                }
-                consumed
-            }
-            DecodeStep::Lineage {
-                lineage_id,
-                consumed,
-            } => {
-                lineage = Some(lineage_id.to_string());
-                consumed
-            }
-            DecodeStep::NewerWriter { ver, missing } => {
-                return Err(refusal(
-                    "incompatible_version",
-                    "WAL cut requires unknown reader features",
-                    json!({"found":format!("broca-wal/v{ver};features={}",missing.join(",")),"required":format!("broca-wal/v3;features={}",framing::KNOWN_FEATURES.join(","))}),
-                ))
-            }
-            DecodeStep::Corrupt(framing::FrameError::UnsupportedVersion { ver }) => {
-                return Err(refusal(
-                    "incompatible_version",
-                    "WAL cut requires an unknown frame version",
-                    json!({"found":format!("broca-wal/v{ver}"),"required":"broca-wal/v3"}),
-                ))
-            }
-            DecodeStep::Corrupt(error) => return Err(unavailable(error)),
-            DecodeStep::TornTail => {
-                return Err(unavailable("cut WAL contains an incomplete frame"))
-            }
-        };
-        cursor = &cursor[consumed..];
-    }
-    let format = format!(
-        "broca-wal/v{version};features={}",
-        features.into_iter().collect::<Vec<_>>().join(",")
-    );
-    move_install::check_format(&format)?;
-    Ok((
-        format,
-        lineage.ok_or_else(|| unavailable("cut WAL has no lineage identity"))?,
-    ))
-}
-
 impl Driver {
     /// The new storage's runtime, when it has opened.
     fn store(&self) -> Option<Arc<broca_module::store_open::StoreRuntime>> {
         self.registry.store_runtime()
     }
 
-    fn activation_bytes(
-        &self,
-        reference: &str,
-        cut_id: &str,
-        session: &BindIdentity,
-    ) -> Result<Vec<u8>, ErrorBody> {
-        let state: broca_module::cut_state::CutState =
-            broca_wal::migration::read_json(&CutStore::new(&self.root).path(cut_id))
-                .map_err(unavailable)?
-                .ok_or_else(|| unavailable("activation has no cut state"))?;
-        let reply = state
-            .replies
-            .get("agent_data.import")
-            .ok_or_else(|| unavailable("activation has no imported reply"))?;
-        let items: contract::import::ImportReply =
-            serde_json::from_value(reply.value.clone()).map_err(unavailable)?;
-        let item = items
-            .items
-            .iter()
-            .find(|item| item.session_ref == reference)
-            .ok_or_else(|| unavailable("imported reply does not cover the activation ref"))?;
-        let path = broca_wal::migration::staging_path(
-            self.wal.root(),
-            cut_id,
-            &broca_core::session_addr(session),
-        )
-        .map_err(unavailable)?;
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut bytes = self
-                    .wal
-                    .bytes_for_move(session)
-                    .map_err(unavailable)?
-                    .ok_or_else(|| unavailable("activation WAL is missing"))?;
-                let end = usize::try_from(item.end_offset).map_err(unavailable)?;
-                if end <= bytes.len() {
-                    bytes.truncate(end);
-                }
-                bytes
-            }
-            Err(e) => return Err(unavailable(e)),
-        };
-        move_install::verify_received(reference, &bytes, item.end_offset, &item.digest).map_err(
-            |error| {
-                broca_module::move_files::activation_refusal(cut_id, state.step, reference, error)
-            },
-        )?;
-        Ok(bytes)
-    }
+    /// The session a mover's door serves for `reference` at `cut_id`. Only session-store moves
+    /// are accepted: broca keeps no session in the old log format, so no computer sends one.
     async fn incoming(
         &self,
         reference: &str,
         cut_id: &str,
         op: Op,
     ) -> Result<Incoming, CutReadFailure> {
-        let mut bytes = Vec::new();
-        let mut metadata = None;
-        loop {
-            let page = self
-                .door
-                .read(reference, bytes.len() as u64, cut_id)
-                .await
-                .map_err(|error| door_failure(op, error))?;
-            if bytes.is_empty() && page.bytes.starts_with(b"broca-store-export/") {
-                return self.incoming_store(reference, cut_id, page, op).await;
-            }
-            if page.stream_end > self.wal.max_read_bytes() {
-                return Err(unavailable("sealed cut exceeds the session WAL size limit").into());
-            }
-            let seal = (page.stream_end, page.digest.clone());
-            if metadata.as_ref().is_some_and(|previous| previous != &seal) {
-                return Err(unavailable("sealed door metadata changed between pages").into());
-            }
-            if page.digest.is_empty() {
-                return Err(unavailable("door did not return a sealed digest").into());
-            }
-            let complete = page.end_offset == page.stream_end;
-            metadata = Some(seal);
-            bytes.extend_from_slice(&page.bytes);
-            if complete {
-                if broca_wal::migration::digest(&bytes) != page.digest {
-                    return Err(CutReadFailure {
-                        refusal: refusal(
-                            "digest_mismatch",
-                            "WAL bytes differ from the door's sealed digest",
-                            Value::Null,
-                        ),
-                        unknown_cause: Some("sealed SHA mismatch"),
-                    });
-                }
-                return Ok(Incoming {
-                    bytes,
-                    end: page.stream_end,
-                    digest: page.digest,
-                    store: false,
-                });
-            }
+        let page = self
+            .door
+            .read(reference, 0, cut_id)
+            .await
+            .map_err(|error| door_failure(op, error))?;
+        if page.bytes.starts_with(b"broca-store-export/") {
+            return self.incoming_store(reference, cut_id, page, op).await;
         }
+        let incompatible = refusal(
+            "incompatible_version",
+            "the cut is in the old session log format, which this computer no longer reads",
+            json!({"found": "broca-wal", "required": broca_session_store::session::moves::FORMAT}),
+        );
+        Err(if contract::errors::may_refuse(op, &incompatible.code) {
+            incompatible
+        } else {
+            unavailable(incompatible.message)
+        }
+        .into())
     }
     /// The sessions `refs` name, looked up in the session-ref index. Every session is in it:
     /// binding a new identity writes its row in the same transaction that mints the identity
@@ -631,9 +474,14 @@ impl MoveDriver for Driver {
         Ok(())
     }
     async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody> {
-        // Empty move probes must not depend on the projection or touch WALs.
+        // Empty move probes must not depend on the projection or touch any session.
         if refs.iter().next().is_none() {
             return Ok(MovePlans::default());
+        }
+        // Every session broca serves lives in the session store, so every op but `abort` needs
+        // it open: an encrypted store opens only once its key has loaded, and the mover retries.
+        if op != Op::Abort && self.store().is_none() {
+            return Err(unavailable("session storage is unavailable"));
         }
         let receiver = matches!(op, Op::Diverged | Op::Import | Op::Activate);
         let state: Option<broca_module::cut_state::CutState> = if op == Op::Busy {
@@ -651,7 +499,7 @@ impl MoveDriver for Driver {
         });
         // Once intent is durable, use only its recorded addresses. Discovering
         // unrelated sessions must never become a prerequisite for cut recovery.
-        let mut inventory = if bound {
+        let inventory = if bound {
             SessionInventory {
                 sessions: state.expect("bound cut exists").sessions,
                 unreadable: Vec::new(),
@@ -661,23 +509,6 @@ impl MoveDriver for Driver {
         } else {
             SessionInventory::default()
         };
-        let retained = if op == Op::Prepare && !bound {
-            self.index.retained_sessions().map_err(unavailable)?
-        } else {
-            Vec::new()
-        };
-        if inventory.unreadable.is_empty() {
-            for session in &retained {
-                inventory
-                    .sessions
-                    .entry(contract::session_ref(
-                        &session.harness,
-                        &session.project_root.to_string_lossy(),
-                        &session.session,
-                    ))
-                    .or_insert_with(|| session.clone());
-            }
-        }
         let sessions = inventory.sessions;
         let unreadable = inventory.unreadable;
         let mut unknown_refs = BTreeSet::new();
@@ -685,12 +516,20 @@ impl MoveDriver for Driver {
         for reference in refs.iter() {
             let session = sessions.get(&reference.r#ref);
             if let Some(session) = session {
-                if let Some(plan) = self
-                    .store_plan(&reference.r#ref, session, cut_id, op)
-                    .await?
-                {
-                    plans.push(plan);
-                    continue;
+                match self.store_plan(&reference.r#ref, session, cut_id, op).await {
+                    Ok(Some(plan)) => {
+                        plans.push(plan);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    // A held session that can't be read here can't be compared with the cut:
+                    // its divergence is unknown, and the other refs are still answered.
+                    Err(error) if op == Op::Diverged => {
+                        tracing::error!(session_ref = %reference.r#ref, cut_id, error = %error.message, "agent-data cannot read a held ref to compare it with the cut");
+                        plans.push(store::unreadable_divergence(&reference.r#ref, session));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             if reference.ref_kind == contract::BROCA_SESSION_REF_KIND
@@ -731,187 +570,48 @@ impl MoveDriver for Driver {
                     json!(reference),
                 ));
             }
-            let local_probe = if op == Op::Diverged {
-                let Some(session) = session else {
-                    continue;
-                };
-                let bytes = match self.wal.bytes_for_move(session) {
-                    Ok(Some(bytes)) => bytes,
-                    Ok(None) => continue,
-                    Err(_) => {
-                        tracing::error!(session_ref=%reference.r#ref,address=%broca_core::session_addr(session),"agent-data cannot inspect the requested local copy");
-                        unknown_refs.insert(reference.r#ref.clone());
-                        continue;
-                    }
-                };
-                Some(bytes)
-            } else {
-                None
-            };
-            if op == Op::Prepare
-                && session.is_some_and(|s| retained.contains(s))
-                && self
-                    .wal
-                    .bytes_for_move(session.expect("retained session resolved"))
-                    .map_err(unavailable)?
-                    .is_none()
-            {
-                return Err(refusal(
-                    "not_exportable",
-                    "retention session must not leave this computer",
-                    Value::Null,
-                ));
-            }
-            let mut sealed = receiver;
-            let mut divergence = None;
-            let mut divergence_reason = None;
-            let bytes = if op == Op::Diverged {
-                let local = local_probe.expect("held divergence ref has local bytes");
-                match broca_module::move_files::retained_move_copy_from_bytes(
-                    self.wal.as_ref(),
-                    session.expect("held ref resolved"),
-                    &local,
-                ) {
-                    Ok(true) => {
-                        divergence = Some(broca_module::move_files::LocalDivergence::Advanced);
-                        sealed = false;
-                        local
-                    }
-                    Err(_) => {
-                        unknown_refs.insert(reference.r#ref.clone());
-                        continue;
-                    }
-                    Ok(false) => {
-                        match self.incoming(&reference.r#ref, cut_id, op).await {
-                            Ok(incoming) => {
-                                let bytes = incoming.bytes;
-                                divergence = Some(if bytes.starts_with(&local) {
-                                    broca_module::move_files::LocalDivergence::AtCut
-                                } else {
-                                    broca_module::move_files::LocalDivergence::Advanced
-                                });
-                                bytes
-                            }
-                            Err(error) => match error.unknown_cause {
-                                Some(cause) => {
-                                    // Divergence entries carry only a state, not a
-                                    // per-ref message. Preserve the safe cause for the
-                                    // answer without logging WAL content.
-                                    tracing::error!(session_ref = %reference.r#ref, cut_id, cause, "agent-data cannot compare the cut with a held ref");
-                                    sealed = false;
-                                    divergence =
-                                        Some(broca_module::move_files::LocalDivergence::Unknown);
-                                    divergence_reason = Some(cause.to_owned());
-                                    local
-                                }
-                                None => return Err(error.refusal),
-                            },
-                        }
-                    }
-                }
-            } else if op == Op::Activate {
-                if session.is_some_and(|session| {
-                    self.root
-                        .join("session-store-moves/staging")
-                        .join(cut_id)
-                        .join(broca_core::session_addr(session))
-                        .exists()
-                }) {
+            // The store has no copy of this session here: it is arriving in this move, or this
+            // computer doesn't hold it.
+            match op {
+                // Nothing to abort, and a copy that isn't here can't have moved past the cut.
+                Op::Abort | Op::Diverged => continue,
+                Op::Import => {
                     let incoming = self
                         .incoming(&reference.r#ref, cut_id, op)
                         .await
                         .map_err(|error| error.refusal)?;
                     plans.push(self.incoming_store_plan(&reference.r#ref, incoming).await?);
-                    continue;
-                } else {
-                    self.activation_bytes(
-                        &reference.r#ref,
-                        cut_id,
-                        session.expect("recorded activation address checked"),
-                    )?
                 }
-            } else if op == Op::Abort {
-                Vec::new()
-            } else if receiver {
-                let incoming = self
-                    .incoming(&reference.r#ref, cut_id, op)
-                    .await
-                    .map_err(|error| error.refusal)?;
-                if incoming.store {
-                    plans.push(self.incoming_store_plan(&reference.r#ref, incoming).await?);
-                    continue;
-                }
-                incoming.bytes
-            } else {
-                let session = session.expect("source ref resolved");
-                match self.wal.bytes_for_move(session).map_err(unavailable)? {
-                    Some(bytes) => bytes,
-                    None => {
-                        return Err(refusal(
-                            "unknown_ref",
-                            "source session has no WAL",
-                            json!(reference),
-                        ))
+                Op::Activate => {
+                    let staged = session.is_some_and(|session| {
+                        self.root
+                            .join("session-store-moves/staging")
+                            .join(cut_id)
+                            .join(broca_core::session_addr(session))
+                            .exists()
+                    });
+                    if !staged {
+                        return Err(unavailable("activation has no staged session"));
                     }
+                    let incoming = self
+                        .incoming(&reference.r#ref, cut_id, op)
+                        .await
+                        .map_err(|error| error.refusal)?;
+                    plans.push(self.incoming_store_plan(&reference.r#ref, incoming).await?);
                 }
-            };
-            let (format, lineage_id) = if matches!(op, Op::Abort | Op::Busy) {
-                ("broca-wal/v1;features=".into(), String::new())
-            } else {
-                wal_format(&bytes)?
-            };
-            let digest = if op == Op::Busy {
-                String::new()
-            } else {
-                broca_wal::migration::digest(&bytes)
-            };
-            let session = if receiver && sealed {
-                move_install::verify_received(
-                    &reference.r#ref,
-                    &bytes,
-                    bytes.len() as u64,
-                    &digest,
-                )?
-            } else {
-                session.expect("local ref resolved").clone()
-            };
-            let local_archive = if matches!(op, Op::Abort | Op::Busy | Op::Diverged) {
-                None
-            } else if self
-                .wal
-                .resolve_live_path(&session)
-                .map_err(unavailable)?
-                .is_none()
-            {
-                self.wal.bytes_for_move(&session).map_err(unavailable)?
-            } else {
-                None
-            };
-            plans.push(PlannedSession {
-                store_prefix: None,
-                reference: reference.r#ref.clone(),
-                session,
-                end_offset: bytes.len() as u64,
-                sealed_digest: sealed.then(|| digest.clone()),
-                digest,
-                bytes,
-                format,
-                lineage_id,
-                local_archive,
-                divergence,
-                divergence_reason,
-            });
+                _ => {
+                    return Err(refusal(
+                        "unknown_ref",
+                        "broca does not hold this session ref",
+                        json!(reference),
+                    ))
+                }
+            }
         }
         Ok(MovePlans {
             sessions: plans,
             unknown_refs,
         })
-    }
-    async fn durable_offset(&self, reference: &str) -> Result<u64, ErrorBody> {
-        self.door
-            .durable_offset(reference)
-            .await
-            .map_err(unavailable)
     }
     async fn export(&self, reference: &str, frozen: &[u8]) -> Result<(), ErrorBody> {
         if frozen.starts_with(b"broca-store-export/") {
@@ -945,7 +645,6 @@ impl MoveDriver for Driver {
         &self,
         op: Op,
         plans: &[PlannedSession],
-        _offsets: &[u64],
         observations: &[MoveObservation],
     ) -> Result<Value, ErrorBody> {
         Ok(match op {
@@ -986,12 +685,8 @@ impl MoveDriver for Driver {
                 if let Some(reason) = &observation.busy_reason {
                     return json!({"state":"busy","reason_code":reason,"reason":format!("session has pending {reason}")});
                 }
-                if plan.format.starts_with(broca_session_store::session::moves::FORMAT) { return json!({"state":"idle"}); }
-                match source_busy_reason(&plan.bytes) {
-                    Ok(Some(reason)) => json!({"state":"busy","reason_code":reason,"reason":format!("session has pending {reason}")}),
-                    Ok(None) => json!({"state":"idle"}),
-                    Err(_) => json!({"state":"unknown"}),
-                }
+                let _ = plan;
+                json!({"state":"idle"})
             }).collect::<Vec<_>>()}),
             Op::Diverged => {
                 use contract::diverged::{DivergedEntry, DivergedReply, DivergedState};
@@ -1028,15 +723,6 @@ impl MoveDriver for Driver {
             Op::Status => return Err(unavailable("status belongs to the cut-state authority")),
         })
     }
-    fn drop_projection(&self, session: &BindIdentity) -> Result<(), String> {
-        self.index.forget_projection(session)
-    }
-}
-
-fn source_busy_reason(bytes: &[u8]) -> Result<Option<&'static str>, ErrorBody> {
-    let range =
-        broca_wal::file_wal::read_verified_member_range(bytes, 0, 0, None).map_err(unavailable)?;
-    broca_module::move_files::source_busy_reason(&range)
 }
 
 #[cfg(test)]
@@ -1054,10 +740,11 @@ mod door_failure_tests {
         )
     }
 
-    const STOPS: [&str; 3] = [
+    const STOPS: [&str; 4] = [
         "cut_not_published",
         "cut_takeover_closed",
         "cut_range_not_local",
+        "cut_item_missing",
     ];
 
     /// Every op that reads a cut answers only codes its row of the agent-data table allows, and
@@ -1172,7 +859,6 @@ mod operational_port_tests {
     struct PortInventory {
         db: Arc<broca_store::SqliteStore>,
         repairs: std::sync::atomic::AtomicUsize,
-        preparations: std::sync::atomic::AtomicUsize,
     }
     impl SessionRefIndex for PortInventory {
         fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
@@ -1188,19 +874,9 @@ mod operational_port_tests {
         }
     }
     impl InventoryPort for PortInventory {
-        fn prepare_inventory(&self, _root: &std::path::Path) -> Result<(), String> {
-            self.preparations.fetch_add(1, Ordering::SeqCst);
-            Err("serving boot must not run synchronous inventory preparation".into())
-        }
         fn rebuild_inventory(&self, root: &std::path::Path) -> Result<(), String> {
             self.repairs.fetch_add(1, Ordering::SeqCst);
             InventoryPort::rebuild_inventory(self.db.as_ref(), root)
-        }
-        fn retained_sessions(&self) -> Result<Vec<BindIdentity>, String> {
-            InventoryPort::retained_sessions(self.db.as_ref())
-        }
-        fn forget_projection(&self, session: &BindIdentity) -> Result<(), String> {
-            InventoryPort::forget_projection(self.db.as_ref(), session)
         }
     }
 
@@ -1219,24 +895,17 @@ mod operational_port_tests {
     async fn with_ports_shares_signalled_readiness_and_repairs_mid_run_gaps() {
         let root = broca_test_support::scratch_root()
             .join(format!("port-inventory-readiness-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("wal")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         let db = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
         let inventory = Arc::new(PortInventory {
             db: db.clone(),
             repairs: 0.into(),
-            preparations: 0.into(),
         });
-        let wal = Arc::new(FileWalStore::with_config(
-            root.join("wal"),
-            broca_wal::WalConfig::LEGACY,
-        ));
         let registry = LineageRegistry::new(Arc::new(NeverOpen));
         let service = AgentDataService::with_ports(
             root.clone(),
             registry.clone(),
-            wal,
             inventory.clone(),
-            db,
             Arc::new(NoDoor),
         );
         let known = BindIdentity::new("/project", "runner", "known");
@@ -1246,7 +915,6 @@ mod operational_port_tests {
         assert!(!inventory.resolve_refs(&[]).unwrap().complete);
         assert_eq!(inventory.named_refs("known", 1).unwrap().sessions.len(), 1);
         service.reconcile_boot().await.unwrap();
-        assert_eq!(inventory.preparations.load(Ordering::SeqCst), 0);
         let readiness = registry.set_session_inventory_readiness(Arc::new(UnusedReadiness));
         assert!(
             Arc::ptr_eq(&readiness, &service.inventory_readiness),
@@ -1286,8 +954,7 @@ mod operational_port_tests {
                     "agent-inventory-port-{}-legacy",
                     std::process::id()
                 ));
-                std::fs::create_dir_all(root.join("wal")).unwrap();
-                let wal = Arc::new(FileWalStore::new(root.join("wal")));
+                std::fs::create_dir_all(&root).unwrap();
                 let registry = LineageRegistry::new(Arc::new(NeverOpen));
                 let (index, service): (Arc<dyn InventoryPort>, AgentDataService) = {
                     let db = Arc::new(
@@ -1295,13 +962,7 @@ mod operational_port_tests {
                     );
                     (
                         db.clone(),
-                        AgentDataService::new(
-                            root.clone(),
-                            registry,
-                            wal.clone(),
-                            db,
-                            Arc::new(NoDoor),
-                        ),
+                        AgentDataService::new(root.clone(), registry, db, Arc::new(NoDoor)),
                     )
                 };
                 let session = BindIdentity::new("/project", "runner", "moved");
@@ -1316,7 +977,6 @@ mod operational_port_tests {
                 let driver = Driver {
                     registry: LineageRegistry::new(Arc::new(NeverOpen)),
                     root: root.clone(),
-                    wal,
                     index: index.clone(),
                     door: Arc::new(NoDoor),
                 };
@@ -1326,8 +986,6 @@ mod operational_port_tests {
                 let found = driver.local_sessions(&refs);
                 assert!(found.unreadable.is_empty());
                 assert_eq!(found.sessions.len(), 1);
-                driver.drop_projection(&session).unwrap();
-                assert_eq!(driver.local_sessions(&refs).sessions.len(), 1);
                 drop(service);
                 drop(driver);
                 drop(index);

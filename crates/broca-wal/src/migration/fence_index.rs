@@ -220,8 +220,7 @@ fn listed_boot_entry(
     }
 }
 
-pub(super) fn check(wal_root: &Path, reference: &str) -> io::Result<Option<Option<String>>> {
-    let state_root = wal_root.parent().unwrap_or(Path::new("."));
+pub(super) fn check(state_root: &Path, reference: &str) -> io::Result<Option<Option<String>>> {
     if !fs::try_exists(&ready(state_root))? {
         return Ok(None);
     }

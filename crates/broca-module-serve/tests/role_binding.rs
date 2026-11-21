@@ -105,8 +105,11 @@ impl PoisonAddresses {
         std::fs::create_dir_all(&root).unwrap();
         let db = root.join("run-index.db");
         let inventory = Arc::new(broca_store::SqliteStore::open(&db).unwrap());
-        broca_store::session_refs::migrate(&db, &broca_core::ReadOnlyWalReader::new(&root))
-            .unwrap();
+        broca_store::session_refs::migrate(
+            &db,
+            &broca_store::session_refs::StoredSessions::new(&root),
+        )
+        .unwrap();
         Self {
             reads: AtomicUsize::new(0),
             inventory,

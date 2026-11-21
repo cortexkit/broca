@@ -439,8 +439,7 @@ impl StoreRuntime {
                 });
             }
             if let Some(cut_id) =
-                broca_wal::migration::cut_fence(&self.state_root.join("wal"), &reference)
-                    .map_err(read)?
+                broca_wal::migration::cut_fence(&self.state_root, &reference).map_err(read)?
             {
                 return Err(OpenError::SessionMoving { cut_id });
             }

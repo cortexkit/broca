@@ -1,5 +1,5 @@
 // Fork calls use no run loop: they read a frozen provider, make one step, and never dispatch tools.
-impl<W: ExecutorWalStore + 'static> LiveLoopExecutor<W> {
+impl LiveLoopExecutor {
     async fn call_fork(
         &self,
         job: broca_module::executor::ForkCallJob,

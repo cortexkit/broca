@@ -24,7 +24,7 @@ pub use projection_gap::{
     session_projection_incomplete, ProjectionRepair, SESSION_PROJECTION_INCOMPLETE,
 };
 mod session_index;
-pub use session_index::{agent_session_ref, legacy_session_ref, SessionRefIndex};
+pub use session_index::{agent_session_ref, legacy_session_ref, record_candidate, SessionRefIndex};
 
 /// A writer opened under a session lease, and the lease its caller keeps.
 pub type WriterAndLease = (Box<dyn Wal + Send>, Box<dyn LeaseHandle>);
@@ -1613,7 +1613,7 @@ impl FileWalStore {
             // reads WAL descriptors directly and does not pass this serving gate.
             for reference in [&legacy, &current] {
                 if let Some(cut_id) = broca_wal::migration::cut_fence(
-                    wal.parent().unwrap_or(Path::new(".")),
+                    self.root.parent().unwrap_or(Path::new(".")),
                     reference,
                 )
                 .map_err(WalError::Io)?

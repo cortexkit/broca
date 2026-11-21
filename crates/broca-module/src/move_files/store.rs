@@ -25,13 +25,9 @@ pub fn failure(error: moves::Error) -> ErrorBody {
 
 impl FileCutArtifacts {
     pub(super) fn move_sidecar(&self, plan: &PlannedSession) -> PathBuf {
-        if is_store(plan) {
-            self.state_root
-                .join("session-store-moves/fences")
-                .join(broca_core::session_addr(&plan.session))
-        } else {
-            self.wal.wal_path(&plan.session)
-        }
+        self.state_root
+            .join("session-store-moves/fences")
+            .join(broca_core::session_addr(&plan.session))
     }
     pub(super) fn store_runtime(&self) -> Result<Arc<crate::store_open::StoreRuntime>, ErrorBody> {
         self.registry
@@ -73,7 +69,7 @@ impl FileCutArtifacts {
             return Ok(());
         }
         if let Some(other) =
-            migration::cut_fence(self.wal.root(), &plan.reference).map_err(unavailable)?
+            migration::cut_fence(&self.state_root, &plan.reference).map_err(unavailable)?
         {
             if other != cut {
                 return Err(foreign_owner(plan, cut, &other, op, state.step));
@@ -105,7 +101,7 @@ impl FileCutArtifacts {
                     {
                         return Ok(());
                     }
-                    return Err(unavailable("source store has moved"));
+                    return Err(super::moved_source(plan, &moved.holder, &moved.cut_id, op));
                 }
             }
             self.owned_freeze(cut, plan, op != Op::Prepare, op, state.step)?;
@@ -142,9 +138,6 @@ impl FileCutArtifacts {
             .map_err(failure)?;
             if actual.files != export.files {
                 return Err(unavailable("frozen source store bytes changed"));
-            }
-            if matches!(live.residence, Residence::Moved(_)) && op != Op::Release {
-                return Err(unavailable("source store has moved"));
             }
         } else if matches!(op, Op::Import | Op::Activate) {
             if runtime
@@ -222,6 +215,10 @@ impl FileCutArtifacts {
         op: Op,
         request: &Request,
     ) -> Result<(), ErrorBody> {
+        // `busy` and `diverged` only read; they change nothing to apply.
+        if matches!(op, Op::Busy | Op::Diverged) {
+            return Ok(());
+        }
         let runtime = self.store_runtime()?;
         let addr = SessionAddr(broca_core::session_addr(&plan.session));
         if op == Op::Abort {
@@ -348,10 +345,13 @@ impl FileCutArtifacts {
                 // its row is written before the session is published. If the index can't take
                 // it, the guard leaves the index marked incomplete until a census repairs it, so
                 // a move asking meanwhile is told to retry rather than that the ref is unknown.
-                let _admission = self
-                    .wal
-                    .record_session_before_install(&addr.0, &plan.session)
-                    .map_err(unavailable)?;
+                let _admission = broca_core::record_candidate(
+                    Some(self.refs.as_ref()),
+                    &self.state_root,
+                    &addr.0,
+                    &plan.session,
+                )
+                .map_err(unavailable)?;
                 export
                     .activate(
                         &self.store_staged(cut, plan),
@@ -364,9 +364,6 @@ impl FileCutArtifacts {
                     )
                     .map_err(failure)?;
                 migration::unlink(&sidecar.with_extension("moved")).map_err(unavailable)?;
-                self.driver
-                    .drop_projection(&plan.session)
-                    .map_err(unavailable)?;
             }
             _ => {}
         }

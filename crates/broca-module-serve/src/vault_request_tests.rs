@@ -647,7 +647,7 @@ async fn executor_with_vault_addressing(
         .await
         .unwrap();
     LiveLoopExecutor::new(
-        Arc::new(FileWalStore::new(root.join("wal"))),
+        root,
         Arc::new(SubcToolPlane::new(tool_conn, "unused")),
         None,
     )

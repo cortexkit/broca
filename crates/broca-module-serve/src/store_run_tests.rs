@@ -10,7 +10,7 @@ fn store_run_parent_future_stays_small() {
         std::mem::size_of::<F>()
     }
     let bytes = future_size(|| {
-        LiveLoopExecutor::<FileWalStore>::run_on_store(
+        LiveLoopExecutor::run_on_store(
             todo!(),
             todo!(),
             todo!(),

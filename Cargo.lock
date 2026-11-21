@@ -652,6 +652,7 @@ dependencies = [
  "broca-core",
  "broca-owner-only",
  "broca-protocol",
+ "broca-session-store",
  "broca-test-support",
  "broca-wal",
  "cortexkit-bus-naming",

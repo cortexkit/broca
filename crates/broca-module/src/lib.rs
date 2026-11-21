@@ -92,4 +92,3 @@ pub use serve::{
 pub mod cut_state;
 mod keep_warm;
 pub mod move_files;
-pub mod move_install;

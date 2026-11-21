@@ -37,7 +37,7 @@ impl TierServeRig {
         let store = Arc::new(broca_store::SqliteStore::open(root.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
             &root.join("store.db"),
-            &broca_core::ReadOnlyWalReader::new(root),
+            &broca_store::session_refs::StoredSessions::new(root),
         )
         .unwrap();
         let executor: Arc<dyn RunExecutor> = Arc::new(live);

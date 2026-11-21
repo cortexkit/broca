@@ -318,6 +318,17 @@ impl Driver {
         .await
         .map_err(|e| unavailable(format!("{e:?}")))?;
         let busy = store_busy(&view);
+        // A prepare of a session with pending work is refused before any door traffic.
+        if let (Op::Prepare, Some(reason)) = (op, busy) {
+            return Err(broca_module::move_files::busy(
+                vec![broca_module::move_files::busy_ref(
+                    reference,
+                    reason,
+                    "source has pending work",
+                )],
+                "source has pending work",
+            ));
+        }
         // The move checks travel with an export; `busy` and `diverged` send none.
         if busy.is_none() && !matches!(op, Op::Busy | Op::Diverged) {
             export.checks = super::snapshot::store_snapshot(&export, runtime.deployment())
@@ -326,7 +337,9 @@ impl Driver {
         }
         let (head, _) = export.head(&addr, runtime.deployment()).map_err(failure)?;
         let cached = self.root.join("session-store-moves/streams").join(&addr.0);
-        let (bytes, end_offset, digest, store_prefix) = if op == Op::Busy {
+        // A session that never moved has no cached stream; `diverged` compares it by its files.
+        let streamless = op == Op::Diverged && !cached.exists();
+        let (bytes, end_offset, digest, store_prefix) = if op == Op::Busy || streamless {
             // A busy answer names only the session's state and format, never a stream.
             (Vec::new(), 0, String::new(), None)
         } else if op == Op::Prepare {
@@ -352,14 +365,29 @@ impl Driver {
         let mut divergence_reason = busy.map(str::to_owned);
         let divergence = if op == Op::Diverged {
             match self.incoming(reference, cut, op).await {
+                Ok(incoming) if streamless => Some(
+                    match same_files(&incoming.bytes, &export, &addr, runtime.deployment()) {
+                        Ok(true) => LocalDivergence::AtCut,
+                        Ok(false) => LocalDivergence::Advanced,
+                        Err(cause) => {
+                            tracing::error!(session_ref = %reference, cut, cause, "agent-data cannot compare the cut with a held ref");
+                            divergence_reason = Some(cause);
+                            LocalDivergence::Unknown
+                        }
+                    },
+                ),
                 Ok(incoming) => {
-                    // The cached stream is what the move brought; the session itself can have
-                    // gone on here since, which the stream never shows. So the copy is at the cut
-                    // only when the door's bytes match the stream and the session holds no record
-                    // past the stream's last export.
-                    let at_cut = incoming.end == end_offset
-                        && incoming.digest == digest
-                        && view.next_seq()
+                    // The cached stream is what the last move here brought or sent. Every move
+                    // appends one export to the session's stream, so a cut whose stream starts
+                    // with this one holds everything it held: the same cut, or one moving the
+                    // session back after it went on elsewhere. The session itself can have gone
+                    // on here since, which the stream never shows. So the copy is at the cut only
+                    // when the cut's stream passes through the cached stream's end with the same
+                    // digest, and the session holds no record past the stream's last export.
+                    let at_cut =
+                        incoming.frame_ends.iter().any(|(end, frame_digest)| {
+                            *end == end_offset && *frame_digest == digest
+                        }) && view.next_seq()
                             == exported_next_seq(&bytes, &addr, runtime.deployment()).await?;
                     Some(if at_cut {
                         LocalDivergence::AtCut
@@ -438,6 +466,37 @@ impl Driver {
 
 /// The sequence number the next record of the session at `addr` would take, as the last export
 /// in the move stream `stream` holds it.
+/// The plan `diverged` answers for a held session it can't read: its divergence unknown.
+pub(super) fn unreadable_divergence(reference: &str, session: &BindIdentity) -> PlannedSession {
+    PlannedSession {
+        store_prefix: None,
+        reference: reference.into(),
+        session: session.clone(),
+        end_offset: 0,
+        digest: String::new(),
+        sealed_digest: None,
+        bytes: vec![],
+        format: moves::FORMAT.into(),
+        lineage_id: String::new(),
+        local_archive: None,
+        divergence: Some(LocalDivergence::Unknown),
+        divergence_reason: None,
+    }
+}
+
+/// Whether the cut in `stream` holds exactly the session files `local` pins, in the same
+/// storage class: the comparison import makes before it refuses a local copy as advanced.
+fn same_files(
+    stream: &[u8],
+    local: &Export,
+    addr: &SessionAddr,
+    deployment: &broca_session_store::keys::DeploymentKey,
+) -> Result<bool, String> {
+    let frame = moves::last_export(stream).map_err(|error| format!("{error:?}"))?;
+    let incoming = Export::decode(frame, addr, deployment).map_err(|error| format!("{error:?}"))?;
+    Ok(incoming.header.class == local.header.class && incoming.files == local.files)
+}
+
 async fn exported_next_seq(
     stream: &[u8],
     addr: &SessionAddr,

@@ -119,14 +119,17 @@ async fn held_migration_serves_known_pairs_and_signals_new_pairs_single_flight()
 #[tokio::test]
 async fn failed_migration_refuses_new_pairs_and_can_be_retried() {
     let fixture = Fixture::new();
-    std::fs::write(fixture.root.join("wal"), b"not a directory").unwrap();
+    // A session store that can't be listed fails the census.
+    let store = broca_wal::StorageClass::Durable.store_root(&fixture.root);
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    std::fs::write(&store, b"not a directory").unwrap();
     let error = fixture.resolve("failed").await.unwrap().unwrap_err();
     assert_eq!(error.code(), "session_address_unavailable");
     assert!(matches!(
         error,
         SessionAddressError::Unavailable(InventoryUnavailable::MigrationFailed(_))
     ));
-    std::fs::remove_file(fixture.root.join("wal")).unwrap();
+    std::fs::remove_file(&store).unwrap();
     assert_eq!(
         fixture.resolve("recovered").await.unwrap().unwrap(),
         new_unscoped("recovered")
@@ -169,7 +172,7 @@ async fn a_mid_run_gap_marker_is_repaired_by_the_next_new_pair_bind() {
     let fixture = Fixture::new();
     broca_store::session_refs::migrate(
         &fixture.root.join("run-index.db"),
-        &broca_core::ReadOnlyWalReader::new(&fixture.root),
+        &broca_store::session_refs::StoredSessions::new(&fixture.root),
     )
     .unwrap();
     assert_eq!(

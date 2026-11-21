@@ -336,7 +336,7 @@ async fn multi_ref_release_failure_retains_intent_fence_and_boot_completes_every
         .unwrap();
     assert_eq!(std::fs::read(store.path(CUT)).unwrap(), before);
     assert_eq!(
-        broca_wal::migration::cut_fence(&root.join("wal"), "b").unwrap(),
+        broca_wal::migration::cut_fence(&root, "b").unwrap(),
         Some(CUT.into())
     );
     artifacts.fail_after.store(usize::MAX, Ordering::SeqCst);
@@ -499,7 +499,7 @@ async fn activate_failure_fences_the_first_installed_ref_and_refuses_abort() {
     );
     let before = std::fs::read(store.path(CUT)).unwrap();
     assert_eq!(
-        broca_wal::migration::cut_fence(&root.join("wal"), "a").unwrap(),
+        broca_wal::migration::cut_fence(&root, "a").unwrap(),
         Some(CUT.into())
     );
     assert_eq!(std::fs::read(artifacts.path("a")).unwrap(), b"cut:a");
@@ -536,10 +536,7 @@ async fn activate_failure_fences_the_first_installed_ref_and_refuses_abort() {
         .unwrap();
     assert!(store.load(CUT).unwrap().intent.is_none());
     assert_eq!(std::fs::read(artifacts.path("b")).unwrap(), b"cut:b");
-    assert_eq!(
-        broca_wal::migration::cut_fence(&root.join("wal"), "a").unwrap(),
-        None
-    );
+    assert_eq!(broca_wal::migration::cut_fence(&root, "a").unwrap(), None);
 }
 
 #[tokio::test]
@@ -744,7 +741,7 @@ async fn a_damaged_cut_file_does_not_stop_boot_reconciliation() {
         "the damaged cut is left untouched"
     );
     assert!(
-        broca_wal::migration::cut_fence(&root.join("wal"), "b").is_err(),
+        broca_wal::migration::cut_fence(&root, "b").is_err(),
         "the move fence still fails closed on the damaged cut"
     );
 }

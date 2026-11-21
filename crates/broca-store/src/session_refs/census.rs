@@ -1,6 +1,6 @@
+use super::stored::{Stored, StoredSessions};
 use super::{backfill, batches::write_batch, insert, MigrationWriteStats};
 use crate::StoreError;
-use broca_core::ReadOnlyWalReader;
 use rusqlite::Connection;
 use std::time::Instant;
 
@@ -9,7 +9,7 @@ pub struct CensusCounts {
     pub addresses: u64,
     pub resumed: u64,
     pub not_represented: u64,
-    /// Addresses whose WAL could not be read, never evidence that a session is absent.
+    /// Addresses whose session head could not be read, never evidence that a session is absent.
     pub unreadable: u64,
     pub bytes_read: u64,
     pub elapsed_ms: u128,
@@ -50,7 +50,7 @@ fn pace_duration(elapsed: std::time::Duration, enabled: bool) {
 
 pub(super) fn run(
     conn: &mut Connection,
-    wal: &ReadOnlyWalReader,
+    sessions: &StoredSessions,
     limit: Option<usize>,
     paced: bool,
 ) -> Result<CensusCounts, StoreError> {
@@ -67,8 +67,8 @@ pub(super) fn run(
         return Ok(counts);
     }
     let work = Instant::now();
-    let addresses = wal.addresses().map_err(|_| {
-        StoreError::InconsistentSnapshot("cannot enumerate WAL addresses for session-ref census")
+    let addresses = sessions.addresses().map_err(|_| {
+        StoreError::InconsistentSnapshot("cannot list stored sessions for session-ref census")
     })?;
     let discovery_work = work.elapsed();
     let queue: Vec<_> = addresses.iter().collect();
@@ -137,61 +137,38 @@ pub(super) fn run(
             if !addresses.contains(&address) {
                 actions.push(Action::Unreadable(
                     address,
-                    "inventory_unobserved: this pass did not establish a current WAL source".into(),
+                    "inventory_unobserved: this pass found no stored session at this address"
+                        .into(),
                 ));
                 processed += 1;
                 continue;
             }
-            {
-                let represented: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM agent_data_session_ref WHERE address=?1)
-                    AND NOT EXISTS(SELECT 1 FROM agent_data_census_inflight WHERE address=?1)",
-                    [&address],
-                    |row| row.get(0),
-                )?;
-                let read = if represented {
-                    wal.probe(&address).map(|bytes| (None, bytes))
-                } else {
-                    counts.not_represented += 1;
-                    wal.records(&address)
-                        .map(|(records, bytes)| (Some(records), bytes))
-                };
-                let (records, bytes) = match read {
-                    Ok(read) => read,
-                    Err(error) => {
-                        let reason = error.to_string();
-                        tracing::warn!(%address, %reason, "session-ref census quarantined an unreadable WAL; coverage remains incomplete");
-                        actions.push(Action::Unreadable(address, reason));
-                        processed += 1;
-                        continue;
+            let represented: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_data_session_ref WHERE address=?1)
+                AND NOT EXISTS(SELECT 1 FROM agent_data_census_inflight WHERE address=?1)",
+                [&address],
+                |row| row.get(0),
+            )?;
+            if !represented {
+                counts.not_represented += 1;
+            }
+            match sessions.identity(&address) {
+                Ok(Stored::Session { identity, bytes }) => {
+                    counts.bytes_read += bytes;
+                    if !represented {
+                        // Persist an in-flight row before candidate insertion. After a crash, a
+                        // partial ref row must not make resume skip this address; Covered
+                        // removes the row after the candidate.
+                        actions.push(Action::Begin(address.clone()));
+                        actions.push(Action::Candidate(address.clone(), identity));
                     }
-                };
-                counts.bytes_read += bytes;
-                if let Some(records) = records {
-                    // Persist an in-flight row before candidate insertion. After a
-                    // crash, a partial ref row must not make resume skip the rest
-                    // of this WAL; Covered removes the row after all candidates.
-                    actions.push(Action::Begin(address.clone()));
-                    let mut candidates = std::collections::BTreeMap::new();
-                    for frame in records {
-                        if let broca_wal::WalRecord::RunStarted { session, .. } = frame.record {
-                            if broca_core::session_addr(&session) == address {
-                                candidates.insert(
-                                    broca_core::wal_writer::legacy_session_ref(
-                                        &session.harness,
-                                        &session.project_root.to_string_lossy(),
-                                        &session.session,
-                                    ),
-                                    session,
-                                );
-                            }
-                        }
-                    }
-                    actions.extend(
-                        candidates
-                            .into_values()
-                            .map(|session| Action::Candidate(address.clone(), session)),
-                    );
+                }
+                Ok(Stored::NoSession) => {}
+                Err(reason) => {
+                    tracing::warn!(%address, %reason, "session-ref census quarantined an unreadable session; coverage remains incomplete");
+                    actions.push(Action::Unreadable(address, reason));
+                    processed += 1;
+                    continue;
                 }
             }
             actions.push(Action::Covered(address));
@@ -299,7 +276,10 @@ pub(super) fn run(
 
 /// A separate SQLite connection lets moves observe an incomplete snapshot while
 /// the one-time backfill runs, instead of holding the serving connection's mutex.
-pub fn migrate(db: &std::path::Path, wal: &ReadOnlyWalReader) -> Result<CensusCounts, StoreError> {
+pub fn migrate(
+    db: &std::path::Path,
+    sessions: &StoredSessions,
+) -> Result<CensusCounts, StoreError> {
     let root = db.parent().unwrap_or_else(|| std::path::Path::new("."));
     let incomplete = broca_core::session_projection_incomplete(root).map_err(|_| {
         StoreError::InconsistentSnapshot("cannot inspect session-ref projection incomplete marker")
@@ -355,7 +335,7 @@ pub fn migrate(db: &std::path::Path, wal: &ReadOnlyWalReader) -> Result<CensusCo
     }
     let backfilled = backfill(&conn)?;
     writes.merge(backfilled.writes);
-    let mut counts = run(&mut conn, wal, None, true)?;
+    let mut counts = run(&mut conn, sessions, None, true)?;
     counts.writes.merge(writes);
     if incomplete && counts.complete {
         counts.complete = match repair {
@@ -382,6 +362,9 @@ pub fn migrate(db: &std::path::Path, wal: &ReadOnlyWalReader) -> Result<CensusCo
     Ok(counts)
 }
 
-pub fn census(conn: &mut Connection, wal: &ReadOnlyWalReader) -> Result<CensusCounts, StoreError> {
-    run(conn, wal, None, true)
+pub fn census(
+    conn: &mut Connection,
+    sessions: &StoredSessions,
+) -> Result<CensusCounts, StoreError> {
+    run(conn, sessions, None, true)
 }

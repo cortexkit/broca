@@ -422,15 +422,14 @@ pub fn release(
 /// Find a pending release or activation naming this session's shared contract
 /// ref. Refuse on unreadable cut JSON: otherwise a reader could append to an
 /// installed WAL before the move's completion is durably recorded.
-/// `session_ref` comes from the shared role helper, never the WAL filename hash.
-pub fn cut_fence(wal_root: &Path, session_ref: &str) -> io::Result<Option<String>> {
-    if let Some(fence) = fence_index::check(wal_root, session_ref)? {
+/// `session_ref` is the agent-data ref (`cortexkit_role_llm_runner::session_ref`), never the
+/// session's address. `state_root`
+/// is broca's state root, which keeps the cuts under `agent-data/`.
+pub fn cut_fence(state_root: &Path, session_ref: &str) -> io::Result<Option<String>> {
+    if let Some(fence) = fence_index::check(state_root, session_ref)? {
         return Ok(fence);
     }
-    let cuts = wal_root
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("agent-data/cuts");
+    let cuts = state_root.join("agent-data/cuts");
     let entries = match fs::read_dir(cuts) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -511,7 +510,10 @@ pub fn check_refs(
     let wal = canonical.as_deref().unwrap_or(wal);
     if write {
         for session_ref in session_refs {
-            if let Some(cut_id) = cut_fence(wal.parent().unwrap_or(Path::new(".")), session_ref)? {
+            let wal_root = wal.parent().unwrap_or(Path::new("."));
+            if let Some(cut_id) =
+                cut_fence(wal_root.parent().unwrap_or(Path::new(".")), session_ref)?
+            {
                 return Ok(Err(MoveRefusal::Moving { cut_id }));
             }
         }

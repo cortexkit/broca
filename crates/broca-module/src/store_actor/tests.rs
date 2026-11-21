@@ -2562,8 +2562,11 @@ impl Inventory {
     pub(super) fn open(dir: &std::path::Path, state_root: &std::path::Path) -> Self {
         let db = dir.join("store.db");
         let store = Arc::new(broca_store::SqliteStore::open(&db).unwrap());
-        broca_store::session_refs::migrate(&db, &broca_core::ReadOnlyWalReader::new(state_root))
-            .unwrap();
+        broca_store::session_refs::migrate(
+            &db,
+            &broca_store::session_refs::StoredSessions::new(state_root),
+        )
+        .unwrap();
         Self { store, db }
     }
 

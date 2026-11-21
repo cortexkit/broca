@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use broca_core::{FileLeaseStore, FileWalStore};
+use broca_core::FileLeaseStore;
 use broca_module::LineageRegistry;
 use broca_module_serve::{
     spawn_catalog_poll, CatalogPoller, ChargeBasisTable, ConsumerRoutes, ServeEnd, ServeIoError,
@@ -366,10 +366,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
     // The session classes whose new sessions start in the backed-up root.
     let backup_class_names = backup_classes.0.clone();
-    let wal_store = Arc::new(
-        FileWalStore::with_config(state_root.join("wal"), wal_config)
-            .with_backup_classes(backup_classes.0),
-    );
 
     // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
     // provider's late results under broca's own principal and hands them to the run's batch.
@@ -421,8 +417,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| ServeIoError(format!("open run index: {error}")))?
         .with_wal_config(wal_config),
     );
-    wal_store.set_session_ref_index(index.clone());
-    wal_store.set_served_history(index.clone());
     let run_index = Some(index);
     // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
     // file is no longer opened; it is left on disk untouched rather than deleted.
@@ -480,7 +474,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     plan_conn.follow_catalog();
     let tool_route_health_plane = Arc::clone(&plane);
     let executor_impl =
-        executor::LiveLoopExecutor::new(wal_store.clone(), plane, provider_base_url);
+        executor::LiveLoopExecutor::new(state_root.clone(), plane, provider_base_url);
     let mut executor_impl = executor_impl
     .with_provider_held_lifecycle(held_runtime.slots.clone())
     .with_hook_plane(Arc::new(broca_subc::SubcHookPlane::new(plan_conn.clone())))
@@ -766,7 +760,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             "the new storage could not be opened without its deployment key: {error}"
         );
     }
-    let move_wal = wal_store.clone();
     let store_move_leases: Arc<dyn broca_core::LeaseStore> = lease_store.clone();
     // Both live hints and durable run events share this process's credential and broker link.
     let bus_connector = Arc::new(broca_module_serve::bus_events_nats::NatsConnector::new(
@@ -966,7 +959,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_module_serve::agent_data::AgentDataService::new(
             state_root.clone(),
             registry.as_ref().clone(),
-            move_wal,
             legacy.clone(),
             door,
         )

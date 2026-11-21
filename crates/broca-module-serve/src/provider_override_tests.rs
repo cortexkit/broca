@@ -585,7 +585,7 @@ fn deepseek_episode_admitted_before_the_reasoning_echo_resumes_with_its_bytes() 
 async fn stand_in_executor(root: &std::path::Path) -> (LiveLoopExecutor, tokio::task::JoinHandle<()>) {
     let (plane, server) = stand_in_plane(root).await;
     let executor = LiveLoopExecutor::new(
-        Arc::new(FileWalStore::new(root.join("wal"))),
+        root.to_path_buf(),
         plane,
         None,
     );

@@ -246,6 +246,12 @@ impl Live {
         let quoted = executable.to_string_lossy().replace('\'', "'\\''");
         std::fs::write(&script,format!("#!/bin/sh\nexec '{quoted}' --exact real_daemon::supervised_fake_session_door --ignored --nocapture\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir_all(config.join("cortexkit/broca")).unwrap();
+        std::fs::write(
+            config.join("cortexkit/broca/broca.jsonc"),
+            "{\n  // no deployment-key vault here: sessions are stored plain\n  \"session_storage\": {\"encryption\": \"off\"},\n}\n",
+        )
+        .unwrap();
         let config_file = config.join("cortexkit/subc.jsonc");
         // Launch broca under its dev name, as every test rig does, never the production
         // `ck-broca` name that operator tools and process lists treat as the live module.
@@ -361,8 +367,18 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
     }
     let shared = root("real-door");
     std::fs::create_dir_all(&shared).unwrap();
-    let source = Rig::new("real-source", Arc::new(FakeDoor::default()));
-    let receiver = Rig::new("real-receiver", Arc::new(FakeDoor::default()));
+    // The daemons keep their sessions plain: no vault holds a deployment key here.
+    let plain = || {
+        broca_session_store::keys::DeploymentKey::new(7, &[4; 32])
+            .creating(broca_session_store::keys::Cipher::None)
+    };
+    let source = rig(root("real-source"), Arc::new(FakeDoor::default()), plain()).await;
+    let receiver = rig(
+        root("real-receiver"),
+        Arc::new(FakeDoor::default()),
+        plain(),
+    )
+    .await;
     // Keep the log paths outside the timed future: cancelling startup must not
     // discard the only diagnostics for a module that never registered.
     let logs = LiveLogGuard([source.root.clone(), receiver.root.clone()]);
@@ -370,10 +386,10 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
         "two real agent-data daemons move and move back",
         async {
             let session = source.session("real-move");
-            source.seed_tool_run(&session, "source-tool-run");
+            source.seed(&session, true).await;
             let params = source.params(CUT, std::slice::from_ref(&session));
             let reference = params["refs"][0]["ref"].as_str().unwrap();
-            let before = source.bytes(&session);
+            let before = source.stored(&session);
             let from = Live::start(&source, &shared, &daemon_bin, &fake_bin).await;
             let to = Live::start(&receiver, &shared, &daemon_bin, &fake_bin).await;
             from.call("prepare", params.clone()).await.unwrap();
@@ -381,7 +397,13 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
             assert_eq!(from.call("export", params.clone()).await.unwrap(), exported);
             assert_eq!(
                 std::fs::read(shared.join("streams").join(reference)).unwrap(),
-                before
+                std::fs::read(
+                    source
+                        .root
+                        .join("session-store-moves/streams")
+                        .join(broca_core::session_addr(&session))
+                )
+                .unwrap()
             );
             seal_door(&shared, CUT, reference);
             std::fs::write(
@@ -390,18 +412,17 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
             )
             .unwrap();
             assert_code(to.call("import", params.clone()).await, "unavailable");
-            assert!(!receiver.root.join("wal-staging").exists());
+            assert_nothing_staged(&receiver);
             std::fs::remove_file(shared.join("omit-digest")).unwrap();
             to.call("import", params.clone()).await.unwrap();
             to.call("activate", params.clone()).await.unwrap();
-            assert_eq!(receiver.bytes(&session), before);
+            receiver.registry.check_move(&session, true).unwrap();
             let mut release = params.clone();
             release["holder"] = json!("receiver-mac");
             from.call("release", release).await.unwrap();
-            assert!(source.wal.check_move(&session, false).is_err());
-            receiver.seed_tool_run(&session, "receiver-tool-run");
-            let extended = receiver.bytes(&session);
-            assert!(extended.starts_with(&before));
+            assert!(source.registry.check_move(&session, false).is_err());
+            assert_ne!(source.stored(&session), before);
+            receiver.extend(&session).await;
             let back = receiver.params(BACK, std::slice::from_ref(&session));
             to.call("prepare", back.clone()).await.unwrap();
             to.call("export", back.clone()).await.unwrap();
@@ -412,19 +433,19 @@ async fn two_real_daemons_move_and_move_back_through_the_attested_door() {
             );
             from.call("import", back.clone()).await.unwrap();
             from.call("activate", back).await.unwrap();
-            assert_eq!(source.bytes(&session), extended);
-            assert!(source.wal.check_move(&session, true).is_ok());
-            source.seed_tool_run(&session, "source-fork-after-rejoin");
+            assert!(source.registry.check_move(&session, true).is_ok());
+            // Work done here after the session came back is ahead of any cut of its old copy.
+            source.extend(&session).await;
             let fork_cut = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
             seal_door(&shared, fork_cut, reference);
             let fork = source.params(fork_cut, std::slice::from_ref(&session));
-            let fork_bytes = source.bytes(&session);
+            let fork_files = source.stored(&session);
             assert_eq!(
                 from.call("diverged", fork.clone()).await.unwrap(),
                 json!({"refs":[{"state":"advanced"}]})
             );
             assert_code(from.call("import", fork).await, "local_advanced");
-            assert_eq!(source.bytes(&session), fork_bytes);
+            assert_eq!(source.stored(&session), fork_files);
             assert_eq!(
                 std::fs::read_to_string(shared.join("broca-principal-observed")).unwrap(),
                 "reserved:broca"

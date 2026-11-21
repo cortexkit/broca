@@ -1,21 +1,57 @@
 use super::*;
-use broca_core::{ReadOnlyWalReader, WalStore};
-use broca_protocol::ModelHandle;
 use std::sync::Arc;
 
-fn started(session: &BindIdentity, retained: bool) -> broca_wal::WalRecord {
-    let mut record = crate::conformance::run_started(
-        1,
-        "run",
-        session,
-        "fixture",
-        ModelHandle::new("stub", "model"),
-    )
-    .record;
-    if let broca_wal::WalRecord::RunStarted { retention, .. } = &mut record {
-        *retention = retained.then_some(3600);
-    }
-    record
+/// Stores `session` as the session store keeps a session, with only its head, in storage
+/// class `class` of the state root `root`.
+pub(super) fn stored_in(
+    root: &std::path::Path,
+    session: &BindIdentity,
+    class: broca_wal::StorageClass,
+) {
+    use broca_session_store::{
+        backend::{LocalBackend, SessionAddr},
+        head::SessionTriple,
+        keys::{Cipher, DeploymentKey},
+        session::Session,
+    };
+    let backend = LocalBackend::new(class.store_root(root));
+    let key = DeploymentKey::new(7, &[4; 32]).creating(Cipher::None);
+    let triple = SessionTriple {
+        project_root: session.project_root.display().to_string(),
+        harness: session.harness.clone(),
+        session: session.session.clone(),
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            Session::create(
+                backend,
+                SessionAddr(session_addr(session)),
+                triple,
+                &key,
+                false,
+            )
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        });
+}
+
+/// As [`stored_in`], in the durable class.
+pub(super) fn stored(root: &std::path::Path, session: &BindIdentity) {
+    stored_in(root, session, broca_wal::StorageClass::Durable);
+}
+
+/// The head file of `session`, stored by [`stored`].
+pub(super) fn head_path(root: &std::path::Path, session: &BindIdentity) -> std::path::PathBuf {
+    broca_wal::StorageClass::Durable
+        .store_root(root)
+        .join("heads")
+        .join(session_addr(session))
+        .join("head")
 }
 
 #[test]
@@ -118,34 +154,15 @@ fn unfinished_backfill_and_legacy_admissions_keep_absence_unknown() {
 }
 
 #[test]
-fn store_lookup_survives_live_retained_and_archived_locations() {
-    for population in ["live", "retained", "archived"] {
+fn store_lookup_finds_a_session_in_any_storage_class() {
+    for class in broca_wal::StorageClass::ALL {
         let root = broca_test_support::scratch_root()
-            .join(format!("session-ref-{}-{population}", std::process::id()));
+            .join(format!("session-ref-{}-{class}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let index = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
-        let wal = broca_core::FileWalStore::new(root.join("wal"));
-        wal.set_session_ref_index(index.clone());
-        let session = BindIdentity::new("/realistic/project/root", "broca", population);
-        let retained = population == "retained";
-        wal.open_with_retention(&session, retained.then_some(3600))
-            .unwrap()
-            .append(1, &started(&session, retained), true)
-            .unwrap();
-        let bytes = wal.bytes_for_move(&session).unwrap().unwrap();
-        if population == "archived" {
-            let directory = root.join("wal-archive");
-            std::fs::create_dir_all(&directory).unwrap();
-            let mut archive =
-                broca_wal::archive::ArchiveWriter::create(directory.join("fold-1.ark"))
-                    .unwrap()
-                    .without_feature_floor();
-            archive.append(&session_addr(&session), &bytes).unwrap();
-            archive.seal().unwrap();
-            std::fs::remove_file(wal.wal_path(&session)).unwrap();
-        }
-        drop(index);
-        migrate(&root.join("run-index.db"), &ReadOnlyWalReader::new(&root)).unwrap();
+        drop(SqliteStore::open(root.join("run-index.db")).unwrap());
+        let session = BindIdentity::new("/realistic/project/root", "broca", class.name());
+        stored_in(&root, &session, class);
+        migrate(&root.join("run-index.db"), &StoredSessions::new(&root)).unwrap();
         let reopened = SqliteStore::open(root.join("run-index.db")).unwrap();
         let reference = agent_session_ref(&session);
         let found = reopened
@@ -155,7 +172,6 @@ fn store_lookup_survives_live_retained_and_archived_locations() {
         let (address, identity) = &found.sessions[&reference];
         assert_eq!(address, &session_addr(&session));
         assert_eq!(identity, &session);
-        assert_eq!(wal.bytes_for_move(identity).unwrap().unwrap(), bytes);
     }
 }
 
@@ -172,140 +188,16 @@ fn historical_triples_never_alias_a_physical_address() {
         .is_empty());
 }
 
-#[test]
-fn legacy_cleanup_removes_only_inventory_artifacts() {
-    let root = broca_test_support::scratch_root()
-        .join(format!("inventory-cleanup-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    for name in [
-        "move-inventory.json",
-        "move-inventory.tmp-12-34",
-        "move-inventory.tmp-56-78",
-        "run-index.db",
-        "move-inventory.other",
-    ] {
-        std::fs::write(root.join(name), b"123456789").unwrap();
-    }
-    assert_eq!(cleanup_legacy_inventory(&root).unwrap(), (3, 27));
-    assert!(root.join("run-index.db").exists());
-    assert!(root.join("move-inventory.other").exists());
-    assert_eq!(cleanup_legacy_inventory(&root).unwrap(), (0, 0));
-}
-
-#[test]
-fn legacy_cleanup_skips_an_entry_vanished_before_metadata() {
-    let root = broca_test_support::scratch_root().join("inventory-vanished-before-metadata");
-    std::fs::create_dir_all(&root).unwrap();
-    let vanished = root.join("move-inventory.tmp-vanished");
-    std::fs::write(&vanished, b"gone").unwrap();
-    std::fs::write(root.join("move-inventory.json"), b"kept").unwrap();
-    let mut removed = false;
-    let result = cleanup_legacy_inventory_with(
-        &root,
-        |path| {
-            if !removed {
-                std::fs::remove_file(path).unwrap();
-                removed = true;
-            }
-            std::fs::symlink_metadata(path)
-        },
-        |path| std::fs::remove_file(path),
-    );
-    assert!(removed);
-    assert_eq!(result.unwrap(), (1, 4));
-    assert!(!vanished.exists());
-    assert!(!root.join("move-inventory.json").exists());
-}
-
-#[test]
-fn legacy_cleanup_skips_an_entry_vanished_before_removal() {
-    let root = broca_test_support::scratch_root().join("inventory-vanished-before-removal");
-    std::fs::create_dir_all(&root).unwrap();
-    let vanished = root.join("move-inventory.tmp-vanished");
-    std::fs::write(&vanished, b"gone").unwrap();
-    std::fs::write(root.join("move-inventory.json"), b"kept").unwrap();
-    let mut removed = false;
-    let result = cleanup_legacy_inventory_with(
-        &root,
-        |path| std::fs::symlink_metadata(path),
-        |path| {
-            if !removed {
-                std::fs::remove_file(path).unwrap();
-                removed = true;
-            }
-            std::fs::remove_file(path)
-        },
-    );
-    assert!(removed);
-    assert_eq!(result.unwrap(), (1, 4));
-    assert!(!vanished.exists());
-    assert!(!root.join("move-inventory.json").exists());
-}
-
-#[test]
-fn legacy_cleanup_preserves_permission_errors() {
-    for fail_metadata in [true, false] {
-        let root = broca_test_support::scratch_root().join("inventory-permission-error");
-        std::fs::create_dir_all(&root).unwrap();
-        let artifact = root.join("move-inventory.json");
-        std::fs::write(&artifact, b"kept").unwrap();
-        let result = cleanup_legacy_inventory_with(
-            &root,
-            |path| {
-                if fail_metadata {
-                    Err(std::io::ErrorKind::PermissionDenied.into())
-                } else {
-                    std::fs::symlink_metadata(path)
-                }
-            },
-            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
-        );
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        assert!(artifact.exists());
-    }
-}
-
-#[test]
-fn legacy_cleanup_rejects_missing_or_non_directory_roots() {
-    let root = broca_test_support::scratch_root().join("inventory-missing-root");
-    assert_eq!(
-        cleanup_legacy_inventory(&root).unwrap_err().kind(),
-        std::io::ErrorKind::NotFound
-    );
-    std::fs::write(&root, b"not a directory").unwrap();
-    assert!(cleanup_legacy_inventory(&root).is_err());
-}
-
-#[test]
-fn legacy_cleanup_rejects_a_root_vanished_during_scan() {
-    let root = broca_test_support::scratch_root().join("inventory-root-vanished");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("move-inventory.json"), b"gone").unwrap();
-    let result = cleanup_legacy_inventory_with(
-        &root,
-        |path| {
-            std::fs::remove_dir_all(&root).unwrap();
-            std::fs::symlink_metadata(path)
-        },
-        |path| std::fs::remove_file(path),
-    );
-    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
-}
-
+/// A session admitted while the index can't take its row keeps the index marked incomplete, so
+/// its ref is unknown rather than absent, and a census then finds it in the session store.
 #[test]
 fn locked_projection_keeps_admission_and_repair_recovers_session() {
     let root = broca_test_support::scratch_root()
         .join(format!("session-ref-locked-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
     let index = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
-    wal.set_session_ref_index(index.clone());
     let session = BindIdentity::new("/project", "broca", "during-outage");
-    let mut writer = wal.open(&session).unwrap();
-    migrate(&root.join("run-index.db"), &ReadOnlyWalReader::new(&root)).unwrap();
+    migrate(&root.join("run-index.db"), &StoredSessions::new(&root)).unwrap();
     let reference = agent_session_ref(&session);
     assert!(
         index
@@ -315,11 +207,16 @@ fn locked_projection_keeps_admission_and_repair_recovers_session() {
     );
     let blocker = Connection::open(root.join("run-index.db")).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-    assert_eq!(
-        writer.append(1, &started(&session, false), true).unwrap(),
-        1
-    );
-    assert_eq!(writer.replay().unwrap().len(), 1);
+    let admission = broca_core::record_candidate(
+        Some(index.as_ref()),
+        &root,
+        &session_addr(&session),
+        &session,
+    )
+    .unwrap();
+    assert!(admission.is_some());
+    stored(&root, &session);
+    drop(admission);
     let marker = root.join(broca_core::SESSION_PROJECTION_INCOMPLETE);
     assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
     #[cfg(unix)]
@@ -336,7 +233,7 @@ fn locked_projection_keeps_admission_and_repair_recovers_session() {
     assert!(!missing.complete);
     assert!(missing.sessions.is_empty());
     blocker.execute_batch("ROLLBACK").unwrap();
-    let counts = migrate(&root.join("run-index.db"), &ReadOnlyWalReader::new(&root)).unwrap();
+    let counts = migrate(&root.join("run-index.db"), &StoredSessions::new(&root)).unwrap();
     assert!(counts.complete);
     assert_eq!(counts.not_represented, 1);
     assert!(!marker.exists());
@@ -353,18 +250,12 @@ fn overlapping_census_late_unreadable_cannot_undo_committed_coverage() {
     std::fs::create_dir_all(&root).unwrap();
     let db = root.join("run-index.db");
     let store = SqliteStore::open(&db).unwrap();
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
     let session = BindIdentity::new("/census/project", "broca", "overlap");
-    wal.open(&session)
-        .unwrap()
-        .append(1, &started(&session, false), true)
-        .unwrap();
+    stored(&root, &session);
     let address = session_addr(&session);
-    let path = wal.wal_path(&session);
+    let path = head_path(&root, &session);
     let original = std::fs::read(&path).unwrap();
-    let mut damaged = original.clone();
-    damaged[21] ^= 1;
-    std::fs::write(&path, damaged).unwrap();
+    std::fs::write(&path, b"damaged head").unwrap();
     backfill(&store.conn.lock().unwrap()).unwrap();
 
     let root_b = root.clone();
@@ -373,20 +264,20 @@ fn overlapping_census_late_unreadable_cannot_undo_committed_coverage() {
     let b_observed = b_completed.clone();
     census::AFTER_READ_HOOK.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
-            // Pass A has read damaged bytes but has not committed its error. Pass B
-            // verifies repaired bytes and commits Covered before A resumes its write.
+            // Pass A has read a damaged head but has not committed its error. Pass B reads
+            // the repaired head and commits Covered before A resumes its write.
             std::fs::write(path, original).unwrap();
             let mut conn_b = rusqlite::Connection::open(db_b).unwrap();
             crate::busy::configure_writer_connection(&conn_b).unwrap();
             let covered =
-                census::run(&mut conn_b, &ReadOnlyWalReader::new(&root_b), None, false).unwrap();
+                census::run(&mut conn_b, &StoredSessions::new(&root_b), None, false).unwrap();
             assert!(covered.complete);
             b_observed.set(true);
         }))
     });
     let mut conn_a = rusqlite::Connection::open(&db).unwrap();
     crate::busy::configure_writer_connection(&conn_a).unwrap();
-    let late = census::run(&mut conn_a, &ReadOnlyWalReader::new(&root), None, false).unwrap();
+    let late = census::run(&mut conn_a, &StoredSessions::new(&root), None, false).unwrap();
     assert!(b_completed.get());
     assert!(late.complete);
     assert_eq!(late.unreadable, 0);
@@ -413,7 +304,7 @@ fn overlapping_census_late_unreadable_cannot_undo_committed_coverage() {
     conn_a
         .execute("DELETE FROM agent_data_census_done", [])
         .unwrap();
-    let resumed = census::run(&mut conn_a, &ReadOnlyWalReader::new(&root), None, false).unwrap();
+    let resumed = census::run(&mut conn_a, &StoredSessions::new(&root), None, false).unwrap();
     assert!(resumed.complete);
     assert_eq!(resumed.unreadable, 0);
     let reference = agent_session_ref(&session);
@@ -427,7 +318,7 @@ fn overlapping_census_late_unreadable_cannot_undo_committed_coverage() {
 #[test]
 fn census_unobserved_inventory_address_remains_uncovered_until_verified() {
     let root = broca_test_support::scratch_root().join("census-unobserved-address");
-    std::fs::create_dir_all(root.join("wal")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
     let store = SqliteStore::open(root.join("run-index.db")).unwrap();
     let session = BindIdentity::new("/census/project", "broca", "unobserved");
     let address = session_addr(&session);
@@ -452,7 +343,7 @@ fn census_unobserved_inventory_address_remains_uncovered_until_verified() {
     );
     let missing = census::run(
         &mut store.conn.lock().unwrap(),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
         None,
         false,
     )
@@ -481,14 +372,10 @@ fn census_unobserved_inventory_address_remains_uncovered_until_verified() {
             .unwrap();
         assert!(reason.starts_with("inventory_unobserved:"));
     }
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
-    wal.open(&session)
-        .unwrap()
-        .append(1, &started(&session, false), true)
-        .unwrap();
+    stored(&root, &session);
     let verified = census::run(
         &mut store.conn.lock().unwrap(),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
         None,
         false,
     )
@@ -506,27 +393,22 @@ fn census_unobserved_inventory_address_remains_uncovered_until_verified() {
 fn census_quarantines_damage_and_commits_healthy_coverage_across_restarts() {
     let root = broca_test_support::scratch_root().join("census-quarantine-restart");
     std::fs::create_dir_all(&root).unwrap();
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
     let store = SqliteStore::open(root.join("run-index.db")).unwrap();
     let mut sessions = Vec::new();
     for i in 0..3 {
         let session = BindIdentity::new("/census/project", "broca", format!("damage-{i}"));
-        wal.open(&session)
-            .unwrap()
-            .append(1, &started(&session, false), true)
-            .unwrap();
+        stored(&root, &session);
         sessions.push(session);
     }
     sessions.sort_by_key(broca_core::session_addr);
-    let path = wal.wal_path(&sessions[1]);
+    let path = head_path(&root, &sessions[1]);
     let original = std::fs::read(&path).unwrap();
-    let mut damaged = original.clone();
-    damaged[21] ^= 1;
+    let damaged = b"damaged head".to_vec();
     std::fs::write(&path, &damaged).unwrap();
     backfill(&store.conn.lock().unwrap()).unwrap();
     let first = census::run(
         &mut store.conn.lock().unwrap(),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
         Some(2),
         false,
     )
@@ -571,7 +453,7 @@ fn census_quarantines_damage_and_commits_healthy_coverage_across_restarts() {
     let reopened = SqliteStore::open(root.join("run-index.db")).unwrap();
     let second = census::run(
         &mut reopened.conn.lock().unwrap(),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
         None,
         false,
     )
@@ -581,7 +463,7 @@ fn census_quarantines_damage_and_commits_healthy_coverage_across_restarts() {
     assert_eq!(
         std::fs::read(&path).unwrap(),
         damaged,
-        "census readers must not repair WAL bytes"
+        "census readers must not repair a session head"
     );
     for session in [&sessions[0], &sessions[2]] {
         let reference = agent_session_ref(session);
@@ -612,7 +494,7 @@ fn census_quarantines_damage_and_commits_healthy_coverage_across_restarts() {
     std::fs::write(&path, &original).unwrap();
     let repaired = census::run(
         &mut reopened.conn.lock().unwrap(),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
         None,
         false,
     )
@@ -630,25 +512,21 @@ fn census_quarantines_damage_and_commits_healthy_coverage_across_restarts() {
 }
 
 #[test]
-fn census_resumes_coverage_without_replaying_covered_wals() {
+fn census_resumes_coverage_without_rereading_covered_sessions() {
     let root =
         broca_test_support::scratch_root().join(format!("census-resume-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
     let store = SqliteStore::open(root.join("run-index.db")).unwrap();
     let mut sessions = Vec::new();
     for i in 0..4 {
-        let session = BindIdentity::new("/legacy-import/project", "broca", format!("import-{i}"));
-        wal.open(&session)
-            .unwrap()
-            .append(1, &started(&session, false), true)
-            .unwrap();
+        let session = BindIdentity::new("/census/project", "broca", format!("resume-{i}"));
+        stored(&root, &session);
         sessions.push(session);
     }
     backfill(&store.conn.lock().unwrap()).unwrap();
     let first = census::run(
         &mut store.conn.lock().unwrap(),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
         Some(2),
         false,
     )
@@ -672,16 +550,24 @@ fn census_resumes_coverage_without_replaying_covered_wals() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    // If restart rereads a covered payload this corruption makes it fail. The
-    // actual move still rejects corrupt bytes; coverage is not byte authority.
+    // If restart rereads a covered session this damage makes it fail. A move still opens the
+    // head with its key and refuses a damaged one; coverage is not authority over the session.
     for address in &covered {
-        std::fs::write(root.join("wal").join(format!("{address}.wal")), b"corrupt").unwrap();
+        std::fs::write(
+            broca_wal::StorageClass::Durable
+                .store_root(&root)
+                .join("heads")
+                .join(address)
+                .join("head"),
+            b"corrupt",
+        )
+        .unwrap();
     }
     drop(store);
     let reopened = SqliteStore::open(root.join("run-index.db")).unwrap();
     let second = census::run(
         &mut reopened.conn.lock().unwrap(),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
         None,
         false,
     )
@@ -699,34 +585,68 @@ fn census_resumes_coverage_without_replaying_covered_wals() {
     }
 }
 
+/// A head whose session belongs at another address is damaged (copied, or written to the wrong
+/// folder): the census quarantines the address rather than map a ref to the wrong folder.
 #[test]
-fn census_repairs_legacy_imports_and_reads_existing_candidates_only_as_metadata() {
+fn census_quarantines_a_head_that_names_another_address() {
     let root =
-        broca_test_support::scratch_root().join(format!("census-legacy-{}", std::process::id()));
+        broca_test_support::scratch_root().join(format!("census-misplaced-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
     let store = SqliteStore::open(root.join("run-index.db")).unwrap();
-    let live = BindIdentity::new("/legacy/project", "broca", "represented");
-    let archived = BindIdentity::new("/legacy/project", "broca", "unindexed-archive");
-    for session in [&live, &archived] {
-        wal.open(session)
-            .unwrap()
-            .append(1, &started(session, false), true)
-            .unwrap();
-    }
-    store.record_session(&session_addr(&live), &live).unwrap();
-    let bytes = wal.bytes_for_move(&archived).unwrap().unwrap();
-    std::fs::create_dir_all(root.join("wal-archive")).unwrap();
-    let mut writer = broca_wal::archive::ArchiveWriter::create(root.join("wal-archive/fold-1.ark"))
-        .unwrap()
-        .without_feature_floor();
-    writer.append(&session_addr(&archived), &bytes).unwrap();
-    writer.seal().unwrap();
-    std::fs::remove_file(wal.wal_path(&archived)).unwrap();
+    let session = BindIdentity::new("/census/project", "broca", "misplaced");
+    stored(&root, &session);
+    let heads = broca_wal::StorageClass::Durable
+        .store_root(&root)
+        .join("heads");
+    let elsewhere = "0123456789abcdef";
+    std::fs::create_dir_all(heads.join(elsewhere)).unwrap();
+    std::fs::copy(
+        head_path(&root, &session),
+        heads.join(elsewhere).join("head"),
+    )
+    .unwrap();
     backfill(&store.conn.lock().unwrap()).unwrap();
     let counts = census::run(
         &mut store.conn.lock().unwrap(),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(!counts.complete);
+    assert_eq!(counts.unreadable, 1);
+    let reason: String = store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT reason FROM agent_data_census_unreadable WHERE address=?1",
+            [elsewhere],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(reason.contains("another address"), "{reason}");
+}
+
+/// The census records only the sessions the index doesn't name yet, and reads each head once.
+#[test]
+fn census_records_only_unrepresented_sessions() {
+    let root = broca_test_support::scratch_root()
+        .join(format!("census-unrepresented-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+    let represented = BindIdentity::new("/census/project", "broca", "represented");
+    let unindexed = BindIdentity::new("/census/project", "broca", "unindexed");
+    for session in [&represented, &unindexed] {
+        stored(&root, session);
+    }
+    store
+        .record_session(&session_addr(&represented), &represented)
+        .unwrap();
+    backfill(&store.conn.lock().unwrap()).unwrap();
+    let counts = census::run(
+        &mut store.conn.lock().unwrap(),
+        &StoredSessions::new(&root),
         None,
         false,
     )
@@ -734,12 +654,17 @@ fn census_repairs_legacy_imports_and_reads_existing_candidates_only_as_metadata(
     assert!(counts.complete);
     assert_eq!(counts.addresses, 2);
     assert_eq!(counts.not_represented, 1);
-    assert_eq!(
-        counts.bytes_read,
-        bytes.len() as u64 + 2 * (broca_wal::framing::HEADER_LEN as u64 + 16)
-    );
-    assert_eq!(wal.bytes_for_move(&archived).unwrap().unwrap(), bytes);
-    let reference = agent_session_ref(&archived);
+    let store_root = broca_wal::StorageClass::Durable.store_root(&root);
+    let backend = broca_session_store::backend::LocalBackend::new(&store_root);
+    let heads: u64 = [&represented, &unindexed]
+        .into_iter()
+        .map(|session| {
+            let addr = broca_session_store::backend::SessionAddr(session_addr(session));
+            backend.read_stored_head(&addr).unwrap().unwrap().0.len() as u64
+        })
+        .sum();
+    assert_eq!(counts.bytes_read, heads);
+    let reference = agent_session_ref(&unindexed);
     assert!(store
         .session_refs([reference.as_str()].into_iter())
         .unwrap()
@@ -749,7 +674,7 @@ fn census_repairs_legacy_imports_and_reads_existing_candidates_only_as_metadata(
 
 #[cfg(unix)]
 #[test]
-fn census_over_read_only_state_root_never_changes_logs_or_manifest() {
+fn census_over_read_only_state_root_never_changes_sessions_or_manifest() {
     use std::os::unix::fs::PermissionsExt;
     fn snapshot(
         path: &std::path::Path,
@@ -803,28 +728,12 @@ fn census_over_read_only_state_root_never_changes_logs_or_manifest() {
     }
     let parent =
         broca_test_support::scratch_root().join(format!("readonly-census-{}", std::process::id()));
-    let root = parent.join("logs");
+    let root = parent.join("state");
     std::fs::create_dir_all(&root).unwrap();
-    let writer = broca_core::FileWalStore::new(root.join("wal"));
-    let session = BindIdentity::new("/readonly/project", "broca", "live");
-    writer
-        .open(&session)
-        .unwrap()
-        .append(1, &started(&session, false), true)
-        .unwrap();
-    let archived = BindIdentity::new("/readonly/project", "broca", "archived");
-    std::fs::create_dir_all(root.join("wal-archive")).unwrap();
-    let mut archive =
-        broca_wal::archive::ArchiveWriter::create(root.join("wal-archive/fold-1.ark"))
-            .unwrap()
-            .without_feature_floor();
-    archive
-        .append(
-            &session_addr(&archived),
-            &broca_wal::framing::encode(1, 1, &started(&archived, false)).unwrap(),
-        )
-        .unwrap();
-    archive.seal().unwrap();
+    let session = BindIdentity::new("/readonly/project", "broca", "durable");
+    stored(&root, &session);
+    let retained = BindIdentity::new("/readonly/project", "broca", "retained");
+    stored_in(&root, &retained, broca_wal::StorageClass::Ephemeral);
     std::fs::write(
         root.join("move-inventory.json"),
         b"cleanup must not run in a census",
@@ -836,7 +745,7 @@ fn census_over_read_only_state_root_never_changes_logs_or_manifest() {
     let before = snapshot(&root);
     let counts = migrate(
         &parent.join("run-index.copy.db"),
-        &ReadOnlyWalReader::new(&root),
+        &StoredSessions::new(&root),
     )
     .unwrap();
     assert!(counts.complete);
@@ -850,8 +759,10 @@ fn census_over_read_only_state_root_never_changes_logs_or_manifest() {
     );
 }
 
+/// An admission whose ref the index can't take, and whose incomplete marker can't be written
+/// either, is refused: nothing would tell a move the ref is merely unknown.
 #[test]
-fn failed_gap_marker_refuses_untracked_wal_bytes() {
+fn failed_gap_marker_refuses_the_admission() {
     struct Failed;
     impl SessionRefIndex for Failed {
         fn record_session(&self, _: &str, _: &BindIdentity) -> Result<(), String> {
@@ -861,16 +772,16 @@ fn failed_gap_marker_refuses_untracked_wal_bytes() {
     let root = broca_test_support::scratch_root()
         .join(format!("session-ref-no-marker-{}", std::process::id()));
     std::fs::create_dir_all(root.join(broca_core::SESSION_PROJECTION_INCOMPLETE)).unwrap();
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
-    wal.set_session_ref_index(Arc::new(Failed));
     let session = BindIdentity::new("/project", "broca", "no-marker");
-    let mut writer = wal.open(&session).unwrap();
-    assert!(writer
-        .append(1, &started(&session, false), true)
-        .unwrap_err()
-        .to_string()
-        .contains("cannot persist incomplete marker"));
-    assert!(writer.replay().unwrap().is_empty());
+    let Err(error) =
+        broca_core::record_candidate(Some(&Failed), &root, &session_addr(&session), &session)
+    else {
+        panic!("the admission was accepted without a marker");
+    };
+    assert!(
+        error.contains("cannot persist incomplete marker"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -884,19 +795,16 @@ fn repair_cannot_clear_gap_across_an_overlapping_admission_or_installation() {
     let root = broca_test_support::scratch_root()
         .join(format!("session-ref-overlap-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let wal = broca_core::FileWalStore::new(root.join("wal"));
-    wal.set_session_ref_index(Arc::new(Failed));
     let session = BindIdentity::new("/project", "broca", "overlap");
+    let address = session_addr(&session);
     let repair = broca_core::ProjectionRepair::begin(&root).unwrap().unwrap();
-    wal.open(&session)
-        .unwrap()
-        .append(1, &started(&session, false), true)
-        .unwrap();
+    // An admission while the repair runs: its incomplete-index marker outlives the repair that
+    // began first.
+    drop(broca_core::record_candidate(Some(&Failed), &root, &address, &session).unwrap());
     assert!(!repair.finish().unwrap());
     assert!(broca_core::session_projection_incomplete(&root).unwrap());
-    let installation = wal
-        .record_session_before_install(&session_addr(&session), &session)
-        .unwrap();
+    let installation =
+        broca_core::record_candidate(Some(&Failed), &root, &address, &session).unwrap();
     assert!(installation.is_some());
     assert!(broca_core::ProjectionRepair::begin(&root)
         .unwrap()
@@ -921,13 +829,11 @@ fn projection_repair_observes_other_process_writers() {
             }
         }
         let root = std::path::PathBuf::from(root);
-        let wal = broca_core::FileWalStore::new(root.join("wal"));
-        wal.set_session_ref_index(Arc::new(Failed));
         let session = BindIdentity::new("/project", "broca", "other-process");
-        wal.open(&session)
-            .unwrap()
-            .append(1, &started(&session, false), true)
-            .unwrap();
+        drop(
+            broca_core::record_candidate(Some(&Failed), &root, &session_addr(&session), &session)
+                .unwrap(),
+        );
         return;
     }
     let root = broca_test_support::scratch_root()

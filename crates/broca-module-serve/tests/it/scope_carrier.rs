@@ -276,7 +276,7 @@ impl Rig {
         let registry = Arc::new(LineageRegistry::new(opener));
         broca_store::session_refs::migrate(
             &dir.join("store.db"),
-            &broca_core::ReadOnlyWalReader::new(&dir),
+            &broca_store::session_refs::StoredSessions::new(&dir),
         )
         .unwrap();
         registry.set_session_address_resolver(Arc::new(ReservationReads {

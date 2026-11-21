@@ -214,7 +214,7 @@ async fn registry_and_wal_inner(
     let _wal_reader: Arc<dyn broca_core::WalStore> = wal.clone();
     broca_store::session_refs::migrate(
         &dir.join("store.db"),
-        &broca_core::ReadOnlyWalReader::new(dir),
+        &broca_store::session_refs::StoredSessions::new(dir),
     )
     .unwrap();
     let reg = Arc::new(broca_module::LineageRegistry::new(Arc::new(opener)));
@@ -257,7 +257,7 @@ async fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_st
     let _wal_reader: Arc<dyn broca_core::WalStore> = wal;
     broca_store::session_refs::migrate(
         &dir.join("store.db"),
-        &broca_core::ReadOnlyWalReader::new(dir),
+        &broca_store::session_refs::StoredSessions::new(dir),
     )
     .unwrap();
     let reg = Arc::new(broca_module::LineageRegistry::new(Arc::new(opener)));

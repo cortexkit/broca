@@ -101,7 +101,7 @@ async fn session_close_releases_hook_and_compaction_routes() {
     let hooks = Arc::new(broca_subc::SubcHookPlane::new(conn.clone()));
     let compaction = Arc::new(broca_subc::SubcCompactionPlane::new(conn.clone()));
     let executor = LiveLoopExecutor::new(
-        Arc::new(FileWalStore::new(root.join("wal"))),
+        root.to_path_buf(),
         Arc::new(SubcToolPlane::new(broca_subc::SubcConnection::connect(&connection).await.unwrap(), "unused-tools".to_owned())),
         None,
     ).with_hook_plane(hooks.clone()).with_compaction_plane(compaction.clone());

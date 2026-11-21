@@ -413,13 +413,6 @@ async fn fork_answer_fixture(
     assert_eq!(requests.len(), 1, "exactly one fork step");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert!(body.to_string().contains("fork question"));
-    assert!(
-        !executor
-            .wal_store
-            .wal_path(&broca_protocol::BindIdentity::new(&root, "test", "session"))
-            .exists(),
-        "fork execution writes no head WAL"
-    );
 }
 
 #[tokio::test]

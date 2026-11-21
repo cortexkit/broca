@@ -23,9 +23,11 @@ pub struct BackfillCounts {
 mod backfill;
 mod batches;
 mod census;
+mod stored;
 mod write;
 pub(crate) use batches::MigrationWriteStats;
 pub use census::{census, migrate, CensusCounts};
+pub use stored::StoredSessions;
 pub(crate) use write::insert;
 #[cfg(test)]
 pub(super) use write::REF_WAIT_HOOK;
@@ -277,66 +279,6 @@ impl SqliteStore {
 impl SessionRefIndex for SqliteStore {
     fn record_session(&self, address: &str, session: &BindIdentity) -> Result<(), String> {
         SessionInventory::shared(&self.conn).record_session(address, session)
-    }
-}
-
-/// Remove only obsolete inventory artifacts, never follow symlinks or recurse.
-/// Errors other than vanished entries are returned so cleanup cannot silently continue after a failure.
-pub fn cleanup_legacy_inventory(root: &std::path::Path) -> std::io::Result<(u64, u64)> {
-    cleanup_legacy_inventory_with(
-        root,
-        |path| std::fs::symlink_metadata(path),
-        |path| std::fs::remove_file(path),
-    )
-}
-
-fn cleanup_legacy_inventory_with(
-    root: &std::path::Path,
-    mut metadata: impl FnMut(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
-    mut remove: impl FnMut(&std::path::Path) -> std::io::Result<()>,
-) -> std::io::Result<(u64, u64)> {
-    let mut count = 0;
-    let mut bytes = 0;
-    for entry in std::fs::read_dir(root)? {
-        let Some(entry) = listed_inventory_entry(root, entry)? else {
-            continue;
-        };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name != "move-inventory.json" && !name.starts_with("move-inventory.tmp-") {
-            continue;
-        }
-        let Some(metadata) = listed_inventory_entry(root, metadata(&entry.path()))? else {
-            continue;
-        };
-        if metadata.is_dir() {
-            continue;
-        }
-        if listed_inventory_entry(root, remove(&entry.path()))?.is_none() {
-            continue;
-        }
-        count += 1;
-        bytes += metadata.len();
-    }
-    tracing::info!(count, bytes, "removed obsolete move inventory files");
-    Ok((count, bytes))
-}
-
-fn listed_inventory_entry<T>(
-    root: &std::path::Path,
-    result: std::io::Result<T>,
-) -> std::io::Result<Option<T>> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A vanished inventory artifact needs no cleanup, just like an absent one,
-            // provided the inventory root is still readable.
-            std::fs::read_dir(root)?;
-            Ok(None)
-        }
-        Err(error) => Err(error),
     }
 }
 

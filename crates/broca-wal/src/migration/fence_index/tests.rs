@@ -226,7 +226,7 @@ fn cut_write_excludes_a_peer_rebuild_until_the_cut_lands() {
     .unwrap();
     // Checked first: without the lock the peer ran and this read finds no fence.
     assert_eq!(
-        super::super::cut_fence(&state_root.join("wal"), reference).unwrap(),
+        super::super::cut_fence(&state_root, reference).unwrap(),
         Some("pending".to_owned())
     );
     assert_eq!(

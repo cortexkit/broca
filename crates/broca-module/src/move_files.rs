@@ -1,11 +1,10 @@
-//! Filesystem participant for moving a set of session WALs. The service bridge
-//! supplies sealed door data and contract replies; this module owns artifacts.
+//! Filesystem participant for moving a set of sessions kept in the session store. The service
+//! bridge supplies sealed door data and contract replies; this module owns artifacts.
 use crate::{
     cut_state::{refusal, CutArtifacts, CutGuard, CutState},
-    move_install::{self, Installation},
     registry::{LineageRegistry, MoveSessionGuard},
 };
-use broca_core::{ExportIndex, FileLeaseStore, FileWalStore, LeaseHandle, LeaseStore};
+use broca_core::{FileLeaseStore, LeaseHandle, LeaseStore};
 use broca_protocol::BindIdentity;
 use broca_wal::migration::{self, Freeze, Moved};
 use broca_wire::agent_data::{errors::ErrorBody, refs::Refs, request::Request, Op};
@@ -101,33 +100,14 @@ pub trait MoveDriver: Send + Sync {
     ) -> Result<(), ErrorBody> {
         Err(unavailable("store move verifier is unavailable"))
     }
-    /// Media needs a transport carrying objects as well as WAL bytes. Until the
-    /// bridge supplies that transport, refuse before any cut intent or freeze.
-    fn prepare_media(
-        &self,
-        session: &BindIdentity,
-        digests: &BTreeSet<String>,
-    ) -> Result<(), ErrorBody> {
-        if digests.is_empty() {
-            return Ok(());
-        }
-        Err(refusal(
-            "incompatible_version",
-            "session media cannot move through the WAL-only transport",
-            serde_json::json!({"session": session.session, "required": ["media-content/v1"]}),
-        ))
-    }
     async fn plan(&self, cut_id: &str, refs: &Refs, op: Op) -> Result<MovePlans, ErrorBody>;
-    async fn durable_offset(&self, reference: &str) -> Result<u64, ErrorBody>;
     async fn export(&self, reference: &str, frozen: &[u8]) -> Result<(), ErrorBody>;
     fn reply(
         &self,
         op: Op,
         plans: &[PlannedSession],
-        durable_offsets: &[u64],
         observations: &[MoveObservation],
     ) -> Result<Value, ErrorBody>;
-    fn drop_projection(&self, session: &BindIdentity) -> Result<(), String>;
 }
 #[derive(Clone)]
 struct LockedPlans {
@@ -152,41 +132,28 @@ impl Drop for ArtifactGuard {
 pub struct FileCutArtifacts {
     state_root: PathBuf,
     registry: LineageRegistry,
-    wal: Arc<FileWalStore>,
+    /// Where a moved-in session's row is written before it is published, so a later move
+    /// finds it by its ref.
+    refs: Arc<dyn broca_core::SessionRefIndex>,
     leases: FileLeaseStore,
-    export: Arc<dyn broca_core::ImportedRunExclusions>,
     driver: Arc<dyn MoveDriver>,
     plans: Arc<Mutex<HashMap<String, LockedPlans>>>,
 }
 
 pub mod store;
 
-struct LegacyExclusions(Arc<dyn ExportIndex>);
-impl broca_core::ImportedRunExclusions for LegacyExclusions {
-    fn record_imported_runs(
-        &self,
-        session: &BindIdentity,
-        cut_id: &str,
-        runs: &[broca_protocol::RunId],
-    ) -> Result<(), broca_core::ExportError> {
-        self.0.record_imported_runs(session, cut_id, runs)
-    }
-    fn is_imported_run(
-        &self,
-        session: &BindIdentity,
-        run: &broca_protocol::RunId,
-    ) -> Result<bool, broca_core::ExportError> {
-        self.0.is_imported_run(session, run)
-    }
-}
 fn unavailable(e: impl std::fmt::Display) -> ErrorBody {
     refusal("unavailable", e.to_string(), Value::Null)
 }
-fn busy_ref(reference: &str, code: &str, reason: &str) -> broca_wire::agent_data::errors::BusyRef {
+pub fn busy_ref(
+    reference: &str,
+    code: &str,
+    reason: &str,
+) -> broca_wire::agent_data::errors::BusyRef {
     broca_wire::agent_data::errors::BusyRef::new("broca-session", reference, reason)
         .with_reason_code(code)
 }
-fn busy(refs: Vec<broca_wire::agent_data::errors::BusyRef>, message: &str) -> ErrorBody {
+pub fn busy(refs: Vec<broca_wire::agent_data::errors::BusyRef>, message: &str) -> ErrorBody {
     use broca_wire::agent_data::errors::{BusyDetail, Detail};
     ErrorBody::with_typed_detail(Detail::Busy(BusyDetail::new(refs)), message)
 }
@@ -195,73 +162,6 @@ fn cut_id(request: &Request) -> Result<String, ErrorBody> {
         .as_str()
         .map(String::from)
         .ok_or_else(|| unavailable("cut request has no cutId"))
-}
-
-/// WAL-derived busy state for closed actors, shared by the read probe and the
-/// prepare preflight. Persisted records cover work that survives actor closure;
-/// LineageRegistry supplies open actors' volatile cache-warm jobs, scheduled
-/// keep-warms and transitions under each session's critical section.
-pub fn source_busy_reason(
-    range: &broca_wal::WalRangeRead,
-) -> Result<Option<&'static str>, ErrorBody> {
-    let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
-        return Err(unavailable("session WAL cannot be inspected"));
-    };
-    let raw = records.iter().map(|f| f.record.clone()).collect::<Vec<_>>();
-    if !broca_core::pending_submissions(&raw).is_empty() {
-        return Ok(Some("send_queued"));
-    }
-    if let Some(lineage) = range.lineage_id {
-        if !broca_core::deferred_call_obligations(lineage, records).is_empty() {
-            return Ok(Some("approval_open"));
-        }
-    }
-    if records.iter().any(|f| match &f.record {
-        broca_wal::WalRecord::RunStarted { run_id, .. } => {
-            broca_core::reconcile_run_state(&raw, &run_id.0).is_none_or(|s| !s.state.is_terminal())
-        }
-        _ => false,
-    }) {
-        return Ok(Some("run_active"));
-    }
-    Ok(None)
-}
-
-/// Retention is a property of the current copy, including legacy WALs outside
-/// wal-ephemeral. Never let an older, expired ledger row classify a fresh WAL.
-pub fn retained_move_copy(wal: &FileWalStore, session: &BindIdentity) -> Result<bool, ErrorBody> {
-    if wal.resolve_live_path(session).map_err(unavailable)? == Some(wal.ephemeral_wal_path(session))
-    {
-        return Ok(true);
-    }
-    let Some(bytes) = wal.bytes_for_move(session).map_err(unavailable)? else {
-        return Ok(false);
-    };
-    retained_bytes(&bytes)
-}
-
-/// Classify a previously read local snapshot without reopening its WAL.
-pub fn retained_move_copy_from_bytes(
-    wal: &FileWalStore,
-    session: &BindIdentity,
-    bytes: &[u8],
-) -> Result<bool, ErrorBody> {
-    if wal.resolve_live_path(session).map_err(unavailable)? == Some(wal.ephemeral_wal_path(session))
-    {
-        return Ok(true);
-    }
-    retained_bytes(bytes)
-}
-
-fn retained_bytes(bytes: &[u8]) -> Result<bool, ErrorBody> {
-    let range =
-        broca_wal::file_wal::read_verified_member_range(bytes, 0, 0, None).map_err(unavailable)?;
-    match range.records() {
-        broca_wal::WalRangeRecords::Complete(records) => {
-            Ok(broca_core::is_retention_lineage(records))
-        }
-        _ => Err(unavailable("local WAL cannot be inspected for retention")),
-    }
 }
 
 /// Import already verified these bytes. A later digest change is corrupt local
@@ -301,7 +201,9 @@ pub fn activation_refusal(
     }
 }
 
-fn moved_source(plan: &PlannedSession, moved: &Moved, op: Op) -> ErrorBody {
+/// The refusal of source operation `op` on a session that moved to `holder` at `cut_id`: the ref
+/// is no longer this computer's, so the driver stops rather than retries.
+pub(super) fn moved_source(plan: &PlannedSession, holder: &str, cut_id: &str, op: Op) -> ErrorBody {
     use broca_wire::agent_data::errors::{Detail, RefusalCode, UnknownRefDetail};
     let code = match op {
         Op::Prepare => RefusalCode::UnknownRef,
@@ -313,7 +215,7 @@ fn moved_source(plan: &PlannedSession, moved: &Moved, op: Op) -> ErrorBody {
         Detail::UnknownRef(UnknownRefDetail::new("broca-session", &plan.reference)),
         format!(
             "session {} is held by {} after cut {}",
-            plan.session.session, moved.holder, moved.cut_id
+            plan.session.session, holder, cut_id
         ),
     );
     error.code = code;
@@ -354,69 +256,17 @@ fn foreign_owner(
     )
 }
 impl FileCutArtifacts {
-    fn install_error(
-        &self,
-        cut_id: &str,
-        state: &CutState,
-        locked: &LockedPlans,
-        error: ErrorBody,
-    ) -> ErrorBody {
-        if error.code.as_str() == "busy" {
-            return busy(
-                locked
-                    .observations
-                    .iter()
-                    .filter_map(|o| {
-                        o.moving_cut.as_ref().map(|cut| {
-                            busy_ref(
-                                &o.reference,
-                                "moving",
-                                &format!("local session is frozen by cut {cut}"),
-                            )
-                        })
-                    })
-                    .collect(),
-                "receiver session is frozen",
-            );
-        }
-        let names = locked
-            .plans
-            .iter()
-            .map(|p| p.reference.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        activation_refusal(cut_id, state.step, &names, error)
-    }
     pub fn new(
         state_root: PathBuf,
         registry: LineageRegistry,
-        wal: Arc<FileWalStore>,
-        export: Arc<dyn ExportIndex>,
+        refs: Arc<dyn broca_core::SessionRefIndex>,
         driver: Arc<dyn MoveDriver>,
     ) -> Self {
-        Self::with_exclusions(
-            state_root,
-            registry,
-            wal,
-            Arc::new(LegacyExclusions(export)),
-            driver,
-        )
-    }
-
-    pub fn with_exclusions(
-        state_root: PathBuf,
-        registry: LineageRegistry,
-        wal: Arc<FileWalStore>,
-        export: Arc<dyn broca_core::ImportedRunExclusions>,
-        driver: Arc<dyn MoveDriver>,
-    ) -> Self {
-        let root = wal.root().parent().unwrap_or(std::path::Path::new("."));
         Self {
+            leases: FileLeaseStore::new(state_root.join("leases")),
             state_root,
             registry,
-            leases: FileLeaseStore::new(root.join("leases")),
-            wal,
-            export,
+            refs,
             driver,
             plans: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -428,63 +278,6 @@ impl FileCutArtifacts {
             .get(cut_id)
             .cloned()
             .ok_or_else(|| unavailable("session critical sections are not held"))
-    }
-    fn staged(&self, cut_id: &str, plan: &PlannedSession) -> Result<PathBuf, ErrorBody> {
-        migration::staging_path(
-            self.wal.root(),
-            cut_id,
-            &broca_core::session_addr(&plan.session),
-        )
-        .map_err(unavailable)
-    }
-    fn installations<'a>(
-        &self,
-        plans: &'a [PlannedSession],
-        paths: &'a [(PathBuf, PathBuf)],
-    ) -> Vec<Installation<'a>> {
-        plans
-            .iter()
-            .zip(paths)
-            .map(|(plan, (staged, live))| Installation {
-                session: &plan.session,
-                staged,
-                live,
-                local_archive: plan.local_archive.as_deref(),
-                end_offset: plan.end_offset,
-                digest: &plan.digest,
-            })
-            .collect()
-    }
-    fn paths(
-        &self,
-        cut_id: &str,
-        plans: &[PlannedSession],
-    ) -> Result<Vec<(PathBuf, PathBuf)>, ErrorBody> {
-        plans
-            .iter()
-            .map(|p| {
-                let range = broca_wal::file_wal::read_verified_member_range(&p.bytes, 0, 0, None)
-                    .map_err(unavailable)?;
-                let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
-                    return Err(unavailable("incoming move WAL has no complete records"));
-                };
-                let class = records
-                    .iter()
-                    .find_map(|frame| match &frame.record {
-                        broca_wal::WalRecord::RunStarted { session_class, .. } => {
-                            Some(session_class.as_deref())
-                        }
-                        _ => None,
-                    })
-                    .flatten();
-                Ok((
-                    self.staged(cut_id, p)?,
-                    self.wal
-                        .move_destination(&p.session, class)
-                        .map_err(unavailable)?,
-                ))
-            })
-            .collect()
     }
     fn owned_freeze(
         &self,
@@ -498,7 +291,7 @@ impl FileCutArtifacts {
         if let Some(moved) =
             migration::read_json::<Moved>(&live.with_extension("moved")).map_err(unavailable)?
         {
-            return Err(moved_source(plan, &moved, op));
+            return Err(moved_source(plan, &moved.holder, &moved.cut_id, op));
         }
         match migration::read_json::<Freeze>(&live.with_extension("moving")).map_err(unavailable)? {
             Some(freeze) if freeze.cut_id != cut_id => {
@@ -618,13 +411,13 @@ impl CutArtifacts for FileCutArtifacts {
                     .iter()
                     .find(|(key, _)| key == &plan.session)
                     .and_then(|(_, reason)| reason.clone()),
-                moving_cut: migration::cut_fence(self.wal.root(), &plan.reference)
+                moving_cut: migration::cut_fence(&self.state_root, &plan.reference)
                     .map_err(unavailable)?
                     .or_else(|| moving.map(|f| f.cut_id)),
                 moved_holder: moved.map(|m| m.holder),
                 open_actor: actor_open(&plan.session),
             };
-            if store::is_store(plan) && observation.busy_reason.is_none() {
+            if observation.busy_reason.is_none() {
                 observation.busy_reason = plan.divergence_reason.clone();
                 if busy.is_none() {
                     busy = observation.busy_reason.clone();
@@ -669,55 +462,6 @@ impl CutArtifacts for FileCutArtifacts {
         let cut_id = cut_id(request)?;
         let locked = self.locked(&cut_id)?;
         let op = request.op();
-        // A session the new session storage owns, or that a move is taking there, isn't
-        // today's to hand over: its WAL is the copy being moved, or the retired one.
-        if op == Op::Prepare {
-            for plan in &locked.plans {
-                if store::is_store(plan) {
-                    continue;
-                }
-                match self
-                    .wal
-                    .store_owner_refusal(&plan.session)
-                    .map_err(unavailable)?
-                {
-                    None => {}
-                    Some(broca_wal::WalError::SessionMoving { .. }) => {
-                        return Err(unavailable(
-                            "source session is moving into the new session storage",
-                        ))
-                    }
-                    Some(_) => {
-                        return Err(refusal(
-                            "not_exportable",
-                            "source session is kept in the new session storage",
-                            Value::Null,
-                        ))
-                    }
-                }
-            }
-        }
-        if matches!(op, Op::Prepare | Op::Import | Op::Activate) {
-            for plan in &locked.plans {
-                if store::is_store(plan) {
-                    continue;
-                }
-                if retained_move_copy(self.wal.as_ref(), &plan.session)? {
-                    if op == Op::Prepare {
-                        return Err(refusal(
-                            "not_exportable",
-                            "retention session cannot be moved",
-                            Value::Null,
-                        ));
-                    }
-                    return Err(refusal(
-                        "local_advanced",
-                        "retained copy with a deletion deadline cannot be replaced by a cut",
-                        Value::Null,
-                    ));
-                }
-            }
-        }
         if op != Op::Abort {
             if let Some(reason) = locked.busy {
                 if matches!(op, Op::Export | Op::Release) {
@@ -760,183 +504,7 @@ impl CutArtifacts for FileCutArtifacts {
             ));
         }
         for plan in &locked.plans {
-            if store::is_store(plan) {
-                self.store_check(&cut_id, plan, op, state, request).await?;
-                continue;
-            }
-            let live = self.wal.wal_path(&plan.session);
-            if let Some(other) =
-                migration::cut_fence(self.wal.root(), &plan.reference).map_err(unavailable)?
-            {
-                if other != cut_id && op != Op::Abort {
-                    return Err(foreign_owner(plan, &cut_id, &other, op, state.step));
-                }
-            }
-            if matches!(op, Op::Prepare | Op::Export) {
-                self.owned_freeze(&cut_id, plan, op == Op::Export, op, state.step)?;
-                if migration::digest(&plan.bytes) != plan.digest
-                    || plan.bytes.len() as u64 != plan.end_offset
-                {
-                    return Err(unavailable(
-                        "source snapshot does not match the frozen item",
-                    ));
-                }
-                let recorded_session = move_install::verify_received(
-                    &plan.reference,
-                    &plan.bytes,
-                    plan.end_offset,
-                    &plan.digest,
-                )?;
-                if recorded_session.project_root.as_os_str()
-                    != plan.session.project_root.as_os_str()
-                    || recorded_session.harness != plan.session.harness
-                    || recorded_session.session != plan.session.session
-                {
-                    return Err(refusal(
-                        "invalid_request",
-                        format!(
-                            "source WAL does not record the carried bind triple for ref {}",
-                            plan.reference
-                        ),
-                        Value::Null,
-                    ));
-                }
-                if op == Op::Export {
-                    let current = if live.try_exists().map_err(unavailable)? {
-                        std::fs::read(&live).map_err(unavailable)?
-                    } else {
-                        plan.local_archive
-                            .clone()
-                            .ok_or_else(|| unavailable("frozen source WAL is missing"))?
-                    };
-                    if current != plan.bytes {
-                        return Err(unavailable("frozen source bytes changed"));
-                    }
-                }
-            }
-            if op == Op::Prepare {
-                let digests =
-                    broca_core::media_store::session_media_digests(&self.state_root, &plan.session)
-                        .map_err(unavailable)?;
-                self.driver.prepare_media(&plan.session, &digests)?;
-                if !live.try_exists().map_err(unavailable)? && plan.local_archive.is_none() {
-                    return Err(refusal(
-                        "unknown_ref",
-                        "source session has no WAL",
-                        Value::Null,
-                    ));
-                }
-                if !live.try_exists().map_err(unavailable)?
-                    && plan.local_archive.as_deref() != Some(plan.bytes.as_slice())
-                {
-                    return Err(unavailable("source archive snapshot changed"));
-                }
-                if migration::digest(&plan.bytes) != plan.digest {
-                    return Err(unavailable("source snapshot digest changed"));
-                }
-                if plan.end_offset != plan.bytes.len() as u64 {
-                    return Err(unavailable("source snapshot endOffset changed"));
-                }
-                if live.try_exists().map_err(unavailable)?
-                    && std::fs::read(&live).map_err(unavailable)? != plan.bytes
-                {
-                    return Err(busy(
-                        vec![busy_ref(
-                            &plan.reference,
-                            "wal_changed",
-                            "source WAL changed before freeze",
-                        )],
-                        "source WAL changed before freeze",
-                    ));
-                }
-                let records =
-                    broca_wal::file_wal::read_verified_member_range(&plan.bytes, 0, 0, None)
-                        .map_err(unavailable)?;
-                if let Some(reason) = source_busy_reason(&records)? {
-                    return Err(busy(
-                        vec![busy_ref(
-                            &plan.reference,
-                            reason,
-                            &format!("source has pending {reason}"),
-                        )],
-                        "source has pending work",
-                    ));
-                }
-            }
-            if op == Op::Release {
-                let moved = migration::read_json::<Moved>(&live.with_extension("moved"))
-                    .map_err(unavailable)?;
-                if let Some(moved) = moved {
-                    if moved.cut_id != cut_id || request.params()["holder"] != moved.holder {
-                        return Err(moved_source(plan, &moved, Op::Release));
-                    }
-                } else {
-                    self.owned_freeze(&cut_id, plan, true, Op::Release, state.step)?;
-                }
-            }
-            if op == Op::Import {
-                move_install::check_format(&plan.format)?;
-                let sealed = plan
-                    .sealed_digest
-                    .as_deref()
-                    .ok_or_else(|| unavailable("door read did not return its sealed digest"))?;
-                if sealed != plan.digest {
-                    return Err(refusal(
-                        "digest_mismatch",
-                        "door sealed digest differs from the cut item",
-                        Value::Null,
-                    ));
-                }
-                move_install::verify_received(
-                    &plan.reference,
-                    &plan.bytes,
-                    plan.end_offset,
-                    &plan.digest,
-                )?;
-                if migration::read_json::<Freeze>(&live.with_extension("moving"))
-                    .map_err(unavailable)?
-                    .is_some()
-                {
-                    return Err(busy(
-                        vec![busy_ref(
-                            &plan.reference,
-                            "moving",
-                            "receiver is frozen by a cut",
-                        )],
-                        "receiver is frozen by a cut",
-                    ));
-                }
-                let local = if live.try_exists().map_err(unavailable)? {
-                    std::fs::read(&live).map_err(unavailable)?
-                } else {
-                    plan.local_archive.clone().unwrap_or_default()
-                };
-                if !plan.bytes.starts_with(&local) {
-                    return Err(refusal(
-                        "local_advanced",
-                        "local WAL is not a prefix of incoming bytes",
-                        Value::Null,
-                    ));
-                }
-            }
-        }
-        if op == Op::Activate {
-            let plans: Vec<_> = locked
-                .plans
-                .iter()
-                .filter(|plan| !store::is_store(plan))
-                .cloned()
-                .collect();
-            let paths = self.paths(&cut_id, &plans)?;
-            if state.intent.as_ref().is_none_or(|i| i.op != "activate")
-                && paths.iter().any(|(staged, _)| !staged.exists())
-            {
-                return Err(unavailable(
-                    "activation staging is missing without a pending activate intent",
-                ));
-            }
-            move_install::check_installations(&self.installations(&plans, &paths))
-                .map_err(|e| self.install_error(&cut_id, state, &locked, e))?;
+            self.store_check(&cut_id, plan, op, state, request).await?;
         }
         Ok(())
     }
@@ -955,7 +523,6 @@ impl CutArtifacts for FileCutArtifacts {
             let held: BusyReply = serde_json::from_value(self.driver.reply(
                 Op::Busy,
                 &locked.plans,
-                &[],
                 &locked.observations,
             )?)
             .map_err(unavailable)?;
@@ -986,148 +553,21 @@ impl CutArtifacts for FileCutArtifacts {
         let cut_id = cut_id(request)?;
         let locked = self.locked(&cut_id)?;
         let op = request.op();
-        let mut offsets = Vec::new();
-        for plan in locked.plans.iter().filter(|plan| store::is_store(plan)) {
+        for plan in &locked.plans {
             self.store_apply(&cut_id, plan, op, request).await?;
-            if op == Op::Prepare {
-                offsets.push(self.driver.durable_offset(&plan.reference).await?);
-            }
         }
-        let wal_plans: Vec<_> = locked
-            .plans
-            .iter()
-            .filter(|plan| !store::is_store(plan))
-            .cloned()
-            .collect();
         match op {
-            Op::Prepare => {
-                for plan in &wal_plans {
-                    migration::freeze(
-                        &self.state_root,
-                        &self.wal.wal_path(&plan.session),
-                        &Freeze {
-                            store_head_version: None,
-                            cut_id: cut_id.clone(),
-                            end_offset: plan.end_offset,
-                            lineage_id: plan.lineage_id.clone(),
-                        },
-                    )
-                    .map_err(unavailable)?
-                    .map_err(unavailable)?;
-                    offsets.push(self.driver.durable_offset(&plan.reference).await?);
-                }
-            }
             Op::Export => {
                 for plan in &locked.plans {
                     self.driver.export(&plan.reference, &plan.bytes).await?;
-                    if store::is_store(plan) {
-                        self.driver.durable_offset(&plan.reference).await?;
-                    }
                 }
-            }
-            Op::Release => {
-                let params = request.params();
-                let holder = params["holder"]
-                    .as_str()
-                    .ok_or_else(|| unavailable("release holder missing"))?;
-                for plan in &wal_plans {
-                    migration::release(
-                        &self.state_root,
-                        &self.wal.wal_path(&plan.session),
-                        &cut_id,
-                        holder,
-                    )
-                    .map_err(unavailable)?
-                    .map_err(unavailable)?;
-                }
-            }
-            Op::Import => {
-                for plan in &wal_plans {
-                    migration::stage(
-                        &self.state_root,
-                        &self.staged(&cut_id, plan)?,
-                        &plan.bytes,
-                        &plan.digest,
-                    )
-                    .map_err(unavailable)?;
-                }
-            }
-            Op::Activate => {
-                let paths = self.paths(&cut_id, &wal_plans)?;
-                let mut projection_admissions = Vec::new();
-                // Keep failed-projection guards through installation so a census
-                // cannot clear their durable marker before the WAL is published.
-                for plan in &wal_plans {
-                    let range =
-                        broca_wal::file_wal::read_verified_member_range(&plan.bytes, 0, 0, None)
-                            .map_err(unavailable)?;
-                    let broca_wal::WalRangeRecords::Complete(records) = range.records() else {
-                        return Err(unavailable(
-                            "incoming move WAL has incomplete identity records",
-                        ));
-                    };
-                    for frame in records {
-                        if let broca_wal::WalRecord::RunStarted { session, .. } = &frame.record {
-                            // One durable marker and lease protect the whole batch.
-                            // Reacquiring the same lease for later identities would
-                            // contend with the guard this installation already holds.
-                            if projection_admissions.is_empty() {
-                                if let Some(admission) = self
-                                    .wal
-                                    .record_session_before_install(
-                                        &broca_core::session_addr(&plan.session),
-                                        session,
-                                    )
-                                    .map_err(unavailable)?
-                                {
-                                    projection_admissions.push(admission);
-                                }
-                            }
-                        }
-                    }
-                }
-                move_install::install_verified(
-                    &self.state_root,
-                    &cut_id,
-                    &self.installations(&wal_plans, &paths),
-                    self.export.as_ref(),
-                    |session| {
-                        if let Some(history) =
-                            broca_core::WalStore::served_history(self.wal.as_ref())
-                        {
-                            let lineage = locked
-                                .plans
-                                .iter()
-                                .find(|plan| &plan.session == session)
-                                .map(|plan| plan.lineage_id.as_str());
-                            history.history_rewritten(session, lineage)?;
-                        }
-                        Ok(())
-                    },
-                    |session| {
-                        // Ownership sidecars retain the canonical wal/ address so every
-                        // transcript tree shares one move refusal and one writer lease.
-                        migration::unlink(&self.wal.wal_path(session).with_extension("moved"))
-                            .map_err(|error| error.to_string())?;
-                        self.driver.drop_projection(session)?;
-                        if let Some(history) =
-                            broca_core::WalStore::served_history(self.wal.as_ref())
-                        {
-                            history.history_rewrite_finished(session)?;
-                        }
-                        Ok(())
-                    },
-                )
-                .map_err(|e| self.install_error(&cut_id, _state, &locked, e))?;
             }
             Op::Abort => {
                 self.rollback(request, _state).await?;
             }
-            Op::Describe | Op::Busy | Op::Diverged | Op::Status => {}
+            _ => {}
         }
-        let reply = self
-            .driver
-            .reply(op, &locked.plans, &offsets, &locked.observations)?;
+        let reply = self.driver.reply(op, &locked.plans, &locked.observations)?;
         if let Request::Diverged(request) = request {
             use broca_wire::agent_data::diverged::{DivergedEntry, DivergedReply, DivergedState};
             let held: DivergedReply = serde_json::from_value(reply).map_err(unavailable)?;
@@ -1163,42 +603,20 @@ impl CutArtifacts for FileCutArtifacts {
         let cut_id = cut_id(request)?;
         let locked = self.locked(&cut_id)?;
         for plan in &locked.plans {
-            if store::is_store(plan) {
-                self.store_apply(&cut_id, plan, Op::Abort, request).await?;
-                migration::unlink(
-                    &self
-                        .state_root
-                        .join("session-store-moves/streams")
-                        .join(broca_core::session_addr(&plan.session))
-                        .with_extension(&cut_id),
-                )
-                .map_err(unavailable)?;
-                let staged = self.store_staged(&cut_id, plan);
-                if staged.exists() {
-                    std::fs::remove_dir_all(&staged).map_err(unavailable)?;
-                }
+            self.store_apply(&cut_id, plan, Op::Abort, request).await?;
+            migration::unlink(
+                &self
+                    .state_root
+                    .join("session-store-moves/streams")
+                    .join(broca_core::session_addr(&plan.session))
+                    .with_extension(&cut_id),
+            )
+            .map_err(unavailable)?;
+            let staged = self.store_staged(&cut_id, plan);
+            if staged.exists() {
+                std::fs::remove_dir_all(&staged).map_err(unavailable)?;
             }
             migration::abort_freeze(&self.move_sidecar(plan), &cut_id).map_err(unavailable)?;
-            migration::unlink(&self.staged(&cut_id, plan)?).map_err(unavailable)?;
-        }
-        // A damaged staged WAL may no longer reveal a bind triple. Staging is
-        // private to this cut, so discard its remaining files without inventing
-        // a session identity or touching another cut's directory.
-        let directory = self
-            .wal
-            .root()
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("wal-staging")
-            .join(&cut_id);
-        match std::fs::read_dir(directory) {
-            Ok(entries) => {
-                for entry in entries {
-                    migration::unlink(&entry.map_err(unavailable)?.path()).map_err(unavailable)?;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(unavailable(error)),
         }
         Ok(())
     }
@@ -1231,93 +649,16 @@ impl CutArtifacts for FileCutArtifacts {
             return Ok(None);
         }
         if op == Op::Import {
-            let mut complete = true;
             for plan in &locked.plans {
-                if store::is_store(plan) {
-                    self.store_apply(&cut_id, plan, Op::Import, &request)
-                        .await?;
-                    continue;
-                }
-                let staged = self.staged(&cut_id, plan)?;
-                match std::fs::read(&staged) {
-                    Ok(bytes)
-                        if bytes.len() as u64 == plan.end_offset
-                            && migration::digest(&bytes) == plan.digest =>
-                    {
-                        // Cached bytes can survive a process death before the
-                        // staging rename's directory barrier. Finish publication
-                        // before returning a reply that records imported.
-                        migration::durable_dir(&self.state_root, staged.parent().unwrap())
-                            .map_err(unavailable)?;
-                    }
-                    Ok(_) => {
-                        migration::unlink(&staged).map_err(unavailable)?;
-                        complete = false;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        complete = false;
-                    }
-                    Err(e) => return Err(unavailable(e)),
-                }
-            }
-            if !complete {
-                return Ok(None);
+                self.store_apply(&cut_id, plan, Op::Import, &request)
+                    .await?;
             }
             return self
                 .driver
-                .reply(op, &locked.plans, &[], &locked.observations)
+                .reply(op, &locked.plans, &locked.observations)
                 .map(Some);
         }
         self.check(&request, state).await?;
         self.apply(&request, state).await.map(Some)
-    }
-}
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod provider_held_tests {
-    use super::*;
-    use broca_core::WalStore;
-    use broca_protocol::{PauseReason, RunId};
-    use broca_wal::WalRecord;
-
-    #[test]
-    fn tool_held_session_is_run_active_for_move() {
-        let root = broca_test_support::scratch_root().join("move-tool-held");
-        let store = FileWalStore::new(root.join("wal"));
-        let session = BindIdentity::new("/project", "broca", "held");
-        let mut writer = store.open(&session).unwrap();
-        writer
-            .append(
-                1,
-                &crate::move_install::tests::started(&session, "run"),
-                true,
-            )
-            .unwrap();
-        writer
-            .append(
-                1,
-                &WalRecord::RunPaused {
-                    account_limit: None,
-                    run_id: RunId("run".into()),
-                    reason: PauseReason::ToolHeld,
-                    error: None,
-                    ts_ms: Some(1),
-                },
-                true,
-            )
-            .unwrap();
-        drop(writer);
-        let range = broca_wal::read_records_range(
-            store.wal_path(&session),
-            broca_wal::DEFAULT_MAX_READ_BYTES,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(source_busy_reason(&range).unwrap(), Some("run_active"));
     }
 }

@@ -455,29 +455,6 @@ impl SqliteStore {
         self
     }
 
-    /// Discard one session's derived transcript and its last projected WAL sequence
-    /// atomically so an installed move is rebuilt from its new WAL. Billing facts and the durable
-    /// imported-run IDs that prevent billing another Mac's work again are
-    /// machine-local authority and are deliberately not deleted.
-    pub fn drop_session_projection(&self, session: &BindIdentity) -> Result<(), String> {
-        let key = Self::key(session);
-        let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM display_fact WHERE session=?1", [&key])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM display_fact_seed WHERE session=?1", [&key])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM message WHERE session=?1", [&key])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM message_tag WHERE session=?1", [&key])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM episode_span WHERE session=?1", [&key])
-            .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM meta WHERE session=?1", [&key])
-            .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
-    }
-
     fn init(conn: &Connection) -> Result<(String, u64, u64), StoreError> {
         crate::busy::configure_writer_connection(conn)?;
         let deadline = std::time::Instant::now() + crate::busy::STORE_BUSY_TIMEOUT;
@@ -811,15 +788,6 @@ impl SqliteStore {
         }
         schema_tx.commit()?;
         Ok(source)
-    }
-
-    fn key(session: &BindIdentity) -> String {
-        format!(
-            "{}\u{1f}{}\u{1f}{}",
-            session.project_root.display(),
-            session.harness,
-            session.session
-        )
     }
 }
 

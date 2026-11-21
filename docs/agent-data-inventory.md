@@ -147,14 +147,14 @@ briefly takes a per-root filesystem lease to detect concurrent WAL appends or
 installations whose identities could not be recorded in SQLite before durably clearing
 the marker.
 
-Old imports, move activations and interrupted admissions may have WALs without
-`run_index` rows. A one-time metadata census closes those gaps across `wal/`,
-`wal-ephemeral/`, `wal-durable/` and sealed `wal-archive*/` members. Represented live
-addresses get only stat and fixed head/tail lineage probes. Only uncovered
-addresses get full verified WAL reads through `ReadOnlyWalReader`, which has no
-writer, manifest, lease, extraction or repair API. Archive enumeration reads indexes/headers,
-not represented member payloads. Unreadable or ambiguous locations prevent census
-completion, never become absence.
+A move activation whose session ref (the agent-data name of the session) the index
+could not record leaves a session stored without its row. A census closes those gaps: it lists the session folders of every storage
+class's session store and reads each folder's head for the bind identity it was
+created under. The head is read without its key, as every key-free reader of heads
+does to name a session; a move that follows the map opens the head with its key and
+refuses one whose authentication fails. A head that names a session at another address, or
+can't be read, is quarantined: it prevents census completion and never becomes
+absence. A folder without a head holds no session and names none.
 
 All migration writes (schema, backfill, queueing, coverage, reset and completion)
 use at most 64 work items per transaction and check a 10 ms work budget between
@@ -197,10 +197,8 @@ are tracked by triggers; current writers suppress those triggers only within the
 same transaction that records the candidate. Legacy gaps invalidate completeness
 and are reconciled on the next migration.
 
-At boot, obsolete `move-inventory.json` and `move-inventory.tmp-*` files in the
-state root are removed without following links or recursing. One INFO event
-reports the count and bytes freed. There is no inventory thread, JSON checkpoint,
-persistent RAM identity map or inventory-progress health metric.
+There is no inventory thread, JSON checkpoint, persistent RAM identity map or
+inventory-progress health metric.
 
 ## Read and send fencing
 

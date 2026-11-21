@@ -885,7 +885,7 @@ impl Rig {
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
             &dir.join("store.db"),
-            &broca_core::ReadOnlyWalReader::new(&dir),
+            &broca_store::session_refs::StoredSessions::new(&dir),
         )
         .unwrap();
         let script = Arc::new(Script::default());
