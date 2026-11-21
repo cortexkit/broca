@@ -1630,12 +1630,18 @@ impl<W: ExecutorWalStore + 'static>
                 human_prompts: 0,
             },
         };
+        // A fresh run's admission moved the send's model out of its request, so the move
+        // re-admits the run with the model its config froze.
+        let req = broca_core::RunRequest {
+            model: wall.run_config.model.clone(),
+            ..self.req.clone()
+        };
         let mut queued_service_tier = None;
         let admitted = self
             .executor
             .admit_episode(
                 EpisodeJob {
-                    req: self.req,
+                    req: &req,
                     kind: RunKind::FreshOrResume,
                     // The offer authorizes this account; the fresh send's auth hints
                     // are admission-only, not a new pin on this resumed episode.

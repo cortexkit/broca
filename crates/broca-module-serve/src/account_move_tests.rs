@@ -405,6 +405,9 @@ async fn a_wall_offered(
         "auth_selection": selection,
     }))
     .unwrap();
+    // As in a live run: a fresh run's admission moves the send's model out of its request,
+    // so the request the move sees names none. The run's own model is in its config.
+    req.model = broca_protocol::request::ModelHandle::new("", "");
     let refused = vec![run.account.to_owned()];
     let now = epoch_millis().max(0) as u64;
     let wall = broca_session_loop::account_move::Wall {
