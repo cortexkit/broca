@@ -256,7 +256,8 @@ impl Rig {
         out
     }
     /// Appends a record to `session` as later work on this computer would, so its copy is
-    /// ahead of any cut taken before.
+    /// ahead of any cut taken before. Only the two-daemon test, which runs on Unix, uses it.
+    #[cfg(unix)]
     async fn extend(&self, session: &BindIdentity) {
         use broca_session_store::{
             backend::{LocalBackend, SessionAddr},
