@@ -303,7 +303,7 @@ echo "  acceptance turn, and use a tool-bearing one so route open, dispatch, res
 echo "  completion are all exercised rather than just generation:"
 echo
 echo "    bash scripts/acceptance-turn.sh"
-echo "    python3 scripts/acceptance-worker-turn.py"
+echo "    python3 scripts/acceptance-worker-turn.py --placement-report <the restart's placement report>"
 echo
 # POINTS AT THE SCRIPT RATHER THAN INLINING THE RECIPE. The inlined form drifted from the
 # script that owns it, and a reader following the printed prompt would see the version in the
@@ -312,8 +312,8 @@ echo
 # version is established above, by --version on the destination binary and the marker
 # differential. See the comment in scripts/acceptance-turn.sh for the live proof.
 echo "  expect: TOOL_CALL read -> TOOL_RESULT is_error=false -> RUN_FINISHED Completed"
-echo "  then: classed fetch-plan turn completed; RunStarted WAL requires session-class/v1"
-echo "        and provider-declarations/v1 (not inferred from the session reply)"
+echo "  then: a worker started after the restart completed, and run.admission shows its AFT"
+echo "        fetch froze result formats or late results (not inferred from the session reply)"
 
 # --- a standing question, not a check -------------------------------------------------------
 #

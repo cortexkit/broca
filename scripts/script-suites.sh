@@ -73,7 +73,6 @@ suites=(
     scripts/test-gated-commit.py
     scripts/tests/test_linux_quickcheck.py
     scripts/test-deploy.py
-    scripts/test-acceptance-worker-turn.py
     scripts/tests/test-acceptance-turns.py
     scripts/test-turn-harnesses.py
     scripts/test-repro-vanished-bind-root.py
@@ -83,8 +82,6 @@ suites=(
     scripts/test-cargo-watchdog.py
     scripts/tests/test_clock_safety.py
     scripts/tests/test_release_fences.py
-    # The release gate finds WAL features the way the Rust crates re-export them.
-    scripts/tests/test_wal_gate_reexports.py
     # Every suite file in scripts/ is listed in one of the arrays in this file.
     scripts/test-script-suites.py
     # nextest's resource groups select modules that exist and every module they must cap.

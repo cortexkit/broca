@@ -33,8 +33,8 @@ env:
   CARGO_TERM_COLOR: always
   # Workflow-wide, not per step: any step that runs a script importing a shared module under
   # scripts/lib/ leaves a __pycache__ there, and the clean-worktree check at the end rightly
-  # refuses it. Set once here, so a new python step cannot forget it; a per-step setting
-  # is how the deploy-gate self-test slipped when scripts/lib/wal_gate.py arrived.
+  # refuses it. Set once here, so a new python step cannot forget it, as it could forget a
+  # per-step setting.
   PYTHONDONTWRITEBYTECODE: "1"
   # Line tables keep panics and backtraces readable while cutting the debug target to a
   # fraction of its size. Full debuginfo filled a GitHub-hosted Linux runner's disk and the

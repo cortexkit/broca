@@ -12,7 +12,6 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lib.archive_read import ArchiveRefusal, read_records
 from lib.state_root import StateRootError, default_state_root
 
 ADDRESS = re.compile(r"[0-9a-f]{16}")
@@ -35,81 +34,6 @@ def error_code(record):
             return code
     match = ROUTE_CODE.match(output.get("message", ""))
     return match[1] if match else "unclassified_error"
-
-
-def scoped_start(frame, after_ms):
-    record = frame.record
-    principal = record.get("principal") or {}
-    scope = record.get("scope") or {}
-    owner = scope.get("owner") or {}
-    timestamp = record.get("ts_ms")
-    return (isinstance(timestamp, int) and not isinstance(timestamp, bool) and timestamp > after_ms
-            and principal.get("kind") == "reserved" and bool(principal.get("module_id"))
-            and owner.get("kind") == "reserved" and bool(owner.get("module_id"))
-            and bool(scope.get("ref")) and isinstance(scope.get("scope_epoch"), int)
-            and "scope/v1" in frame.requires)
-
-
-def summarize(frames, after_ms):
-    """Join results to durable dispatch intents within their own qualifying episode."""
-    active = False
-    dispatches = {}
-    successes, errors = 0, set()
-    for frame in frames:
-        record = frame.record
-        kind = record["type"]
-        if kind == "run_started":
-            active = scoped_start(frame, after_ms)
-            dispatches = {}
-        elif kind == "run_finished":
-            active = False
-        elif active and kind == "tool_dispatch_intent":
-            dispatches[(record.get("batch_id"), record.get("tool_call_id"))] = record.get("module_id")
-        elif active and kind == "tool_result":
-            result = record.get("result") or {}
-            output = result.get("output") or {}
-            provider = dispatches.get((record.get("batch_id"), result.get("tool_call_id")))
-            # Some undelivered errors carry attribution without an intent. They are
-            # failures, not evidence that AFT executed a call.
-            if provider != "aft" and output.get("module") != "aft":
-                continue
-            if (provider == "aft" and result.get("is_error") is False
-                    and record.get("outcome") == "completed"
-                    and output.get("kind") not in ("error", "denied")):
-                successes += 1
-            else:
-                errors.add(error_code(record))
-    return successes, errors
-
-
-def scan(state_root, after_ms, cache):
-    summaries, unavailable = {}, {}
-    # Cold archives cannot contain a run admitted after this restart. Sessions
-    # driven by daemon-authenticated modules can use either backup policy or a
-    # retention limit, so their WALs may live in any of the three live folders.
-    for folder in ("wal", "wal-durable", "wal-ephemeral"):
-        for path in sorted((state_root / folder).glob("*.wal")):
-            address = path.stem
-            if not ADDRESS.fullmatch(address):
-                continue
-            try:
-                stat = path.stat()
-                if stat.st_mtime_ns // 1_000_000 < after_ms:
-                    continue
-                identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-                if cache.get(path, (None,))[0] != identity:
-                    cache[path] = (identity, summarize(read_records(path), after_ms))
-                summaries[address] = cache[path][1]
-            except FileNotFoundError:
-                # A WAL can be removed after enumeration but before it is opened.
-                continue
-            except (ArchiveRefusal, ValueError, KeyError, TypeError, AttributeError):
-                # An append may have a torn tail. Retry the snapshot, but never
-                # certify its partial records or echo a decoder's message content.
-                unavailable[address] = "unverified_wal"
-            except OSError:
-                unavailable[address] = "unreadable_wal"
-    return summaries, unavailable
 
 
 def store_addresses(state_root, after_ms):
@@ -302,17 +226,16 @@ def scan_store(state_root, after_ms, session_bin, subc, deadline):
 
 def wait_for_traffic(state_root, after_ms, timeout=600, poll=5, session_bin=None, subc=None):
     deadline = time.monotonic() + timeout
-    cache, seen_errors = {}, {}
+    seen_errors = {}
     while True:
-        summaries, unavailable = scan(state_root, after_ms, cache)
-        stores, store_unavailable = scan_store(state_root, after_ms, session_bin, subc,
-                                               deadline if timeout else time.monotonic() + 30)
-        counts = f"examined_sessions=wal:{len(summaries)},store:{len(stores)}"
-        total = sum(count for count, _ in [*summaries.values(), *stores.values()])
-        evidence = f"{counts} qualifying_results={total} could_not_tell={len(unavailable) + len(store_unavailable)}"
-        for address, error in sorted(store_unavailable.items()):
+        stores, unavailable = scan_store(state_root, after_ms, session_bin, subc,
+                                         deadline if timeout else time.monotonic() + 30)
+        total = sum(count for count, _ in stores.values())
+        evidence = (f"examined_sessions={len(stores)} qualifying_results={total} "
+                    f"could_not_tell={len(unavailable)}")
+        for address, error in sorted(unavailable.items()):
             print(f"acceptance-scoped: could not tell -- session={address} error={error}", file=sys.stderr)
-        for address, (successes, errors) in [*summaries.items(), *stores.items()]:
+        for address, (successes, errors) in stores.items():
             if successes:
                 print(f"acceptance-scoped: PASS -- session={address} successful_aft_results={successes} {evidence}")
                 return 0
@@ -326,12 +249,9 @@ def wait_for_traffic(state_root, after_ms, timeout=600, poll=5, session_bin=None
         for address, errors in sorted(seen_errors.items()):
             print(f"acceptance-scoped: FAILED -- session={address} successful_aft_results=0 "
                   f"error_codes={','.join(sorted(errors))} {evidence}", file=sys.stderr)
-    elif store_unavailable:
-        print(f"acceptance-scoped: FAILED -- could not tell: daemon evidence unavailable; {evidence}", file=sys.stderr)
     elif unavailable:
-        for address, code in sorted(unavailable.items()):
-            print(f"acceptance-scoped: FAILED -- session={address} error_codes={code} {evidence}", file=sys.stderr)
-    elif not summaries and not stores:
+        print(f"acceptance-scoped: FAILED -- could not tell: daemon evidence unavailable; {evidence}", file=sys.stderr)
+    elif not stores:
         print(f"acceptance-scoped: FAILED -- could not examine any session; {evidence}", file=sys.stderr)
     else:
         print("acceptance-scoped: FAILED -- no scoped traffic was seen after restart "
@@ -357,8 +277,8 @@ def main():
         return wait_for_traffic(args.state_root or default_state_root(), after_ms, args.timeout,
                                session_bin=args.session_bin, subc=args.subc)
     except (OSError, ValueError, KeyError, TypeError, StateRootError):
-        # Report only the evidence category, not content from a report or WAL.
-        print("acceptance-scoped: FAILED -- invalid restart boundary or unavailable WAL tree",
+        # Report only the evidence category, not content from a report or the store.
+        print("acceptance-scoped: FAILED -- invalid restart boundary or unreadable state root",
               file=sys.stderr)
         return 1
 
