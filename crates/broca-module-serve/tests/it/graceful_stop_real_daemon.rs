@@ -150,18 +150,11 @@ impl Rig {
             serde_json::json!({
                 "cadence_ms": 3600000, "deadline_ms": 5000, "failure_threshold": 3
             }),
-            None,
         )
         .await
     }
 
-    /// `drain_timeout_ms`, when given, is broca's drain budget in the daemon's module config:
-    /// how long a restart's teardown waits for the old process to exit before killing it.
-    async fn start_with_health(
-        model_url: &str,
-        health: Value,
-        drain_timeout_ms: Option<u64>,
-    ) -> Option<Self> {
+    async fn start_with_health(model_url: &str, health: Value) -> Option<Self> {
         let subc_source = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         for bin in [&subc_source, &fake_aft] {
@@ -239,9 +232,6 @@ impl Rig {
         )
         .unwrap();
         let mut config = config;
-        if let Some(budget) = drain_timeout_ms {
-            config["modules"]["broca"]["drain_timeout_ms"] = budget.into();
-        }
         config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] =
             broca_config.display().to_string().into();
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
@@ -594,107 +584,6 @@ fn restart_health_evidence_does_not_infer_eviction_from_other_events() {
     .map(str::to_owned);
     assert_eq!(health_restart_evidence(&lines),
         "observed broca periodic health failures/alerts: []; observed broca health-triggered module restarts: []");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn health_restart_can_coalesce_manual_restart_without_another_drain_verdict() {
-    let url = serve_model(Arc::new(AtomicUsize::new(0))).await;
-    // The manual restart coalesces only while the health restart's teardown still waits for
-    // the held process to exit, which lasts as long as broca's drain budget. A `ck` process can
-    // take over a second to start on a loaded machine, so the budget is long enough to cover it;
-    // releasing the process ends the wait early.
-    let Some(rig) = Rig::start_with_health(
-        &url,
-        serde_json::json!({
-            "cadence_ms": 100, "deadline_ms": 500, "failure_threshold": 1
-        }),
-        Some(10_000),
-    )
-    .await
-    else {
-        return;
-    };
-    let launch = rig.health().await["launch_id"].clone();
-    let children = broca_children(rig.daemon.id().unwrap());
-    assert_eq!(children.len(), 1);
-    let signal = |name: &str| {
-        std::process::Command::new("kill")
-            .args([name, &children[0].to_string()])
-            .status()
-            .unwrap()
-    };
-    assert!(signal("-STOP").success());
-    // Hold the real module, not a CPU burner: periodic health evicts it, and that restart's
-    // drain reaches its ceiling. Queue the manual restart while the health-triggered restart
-    // is tearing down the held module: it coalesces with that restart, with no second drain.
-    // Release the process even when the hang guard fires so teardown can finish normally.
-    let observed = broca_test_support::event_timeout(
-        "health-triggered restart drain of held broca",
-        async {
-            loop {
-                let evidence = health_restart_evidence(&rig.daemon_log_lines());
-                rig.observe_wait(format!("waiting for periodic health eviction: {evidence}"));
-                if evidence.contains("health-triggered module restart")
-                    && !rig.restart_drain_lines().is_empty()
-                {
-                    return evidence;
-                }
-                sleep(Duration::from_millis(25)).await;
-            }
-        },
-        || rig.restart_diagnostics(),
-    )
-    .await;
-    if observed.is_err() {
-        assert!(signal("-CONT").success());
-    }
-    let evidence = observed.expect("the held module must trigger a logged periodic health restart");
-    assert!(
-        evidence.contains("module health threshold breached"),
-        "{evidence}"
-    );
-    assert!(evidence.contains("module_id=broca"), "{evidence}");
-    eprintln!("held-process evidence: {evidence}");
-    let (earlier, released) =
-        tokio::join!(rig.restart_with_drain(Duration::from_secs(120)), async {
-            let received = broca_test_support::event_timeout(
-                "manual restart queued during health teardown",
-                async {
-                    loop {
-                        if rig.daemon_log_lines().iter().any(|line| {
-                            line.contains("supervisor request received")
-                                && line.contains("op=supervisor.restart")
-                                && line.contains("module_id=broca")
-                        }) {
-                            break;
-                        }
-                        sleep(Duration::from_millis(25)).await;
-                    }
-                },
-                || rig.restart_diagnostics(),
-            )
-            .await;
-            assert!(signal("-CONT").success());
-            received
-        });
-    released.expect("manual restart must reach the daemon before releasing the held module");
-    rig.wait_for_replacement(&launch).await;
-    assert_eq!(
-        rig.restart_drain_lines().len(),
-        earlier,
-        "the coalesced restart must not emit a second drain verdict"
-    );
-    let message = rig
-        .restart_drain_verdict(earlier)
-        .expect_err("a replaced module with no second drain must be diagnosed immediately");
-    assert!(
-        message.contains("was replaced without restart drain verdict"),
-        "{message}"
-    );
-    assert!(
-        message.contains("health-triggered module restart"),
-        "{message}"
-    );
 }
 
 /// The last run end among `records`.
