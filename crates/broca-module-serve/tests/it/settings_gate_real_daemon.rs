@@ -5,7 +5,9 @@
 //! It needs a `ck-subc` built with subc's `test-support` feature, named by `SUBC_GATE_CORE_BIN`:
 //! that build lets `SUBC_TEST_CONFIG_GATE=1` turn the gate on with an isolated config store, never
 //! the operator's. The rig ck-subc the other suites use is built without it, so under them broca
-//! reads its file as under any daemon that doesn't manage its settings.
+//! reads its file as under any daemon that doesn't manage its settings. CI's fixtures don't build
+//! that daemon, so the test is required only where `BROCA_REQUIRE_SUBC_GATE` is set (the native
+//! release suites), not by `BROCA_REQUIRE_SUBC` alone.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -36,13 +38,13 @@ impl Rig {
     async fn start(name: &str, old: &[u8]) -> Option<Self> {
         let Some(subc_core) = std::env::var_os("SUBC_GATE_CORE_BIN").map(PathBuf::from) else {
             assert!(
-                std::env::var_os("BROCA_REQUIRE_SUBC").is_none(),
+                std::env::var_os("BROCA_REQUIRE_SUBC_GATE").is_none(),
                 "settings_gate_real_daemon: SUBC_GATE_CORE_BIN is unset, but this run is \
-                 REQUIRED by BROCA_REQUIRE_SUBC"
+                 REQUIRED by BROCA_REQUIRE_SUBC_GATE"
             );
             println!(
                 "SKIP settings_gate_real_daemon: SUBC_GATE_CORE_BIN is unset. This reports \
-                 `ok`; set BROCA_REQUIRE_SUBC=1 to make it a failure instead."
+                 `ok`; set BROCA_REQUIRE_SUBC_GATE=1 to make it a failure instead."
             );
             return None;
         };
