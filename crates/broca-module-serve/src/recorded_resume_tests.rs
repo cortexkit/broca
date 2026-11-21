@@ -193,17 +193,21 @@ async fn a_pool_key_run_sends_the_variant_it_was_asked_for() {
     assert_eq!(body["output_config"], plain_body["output_config"]);
 }
 
-/// A company AI gateway key, filed under the gateway's own provider id: the vault serves it with
-/// the gateway's address, the header and scheme that carry it, and fixed headers.
-#[tokio::test]
-async fn a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers() {
-    // It replaces the process-wide catalog, so it runs in a child process of its own.
-    if !run_catalog_drift_child("a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers")
-    {
-        return;
-    }
+/// What one run on the gateway fixture sent the gateway and froze.
+struct GatewayRun {
+    request: CapturedResumeRequest,
+    config: broca_wal::RunConfig,
+    segments: Vec<broca_core::billing::SpendSegment>,
+    gateway_root: String,
+}
+
+/// Runs one turn with a company AI gateway key, filed under the gateway's own provider id
+/// `anthropic-gw-acme`: the vault serves it with the gateway's address, the header and scheme
+/// that carry it, and fixed headers. `auth` is the send's own `auth` member. The caller must
+/// run in a catalog child process, because this installs the process-wide test catalog.
+async fn gateway_run(label: &str, auth: Option<broca_protocol::AuthRequest>) -> GatewayRun {
     let _catalog = install_test_catalog();
-    let root = fresh_vault_root("gateway-key");
+    let root = fresh_vault_root(label);
     let server = resume_http_fixture().await;
     // The stand-in answers under `/v1`; the gateway's root stands in for Anthropic's, so the
     // request path `/v1/messages` lands below it.
@@ -251,12 +255,6 @@ async fn a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers() {
     let parts = broca_session_loop::parts::SharedParts::new(Box::new(
         broca_session_loop::parts::MemoryParts::default(),
     ));
-    let auth = broca_protocol::AuthRequest {
-        method: "gateway".into(),
-        account: None,
-        pool: None,
-        credential_id: None,
-    };
     let end = serve_store_run_with_control(
         &executor,
         &mut session,
@@ -264,7 +262,7 @@ async fn a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers() {
         req,
         broca_module::executor::StoreRunMode::Fresh,
         Default::default(),
-        Some(auth),
+        auth,
     )
     .await;
     vault.assert_healthy();
@@ -296,6 +294,35 @@ async fn a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers() {
     );
     drop(executor);
     let _ = std::fs::remove_dir_all(root);
+    GatewayRun {
+        request: gateway,
+        config,
+        segments,
+        gateway_root,
+    }
+}
+
+/// A send naming the gateway's method goes to the gateway, with the gateway's header, scheme
+/// and fixed headers, renders a paid key's request, and is priced at Anthropic's rates.
+#[tokio::test]
+async fn a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers() {
+    // It replaces the process-wide catalog, so it runs in a child process of its own.
+    if !run_catalog_drift_child("a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers")
+    {
+        return;
+    }
+    let auth = broca_protocol::AuthRequest {
+        method: "gateway".into(),
+        account: None,
+        pool: None,
+        credential_id: None,
+    };
+    let GatewayRun {
+        request: gateway,
+        config,
+        segments,
+        gateway_root,
+    } = gateway_run("gateway-key", Some(auth)).await;
     let (plain, _) = borrowed_rows_run(
         "gateway-plain",
         "anthropic",
@@ -348,4 +375,25 @@ async fn a_gateway_key_run_goes_to_its_gateway_with_the_gateways_headers() {
         write("gateway-run-request-body.json", &gateway.body);
         write("gateway-run-request-headers.txt", gateway.headers.as_bytes());
     }
+}
+
+/// A send with no `auth` member on the gateway's provider id is a gateway run too: the vault
+/// lists only gateway keys under that id, so the method is `gateway`. Prefrontal sends gateway
+/// routes this way, because routing's `route.select` names the provider and no method.
+#[tokio::test]
+async fn a_send_without_auth_on_a_gateway_provider_runs_on_the_gateway_key() {
+    if !run_catalog_drift_child("a_send_without_auth_on_a_gateway_provider_runs_on_the_gateway_key")
+    {
+        return;
+    }
+    let run = gateway_run("gateway-no-auth", None).await;
+    let headers = run.request.headers.to_ascii_lowercase();
+    assert!(headers.contains("authorization: bearer gateway-key"), "the gateway's key and header");
+    assert!(headers.contains("x-team: engineering"), "with the gateway's fixed headers");
+    assert_eq!(run.config.frozen_render_config["base_url"], serde_json::json!(run.gateway_root));
+    let selection = run.config.auth_selection.as_ref().expect("a vault run freezes its selection");
+    assert_eq!(selection.credential_id, "gateway:anthropic-gw-acme", "the gateway method");
+    assert_eq!(selection.resolved_credential_id.as_deref(), Some("apikey:anthropic-gw-acme"));
+    assert_eq!(run.segments.len(), 1);
+    assert_eq!(run.segments[0].charge_basis, broca_core::ChargeBasis::MeteredApi);
 }
