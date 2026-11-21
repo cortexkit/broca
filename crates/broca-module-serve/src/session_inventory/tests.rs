@@ -119,17 +119,21 @@ async fn held_migration_serves_known_pairs_and_signals_new_pairs_single_flight()
 #[tokio::test]
 async fn failed_migration_refuses_new_pairs_and_can_be_retried() {
     let fixture = Fixture::new();
-    // A session store that can't be listed fails the census.
-    let store = broca_wal::StorageClass::Durable.store_root(&fixture.root);
-    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
-    std::fs::write(&store, b"not a directory").unwrap();
+    // A session store whose session folder list can't be read fails the census. Its `heads`
+    // folder is a file: listing it fails on every platform, while a missing path below a file
+    // reads as an empty store on Windows.
+    let heads = broca_wal::StorageClass::Durable
+        .store_root(&fixture.root)
+        .join("heads");
+    std::fs::create_dir_all(heads.parent().unwrap()).unwrap();
+    std::fs::write(&heads, b"not a directory").unwrap();
     let error = fixture.resolve("failed").await.unwrap().unwrap_err();
     assert_eq!(error.code(), "session_address_unavailable");
     assert!(matches!(
         error,
         SessionAddressError::Unavailable(InventoryUnavailable::MigrationFailed(_))
     ));
-    std::fs::remove_file(&store).unwrap();
+    std::fs::remove_file(&heads).unwrap();
     assert_eq!(
         fixture.resolve("recovered").await.unwrap().unwrap(),
         new_unscoped("recovered")
