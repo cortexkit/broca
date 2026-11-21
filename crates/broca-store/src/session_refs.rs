@@ -1,4 +1,5 @@
-//! Additive, durable agent-data discovery projection. No WAL payload is cached.
+//! The session-ref index: which stored session each agent-data ref names, so an agent move
+//! finds its sessions without reading every stored head. No session content is cached.
 use crate::{SessionInventory, SqliteStore, StoreError};
 use broca_core::agent_session_ref;
 #[cfg(test)]
@@ -12,15 +13,6 @@ use std::collections::BTreeMap;
 
 pub use broca_core::SessionRefs;
 
-#[derive(Default, Debug)]
-pub struct BackfillCounts {
-    pub rows: u64,
-    pub distinct_sessions: u64,
-    pub inserted: u64,
-    pub writes: MigrationWriteStats,
-}
-
-mod backfill;
 mod batches;
 mod census;
 mod stored;
@@ -53,26 +45,12 @@ fn init_schema_measured(
          ) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS agent_data_session_address ON agent_data_session_ref(address)",
         "CREATE TABLE IF NOT EXISTS agent_data_session_ref_v2_rule (id INTEGER PRIMARY KEY CHECK(id=1), probe TEXT NOT NULL, sessions INTEGER NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS agent_data_projection (id INTEGER PRIMARY KEY CHECK(id=1), backfilled INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS agent_data_census (address TEXT PRIMARY KEY, covered INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID",
         "CREATE INDEX IF NOT EXISTS agent_data_census_pending ON agent_data_census(address) WHERE covered=0",
         "CREATE TABLE IF NOT EXISTS agent_data_census_inflight (address TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS agent_data_census_unreadable (address TEXT PRIMARY KEY, reason TEXT NOT NULL) WITHOUT ROWID",
         "CREATE TABLE IF NOT EXISTS agent_data_census_done (id INTEGER PRIMARY KEY CHECK(id=1))",
-        "CREATE TABLE IF NOT EXISTS agent_data_pending_session (session TEXT PRIMARY KEY) WITHOUT ROWID",
-        "CREATE TABLE IF NOT EXISTS agent_data_writer (id INTEGER PRIMARY KEY CHECK(id=1))",
-        "CREATE TABLE IF NOT EXISTS agent_data_backfill_cursor (id INTEGER PRIMARY KEY CHECK(id=1), last_run_id TEXT, valid INTEGER NOT NULL)",
         crate::session_address::SCOPE_RESERVATION_SCHEMA,
-        "CREATE TRIGGER IF NOT EXISTS agent_data_run_insert AFTER INSERT ON run_index
-         WHEN NOT EXISTS(SELECT 1 FROM agent_data_writer) BEGIN
-            INSERT OR IGNORE INTO agent_data_pending_session VALUES(NEW.session);
-            DELETE FROM agent_data_census_done;
-         END",
-        "CREATE TRIGGER IF NOT EXISTS agent_data_run_update AFTER UPDATE OF session ON run_index
-         WHEN NOT EXISTS(SELECT 1 FROM agent_data_writer) BEGIN
-            INSERT OR IGNORE INTO agent_data_pending_session VALUES(NEW.session);
-            DELETE FROM agent_data_census_done;
-         END",
     ];
     if !conn.is_autocommit() {
         // Store initialization already owns the schema transaction. Standalone
@@ -151,12 +129,6 @@ fn rekey_v2(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// The same one-time migration used by daemon startup and the copy-only timing tool.
-/// Triggers preserve lag information even if an older binary writes run_index.
-pub fn backfill(conn: &Connection) -> Result<BackfillCounts, StoreError> {
-    backfill::run(conn)
-}
-
 pub(crate) fn projection_gap(root: Option<&std::path::Path>) -> Result<bool, StoreError> {
     root.map(broca_core::session_projection_incomplete)
         .transpose()
@@ -170,9 +142,7 @@ pub(crate) fn projection_gap(root: Option<&std::path::Path>) -> Result<bool, Sto
 
 pub(crate) fn projection_complete(conn: &Connection) -> Result<bool, StoreError> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agent_data_projection WHERE id=1 AND backfilled=1)
-         AND EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1)
-         AND NOT EXISTS(SELECT 1 FROM agent_data_pending_session)
+        "SELECT EXISTS(SELECT 1 FROM agent_data_census_done WHERE id=1)
          AND NOT EXISTS(SELECT 1 FROM agent_data_census WHERE covered=0)
          AND NOT EXISTS(SELECT 1 FROM agent_data_census_unreadable u
              JOIN agent_data_census c ON c.address=u.address WHERE c.covered=0)",
@@ -182,8 +152,8 @@ pub(crate) fn projection_complete(conn: &Connection) -> Result<bool, StoreError>
 }
 
 impl SessionInventory {
-    /// Missing refs are absent only in a complete projection snapshot. Pending
-    /// legacy writes, an unfinished backfill, and database failures never prove absence.
+    /// Missing refs are absent only in a complete projection snapshot. An unfinished census
+    /// and database failures never prove absence.
     pub fn session_refs<'a>(
         &self,
         refs: impl Iterator<Item = &'a str>,

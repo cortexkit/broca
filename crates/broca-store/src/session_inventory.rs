@@ -1,4 +1,4 @@
-//! The session-address inventory, without the run_index or materialized message tables.
+//! The session-address inventory, read without the store that keeps it.
 
 use std::{
     path::Path,
@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use crate::KeeperOpenError;
 
 /// A connection to the existing address and scope inventory in run-index.db.
-/// Initialization and discovery migration remain the legacy store's responsibility.
+/// Creating its tables and running the census stay with [`crate::SqliteStore`].
 pub struct SessionInventory {
     pub(crate) conn: Arc<Mutex<Connection>>,
 }
@@ -26,12 +26,10 @@ impl SessionInventory {
                 "agent_data_session_ref",
                 "agent_data_session_ref_v2",
                 "session_scope_reservation",
-                "agent_data_projection",
                 "agent_data_census",
                 "agent_data_census_inflight",
                 "agent_data_census_unreadable",
                 "agent_data_census_done",
-                "agent_data_pending_session",
             ],
         )?;
         Ok(Self {

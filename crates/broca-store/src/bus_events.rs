@@ -120,23 +120,6 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          CREATE INDEX IF NOT EXISTS bus_event_unpublished ON bus_event_outbox(best_effort)
             WHERE published_ms IS NULL AND best_effort=0;
          CREATE INDEX IF NOT EXISTS bus_event_age ON bus_event_outbox(at_ms);
-         -- Runs the run index shows live, by when they last changed state, for recovery.
-         CREATE INDEX IF NOT EXISTS bus_event_live_runs ON run_index(state_changed_ms)
-            WHERE state IN ('active','paused');
-         CREATE TABLE IF NOT EXISTS bus_event_projection (
-            session TEXT PRIMARY KEY, epoch TEXT NOT NULL, seq INTEGER NOT NULL,
-            state_json TEXT NOT NULL
-         );
-         -- Sessions whose projection has a run started and not yet seen finish. Recovery after
-         -- process loss visits these and the run index's live runs of the current period.
-         CREATE TABLE IF NOT EXISTS bus_event_open (
-            session TEXT PRIMARY KEY, identity TEXT NOT NULL
-         );
-         -- The one row says when the current enabled period began. Absent means events were
-         -- off at the last start, so the next enable begins a new period.
-         CREATE TABLE IF NOT EXISTS bus_event_period (
-            id INTEGER PRIMARY KEY CHECK (id = 1), started_ms INTEGER NOT NULL
-         );
          -- Compaction advance notices (compaction-provider/v1 §5) waiting for the bus. A notice is headers only: the bus message id names the session
          -- and the notice's sequence number, and the bus digest is the notice digest.
          CREATE TABLE IF NOT EXISTS compaction_notice_outbox (
@@ -1040,7 +1023,8 @@ mod tests {
 
     #[test]
     fn legacy_event_schema_matches_frozen_catalog() {
-        // The fixture records sqlite_schema.sql from the legacy initializer at 6ce6d968d1f5.
+        // The fixture pins the outbox tables' schema: an older build reads these tables after a
+        // rollback, so any change to them must be deliberate.
         let expected: Vec<(String, String)> =
             serde_json::from_str(include_str!("../tests/fixtures/legacy-bus-schema.json")).unwrap();
         let store = SqliteStore::open_in_memory().unwrap();

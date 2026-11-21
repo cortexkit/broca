@@ -148,17 +148,6 @@ impl broca_store::SessionAddressResolver for PoisonAddresses {
             ),
         )
     }
-
-    fn session_log_state(
-        &self,
-        session: &BindIdentity,
-        wal: &dyn broca_core::WalStore,
-    ) -> Result<
-        broca_store::session_log_evidence::SessionLogState,
-        broca_store::session_log_evidence::SessionLogError,
-    > {
-        broca_store::SessionAddressResolver::session_log_state(&*self.inventory, session, wal)
-    }
 }
 
 struct EmptyCatalog;

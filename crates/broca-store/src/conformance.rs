@@ -17,8 +17,6 @@ use broca_protocol::{
 };
 use broca_wal::{AuthSelection, FramedRecord, RunConfig, WalRecord};
 
-pub mod migration_order;
-
 mod billing_floor;
 pub use billing_floor::billing_floor_preserves_local_and_new_runs;
 

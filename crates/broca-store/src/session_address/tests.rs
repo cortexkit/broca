@@ -4,9 +4,12 @@ use broca_protocol::BindPrincipal;
 use std::sync::{Arc, Barrier};
 
 fn complete(store: &SqliteStore) {
-    store.conn.lock().unwrap().execute_batch(
-        "INSERT INTO agent_data_projection VALUES(1,1); INSERT INTO agent_data_census_done VALUES(1)",
-    ).unwrap();
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch("INSERT INTO agent_data_census_done VALUES(1)")
+        .unwrap();
 }
 
 fn bind(root: &str) -> BindIdentity {
@@ -283,11 +286,8 @@ fn existing_pair_bind_succeeds_while_another_connection_holds_the_write_lock() {
     let held = writer
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
-    held.execute(
-        "UPDATE agent_data_projection SET backfilled=backfilled WHERE id=1",
-        [],
-    )
-    .unwrap();
+    held.execute("UPDATE agent_data_census_done SET id=id WHERE id=1", [])
+        .unwrap();
     let before = store.conn.lock().unwrap().total_changes();
     assert_eq!(
         store

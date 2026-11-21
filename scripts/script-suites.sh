@@ -126,7 +126,6 @@ for suite in "${native_macos_suites[@]}"; do
     fi
 done
 python3 scripts/check-path-deps.py
-python3 scripts/audit-export-lane.py --self-test
 # Nothing under .cortexkit/ may be tracked except release-notes/, skills/, rules/ and WORKER.md.
 scripts/check-cortexkit-layout.sh
 # No hand-written Rust file grows past 5,000 lines, or past its listed size if already larger.

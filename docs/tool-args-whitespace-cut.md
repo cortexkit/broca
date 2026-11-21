@@ -55,7 +55,6 @@ scanners. No existing reader needed a change to accept the new outcome spelling:
 | `scripts/lib/archive_read.py` | Generic JSON/frame decoding; no outcome enum validation. |
 | `scripts/wal-scan.py` | Searches caller-supplied byte patterns; no outcome semantics. |
 | `scripts/step-timing.py` | Reads model-step records and derives run outcomes from run-finished/run-paused transitions, not attempt outcomes. |
-| `scripts/audit-export-lane.py` | Audits run-index/export facts, not attempt outcomes. |
 
 ## Released-reader rollback checks
 

@@ -202,17 +202,6 @@ impl broca_store::SessionAddressResolver for ReservationReads {
         }
         self.store.scope_reservation(session)
     }
-
-    fn session_log_state(
-        &self,
-        session: &BindIdentity,
-        wal: &dyn broca_core::WalStore,
-    ) -> Result<
-        broca_store::session_log_evidence::SessionLogState,
-        broca_store::session_log_evidence::SessionLogError,
-    > {
-        broca_store::SessionAddressResolver::session_log_state(self.store.as_ref(), session, wal)
-    }
 }
 
 struct Rig {

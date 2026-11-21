@@ -38,7 +38,6 @@ fn fixture(tag: &str) -> (std::path::PathBuf, Arc<SqliteStore>) {
             .unwrap();
         stored(&root, &session);
     }
-    backfill(&store.conn.lock().unwrap()).unwrap();
     (root, store)
 }
 /// All store writers share short lock polls so the census and foreground commits
@@ -133,56 +132,6 @@ fn ref_write_waits_during_census_without_marker_or_rearming() {
         .unwrap()
         .sessions
         .contains_key(&reference));
-}
-
-#[test]
-fn backfill_resumes_committed_pages_without_certifying_partial_absence() {
-    let (root, store) = fixture("backfill-resume");
-    let conn = store.conn.lock().unwrap();
-    conn.execute("DELETE FROM agent_data_projection", [])
-        .unwrap();
-    conn.execute("DELETE FROM agent_data_backfill_cursor", [])
-        .unwrap();
-    for i in 0..150 {
-        let session = BindIdentity::new("/project/backfill", "broca", format!("row-{i}"));
-        conn.execute(
-            "INSERT INTO run_index(run_id,session,state) VALUES(?1,?2,'completed')",
-            params![
-                format!("row-{i:04}"),
-                serde_json::to_string(&session).unwrap()
-            ],
-        )
-        .unwrap();
-    }
-    backfill::run_limited(&conn, Some(73)).unwrap();
-    assert!(!conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_data_projection)",
-            [],
-            |row| row.get::<_, bool>(0)
-        )
-        .unwrap());
-    assert_eq!(
-        conn.query_row(
-            "SELECT last_run_id FROM agent_data_backfill_cursor",
-            [],
-            |row| row.get::<_, String>(0)
-        )
-        .unwrap(),
-        "row-0072"
-    );
-    drop(conn);
-    drop(store);
-    let reopened = SqliteStore::open(root.join("run-index.db")).unwrap();
-    backfill(&reopened.conn.lock().unwrap()).unwrap();
-    for i in 0..150 {
-        let session = BindIdentity::new("/project/backfill", "broca", format!("row-{i}"));
-        assert!(reopened
-            .session_refs([agent_session_ref(&session).as_str()].into_iter())
-            .unwrap()
-            .sessions
-            .contains_key(&agent_session_ref(&session)));
-    }
 }
 
 #[test]

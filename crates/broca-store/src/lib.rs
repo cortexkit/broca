@@ -17,15 +17,14 @@ use std::sync::{Arc, Mutex};
 use broca_protocol::BindIdentity;
 use rusqlite::{config::DbConfig, Connection};
 
-mod served_history;
-
 const STORE_SCHEMA_VERSION: i64 = 1;
+/// The size run-index.db's WAL file is cut back to after a checkpoint resets it.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
 mod busy;
 use busy::STORE_BUSY_TIMEOUT;
 
 pub mod bus_events;
-mod display_facts;
 pub mod export_index;
 mod keeper_connection;
 pub mod legacy_inventory;
@@ -34,14 +33,9 @@ pub(crate) use keeper_connection::KeeperOpenError;
 mod fold_identities;
 pub mod grants;
 pub mod late_results_store;
-mod retained_head;
-pub mod retention;
-pub mod retention_withdrawals;
 pub mod session_address;
 pub mod session_inventory;
 pub use session_inventory::SessionInventory;
-pub mod session_log_evidence;
-pub mod session_ref_audit;
 pub mod session_refs;
 pub mod system_one;
 pub use fold_identities::{require_legacy_operator_root, LegacyOnlyOperator};
@@ -65,25 +59,9 @@ pub trait SessionAddressResolver: Send + Sync {
         &self,
         session: &BindIdentity,
     ) -> Result<Option<session_address::ScopeReservation>, session_address::SessionAddressError>;
-
-    /// Check history without opening a writer. Evidence failures must remain
-    /// errors; an unreadable inventory cannot certify a new or available log.
-    fn session_log_state(
-        &self,
-        session: &BindIdentity,
-        wal: &dyn broca_core::WalStore,
-    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError>;
 }
 
 impl SessionAddressResolver for SqliteStore {
-    fn session_log_state(
-        &self,
-        session: &BindIdentity,
-        wal: &dyn broca_core::WalStore,
-    ) -> Result<session_log_evidence::SessionLogState, session_log_evidence::SessionLogError> {
-        SqliteStore::checked_session_log_state(self, session, wal)
-    }
-
     fn resolve_session_address(
         &self,
         bind: &BindIdentity,
@@ -192,40 +170,6 @@ pub struct SqliteStore {
     wal_config: broca_wal::WalConfig,
     bus_events: bus_events::State,
     export: ExportStore,
-}
-
-struct SchemaUpgradeLog {
-    from_version: i64,
-    to_version: i64,
-    started_at: std::time::Instant,
-}
-
-impl SchemaUpgradeLog {
-    fn new(from_version: i64, to_version: i64) -> Self {
-        tracing::info!(
-            target: "store.schema",
-            from_version,
-            to_version,
-            "store schema upgrade started"
-        );
-        Self {
-            from_version,
-            to_version,
-            started_at: std::time::Instant::now(),
-        }
-    }
-}
-
-impl Drop for SchemaUpgradeLog {
-    fn drop(&mut self) {
-        tracing::info!(
-            target: "store.schema",
-            from_version = self.from_version,
-            to_version = self.to_version,
-            elapsed_ms = self.started_at.elapsed().as_millis(),
-            "store schema upgrade ended"
-        );
-    }
 }
 
 /// Restrict a store file and its sqlite sidecars to the owner.
@@ -467,319 +411,24 @@ impl SqliteStore {
         if let Err(error) = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true) {
             tracing::warn!(%error, "could not retain SQLite WAL sidecars on close");
         }
+        // SQLite reuses the WAL file from its start after a checkpoint but never shrinks it, so
+        // one large transaction (a VACUUM writes the whole database through it) would leave a
+        // WAL file of the database's size on disk for good. Truncate it to this after each
+        // checkpoint that resets it.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
         // Start the schema transaction before inspecting columns. Schema creation
         // and upgrade steps share it so concurrent opens cannot see a partial upgrade.
         let schema_tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         let conn = &schema_tx;
-        crate::served_history::initialize(conn)?;
         let from_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let has_existing_schema: bool = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM sqlite_master
-                 WHERE type='table' AND name IN ('meta', 'message', 'run_index')
-             )",
-            [],
-            |row| row.get(0),
-        )?;
-        let _upgrade_log = (from_version < STORE_SCHEMA_VERSION && has_existing_schema)
-            .then(|| SchemaUpgradeLog::new(from_version, STORE_SCHEMA_VERSION));
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meta (
-                 session TEXT PRIMARY KEY,
-                 watermark_seq INTEGER NOT NULL,
-                 lineage_id TEXT,
-                 control_head_wal_seq INTEGER,
-                 control_head_sub_index INTEGER,
-                 context_epoch INTEGER NOT NULL,
-                 completed_steps INTEGER NOT NULL DEFAULT 0,
-                 usage_json TEXT NOT NULL DEFAULT '{}',
-                 last_step_usage_json TEXT,
-                  last_step_finish_reason_json TEXT,
-                  last_run_id TEXT,
-                  last_episode_usage_json TEXT,
-                  wal_anchor_file_id TEXT,
-                  wal_anchor_seq INTEGER,
-                  wal_anchor_byte_end INTEGER,
-                  prefix_len INTEGER,
-                  admission_checkpoint_json TEXT
-             );
-              CREATE TABLE IF NOT EXISTS episode_span (
-                  session TEXT NOT NULL,
-                  start_ord INTEGER NOT NULL,
-                  end_ord INTEGER NOT NULL,
-                  PRIMARY KEY (session, start_ord)
-              );
-              CREATE TABLE IF NOT EXISTS message (
-                 session TEXT NOT NULL,
-                 ord     INTEGER NOT NULL,
-                 json    TEXT NOT NULL,
-                  PRIMARY KEY (session, ord)
-              );
-              CREATE TABLE IF NOT EXISTS display_fact_seed (
-                  session TEXT NOT NULL, lineage TEXT NOT NULL, state TEXT NOT NULL,
-                  PRIMARY KEY(session,lineage)
-              );
-              CREATE TABLE IF NOT EXISTS display_fact (
-                  session TEXT NOT NULL, lineage TEXT NOT NULL, ord INTEGER NOT NULL,
-                  seq INTEGER NOT NULL, facts TEXT NOT NULL,
-                  PRIMARY KEY(session,lineage,ord,seq)
-              );
-              CREATE TABLE IF NOT EXISTS run_index (
-                  run_id                       TEXT PRIMARY KEY,
-                   -- SAME NAME AND TYPE AS meta.session, DIFFERENT ENCODING: this one is the
-                   -- serialised BindIdentity as JSON, meta.session is the triple joined by
-                   -- U+001F. So a join on session matches nothing and returns zero rows
-                   -- rather than an error, which reads as an absence of sessions instead of a
-                   -- wrong key. To join, rebuild meta's shape from the JSON fields:
-                   --   json_extract(session, path to project_root) || char(31) ||
-                   --   json_extract(session, path to harness)      || char(31) ||
-                   --   json_extract(session, path to session)
-                   session                      TEXT NOT NULL,
-                  submission_id                TEXT,
-                  request_identity_digest      TEXT,
-                  state                        TEXT NOT NULL,
-                  usage_json                   TEXT,
-                  final_step_finish_reason_json TEXT,
-                  retries_used                 INTEGER NOT NULL DEFAULT 0
-              );
-              CREATE TABLE IF NOT EXISTS retention_lineage (
-                  lineage_id TEXT PRIMARY KEY,
-                  session TEXT NOT NULL,
-                  retention_s INTEGER NOT NULL,
-                  last_activity_ms INTEGER NOT NULL,
-                  expires_at_ms INTEGER,
-                  wal_bytes INTEGER NOT NULL,
-                  expired_at_ms INTEGER
-              );
-              CREATE TABLE IF NOT EXISTS retention_withdrawal (
-                  lineage_id TEXT NOT NULL,
-                  session TEXT NOT NULL,
-                  call_key TEXT NOT NULL,
-                  scope_json TEXT NOT NULL,
-                  elicitation_id TEXT,
-                  provider_id TEXT NOT NULL,
-                  provider_incarnation TEXT,
-                  expires_at_ms TEXT NOT NULL,
-                  state TEXT NOT NULL CHECK(state IN ('ready','id_unknown','scope_unknown')),
-                  PRIMARY KEY(lineage_id, call_key)
-              );
-              CREATE TABLE IF NOT EXISTS retention_withdrawal_stop (
-                  lineage_id TEXT NOT NULL,
-                  call_key TEXT NOT NULL,
-                  reason TEXT NOT NULL CHECK(reason = 'withdrawal_retry_exhausted'),
-                  PRIMARY KEY(lineage_id, call_key)
-              );
-               CREATE TABLE IF NOT EXISTS retention_deletion (
-                   lineage_id TEXT PRIMARY KEY,
-                   session TEXT NOT NULL
-               );
-               CREATE INDEX IF NOT EXISTS retention_lineage_expires_idx
-                  ON retention_lineage(expires_at_ms) WHERE expires_at_ms IS NOT NULL;
-              CREATE UNIQUE INDEX IF NOT EXISTS retention_lineage_live_session_idx
-                  ON retention_lineage(session) WHERE expired_at_ms IS NULL;",
-        )?;
-        let columns = {
-            let mut stmt = conn.prepare("PRAGMA table_info(meta)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<std::collections::HashSet<_>, _>>()?
-        };
-        for (column, sql_type) in [
-            ("head_json", "TEXT"),
-            ("lineage_id", "TEXT"),
-            ("control_head_wal_seq", "INTEGER"),
-            ("control_head_sub_index", "INTEGER"),
-            ("retries_used", "INTEGER"),
-            ("last_step_usage_json", "TEXT"),
-            ("last_step_finish_reason_json", "TEXT"),
-            ("last_run_id", "TEXT"),
-            ("last_episode_usage_json", "TEXT"),
-            ("wal_anchor_file_id", "TEXT"),
-            ("wal_anchor_seq", "INTEGER"),
-            ("wal_anchor_byte_end", "INTEGER"),
-            ("prefix_len", "INTEGER"),
-            ("admission_checkpoint_json", "TEXT"),
-            // The session's newest caller title, projected from `RunStarted`, `Queued` and
-            // `Steered`. NULL when no projected send carried one, and on rows not reprojected
-            // since the column existed.
-            ("last_title", "TEXT"),
-            ("compaction_setup_seen", "INTEGER"),
-            ("deferred_calls_json", "TEXT"),
-            ("run_attribution_version", "INTEGER NOT NULL DEFAULT 0"),
-            ("episode_spans_complete", "INTEGER NOT NULL DEFAULT 0"),
-            ("episode_spans_seq", "INTEGER"),
-            ("open_episode_span", "INTEGER"),
-            // Every projected episode's render inputs (start, original first user, first model
-            // step, frozen render config), JSON in lineage order. NULL on a row not reprojected
-            // since the column existed, and on a session with no episode yet.
-            ("episode_metadata_json", "TEXT"),
-            // The watermark `episode_metadata_json` was computed at. A row carrying another
-            // value is a projection that advanced without recomputing it, so its metadata reads
-            // as absent and the session replays from the WAL.
-            ("episode_metadata_seq", "INTEGER"),
-            // NULL is an older writer's unknown state; a JSON object records even an empty
-            // schedule. No default or constraints: adding this column never rewrites rows.
-            ("refusal_replay_json", "TEXT"),
-        ] {
-            if !columns.contains(column) {
-                conn.execute(
-                    &format!("ALTER TABLE meta ADD COLUMN {column} {sql_type}"),
-                    [],
-                )?;
-            }
-        }
+        session_refs::init_schema(conn)?;
+        bus_events::init_schema(conn)?;
         #[cfg(test)]
         SCHEMA_UPGRADE_HOOK.with(|hook| match *hook.borrow() {
             Some(hook) => hook(),
             None => Ok(()),
         })?;
-        let message_columns = {
-            let mut stmt = conn.prepare("PRAGMA table_info(message)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<std::collections::HashSet<_>, _>>()?
-        };
-        if !message_columns.contains("run_json") {
-            // SQL NULL means uncomputed, including rows appended by a rolled-back writer.
-            // JSON null is the explicit, computed marker for an unattributable message.
-            conn.execute("ALTER TABLE message ADD COLUMN run_json TEXT", [])?;
-        }
-        if !message_columns.contains("tags_json") {
-            // A message's runner tags (a JSON array, one per block). NULL for an untagged
-            // message, and on every row written before tags existed: those sessions have none.
-            conn.execute("ALTER TABLE message ADD COLUMN tags_json TEXT", [])?;
-        }
-        if !message_columns.contains("written_at_ms") {
-            conn.execute("ALTER TABLE message ADD COLUMN written_at_ms INTEGER", [])?;
-        }
-        let add_completion = !message_columns.contains("completed_at_ms");
-        let add_creation = !message_columns.contains("created_at_ms");
-        if add_completion || add_creation {
-            let started = std::time::Instant::now();
-            tracing::info!(target: "store.schema", step = "message_display_fact_times",
-                added_completed_at_ms = add_completion, added_created_at_ms = add_creation,
-                "store schema step started");
-            if add_completion {
-                conn.execute("ALTER TABLE message ADD COLUMN completed_at_ms INTEGER", [])?;
-            }
-            if add_creation {
-                conn.execute("ALTER TABLE message ADD COLUMN created_at_ms INTEGER", [])?;
-            }
-            tracing::info!(target: "store.schema", step = "message_display_fact_times",
-                elapsed_ms = started.elapsed().as_millis(), "store schema step ended");
-        }
-        if !message_columns.contains("compaction_json") {
-            conn.execute("ALTER TABLE message ADD COLUMN compaction_json TEXT", [])?;
-        }
-        if !message_columns.contains("compaction_compact_json") {
-            conn.execute(
-                "ALTER TABLE message ADD COLUMN compaction_compact_json TEXT",
-                [],
-            )?;
-        }
-        conn.execute("CREATE INDEX IF NOT EXISTS message_compaction_mid_idx ON message(session,json_extract(compaction_compact_json,'$.mid')) WHERE compaction_compact_json IS NOT NULL", [])?;
-        // The one-time index build scans existing messages during upgrade. Thereafter
-        // completeness probes visit only this session's unattributed rows, not its bodies.
-        conn.execute("CREATE INDEX IF NOT EXISTS message_unattributed_session_idx ON message(session) WHERE run_json IS NULL", [])?;
-        // System messages render at the head of every request wherever they sit in the
-        // transcript, so a resume under an applied compaction view holds every one of them. This
-        // partial index finds them without reading the other rows. A stored message is its serde
-        // JSON, whose first member is always `role`; `substr` (unlike a JSON function) cannot fail
-        // on a malformed row. The one-time build scans existing rows during upgrade.
-        conn.execute(
-            &format!(
-                "CREATE INDEX IF NOT EXISTS message_system_idx ON message(session, ord) WHERE {SYSTEM_ROW_SQL}"
-            ),
-            [],
-        )?;
-        // The runner-tag index: which materialized message and block hold each tag, written
-        // with the message rows, so `session.resolve` finds a part without reading the
-        // transcript. Rows follow their message: a truncated or reset projection drops them.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS message_tag (
-                 session TEXT NOT NULL,
-                 tag     INTEGER NOT NULL,
-                 ord     INTEGER NOT NULL,
-                 part    INTEGER NOT NULL,
-                 PRIMARY KEY (session, tag)
-             )",
-            [],
-        )?;
-        // SQLite stores columns added by ALTER TABLE after the existing checkpoint blob.
-        // Covering the new scalar lets page reads fetch it without traversing that blob's
-        // overflow pages; the remaining selected metadata already precedes the blob.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS meta_page_usage_idx
-             ON meta(session, last_episode_usage_json)",
-            [],
-        )?;
-        // The title column was added after the checkpoint blob too, so it gets its own covering
-        // index for the same reason: `session.head` reads it on every call.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS meta_last_title_idx ON meta(session, last_title)",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS meta_head_idx ON meta(session, head_json)",
-            [],
-        )?;
-        retained_head::init(conn)?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS meta_compaction_setup_idx ON meta(session, compaction_setup_seen)",
-            [],
-        )?;
-        let run_index_columns = {
-            let mut stmt = conn.prepare("PRAGMA table_info(run_index)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<std::collections::HashSet<_>, _>>()?
-        };
-        for (column, sql_type) in [
-            ("request_identity_digest", "TEXT"),
-            ("usage_json", "TEXT"),
-            ("final_step_finish_reason_json", "TEXT"),
-            ("retries_used", "INTEGER NOT NULL DEFAULT 0"),
-            // Nullable on purpose, and never defaulted. A row written before this column
-            // existed has an unknown transition time; both 0 and "now" would spell that
-            // unknown as a real-looking reading, which is the thing the column exists to
-            // prevent. NULL reads as "no time recorded".
-            ("state_changed_ms", "INTEGER"),
-            // The caller's title for the run's send, written at admission. NULL for a send
-            // without one and for rows written before the column existed.
-            ("title", "TEXT"),
-            ("lineage_id", "TEXT"),
-            ("expired_at_ms", "INTEGER"),
-            ("withdrawals_owed", "INTEGER NOT NULL DEFAULT 0"),
-            ("provider_module_id", "TEXT"),
-            ("credential_id", "TEXT"),
-            ("error_class", "TEXT"),
-            ("error_code", "TEXT"),
-            ("pause_reason", "TEXT"),
-            ("interrupt_reason", "TEXT"),
-        ] {
-            if !run_index_columns.contains(column) {
-                conn.execute(
-                    &format!("ALTER TABLE run_index ADD COLUMN {column} {sql_type}"),
-                    [],
-                )?;
-            }
-        }
-        // All retained sessions (including expired ones) and per-lineage run lookups
-        // need an index even when no withdrawal work is owed.
-        // Adding an ordinary SQLite index changes neither columns nor row bytes;
-        // older binaries can keep opening and writing this database on rollback.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS run_index_lineage_session_idx ON run_index(lineage_id, session)",
-            [],
-        )?;
-        // Keep the partial discovery index: unlike the general index, it covers the
-        // withdrawals_owed predicate without reading potentially large run rows.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS run_index_discovery_lineage_idx ON run_index(lineage_id, session) WHERE withdrawals_owed=1",
-            [],
-        )?;
-        retention::init_work_schema(conn)?;
-        session_refs::init_schema(conn)?;
-        bus_events::init_schema(conn)?;
-        session_log_evidence::indexes::install(conn)?;
         let source = export_index::init_schema(conn).map_err(StoreError::from)?;
         if from_version < STORE_SCHEMA_VERSION {
             // `user_version` provides one global checkpoint for this idempotent schema path.
@@ -796,9 +445,6 @@ impl broca_core::RunEventBodies for SqliteStore {
         self.get_bus_event(event_key).map_err(|e| e.to_string())
     }
 }
-
-/// The `message` rows `message_system_idx` covers: system messages (see the index).
-const SYSTEM_ROW_SQL: &str = "substr(json, 1, 16) = '{\"role\":\"system\"'";
 
 #[cfg(test)]
 mod tests {
@@ -1018,115 +664,6 @@ mod tests {
 
     use super::SqliteStore;
 
-    #[test]
-    fn retention_and_approval_migrations_commute_and_are_idempotent() {
-        use crate::conformance::migration_order::{
-            common_schema, deferred_schema, retention_schema,
-        };
-        use std::collections::BTreeMap;
-
-        fn schema(conn: &rusqlite::Connection) -> BTreeMap<String, String> {
-            let mut schema = BTreeMap::new();
-            for table in ["meta", "message", "run_index", "retention_lineage"] {
-                let mut stmt = conn
-                    .prepare(&format!("PRAGMA table_info({table})"))
-                    .unwrap();
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, i64>(5)?,
-                        ))
-                    })
-                    .unwrap();
-                for row in rows {
-                    let (name, ty, not_null, default, pk) = row.unwrap();
-                    // ALTER TABLE appends columns in release order; named columns, defaults and
-                    // constraints must converge, not their historical physical ordinals.
-                    schema.insert(
-                        format!("{table}.{name}"),
-                        format!("{ty}/{not_null}/{default:?}/{pk}"),
-                    );
-                }
-            }
-            let mut stmt = conn.prepare("SELECT name, sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL ORDER BY name").unwrap();
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .unwrap();
-            for row in rows {
-                let (name, sql) = row.unwrap();
-                schema.insert(
-                    format!("index.{name}"),
-                    sql.split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .replace("IF NOT EXISTS ", ""),
-                );
-            }
-            schema
-        }
-
-        let mut layouts = Vec::new();
-        for retention_first in [true, false] {
-            let conn = rusqlite::Connection::open_in_memory().unwrap();
-            conn.execute_batch(&common_schema("INTEGER", "INTEGER"))
-                .unwrap();
-            if retention_first {
-                conn.execute_batch(&retention_schema("INTEGER")).unwrap();
-            } else {
-                conn.execute_batch(&deferred_schema("INTEGER NOT NULL DEFAULT 0"))
-                    .unwrap();
-                conn.execute(
-                    "UPDATE run_index SET withdrawals_owed=1 WHERE run_id='existing'",
-                    [],
-                )
-                .unwrap();
-            }
-            SqliteStore::init(&conn).unwrap();
-            let first = schema(&conn);
-            assert_eq!(first["run_index.lineage_id"], "TEXT/0/None/0");
-            assert_eq!(first["run_index.expired_at_ms"], "INTEGER/0/None/0");
-            assert_eq!(
-                first["run_index.withdrawals_owed"],
-                "INTEGER/1/Some(\"0\")/0"
-            );
-            assert_eq!(first["meta.deferred_calls_json"], "TEXT/0/None/0");
-            assert_eq!(
-                first
-                    .keys()
-                    .filter(|key| key.starts_with("retention_lineage."))
-                    .count(),
-                7
-            );
-            assert!(first["index.retention_lineage_expires_idx"]
-                .contains("WHERE expires_at_ms IS NOT NULL"));
-            assert!(first["index.retention_lineage_live_session_idx"].contains("UNIQUE INDEX"));
-            assert!(first["index.retention_lineage_live_session_idx"]
-                .contains("WHERE expired_at_ms IS NULL"));
-            SqliteStore::init(&conn).unwrap();
-            assert_eq!(schema(&conn), first);
-            let (title, owed): (String, bool) = conn
-                .query_row(
-                    "SELECT title, withdrawals_owed FROM run_index WHERE run_id='existing'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(title, "keep this title");
-            assert_eq!(owed, !retention_first);
-            if retention_first {
-                assert_eq!(conn.query_row("SELECT COUNT(*) FROM retention_lineage WHERE lineage_id='old' AND wal_bytes=1024", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-            }
-            layouts.push(first);
-        }
-        assert_eq!(layouts[0], layouts[1]);
-    }
-
     /// A run-index row records WHEN it entered its state, so a stale row is distinguishable
     /// from a live one.
     ///
@@ -1244,112 +781,18 @@ mod tests {
         SqliteStore::open_in_memory().expect("in-memory sqlite store opens")
     }
 
+    /// The store's connection cuts its WAL file back after a checkpoint, so one VACUUM doesn't
+    /// leave a WAL file the size of the database.
     #[test]
-    fn completion_column_upgrade_preserves_existing_message_rows_without_backfill() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE message (session TEXT NOT NULL, ord INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(session,ord)); INSERT INTO message VALUES ('legacy',0,'unchanged');").unwrap();
-        SqliteStore::init(&conn).unwrap();
-        let (body, completion, creation): (String, Option<u64>, Option<u64>) = conn
-            .query_row(
-                "SELECT json,completed_at_ms,created_at_ms FROM message WHERE session='legacy' AND ord=0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+    fn the_store_caps_its_wal_file_size() {
+        let store = sqlite_store();
+        let limit: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_size_limit", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(body, "unchanged");
-        assert_eq!(completion, None);
-        assert_eq!(creation, None);
-        for column in ["completed_at_ms", "created_at_ms"] {
-            let default: Option<String> = conn
-                .query_row(
-                    "SELECT dflt_value FROM pragma_table_info('message') WHERE name=?1",
-                    [column],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(default, None);
-        }
-        let indexes: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='message' AND sql LIKE '%created_at_ms%'", [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(indexes, 0);
-    }
-
-    #[test]
-    fn additive_projection_columns_are_added_to_existing_meta_tables() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (
-                 session TEXT PRIMARY KEY,
-                 watermark_seq INTEGER NOT NULL,
-                 context_epoch INTEGER NOT NULL,
-                 completed_steps INTEGER NOT NULL DEFAULT 0,
-                 usage_json TEXT NOT NULL DEFAULT '{}',
-                 last_run_id TEXT
-             );",
-        )
-        .unwrap();
-        SqliteStore::init(&conn).unwrap();
-        let columns = {
-            let mut stmt = conn.prepare("PRAGMA table_info(meta)").unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(1))
-                .unwrap()
-                .collect::<Result<std::collections::HashSet<_>, _>>()
-                .unwrap()
-        };
-        for column in [
-            "lineage_id",
-            "control_head_wal_seq",
-            "control_head_sub_index",
-            "last_step_usage_json",
-            "last_step_finish_reason_json",
-            "wal_anchor_file_id",
-            "wal_anchor_seq",
-            "wal_anchor_byte_end",
-            "prefix_len",
-            "admission_checkpoint_json",
-            "last_episode_usage_json",
-        ] {
-            assert!(columns.contains(column));
-        }
-    }
-
-    #[test]
-    fn additive_lineage_column_preserves_legacy_meta_rows() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE meta (
-                 session TEXT PRIMARY KEY,
-                 watermark_seq INTEGER NOT NULL,
-                 context_epoch INTEGER NOT NULL,
-                 completed_steps INTEGER NOT NULL DEFAULT 0,
-                 usage_json TEXT NOT NULL DEFAULT '{}',
-                 last_run_id TEXT
-             );
-             INSERT INTO meta (
-                 session, watermark_seq, context_epoch, completed_steps, usage_json, last_run_id
-             ) VALUES ('legacy', 7, 3, 2, '{}', 'run-legacy');",
-        )
-        .unwrap();
-
-        SqliteStore::init(&conn).unwrap();
-        let row = conn
-            .query_row(
-                "SELECT watermark_seq, context_epoch, completed_steps, last_run_id, lineage_id
-                   FROM meta WHERE session='legacy'",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(row, (7, 3, 2, "run-legacy".to_string(), None));
+        assert_eq!(limit, super::WAL_SIZE_LIMIT_BYTES);
     }
 
     #[test]

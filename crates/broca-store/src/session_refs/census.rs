@@ -1,5 +1,5 @@
 use super::stored::{Stored, StoredSessions};
-use super::{backfill, batches::write_batch, insert, MigrationWriteStats};
+use super::{batches::write_batch, insert, MigrationWriteStats};
 use crate::StoreError;
 use rusqlite::Connection;
 use std::time::Instant;
@@ -274,8 +274,9 @@ pub(super) fn run(
     Ok(counts)
 }
 
-/// A separate SQLite connection lets moves observe an incomplete snapshot while
-/// the one-time backfill runs, instead of holding the serving connection's mutex.
+/// Runs the census (a pass that lists every stored session and records the rows the index
+/// lacks) on its own SQLite connection, so an agent move looking up refs meanwhile reads the
+/// index as incomplete instead of waiting on the serving connection's mutex.
 pub fn migrate(
     db: &std::path::Path,
     sessions: &StoredSessions,
@@ -333,8 +334,6 @@ pub fn migrate(
             )?;
         }
     }
-    let backfilled = backfill(&conn)?;
-    writes.merge(backfilled.writes);
     let mut counts = run(&mut conn, sessions, None, true)?;
     counts.writes.merge(writes);
     if incomplete && counts.complete {

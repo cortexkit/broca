@@ -2151,8 +2151,7 @@ async fn handle_control_request(
             //
             // So do not add a field here that a caller might read as an assertion about durable
             // state. Anything of that kind has to be derived from the store or the WAL by a
-            // reader that did not write them -- scripts/live-runs.py and
-            // scripts/audit-export-lane.py are that shape deliberately.
+            // reader that did not write them -- scripts/live-runs.py is that shape deliberately.
             let mut metrics = serde_json::json!({
                     "agent_data_ops": crate::agent_data::health_counts(routes.agent_data.as_deref()),
                     "retention_unreadable_sessions": retention_unreadable,
@@ -8706,17 +8705,6 @@ mod tests {
                     Err(broca_store::session_address::SessionAddressError::store_error(reason))
                 }
             }
-        }
-
-        fn session_log_state(
-            &self,
-            session: &broca_protocol::BindIdentity,
-            wal: &dyn broca_core::WalStore,
-        ) -> Result<
-            broca_store::session_log_evidence::SessionLogState,
-            broca_store::session_log_evidence::SessionLogError,
-        > {
-            broca_store::SessionAddressResolver::session_log_state(&*self.inventory, session, wal)
         }
     }
 

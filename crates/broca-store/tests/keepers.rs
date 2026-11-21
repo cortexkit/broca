@@ -252,12 +252,10 @@ fn standalone_opens_refuse_missing_databases_and_each_required_table_by_name() {
             "agent_data_session_ref",
             "agent_data_session_ref_v2",
             "session_scope_reservation",
-            "agent_data_projection",
             "agent_data_census",
             "agent_data_census_inflight",
             "agent_data_census_unreadable",
             "agent_data_census_done",
-            "agent_data_pending_session",
         ],
     )] {
         for table in tables {

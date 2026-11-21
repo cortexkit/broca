@@ -54,103 +54,23 @@ pub(super) fn head_path(root: &std::path::Path, session: &BindIdentity) -> std::
         .join("head")
 }
 
+/// A ref the index lacks is absent only once a census (the pass that records every stored
+/// session in the index) has finished: before that it is unknown, so a move asking is told to
+/// retry.
 #[test]
-fn backfill_maps_every_distinct_run_index_triple_once() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE run_index(run_id TEXT PRIMARY KEY,session TEXT NOT NULL)")
-        .unwrap();
-    let sessions: Vec<_> = (0_usize..31)
-        .map(|i| {
-            BindIdentity::new(
-                format!("/project/{i}"),
-                if i.is_multiple_of(2) {
-                    "broca"
-                } else {
-                    "runner"
-                },
-                format!("session-{i}"),
-            )
-        })
-        .collect();
-    for i in 0..95 {
-        conn.execute(
-            "INSERT INTO run_index VALUES(?1,?2)",
-            params![
-                format!("run-{i}"),
-                serde_json::to_string(&sessions[i % sessions.len()]).unwrap()
-            ],
-        )
-        .unwrap();
-    }
-    let counts = backfill(&conn).unwrap();
-    assert_eq!(
-        (counts.rows, counts.distinct_sessions, counts.inserted),
-        (95, 31, 31)
-    );
-    for session in &sessions {
-        let (address,root,harness,name): (String,String,String,String) = conn.query_row(
-            "SELECT address,project_root,harness,session FROM agent_data_session_ref WHERE session_ref=?1", [broca_core::wal_writer::legacy_session_ref(&session.harness, &session.project_root.to_string_lossy(), &session.session)],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
-        assert_eq!(address, session_addr(session));
-        assert_eq!(BindIdentity::new(root, harness, name), *session);
-    }
-    let counts = backfill(&conn).unwrap();
-    assert_eq!(
-        (counts.rows, counts.distinct_sessions, counts.inserted),
-        (0, 0, 0)
-    );
-}
-
-#[test]
-fn unfinished_backfill_and_legacy_admissions_keep_absence_unknown() {
+fn absence_is_unknown_until_a_census_finishes() {
     let store = SqliteStore::open_in_memory().unwrap();
-    backfill(&store.conn.lock().unwrap()).unwrap();
-    store
-        .conn
-        .lock()
-        .unwrap()
-        .execute("INSERT INTO agent_data_census_done VALUES(1)", [])
-        .unwrap();
     let missing = "00000000000000000000000000000000";
-    assert!(store.session_refs([missing].into_iter()).unwrap().complete);
-    store
-        .conn
-        .lock()
-        .unwrap()
-        .execute("DELETE FROM agent_data_projection", [])
-        .unwrap();
     let found = store.session_refs([missing].into_iter()).unwrap();
     assert!(found.sessions.is_empty());
     assert!(!found.complete);
-    backfill(&store.conn.lock().unwrap()).unwrap();
-    let session = BindIdentity::new("/legacy/project", "broca", "session");
-    store
-        .conn
-        .lock()
-        .unwrap()
-        .execute(
-            "INSERT INTO run_index(run_id,session,state) VALUES('old',?1,'active')",
-            [serde_json::to_string(&session).unwrap()],
-        )
-        .unwrap();
-    let reference = agent_session_ref(&session);
-    let found = store
-        .session_refs([reference.as_str()].into_iter())
-        .unwrap();
-    assert!(found.sessions.is_empty());
-    assert!(!found.complete);
-    backfill(&store.conn.lock().unwrap()).unwrap();
     store
         .conn
         .lock()
         .unwrap()
         .execute("INSERT INTO agent_data_census_done VALUES(1)", [])
         .unwrap();
-    let found = store
-        .session_refs([reference.as_str()].into_iter())
-        .unwrap();
-    assert!(found.complete);
-    assert_eq!(found.sessions[&reference].1, session);
+    assert!(store.session_refs([missing].into_iter()).unwrap().complete);
 }
 
 #[test]
@@ -256,7 +176,6 @@ fn overlapping_census_late_unreadable_cannot_undo_committed_coverage() {
     let path = head_path(&root, &session);
     let original = std::fs::read(&path).unwrap();
     std::fs::write(&path, b"damaged head").unwrap();
-    backfill(&store.conn.lock().unwrap()).unwrap();
 
     let root_b = root.clone();
     let db_b = db.clone();
@@ -323,7 +242,6 @@ fn census_unobserved_inventory_address_remains_uncovered_until_verified() {
     let session = BindIdentity::new("/census/project", "broca", "unobserved");
     let address = session_addr(&session);
     let reference = agent_session_ref(&session);
-    backfill(&store.conn.lock().unwrap()).unwrap();
     {
         let conn = store.conn.lock().unwrap();
         conn.execute(
@@ -405,7 +323,6 @@ fn census_quarantines_damage_and_commits_healthy_coverage_across_restarts() {
     let original = std::fs::read(&path).unwrap();
     let damaged = b"damaged head".to_vec();
     std::fs::write(&path, &damaged).unwrap();
-    backfill(&store.conn.lock().unwrap()).unwrap();
     let first = census::run(
         &mut store.conn.lock().unwrap(),
         &StoredSessions::new(&root),
@@ -523,7 +440,6 @@ fn census_resumes_coverage_without_rereading_covered_sessions() {
         stored(&root, &session);
         sessions.push(session);
     }
-    backfill(&store.conn.lock().unwrap()).unwrap();
     let first = census::run(
         &mut store.conn.lock().unwrap(),
         &StoredSessions::new(&root),
@@ -605,7 +521,6 @@ fn census_quarantines_a_head_that_names_another_address() {
         heads.join(elsewhere).join("head"),
     )
     .unwrap();
-    backfill(&store.conn.lock().unwrap()).unwrap();
     let counts = census::run(
         &mut store.conn.lock().unwrap(),
         &StoredSessions::new(&root),
@@ -643,7 +558,6 @@ fn census_records_only_unrepresented_sessions() {
     store
         .record_session(&session_addr(&represented), &represented)
         .unwrap();
-    backfill(&store.conn.lock().unwrap()).unwrap();
     let counts = census::run(
         &mut store.conn.lock().unwrap(),
         &StoredSessions::new(&root),
