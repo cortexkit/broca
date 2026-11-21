@@ -175,10 +175,17 @@ impl KeyLogs {
         self.0.lock().unwrap().clone()
     }
 
+    /// The session-storage events at `level`, without the slow-phase warnings a disk sync on a
+    /// loaded machine logs under the same target: those say how fast the machine is, not
+    /// anything about the key.
     fn at(&self, level: tracing::Level) -> Vec<String> {
         self.events()
             .into_iter()
-            .filter(|(at, target, _)| *at == level && target == "session_storage")
+            .filter(|(at, target, fields)| {
+                *at == level
+                    && target == "session_storage"
+                    && !fields.contains("slow session storage phase")
+            })
             .map(|(_, _, fields)| fields)
             .collect()
     }
