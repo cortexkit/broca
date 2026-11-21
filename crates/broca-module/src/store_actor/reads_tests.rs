@@ -1,4 +1,4 @@
-//! Reads of a session kept in the new storage, served without reloading the session: by its
+//! Reads of a session kept in the session store, served without reloading the session: by its
 //! store actor while the session is open, and from kept views once it is closed. Each read is
 //! compared with the same read from a fresh `Session::view` at the same moment.
 
@@ -420,7 +420,7 @@ fn submission_admission_future_stays_small() {
     );
 }
 
-/// A module whose new sessions start in the new storage, over a scratch folder, whose scripted
+/// A module whose new sessions start in the session store, over a scratch folder, whose scripted
 /// provider answers `steps`, each one once the test lets it through `gate`.
 struct Module {
     dir: std::path::PathBuf,

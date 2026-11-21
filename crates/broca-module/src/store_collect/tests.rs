@@ -41,7 +41,7 @@ fn key(root: &Path, name: &str) -> BindIdentity {
     BindIdentity::new(root.join("project"), "runner", name)
 }
 
-/// The new storage's runtime over `root`, with its deployment key loaded.
+/// The session store's runtime over `root`, with its deployment key loaded.
 async fn slot(root: &Path) -> Arc<StoreSlot> {
     let runtime = StoreRuntime::open(
         root,

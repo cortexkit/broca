@@ -1,4 +1,4 @@
-//! `run.tool_calls` for a session kept in the new storage: the run's calls in the order its
+//! `run.tool_calls` for a session kept in the session store: the run's calls in the order its
 //! steps made them, each with its outcome, key, dispatch module and result size, paged as
 //! today's storage pages them (`serve::run_tool_calls_answer`).
 //!
@@ -21,7 +21,7 @@
 //!   outcome lists its result ordinal already: the contract wants it on every finished call.
 //!
 //! The keys are the ones the store recorded: a moved session keeps today's keys, and a session
-//! the new storage started has its own. A cursor carries the store's seqs and names the
+//! the session store started has its own. A cursor carries the store's seqs and names the
 //! session's log incarnation, so a cursor today's storage issued, or one from a session that was
 //! created again, is refused naming `after`.
 

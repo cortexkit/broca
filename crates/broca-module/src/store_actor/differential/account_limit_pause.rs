@@ -398,7 +398,7 @@ impl Side {
         assert_eq!(state["reason"], "account_limit");
         assert_eq!(state["resume_not_before_ms"], RESET);
         self.idle().await;
-        // The head shows the same resume time while the run is paused, on the new storage,
+        // The head shows the same resume time while the run is paused, in the session store,
         // where heads live. Today's storage leaves the optional member out of its head.
         let head = self
             .registry
@@ -809,7 +809,7 @@ async fn account_limit_refused_resume_seals_and_drains_alike() {
         side.idle().await;
         side.stop().await;
         let records = side.records().await;
-        // The old seal also writes a resume record before the interrupted end. The new storage
+        // The old seal also writes a resume record before the interrupted end. The session store
         // writes only the end because the refused resume ran no step. Compare the end and caller
         // reads instead of requiring a resume record for work that never resumed.
         histories.push(

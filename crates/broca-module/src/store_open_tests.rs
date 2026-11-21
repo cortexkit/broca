@@ -1,4 +1,4 @@
-// Tests of the new storage's three class roots: where the opener creates a session, which root
+// Tests of the session store's three class roots: where the opener creates a session, which root
 // a session is opened from, and the refusal of a session whose head is in two roots.
 
 use std::path::{Path, PathBuf};
@@ -547,7 +547,7 @@ async fn a_new_session_is_placed_by_one_rule() {
             expected,
             "{name}"
         );
-        // The new storage, as a send the store actor serves creates the session.
+        // The session store, as a send the store actor serves creates the session.
         let stored = key(&root, &format!("store-{name}"));
         let handle = registry.handle();
         handle.mark_store_eligible(&stored, StoreCreation::Send);

@@ -34,17 +34,17 @@ pub const OP_IMPORT: &str = "session.import";
 /// session's first step.
 pub const OP_INSTALL_VIEW: &str = broca_wire::head_import::OP_SESSION_INSTALL_VIEW;
 pub const OP_RETRACT: &str = "session.retract";
-/// Move a live, idle session from today's storage into the new storage. Only the operator calls
+/// Move a live, idle session from today's storage into the session store. Only the operator calls
 /// it, through `broca-session move-to-store`.
-/// Restore a session kept in the new storage, or every such session, from the files its store
+/// Restore a session kept in the session store, or every such session, from the files its store
 /// holds after a backup came back. Only the operator calls it, through `broca-session
 /// restore-from-backup`.
 pub const OP_RESTORE_FROM_BACKUP: &str = "session.restore_from_backup";
-/// Read which message and part each part number of a session kept in the new storage belongs
+/// Read which message and part each part number of a session kept in the session store belongs
 /// to. Only the operator calls it, through `broca-session tag-map`; it is outside the runner role.
 pub const OP_TAG_MAP: &str = broca_wire::tag_map::OP_SESSION_TAG_MAP;
 pub const OP_REQUEST_DUMP: &str = broca_wire::request_dump::OP_SESSION_REQUEST_DUMP;
-/// Deletes one session kept in the new storage that holds no work; operator only, outside the
+/// Deletes one session kept in the session store that holds no work; operator only, outside the
 /// runner role.
 pub const OP_SESSION_DELETE: &str = broca_wire::session_delete::OP_SESSION_DELETE;
 pub const OP_CANCEL: &str = "run.cancel";

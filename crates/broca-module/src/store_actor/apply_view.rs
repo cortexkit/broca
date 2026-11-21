@@ -1,4 +1,4 @@
-//! `session.apply_view` on a session kept in the new storage. The compaction provider hands
+//! `session.apply_view` on a session kept in the session store. The compaction provider hands
 //! over a view between steps (a background summary finishing while the session is idle, its
 //! answer to the notice after a run's last step, or its re-offer at Setup), and the session
 //! records it as the view it accepted. The next step applies it, as today's actor has today's

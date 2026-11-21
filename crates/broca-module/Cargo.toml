@@ -22,7 +22,7 @@ broca-wal = { path = "../broca-wal" }
 # Owner-only files for the Claude Code persona's identity (`claude_code_identity`).
 broca-owner-only.workspace = true
 broca-store = { path = "../broca-store" }
-# Sessions kept in the new storage: their store and the run loop that runs on it.
+# Sessions kept in the session store: their store and the run loop that runs on it.
 broca-session-store = { path = "../broca-session-store" }
 broca-session-loop = { path = "../broca-session-loop" }
 ck-session-import = { path = "../ck-session-import" }

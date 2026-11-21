@@ -15,16 +15,16 @@ pub struct MemoryReportParams {}
 /// Sizes and counts only: it never carries content, message ids or anything else from a
 /// transcript. A session is named by its store address.
 ///
-/// "The new storage" is the session store of `broca-session-store`; "today's storage" is the
+/// "The session store" is the session store of `broca-session-store`; "today's storage" is the
 /// write-ahead log the older runner keeps sessions in, which the report counts and doesn't size.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryReport {
-    /// Every session open on the new storage (`broca-session-store`), largest first.
+    /// Every session open in the session store (`broca-session-store`), largest first.
     pub sessions: Vec<MemorySession>,
     /// How many of them had a run in progress: those hold their run's entries and request on
     /// top of what an idle session holds, so compare like with like.
     pub running_sessions: u64,
-    /// Sessions open on the new storage whose actor didn't answer in time, or was closing;
+    /// Sessions open in the session store whose actor didn't answer in time, or was closing;
     /// counted, not sized.
     #[serde(default)]
     pub unanswered_sessions: u64,
@@ -47,7 +47,7 @@ pub struct MemoryReport {
     pub setup_stores: Vec<MemorySetupStore>,
 }
 
-/// One session open on the new storage (`broca-session-store`).
+/// One session open in the session store (`broca-session-store`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySession {
     /// The session's store address.

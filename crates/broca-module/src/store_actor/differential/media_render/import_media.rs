@@ -1,4 +1,4 @@
-//! A head imported into the new storage whose history holds images: its first owner run's
+//! A head imported into the session store whose history holds images: its first owner run's
 //! request carries them, and so does every later one, through the session's media fold and the
 //! real renderer. An import writes its whole history as one seeded run, which the media fold
 //! reads as the run's input.

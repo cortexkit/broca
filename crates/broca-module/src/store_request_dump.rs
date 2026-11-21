@@ -1,4 +1,4 @@
-//! `session.request_dump` for a session kept in the new storage: rebuild the request each step
+//! `session.request_dump` for a session kept in the session store: rebuild the request each step
 //! of one run sent, and write the bodies that rebuild to the digest the step recorded.
 //!
 //! Each step is rebuilt as a warm-up rebuilds a recorded request

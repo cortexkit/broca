@@ -1,8 +1,8 @@
-//! The control stream of a session kept in the new storage: its records projected to today's
+//! The control stream of a session kept in the session store: its records projected to today's
 //! `session.subscribe` payloads, unit for unit.
 //!
 //! Today's projection (`broca_core::project_control_with_mids`) walks WAL records; this one walks
-//! the new storage's records, which split today's records into a transcript and a ledger. The
+//! the session store's records, which split today's records into a transcript and a ledger. The
 //! payload of each unit is built by the same shared rules (`broca_core::projection`), so a unit's
 //! content can't differ between the two storages; only the walk that decides which units each
 //! record yields, and where, is new here.

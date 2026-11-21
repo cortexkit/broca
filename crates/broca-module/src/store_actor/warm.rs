@@ -1,4 +1,4 @@
-//! `session.warm` on a session kept in the new storage: re-send the session's next model request
+//! `session.warm` on a session kept in the session store: re-send the session's next model request
 //! shaped to generate nothing, keeping the provider's cached prefix alive, by today's rules.
 //!
 //! Every refusal is decided from what the actor holds before anything is sent, in this order: a
@@ -124,14 +124,14 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             )))
         };
         let now_ms = (self.now_ms)();
-        // A session in the new storage has no write-ahead log, so it has no lineage: a warm
+        // A session in the session store has no write-ahead log, so it has no lineage: a warm
         // naming one names a history this session isn't, as today's actor refuses a warm naming
         // a lineage its log doesn't have.
         if let Some(requested) = lineage_id {
             return refuse(Refusal::LineageChanged { requested });
         }
         // Today's actor warms a running run's in-flight request with the exact bytes its
-        // transport sent, which a run on the new storage doesn't hand the actor yet.
+        // transport sent, which a run in the session store doesn't hand the actor yet.
         if self.run.is_some() {
             return Err(Box::new(WarmOutcome::Error(unserved(
                 "a warm while a run is running",

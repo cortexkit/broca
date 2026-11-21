@@ -1,7 +1,7 @@
 //! The state of one fork of a head session (llm-runner `fork_answer`), folded from the `Fork`
 //! records of the fork's own session.
 //!
-//! A fork lives in a short-lived session of its own in the new storage's ephemeral root. Its
+//! A fork lives in a short-lived session of its own in the session store's ephemeral root. Its
 //! first record says who prepared it and which head request it is based on; later records say
 //! which asks began and how each attempt ended, when the fork ended or was revoked, and which
 //! routing admissions and spend facts are settled. This fold is the one reading of those records:

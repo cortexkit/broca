@@ -11376,7 +11376,7 @@ async fn a_reading_with_no_view_ever_names_none() {
 }
 
 /// A session converted from today's storage, whose last step ran under a view: its entry
-/// facts carry that view, so the first run on the new storage names it with the step's reading.
+/// facts carry that view, so the first run in the session store names it with the step's reading.
 #[tokio::test]
 async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
     // A run that called a tool and answered, measured at 900 tokens, as the old storage wrote

@@ -1,4 +1,4 @@
-//! `session.delete`: deletes one session kept in the new storage, for the operator.
+//! `session.delete`: deletes one session kept in the session store, for the operator.
 //!
 //! For sessions nobody uses any more, such as an import that will be redone or a trial copy.
 //! The session must hold no work a deletion would lose: no run active or paused, no queued send,

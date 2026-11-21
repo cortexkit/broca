@@ -1,4 +1,4 @@
-//! `session.restore_from_backup`: restores sessions kept in the new storage after their files
+//! `session.restore_from_backup`: restores sessions kept in the session store after their files
 //! came back from a backup (see `broca_session_store::session::restore`, which decides and
 //! writes). Encrypted sessions need the deployment key to be checked, which only this process
 //! reads, so the restore runs in the daemon.
@@ -38,7 +38,7 @@ pub struct StoreRestore {
 }
 
 impl StoreRestore {
-    /// The restore of the new storage under `state_root`, opened with `slot`'s runtime, holding
+    /// The restore of the session store under `state_root`, opened with `slot`'s runtime, holding
     /// a session through `registry` and `leases` while it writes.
     pub fn new(
         registry: LineageRegistry,

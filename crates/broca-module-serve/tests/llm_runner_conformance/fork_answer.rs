@@ -31,7 +31,7 @@ pub(super) fn routed_session(session: &str) -> bool {
     ROUTED_CASES.iter().any(|case| session.contains(case))
 }
 
-/// Plan members the runner serves only for a head kept in the new storage. A head starts there
+/// Plan members the runner serves only for a head kept in the session store. A head starts there
 /// when the send creating it names the head session class.
 pub(super) const NEW_STORAGE_PLAN_MEMBERS: [&str; 2] = ["fork_callers", "readers"];
 

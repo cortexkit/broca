@@ -64,7 +64,7 @@ async fn resume_http_fixture_with_body(script: Option<&'static str>) -> ResumeHt
 }
 
 /// Admit and run one fresh run of `claude-haiku-4-5` under `provider` through the production
-/// executor, on a session in the new storage, with its vault (`listing`) and an HTTP stand-in
+/// executor, on a session in the session store, with its vault (`listing`) and an HTTP stand-in
 /// for Anthropic's host. Returns the request the stand-in received and the config the run froze.
 async fn borrowed_rows_run(
     label: &str,

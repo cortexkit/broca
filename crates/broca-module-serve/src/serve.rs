@@ -2266,7 +2266,7 @@ async fn handle_control_request(
             // view cache's byte cap: each read of such a session while it is closed loads it again.
             metrics["views_over_cap"] =
                 serde_json::json!(broca_module::store_reads::views_over_cap());
-            // Which deployment key the new session storage is opened with, and whether it has
+            // Which deployment key the session store is opened with, and whether it has
             // loaded: while it hasn't, sessions kept there are refused `key_unavailable`.
             metrics["store"] = crate::store_key::health();
             // The daemon's settings broca runs on, and the changed fields that wait for its next
@@ -2914,7 +2914,7 @@ where
         }
         // Establish storage ownership before authorization or dispatch can answer from today's
         // WAL. Without a store runtime the rollback guard refuses every op; with one, only ops
-        // implemented for the new storage may proceed.
+        // implemented for the session store may proceed.
         match handler.kept_in_new_storage(&session) {
             Ok(true) if !served_on_new_storage(method, params) => {
                 return send_error(
@@ -5639,14 +5639,14 @@ fn restore_all(params: &serde_json::Value) -> Result<bool, String> {
     }
 }
 
-/// The refusal of an op that has no implementation yet for a session kept in the new storage.
+/// The refusal of an op that has no implementation yet for a session kept in the session store.
 const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 
-/// The refusal of an op that serves only sessions kept in the new storage, for a session today's
+/// The refusal of an op that serves only sessions kept in the session store, for a session today's
 /// storage keeps. Permanent while the session stays there.
 const NOT_SERVED_ON_OLD_STORAGE: &str = "not_served_on_old_storage";
 
-/// Whether `method` is served for a session kept in the new storage. Every other op is refused
+/// Whether `method` is served for a session kept in the session store. Every other op is refused
 /// `not_served_on_new_storage` for such a session, so none can fall through to today's WAL
 /// reads. An op joins this list in the change that gives it a store implementation.
 ///
@@ -5676,13 +5676,13 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
         // Both file and inline imports write one seeded batch through the store actor.
         OP_IMPORT => true,
         OP_INSTALL_VIEW => true,
-        // Restore repairs the new storage's own files (`store_restore`).
+        // Restore repairs the session store's own files (`store_restore`).
         OP_RESTORE_FROM_BACKUP => true,
         // The tag map reads the store's own entry facts (`store_tag_map`).
         OP_TAG_MAP => true,
         // Request dumps rebuild a run's requests from the store's records (`store_request_dump`).
         OP_REQUEST_DUMP => true,
-        // Deletion removes a session from the new storage only (`retention_store`).
+        // Deletion removes a session from the session store only (`retention_store`).
         OP_SESSION_DELETE => true,
         // The store actor warms the request its loop would send next, dated by the store's own
         // cache clock (`store_actor::warm`).
@@ -5737,7 +5737,7 @@ fn the_store_gate_serves_inline_import_output_references_and_run_event_bodies() 
     ));
 }
 
-/// Routes a command only the new storage serves, and sends its answer: the reply, or its
+/// Routes a command only the session store serves, and sends its answer: the reply, or its
 /// refusal under the refusal's own code.
 #[allow(clippy::too_many_arguments)]
 async fn send_store_outcome<H: ServeHandler + ?Sized>(
@@ -10502,7 +10502,7 @@ mod tests {
         write_frame(&mut daemon, &ack).await.unwrap();
 
         // A new connection reports both serve-loop counters before this test submits any drops.
-        // Health also names the new storage's deployment key and whether it has loaded.
+        // Health also names the session store's deployment key and whether it has loaded.
         crate::store_key::publish(Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
             std::path::Path::new("/unused"),
             7,

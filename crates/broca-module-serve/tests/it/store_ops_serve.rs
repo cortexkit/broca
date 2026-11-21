@@ -1,4 +1,4 @@
-//! Operations a session kept in the new storage serves, reached through the real serve path:
+//! Operations a session kept in the session store serves, reached through the real serve path:
 //! each request goes over the wire into `serve_connection`, past its refusal of ops the new
 //! storage doesn't serve, into the registry and on to the store. The session is created in the
 //! new storage through the same registry the connection serves, by a send the store actor runs
@@ -449,7 +449,7 @@ impl Rig {
         self.settled(run_id).await;
     }
 
-    /// Creates the session in the new storage by importing, through the registry the connection
+    /// Creates the session in the session store by importing, through the registry the connection
     /// serves, a head whose first message carries `image`, owned by core under its head scope.
     async fn import_with_image(&self, image: &[u8]) {
         use broca_module::store_import::{ImportCommand, ImportRoots, StoreCommand, StoreOutcome};
@@ -524,9 +524,9 @@ impl Rig {
         panic!("run {run_id} never settled");
     }
 
-    /// The session is kept in the new storage, and nothing of it is on today's storage.
+    /// The session is kept in the session store, and nothing of it is on today's storage.
     /// Installs retention over the rig's own leases and store, as the module installs it at
-    /// startup: what deletes a session from the new storage.
+    /// startup: what deletes a session from the session store.
     fn install_retention(&self) {
         self.registry.set_retention_service(Arc::new(
             broca_module::retention::RetentionService::new(
@@ -833,7 +833,7 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// `session.media_read` and the upload operations reach the store through the serve path. A
-/// head imported into the new storage carries an image, which reads back byte-equal, whole and
+/// head imported into the session store carries an image, which reads back byte-equal, whole and
 /// by byte range. An image uploaded to the session is staged and committed, and reading it is
 /// refused while no record of the session names it.
 #[tokio::test]
@@ -899,9 +899,9 @@ async fn media_read_and_uploads_reach_the_store_through_serve() {
     );
 }
 
-/// `session.warm` reaches the store through the serve path. A session the new storage keeps is
+/// `session.warm` reaches the store through the serve path. A session the session store keeps is
 /// answered by the store actor's warm rules (here: this module reads no session's cache policy),
-/// never refused as an operation the new storage doesn't serve.
+/// never refused as an operation the session store doesn't serve.
 #[tokio::test]
 async fn warm_reaches_the_store_through_serve() {
     let mut rig = Rig::start("warm", vec![text_step("a1", "hello")]).await;

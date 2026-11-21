@@ -1,4 +1,4 @@
-//! `session.read {tag, call_key}` (llm-runner `tag_read`) for a session kept in the new storage:
+//! `session.read {tag, call_key}` (llm-runner `tag_read`) for a session kept in the session store:
 //! the message part the model saw as part number `tag` in the request that produced the tool
 //! call `call_key`.
 //!

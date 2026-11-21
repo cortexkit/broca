@@ -1,5 +1,5 @@
 //! When a session on today's storage last changed, as `session.head` serves it (`updated_at`).
-//! The head and a move into the new storage both take it from here: a move records it in the
+//! The head and a move into the session store both take it from here: a move records it in the
 //! moved session (`Record::Moved`), so the head reads the same after the move.
 
 use std::time::SystemTime;

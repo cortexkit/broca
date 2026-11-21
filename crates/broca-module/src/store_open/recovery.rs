@@ -1,4 +1,4 @@
-//! Boot discovery for the new storage uses heads and operational folds, never the run index.
+//! Boot discovery for the session store uses heads and operational folds, never the run index.
 
 use super::*;
 

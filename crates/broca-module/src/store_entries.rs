@@ -1,9 +1,9 @@
-//! What the compaction provider and history readers read from a session kept in the new storage
+//! What the compaction provider and history readers read from a session kept in the session store
 //! (`broca_session_store`): the `compaction-runner/v1` route's operations and `session.history`.
 //!
 //! Every read loads the session read-only (`StoreRuntime::view`): no lease, no actor, no WAL. A
 //! reply here equals the reply today's storage builds for the same history, apart from the
-//! differences the new storage has by design: no WAL lineage, the store's incarnation and
+//! differences the session store has by design: no WAL lineage, the store's incarnation and
 //! history version, no subscribe cursor, and the store's message ids.
 //!
 //! The `compaction-runner/v1` route on a store session:
@@ -109,7 +109,7 @@ pub fn frozen_provider<B: SessionBackend>(
         .map(|item| item.0))
 }
 
-/// Serves one `compaction-runner/v1` operation for the session `key`, kept in the new storage.
+/// Serves one `compaction-runner/v1` operation for the session `key`, kept in the session store.
 /// `caller` is the daemon-attested module id of the route, never a body field. The session's actor
 /// serves it when it holds the session open (see `store_reads`).
 pub async fn compaction_runner(
@@ -340,7 +340,7 @@ fn admit<'s, B: SessionBackend>(
     Ok(session)
 }
 
-/// `session.apply_view` on the route, for the session `key` kept in the new storage: admitted
+/// `session.apply_view` on the route, for the session `key` kept in the session store: admitted
 /// and read as today's route reads it, then applied by the session's actor, which records the
 /// view and sets it in the compaction state it hands to every run (`StoreCommand::ApplyView`).
 pub async fn apply_view(
@@ -469,7 +469,7 @@ fn cursor(entry: &Entry) -> Cursor {
     Cursor::new(entry.ordinal, &entry.mid, &entry.digest)
 }
 
-/// What `session.history` reads about a session kept in the new storage besides its pages,
+/// What `session.history` reads about a session kept in the session store besides its pages,
 /// which today's storage answers from `session.head` and from the WAL form of a message id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryHead {

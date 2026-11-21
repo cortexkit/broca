@@ -1,4 +1,4 @@
-//! The session actor for a session kept in the new storage (`broca_session_store`).
+//! The session actor for a session kept in the session store (`broca_session_store`).
 //!
 //! It takes the registry's session commands ([`crate::actor::LineageCmd`]) and answers with the
 //! shared outcome types. It owns the session's `Session` for the session's whole life and is its only writer. A run
@@ -79,7 +79,7 @@ fn unserved(what: &str) -> String {
     format!("{what} is not served yet for a session kept in the new storage")
 }
 
-/// A session actor over the new storage.
+/// A session actor over the session store.
 pub struct StoreActor<B: SessionBackend> {
     key: BindIdentity,
     session: Session<B>,
@@ -4680,10 +4680,10 @@ fn finished(run_id: &RunId, reason: broca_protocol::RunFinishReason) -> SendOutc
 }
 
 /// The feature a send to a session compacted under the first compaction protocol is refused
-/// for: the session moved to the new storage read-only.
+/// for: the session moved to the session store read-only.
 pub(crate) const FIRST_PROTOCOL_COMPACTION: &str = "first_protocol_compaction";
 
-/// The message of a send refused because it asks the new storage for `feature`, which it
+/// The message of a send refused because it asks the session store for `feature`, which it
 /// doesn't serve: a send continuing a session compacted under the first compaction protocol.
 pub(crate) fn unserved_message(feature: &str) -> String {
     if feature == FIRST_PROTOCOL_COMPACTION {

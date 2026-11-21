@@ -1883,7 +1883,7 @@ struct ChatgptRefreshRun {
     pause_code: Option<String>,
 }
 
-/// Drive one run through the production executor on a session in the new storage: real vault
+/// Drive one run through the production executor on a session in the session store: real vault
 /// admission, catalog auth shaping, transport, the run loop's pause mapping and the run-end
 /// report. Only the vault daemon and the ChatGPT HTTP backend are scripted locally.
 async fn chatgpt_refresh_run(

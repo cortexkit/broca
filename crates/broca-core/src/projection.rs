@@ -52,7 +52,7 @@ pub struct Cursor {
 /// the one the log holds at that position.
 #[derive(Debug, Clone, Copy)]
 enum FrameProof {
-    /// A record of a session kept in the new storage: its head's incarnation and the record's
+    /// A record of a session kept in the session store: its head's incarnation and the record's
     /// keyed digest, both minted by that storage.
     Store { incarnation: [u8; 16], digest: u64 },
 }
@@ -66,7 +66,7 @@ impl Cursor {
         }
     }
 
-    /// Binds the cursor to a record of a session kept in the new storage: the session head's
+    /// Binds the cursor to a record of a session kept in the session store: the session head's
     /// `incarnation` and the record's keyed `digest`.
     pub fn with_store_identity(mut self, incarnation: [u8; 16], digest: u64) -> Self {
         self.frame = Some(FrameProof::Store {
@@ -76,7 +76,7 @@ impl Cursor {
         self
     }
 
-    /// The new storage's identity this cursor carries: the head's incarnation and the record's
+    /// The session store's identity this cursor carries: the head's incarnation and the record's
     /// digest.
     pub fn store_identity(self) -> Option<([u8; 16], u64)> {
         match self.frame {
@@ -88,7 +88,7 @@ impl Cursor {
         }
     }
 
-    /// The cursor's `incarnation` and `digest` as the wire spells them: the new storage's
+    /// The cursor's `incarnation` and `digest` as the wire spells them: the session store's
     /// incarnation in lowercase hex as `session.read` serves it, and the digest as 16 lowercase
     /// hex digits.
     pub fn wire_identity(self) -> Option<(String, String)> {
@@ -133,7 +133,7 @@ impl std::hash::Hash for Cursor {
 /// Episode-local tracking shared by control projection and run-status reconciliation. A dispatch
 /// intent remains unresolved until a definite terminal arrives; an indeterminate terminal stays in
 /// the reported set because the tool may already have applied its side effect. A session kept in
-/// the new storage reports a run's indeterminate calls through the same tracking.
+/// the session store reports a run's indeterminate calls through the same tracking.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IndeterminateToolCalls {
     unresolved_dispatches: Vec<ToolCallId>,
@@ -225,7 +225,7 @@ pub struct ProjectedNotice {
 }
 
 /// The lifecycle event of message `mid`: started, or finished. With no message, a reset.
-/// Shared by today's projection and the projection of a session kept in the new storage.
+/// Shared by today's projection and the projection of a session kept in the session store.
 pub fn message_lifecycle_event(
     mid: Option<String>,
     finished: bool,

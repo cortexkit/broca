@@ -1,4 +1,4 @@
-//! `session.head` for a session kept in the new session storage.
+//! `session.head` for a session kept in the session store.
 //!
 //! The head is read from the session's head, its folds and the setup parts its run starts name,
 //! through a read-only load (`StoreRuntime::view`): no lease, no actor and no WAL. The reply
@@ -145,7 +145,7 @@ pub struct HeadFacts {
     /// The newest title a send carried.
     pub title: Option<String>,
     /// Whether the session is on the current compaction contract: for today's storage, whether
-    /// its first run froze a compaction plan version; for the new storage, whether its latest
+    /// its first run froze a compaction plan version; for the session store, whether its latest
     /// run did (`Operations::on_contract`).
     pub mode3: bool,
     /// When the session last changed.
@@ -312,7 +312,7 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         usage: crate::store_read::session_usage(operations.session_usage.as_ref()),
         title: operations.title.clone(),
         // Mode 3 is the session being on the current compaction contract, read from its latest
-        // run as every reader on the new storage reads it (`Operations::on_contract`): a
+        // run as every reader in the session store reads it (`Operations::on_contract`): a
         // session that moved onto it serves as mode 3 from that run on.
         mode3: operations.on_contract(),
         updated_at: Some(updated_at),
@@ -381,7 +381,7 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
     })
 }
 
-/// Serves `session.head` for the session `key`, kept in the new storage: the head built from a
+/// Serves `session.head` for the session `key`, kept in the session store: the head built from a
 /// read-only load of the session, the input profile it names, the session's prompt-cache clock,
 /// and what the caller (`principal`, bound with `scope`) may send.
 pub(crate) async fn serve_head(

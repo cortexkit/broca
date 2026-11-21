@@ -1,5 +1,5 @@
-//! The new session storage's deployment key: read from the vault when the module starts, kept in
-//! memory only, and used to open the new storage's runtime.
+//! The session store's deployment key: read from the vault when the module starts, kept in
+//! memory only, and used to open the session store's runtime.
 //!
 //! Each deployment key is a static vault record, `opaque:broca-deployment:<key-id>`. The
 //! operator grants `reserved:broca` an exact `read` on it. Its value is 32 random bytes written
@@ -7,7 +7,7 @@
 //! key the module uses (see `config::SessionStorageConfig`).
 //!
 //! The module starts without waiting for the key. Until the key loads, an encrypted session kept
-//! in the new storage is refused `key_unavailable`, a transient refusal, while plain sessions
+//! in the session store is refused `key_unavailable`, a transient refusal, while plain sessions
 //! kept there and today's sessions are served as before. The read is retried with backoff until
 //! it succeeds, and the key is then installed with no restart. The key never reaches disk or a
 //! log: only its id is logged or reported, and the vault's reply is never echoed, since a reply
@@ -46,7 +46,7 @@ pub enum KeyUnavailable {
     Refused,
     /// The record's value isn't 64 lowercase hex characters.
     Malformed,
-    /// The new storage couldn't be opened with the key: its setup parts didn't load.
+    /// The session store couldn't be opened with the key: its setup parts didn't load.
     Open,
 }
 
@@ -142,7 +142,7 @@ impl Default for Backoff {
     }
 }
 
-/// Loads the deployment key into `slot` and installs the new storage's runtime there.
+/// Loads the deployment key into `slot` and installs the session store's runtime there.
 pub struct KeyLoader {
     /// `None` when the module reads no vault, so the key can't load.
     pub source: Option<Arc<dyn DeploymentKeySource>>,
@@ -326,7 +326,7 @@ pub fn publish(slot: Arc<StoreSlot>) {
         .unwrap_or_else(|e| e.into_inner()) = Some(slot);
 }
 
-/// `{key_id, loaded, new_sessions, phases}` for the published slot: which deployment key the new storage
+/// `{key_id, loaded, new_sessions, phases}` for the published slot: which deployment key the session store
 /// opens encrypted sessions with, whether it has loaded, and the mode the sessions it creates
 /// take (`"encrypted"` or `"plain"`), and process-lifetime storage/run-loop timings and seal
 /// statistics. Null in a process that published none.

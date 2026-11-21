@@ -1556,7 +1556,7 @@ async fn an_unmapped_credential_is_never_offered_warned_once_and_counted() {
     assert_eq!(cache.unmapped().count(), 1);
 }
 
-/// A non-model record that broca's exact grant lists, such as the new session storage's
+/// A non-model record that broca's exact grant lists, such as the session store's
 /// deployment key, has no category, no auth_method and no provider ids. It is not a model
 /// credential, so it is neither warned about nor counted as unmapped, and never offered.
 #[tokio::test]

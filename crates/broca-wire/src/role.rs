@@ -416,10 +416,10 @@ pub fn broca_role_describe_with_writers(
         "fetch-plan-optional-tools/v1",
         SEND_TOOL_REPLY_BOUND_CAPABILITY,
         "session_class",
-        // Served on the new storage, where every head lives; a session still kept in today's
+        // Served in the session store, where every head lives; a session still kept in today's
         // storage refuses the read by name until it is converted.
         cortexkit_role_llm_runner::capabilities::PLAN_VIEW,
-        // Reader policies are served on the new storage; today's storage refuses plan.readers.
+        // Reader policies are served in the session store; today's storage refuses plan.readers.
         cortexkit_role_llm_runner::capabilities::APP_READERS,
         cortexkit_role_llm_runner::capabilities::STRUCTURED_OUTPUT,
         cortexkit_role_llm_runner::capabilities::SEND_STATUS,
@@ -487,7 +487,7 @@ pub fn broca_role_describe_with_writers(
     }
     let mut ops = ops;
     if broca_protocol::FORK_ANSWER_SERVED {
-        // Served for heads kept in the new storage (`broca_session_store`), where heads are
+        // Served for heads kept in the session store (`broca_session_store`), where heads are
         // created; a head not yet converted from a write-ahead log refuses each op with
         // fork_unsupported.
         ops.extend(

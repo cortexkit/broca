@@ -283,9 +283,9 @@ pub const RUNS_COMPACTION_V2: bool = true;
 /// (see `archive.rs`).
 pub const ARCHIVE_INDEX_V2_FEATURE: &str = "archive-index/v2";
 
-/// Not a WAL frame feature either: no frame ever requires it. It names the new session storage
+/// Not a WAL frame feature either: no frame ever requires it. It names the session store
 /// (`broca-session-store`), which keeps each session under [`SESSION_STORAGE_DIR`] instead of in
-/// a WAL. The new storage raises the machine's feature floor with this name before it writes its
+/// a WAL. The session store raises the machine's feature floor with this name before it writes its
 /// first session in a state root, so placement then refuses every build whose table lacks it.
 /// A build that lists it either serves those sessions or refuses them by name, and never creates
 /// a WAL at their address: a second log for the same session would fork it. Today's

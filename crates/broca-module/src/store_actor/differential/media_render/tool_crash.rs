@@ -1,4 +1,4 @@
-//! A crash while a planned session's tool call runs, recovered on the new storage.
+//! A crash while a planned session's tool call runs, recovered in the session store.
 //!
 //! The process dies with the call dispatched and no result recorded. A new process seals the
 //! run as the crash's orphan, answering the call as never run, and the session's next run sends

@@ -1,7 +1,7 @@
 //! An import written in batches into a staged session and published whole over the empty
-//! session it was admitted into, on the new storage's class roots: an import larger than one log
+//! session it was admitted into, on the session store's class roots: an import larger than one log
 //! batch, parity with the single batch an import was written as before staging, and a crash at
-//! each step before and after the publication, each reopened through the new storage's own open.
+//! each step before and after the publication, each reopened through the session store's own open.
 //! Every case runs in both cipher modes.
 
 use std::path::Path;
@@ -351,7 +351,7 @@ async fn a_staged_import_reads_as_the_same_import_written_in_one_batch() {
     }
 }
 
-/// A crash at each step of an import, then the new storage opened again as at a restart: before
+/// A crash at each step of an import, then the session store opened again as at a restart: before
 /// the head is replaced the session is the empty one the import was admitted into, whatever the
 /// attempt staged is gone, and a retry under the same import id is admitted as new; after it the
 /// session is the whole import, and the retry is answered from its receipt. The import here

@@ -1,4 +1,4 @@
-//! Keep-warm on a session kept in the new storage, through the module's registry.
+//! Keep-warm on a session kept in the session store, through the module's registry.
 //!
 //! The module runs a scripted model whose transport notes each request it sends on the seal its
 //! run gives it, as the real transport does. The model's frozen render config is a first-party

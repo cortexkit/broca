@@ -860,7 +860,7 @@ fn an_imports_seeded_run_places_the_imported_messages() {
     );
 }
 
-/// The records only the new storage writes that don't touch media hand nothing over: an
+/// The records only the session store writes that don't touch media hand nothing over: an
 /// enrollment in the current compaction contract and an applied refresh, written in a run
 /// start's batch after its inputs, and a run's billing.
 #[test]

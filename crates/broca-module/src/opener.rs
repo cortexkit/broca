@@ -56,13 +56,13 @@ impl<L: LeaseStore> DefaultOpener<L> {
         self
     }
 
-    /// Serves sessions kept in the new storage through `store`.
+    /// Serves sessions kept in the session store through `store`.
     pub fn with_store_runtime(mut self, store: Arc<crate::store_open::StoreRuntime>) -> Self {
         self.store = Some(Arc::new(crate::store_open::StoreSlot::loaded(store)));
         self
     }
 
-    /// Serves sessions kept in the new storage through `slot`, whose runtime is installed once
+    /// Serves sessions kept in the session store through `slot`, whose runtime is installed once
     /// the deployment key loads. Until then those sessions are refused `key_unavailable`.
     pub fn with_store_slot(mut self, slot: Arc<crate::store_open::StoreSlot>) -> Self {
         self.store = Some(slot);
@@ -220,7 +220,7 @@ impl<L: LeaseStore + 'static> DefaultOpener<L> {
         session_class: Option<String>,
         status: bool,
     ) -> Result<ActorHandle, OpenError> {
-        // Every session lives in the new storage: one it doesn't hold, and that no creating send
+        // Every session lives in the session store: one it doesn't hold, and that no creating send
         // or import marked, doesn't exist.
         let Some(slot) = &self.store else {
             return Err(OpenError::UnknownSession);
@@ -258,7 +258,7 @@ impl<L: LeaseStore + 'static> DefaultOpener<L> {
             runtime.expiry_markers(key)?;
         }
         // Decided under the lease, so no other open of this session decides beside it. A
-        // session in the new storage is served from there, and refused while it is encrypted and
+        // session in the session store is served from there, and refused while it is encrypted and
         // its key hasn't loaded. One that exists nowhere starts there when the registry marked its
         // creating send or import; while the storage's key hasn't loaded (the first seconds after
         // a start), that send is refused as retryable. It starts in the root of the class its

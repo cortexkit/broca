@@ -20,7 +20,7 @@ pub const LARGEST: usize = 10;
 /// What an actor answers the report.
 #[derive(Debug)]
 pub enum MemoryAnswer {
-    /// A session on the new storage, sized.
+    /// A session in the session store, sized.
     Store(Box<ActorMemory>),
     /// A session on today's storage, which the report counts and doesn't size.
     Legacy,

@@ -139,7 +139,7 @@ struct CoreExec {
 
 #[async_trait]
 impl RunExecutor for CoreExec {
-    /// Every session is kept in the new storage: its runs go through the new loop over the
+    /// Every session is kept in the session store: its runs go through the new loop over the
     /// same gated provider.
     async fn execute_on_store(
         &self,
@@ -478,7 +478,7 @@ impl Rig {
         .await
     }
 
-    /// The session's records in the new storage, in log order. Empty while it doesn't exist.
+    /// The session's records in the session store, in log order. Empty while it doesn't exist.
     async fn records(&self) -> Vec<Record> {
         let runtime = self.registry.store_runtime().unwrap();
         match runtime.current_view(&self.session).await {
@@ -505,7 +505,7 @@ impl Rig {
             .collect()
     }
 
-    /// Whether the new storage holds the session at all.
+    /// Whether the session store holds the session at all.
     fn exists(&self) -> bool {
         broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.session))
             .unwrap()

@@ -1,4 +1,4 @@
-//! The plan-change facts of a session kept in the new storage, which the plan-change rules
+//! The plan-change facts of a session kept in the session store, which the plan-change rules
 //! (`crate::plan_change`) decide from as they decide from today's fold. The operational fold
 //! holds the session's change counters, its pending change and the manifests its latest run and
 //! latest refresh froze (`Operations::plan`). What a request's own generation or `send_id`
@@ -204,7 +204,7 @@ pub(crate) async fn identities<B: SessionBackend>(
     Ok(Some((effective, accepted)))
 }
 
-/// What `session.baseline` reads about a session kept in the new storage, before the serve layer
+/// What `session.baseline` reads about a session kept in the session store, before the serve layer
 /// checks the caller is the owner and adds the cache declaration (see `crate::serve`'s
 /// `baseline`, which reads the same facts from a WAL).
 #[derive(Debug)]

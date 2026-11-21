@@ -1,6 +1,6 @@
 //! The session's image index: what a run's writes hand over is applied before the run hears its
 //! write went through, an open starts from the saved index and reads no record twice, a session
-//! without images keeps no index, and the records only the new storage has (an undo, a recovery
+//! without images keeps no index, and the records only the session store has (an undo, a recovery
 //! cut) change the rendered request as their rules say.
 
 use std::sync::Arc;

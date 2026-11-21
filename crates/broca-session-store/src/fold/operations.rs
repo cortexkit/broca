@@ -2251,7 +2251,7 @@ impl Operations {
                     sender,
                     request_identity_digest,
                     // A delivery names no stored media of its own. The loop writes one only for an
-                    // ordered send, which a session in the new storage doesn't take yet.
+                    // ordered send, which a session in the session store doesn't take yet.
                     media: Vec::new(),
                     named_speaker: crate::record::marks_name_speaker(message_marks.as_ref()),
                     message_marks,

@@ -1,4 +1,4 @@
-//! Keep-warm on a session kept in the new storage: while a run whose keep-warm is `auto` waits on
+//! Keep-warm on a session kept in the session store: while a run whose keep-warm is `auto` waits on
 //! tool calls, today's scheduler (`broca_core::keep_warm_wait`) re-sends the run's last request
 //! to keep the provider's cached prefix alive, through the driver here, by the rules today's
 //! driver (`crate::keep_warm::AutomaticWarmer`) follows on a session whose log doesn't reserve

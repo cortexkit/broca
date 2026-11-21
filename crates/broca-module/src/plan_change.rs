@@ -50,7 +50,7 @@ pub(crate) struct ChangeFacts {
     pub enrollment: Option<EnrollmentFacts>,
 }
 
-/// What a refresh that adds a compaction provider is checked against on the new storage.
+/// What a refresh that adds a compaction provider is checked against in the session store.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct EnrollmentFacts {
     /// The window holds every message the session placed (`enroll::window_whole`).
@@ -131,7 +131,7 @@ pub(crate) enum RefreshAcceptance {
 /// The actor's checks of a refresh of `generation` under `policy`, whose fetched manifest is
 /// `manifest`, made where it writes: generation order against what the session accepted since
 /// the serve layer looked, the compaction item, which stays the session's for its life once it
-/// has one (a session in the new storage may gain one, see [`ChangeFacts::enrollment`]), and the
+/// has one (a session in the session store may gain one, see [`ChangeFacts::enrollment`]), and the
 /// rungs the changed surfaces support. A new refresh's reply says whether a run is in progress
 /// and whether the change applies from the next run, which it does under `immediately` or after
 /// a flush.
@@ -159,7 +159,7 @@ pub(crate) fn accept_refresh(
         &facts.enrollment,
     ) {
         (Ok(session_change::CompactionItemChange::Same), _) => {}
-        // Only the new storage moves a session onto the compaction contract, at the run that
+        // Only the session store moves a session onto the compaction contract, at the run that
         // applies this refresh; the state that move needs is checked again here, where the
         // refresh is written, as the serve layer's preflight checked it before the fetch.
         (Ok(session_change::CompactionItemChange::Added), Some(enrollment)) => {
@@ -761,7 +761,7 @@ mod tests {
         manifest
     }
 
-    /// Only a session in the new storage takes a refresh that adds a compaction provider, and
+    /// Only a session in the session store takes a refresh that adds a compaction provider, and
     /// only while it can enroll; every other change to the item is refused with today's bytes, on
     /// either storage, against the latest accepted plan: the pending one once there is one.
     #[test]

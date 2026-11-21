@@ -184,14 +184,14 @@ enum Cmd {
     },
     /// `session.request_dump`: rebuild the request each step of run `run_id` of this session
     /// sent, and write the bodies that match their recorded SHA-256 to a private folder under
-    /// broca's state root. Operator only, for a session kept in the new storage. Stdout is the
+    /// broca's state root. Operator only, for a session kept in the session store. Stdout is the
     /// reply (the folder and each step's outcome, never any content) or the refusal as the
     /// daemon sent it, which exits 1. The daemon gets up to ten minutes to answer.
     RequestDump {
         #[arg(long)]
         run_id: String,
     },
-    /// `session.delete`: delete this session from the new storage, when it holds no run, queued
+    /// `session.delete`: delete this session from the session store, when it holds no run, queued
     /// send or unexported spend. Operator only. Stdout is the reply (`{"result":{"deleted":…}}`)
     /// or the refusal as the daemon sent it, which exits 1.
     Delete {
@@ -321,7 +321,7 @@ enum Cmd {
         display: bool,
     },
     /// `session.restore_from_backup`: after the state root's files came back from a backup,
-    /// restore this session kept in the new storage, or with `--all` every such session, from
+    /// restore this session kept in the session store, or with `--all` every such session, from
     /// what the store holds. Operator only. A session whose head and everything it names are
     /// there is kept untouched. Otherwise the newest complete head version is restored, and its
     /// open log is cut back before the first record naming a file the backup lacks, the cut bytes
@@ -329,14 +329,14 @@ enum Cmd {
     /// JSON object per session) and exits 0 when every session was kept or restored, 1
     /// otherwise.
     RestoreFromBackup {
-        /// Every session kept in the new storage; the session identity given then only
+        /// Every session kept in the session store; the session identity given then only
         /// attaches the command to the daemon.
         #[arg(long)]
         all: bool,
     },
     /// `session.tag_map`: which message and part each part number of this session belongs to,
     /// the number the model is shown in front of the part. Operator only, for a session
-    /// kept in the new storage. Pages until the last message and writes one JSON document,
+    /// kept in the session store. Pages until the last message and writes one JSON document,
     /// `{"session": <name>, "rows": [...]}`, each row naming a number's message id, ordinal,
     /// part index and role, never any content. A refusal is written to stdout as the daemon sent
     /// it, and exits 1.

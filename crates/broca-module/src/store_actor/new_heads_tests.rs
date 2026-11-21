@@ -1,6 +1,6 @@
-//! A send creating an agent head starts it in the new storage, in its durable class (the folder
-//! backups copy). A head the new storage can't start is refused, before anything is created.
-//! While a session in the new storage has no run, only the scope whose stamped `route.bind`
+//! A send creating an agent head starts it in the session store, in its durable class (the folder
+//! backups copy). A head the session store can't start is refused, before anything is created.
+//! While a session in the session store has no run, only the scope whose stamped `route.bind`
 //! reserved its address may start it, and a session whose creating send was refused is deleted
 //! when its actor closes.
 
@@ -22,8 +22,8 @@ use crate::registry::{LineageRegistry, OpenError, HEAD_SESSION_CLASS};
 
 pub(super) const IDLE: Duration = Duration::from_millis(100);
 
-/// A module over a scratch state root whose registry creates no session in the new storage but a
-/// head. Its opener serves the new storage when `store`.
+/// A module over a scratch state root whose registry creates no session in the session store but a
+/// head. Its opener serves the session store when `store`.
 pub(super) struct Module {
     dir: PathBuf,
     pub(super) registry: LineageRegistry,
@@ -131,12 +131,12 @@ impl Module {
         panic!("the session's actor never closed");
     }
 
-    /// The class of the new storage's root holding the session's head, if one does.
+    /// The class of the session store's root holding the session's head, if one does.
     fn store_class(&self) -> Option<StorageClass> {
         broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key)).unwrap()
     }
 
-    /// Whether any of the new storage's roots holds a head, a log or an object of the session.
+    /// Whether any of the session store's roots holds a head, a log or an object of the session.
     fn store_leftovers(&self) -> Vec<PathBuf> {
         let addr = broca_core::session_addr(&self.key);
         StorageClass::ALL
@@ -201,7 +201,7 @@ fn sent_by(
     sent
 }
 
-/// A head's creating send starts the session in the new storage's durable root, with no WAL and
+/// A head's creating send starts the session in the session store's durable root, with no WAL and
 /// the feature floor raised, though the module creates no other session there. Its actor closes
 /// when idle, and the head's next send reopens it from that root.
 #[tokio::test]

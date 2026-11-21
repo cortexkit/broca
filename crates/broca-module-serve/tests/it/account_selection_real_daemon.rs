@@ -351,14 +351,14 @@ struct Vault {
     openai_apikey_listed: std::sync::atomic::AtomicBool,
     /// Once set, the listing also carries the OpenRouter API key `apikey:openrouter`.
     openrouter_listed: std::sync::atomic::AtomicBool,
-    /// The value of the new storage's deployment-key record (`opaque:broca-deployment:<id>`).
+    /// The value of the session store's deployment-key record (`opaque:broca-deployment:<id>`).
     /// `None` answers `not_found`, as a vault without the record or its grant does.
     deployment_key: Mutex<Option<Vec<u8>>>,
     /// Once set, the Antigravity sign-in is served without its Google Cloud project.
     antigravity_without_project: std::sync::atomic::AtomicBool,
 }
 
-/// The prefix of the new storage's deployment-key records, which the daemon reads at boot.
+/// The prefix of the session store's deployment-key records, which the daemon reads at boot.
 const DEPLOYMENT_KEY_RECORD: &str = "opaque:broca-deployment:";
 
 impl Vault {
@@ -1337,7 +1337,7 @@ impl Rig {
 
     /// A `session.send` to the fresh session `name` that must be refused before anything is
     /// durable: its error body parsed and as the exact bytes the serve path sent. Nothing in
-    /// the new storage changes: no session is created and no existing file changes size.
+    /// the session store changes: no session is created and no existing file changes size.
     async fn refused_send(&self, name: &str, send_id: &str) -> (Value, Vec<u8>) {
         let conn = SubcConnection::connect(&self.connection_file)
             .await
@@ -1635,11 +1635,11 @@ impl Rig {
         identity
     }
 
-    /// Creates the session `identity` in the new storage, in the mode `deployment` creates
+    /// Creates the session `identity` in the session store, in the mode `deployment` creates
     /// sessions in, and returns the incarnation its head names, which `session.history` reports
     /// for a session served from there. Asserts the head is where the daemon looks for it:
     /// `session_storage_head` of the session's address, the path the daemon's check of whether
-    /// the new storage keeps a session reads.
+    /// the session store keeps a session reads.
     async fn create_held(
         &self,
         identity: &broca_protocol::BindIdentity,
@@ -1801,7 +1801,7 @@ impl Rig {
         .await
     }
 
-    /// Session `name`'s records in the new storage, in log order; empty while it doesn't exist.
+    /// Session `name`'s records in the session store, in log order; empty while it doesn't exist.
     /// A management route opened without a scope keys its session under the unscoped
     /// namespace (see [`Self::served_identity`]).
     async fn frames(&self, name: &str) -> Vec<FramedRecord> {
@@ -4477,11 +4477,11 @@ async fn the_real_daemon_creating_plain_sessions_still_refuses_an_encrypted_one_
 /// session (`session.head`, `session.read`, raw and display `session.history`, `run.status`,
 /// `run.result`, `session.send_status` and `session.subscribe`) is refused `open_failed`, class
 /// transient, its reason naming `key_unavailable`. The daemon refuses so only a session it found
-/// in the new storage, so each refusal also shows it found the head written here. None of those
+/// in the session store, so each refusal also shows it found the head written here. None of those
 /// reads leaves a log in today's storage. The plain session is
-/// served from the new storage meanwhile, and a session on today's storage is served too. Once
+/// served from the session store meanwhile, and a session on today's storage is served too. Once
 /// the record exists, the daemon reads it again without being asked and serves the encrypted
-/// session from the new storage (its own incarnation, not today's empty answer), with no restart.
+/// session from the session store (its own incarnation, not today's empty answer), with no restart.
 /// The missing record is never reported to the vault as an auth failure.
 async fn held_sessions_across_the_deployment_key(encryption: &str) {
     let Some(rig) = Rig::start_with(json!({"session_storage": {"encryption": encryption}})).await

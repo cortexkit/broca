@@ -1,4 +1,4 @@
-//! The wire types of a head's import into the new session storage: `session.import` with a file
+//! The wire types of a head's import into the session store: `session.import` with a file
 //! source, and `session.install_view`, which records the compaction provider's first view of
 //! the imported history.
 
@@ -130,7 +130,7 @@ pub struct FileImportReply {
     pub moves: MoveList,
     pub newest: ImportNewest,
     pub history_version: u64,
-    /// The session's incarnation in the new storage, in lowercase hex.
+    /// The session's incarnation in the session store, in lowercase hex.
     pub incarnation: String,
     /// How many messages the import placed.
     pub imported_messages: u64,

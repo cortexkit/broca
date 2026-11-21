@@ -1,4 +1,4 @@
-//! Run and send facts of a session kept in the new storage: `run.status` (for one run, and the
+//! Run and send facts of a session kept in the session store: `run.status` (for one run, and the
 //! queued send a run id may still name), `run.result`, `send.status` and `session.send_status`.
 //! The no-run `status` stays on the registry's own path (`route_status`), which asks the
 //! session's store actor, opening it when the session needs recovering.
@@ -16,7 +16,7 @@
 //! - an active run's `step` (the in-flight model step) is served only when the session's store
 //!   actor answers the read: it is a live hint the actor keeps in memory, as today's actor does,
 //!   and nothing durable holds it;
-//! - `awaiting_approval` is always absent: the new storage takes no approval questions;
+//! - `awaiting_approval` is always absent: the session store takes no approval questions;
 //! - a final message's `mid` is the id the session stored when it placed the message;
 //! - a final message's text is cleaned of tag notation whenever the message's entry facts say its
 //!   run cleans replies, as `session.entries` serves it. Today's `run.result` cleans by the run's
@@ -46,7 +46,7 @@ use broca_session_store::record::{CallOutcome, Record, RunStart};
 use broca_session_store::session::{Session, SessionError};
 use serde_json::Value;
 
-/// Why a run or send fact of a session kept in the new storage wasn't served.
+/// Why a run or send fact of a session kept in the session store wasn't served.
 #[derive(Debug)]
 pub enum StatusError {
     /// The session couldn't be read.
@@ -1374,7 +1374,7 @@ impl StoreRead<'_> {
     }
 }
 
-/// Serves run and send facts from a loaded session kept in the new storage: the module through
+/// Serves run and send facts from a loaded session kept in the session store: the module through
 /// [`StoreRead`], and the converter's check over a converted session.
 #[derive(Clone)]
 pub struct Reader<'a> {

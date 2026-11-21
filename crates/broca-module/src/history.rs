@@ -265,7 +265,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
         HistoryMode::FromMid(mid) | HistoryMode::BeforeMid(mid) => Some(mid),
         _ => None,
     };
-    // A session kept in the new storage is read from it: its head facts here, its pages through
+    // A session kept in the session store is read from it: its head facts here, its pages through
     // `handler.read`, and what output references need through the handler's store reads.
     let store = handler.store_history_head(session, named).await?;
 

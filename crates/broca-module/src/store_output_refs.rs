@@ -1,4 +1,4 @@
-//! What output references read of a session kept in the new storage, as today's read of the
+//! What output references read of a session kept in the session store, as today's read of the
 //! session's log answers it: where a part number sits, and the compaction view the request of
 //! the model step that wrote a message was rendered under. Both are read from facts recorded
 //! when each message was placed (`EntryFacts::runner_tag_base`, `EntryFacts::legacy_view_seq`),

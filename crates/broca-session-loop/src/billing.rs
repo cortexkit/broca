@@ -1,4 +1,4 @@
-//! A run's spend facts, for a session kept in the new storage.
+//! A run's spend facts, for a session kept in the session store.
 //!
 //! The usage export holds the facts today's builder writes
 //! (`broca_core::billing::compute_segments_for_run`), and its readers read nothing else. That

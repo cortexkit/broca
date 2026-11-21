@@ -129,7 +129,7 @@ fn worker_acceptance_scope_authorizes_broca_for_aft() {
 async fn worker_admission_acceptance_reads_real_run_started_gates() {
     use subc_protocol::manifest::{Concurrency, ExecutionMode, IdentityScope, ProviderRole, Tool};
     let model = ScopeModel::start().await;
-    // A mason starts in the new storage, which refuses a new session until its deployment key
+    // A mason starts in the session store, which refuses a new session until its deployment key
     // loads; plain sessions need no key, so the rig needs no vault.
     let storage = serde_json::json!({"session_storage": {"encryption": "off"}});
     let Some(rig) = Rig::start_with_broca_config(None, None, Some(&model.url), Some(storage)).await
@@ -260,7 +260,7 @@ async fn worker_admission_acceptance_reads_real_run_started_gates() {
     let run = admitted["result"]["run_id"].as_str().unwrap();
     completed_run(&owner, &route, run).await;
 
-    // A mason runs in the new storage; its run start is read back through `run.admission`, the
+    // A mason runs in the session store; its run start is read back through `run.admission`, the
     // same read the acceptance script makes.
     let admission = scope_request(
         &owner,
@@ -1051,7 +1051,7 @@ impl Rig {
             .collect()
     }
 
-    /// Whether the new storage holds `session`.
+    /// Whether the session store holds `session`.
     fn exists(&self, session: &broca_protocol::BindIdentity) -> bool {
         broca_wal::session_storage_class(
             &self.state_root,
@@ -1061,7 +1061,7 @@ impl Rig {
         .is_some()
     }
 
-    /// `session`'s records in the new storage, in log order; empty while it doesn't exist.
+    /// `session`'s records in the session store, in log order; empty while it doesn't exist.
     async fn records(&self, session: &broca_protocol::BindIdentity) -> Vec<Record> {
         stored_log::stored_records(&self.state_root, &self.keyed(session)).await
     }
@@ -2000,7 +2000,7 @@ async fn real_agent_run_scope_freezes_bills_and_refuses_every_invalid_send_witho
 }
 
 /// A head's creating send, over a route the daemon stamped with its owner's scope, starts the
-/// head in the durable root of the new storage, not on today's storage: the real `ck-broca`,
+/// head in the durable root of the session store, not on today's storage: the real `ck-broca`,
 /// supervised by the real `ck-subc`, creating plain sessions. Its first turn completes there.
 /// After the daemon and broca restart over the same state, the owner's next send runs as the
 /// head's second turn, and the head's history reads both turns back, with no log of the head
@@ -2016,7 +2016,7 @@ async fn a_new_head_runs_two_turns_across_a_restart_in_the_new_storage() {
         return;
     };
     let session = first.session("alfonso:head:agent_0123456789abcdef");
-    // Where the head is kept: the new storage's root holding its head file, if any.
+    // Where the head is kept: the session store's root holding its head file, if any.
     let kept = |rig: &Rig| {
         broca_wal::session_storage_class(&rig.state_root, &broca_core::session_addr(&session))
             .unwrap()

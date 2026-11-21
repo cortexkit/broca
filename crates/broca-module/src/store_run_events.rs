@@ -1,4 +1,4 @@
-//! Run events (`event.broca.run.*.v1`) of the sessions kept in the new storage.
+//! Run events (`event.broca.run.*.v1`) of the sessions kept in the session store.
 //!
 //! Prefrontal, Magic Context and Colliculus learn that a run started, paused, consumed a steer or
 //! ended from these events, and fall back to polling while none arrive. Each event is derived

@@ -143,7 +143,7 @@ fn templated(
     )
 }
 
-/// A session in the new storage served by the store actor over a script.
+/// A session in the session store served by the store actor over a script.
 struct Pair {
     commands: store::Commands,
     served: tokio::task::JoinHandle<Session<&'static MemoryBackend>>,

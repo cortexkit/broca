@@ -906,7 +906,7 @@ struct PriorRunView {
     config: broca_wal::RunConfig,
     idle: bool,
     /// The run moved to another account at a quota wall: its config names the account it
-    /// moved to. Only a run in the new storage moves.
+    /// moved to. Only a run in the session store moves.
     moved: bool,
     /// The run is paused where its resume can durably record a change of account: for a
     /// sign-in or for a restart. Its resume writes the account and the config that names it
@@ -1036,7 +1036,7 @@ fn store_cc_version_suffix(
     first_durable_cc_version_suffix(first_user.cloned().as_slice(), &req.input)
 }
 
-/// The loop's seams for a run kept in the new session storage, from the run's controls.
+/// The loop's seams for a run kept in the session store, from the run's controls.
 #[allow(clippy::too_many_arguments)]
 fn store_seams<'a, P: broca_core::provider::Provider>(
     provider: &'a P,
@@ -1678,7 +1678,7 @@ impl broca_session_loop::account_move::AccountContinue<Box<dyn broca_core::provi
                     queued_service_tier: &mut queued_service_tier,
                     media_profile: &None,
                     clock: self.clock,
-                    // Only a run in the new session storage moves.
+                    // Only a run in the session store moves.
                     continue_offer: Some(&choice),
                     // The offer is the account: the moved config already names it, so
                     // the resume rule that would ask routing again doesn't apply.
@@ -2337,7 +2337,7 @@ impl LiveLoopExecutor {
     /// context management, the credential and account (routing included), the cache policy
     /// and key, a Claude Code persona and the provider's resolved render config. `history`
     /// says what the session holds, so the same decision serves a session on today's WAL
-    /// and one in the new storage. An error means nothing was written and no model was
+    /// and one in the session store. An error means nothing was written and no model was
     /// called; the caller answers the admission with it.
     async fn admit_episode(
         &self,
@@ -2971,7 +2971,7 @@ impl LiveLoopExecutor {
     /// starts with, the frozen credential selection, the reporter of its account evidence
     /// to routing, and its frozen context limit. Returns the reporter too, for the run's
     /// end. `durable_head` is the seq of the session's last durable record: the reporter
-    /// names only records at or below it. `store_session` is a run in the new storage's
+    /// names only records at or below it. `store_session` is a run in the session store's
     /// session id, which its event ids are named by in place of a WAL lineage.
     #[allow(clippy::too_many_arguments)]
     fn episode_control(
@@ -4586,7 +4586,7 @@ impl RunExecutor for LiveLoopExecutor {
             .await
     }
 
-    /// Runs a session kept in the new session storage: the same admission decisions as
+    /// Runs a session kept in the session store: the same admission decisions as
     /// `execute`, read from the session's folds instead of the WAL, then the new run loop
     /// (`broca_session_loop`) writing through the store actor.
     async fn execute_on_store(

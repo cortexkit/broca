@@ -107,7 +107,7 @@ pub(crate) fn freeze_manifest(
 /// from it with the session's own mode:
 /// - Today's loop reads it only for a brand-new log. An existing log keeps the mode its first
 ///   run recorded, and a refresh can't add a compaction provider there.
-/// - The new storage's loop reads it for every run (`broca_session_loop::admit::session_contract`).
+/// - The session store's loop reads it for every run (`broca_session_loop::admit::session_contract`).
 ///   A session already on the contract stays on it. A session that ran outside it moves onto it
 ///   at the first run whose plan names a compaction provider.
 pub(crate) fn plan_compaction_version(manifest: Option<&PlanManifest>) -> Option<u32> {

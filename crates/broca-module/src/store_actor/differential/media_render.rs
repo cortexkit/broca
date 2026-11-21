@@ -1,4 +1,4 @@
-//! Requests holding media, rendered for a session kept in the new storage: every request is
+//! Requests holding media, rendered for a session kept in the session store: every request is
 //! pinned byte for byte.
 //!
 //! The executor installs a media renderer as the module's executor does, from the session's
@@ -251,7 +251,7 @@ struct RenderExecutor {
     compactor: Option<Arc<super::controls::Compactor>>,
 }
 
-/// The new storage's renderer, installed as the module's executor installs it for a store run
+/// The session store's renderer, installed as the module's executor installs it for a store run
 /// that may carry media: ready once the session's image index is, each model call waiting for it.
 fn install_store(
     job_media: Option<crate::store_media::StoreRunMediaWait>,
@@ -376,7 +376,7 @@ impl RunExecutor for RenderExecutor {
 }
 
 /// A module over the state root `dir` whose runs render their requests into `sent`. Sessions
-/// start in the new storage; `store` must say so.
+/// start in the session store; `store` must say so.
 async fn registry(
     dir: &std::path::Path,
     store: bool,
@@ -858,7 +858,7 @@ fn photo_tool_by_core(text: &str) -> SubmissionRequest {
     sent
 }
 
-/// The first request of a session's latest run, rendered offline from the new storage: the
+/// The first request of a session's latest run, rendered offline from the session store: the
 /// session as the run holds it and its own media objects (`store_media::offline_render`). For a
 /// session holding a tool's image and a photo the user sent, that must be the bytes the model was
 /// asked to send. So the offline render, which a session move uses to check the copy it writes,
@@ -908,7 +908,7 @@ async fn an_input_photo_and_a_tool_image_render_offline_as_sent(cipher: Cipher) 
         "the request carries the tool's image and the user's photo"
     );
 
-    // The new storage's: the session as its run holds it now, and its own media objects.
+    // The session store's: the session as its run holds it now, and its own media objects.
     use broca_session_store::backend::{LocalBackend, SessionAddr};
     let root = store.side.dir.join(broca_wal::SESSION_STORAGE_DIR);
     let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
@@ -1118,7 +1118,7 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
 /// A view that inserts a user message carrying an image, as Magic Context inserts the image it
 /// draws of its memories, renders alike. The image isn't a medium the session captured, so on
 /// both storages the request shows its provenance marker in its place, never its bytes. Until
-/// the new storage rendered it, such a view applied there and then failed every request. The
+/// the session store rendered it, such a view applied there and then failed every request. The
 /// new storage tells its provider it takes no images, whatever the model takes, yet accepts the
 /// view: a provider repeats an insert it made before, and refusing it would hold an older view.
 async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {

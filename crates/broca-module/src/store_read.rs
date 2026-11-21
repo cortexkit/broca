@@ -1,4 +1,4 @@
-//! Reads of a session kept in the new session storage.
+//! Reads of a session kept in the session store.
 //!
 //! A read is served by the session's store actor from the session it holds, or, for a session no
 //! actor holds, from a read-only view (`Session::view_at`) kept while the session stays where it
@@ -397,10 +397,10 @@ async fn imported_notices<B: SessionBackend>(
     Ok(notices)
 }
 
-/// Serves `session.read` for a session kept in the new storage. The reply is today's for the
+/// Serves `session.read` for a session kept in the session store. The reply is today's for the
 /// same history, built from the session's head, its folds and its entry facts, never from a WAL.
 ///
-/// A late-approval cursor is refused by name: the new storage takes no approval questions, so no
+/// A late-approval cursor is refused by name: the session store takes no approval questions, so no
 /// cursor names one.
 pub async fn serve_read(
     registry: &crate::LineageRegistry,

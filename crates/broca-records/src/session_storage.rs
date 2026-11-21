@@ -1,20 +1,20 @@
-//! Which storage owns a session: today's (a WAL) or the new session storage
+//! Which storage owns a session: today's (a WAL) or the session store
 //! (`broca-session-store`), and where each storage places a new session.
 //!
 //! Both storages split their sessions into three backup classes ([`StorageClass`]), chosen once
 //! when a session is created by one rule ([`placement`]). Today's storage keeps them in `wal/`,
-//! `wal-durable/` and `wal-ephemeral/`; the new storage in three complete stores,
+//! `wal-durable/` and `wal-ephemeral/`; the session store in three complete stores,
 //! [`SESSION_STORAGE_DIR`], [`SESSION_STORAGE_DURABLE_DIR`] and
 //! [`SESSION_STORAGE_EPHEMERAL_DIR`]. Only the durable ones are backed up.
 //!
-//! The new storage owns a session once its head exists in one of its roots
+//! The session store owns a session once its head exists in one of its roots
 //! ([`session_storage_class`]). A move of a live session from today's storage into the new one
 //! writes a journal naming the session ([`session_storage_move_journal`]) before it touches
 //! anything else, and deletes it last, so while a move is in flight the journal names the session
 //! too. Readers of today's storage that don't go through `FileWalStore::check_move` ask
 //! [`owned_by_store`] and skip or refuse a session it claims: otherwise they could expire a
 //! WAL, copy its records into the run index, or rewrite it while a move is copying it, or after
-//! the new storage has already taken the session over.
+//! the session store has already taken the session over.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,15 +24,15 @@ use serde::{Deserialize, Serialize};
 use crate::features::SESSION_STORAGE_DIR;
 use crate::fs_ops as fs;
 
-/// The folder of a state root holding the new storage's durable sessions, the one class of the
+/// The folder of a state root holding the session store's durable sessions, the one class of the
 /// three that backups capture.
 pub const SESSION_STORAGE_DURABLE_DIR: &str = "session-store-durable";
 
-/// The folder of a state root holding the new storage's sessions with a retention policy, which
+/// The folder of a state root holding the session store's sessions with a retention policy, which
 /// backups leave out so no backup outlives the retention promise.
 pub const SESSION_STORAGE_EPHEMERAL_DIR: &str = "session-store-ephemeral";
 
-/// The folder of a state root where moves into the new storage keep their journals and staged
+/// The folder of a state root where moves into the session store keep their journals and staged
 /// copies. It sits beside the three class roots, not inside one, so a backup of the durable root
 /// never carries a half-staged session; and on the state root's filesystem, so publishing a
 /// staged session is still one rename.
@@ -45,7 +45,7 @@ pub const MOVE_JOURNAL_DIR: &str = "journals";
 /// per move id. A journal's `staging` names its folder relative to the moves folder.
 pub const MOVE_STAGING_DIR: &str = "staging";
 
-/// The refusal of a session whose head exists in two of the new storage's roots. Placement puts
+/// The refusal of a session whose head exists in two of the session store's roots. Placement puts
 /// a session in exactly one root, so a second head is damage, which is never resolved by
 /// preferring one root.
 pub const SESSION_IN_TWO_CLASSES: &str = "session_in_two_classes";
@@ -67,7 +67,7 @@ pub enum StorageClass {
 }
 
 impl StorageClass {
-    /// Every class, in the order the new storage's roots are probed.
+    /// Every class, in the order the session store's roots are probed.
     pub const ALL: [Self; 3] = [Self::Durable, Self::Ordinary, Self::Ephemeral];
 
     /// The class's name, as move exports carry it and refusals print it.
@@ -88,7 +88,7 @@ impl StorageClass {
         }
     }
 
-    /// The folder of a state root holding the new storage's sessions of this class.
+    /// The folder of a state root holding the session store's sessions of this class.
     pub const fn store_dir(self) -> &'static str {
         match self {
             Self::Durable => SESSION_STORAGE_DURABLE_DIR,
@@ -97,7 +97,7 @@ impl StorageClass {
         }
     }
 
-    /// The root of the new storage's sessions of this class under `state_root`: a complete
+    /// The root of the session store's sessions of this class under `state_root`: a complete
     /// store, with its own heads, logs, objects and setup parts.
     pub fn store_root(self, state_root: &Path) -> PathBuf {
         state_root.join(self.store_dir())
@@ -132,7 +132,7 @@ pub fn selected_for_backup(session_class: Option<&str>, backup_classes: &[String
     session_class.is_some_and(|class| backup_classes.iter().any(|value| value == class))
 }
 
-/// Where the new session storage keeps the head of the session at `address` in the root of
+/// Where the session store keeps the head of the session at `address` in the root of
 /// `class` under `state_root`. The session exists there exactly when this file does: creating a
 /// session writes its head before anything else. The layout is the store's local backend's,
 /// `<root>/heads/<address>/head`.
@@ -144,7 +144,7 @@ pub fn session_storage_head(state_root: &Path, class: StorageClass, address: &st
         .join("head")
 }
 
-/// The class of the new storage's root holding the session at `address`, `None` when no root
+/// The class of the session store's root holding the session at `address`, `None` when no root
 /// holds its head. A head found in two roots is refused [`SESSION_IN_TWO_CLASSES`]
 /// ([`SessionInTwoClasses`] inside an `InvalidData` error). Only a head found absent counts as
 /// absent: any other failure to check it is an error, so an unreadable folder never reads as
@@ -155,7 +155,7 @@ pub fn session_storage_class(state_root: &Path, address: &str) -> io::Result<Opt
 
 /// [`session_storage_class`], checking whether each root's head exists with `exists`: for a
 /// caller that checks the head its own way, such as without following a link, as it did when
-/// the new storage had one root. Errors as [`session_storage_class`], and as `exists` does.
+/// the session store had one root. Errors as [`session_storage_class`], and as `exists` does.
 pub fn session_storage_class_by(
     state_root: &Path,
     address: &str,
@@ -180,7 +180,7 @@ pub fn session_storage_class_by(
     }
 }
 
-/// A session with a head in more than one of the new storage's roots.
+/// A session with a head in more than one of the session store's roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInTwoClasses {
     pub address: String,
@@ -215,7 +215,7 @@ pub fn session_storage_moves(state_root: &Path) -> PathBuf {
     state_root.join(SESSION_STORAGE_MOVES_DIR)
 }
 
-/// Where a move of the session at `address` into the new session storage keeps its journal.
+/// Where a move of the session at `address` into the session store keeps its journal.
 pub fn session_storage_move_journal(state_root: &Path, address: &str) -> PathBuf {
     session_storage_moves(state_root)
         .join(MOVE_JOURNAL_DIR)
@@ -249,7 +249,7 @@ pub struct MoveJournal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appends_in_conversation: Option<bool>,
     /// The class whose root the session moves into. Every move records it; only journals
-    /// written before the new storage had classes lack it (see [`Self::destination`]).
+    /// written before the session store had classes lack it (see [`Self::destination`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<StorageClass>,
 }
@@ -277,9 +277,9 @@ pub struct FrozenPrefix {
 pub enum StoreOwnership {
     /// Today's storage: no head and no move journal.
     Today,
-    /// The new storage: the session's head exists.
+    /// The session store: the session's head exists.
     Held,
-    /// A move into the new storage is in flight (or was interrupted): its journal names the
+    /// A move into the session store is in flight (or was interrupted): its journal names the
     /// session and no head exists yet.
     Moving { move_id: String },
 }
@@ -311,7 +311,7 @@ pub fn store_ownership(state_root: &Path, address: &str) -> io::Result<StoreOwne
     })
 }
 
-/// Whether the new session storage owns the session at `address`, or a move into it is in
+/// Whether the session store owns the session at `address`, or a move into it is in
 /// flight: its head exists in one of its roots, or a move journal names it. A reader of today's
 /// storage that sees `true` skips the session or refuses it. Errors as [`store_ownership`].
 pub fn owned_by_store(state_root: &Path, address: &str) -> io::Result<bool> {
@@ -394,7 +394,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A head in any one of the three roots claims its address for the new storage, and names
+    /// A head in any one of the three roots claims its address for the session store, and names
     /// its root's class.
     #[test]
     fn a_head_in_any_class_root_claims_the_address() {
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(placement(true, true), StorageClass::Ephemeral);
     }
 
-    /// A journal written before the new storage had classes names no class; its session moves
+    /// A journal written before the session store had classes names no class; its session moves
     /// into the durable root, which the single folder it was written for became.
     #[test]
     fn a_journal_without_a_class_moves_into_the_durable_root() {

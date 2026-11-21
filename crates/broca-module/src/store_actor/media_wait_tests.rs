@@ -1,4 +1,4 @@
-//! A run on a session kept in the new storage waits for the session's media fold before its
+//! A run on a session kept in the session store waits for the session's media fold before its
 //! first model call, while the fold is built off the actor: the actor keeps answering commands
 //! meanwhile, and a cancel during the wait ends the run as a cancel during a model call does.
 

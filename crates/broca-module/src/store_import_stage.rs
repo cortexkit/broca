@@ -12,7 +12,7 @@
 //!
 //! Each attempt stages in its own folder under `<state root>/session-store-imports/staging/`,
 //! outside every class root, so nothing serves or backs it up. An attempt that fails removes its
-//! folder; what a crashed one left is removed when the new storage next opens
+//! folder; what a crashed one left is removed when the session store next opens
 //! ([`clear_import_staging`]), before any actor runs, and is never published.
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub fn import_staging_root(state_root: &Path) -> PathBuf {
     state_root.join("session-store-imports").join("staging")
 }
 
-/// Removes what every import attempt staged under `state_root`. The new storage does this when
+/// Removes what every import attempt staged under `state_root`. The session store does this when
 /// it opens, before any actor runs, so a crashed attempt's leftovers never pile up; no attempt
 /// publishes from a folder it didn't stage itself.
 pub fn clear_import_staging(state_root: &Path) -> std::io::Result<()> {
@@ -69,7 +69,7 @@ pub trait ImportStaging<B: SessionBackend>: Send + Sync {
     ) -> Result<Session<B>, SessionError>;
 }
 
-/// The staging of the new storage's class roots: a folder per attempt under the state root,
+/// The staging of the session store's class roots: a folder per attempt under the state root,
 /// published into the root of the session's class.
 pub struct FsImportStaging {
     state_root: PathBuf,
@@ -176,7 +176,7 @@ impl ImportStaging<LocalBackend> for FsImportStaging {
         match std::fs::remove_dir_all(&staging) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            // Left for the next open of the new storage to remove.
+            // Left for the next open of the session store to remove.
             Err(error) => tracing::warn!(
                 target: "store_import",
                 attempt,

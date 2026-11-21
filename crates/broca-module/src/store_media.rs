@@ -1,4 +1,4 @@
-//! Media in the requests of a run on a session kept in the new storage.
+//! Media in the requests of a run on a session kept in the session store.
 //!
 //! **The index.** The session's actor owns its image index ([`SessionIndex`]): the engine's
 //! state for the session (`broca_provider::media_request::MediaIndex`: which media it captured
@@ -611,7 +611,7 @@ fn limits_of(parts: &dyn Parts, part: &PartRef) -> Result<Option<MediaLimits>, S
     Ok(limits_in(&config))
 }
 
-/// What a run of a session in the new storage renders its media from: the actor's index, read
+/// What a run of a session in the session store renders its media from: the actor's index, read
 /// as it stands at each render. A cache warm that renders a recorded request again, to resend
 /// its prefix, reads the same index through a clone of this.
 #[derive(Clone)]
@@ -1041,7 +1041,7 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
 /// run loop builds it for a provider that renders media (`offline_media_request`), rendered
 /// through an index built from every record of `session` and its own media objects, read over
 /// `reader`, under `frozen` with `max_output_tokens` as the step's cap. For checking a session in
-/// the new storage against the request today's storage renders for it.
+/// the session store against the request today's storage renders for it.
 #[allow(clippy::too_many_arguments)]
 pub async fn offline_render<B, R>(
     session: &Session<B>,

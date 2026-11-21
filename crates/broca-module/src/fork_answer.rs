@@ -1,4 +1,4 @@
-//! Serving llm-runner 0.8.42 §9.20 `fork_answer` on heads kept in the new storage: private
+//! Serving llm-runner 0.8.42 §9.20 `fork_answer` on heads kept in the session store: private
 //! questions asked of a copy of a head's last served request, without touching the head.
 //!
 //! `session.fork_prepare` fixes a fork's base at the head's newest served model request (its
@@ -14,7 +14,7 @@
 //! runs, writes nothing of the head's and emits nothing on its stream. The base is rebuilt by the
 //! code idle cache warming rebuilds a recorded request with (`store_actor::recorded_warm`).
 //!
-//! Each fork lives in a session of its own in the new storage's ephemeral root, named after the
+//! Each fork lives in a session of its own in the session store's ephemeral root, named after the
 //! head (its session name, `:fork:` and the fork id, under the head's project and harness) and
 //! holding only `Fork` records, which [`ForkState`] folds. Its records say who prepared it, each
 //! ask's attempts and stored answers, and its end and revocation; retention keeps the session at
@@ -278,7 +278,7 @@ struct Head {
     view: crate::store_read::StoredLocalView,
 }
 
-/// Serves the fork operations of every head kept in the new storage.
+/// Serves the fork operations of every head kept in the session store.
 pub struct ForkManager {
     runtime: Arc<StoreRuntime>,
     clock: broca_core::Clock,

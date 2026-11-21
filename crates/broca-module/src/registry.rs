@@ -111,13 +111,13 @@ pub enum OpenError {
         reason: String,
         class: broca_protocol::ErrorClass,
     },
-    /// A send creating a head asked for `feature`, which the new storage doesn't serve on a
+    /// A send creating a head asked for `feature`, which the session store doesn't serve on a
     /// session's creating send yet. A head starts nowhere else, so it is refused, permanently,
     /// before any session is opened or created.
     NotServedOnNewStorage {
         feature: &'static str,
     },
-    /// The session doesn't exist: the new storage doesn't hold it, and no creating send or
+    /// The session doesn't exist: the session store doesn't hold it, and no creating send or
     /// import asked for it. Nothing was created.
     UnknownSession,
 }
@@ -295,11 +295,11 @@ pub trait LineageOpener: Send + Sync {
         Ok(None)
     }
     /// Read-only access to the derived run index, without acquiring a session writer.
-    /// The runtime serving sessions kept in the new storage, when this opener has one.
+    /// The runtime serving sessions kept in the session store, when this opener has one.
     fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         None
     }
-    /// Why a session can't be created in the new storage right now although this opener keeps
+    /// Why a session can't be created in the session store right now although this opener keeps
     /// one: its deployment key hasn't loaded (the first seconds after a start), answered as the
     /// retryable `key_unavailable`. `None` when it can create one, or keeps no new storage.
     fn store_creation_pending(&self) -> Option<OpenError> {
@@ -309,8 +309,8 @@ pub trait LineageOpener: Send + Sync {
     fn step_events(&self) -> Option<Arc<crate::step_events::StepEvents>> {
         None
     }
-    /// The runtime when the new storage keeps the session `key`, which then has no WAL; `None`
-    /// for a session on today's storage, or an opener without the new storage. A session the new
+    /// The runtime when the session store keeps the session `key`, which then has no WAL; `None`
+    /// for a session on today's storage, or an opener without the session store. A session the new
     /// storage keeps is refused `key_unavailable` while its deployment key hasn't loaded, never
     /// read as one of today's. A head that can't be checked is an error, never `None`.
     fn store_holding(
@@ -523,7 +523,7 @@ pub enum CutLockMode {
 
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
-/// What creates a session in the new storage, which decides the class of root it is created in
+/// What creates a session in the session store, which decides the class of root it is created in
 /// (`broca_wal::placement`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreCreation {
@@ -533,7 +533,7 @@ pub(crate) enum StoreCreation {
     /// durable whatever its label.
     Import,
     /// A send labelled [`HEAD_SESSION_CLASS`], placed as a send is. A head starts only in the
-    /// new storage: one the new storage can't create now is refused, never started on today's
+    /// new storage: one the session store can't create now is refused, never started on today's
     /// storage.
     Head,
 }
@@ -1194,8 +1194,8 @@ impl LineageRegistry {
         self.inner.opener.compaction_supported()
     }
 
-    /// What serves `session.fork_*` on heads kept in the new storage, dated by retention's
-    /// clock. Refuses on a module without the new storage, which serves no fork.
+    /// What serves `session.fork_*` on heads kept in the session store, dated by retention's
+    /// clock. Refuses on a module without the session store, which serves no fork.
     pub fn fork_manager(
         &self,
     ) -> Result<Arc<crate::fork_answer::ForkManager>, crate::fork_answer::ForkError> {
@@ -1219,7 +1219,7 @@ impl LineageRegistry {
         })))
     }
 
-    /// The runtime serving sessions kept in the new storage, for reads that take no lease.
+    /// The runtime serving sessions kept in the session store, for reads that take no lease.
     pub fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
         self.inner.opener.store_runtime()
     }
@@ -1233,7 +1233,7 @@ impl LineageRegistry {
         self.inner.opener.backup_classes()
     }
 
-    /// Why a session can't be created in the new storage right now, when it can't: the
+    /// Why a session can't be created in the session store right now, when it can't: the
     /// retryable `key_unavailable` while its deployment key still loads.
     pub(crate) fn store_creation_pending(&self) -> Option<OpenError> {
         self.inner.opener.store_creation_pending()
@@ -1654,7 +1654,7 @@ impl LineageRegistry {
         ) {
             return BindOwnership::Known(broca_core::SessionOwnershipV1::default());
         }
-        // A session kept in the new storage has no WAL to read. Its ownership comes from the
+        // A session kept in the session store has no WAL to read. Its ownership comes from the
         // owner summary the stored session keeps (`Operations::owner`), which records the same
         // facts `durable_session_ownership` gathers from a WAL.
         match self.store_holding(key) {
@@ -1672,7 +1672,7 @@ impl LineageRegistry {
     }
 }
 
-/// The ownership of a session kept in the new storage, from a read-only view of it. A session
+/// The ownership of a session kept in the session store, from a read-only view of it. A session
 /// whose creation never committed holds no run, so it has no owner yet.
 async fn store_bind_ownership(
     registry: &LineageRegistry,
@@ -1685,7 +1685,7 @@ async fn store_bind_ownership(
     }
 }
 
-/// The ownership of a session kept in the new storage, as every authorization path reads it:
+/// The ownership of a session kept in the session store, as every authorization path reads it:
 /// the owner summary the stored session keeps (`Operations::owner`), with the first run's tools
 /// and plan read back from the deployment's setup parts. It records the same facts
 /// `durable_session_ownership` gathers from a WAL. A session whose creation never committed
@@ -2060,10 +2060,10 @@ impl LineageRegistry {
         }
     }
 
-    /// Route a command only the new storage serves to the session's store actor. An import may
+    /// Route a command only the session store serves to the session's store actor. An import may
     /// create its session there; nothing else creates one. An imported session is a head, and a
-    /// head starts in the new storage whenever the opener has one, so an import needs only the
-    /// store runtime. Any other command is refused by name unless the new storage already keeps
+    /// head starts in the session store whenever the opener has one, so an import needs only the
+    /// store runtime. Any other command is refused by name unless the session store already keeps
     /// the session, as it keeps a head, whose compaction provider applies its views through here.
     pub async fn route_store_command(
         &self,
@@ -2436,8 +2436,8 @@ impl LineageRegistry {
         }
     }
 
-    /// The new storage's runtime when it keeps the session `key`, which then has no WAL; `None`
-    /// for a session on today's storage, or a module without the new storage. A session it keeps
+    /// The session store's runtime when it keeps the session `key`, which then has no WAL; `None`
+    /// for a session on today's storage, or a module without the session store. A session it keeps
     /// is refused `key_unavailable` while the deployment key hasn't loaded.
     pub(crate) fn store_holding(
         &self,
@@ -3171,7 +3171,7 @@ impl RegistryHandle {
 }
 
 struct Inner {
-    /// The sessions a move into the new storage holds (see `store_move`), by address, and the
+    /// The sessions a move into the session store holds (see `store_move`), by address, and the
     /// reads in flight per address that take no session lease, which such a move waits out.
     restore_fences: store_move::RestoreFences,
     /// What runs `session.restore_from_backup`, installed by the daemon with its stores.
@@ -3192,7 +3192,7 @@ struct Inner {
     /// Serialize refresh fetches without blocking sends or the actor's running episode.
     change_gates: Mutex<HashMap<LineageKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     retention: std::sync::OnceLock<Arc<crate::retention::RetentionService>>,
-    /// Serves the fork operations of the heads kept in the new storage, made on the first one.
+    /// Serves the fork operations of the heads kept in the session store, made on the first one.
     forks: std::sync::OnceLock<Arc<crate::fork_answer::ForkManager>>,
     /// Who owns each session whose ownership was read lately, for the reader census, which
     /// must not read storage itself. Bounded: emptied when it reaches [`OWNERS_CACHED`].

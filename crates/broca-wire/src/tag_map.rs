@@ -1,5 +1,5 @@
 //! `session.tag_map`: which message and part each part number (the number broca renders, between
-//! section signs, in front of a numbered part) belongs to, for a session kept in the new storage.
+//! section signs, in front of a numbered part) belongs to, for a session kept in the session store.
 //!
 //! Operator only, and outside the runner role: no caller-facing read carries tag rows. The reply
 //! carries ids and numbers only, never any content.

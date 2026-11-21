@@ -270,7 +270,7 @@ pub(crate) async fn dispatch(
 }
 
 struct Driver {
-    /// Read for the new storage's runtime at each use rather than once: a runtime that failed to
+    /// Read for the session store's runtime at each use rather than once: a runtime that failed to
     /// open at boot can open later, when the key loader retries it.
     registry: LineageRegistry,
     root: PathBuf,
@@ -357,7 +357,7 @@ impl From<ErrorBody> for CutReadFailure {
 }
 
 impl Driver {
-    /// The new storage's runtime, when it has opened.
+    /// The session store's runtime, when it has opened.
     fn store(&self) -> Option<Arc<broca_module::store_open::StoreRuntime>> {
         self.registry.store_runtime()
     }

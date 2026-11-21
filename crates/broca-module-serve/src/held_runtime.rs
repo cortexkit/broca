@@ -14,7 +14,7 @@
 //!   cursor the provider returned, after the delivered terminal is synced.
 //! - **Boot recovery** ([`HeldRuntime::recover`]): every session with a registration is opened
 //!   so its open-time recovery runs, then a puller starts for every module that still needs its
-//!   feed. A missing or unreadable intake database is rebuilt from WALs and new-storage sessions, off the
+//!   feed. A missing or unreadable intake database is rebuilt from WALs and session-store sessions, off the
 //!   startup path; until that scan completes every pulled entry is Blocked and nothing is acked.
 //!
 //! Installing this runtime declares `tool-result/v1` and `held-reply/v1` on dispatch routes in
@@ -299,7 +299,7 @@ impl HeldRuntime {
     /// module whose feed is still needed.
     pub async fn recover(self: Arc<Self>, registry: Arc<broca_module::registry::LineageRegistry>) {
         if let Some(runtime) = registry.store_runtime() {
-            // Withdrawals of cancelled held calls read new-storage sessions the same way intake
+            // Withdrawals of cancelled held calls read session-store sessions the same way intake
             // classifies their late results.
             self.withdrawals.with_store_runtime(runtime.clone());
             self.intake.set_session_store(runtime);

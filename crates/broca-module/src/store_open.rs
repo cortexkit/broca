@@ -1,4 +1,4 @@
-//! Opening a session kept in the new storage (`broca_session_store`) as the module's actor for
+//! Opening a session kept in the session store (`broca_session_store`) as the module's actor for
 //! it.
 //!
 //! The opener takes the session lease as it does for any session, then hands the session here
@@ -11,7 +11,7 @@
 //! loaded from the vault. `session_storage.encryption` in `broca.jsonc` chooses the mode of the
 //! sessions created here.
 //!
-//! The new storage is three complete stores, one per backup class (`broca_wal::StorageClass`):
+//! The session store is three complete stores, one per backup class (`broca_wal::StorageClass`):
 //! each root has its own heads, logs, objects and setup parts, and all share the deployment key.
 //! A session is created in the root its creating send's class places it in
 //! (`broca_wal::placement`), and from then on the root holding its head is where it is opened,
@@ -42,7 +42,7 @@ const COMMANDS: usize = 64;
 #[path = "store_expiry.rs"]
 mod expiry;
 
-/// What the module needs to serve sessions kept in the new storage. Opened without the
+/// What the module needs to serve sessions kept in the session store. Opened without the
 /// deployment key it serves plain sessions only; the key is installed into it once it loads
 /// (see [`StoreSlot::load`]), and from then on it serves every session.
 pub struct StoreRuntime {
@@ -99,7 +99,7 @@ struct RootParts {
 }
 
 impl StoreRuntime {
-    /// The runtime for the new storage under `state_root`, its three class roots (see
+    /// The runtime for the session store under `state_root`, its three class roots (see
     /// [`StorageClass::store_dir`]), with its deployment key loaded. Loads every setup part each
     /// root holds, in both modes, so a run started before the module did reads its parts back.
     /// It creates sessions in the mode `deployment` creates them in.
@@ -122,7 +122,7 @@ impl StoreRuntime {
         Ok(runtime)
     }
 
-    /// The runtime for the new storage under `state_root` before deployment key `key_id` has
+    /// The runtime for the session store under `state_root` before deployment key `key_id` has
     /// loaded. It serves plain sessions, whose setup parts it loads from each root, and creates
     /// sessions in mode `new_sessions`, which it can do only for plain ones until the key loads.
     pub async fn open_without_key(
@@ -349,7 +349,7 @@ impl StoreRuntime {
         &self.views
     }
 
-    /// Writes the spend facts of every run on the new storage to `billing`, the deployment's
+    /// Writes the spend facts of every run in the session store to `billing`, the deployment's
     /// usage export, as today's runs are written.
     pub fn with_billing(mut self, billing: crate::store_billing::StoreBilling) -> Self {
         self.billing = Some(billing);
@@ -376,7 +376,7 @@ impl StoreRuntime {
         self.key_id
     }
 
-    /// Whether the session `key` is kept in the new storage: whether its head exists in one of
+    /// Whether the session `key` is kept in the session store: whether its head exists in one of
     /// its roots. A head that can't be checked, or one found in two roots, is an error, never
     /// read as absent.
     pub fn holds(&self, key: &BindIdentity) -> Result<bool, OpenError> {
@@ -779,7 +779,7 @@ impl StoreRuntime {
             // The feature floor lists what this state root's logs need a build to understand.
             // Release placement (`scripts/place-release.sh`) refuses to install a build that
             // doesn't know a listed feature, and builds older than the one that refuses
-            // new-storage sessions by name don't know this one. So once a session lives here,
+            // session-store sessions by name don't know this one. So once a session lives here,
             // no build that would serve it from a WAL it doesn't have can be placed. The floor
             // is raised before the session's head exists.
             broca_wal::raise_floor(
@@ -894,7 +894,7 @@ impl StoreRuntime {
         Ok(ActorHandle {
             gen,
             tx,
-            // The new storage keeps no WAL, so there is no WAL offset to share.
+            // The session store keeps no WAL, so there is no WAL offset to share.
             run_in_flight,
             first_episode,
         })
@@ -966,7 +966,7 @@ impl StoreRuntimeSetup {
     }
 }
 
-/// The new storage as the opener sees it from the module's start. Whether a session is kept
+/// The session store as the opener sees it from the module's start. Whether a session is kept
 /// there needs only the state root, so such a session is told apart from today's from the first
 /// open. Its runtime is opened at the start without the deployment key
 /// ([`StoreSlot::open_without_key`]) and serves plain sessions from then on. Serving an encrypted
@@ -986,7 +986,7 @@ pub struct StoreSlot {
 }
 
 impl StoreSlot {
-    /// The new storage under `state_root`, whose deployment key `key_id` hasn't loaded yet. It
+    /// The session store under `state_root`, whose deployment key `key_id` hasn't loaded yet. It
     /// creates encrypted sessions unless [`creating`](Self::creating) says otherwise.
     pub fn awaiting_key(state_root: &Path, key_id: u16) -> Self {
         Self {
@@ -1004,7 +1004,7 @@ impl StoreSlot {
         self
     }
 
-    /// The new storage served by `runtime`, its key already loaded.
+    /// The session store served by `runtime`, its key already loaded.
     pub fn loaded(runtime: Arc<StoreRuntime>) -> Self {
         let slot = Self::awaiting_key(&runtime.state_root, runtime.key_id())
             .creating(runtime.new_sessions());
@@ -1012,7 +1012,7 @@ impl StoreSlot {
         slot
     }
 
-    /// The id of the deployment key the new storage is opened with.
+    /// The id of the deployment key the session store is opened with.
     pub fn key_id(&self) -> u16 {
         self.key_id
     }
@@ -1085,7 +1085,7 @@ impl StoreSlot {
         runtime.install_key(deployment, parts)
     }
 
-    /// The runtime when the new storage keeps the session `key`; `None` for a session it
+    /// The runtime when the session store keeps the session `key`; `None` for a session it
     /// doesn't keep. Once the key has loaded every session kept here is served. Before then the
     /// session's head names its mode: a plain session is served, and an encrypted one is refused
     /// `key_unavailable` and remembered, so the module opens it once the key loads
@@ -1118,7 +1118,7 @@ impl StoreSlot {
     }
 }
 
-/// The refusal of a session kept in the new storage while its deployment key `key_id` hasn't
+/// The refusal of a session kept in the session store while its deployment key `key_id` hasn't
 /// loaded. Transient: the key loads without a restart, and the session is served then.
 pub fn key_unavailable(key_id: u16) -> OpenError {
     OpenError::Classified {
@@ -1130,7 +1130,7 @@ pub fn key_unavailable(key_id: u16) -> OpenError {
     }
 }
 
-/// The refusal of a session whose head is in two of the new storage's roots: damage, which an
+/// The refusal of a session whose head is in two of the session store's roots: damage, which an
 /// operator must look at, so it is permanent and never served from either root.
 fn session_in_two_classes(refusal: &broca_wal::SessionInTwoClasses) -> OpenError {
     OpenError::Classified {

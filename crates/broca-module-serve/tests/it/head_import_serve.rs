@@ -1,7 +1,7 @@
 //! `session.import` from a file and `session.install_view`, through the real serve path into a
 //! module whose new storage creates sessions: the route's attested principal and scope stamp
 //! reach the store actor, the reply and refusals come back as the store answers them, and the
-//! imported session then reads back from the new storage.
+//! imported session then reads back from the session store.
 //!
 //! The daemon side is played by the test, as in the scope carrier tests: it sends the HELLO_ACK
 //! advertising `scopes/v1` and stamps each bind.

@@ -132,14 +132,14 @@ pub enum LineageCmd {
         request: Box<broca_core::ImportRequest>,
         reply: oneshot::Sender<ImportOutcome>,
     },
-    /// A command only a session kept in the new storage serves: a file-source import, or
+    /// A command only a session kept in the session store serves: a file-source import, or
     /// installing the compaction provider's first view (see `store_import`). The legacy actor
     /// refuses it: a session on today's storage already exists.
     Store {
         command: crate::store_import::StoreCommand,
         reply: oneshot::Sender<crate::store_import::StoreOutcome>,
     },
-    /// A read of a session kept in the new storage, which its store actor answers from the
+    /// A read of a session kept in the session store, which its store actor answers from the
     /// session it holds (see `store_reads`). The legacy actor holds no such session: it answers
     /// `Reopen`, and the reader reads the session as stored.
     StoreRead {
@@ -266,7 +266,7 @@ pub enum ImportOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendOutcome {
-    /// A send asks the new storage for `feature`, which it doesn't serve: refused
+    /// A send asks the session store for `feature`, which it doesn't serve: refused
     /// `not_served_on_new_storage`, permanent, with nothing written.
     NotServedOnNewStorage {
         feature: &'static str,

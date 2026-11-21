@@ -97,7 +97,7 @@ fn one_step_text_reply(text: &str) -> Vec<NormalizedEvent> {
 
 #[async_trait]
 impl RunExecutor for FakeExec {
-    /// Every session is kept in the new storage: its run answers "ok" through the new loop,
+    /// Every session is kept in the session store: its run answers "ok" through the new loop,
     /// parked on `hold`, when set, between its admission and its answer.
     async fn execute_on_store(
         &self,
@@ -115,7 +115,7 @@ impl RunExecutor for FakeExec {
 
 #[async_trait]
 impl RunExecutor for CoreExec {
-    /// Every session is kept in the new storage: its run answers `reply_text` through the new
+    /// Every session is kept in the session store: its run answers `reply_text` through the new
     /// loop.
     async fn execute_on_store(
         &self,
@@ -141,7 +141,7 @@ async fn registry_and_wal(dir: &Path) -> (Arc<LineageRegistry>, Sessions) {
     registry_and_wal_inner(dir, None).await
 }
 
-/// The sessions of a test registry, as the new storage keeps them.
+/// The sessions of a test registry, as the session store keeps them.
 struct Sessions(Arc<broca_module::store_open::StoreRuntime>);
 
 /// One record of a session's log.
@@ -1856,7 +1856,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         "opening",
         "closing",
         "vault",
-        // This library-only rig publishes no new-storage slot or deployment key. The metric
+        // This library-only rig publishes no session-store slot or deployment key. The metric
         // remains present as null, without degrading the healthy process.
         "store",
         // This rig's daemon doesn't manage broca's settings (broca reads its own file), so
@@ -3820,7 +3820,7 @@ struct CompletionGate {
 
 #[async_trait]
 impl RunExecutor for GatedCoreExec {
-    /// Every session is kept in the new storage: the first run waits on `gate` before its model
+    /// Every session is kept in the session store: the first run waits on `gate` before its model
     /// step, and its completion is held on `completion_gate` once the run has ended.
     async fn execute_on_store(
         &self,
@@ -3999,7 +3999,7 @@ impl PrincipalRig {
         body["result"].clone()
     }
 
-    /// The rig's session's records in the new storage, in log order.
+    /// The rig's session's records in the session store, in log order.
     async fn records(&self) -> Vec<Record> {
         store_exec::records(&self.runtime, &self.session).await
     }
@@ -4013,7 +4013,7 @@ impl PrincipalRig {
             .collect()
     }
 
-    /// Whether the new storage holds the rig's session at all.
+    /// Whether the session store holds the rig's session at all.
     fn exists(&self) -> bool {
         broca_wal::session_storage_class(
             self.runtime.state_root(),

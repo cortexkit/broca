@@ -136,7 +136,7 @@ fn counter(counters: &Value, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("health.check reports {name}: {counters}"))
 }
 
-/// The session `session` names is stored in the new storage under its bind triple's address,
+/// The session `session` names is stored in the session store under its bind triple's address,
 /// holds exactly the runs `run_ids`, and is what the inventory's ref resolves to. With
 /// `elsewhere`, nothing is stored or referenced under the same name in that folder.
 async fn assert_keyed_by_bind(

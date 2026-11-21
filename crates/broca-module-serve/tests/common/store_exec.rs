@@ -1,4 +1,4 @@
-//! One run of a session kept in the new storage, through the new loop, over a test's own
+//! One run of a session kept in the session store, through the new loop, over a test's own
 //! provider and tool plane: what a test executor's `execute_on_store` does. Include this file
 //! with `#[path = "common/store_exec.rs"] mod store_exec;` (or the path from the test's own
 //! folder).
@@ -88,7 +88,7 @@ where
     StoreRunEnd { parts, result }
 }
 
-/// The new storage for a test registry over `dir`, running each session's runs through
+/// The session store for a test registry over `dir`, running each session's runs through
 /// `executor`'s `execute_on_store`, with every session encrypted under a fixed key.
 pub async fn store_runtime(
     dir: &std::path::Path,

@@ -28,7 +28,7 @@ mod cache_write_split;
 #[path = "directives_tests.rs"]
 mod directives;
 
-/// One module over a scratch folder, whose sessions start in the new storage when `store`.
+/// One module over a scratch folder, whose sessions start in the session store when `store`.
 struct Side {
     dir: std::path::PathBuf,
     registry: LineageRegistry,
@@ -60,7 +60,7 @@ fn scratch() -> std::path::PathBuf {
 }
 
 /// A module over `dir` whose scripted provider answers `steps`, each step waiting for `gate`
-/// when one is given. With `store`, a session that exists nowhere starts in the new storage.
+/// when one is given. With `store`, a session that exists nowhere starts in the session store.
 async fn side_at(
     dir: std::path::PathBuf,
     steps: Vec<Vec<NormalizedEvent>>,
@@ -97,7 +97,7 @@ async fn side(steps: Vec<Vec<NormalizedEvent>>, gate: Option<Arc<Notify>>) -> Si
     side_at(scratch(), steps, gate).await
 }
 
-/// The new storage's side over the script, and its gate when `gated`.
+/// The session store's side over the script, and its gate when `gated`.
 async fn pair(
     steps: impl Fn() -> Vec<Vec<NormalizedEvent>>,
     gated: bool,

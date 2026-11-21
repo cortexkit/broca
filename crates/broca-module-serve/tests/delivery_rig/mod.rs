@@ -559,7 +559,7 @@ impl RunExecutor for CoreExec {
         self.hook_plane.lock().unwrap().clone()
     }
 
-    /// A session kept in the new storage (one a move took there) runs through the new loop over
+    /// A session kept in the session store (one a move took there) runs through the new loop over
     /// the same scripted provider, tools and approvals today's runs use.
     async fn execute_on_store(
         &self,
@@ -914,7 +914,7 @@ impl Rig {
                 resolver: Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::Unknown, 1)),
             }),
         );
-        // Every session is kept in the new storage. It writes usage exports the way the module
+        // Every session is kept in the session store. It writes usage exports the way the module
         // does: one fact per finished run, into the run index's export table.
         let opener = opener
             .with_store_runtime(runtime.clone())
@@ -1509,7 +1509,7 @@ impl Rig {
             .collect()
     }
 
-    /// The session's records in the new storage, in log order: what its runs and sends wrote.
+    /// The session's records in the session store, in log order: what its runs and sends wrote.
     /// Empty while the session doesn't exist.
     /// Whether the rig's session has a log in the store.
     pub async fn session_stored(&self) -> bool {
@@ -2032,7 +2032,7 @@ pub fn normalize_snapshot_bytes(body: &[u8], run_id: &str, incarnation: &str) ->
         .replace(incarnation, "@LINEAGE_ID@")
 }
 
-/// `text` with the ids the new storage mints per session replaced by placeholders: message ids
+/// `text` with the ids the session store mints per session replaced by placeholders: message ids
 /// (`g<writer generation's first 16 hex digits>.<seq>`, spelled `g@GENERATION@.<seq>`) and the
 /// session id call keys begin with (`<32 hex digits>:<seq>`, spelled `@SESSION_ID@:<seq>`).
 /// Only a quoted string that is exactly such an id is replaced, so content stays intact.

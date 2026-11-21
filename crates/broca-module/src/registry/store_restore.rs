@@ -13,7 +13,7 @@ use super::{LineageKey, LineageRegistry};
 #[async_trait::async_trait]
 pub trait StoreRestorer: Send + Sync {
     /// Restores the session `key` from the files its store holds after a backup came back, or,
-    /// with `all`, every session kept in the new storage; `key` is then only the route the
+    /// with `all`, every session kept in the session store; `key` is then only the route the
     /// operator called on. Returns one report per session; a refusal stops before any session.
     async fn restore_from_backup(
         &self,
@@ -30,7 +30,7 @@ impl LineageRegistry {
 
     /// Runs `session.restore_from_backup` for `key`, or for every session kept in the new
     /// storage with `all`, or refuses `store_unavailable` when this module keeps no sessions in
-    /// the new storage.
+    /// the session store.
     pub async fn restore_from_backup(
         &self,
         key: &LineageKey,

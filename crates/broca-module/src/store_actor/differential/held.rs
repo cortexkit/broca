@@ -757,7 +757,7 @@ async fn boot_sweep_seals_store_orphans_without_a_run_index(cipher: Cipher) {
         original.send().await;
         let side = original.restarted().await;
         if store {
-            // Neither side has a run index. Discovery must come from the new storage's heads.
+            // Neither side has a run index. Discovery must come from the session store's heads.
             let sweep = side.registry.recover_store_crash_orphans().await.unwrap();
             assert_eq!(sweep.inspected, 1, "{sweep:?}");
             assert_eq!(sweep.recovered, 1, "{sweep:?}");

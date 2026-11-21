@@ -1,5 +1,5 @@
-//! `run.tool_calls` of a session kept in the new storage, through the module's registry, in both
-//! of the new storage's modes.
+//! `run.tool_calls` of a session kept in the session store, through the module's registry, in both
+//! of the session store's modes.
 //!
 //! Each page is pinned (see `broca_test_support::pins`) with what the storage mints for itself
 //! taken out: each call's key (kept as whether it is present), and the `next` cursor, which names
@@ -24,7 +24,7 @@ use crate::executor::{RunExecutor, RunKind};
 use crate::registry::LineageRegistry;
 use crate::serve::{ServeError, ServeHandler};
 
-/// One module over a scratch folder, whose sessions start in the new storage when `store`.
+/// One module over a scratch folder, whose sessions start in the session store when `store`.
 struct Side {
     dir: std::path::PathBuf,
     registry: LineageRegistry,
@@ -65,7 +65,7 @@ fn tool_gate() -> ToolGate {
 
 /// A module over `dir` whose scripted provider answers `steps`, and whose tool dispatches each
 /// wait for a release of `tools` when it is given. With `store`, a session that exists nowhere
-/// starts in the new storage, in mode `cipher`.
+/// starts in the session store, in mode `cipher`.
 async fn side_at(
     dir: std::path::PathBuf,
     steps: Vec<Vec<NormalizedEvent>>,
@@ -117,7 +117,7 @@ async fn side_answering(
     }
 }
 
-/// The new storage's side over the script, and its gate when `gated`.
+/// The session store's side over the script, and its gate when `gated`.
 async fn pair(
     steps: impl Fn() -> Vec<Vec<NormalizedEvent>>,
     gated: bool,
@@ -130,7 +130,7 @@ async fn pair(
     )
 }
 
-/// A side on the new storage, over the script.
+/// A side in the session store, over the script.
 async fn side(steps: Vec<Vec<NormalizedEvent>>, gate: Option<ToolGate>, cipher: Cipher) -> Side {
     side_at(scratch(), steps, gate, cipher).await
 }
@@ -181,7 +181,7 @@ impl Side {
         .await;
     }
 
-    /// Whether the session is kept in the new storage, in mode `cipher`.
+    /// Whether the session is kept in the session store, in mode `cipher`.
     fn stored_in(&self, cipher: Cipher) -> bool {
         use broca_session_store::backend::{LocalBackend, SessionAddr};
         let stored = LocalBackend::new(self.dir.join(broca_wal::SESSION_STORAGE_DIR))

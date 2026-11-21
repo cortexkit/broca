@@ -1,4 +1,4 @@
-//! Spend facts for runs kept in the new storage, written to the usage export.
+//! Spend facts for runs kept in the session store, written to the usage export.
 //!
 //! A run's end makes its billing owed: the operational fold lists it in `billing_owed`. The
 //! store actor bills every owed run after a run ends and when it opens the session, before it

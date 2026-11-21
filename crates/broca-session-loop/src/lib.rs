@@ -1,4 +1,4 @@
-//! The run loop for sessions on broca's new session storage (`broca-session-store`).
+//! The run loop for sessions on broca's session store (`broca-session-store`).
 //!
 //! A run is a sequence of model steps and tool batches. Today's loop (`broca_core::run`)
 //! rebuilds its state by replaying its log in several places; this loop reads the state the

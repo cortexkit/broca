@@ -21,7 +21,7 @@ use crate::registry::LineageRegistry;
 
 /// Turns async test functions that take a `Cipher` into tests run once in each mode, as the
 /// session store's own tests are: each named function `f` becomes the tests `f::encrypted` and
-/// `f::plain`, whose module creates new-storage sessions in that mode. A test function left out
+/// `f::plain`, whose module creates session-store sessions in that mode. A test function left out
 /// of the list is never called, which the build refuses as dead code, so no test is silently
 /// dropped.
 macro_rules! cipher_tests {
@@ -1056,7 +1056,7 @@ async fn an_agents_named_notice_is_kept_alike() {
     .await;
 }
 
-/// A module over a scratch folder whose opener can serve the new storage, with the registry's
+/// A module over a scratch folder whose opener can serve the session store, with the registry's
 /// new-session switch `on` or off.
 struct Module {
     dir: std::path::PathBuf,
@@ -1112,7 +1112,7 @@ async fn module_options_with_render(
         N.fetch_add(1, Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    // The WAL store's folder sits in the state root `dir`, beside the new storage.
+    // The WAL store's folder sits in the state root `dir`, beside the session store.
     let mut store_loop = executor(steps.clone(), gate.clone());
     store_loop.provider.render_config = render_config;
     let executor: Arc<dyn RunExecutor> = Arc::new(store_loop);
@@ -1273,8 +1273,8 @@ impl Module {
     }
 }
 
-/// With the switch on, a session that exists nowhere starts in the new storage: its head is
-/// written, no WAL is, and the feature floor names the new storage before anything else. The
+/// With the switch on, a session that exists nowhere starts in the session store: its head is
+/// written, no WAL is, and the feature floor names the session store before anything else. The
 /// actor closes when idle, and the next send reopens the session from its head and runs after
 /// the first run.
 #[tokio::test]
@@ -1358,7 +1358,7 @@ async fn read_json(
     (value, mids)
 }
 
-/// A session in the new storage reads its history: the newest page, a page from an ordinal, and
+/// A session in the session store reads its history: the newest page, a page from an ordinal, and
 /// a page after a message's id, each pinned. The session's own message ids continue a read.
 #[tokio::test]
 async fn a_store_session_reads_as_the_same_history_on_todays_storage() {

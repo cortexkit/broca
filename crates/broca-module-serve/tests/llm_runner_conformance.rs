@@ -1481,7 +1481,7 @@ fn a_dropped_rig_hands_fixtures_back_to_the_daemon_started_before_it() {
 }
 
 /// Whether `session` is the head of one of the kit's plan_view cases (`cf-plan-view-<n>`).
-/// `session.plan_view` serves only heads kept in the new storage, and the case that sends
+/// `session.plan_view` serves only heads kept in the session store, and the case that sends
 /// without a plan must still reach its `no_plan` answer there, so these heads start in the new
 /// storage whatever their first send carries.
 fn plan_view_session(session: &str) -> bool {
@@ -4245,7 +4245,7 @@ impl LlmRunnerSubject for BrocaSubject {
         sleep(Duration::from_millis(50)).await;
     }
 
-    /// Every message the new storage keeps belongs to a run: a send's to the run it started or
+    /// Every message the session store keeps belongs to a run: a send's to the run it started or
     /// joined, and an import's to the import's own run, which stands for the history it brought.
     async fn install_attribution_fixture(
         &self,
@@ -5672,7 +5672,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
             report.render()
         );
     }
-    // The new storage keeps no message without the run that wrote it, so the harness can't
+    // The session store keeps no message without the run that wrote it, so the harness can't
     // plant one for the kit's unknown-origin rule (`install_attribution_fixture`). That one
     // rule goes unchecked, by declaration; every other attribution rule must pass.
     let attribution = report

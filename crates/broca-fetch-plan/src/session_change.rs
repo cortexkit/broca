@@ -179,7 +179,7 @@ impl EffectiveState {
         }
     }
 
-    /// These facts as the new storage records them in the applying run start's batch.
+    /// These facts as the session store records them in the applying run start's batch.
     pub fn applied_change(&self) -> broca_protocol::session_change::AppliedChange {
         broca_protocol::session_change::AppliedChange {
             generation: self.generation,

@@ -1,4 +1,4 @@
-//! `session.tag_map` for a session kept in the new storage: which message and part each part
+//! `session.tag_map` for a session kept in the session store: which message and part each part
 //! number belongs to, the number the model is shown in front of the part.
 //!
 //! The numbers come from the code that already numbers each message, never from a numbering of
@@ -28,7 +28,7 @@ use broca_wire::tag_map::{TagMapParams, TagMapResponse, TagMapRow};
 use crate::serve::ServeError;
 use crate::store_open::StoreRuntime;
 
-/// Serves `session.tag_map` for the session `key`, which the new storage keeps. A session whose
+/// Serves `session.tag_map` for the session `key`, which the session store keeps. A session whose
 /// creation never committed holds no message, so it numbers nothing, as `session.read` reads it
 /// as an empty transcript.
 pub async fn serve(

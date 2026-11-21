@@ -1,4 +1,4 @@
-//! `session.tag_map` over a session kept in the new storage, through the module's registry: the
+//! `session.tag_map` over a session kept in the session store, through the module's registry: the
 //! numbers it names are the ones `session.entries` serves and the next request shows, before and
 //! after a compaction cut seals history and after a revert, and its pages split no message.
 

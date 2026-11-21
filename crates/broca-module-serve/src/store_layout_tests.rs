@@ -1,4 +1,4 @@
-// Tests of the one-time step that makes the new storage's single-folder tree its durable root.
+// Tests of the one-time step that makes the session store's single-folder tree its durable root.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     found
 }
 
-/// The tree the new storage kept in its single folder: one session (its head, log, an object
+/// The tree the session store kept in its single folder: one session (its head, log, an object
 /// and a setup part), and a move journal and staged session left by a move that never finished.
 async fn single_folder_tree(state: &Path) {
     let single = state.join(broca_wal::SESSION_STORAGE_DIR);

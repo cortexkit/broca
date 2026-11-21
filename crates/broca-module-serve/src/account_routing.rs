@@ -1091,7 +1091,7 @@ const MODEL_CATEGORY: &str = "llm-provider";
 
 pub fn metadata_in_chooser_scope(row: &ScopedCredential) -> bool {
     // Only model credentials are judged for routing metadata. broca's grants also list
-    // non-model records, such as the new session storage's deployment key, which have no
+    // non-model records, such as the session store's deployment key, which have no
     // category and no auth_method. The row's `type` can't tell them apart: the vault derives it
     // from the id's prefix and reports "unknown" for such records.
     row.categories.iter().any(|category| category == MODEL_CATEGORY)
@@ -2514,7 +2514,7 @@ fn held_admission_id(decision: &AccountDecision) -> Option<&str> {
 impl RunReporter {
     /// Report only an allocation routing granted to this runner. Older static decisions can
     /// contain fabricated admission ids; their presence must not enable live or recovery reports.
-    /// New-storage runs pass their session id to name reports without a WAL lineage.
+    /// Session-store runs pass their session id to name reports without a WAL lineage.
     pub fn start_for_decision(
         client: Arc<RoutingClient>,
         decision: &AccountDecision,

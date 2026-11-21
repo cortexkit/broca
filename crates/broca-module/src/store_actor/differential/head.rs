@@ -1,4 +1,4 @@
-//! `session.head` on a session kept in the new storage.
+//! `session.head` on a session kept in the session store.
 //!
 //! Each scenario pins the head as JSON, for an anonymous caller, the session's owner and another
 //! module. Only what the storage keeps for itself is taken out: the log identity
@@ -66,7 +66,7 @@ async fn gated_module_in(
     }
 }
 
-/// A module whose sessions start in the new storage, over `steps`, and the gate its model steps
+/// A module whose sessions start in the session store, over `steps`, and the gate its model steps
 /// wait for when `gated`.
 pub(super) async fn both(
     steps: Vec<Vec<NormalizedEvent>>,

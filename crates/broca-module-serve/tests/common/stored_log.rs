@@ -113,7 +113,7 @@ pub fn stored_spend_facts(state_root: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Every file under the new storage's roots in `state_root`, with its size: a snapshot two
+/// Every file under the session store's roots in `state_root`, with its size: a snapshot two
 /// readings of which are equal exactly when nothing was written to any session in between.
 /// The recovery index's completeness marker is left out: the startup inventory writes it on its
 /// own schedule, which on a slow machine falls after a test's first reading.

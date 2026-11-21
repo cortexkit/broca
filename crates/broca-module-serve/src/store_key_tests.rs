@@ -1,6 +1,6 @@
 // Included in executor::tests: the daemon's deployment-key loader against the vault stand-in
 // above, through a real `VaultClient` that reads by grant, over a registry whose opener holds
-// the new storage as the daemon's does.
+// the session store as the daemon's does.
 
 /// The deployment key the held session was created under. Not one repeated byte, so a partial
 /// copy of it is as recognisable as the whole.
@@ -25,7 +25,7 @@ struct NeverRuns;
 impl broca_module::executor::RunExecutor for NeverRuns {
 }
 
-/// A state root holding one session in the new storage (`held`), created under
+/// A state root holding one session in the session store (`held`), created under
 /// [`deployment_key`], and a registry over it whose new storage awaits its key, wired as `main`
 /// wires it.
 struct KeyRig {

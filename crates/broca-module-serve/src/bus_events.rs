@@ -45,7 +45,7 @@ struct Liveness {
     /// When the loop last began a pass, on `broca_diagnostics`' monotonic clock; zero before the
     /// first pass.
     pass_started_ms: AtomicU64,
-    /// Batches of run events from sessions in the new storage recorded in the outbox.
+    /// Batches of run events from sessions in the session store recorded in the outbox.
     store_batches_recorded: AtomicU64,
     /// Batches of them waiting to be recorded, because the machine account isn't known yet or
     /// recording failed. A count that stays above zero means none reach the outbox.
@@ -141,7 +141,7 @@ impl Config {
     }
 }
 
-/// The run events of sessions kept in the new storage (see [`broca_module::store_run_events`]),
+/// The run events of sessions kept in the session store (see [`broca_module::store_run_events`]),
 /// on their way to the outbox.
 ///
 /// A session's writer hands each durable batch's events here, and they are recorded in the
@@ -351,7 +351,7 @@ pub struct Service {
     pub store: Arc<dyn RunEventStore>,
     pub registry: LineageRegistry,
     pub connector: Option<Arc<dyn BusConnector>>,
-    /// The run events of sessions in the new storage, when they are installed.
+    /// The run events of sessions in the session store, when they are installed.
     pub store_events: Option<Arc<StoreRunEvents>>,
     pub stop: CancellationToken,
 }
@@ -629,7 +629,7 @@ pub(crate) mod tests {
         assert!(has_bus(true));
     }
 
-    /// A session in the new storage hands its run events to [`StoreRunEvents`]. Before the
+    /// A session in the session store hands its run events to [`StoreRunEvents`]. Before the
     /// machine account is known they wait, in order; once it is, the first pass records them,
     /// and later ones are recorded as they arrive. Each is published with the id, subject and
     /// headers prefrontal checks.

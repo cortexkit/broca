@@ -1,4 +1,4 @@
-// Drives the serve executor's path for sessions kept in the new session storage: a run goes
+// Drives the serve executor's path for sessions kept in the session store: a run goes
 // through `execute_on_store`, which makes `execute`'s admission decisions from the session's
 // folds and runs the new run loop, its writes served on the session as the store actor serves
 // them.
@@ -180,7 +180,7 @@ fn store_texts(
         .collect()
 }
 
-/// A session in the new storage runs through the production executor: its admission resolves
+/// A session in the session store runs through the production executor: its admission resolves
 /// the provider and credential the way `execute` does, the new run loop sends the
 /// session's prompt once, and the answer and the run's end are in the session. A second run
 /// on the same session is admitted from the folds, reading the first run's frozen config back
@@ -263,7 +263,7 @@ async fn a_store_session_runs_through_the_production_executor() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// On the new storage, a run on a paid key filed under `anthropic-platform` stores the provider
+/// On the session store, a run on a paid key filed under `anthropic-platform` stores the provider
 /// whose rows it borrowed with its config, so the next admission (and a resume, and the run's
 /// spend) reads `anthropic` back rather than resolving it again; both runs go to Anthropic's
 /// endpoint with the key in `x-api-key`.

@@ -1,4 +1,4 @@
-//! A run on a session kept in the new storage renders nothing before its media are ready. Unlike
+//! A run on a session kept in the session store renders nothing before its media are ready. Unlike
 //! the comparisons beside it, these drive the store side alone: the store actor builds the
 //! session's media fold and hands each run its media, and the executor installs the run's media
 //! renderer as the module's executor does (`store_media::LazyRenderer`), which refuses every

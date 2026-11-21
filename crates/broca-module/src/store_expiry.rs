@@ -1,4 +1,4 @@
-//! Read-side expiry and counter floors for the new storage's retained sessions.
+//! Read-side expiry and counter floors for the session store's retained sessions.
 
 use super::*;
 use broca_session_store::expired::{self, Marker};

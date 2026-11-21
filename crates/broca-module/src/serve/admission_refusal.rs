@@ -87,7 +87,7 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
         ServeError::Upload(error) => {
             return Some(AdmissionRefusal::Other(upload_refusal(error, false)))
         }
-        // An open that may succeed when repeated (the new storage's key still loading after a
+        // An open that may succeed when repeated (the session store's key still loading after a
         // start, a temporary read failure) is answered with the contract's retryable code, since
         // callers decide retries by code alone; the cause names what to wait for.
         ServeError::Open(reason, Some(ErrorClass::Transient)) => (
@@ -154,7 +154,7 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
 }
 
 /// The cause a transient open refusal names: the code its reason starts with (`key_unavailable`
-/// in "key_unavailable: the new storage's deployment key 1 has not loaded yet"), or
+/// in "key_unavailable: the session store's deployment key 1 has not loaded yet"), or
 /// `open_failed` for a reason that starts with none.
 fn open_cause(reason: &str) -> &str {
     match reason.split_once(':') {
@@ -364,7 +364,7 @@ mod tests {
         }
     }
 
-    /// A transient open refusal (the new storage's key still loading after a start) is answered
+    /// A transient open refusal (the session store's key still loading after a start) is answered
     /// with the retryable code `transient` and its cause; a permanent one keeps `open_failed`.
     /// Callers decide retries by code alone, so `open_failed` made a worker launch in the first
     /// seconds after a restart fail for good.

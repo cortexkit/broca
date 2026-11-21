@@ -168,7 +168,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
         .map_err(|error| ServeIoError(error.into()))?;
-    // Before any session opens: every sync the new storage makes follows it.
+    // Before any session opens: every sync the session store makes follows it.
     broca_session_store::durable::configure_full_flush(
         broca_module_serve::config::StorageSyncConfig::from_settings(&settings)
             .map_err(ServeIoError)?
@@ -312,7 +312,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // default location is a contract with another module, not a local preference.
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
-    // Before the new storage's class roots are created there, its first single-folder tree
+    // Before the session store's class roots are created there, its first single-folder tree
     // becomes the durable root, once: creating the durable root first would leave that tree
     // where backups no longer capture it.
     broca_module_serve::store_layout::class_single_folder_tree(&state_root).map_err(|error| {
@@ -474,8 +474,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     charge_basis_table.publish_for_health();
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
     let mut classifier_router = None;
-    // Where the new session storage's deployment key is read from: the vault, by grant. `None`
-    // when the module reads no vault, so sessions kept in the new storage stay refused.
+    // Where the session store's deployment key is read from: the vault, by grant. `None`
+    // when the module reads no vault, so sessions kept in the session store stay refused.
     let mut store_key_source: Option<Arc<dyn broca_module_serve::store_key::DeploymentKeySource>> =
         None;
     // System One's provider credentials. Without a vault (the mock provider path) their
@@ -672,7 +672,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_subc::SubcCompactionPlane::new(plan_conn.clone()),
     ));
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
-    // The new session storage. A session kept there is told apart from today's from the first
+    // The session store. A session kept there is told apart from today's from the first
     // open. Its runtime opens here, without the deployment key, and serves plain sessions from
     // the start; encrypted sessions are served once the key has loaded from the vault (see
     // `store_key`). `session_storage.encryption` chooses the mode of the sessions it creates.
@@ -687,7 +687,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .creating(session_storage.new_sessions()),
     );
     broca_module_serve::store_key::publish(Arc::clone(&store_slot));
-    // With run events on, a session in the new storage hands the events of its durable records
+    // With run events on, a session in the session store hands the events of its durable records
     // to the outbox the publisher drains, as a session in today's storage does from its WAL.
     let store_run_events = bus_event_config.enabled.then(|| {
         broca_module_serve::bus_events::StoreRunEvents::new(run_index.as_ref().unwrap().clone())
@@ -699,7 +699,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         import_roots: broca_module_serve::config::ImportConfig::from_settings(&settings)
             .map_err(ServeIoError)?
             .roots,
-        // A run that ends on a session kept in the new storage is billed into the usage export
+        // A run that ends on a session kept in the session store is billed into the usage export
         // today's runs are billed into, under the same charge-basis table.
         billing: run_index
             .as_ref()
@@ -744,7 +744,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = LineageRegistry::new_with_run_index(Arc::new(opener_builder), store_reader);
     registry.set_session_address_inventory(run_index.as_ref().unwrap().clone());
     let registry = Arc::new(registry);
-    // `session.restore_from_backup` repairs sessions kept in the new storage after their files
+    // `session.restore_from_backup` repairs sessions kept in the session store after their files
     // came back from a backup, holding each one it writes as a move does.
     registry.set_store_restorer(Arc::new(
         broca_module_serve::store_restore::StoreRestore::new(
@@ -754,7 +754,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&store_move_leases),
         ),
     ));
-    // Deletes what sealed changes left behind in sessions kept in the new storage that no actor
+    // Deletes what sealed changes left behind in sessions kept in the session store that no actor
     // holds, such as finished workers' sessions (see `store_collect`). An actor collects the
     // session it serves itself.
     let _store_collect = tokio::spawn(

@@ -1,4 +1,4 @@
-//! Sends that reach a session kept in the new storage while its latest run is paused, as
+//! Sends that reach a session kept in the session store while its latest run is paused, as
 //! today's actor takes them (`interrupt_submission`, `end_paused_run_for_interrupt` and
 //! `steer_submission` in `crate::actor`): an interrupt ends the paused run and starts after it,
 //! and a steer into a run paused for a restart waits for that run's resume.

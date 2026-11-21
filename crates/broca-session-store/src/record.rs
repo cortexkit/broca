@@ -411,7 +411,7 @@ message! {
         17 opt marks: SharedJson,
         /// The message was converted from a log of today's storage that had no lineage, so
         /// today's read serves it none of what an `include_display_facts` read adds, and nor does
-        /// the new storage's. Absent for every message broca places itself.
+        /// the session store's. Absent for every message broca places itself.
         18 opt no_display_facts: bool,
         /// For an assistant message: the summaries its reasoning blocks carry, in the order of
         /// its content blocks, as `session.read` serves them with display facts. Recorded when

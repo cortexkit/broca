@@ -1,4 +1,4 @@
-//! `session.history` and the `compaction-runner/v1` route on a session kept in the new storage,
+//! `session.history` and the `compaction-runner/v1` route on a session kept in the session store,
 //! through the module's registry.
 //!
 //! Each scenario pins the replies as JSON with only what the storage keeps for itself taken out
@@ -191,7 +191,7 @@ impl Drop for Side {
 
 const IDLE: Duration = Duration::from_millis(100);
 
-/// A module whose sessions start in the new storage when `store`, over the scripted provider
+/// A module whose sessions start in the session store when `store`, over the scripted provider
 /// `steps`. With `gated`, every model step waits for the gate. With
 /// `compaction`, the module has a ready compaction provider.
 async fn side(steps: Vec<Vec<NormalizedEvent>>, gated: bool, compaction: bool) -> Side {
@@ -650,7 +650,7 @@ async fn compare_compaction_refusals(store: &Side, label: &str) {
     }
 }
 
-/// A module whose sessions start in the new storage, over the scripted provider steps.
+/// A module whose sessions start in the session store, over the scripted provider steps.
 async fn both(steps: Vec<Vec<NormalizedEvent>>, gated: bool) -> Side {
     side(steps, gated, false).await
 }
@@ -1774,7 +1774,7 @@ fn comparison(
 }
 
 /// For each host folder (`opencode2`, `pi`) of a Thalamus export folder, imports the export
-/// through the module's real file import into a session in the new storage, then reads every
+/// through the module's real file import into a session in the session store, then reads every
 /// page of `session.entries` through the module's `compaction-runner/v1` route, as the
 /// compaction provider `magic-context` would. Writes, under `HEAD_IMPORT_OUT_DIR/<host>/`:
 /// - `import-reply.json`, the import's reply, move list included;

@@ -1,4 +1,4 @@
-//! `session.warm` on a session kept in the new storage, through the module's registry.
+//! `session.warm` on a session kept in the session store, through the module's registry.
 //!
 //! The module runs a scripted model whose frozen render config is a first-party Anthropic one
 //! with one-hour cache markers, so the session's cache policy allows a warm, read with the
@@ -167,7 +167,7 @@ impl RunExecutor for Loops {
     }
 }
 
-/// A module over the state root `dir` whose sessions start in the new storage when `store`.
+/// A module over the state root `dir` whose sessions start in the session store when `store`.
 /// With `declares`, it reads sessions' cache policies; with `config`, its model freezes that
 /// render config.
 struct Side {

@@ -177,7 +177,7 @@ fn scratch_dir() -> std::path::PathBuf {
     dir
 }
 
-/// A module over a scratch folder whose new sessions start in the new session storage
+/// A module over a scratch folder whose new sessions start in the session store
 /// (`broca_session_store`), run by `executor`.
 struct Side {
     dir: std::path::PathBuf,

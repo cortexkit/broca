@@ -449,7 +449,7 @@ fn noting(noter: &Arc<Noter>) -> Planes {
     }
 }
 
-/// A session in the new storage served by the store actor over a script, its executor offering
+/// A session in the session store served by the store actor over a script, its executor offering
 /// `planes`.
 struct Pair {
     backend: &'static MemoryBackend,

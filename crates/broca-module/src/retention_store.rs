@@ -36,7 +36,7 @@ pub(crate) mod counters;
 #[path = "retention_store_deadlines.rs"]
 mod kept;
 
-/// What retention keeps between passes about the sessions in the new storage.
+/// What retention keeps between passes about the sessions in the session store.
 #[derive(Default)]
 pub(super) struct StoreRetention {
     /// Each session's deadline, as its records said at the stored position it was read at, by
@@ -80,9 +80,9 @@ impl Drop for Deleting<'_> {
     }
 }
 
-/// The retention seconds, last activity and deadline of the new storage's session whose records
+/// The retention seconds, last activity and deadline of the session store's session whose records
 /// are `records`, every one of both streams in seq order; `None` for a session whose first run
-/// set no retention. The records today's rule reads keep their meaning in the new storage: a run
+/// set no retention. The records today's rule reads keep their meaning in the session store: a run
 /// start carries its retention and time; a queued send its time, and in its receipt the retention
 /// it set; a steer both in its receipt; a run's end and pause their time. A send queued or steered
 /// by the store actor, and one converted from today's log, keep these under today's names
@@ -142,7 +142,7 @@ pub fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)
     )))
 }
 
-/// What an operator's deletion of a session in the new storage came to
+/// What an operator's deletion of a session in the session store came to
 /// ([`RetentionService::delete_store_session_for_operator`]).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OperatorDeletion {
@@ -179,7 +179,7 @@ impl RetentionService {
         )
         .await
     }
-    /// Whether retention is deleting the session `key` from the new storage now, holding its
+    /// Whether retention is deleting the session `key` from the session store now, holding its
     /// lease. An open that finds the lease held waits for this, as it waits for today's deletion
     /// of an expired session, rather than refusing the send.
     pub(crate) fn store_deletion_in_flight(&self, key: &BindIdentity) -> bool {
@@ -190,7 +190,7 @@ impl RetentionService {
             .contains(key)
     }
 
-    /// Deletes every session in the new storage's ephemeral root whose retention policy expired
+    /// Deletes every session in the session store's ephemeral root whose retention policy expired
     /// at or before `now_ms`, each under its lease, and returns the sessions deleted. One that
     /// can't be decided or deleted now is logged and decided again on the next pass.
     pub(crate) async fn sweep_store(

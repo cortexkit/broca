@@ -1,4 +1,4 @@
-//! Reads of a session kept in the new storage, answered without reloading the session.
+//! Reads of a session kept in the session store, answered without reloading the session.
 //!
 //! A read used to load the session read-only (`Session::view`) on every call: the whole open log
 //! read, authenticated and folded again, which on a long open log costs far more than the read.
@@ -34,7 +34,7 @@ use broca_session_store::session::{Position, Session, SessionView, StoredEntry};
 use crate::serve::ServeError;
 use crate::store_status::SettledRuns;
 
-/// A read of a session kept in the new storage.
+/// A read of a session kept in the session store.
 #[derive(Debug, Clone)]
 pub enum StoreReadRequest {
     /// `run.admission` for one run's frozen start.
@@ -200,7 +200,7 @@ pub struct StoredMedia {
 /// the applied plan's and the latest accepted one's; `None` before any refresh.
 pub type RefreshedIdentities = Option<(Option<String>, Option<String>)>;
 
-/// What a plan-change op's preflight read about a session kept in the new storage.
+/// What a plan-change op's preflight read about a session kept in the session store.
 pub struct PlanChangeRead(pub(crate) crate::serve::ChangeRead);
 
 /// How the session's store actor answered a read.

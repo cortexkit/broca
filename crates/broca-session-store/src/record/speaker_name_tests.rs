@@ -1,4 +1,4 @@
-//! Display marks as the new storage stores them before a speaker could carry a display name: a
+//! Display marks as the session store stores them before a speaker could carry a display name: a
 //! speaker without a name, and a notice. A named speaker is gated by a must-understand field of
 //! its own, so these records must keep exactly these bytes.
 

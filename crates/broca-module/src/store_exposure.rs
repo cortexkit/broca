@@ -1,4 +1,4 @@
-//! How the llm-runner surface exposes what a session kept in the new storage holds.
+//! How the llm-runner surface exposes what a session kept in the session store holds.
 //!
 //! **Replies.** The model is shown a number in front of each part (`§N§`) and often starts its
 //! own reply with one. The stored message keeps what the model wrote; every caller-facing

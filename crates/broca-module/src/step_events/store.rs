@@ -1,4 +1,4 @@
-//! A small metadata projection of new-storage writes. No replay or transcript copy is needed.
+//! A small metadata projection of session-store writes. No replay or transcript copy is needed.
 
 use super::*;
 use broca_protocol::BindIdentity;

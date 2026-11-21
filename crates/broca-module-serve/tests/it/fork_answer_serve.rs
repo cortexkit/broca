@@ -1,4 +1,4 @@
-//! `fork_answer` (llm-runner §9.20) on a head kept in the new storage, through the real serve
+//! `fork_answer` (llm-runner §9.20) on a head kept in the session store, through the real serve
 //! path: each request goes over the wire into `serve_connection`, into the registry and on to
 //! the fork manager, which reads the head through a read-only view and keeps each fork in its
 //! own session. The head is created by a send the store actor runs over a scripted provider; the

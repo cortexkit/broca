@@ -626,7 +626,7 @@ async fn real_module_completes_against_captured_openai_chat_bytes() {
         !super::stored_log::stored_files(&daemon.broca_state_root()).is_empty(),
         "the run is stored in the new storage"
     );
-    // The run's boundaries, in the order the run wrote them, read back from the new storage. An
+    // The run's boundaries, in the order the run wrote them, read back from the session store. An
     // unscoped route's session is keyed under the unscoped root, whatever folder the bind named.
     let stored = broca_protocol::BindIdentity::new(
         broca_protocol::session::UNSCOPED_SESSION_ROOT,

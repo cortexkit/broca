@@ -1,4 +1,4 @@
-//! Billing for runs on the new storage: a run's end makes its spend facts owed, the actor
+//! Billing for runs in the session store: a run's end makes its spend facts owed, the actor
 //! inserts them into the usage export through today's export path, and only then records the
 //! run billed.
 
@@ -418,7 +418,7 @@ async fn a_failed_insert_leaves_the_run_owed_until_the_next_runs_end() {
 }
 
 /// A converted session holds a `Billed` record after each run's end, since today's storage
-/// billed those runs: it opens owing nothing and inserts no fact. A run on the new storage after
+/// billed those runs: it opens owing nothing and inserts no fact. A run in the session store after
 /// them is billed once.
 #[tokio::test]
 async fn a_converted_session_owes_nothing_and_a_later_run_is_billed_once() {
@@ -463,7 +463,7 @@ async fn a_converted_session_owes_nothing_and_a_later_run_is_billed_once() {
 }
 
 /// A run seeded from an import never called a provider: its end owes nothing, and opening its
-/// session inserts no fact. A run on the new storage after it is billed once.
+/// session inserts no fact. A run in the session store after it is billed once.
 #[tokio::test]
 async fn an_imported_session_owes_nothing_and_a_later_run_is_billed_once() {
     // A real run's start, from a scratch session sharing the parts store, to copy as the start

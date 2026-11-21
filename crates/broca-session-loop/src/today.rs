@@ -1,7 +1,7 @@
 //! Today's record form rebuilt from the new records, for the records billing reads.
 //!
 //! The usage export is built by today's builder (`broca_core::billing`) from today's records
-//! (`broca_wal::WalRecord`). A run kept in the new storage is billed by rebuilding those records
+//! (`broca_wal::WalRecord`). A run kept in the session store is billed by rebuilding those records
 //! from its new ones and calling the same builder, so its facts can't differ from a run's on
 //! today's storage. Each function here rebuilds one kind of today's record as JSON, the form the
 //! converter's inverse (`broca-session-convert`) compares with today's logs; that comparison

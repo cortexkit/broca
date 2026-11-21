@@ -107,9 +107,9 @@ pub const COMPACTION_VIEW_FEATURE: &str = "compaction-view/v1";
 /// them could repeat a wait after a crash or send a request the runner durably refused.
 pub const CONTEXT_CEILING_FEATURE: &str = "context-ceiling/v1";
 
-/// The folder of a state root that holds the new session storage's ordinary sessions, the ones
+/// The folder of a state root that holds the session store's ordinary sessions, the ones
 /// backups leave out. The durable and ephemeral classes have their own folders
-/// (`session_storage::StorageClass`). Before the new storage had classes it kept every session
+/// (`session_storage::StorageClass`). Before the session store had classes it kept every session
 /// here.
 pub const SESSION_STORAGE_DIR: &str = "session-store";
 

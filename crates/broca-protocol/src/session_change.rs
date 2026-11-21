@@ -17,7 +17,7 @@ use crate::request::ModelHandle;
 
 /// A pending change: the highest accepted generation not yet applied, with its latest policy and
 /// the manifest it will freeze when it applies, held as `M`. Today's fold holds the manifest
-/// itself. The new storage's fold holds a reference to it instead: the setup parts the manifest
+/// itself. The session store's fold holds a reference to it instead: the setup parts the manifest
 /// is stored as (its plan, each provider's answer, its tools, its system text and its
 /// declarations) and the rest of its members, as a run start references the manifest it froze.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,7 +37,7 @@ pub struct Applying {
 
 /// A pending change a run start applied, with the facts the session's baseline reports for it:
 /// the applied manifest's digest, its composition digest when it has one, and the plan items its
-/// fetch left absent. The new storage records it in the batch of the run start that applied it.
+/// fetch left absent. The session store records it in the batch of the run start that applied it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppliedChange {
     pub generation: u64,
@@ -81,7 +81,7 @@ pub fn applies_at_run_start(
 ///
 /// A run start is two steps. [`Self::run_started`] notes the run's model and manifest, and when
 /// the pending change applies at it, [`Self::applied`] applies it after. Whether it applies is
-/// decided before either, by [`Self::applying`]. The new storage records that decision in the
+/// decided before either, by [`Self::applying`]. The session store records that decision in the
 /// run start's batch; today's fold makes it again on replay.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transitions<M> {

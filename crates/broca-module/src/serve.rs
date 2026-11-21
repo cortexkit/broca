@@ -537,7 +537,7 @@ pub type RecordedSummaries =
 /// per-call facts names each call with no times.
 ///
 /// Today's storage reads reasoning summaries from the message's reasoning blocks (`recorded` is
-/// `None`); the new storage serves the ones it recorded when it placed the message, as a seal
+/// `None`); the session store serves the ones it recorded when it placed the message, as a seal
 /// prunes the blocks they are read from.
 pub fn apply_display_facts(
     response: &mut SessionReadResponse,
@@ -1571,7 +1571,7 @@ pub enum ServeError {
         code: &'static str,
         message: String,
     },
-    /// A send asked the new storage for `feature`, which it doesn't serve: a creating send's
+    /// A send asked the session store for `feature`, which it doesn't serve: a creating send's
     /// feature, as a head starts nowhere else, or a send continuing a session compacted under
     /// the first compaction protocol, which moved read-only. Refused
     /// [`crate::store_entries::NOT_SERVED_ON_NEW_STORAGE`], permanent, with nothing written.
@@ -1887,7 +1887,7 @@ pub trait ServeHandler: Send + Sync {
             .await
     }
 
-    /// Reader policies are served only for sessions kept, or being created, in the new storage.
+    /// Reader policies are served only for sessions kept, or being created, in the session store.
     fn plan_readers_supported(
         &self,
         _session: &LineageKey,
@@ -1987,7 +1987,7 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// `session.import` from a file source, and `session.install_view`: commands only a session
-    /// kept in the new storage serves. A handler without the new storage refuses them by name.
+    /// kept in the session store serves. A handler without the session store refuses them by name.
     async fn store_command(
         &self,
         _session: &LineageKey,
@@ -2001,7 +2001,7 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
-    /// Whether `session` is served from the new storage. Refuses a session owned by the new
+    /// Whether `session` is served from the session store. Refuses a session owned by the new
     /// storage when this handler has no runtime for it, before dispatch can consult today's WAL.
     fn kept_in_new_storage(&self, _session: &LineageKey) -> Result<bool, ServeError> {
         Ok(false)
@@ -2019,7 +2019,7 @@ pub trait ServeHandler: Send + Sync {
 
     /// `session.tag_map`: which message and part each part number of the session belongs to
     /// (see `store_tag_map`). `None` for a session today's storage keeps, which the operation
-    /// doesn't serve; a handler without the new storage keeps every session there.
+    /// doesn't serve; a handler without the session store keeps every session there.
     async fn tag_map(
         &self,
         _session: &LineageKey,
@@ -2031,7 +2031,7 @@ pub trait ServeHandler: Send + Sync {
     /// `session.read {tag, call_key}` (llm-runner `tag_read`): the message part the model saw as
     /// part number `tag` in the request that produced call `call_key` (see `store_tag_read`),
     /// for the session's owner alone. `principal` is the one the daemon attests opened the
-    /// route and `scope` the daemon's stamp on it. `None` for a handler without the new storage,
+    /// route and `scope` the daemon's stamp on it. `None` for a handler without the session store,
     /// which keeps no request's part numbers.
     async fn tag_read(
         &self,
@@ -2066,8 +2066,8 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// `session.restore_from_backup`: restores the session, or with `all` every session kept in
-    /// the new storage, from the files the store holds after a backup came back (see
-    /// `registry::store_restore`). A handler without the new storage refuses by name.
+    /// the session store, from the files the store holds after a backup came back (see
+    /// `registry::store_restore`). A handler without the session store refuses by name.
     async fn restore_from_backup(
         &self,
         _session: &LineageKey,
@@ -2079,7 +2079,7 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
-    /// Where a file-source import may read from. `None` without the new storage.
+    /// Where a file-source import may read from. `None` without the session store.
     fn import_roots(&self) -> Option<std::sync::Arc<crate::store_import::ImportRoots>> {
         None
     }
@@ -2122,7 +2122,7 @@ pub trait ServeHandler: Send + Sync {
         Ok(None)
     }
 
-    /// For a session kept in the new storage, the compaction view the request of the model step
+    /// For a session kept in the session store, the compaction view the request of the model step
     /// that wrote message `ordinal` (counting from 0) was rendered under, which output references
     /// check a named part against: `Some(None)` when no view applied. `None` for a session kept
     /// on today's storage, whose views output references read from its log instead
@@ -2282,7 +2282,7 @@ pub trait ServeHandler: Send + Sync {
             .map(|head| (head.mode3, head.lineage_id))
     }
 
-    /// `session.history`'s head for a session kept in the new storage, resolving `mid` when the
+    /// `session.history`'s head for a session kept in the session store, resolving `mid` when the
     /// read names a message; `None` for a session on today's storage, which `head` answers.
     async fn store_history_head(
         &self,
@@ -2514,7 +2514,7 @@ pub trait ServeHandler: Send + Sync {
 impl crate::LineageRegistry {
     /// The preflight's check of a refresh's compaction item against the latest plan the session
     /// accepted (`ChangeFacts::latest_manifest`). Keeping the item is always fine; removing or
-    /// changing it is refused, and so is adding one on today's storage. On the new storage a
+    /// changing it is refused, and so is adding one on today's storage. On the session store a
     /// session may gain one: the window must be whole, and a context limit must resolve for the
     /// plan's model (`plan_model`), else the session's, since a run on the compaction contract
     /// can't run without one and the provider can't be removed again. A limit resolution that
@@ -2561,7 +2561,7 @@ impl crate::LineageRegistry {
         wal_error: fn(String) -> String,
     ) -> Result<ChangeRead, SessionChangeError> {
         use crate::store_reads::{StoreReadReply, StoreReadRequest};
-        // A session kept in the new storage is read from its fold and its id index.
+        // A session kept in the session store is read from its fold and its id index.
         if let Some(store) = self
             .store_holding(session)
             .map_err(|error| SessionChangeError::Transient(wal_error(format!("{error:?}"))))?

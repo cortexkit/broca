@@ -1,4 +1,4 @@
-//! `session.media_read` and the upload operations on a session kept in the new storage, through
+//! `session.media_read` and the upload operations on a session kept in the session store, through
 //! the module's registry.
 //!
 //! The session got its image from a head import, which stores it as an input medium of the
@@ -119,7 +119,7 @@ pub(super) struct Side {
     pub(super) key: BindIdentity,
     /// What each model step waits for, when the side's steps are gated.
     pub(super) gate: Option<Arc<tokio::sync::Notify>>,
-    /// The mode the side's module creates new-storage sessions in.
+    /// The mode the side's module creates session-store sessions in.
     pub(super) cipher: Cipher,
     /// The caller whose sends reach the side's session.
     pub(super) caller: crate::store_actor::tests::Caller,
@@ -165,7 +165,7 @@ pub(super) async fn side_gated(
 }
 
 /// A module over the state root `dir`, as a process starting there opens it: its sessions
-/// start in the new storage when `store`, its runs scripted by `steps`, and its new storage
+/// start in the session store when `store`, its runs scripted by `steps`, and its new storage
 /// creates sessions in mode `cipher`.
 pub(super) async fn registry_at(
     dir: &std::path::Path,
@@ -208,7 +208,7 @@ async fn registry_gated(
 }
 
 impl Side {
-    /// The mode the stored head of the side's session names, which a session in the new storage
+    /// The mode the stored head of the side's session names, which a session in the session store
     /// keeps for its life.
     pub(super) fn stored_mode(&self) -> Cipher {
         stored_mode(&self.dir, &self.key)
@@ -427,7 +427,7 @@ pub(super) fn reads_of(sha256: &str, size: u64) -> Vec<Value> {
     ]
 }
 
-/// The upload operations and `session.media_read` on a session in the new storage: an upload's
+/// The upload operations and `session.media_read` on a session in the session store: an upload's
 /// every step and its refusals, the image the session holds read whole, by byte range and as a
 /// metadata probe, and the refusals of a digest the session doesn't hold. An upload no send named
 /// is not readable, and neither is a digest of another session, nor one malformed.

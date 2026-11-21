@@ -1,4 +1,4 @@
-//! Inline-import and output-reference replies of a session in the new storage, each pinned.
+//! Inline-import and output-reference replies of a session in the session store, each pinned.
 
 use super::*;
 use crate::actor::LineageCmd;
@@ -377,7 +377,7 @@ async fn output_reference_list_and_byte_reads_match_today() {
     );
 }
 
-/// An output-reference set id on a session created on the new storage names the history version
+/// An output-reference set id on a session created in the session store names the history version
 /// the session stores, not the one its reads serve (`store_exposure`): a build from before the
 /// exposure epoch served the stored version and scoped its ids by it, so an id it handed out
 /// still resolves. An id scoped to the served version names nothing.

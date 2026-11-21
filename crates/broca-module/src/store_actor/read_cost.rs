@@ -1,4 +1,4 @@
-//! The read cost bar: what each read of a session kept in the new storage costs, served by its
+//! The read cost bar: what each read of a session kept in the session store costs, served by its
 //! actor (open), from a kept view (closed, cached), and from a fresh load (closed, cold), on
 //! synthetic sessions of 1,000 to 500,000 messages. Ignored: it writes gigabytes and runs for
 //! minutes. Run it on a release build:

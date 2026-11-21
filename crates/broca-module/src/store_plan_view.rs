@@ -1,4 +1,4 @@
-//! The applied plan on the new storage, using the same read path and shared setup parts as
+//! The applied plan in the session store, using the same read path and shared setup parts as
 //! transcript reads. Attribution is computed, never written into a session's history.
 
 use broca_protocol::BindIdentity;

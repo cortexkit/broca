@@ -132,7 +132,7 @@ fn append_matching_file_tails(
     }
 }
 
-/// The sessions each of the new storage's roots under `state_root` holds: one line per session
+/// The sessions each of the session store's roots under `state_root` holds: one line per session
 /// head, with its size. The roots' folder names are the storage's (`session-store` and its
 /// durable and ephemeral siblings).
 fn append_session_inventory(output: &mut String, state_root: &Path) {

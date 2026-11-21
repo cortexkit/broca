@@ -1,4 +1,4 @@
-//! The `session.subscribe` stream of a session kept in the new storage.
+//! The `session.subscribe` stream of a session kept in the session store.
 //!
 //! Its control lane keeps today's meaning: a subscriber gets every unit after its attach point
 //! exactly once, first from a catch-up over the session's stored records, then from the live

@@ -1,4 +1,4 @@
-//! The run events a session in the new storage hands its run-event sink.
+//! The run events a session in the session store hands its run-event sink.
 
 use std::sync::{Arc, Mutex};
 

@@ -30,7 +30,7 @@ use crate::store_import::{
 #[path = "import_inline_tests.rs"]
 mod inline;
 
-// Imports staged and published on the new storage's class roots.
+// Imports staged and published on the session store's class roots.
 #[path = "import_repetition_tests.rs"]
 mod repetition;
 #[path = "import_stage_tests.rs"]
@@ -807,7 +807,7 @@ async fn an_imported_image_is_a_persons_at_its_place_and_renders_with_its_bytes(
     assert!(body.contains(PNG), "{body}");
 }
 
-/// Through the registry: an import creates its session in the new storage, never on today's,
+/// Through the registry: an import creates its session in the session store, never on today's,
 /// and a retry is answered from it. Like any head, it needs only the store runtime: the switch
 /// that starts every new session there stays off, as in production.
 #[tokio::test]
@@ -2717,7 +2717,7 @@ async fn an_imported_session_states_no_reading_until_its_own_step() {
 
 /// `run.result` of an import's seeded run. The run ends completed and places none of its own
 /// messages: imported messages belong to no run. Today's storage serves the last assistant message
-/// of the transcript the run left, so the new storage must serve it too, with the id the source
+/// of the transcript the run left, so the session store must serve it too, with the id the source
 /// gave it, and not refuse the run as one that placed nothing. An import holding no assistant
 /// message has no final message to serve, and the search for one stays inside the run's own
 /// messages.

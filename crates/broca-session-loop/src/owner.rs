@@ -3,7 +3,7 @@
 //! The store's operational fold keeps the owner summary its run starts recorded
 //! ([`Owner`]); `broca_core::scope_admission` decides who may send to, cancel or retract a
 //! session from a `SessionOwnershipV1`. This builds that summary from the fold, so a session in
-//! the new storage is judged by the same rules as one in today's.
+//! the session store is judged by the same rules as one in today's.
 
 use broca_core::admission::SessionOwnershipV1;
 use broca_session_store::fold::operations::Owner;

@@ -1,7 +1,7 @@
 //! `session.request_dump`: the exact request body each step of one run sent, rebuilt from the
-//! records of a session kept in the new storage, for the operator to read.
+//! records of a session kept in the session store, for the operator to read.
 //!
-//! The new storage keeps each attempt's request digest, not its bytes. This operation rebuilds
+//! The session store keeps each attempt's request digest, not its bytes. This operation rebuilds
 //! each step's request through the same path broca's warm-ups use, renders it with the run's
 //! frozen render config, and writes it as the step's body only when its SHA-256 equals the digest
 //! the step's last attempt recorded. A body that rebuilds to other bytes is written beside, under

@@ -1,7 +1,7 @@
-//! The one-time step that turns the new session storage's first, single-folder tree into its
+//! The one-time step that turns the session store's first, single-folder tree into its
 //! durable root.
 //!
-//! The new storage first kept every session in one folder, `session-store/`, and the backup
+//! The session store first kept every session in one folder, `session-store/`, and the backup
 //! descriptor captured all of it. Only long-lived agent heads, moved or imported there, were
 //! ever placed in it, so everything in that tree is durable by construction. The storage now
 //! keeps one root per backup class (`broca_wal::StorageClass`), and `session-store/` is the

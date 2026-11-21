@@ -201,7 +201,7 @@ async fn scenario(cipher: Cipher, with_bus: bool, fail: bool, interrupted: bool)
         bodies.push(body);
     }
     if with_bus {
-        // The new storage's attempt records no physical request length, so the event leaves
+        // The session store's attempt records no physical request length, so the event leaves
         // `request_body_bytes` out rather than stand a canonical length in for it.
         assert!(normalized(&bodies[0]).get("request_body_bytes").is_none());
         broca_test_support::pin!("the step event", normalized(&bodies[0]));

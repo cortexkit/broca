@@ -1,4 +1,4 @@
-//! Read admission for plans on the new storage, shared by live actors and stored views.
+//! Read admission for plans in the session store, shared by live actors and stored views.
 
 use broca_protocol::{BindPrincipal, RunId};
 use broca_session_loop::parts::Parts;

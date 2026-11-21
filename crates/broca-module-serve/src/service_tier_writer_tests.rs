@@ -204,7 +204,7 @@ impl TierServeRig {
         (status, result)
     }
 
-    /// The session's records in the new storage, in log order; empty while it doesn't exist.
+    /// The session's records in the session store, in log order; empty while it doesn't exist.
     async fn records(&self) -> Vec<broca_session_store::record::Record> {
         match self.runtime.current_view(&self.session).await {
             Ok(Some(view)) => view

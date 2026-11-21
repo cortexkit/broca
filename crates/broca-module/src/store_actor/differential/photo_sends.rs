@@ -1,4 +1,4 @@
-//! Photo sends to a session kept in the new storage, through the module's registry: a send that
+//! Photo sends to a session kept in the session store, through the module's registry: a send that
 //! starts a run, a queued send, a steer and a retracted queued send.
 //!
 //! An upload belongs to a session, so the session is created by a text send first. Then the image
@@ -155,7 +155,7 @@ async fn photo_send(
 }
 
 /// A photo send can't create its session with its photo: an upload needs a session to belong to,
-/// so a creating send naming one is refused, and the new storage keeps the session the send
+/// so a creating send naming one is refused, and the session store keeps the session the send
 /// opened, empty.
 async fn a_photo_send_creating_its_session_answers_alike(cipher: Cipher) {
     let store = side_gated(steps(), false, cipher).await;

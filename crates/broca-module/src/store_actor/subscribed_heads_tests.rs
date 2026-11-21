@@ -1,4 +1,4 @@
-//! A subscriber keeps an idle session in the new storage open, as on today's storage: its actor
+//! A subscriber keeps an idle session in the session store open, as on today's storage: its actor
 //! doesn't close at an idle deadline or an idle tick while the subscriber holds its stream, and
 //! closes at the first idle deadline after the subscriber has gone. A module stop still closes
 //! it and ends the subscription.

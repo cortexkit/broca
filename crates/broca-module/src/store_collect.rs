@@ -1,4 +1,4 @@
-//! Deleting what sealed changes left behind, in sessions kept in the new storage that no actor
+//! Deleting what sealed changes left behind, in sessions kept in the session store that no actor
 //! holds.
 //!
 //! A session's store actor collects its own session when it opens it and after each seal (see
@@ -83,7 +83,7 @@ enum Outcome {
 }
 
 impl StoreCollectSweep {
-    /// The sweep over the new storage under `state_root`, opened with `slot`'s runtime. It
+    /// The sweep over the session store under `state_root`, opened with `slot`'s runtime. It
     /// skips the sessions `served` names and holds each session it writes through `leases`,
     /// as an actor opening it would.
     pub fn new(
@@ -180,7 +180,7 @@ impl StoreCollectSweep {
             .start()
             .with_session(|| None);
         let mut pass = SweepPass::default();
-        // Until the new storage's runtime opens, no session there is served or collected.
+        // Until the session store's runtime opens, no session there is served or collected.
         let Some(runtime) = self.slot.runtime() else {
             return pass;
         };
@@ -234,7 +234,7 @@ impl StoreCollectSweep {
         pass
     }
 
-    /// Every session folder in the new storage's roots, ordered by class, then address. A pass
+    /// Every session folder in the session store's roots, ordered by class, then address. A pass
     /// reads the heads of only some of them, and a folder without a head reads as nothing due.
     fn sessions(&self, pass: &mut SweepPass) -> Vec<(StorageClass, SessionAddr)> {
         let mut sessions = Vec::new();

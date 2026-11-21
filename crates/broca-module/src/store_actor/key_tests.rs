@@ -1,4 +1,4 @@
-//! A session kept in the new storage while the deployment key hasn't loaded: refused
+//! A session kept in the session store while the deployment key hasn't loaded: refused
 //! `key_unavailable`, and served once the key loads, without a restart. A run that ends on such a session writes its spend facts to the usage export.
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ const KEY: [u8; 32] = [0x5a; 32];
 /// Long enough that no actor closes while a test runs.
 const OPEN: Duration = Duration::from_secs(600);
 
-/// A module over a scratch state root holding one session in the new storage (`held`), whose
+/// A module over a scratch state root holding one session in the session store (`held`), whose
 /// deployment key hasn't loaded, and naming one no storage holds (`absent`).
 struct Module {
     dir: std::path::PathBuf,
@@ -110,7 +110,7 @@ impl Module {
     }
 }
 
-/// The refusal a session kept in the new storage gets while its key hasn't loaded.
+/// The refusal a session kept in the session store gets while its key hasn't loaded.
 fn assert_key_unavailable(error: OpenError) {
     match error {
         OpenError::Classified { reason, class } => {
@@ -122,7 +122,7 @@ fn assert_key_unavailable(error: OpenError) {
     }
 }
 
-/// With no key loaded, a session kept in the new storage is refused with the transient
+/// With no key loaded, a session kept in the session store is refused with the transient
 /// `key_unavailable` on open and on a read.
 #[tokio::test]
 async fn a_held_session_is_refused_key_unavailable_while_the_key_loads() {
@@ -300,10 +300,10 @@ async fn a_flipped_head_mode_is_refused_as_damage_both_ways() {
     }
 }
 
-/// A head's creating send while the new storage can't create its session, because it creates
+/// A head's creating send while the session store can't create its session, because it creates
 /// encrypted sessions and the deployment key hasn't loaded, is refused `key_unavailable`,
 /// transient, and nothing of it is created.
-/// Once the key loads, the same send starts the head in the new storage's durable root.
+/// Once the key loads, the same send starts the head in the session store's durable root.
 #[tokio::test]
 async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
     let module = module("head", None).await;
@@ -616,7 +616,7 @@ async fn a_run_ending_on_a_held_session_writes_one_spend_fact_under_todays_fact_
     assert_eq!(export.read_export_page(None, 100).unwrap().facts.len(), 1);
 }
 
-/// How long the new storage's check of a session costs on a state root that keeps no session
+/// How long the session store's check of a session costs on a state root that keeps no session
 /// there, the case of every open on today's storage: one `symlink_metadata` of a head that
 /// doesn't exist. A measurement, so it runs only when asked: `--ignored --nocapture`.
 #[test]

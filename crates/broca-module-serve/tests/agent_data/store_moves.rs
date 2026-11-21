@@ -539,7 +539,7 @@ async fn store_prepare_refuses_a_retention_session() {
     source.registry.check_move(&session, true).unwrap();
 }
 
-/// The agent-data service finds a stored session even when the new storage opened only after the
+/// The agent-data service finds a stored session even when the session store opened only after the
 /// service was built: it reads the storage's runtime at each request, not once at boot.
 #[tokio::test]
 async fn agent_data_finds_a_store_that_opened_after_it_was_built() {

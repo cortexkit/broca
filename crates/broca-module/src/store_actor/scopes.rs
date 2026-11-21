@@ -1,4 +1,4 @@
-//! Scope admission on a session kept in the new storage, by today's actor's rules (`crate::actor`)
+//! Scope admission on a session kept in the session store, by today's actor's rules (`crate::actor`)
 //! and the shared ones in `broca_core::scope_admission`: a send under an agent-run scope, a send
 //! that reopens the session's scope at a later epoch, and a cancel from a module other than the
 //! session's owner.

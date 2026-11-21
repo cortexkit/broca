@@ -1,4 +1,4 @@
-//! A head's import into the new storage: `session.import` with a file source, and
+//! A head's import into the session store: `session.import` with a file source, and
 //! `session.install_view`.
 //!
 //! A head is a long-lived agent session another runner hosted. Its whole history becomes the

@@ -1,5 +1,5 @@
 //! The daemon clock the retention and fork cases move, and the check that an expired session is
-//! gone from the new storage.
+//! gone from the session store.
 
 use super::*;
 
@@ -188,7 +188,7 @@ impl BrocaSubject {
     }
 }
 
-/// Whether `key`'s session is gone from the new storage: no class holds its head.
+/// Whether `key`'s session is gone from the session store: no class holds its head.
 pub(super) fn deletion_finished(
     state: &Path,
     key: &broca_protocol::BindIdentity,

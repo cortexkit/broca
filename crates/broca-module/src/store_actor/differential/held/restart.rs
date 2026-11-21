@@ -299,7 +299,7 @@ async fn background_candidates_resume_an_untouched_restart_paused_store_session(
     assert!(original.registry.stop_and_seal().await);
 }
 
-/// A restart pause older than the continuation window is not continued on the new storage:
+/// A restart pause older than the continuation window is not continued in the session store:
 /// the run ends Interrupted without a model call, and the send queued behind it starts.
 #[tokio::test]
 async fn an_old_restart_pause_ends_interrupted_and_the_next_send_starts() {

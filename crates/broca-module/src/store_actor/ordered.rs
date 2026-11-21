@@ -1,4 +1,4 @@
-//! Sends whose `delivery` is an ordered list of modes, on a session kept in the new storage.
+//! Sends whose `delivery` is an ordered list of modes, on a session kept in the session store.
 //!
 //! Admission follows today's actor (`string_sender`, `ordered_sender`,
 //! `render_ordered_template` and `queue_ordered_submission` in `crate::actor`), built from the

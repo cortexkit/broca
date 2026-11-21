@@ -3,7 +3,7 @@
 //! admits and the model a send that leaves its model to the session runs on. Both follow the
 //! session's latest accepted refresh from its acceptance, before any run applies it, by the
 //! rules today's head and ownership summary fold (`broca_core::head::HeadProjection`,
-//! `SessionOwnershipV1::effective_senders`). Every reader on the new storage asks here, never
+//! `SessionOwnershipV1::effective_senders`). Every reader in the session store asks here, never
 //! the first run's manifest.
 
 use std::sync::Arc;
@@ -28,7 +28,7 @@ pub fn sender_manifest(
 }
 
 /// The plan senders the session admits now, each with its grants and templates: what every
-/// sender check on the new storage reads.
+/// sender check in the session store reads.
 pub fn senders(operations: &Operations, parts: &dyn Parts) -> Result<Vec<PlanSender>, String> {
     Ok(sender_manifest(operations, parts)?
         .as_deref()

@@ -1,4 +1,4 @@
-//! Crashes of a session holding images, kept in the new storage: the process dies after any
+//! Crashes of a session holding images, kept in the session store: the process dies after any
 //! record of the scenario reached the disk, and a new process opens what it left.
 //!
 //! The scenario runs on the module's real store path, on a session whose plan names a compaction
@@ -54,7 +54,7 @@ const IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 /// The runs the scenario sends, in order.
 const RUNS: [&str; 4] = ["r1", "r2", "r3", "r4"];
 
-/// The new storage's runs, rendering each request into `sent`, as the module's executor runs
+/// The session store's runs, rendering each request into `sent`, as the module's executor runs
 /// them. Each run's stop request is `stop`, so cancelling it pauses a run that resumes after a
 /// restart at its next boundary, as a shutdown does. The run loop records the wall clock, as in
 /// production, because a restart pause is continued only while it is recent.
@@ -179,7 +179,7 @@ fn deployment(cipher: Cipher) -> DeploymentKey {
     DeploymentKey::new(1, &[7; 32]).creating(cipher)
 }
 
-/// A module over the state root `dir` whose sessions start in the new storage, scripted by
+/// A module over the state root `dir` whose sessions start in the session store, scripted by
 /// `steps`, rendering into `sent`, with the compaction provider it returns: a planned session's
 /// history is sealed only when that provider's view cuts it.
 async fn module(
@@ -524,7 +524,7 @@ async fn expected(dir: &Path, key: &BindIdentity, cipher: Cipher) -> Expected {
     }
 }
 
-/// What a starting process does once its routes are registered: it sweeps the new storage for
+/// What a starting process does once its routes are registered: it sweeps the session store for
 /// sessions a crash or a shutdown left unfinished, sealing crash orphans and resuming runs that
 /// paused for the restart, after enabling admission once dependency routes are ready.
 async fn restart(side: &Side) {

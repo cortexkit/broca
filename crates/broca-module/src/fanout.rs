@@ -1,7 +1,7 @@
 //! The subscribe lanes' shared pieces: the units a subscriber receives ([`Delivery`]), where a
 //! subscription starts ([`FromCursor`]), the open step's replay ([`StepReplay`]), the attach
 //! barrier's dedup decision ([`deliver_from_ring`]), the ring sizes, and delivery to a sink with
-//! its counters. The new storage's fan-out (`store_fanout`) builds on these.
+//! its counters. The session store's fan-out (`store_fanout`) builds on these.
 //!
 //! The control lane is reliable: it is projected from the session's records and addressed by a
 //! cursor, so a subscriber that falls behind detaches and replays from its durable cursor. The

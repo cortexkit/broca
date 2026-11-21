@@ -308,7 +308,7 @@ impl LateResultsIntake {
         })
     }
 
-    /// Install the reader that owns new-storage sessions before recovering their feeds.
+    /// Install the reader that owns session-store sessions before recovering their feeds.
     pub fn set_session_store(&self, runtime: Arc<crate::store_open::StoreRuntime>) {
         *self.session_store.lock().expect("session store") = Some(runtime);
     }

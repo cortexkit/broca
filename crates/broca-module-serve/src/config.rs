@@ -58,7 +58,7 @@ mod classifier_routing_config_tests {
     }
 }
 
-/// How the new session storage makes its writes durable (`storage_sync` in broca.jsonc). Off by
+/// How the session store makes its writes durable (`storage_sync` in broca.jsonc). Off by
 /// default: on macOS each sync is a plain `fsync`, which survives a broca crash, kill or restart
 /// but not a power loss or kernel panic before the drive empties its cache. `full_flush` makes
 /// each sync a full flush of the drive's cache (`F_FULLFSYNC`) instead, about 4 ms each, for a
@@ -698,7 +698,7 @@ mod account_limit_pause_config_tests {
 /// absolute folder. Absent, broca's own import folder under its state root is the only root,
 /// the folder Thalamus's `session.export` writes to. A source is read only under a root,
 /// resolved after symlinks, and deleted after its import only inside broca's own folder. Loaded
-/// once at boot and handed to the new storage's runtime (`StoreRuntime::with_import_roots`).
+/// once at boot and handed to the session store's runtime (`StoreRuntime::with_import_roots`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportConfig {
     pub roots: Option<Vec<std::path::PathBuf>>,
@@ -741,7 +741,7 @@ impl ImportConfig {
     }
 }
 
-/// How the new session storage is configured: `session_storage` in `broca.jsonc`.
+/// How the session store is configured: `session_storage` in `broca.jsonc`.
 ///
 /// `deployment_key_id` names the deployment key encrypted sessions are opened with, 1 when
 /// absent. The key itself is the vault record `opaque:broca-deployment:<id>` (see `store_key`).
@@ -758,7 +758,7 @@ pub struct SessionStorageConfig {
     pub encryption: Encryption,
 }
 
-/// `session_storage.encryption`: whether the sessions the new storage creates are encrypted.
+/// `session_storage.encryption`: whether the sessions the session store creates are encrypted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Encryption {
@@ -777,7 +777,7 @@ impl Default for SessionStorageConfig {
 }
 
 impl SessionStorageConfig {
-    /// The mode of the sessions the new storage creates.
+    /// The mode of the sessions the session store creates.
     pub fn new_sessions(&self) -> broca_session_store::keys::Cipher {
         match self.encryption {
             Encryption::On => broca_session_store::keys::Cipher::XChaCha20Poly1305,

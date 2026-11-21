@@ -1,4 +1,4 @@
-//! The deadlines retention found for the sessions in the new storage's ephemeral root, kept on
+//! The deadlines retention found for the sessions in the session store's ephemeral root, kept on
 //! disk between restarts.
 //!
 //! A pass reads a session's records again only once its stored position has moved since its

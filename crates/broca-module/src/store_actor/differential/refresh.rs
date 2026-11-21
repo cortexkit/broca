@@ -1,7 +1,7 @@
-//! Plan refreshes on a session kept in the new storage.
+//! Plan refreshes on a session kept in the session store.
 //!
 //! Each scenario drives sends, refreshes, policy changes and prefix flushes through a module
-//! whose sessions start in the new storage, and pins every reply and the plan each run froze.
+//! whose sessions start in the session store, and pins every reply and the plan each run froze.
 //! Refreshes are handed to the session's actor as the serve layer hands over a fetched manifest
 //! (`route_session_refresh`); policy changes and flushes go through the serve layer's own
 //! preflight (`ServeHandler`).
@@ -350,7 +350,7 @@ async fn an_immediate_refresh_applies_at_the_next_run_alike() {
     assert_eq!(runs[1].1.as_deref(), Some("plan-2"));
 }
 
-/// `session.baseline` on the new storage after a refresh is accepted and after it applies: the generations, the pending change, the effective plan and its tools,
+/// `session.baseline` in the session store after a refresh is accepted and after it applies: the generations, the pending change, the effective plan and its tools,
 /// and it refuses a module that isn't the session's owner.
 #[tokio::test]
 async fn the_baseline_reports_accepted_pending_and_applied_changes_alike() {

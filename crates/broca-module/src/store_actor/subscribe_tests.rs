@@ -1,4 +1,4 @@
-//! `session.subscribe` on a session kept in the new storage, through the store actor: what a
+//! `session.subscribe` on a session kept in the session store, through the store actor: what a
 //! subscriber sees live, catching up and resuming at every unit, each refusal of a resume
 //! cursor, and resuming across a seal and a revert.
 

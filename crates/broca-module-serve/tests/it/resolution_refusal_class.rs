@@ -5,7 +5,7 @@
 //! byte.
 //!
 //! Every refusal is sent four ways: to a session kept in today's storage and to one kept in the
-//! new storage, each with and without a fetch plan. The new-storage, plan-carrying send is the one
+//! new storage, each with and without a fetch plan. The session-store, plan-carrying send is the one
 //! Core makes (session class `consult`, a fetch plan and a scope stamp). One cause must reach the
 //! caller as one body whichever way it was sent: the same code, detail and class.
 //!
@@ -37,14 +37,14 @@ use subc_protocol::{
 use subc_transport::{read_frame, write_frame};
 use tokio::sync::mpsc;
 
-/// The session class Core's consults are sent with, which the module keeps in the new storage.
+/// The session class Core's consults are sent with, which the module keeps in the session store.
 const CONSULT: &str = "consult";
 
 /// Refuses every run before it starts with the error it holds, on both storages, as the module's
 /// executor refuses a run whose model or variant it can't resolve: on today's storage through the
-/// admission acknowledgement, on the new storage as the run's admission error. Holding no error,
+/// admission acknowledgement, in the session store as the run's admission error. Holding no error,
 /// it runs a send to completion instead: on today's storage its start (with the send's key) and a
-/// completed end, on the new storage the new loop over a provider answering one text step.
+/// completed end, in the session store the new loop over a provider answering one text step.
 struct Refusing {
     error: Mutex<Option<RunError>>,
     /// When set, a run this executor admits waits for it before answering its first step (on
@@ -713,7 +713,7 @@ async fn run_starts(rig: &Rig, key: &broca_protocol::BindIdentity) -> usize {
         .len()
 }
 
-/// A provider that waits for `hold` before answering its step, so a run on the new storage stays
+/// A provider that waits for `hold` before answering its step, so a run in the session store stays
 /// running after its start.
 struct Gated {
     inner: broca_core::provider::StubProvider,
