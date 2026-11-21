@@ -19,8 +19,10 @@ use crate::{CatalogError, OVERLAY};
 
 mod lkg;
 mod reasoning_facts;
+mod temperature_facts;
 use lkg::{load_lkg, persist_bootable_lkg};
 use reasoning_facts::{reasoning_default_effort_fact, reasoning_fact, reasoning_options_fact};
+use temperature_facts::temperature_facts;
 
 // Snapshot replacement bypasses refresh validation and must not be available to shipping code.
 #[cfg(all(feature = "test-support", not(debug_assertions)))]
@@ -1572,40 +1574,6 @@ fn serving_model_from_facts(
         wire_family: None,
         kind: model_kind_fact(identity, facts)?,
     })
-}
-
-fn temperature_facts(
-    identity: &str,
-    facts: &BTreeMap<String, Value>,
-) -> broca_core::provider::TemperaturePolicy {
-    let malformed = |key: &str| {
-        tracing::warn!(
-            model = identity,
-            fact = key,
-            "ignoring malformed temperature fact"
-        )
-    };
-    let supported = facts.get(TEMPERATURE_FACTS[0]).and_then(|value| {
-        let result = value.as_bool();
-        if result.is_none() {
-            malformed(TEMPERATURE_FACTS[0]);
-        }
-        result
-    });
-    let bound = |key: &str| {
-        facts.get(key).and_then(|value| {
-            let result = value.as_f64().filter(|value| value.is_finite());
-            if result.is_none() {
-                malformed(key);
-            }
-            result
-        })
-    };
-    broca_core::provider::TemperaturePolicy {
-        supported,
-        min: bound(TEMPERATURE_FACTS[1]),
-        max: bound(TEMPERATURE_FACTS[2]),
-    }
 }
 
 /// Read one capability fact that is present: a boolean is known, an explicit null is the

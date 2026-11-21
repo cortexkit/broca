@@ -6,4 +6,4 @@
     6637 crates/broca-session-loop/src/run.rs the run loop; split into model step, tool batch and between-step work (compaction views, messages sent into a running run)
 6350 crates/broca-wire/src/lib.rs wire types of every op; split by op family
 7068 crates/broca-wal/src/file_wal.rs the WAL's file store (the write-ahead log the session store replaced); deleted with the WAL code
-6105 crates/broca-catalog/src/runtime.rs catalog resolution; split poller, cache and resolution
+6073 crates/broca-catalog/src/runtime.rs catalog resolution; split poller, cache and resolution
