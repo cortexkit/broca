@@ -27,7 +27,6 @@ mod busy;
 use busy::STORE_BUSY_TIMEOUT;
 
 pub mod bus_events;
-pub mod diagnostics;
 mod display_facts;
 pub mod export_index;
 mod keeper_connection;
@@ -43,6 +42,7 @@ pub mod retention_withdrawals;
 pub mod session_address;
 pub mod session_inventory;
 pub use session_inventory::SessionInventory;
+mod run_lifecycle;
 pub mod session_log_evidence;
 pub mod session_ref_audit;
 pub mod session_refs;
@@ -854,7 +854,6 @@ impl SqliteStore {
         retention::init_work_schema(conn)?;
         session_refs::init_schema(conn)?;
         bus_events::init_schema(conn)?;
-        diagnostics::init_schema(conn)?;
         session_log_evidence::indexes::install(conn)?;
         let source = export_index::init_schema(conn).map_err(StoreError::from)?;
         if from_version < STORE_SCHEMA_VERSION {
@@ -971,7 +970,7 @@ impl RunIndex for SqliteStore {
             .transpose()
             .map_err(|e| e.to_string())?;
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        diagnostics::write_lifecycle(
+        run_lifecycle::write_lifecycle(
             &conn,
             run_id,
             state.as_str(),
@@ -1004,7 +1003,7 @@ impl RunIndex for SqliteStore {
             .transpose()
             .map_err(|e| e.to_string())?;
         let conn = self.conn.lock().unwrap();
-        diagnostics::write_lifecycle(
+        run_lifecycle::write_lifecycle(
             &conn,
             run_id,
             state.as_str(),
@@ -1139,12 +1138,6 @@ impl RunIndex for SqliteStore {
             }
         }
     }
-}
-
-fn bind_identity_from_store_key(key: &str) -> Option<BindIdentity> {
-    let mut fields = key.split('\u{1f}');
-    let identity = BindIdentity::new(fields.next()?, fields.next()?, fields.next()?);
-    fields.next().is_none().then_some(identity)
 }
 
 /// The `message` rows `message_system_idx` covers: system messages (see the index).

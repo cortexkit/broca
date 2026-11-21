@@ -823,6 +823,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // Deletions that came due while the session was closed run once the actor is idle, so
         // they never hold up a command or a run.
         self.collect_due = true;
+        self.report_open_pause().await;
         let idle_after = |now: tokio::time::Instant| idle_ttl.map(|ttl| now + ttl);
         let mut idle_deadline = idle_after(tokio::time::Instant::now());
         // What the registry was last told holds the session open; `None` until it took a note,

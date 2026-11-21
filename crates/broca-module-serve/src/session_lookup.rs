@@ -17,8 +17,7 @@ pub fn lookup(root: &Path, id: &str) -> Result<BindIdentity, String> {
 }
 
 fn lookup_inner(root: &Path, id: &str) -> Result<BindIdentity, String> {
-    let index = root
-        .join(broca_store::diagnostics::operational_database_name(root).unwrap_or("state-format"));
+    let index = root.join("run-index.db");
     let store = broca_store::legacy_inventory::open_session_resolver(root).map_err(|_| {
         format!(
             "cannot read session-ref inventory {} for {id:?}; pass --project-root and --harness",

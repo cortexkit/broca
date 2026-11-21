@@ -365,6 +365,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
     }
 
+    /// Reports the session's run to diagnostics when it opens paused for sign-in or an account
+    /// limit. Only here can a pause from before this process started be reported: its record
+    /// was written before this process began observing the session's records.
+    pub(super) async fn report_open_pause(&self) {
+        match crate::run_outcomes::paused_at_open(&self.session).await {
+            Ok(Some(paused)) => crate::diagnostics::RUN_OUTCOMES.record(paused),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(target: "broca.store_actor", %error, "a paused run could not be reported to diagnostics")
+            }
+        }
+    }
+
     pub(super) async fn probe_sign_in_on_open(&mut self) {
         if !self.sign_in_open_owed {
             return;

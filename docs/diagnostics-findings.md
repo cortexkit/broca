@@ -50,7 +50,7 @@ a complete inventory or a pagination cursor.
 
 | Check | Source and rule |
 | --- | --- |
-| `paused_runs` | Current indexed authentication/account pauses with a pause reason and observation time, independent of the window, grouped by provider and frozen credential. Warn; error after 24 hours. |
+| `paused_runs` | Runs whose newest outcome is a pause for sign-in (`auth_required`) or an account limit, independent of the window, grouped by provider and credential. Warn; error 24 hours after the pause. A pause from before broca started is reported once its session opens: the sign-in sweep at startup opens every session paused for sign-in. |
 | `deletion_fenced` | Process map of retention refusals/deferments, keyed by session address and fence kind. Includes held intake, incomplete relocation and overhaul deferral. Warn; cleared only after deletion completion. Rebuilds as retention sweeps observe sessions after boot. |
 | `late_results_rebuild_required` | State-root `late-results-rebuild-required` marker. Error; observation never clears or repairs it. |
 | `catalog_stale` | Cached catalog age beyond the 30-minute poll cadence, or timestamped refused/failed polls in the window. Age warns after 30 minutes and errors after six hours; historical poll refusals warn separately with their observed count. |
@@ -58,12 +58,10 @@ a complete inventory or a pagination cursor.
 | `send_refusals` | Timestamped routing-refused send admissions grouped by routing code. Warn. Unreachable routing is `routing_unavailable`. Invalid/non-token codes are `unattributed`. |
 | `session_address_unavailable` | Timestamped session-bind refusals grouped by inventory reason, including `wait_expired`, `migration_failed`, `gap_marker` and store errors. Error from the first refusal; no burst floor. Counts refused binds, not affected sessions or outage episodes. |
 | `session_inventory_repairs` | Timestamped repair attempts grouped by `started`, `completed` and `failed`. Progress/completion is informational; failure is an error. Counts attempts, not sessions or census rows. |
-| `run_errors` | Indexed error terminals with provider, error class and observation time, grouped by provider, shared error class and safe provider code. Floors below. A missing optional provider code or credential does not prevent classification. |
+| `run_errors` | Runs that ended `error` in the window, grouped by provider, shared error class and provider code. Floors below. An end that recorded no provider error groups with a null class and code. |
 | `tool_outages` | Newly durable attributed unavailable tool results/no-dispatch records, grouped by module. Warn. Counts calls/results, not outage episodes. |
 | `tool_result_json_dump` | Tool-result intake observations, grouped by provider module and tool name. Warn when model-visible text dumps raw JSON; the tool provider should shape its output. The summary names the tool, its module, and how many results and sessions it covers, and the hint names who to report it to, since digests print those two lines and not the key. The exact rule and bounded coverage are described below. |
-| `interrupted_runs` | Indexed interrupted terminals with an interruption reason and observation time, other than explicit `runner_shutdown`/`runner_crash` seals, plus observed `transform_unavailable` terminals. Warn; a run is not classified as restart-related based only on its timestamp. |
-| `data_quality` | One info finding for indexed rows excluded from `paused_runs`, `run_errors` and `interrupted_runs` because classification fields or observation times are NULL. Counts do not contribute to operational severity. |
-| `wal_recovery_cut` | Immutable overhaul recovery manifests, scanned with bounded traversal and file size. Warn; samples name the session, reason, cut offset, removed length and `unattributed_tool_risk`, never removed content. The flag signals that undecodable removed bytes may conceal dispatch identities; it does not block later episodes. Evidence persists across restarts until whole-session retention deletion removes the captured recovery artifacts with the session. |
+| `interrupted_runs` | Runs that ended `interrupted` in the window, other than the `runner_shutdown`/`runner_crash` seals a restart writes, grouped by interruption reason (`unattributed` when the end recorded none). Warn; a run is not classified as restart-related based only on its timestamp. |
 
 `result.coverage` is additive. For each ring-backed check it gives `since_ms`
 (process start, or the oldest retained event after eviction) and `truncated`.
@@ -105,23 +103,14 @@ on restart and findings age with the requested window, so neither is an assertio
 that the inventory remains unavailable now. A failed diagnostics evidence read still
 returns its existing explicit error rather than inventing healthy evidence.
 
-Run-error coverage reports the oldest attributed row in the bounded window
-scan, or the report time when none was observed. Interruption coverage likewise
-describes classifiable rows. Rows without observation times are never placed
-inside or outside the requested window: they join the single `data_quality`
-finding instead. NULL metadata cannot distinguish an old row from a newer
-synthetic writer. An unavailable evidence source still fails explicitly; it is
-never downgraded to data quality.
-
-The data-quality sample has `counts_by_check`, `missing_fields`, `oldest_row_ms`,
-`newest_row_ms`, `scan_limit` and `truncated_checks`. Field counts cover NULLs
-among excluded rows, including optional or state-inapplicable attribution fields;
-those optional NULLs alone do not exclude a row. The oldest/newest times bound
-only recorded `state_changed_ms` values and are null when every excluded row is
-untimed. They are not guessed from run ids or session logs. The finding's
-`first_seen_ms`/`last_seen_ms` are the time of the data-quality observation, not
-invented transition times. Truncated counts are bounded observations, not an
-exhaustive legacy inventory.
+The three run checks read run outcomes, one more process-local ring. Each
+session reports its runs' outcomes there from its records once those records are
+durable: an error or interrupted end, a pause for sign-in or an account
+limit, and the resume or other end that clears such a pause. A completed run
+records nothing, so the ring's 20,000 outcomes span far more runs. An outcome
+names the run, its provider and its credential (the one an account move chose,
+once there is one), the error's shared class and provider code, and the
+interruption reason. `run_errors` and `interrupted_runs` coverage is the ring's.
 
 Credential metadata scope reuses `account_routing::selects_accounts`: OAuth
 (Claude-subscription) and ChatGPT methods, not API keys or Antigravity. Missing
@@ -148,31 +137,25 @@ fall below three. Credential/billing floors remain one.
 
 ## Read limits and failures
 
-The handler opens an existing `run-index.db` read-only. It never opens actors,
-takes session leases, reads session logs, refreshes the catalog or calls the
-vault. Each of five indexed queries reads at most 20,001 scalar rows: 20,000
-observations plus a limit sentinel. The standing live-row query uses the existing
-`bus_event_live_runs` partial index; two new partial timestamp indexes cover
-error and interrupted/transform-unavailable terminals. Separate NULL-time
-queries use those same indexes. Timestamp ties use descending rowid (already
-present in each index), without a separate sort. No query joins a transcript table.
+The handler reads process memory and the state root's rebuild fence. It never
+opens a database or an actor, takes session leases, reads session logs, refreshes
+the catalog or calls the vault.
 
-Index samples cap run/provider ids at 256 characters, credential ids at 512,
-classes at 64, codes and interruption reasons at 128. Ring module ids over 256
-bytes and codes over 128 bytes are replaced by stable SHA-256 identifiers rather
-than retained unbounded. Store failure or inability
-to inspect the persistent rebuild fence returns an error frame. An unreadable
-catalog, event ring or retention map returns a check-specific error-severity
-`evidence_unavailable` finding. A truncated standing live-row scan likewise
-reports that it could not finish the pause check. The retention map is capped
-at 20,000 conditions; overflow is explicit unavailability, not a false clean read.
+Ring module ids over 256 bytes and codes over 128 bytes, and run outcomes' run
+and provider ids over 256 bytes, credential ids over 512, classes over 64, and
+codes and interruption reasons over 128, are replaced by stable SHA-256
+identifiers rather than retained unbounded. Inability to inspect the persistent
+rebuild fence returns an error frame. An unreadable catalog, event ring or
+retention map returns a check-specific error-severity `evidence_unavailable`
+finding. The retention map is capped at 20,000 conditions; overflow is explicit
+unavailability, not a false clean read.
 
 ## Verification
 
 Serving-generated request/reply fixtures live under
 `crates/broca-module-serve/tests/vectors/diagnostics-findings-v1/`. Regenerate with
 `UPDATE_BROCA_DIAGNOSTICS_FINDINGS_VECTORS=1 cargo test --locked -p broca-module-serve --lib diagnostics_findings_v1_vectors_match_serving_replies`.
-The handler uses a seeded scratch SQLite store and fixed clocks; ordinary runs
+The handler uses seeded run outcomes and fixed clocks; ordinary runs
 byte-compare pretty JSON plus a trailing newline.
 
 Native real-daemon lane (requires the staged `ck-subc` and `fake-aft-stub`):

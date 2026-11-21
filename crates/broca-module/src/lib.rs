@@ -42,6 +42,7 @@ pub mod reader_admission;
 pub mod registry;
 pub mod retention;
 mod run_admission;
+pub mod run_outcomes;
 mod send_fate;
 mod sender_admission;
 pub mod serve;

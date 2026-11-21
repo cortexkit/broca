@@ -430,7 +430,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
     // poll below can dial that sibling module.
-    broca_module_serve::diagnostics::install_decided(wal_decision.into_owned(), wal_config);
+    broca_module_serve::diagnostics::install(state_root.clone());
     let catalog_cache = Arc::new(broca_catalog::CatalogCache::open(
         state_root.join("catalog/fusiform-lkg.json"),
     ));

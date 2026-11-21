@@ -1,131 +1,12 @@
 use super::*;
-use broca_core::{RunIndex, RunIndexAttribution, RunIndexRow, RunIndexState};
-use broca_protocol::{BindIdentity, BindScope, SessionScope};
+use broca_protocol::{BindScope, PauseReason, SessionScope};
 use std::cell::Cell;
 
 const NOW: i64 = 200_000_000;
 
-/// The root every test that calls `install_decided` points diagnostics at.
-///
-/// The module records the installed root in a process-wide `OnceLock`, which keeps the first
-/// installation for the life of the process. libtest runs every test of this crate in one
-/// process, so each test installing its own folder would silently keep whichever folder was
-/// installed first. Sharing one folder and serializing installs with `INSTALL_LOCK` means an
-/// installing test always sees the folder it prepared.
-#[cfg(feature = "test-clock")]
-fn installed_root() -> PathBuf {
-    broca_test_support::scratch_root().join("diagnostics-installed")
-}
-
-/// Serializes tests that install a decided root, because installation is process-wide. Each
-/// holder rebuilds `installed_root()` from empty, so it starts from its own contents.
-#[cfg(feature = "test-clock")]
-static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Take `INSTALL_LOCK` and leave an empty `installed_root()`.
-#[cfg(feature = "test-clock")]
-fn install_lock() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
-    let guard = INSTALL_LOCK
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let root = installed_root();
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    (guard, root)
-}
-
-#[cfg(feature = "test-clock")]
-#[test]
-fn legacy_findings_request_does_not_read_a_marker_after_boot() {
-    use broca_wal::fs_ops::{self, FsOps};
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-    struct MarkerProbe {
-        marker: PathBuf,
-        reads: Arc<AtomicUsize>,
-    }
-    impl FsOps for MarkerProbe {
-        fn open(
-            &self,
-            p: &Path,
-            o: &fs_ops::OpenOptions,
-        ) -> std::io::Result<Box<dyn fs_ops::FileOps>> {
-            if p == self.marker {
-                self.reads.fetch_add(1, Ordering::Relaxed);
-                return Err(std::io::Error::other("marker unavailable after boot"));
-            }
-            fs_ops::RealFs.open(p, o)
-        }
-        fn metadata(&self, p: &Path) -> std::io::Result<std::fs::Metadata> {
-            fs_ops::RealFs.metadata(p)
-        }
-        fn create_dir_all(&self, p: &Path) -> std::io::Result<()> {
-            fs_ops::RealFs.create_dir_all(p)
-        }
-        fn rename(&self, a: &Path, b: &Path) -> std::io::Result<()> {
-            fs_ops::RealFs.rename(a, b)
-        }
-        fn remove_file(&self, p: &Path) -> std::io::Result<()> {
-            fs_ops::RealFs.remove_file(p)
-        }
-        fn sync_dir(&self, p: &Path) -> std::io::Result<()> {
-            fs_ops::RealFs.sync_dir(p)
-        }
-        fn create_dir(&self, p: &Path) -> std::io::Result<()> {
-            fs_ops::RealFs.create_dir(p)
-        }
-        fn hard_link(&self, a: &Path, b: &Path) -> std::io::Result<()> {
-            fs_ops::RealFs.hard_link(a, b)
-        }
-        fn canonicalize(&self, p: &Path) -> std::io::Result<PathBuf> {
-            fs_ops::RealFs.canonicalize(p)
-        }
-        fn read_dir(&self, p: &Path) -> std::io::Result<fs_ops::ReadDir> {
-            fs_ops::RealFs.read_dir(p)
-        }
-        fn validate_if_exists(&self, p: &Path) -> std::io::Result<()> {
-            fs_ops::RealFs.validate_if_exists(p)
-        }
-    }
-    // `install_decided` keeps the process's first root, so this test's root must be the one
-    // the installing tests share; holding the lock guarantees it is installed for this root.
-    let (_install, root) = install_lock();
-    drop(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
-    install_decided(
-        broca_wal::state_format::decide_state_root(&root)
-            .unwrap()
-            .into_owned(),
-        broca_wal::WalConfig::LEGACY,
-    );
-    std::fs::create_dir(root.join("state-format")).unwrap();
-    let reads = Arc::new(AtomicUsize::new(0));
-    let owner = principal();
-    let head = scope(owner.clone(), ScopeKind::Head, false, true);
-    let reply = fs_ops::with_fs_ops(
-        Arc::new(MarkerProbe {
-            marker: root.join("state-format"),
-            reads: reads.clone(),
-        }),
-        || serving_reply(json!({}), Some(&owner), &head, Ok(100), NOW),
-    );
-    assert!(
-        reply.is_ok(),
-        "a later marker failure cannot change the boot-selected legacy diagnostics: {reply:?}"
-    );
-    assert_eq!(
-        reads.load(Ordering::Relaxed),
-        0,
-        "diagnostics.findings must not classify the legacy root again"
-    );
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 #[test]
 fn diagnostics_missing_session_log_names_the_session_as_an_error() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    let mut evidence = healthy(&store, NOW - 1000);
+    let mut evidence = healthy();
     evidence.rings.insert(
         "session_log_missing".into(),
         Ok(Snapshot {
@@ -151,8 +32,7 @@ fn diagnostics_missing_session_log_names_the_session_as_an_error() {
 
 #[test]
 fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_reason() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    let mut evidence = healthy(&store, NOW - 1000);
+    let mut evidence = healthy();
     evidence.rings.insert(
         "session_address_unavailable".into(),
         Ok(Snapshot {
@@ -199,45 +79,6 @@ fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_rea
     }
 }
 
-#[test]
-fn diagnostics_inventory_repairs_distinguish_progress_from_failure() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    let mut evidence = healthy(&store, NOW - 1000);
-    evidence.rings.insert(
-        "session_inventory_repairs".into(),
-        Ok(Snapshot {
-            since_ms: NOW - 1000,
-            truncated: false,
-            events: ["started", "completed", "failed"]
-                .into_iter()
-                .map(|code| Event {
-                    at_ms: NOW - 1,
-                    module: String::new(),
-                    code: code.into(),
-                })
-                .collect(),
-        }),
-    );
-    let reply = report(evidence, NOW, 1000);
-    let findings: Vec<_> = reply
-        .findings
-        .iter()
-        .filter(|finding| finding.check == "session_inventory_repairs")
-        .collect();
-    assert_eq!(findings.len(), 3);
-    for finding in findings {
-        assert_eq!(finding.count, 1);
-        assert_eq!(
-            finding.severity,
-            if finding.key == "failed" {
-                Severity::Error
-            } else {
-                Severity::Info
-            }
-        );
-        assert!(finding.summary.contains("Session inventory repairs"));
-    }
-}
 fn principal() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "prefrontal-core".into(),
@@ -261,15 +102,21 @@ fn scope(owner: BindPrincipal, kind: ScopeKind, flow: bool, authorized: bool) ->
         owner_authorized: authorized,
     })
 }
-fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
+fn healthy() -> Evidence {
     Evidence {
         tool_result_json_dumps: Ok(broca_subc::tool_result_diagnostics::Snapshot {
             since_ms: NOW - 1000,
             truncated: false,
             tools: vec![],
         }),
-        recovery_cuts: Vec::new(),
-        runs: store.diagnostic_evidence(since, NOW).unwrap(),
+        runs: Ok(RunEvidence {
+            window: Snapshot {
+                since_ms: NOW - 1000,
+                truncated: false,
+                events: vec![],
+            },
+            held: vec![],
+        }),
         late_fence_ms: None,
         late_delivery_stuck: vec![],
         retention: Ok(vec![]),
@@ -295,234 +142,53 @@ fn healthy(store: &broca_store::SqliteStore, since: i64) -> Evidence {
     }
 }
 
-#[test]
-fn wal_recovery_cut_finding_reports_unattributed_risk_without_removed_content() {
-    check_recovery_finding(false);
-}
-
-#[test]
-fn wal_recovery_unreadable_raw_evidence_warns_without_blocking_reopen() {
-    check_recovery_finding(true);
-}
-
-fn check_recovery_finding(remove_raw: bool) {
-    use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
-    use std::io::Write;
-    let root = broca_test_support::scratch_root().join(format!(
-        "diagnostic-recovery-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let log = root.join("wal/session.wal");
-    let floor = root.join(broca_wal::FEATURE_FLOOR_FILENAME);
-    let mut wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone())
-        .unwrap()
-        .with_feature_floor(floor.clone())
-        .with_wal_config(WalConfig::OVERHAUL)
-        .unwrap();
-    wal.append(
-        1,
-        &WalRecord::StepStarted {
-            step_id: broca_protocol::StepId(1),
-        },
-        true,
-    )
-    .unwrap();
-    drop(wal);
-    let mut pending = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
-    pending
-        .write_all(b"undecodable private removed content")
-        .unwrap();
-    // An intact later frame makes this real corruption, not an ordinary final
-    // torn append that recovery may silently discard without a cut manifest.
-    pending
-        .write_all(
-            &broca_wal::framing::encode_v4(
-                broca_wal::framing::v4::Metadata {
-                    seq: 2,
-                    fence: 1,
-                    appended_ms: 0,
-                    writer_id: [3; 16],
-                },
-                &[broca_wal::framing::FRAME_STAMPS_FEATURE],
-                &WalRecord::StepStarted {
-                    step_id: broca_protocol::StepId(2),
-                },
-            )
-            .unwrap(),
-        )
-        .unwrap();
-    drop(pending);
-    drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone()).unwrap());
-    if remove_raw {
-        let manifests = broca_wal::recovery::manifests(&log, 1_000_000).unwrap();
-        assert_eq!(manifests.len(), 1);
-        std::fs::remove_file(
-            log.parent()
-                .unwrap()
-                .join(&manifests[0].recovery.sidecar_basename),
-        )
-        .unwrap();
-        let wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor).unwrap();
-        assert!(wal.replay().unwrap().iter().any(|frame| matches!(&frame.record,
-            WalRecord::RecoveryCut { recovery } if recovery.cut_id == manifests[0].recovery.cut_id)));
-    }
-    let index = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    let mut evidence = healthy(&index, 0);
-    evidence.recovery_cuts = recovery_cut_findings(&root, NOW);
-    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
-    let warning = reply
-        .findings
-        .iter()
-        .find(|finding| finding.check == "wal_recovery_cut")
-        .unwrap();
-    assert_eq!(warning.severity, Severity::Warn);
-    assert_eq!(warning.samples[0]["unattributed_tool_risk"], true);
-    if remove_raw {
-        assert!(warning
-            .samples
+impl Evidence {
+    /// The evidence with its run outcomes `outcomes`: those from `since` in the window, all of
+    /// them held, as [`gather`] reads them from the ring.
+    fn with_outcomes(mut self, since: i64, outcomes: Vec<RunOutcome>) -> Self {
+        let runs = self.runs.as_mut().unwrap();
+        runs.window.events = outcomes
             .iter()
-            .any(|sample| sample["removed_evidence"] == "unreadable"));
+            .filter(|o| o.at_ms >= since)
+            .cloned()
+            .collect();
+        runs.held = outcomes;
+        self
     }
-    assert!(warning.samples[0]["session"]
-        .as_str()
-        .unwrap()
-        .contains("session.wal"));
-    assert!(!serde_json::to_string(&reply)
-        .unwrap()
-        .contains("private removed content"));
-    // Close the store before deleting its folder: Windows refuses to delete an open file
-    // (OS error 32).
-    drop(index);
-    std::fs::remove_dir_all(root).unwrap();
-}
-#[test]
-fn wal_recovery_reports_unowned_call_evidence_as_unknown() {
-    use broca_wal::{FileWal, Wal, WalConfig, WalRecord};
-    use std::io::Write;
-    let root = broca_test_support::scratch_root().join(format!(
-        "unowned-recovery-diagnostic-{}",
-        std::process::id()
-    ));
-    let log = root.join("wal/session.wal");
-    let floor = root.join(broca_wal::FEATURE_FLOOR_FILENAME);
-    let mut wal = FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor.clone())
-        .unwrap()
-        .with_feature_floor(floor.clone())
-        .with_wal_config(WalConfig::OVERHAUL)
-        .unwrap();
-    wal.append(
-        1,
-        &WalRecord::StepStarted {
-            step_id: broca_protocol::StepId(1),
-        },
-        true,
-    )
-    .unwrap();
-    drop(wal);
-    let result = WalRecord::ToolResult {
-        finished_at_ms: None,
-        tags: None,
-        hooks: None,
-        batch_id: broca_protocol::BatchId("unowned-batch".into()),
-        result: std::sync::Arc::new(broca_core::outcome_unknown_result(
-            &broca_protocol::ToolCallId("call_0".into()),
-        )),
-        outcome: broca_wal::DispatchOutcome::Unknown,
-        reason: None,
-        withdraw_elicitation: None,
-        provider_held: None,
-    };
-    let bytes = broca_wal::framing::encode_v4(
-        broca_wal::framing::v4::Metadata {
-            seq: 3,
-            fence: 1,
-            appended_ms: 0,
-            writer_id: [3; 16],
-        },
-        &[broca_wal::framing::FRAME_STAMPS_FEATURE],
-        &result,
-    )
-    .unwrap();
-    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
-    file.write_all(&bytes).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    drop(FileWal::open_with_recovery(&log, WalConfig::OVERHAUL, floor).unwrap());
-    let warnings = recovery_cut_findings(&root, NOW);
-    let warning = warnings
-        .iter()
-        .find(|finding| finding.check == "wal_recovery_cut")
-        .unwrap();
-    assert!(warning
-        .samples
-        .iter()
-        .any(|sample| sample["outcome"] == "unknown"
-            && sample["unowned_calls"].as_array().is_some_and(|calls| calls
-                .iter()
-                .any(|call| call["tool_call_id"] == "call_0" && call["outcome"] == "unknown"))));
-    std::fs::remove_dir_all(root).unwrap();
 }
 
-type SeedDetails<'a> = (
-    Option<&'a str>,
-    Option<&'a str>,
-    Option<&'a str>,
-    Option<&'a str>,
-    Option<&'a str>,
-);
-fn seed(
-    store: &broca_store::SqliteStore,
-    id: &str,
-    state: RunIndexState,
-    at: i64,
-    details: SeedDetails<'_>,
-) {
-    let (provider, class, code, pause, interrupt) = details;
-    seed_active(store, id);
-    store
-        .index_run_attributed(
-            id,
-            state,
-            None,
-            None,
-            0,
-            &RunIndexAttribution {
-                provider_module_id: provider.map(str::to_owned),
-                credential_id: Some("credential".into()),
-                error_class: class.map(str::to_owned),
-                error_code: code.map(str::to_owned),
-                pause_reason: pause.map(str::to_owned),
-                interrupt_reason: interrupt.map(str::to_owned),
-                at_ms: Some(at as u64),
-            },
-        )
-        .unwrap();
+fn outcome(run: &str, at_ms: i64, provider: Option<&str>, kind: OutcomeKind) -> RunOutcome {
+    RunOutcome {
+        at_ms,
+        run_id: run.into(),
+        provider: provider.map(str::to_owned),
+        credential: Some("credential".into()),
+        kind,
+    }
 }
-fn seed_active(store: &broca_store::SqliteStore, id: &str) {
-    store
-        .index_run_active(&RunIndexRow {
-            run_id: id.into(),
-            session: BindIdentity::new("/project", "test", "session"),
-            submission_id: None,
-            request_identity_digest: None,
-            state: RunIndexState::Active,
-            usage: None,
-            final_step_finish_reason: None,
-            retries_used: 0,
-            title: None,
-            withdrawals_owed: false,
-        })
-        .unwrap();
+fn error(run: &str, at_ms: i64, class: Option<&str>, code: Option<&str>) -> RunOutcome {
+    outcome(
+        run,
+        at_ms,
+        Some("openai"),
+        OutcomeKind::Error {
+            class: class.map(str::to_owned),
+            code: code.map(str::to_owned),
+        },
+    )
 }
-fn seed_legacy(store: &broca_store::SqliteStore, id: &str, state: RunIndexState) {
-    seed_active(store, id);
-    store
-        .index_run_attributed(id, state, None, None, 0, &RunIndexAttribution::default())
-        .unwrap();
+fn interrupted(run: &str, at_ms: i64, reason: Option<&str>) -> RunOutcome {
+    outcome(
+        run,
+        at_ms,
+        Some("openai"),
+        OutcomeKind::Interrupted {
+            reason: reason.map(str::to_owned),
+        },
+    )
+}
+fn paused(run: &str, at_ms: i64, reason: PauseReason) -> RunOutcome {
+    outcome(run, at_ms, Some("openai"), OutcomeKind::Paused { reason })
 }
 
 fn metadata_scope_listing() -> broca_subc::vault::ScopedList {
@@ -559,8 +225,7 @@ fn unmapped_credentials() -> BTreeMap<String, &'static str> {
 
 #[test]
 fn diagnostics_unmapped_credentials_use_chooser_scope_and_name_vault_fixes() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    let mut evidence = healthy(&store, 0);
+    let mut evidence = healthy();
     evidence.unmapped_credentials = unmapped_credentials();
     let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
     let keys: Vec<_> = reply.findings.iter().map(|f| f.key.as_str()).collect();
@@ -588,74 +253,28 @@ fn diagnostics_unmapped_credentials_use_chooser_scope_and_name_vault_fixes() {
     }
 }
 
+/// A run still paused for sign-in is a finding, raised to an error after a day; one that
+/// resumed since is not.
 #[test]
-fn diagnostics_legacy_null_rows_are_one_info_finding_not_operational_errors() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    for (id, state) in [
-        ("legacy-pause", RunIndexState::Paused),
-        ("legacy-error", RunIndexState::Error),
-        ("legacy-interruption", RunIndexState::Interrupted),
-    ] {
-        seed_legacy(&store, id, state);
-    }
-    let reply = answer(
-        json!({}),
-        Some(&principal()),
-        &scope(principal(), ScopeKind::Head, false, true),
-        NOW,
-        |since| Ok(healthy(&store, since)),
-    )
-    .unwrap();
-    assert_eq!(reply.findings.len(), 1, "{:#?}", reply.findings);
-    let finding = &reply.findings[0];
-    assert_eq!(finding.check, "data_quality");
-    assert_eq!(finding.severity, Severity::Info);
-    assert_eq!(finding.count, 3);
-    assert!(finding.samples[0]["oldest_row_ms"].is_null());
-    assert!(finding.samples[0]["newest_row_ms"].is_null());
-    assert_eq!(
-        finding.samples[0]["counts_by_check"],
-        json!({"paused_runs":1,"run_errors":1,"interrupted_runs":1})
-    );
-    for field in [
-        "state_changed_ms",
-        "provider_module_id",
-        "credential_id",
-        "error_class",
-        "error_code",
-        "pause_reason",
-        "interrupt_reason",
-    ] {
-        assert_eq!(finding.samples[0]["missing_fields"][field], 3, "{field}");
-    }
-}
-
-#[test]
-fn diagnostics_auth_pauses_keep_severity_alongside_legacy_rows() {
+fn diagnostics_auth_pauses_escalate_after_a_day_and_clear_on_resume() {
     for (age, severity) in [(100, Severity::Warn), (90_000_000, Severity::Error)] {
-        let store = broca_store::SqliteStore::open_in_memory().unwrap();
-        seed_legacy(&store, "legacy-pause", RunIndexState::Paused);
-        seed(
-            &store,
-            "auth-pause",
-            RunIndexState::Paused,
-            NOW - age,
-            (Some("anthropic"), None, None, Some("auth_required"), None),
+        let evidence = healthy().with_outcomes(
+            0,
+            vec![
+                paused("auth-pause", NOW - age, PauseReason::AuthRequired),
+                paused("resumed-pause", NOW - 300, PauseReason::AccountLimit),
+                outcome(
+                    "resumed-pause",
+                    NOW - 200,
+                    Some("openai"),
+                    OutcomeKind::Resumed,
+                ),
+            ],
         );
-        seed(
-            &store,
-            "other-pause",
-            RunIndexState::Paused,
-            NOW - 100,
-            (None, None, None, Some("waiting"), None),
-        );
-        let reply = report(healthy(&store, 0), NOW, DEFAULT_WINDOW_MS);
-        assert_eq!(reply.findings.len(), 2);
-        let pause = reply
-            .findings
-            .iter()
-            .find(|f| f.check == "paused_runs")
-            .unwrap();
+        let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
+        assert_eq!(reply.findings.len(), 1, "{:#?}", reply.findings);
+        let pause = &reply.findings[0];
+        assert_eq!(pause.check, "paused_runs");
         assert_eq!(pause.count, 1);
         assert_eq!(pause.severity, severity);
         assert_eq!(pause.samples[0]["run_id"], "auth-pause");
@@ -663,36 +282,7 @@ fn diagnostics_auth_pauses_keep_severity_alongside_legacy_rows() {
 }
 
 #[test]
-fn diagnostics_partial_attribution_reports_known_row_time_bounds() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    seed(
-        &store,
-        "partial-error",
-        RunIndexState::Error,
-        NOW - 200,
-        (None, Some("auth_required"), None, None, None),
-    );
-    seed(
-        &store,
-        "partial-interruption",
-        RunIndexState::Interrupted,
-        NOW - 100,
-        (Some("anthropic"), None, None, None, None),
-    );
-    seed_legacy(&store, "untimed", RunIndexState::Error);
-    let reply = report(healthy(&store, 0), NOW, DEFAULT_WINDOW_MS);
-    assert_eq!(reply.findings.len(), 1);
-    let quality = &reply.findings[0];
-    assert_eq!(quality.severity, Severity::Info);
-    assert_eq!(quality.count, 3);
-    assert_eq!(quality.samples[0]["oldest_row_ms"], NOW - 200);
-    assert_eq!(quality.samples[0]["newest_row_ms"], NOW - 100);
-    assert_eq!(quality.samples[0]["missing_fields"]["state_changed_ms"], 1);
-}
-
-#[test]
 fn diagnostics_admission_never_reads_refused_routes() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
     let mut flow_with_owner_run = scope(principal(), ScopeKind::Head, true, true);
     if let SendScope::Stamped(stamp) = &mut flow_with_owner_run {
         stamp.scope.run_id = Some("owners-run".into());
@@ -749,9 +339,9 @@ fn diagnostics_admission_never_reads_refused_routes() {
         (principal(), SendScope::DaemonWithoutScopes, false),
     ] {
         let reads = Cell::new(0);
-        let reply = answer(json!({}), Some(&caller), &stamp, NOW, |since| {
+        let reply = answer(json!({}), Some(&caller), &stamp, NOW, |_since| {
             reads.set(reads.get() + 1);
-            Ok(healthy(&store, since))
+            Ok(healthy())
         });
         assert_eq!(reply.is_ok(), admitted);
         assert_eq!(reads.get(), usize::from(admitted));
@@ -784,83 +374,29 @@ fn diagnostics_window_validation_and_unknown_params() {
 
 #[test]
 fn diagnostics_seeded_checks_floor_and_restart_exclusion() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    seed(
-        &store,
-        "paused",
-        RunIndexState::Paused,
-        NOW - 90_000_000,
-        (Some("openai"), None, None, Some("auth_required"), None),
+    let since = NOW - DEFAULT_WINDOW_MS;
+    let mut evidence = healthy().with_outcomes(
+        since,
+        vec![
+            paused("paused", NOW - 90_000_000, PauseReason::AuthRequired),
+            error(
+                "billing",
+                NOW - 100,
+                Some("permanent"),
+                Some("billing_exhausted"),
+            ),
+            error(
+                "scattered",
+                NOW - 90,
+                Some("permanent"),
+                Some("cyber_policy"),
+            ),
+            interrupted("interrupted", NOW - 70, None),
+            interrupted("shutdown", NOW - 60, Some("runner_shutdown")),
+            interrupted("crash", NOW - 50, Some("runner_crash")),
+            error("outside", since - 1, Some("auth_required"), None),
+        ],
     );
-    seed(
-        &store,
-        "billing",
-        RunIndexState::Error,
-        NOW - 100,
-        (
-            Some("openai"),
-            Some("permanent"),
-            Some("billing_exhausted"),
-            None,
-            None,
-        ),
-    );
-    seed(
-        &store,
-        "scattered",
-        RunIndexState::Error,
-        NOW - 90,
-        (
-            Some("openai"),
-            Some("permanent"),
-            Some("cyber_policy"),
-            None,
-            None,
-        ),
-    );
-    seed(
-        &store,
-        "unknown",
-        RunIndexState::Error,
-        NOW - 80,
-        (None, None, None, None, None),
-    );
-    seed(
-        &store,
-        "interrupted",
-        RunIndexState::Interrupted,
-        NOW - 70,
-        (Some("openai"), None, None, None, None),
-    );
-    seed(
-        &store,
-        "shutdown",
-        RunIndexState::Interrupted,
-        NOW - 60,
-        (Some("openai"), None, None, None, Some("runner_shutdown")),
-    );
-    seed(
-        &store,
-        "crash",
-        RunIndexState::Interrupted,
-        NOW - 50,
-        (Some("openai"), None, None, None, Some("runner_crash")),
-    );
-    seed(
-        &store,
-        "transform",
-        RunIndexState::TransformUnavailable,
-        NOW - 40,
-        (Some("openai"), None, None, None, None),
-    );
-    seed(
-        &store,
-        "outside",
-        RunIndexState::Error,
-        NOW - DEFAULT_WINDOW_MS - 1,
-        (Some("openai"), Some("auth_required"), None, None, None),
-    );
-    let mut evidence = healthy(&store, NOW - DEFAULT_WINDOW_MS);
     evidence.late_fence_ms = Some(NOW - 200);
     evidence.retention = Ok(vec![Fence {
         session: "address".into(),
@@ -915,32 +451,28 @@ fn diagnostics_seeded_checks_floor_and_restart_exclusion() {
             "missing {check}"
         );
     }
-    assert_eq!(
+    let count = |check: &str| {
         reply
             .findings
             .iter()
-            .filter(|f| f.check == "run_errors")
+            .filter(|f| f.check == check)
             .map(|f| f.count)
-            .sum::<u64>(),
-        1
-    );
+            .sum::<u64>()
+    };
+    // The billing error needs one occurrence; one scattered policy refusal is under its floor,
+    // and the error before the window isn't counted.
+    assert_eq!(count("run_errors"), 1);
+    // The interruptions a restart writes (`runner_shutdown`, `runner_crash`) are not findings;
+    // an interruption without a recorded reason is.
+    assert_eq!(count("interrupted_runs"), 1);
     assert_eq!(
         reply
             .findings
             .iter()
-            .filter(|f| f.check == "interrupted_runs")
-            .map(|f| f.count)
-            .sum::<u64>(),
-        1
-    );
-    assert_eq!(
-        reply
-            .findings
-            .iter()
-            .find(|f| f.check == "data_quality")
+            .find(|f| f.check == "interrupted_runs")
             .unwrap()
-            .count,
-        2
+            .key,
+        "unattributed"
     );
     assert_eq!(
         reply
@@ -979,9 +511,8 @@ fn a_catalog_aged_just_past_one_poll_interval_is_not_stale() {
     // A healthy poller refreshes one interval after its last refresh finished, so the catalog
     // is briefly older than one interval before every refresh. Only a missed poll is stale.
     let interval = crate::CATALOG_POLL_INTERVAL.as_millis() as i64;
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
     for (age, stale) in [(interval + 5_000, false), (2 * interval + 1, true)] {
-        let mut evidence = healthy(&store, NOW - DEFAULT_WINDOW_MS);
+        let mut evidence = healthy();
         evidence.catalog_age_ms = Ok(age);
         let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
         let found = reply.findings.iter().any(|f| f.check == "catalog_stale");
@@ -991,9 +522,8 @@ fn a_catalog_aged_just_past_one_poll_interval_is_not_stale() {
 
 #[test]
 fn diagnostics_unreadable_sources_are_not_silent() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    seed_legacy(&store, "legacy", RunIndexState::Error);
-    let mut evidence = healthy(&store, 0);
+    let mut evidence = healthy();
+    evidence.runs = Err("unreadable".into());
     evidence.retention = Err("unreadable".into());
     evidence.catalog_age_ms = Err("unreadable".into());
     for value in evidence.rings.values_mut() {
@@ -1005,24 +535,17 @@ fn diagnostics_unreadable_sources_are_not_silent() {
         "catalog_stale",
         "send_refusals",
         "tool_outages",
+        "paused_runs",
+        "run_errors",
+        "interrupted_runs",
     ] {
-        assert!(reply.findings.iter().any(|f| f.check == check
-            && f.key == "evidence_unavailable"
-            && f.severity == Severity::Error));
+        assert!(
+            reply.findings.iter().any(|f| f.check == check
+                && f.key == "evidence_unavailable"
+                && f.severity == Severity::Error),
+            "{check}"
+        );
     }
-    assert!(reply
-        .findings
-        .iter()
-        .any(|f| f.check == "data_quality" && f.severity == Severity::Info));
-    let root = broca_test_support::scratch_root().join("diagnostics-unreadable-source");
-    let result = answer(
-        json!({}),
-        Some(&principal()),
-        &scope(principal(), ScopeKind::Head, false, true),
-        NOW,
-        |since| gather(&root, Ok(0), since, NOW, broca_wal::WalConfig::LEGACY),
-    );
-    assert_eq!(result.unwrap_err().code, "store_error");
 }
 
 #[test]
@@ -1080,7 +603,6 @@ fn tool_result_json_dump_finding_shape() {
         .join(format!("diagnostics-json-dump-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
     let tally = broca_subc::tool_result_diagnostics::Tally::new(NOW - 1000);
     for offset in 1..=7 {
         // The oldest result comes from a second session, so the summary counts sessions.
@@ -1101,7 +623,7 @@ fn tool_result_json_dump_finding_shape() {
     tally.record(NOW - 8, "other-tools", "search", "other-session", None, 300);
     let head = scope(principal(), ScopeKind::Head, false, true);
     let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
-        let mut evidence = healthy(&store, since);
+        let mut evidence = healthy();
         evidence.tool_result_json_dumps = tally.snapshot(since, NOW);
         Ok(evidence)
     })
@@ -1151,8 +673,7 @@ fn tool_result_json_dump_unavailable_evidence_is_not_clean() {
         std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
-    let mut evidence = healthy(&store, NOW - 1000);
+    let mut evidence = healthy();
     evidence.tool_result_json_dumps = Err("poisoned".into());
     let reply = report(evidence, NOW, 1000);
     assert_eq!(reply.findings.len(), 1);
@@ -1167,7 +688,6 @@ fn diagnostics_findings_v1_vectors_match_serving_replies() {
         .join(format!("diagnostics-vectors-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
     for (name, params) in [
         ("request-empty.json", json!({})),
         ("request-window.json", json!({"window_ms":60000})),
@@ -1186,51 +706,33 @@ fn diagnostics_findings_v1_vectors_match_serving_replies() {
         }),
     );
     let head = scope(principal(), ScopeKind::Head, false, true);
-    let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
-        Ok(healthy(&store, since))
+    let reply = answer(json!({}), Some(&principal()), &head, NOW, |_since| {
+        Ok(healthy())
     })
     .unwrap();
     assert!(reply.findings.is_empty());
     assert_eq!(reply.coverage["send_refusals"].since_ms, NOW - 1000);
     vector("reply-healthy.json", json!({"result":reply}));
-    seed(
-        &store,
-        "paused",
-        RunIndexState::Paused,
-        NOW - 90_000_000,
-        (
-            Some("openai"),
-            Some("auth_required"),
-            None,
-            Some("auth_required"),
-            None,
-        ),
-    );
-    seed(
-        &store,
-        "billing",
-        RunIndexState::Error,
-        NOW - 100,
-        (
-            Some("openai"),
+    let outcomes = vec![
+        paused("paused", NOW - 90_000_000, PauseReason::AuthRequired),
+        error(
+            "billing",
+            NOW - 100,
             Some("permanent"),
             Some("billing_exhausted"),
-            None,
-            None,
         ),
-    );
-    seed_legacy(&store, "legacy-pause", RunIndexState::Paused);
-    seed_legacy(&store, "legacy-error", RunIndexState::Error);
-    seed_legacy(&store, "legacy-interruption", RunIndexState::Interrupted);
-    seed(
-        &store,
-        "partial-error",
-        RunIndexState::Error,
-        NOW - 200,
-        (None, Some("auth_required"), None, None, None),
-    );
+        outcome(
+            "unattributed-error",
+            NOW - 200,
+            None,
+            OutcomeKind::Error {
+                class: Some("auth_required".into()),
+                code: None,
+            },
+        ),
+    ];
     let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
-        let mut evidence = healthy(&store, since);
+        let mut evidence = healthy().with_outcomes(since, outcomes);
         evidence.unmapped_credentials = unmapped_credentials();
         evidence.rings.insert(
             "session_address_unavailable".into(),
@@ -1255,7 +757,7 @@ fn diagnostics_findings_v1_vectors_match_serving_replies() {
 
 #[test]
 fn diagnostics_error_floors_require_bursts_but_auth_requires_one() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
+    let mut outcomes = Vec::new();
     for (class, code, total) in [
         ("permanent", "request_invalid", 9),
         ("transient", "rate_limited", 49),
@@ -1263,20 +765,23 @@ fn diagnostics_error_floors_require_bursts_but_auth_requires_one() {
         ("auth_required", "invalid_api_key", 1),
     ] {
         for n in 0..total {
-            seed(
-                &store,
+            outcomes.push(error(
                 &format!("{class}-{n}"),
-                RunIndexState::Error,
                 NOW - 100,
-                (Some("provider"), Some(class), Some(code), None, None),
-            );
+                Some(class),
+                Some(code),
+            ));
         }
     }
-    let before = report(
-        healthy(&store, NOW - DEFAULT_WINDOW_MS),
-        NOW,
-        DEFAULT_WINDOW_MS,
-    );
+    let since = NOW - DEFAULT_WINDOW_MS;
+    let errors = |outcomes: &[RunOutcome]| {
+        report(
+            healthy().with_outcomes(since, outcomes.to_vec()),
+            NOW,
+            DEFAULT_WINDOW_MS,
+        )
+    };
+    let before = errors(&outcomes);
     assert_eq!(
         before
             .findings
@@ -1290,19 +795,14 @@ fn diagnostics_error_floors_require_bursts_but_auth_requires_one() {
         ("transient", "rate_limited", 49),
         ("context_overflow", "context_length_exceeded", 24),
     ] {
-        seed(
-            &store,
+        outcomes.push(error(
             &format!("{class}-{n}"),
-            RunIndexState::Error,
             NOW - 100,
-            (Some("provider"), Some(class), Some(code), None, None),
-        );
+            Some(class),
+            Some(code),
+        ));
     }
-    let after = report(
-        healthy(&store, NOW - DEFAULT_WINDOW_MS),
-        NOW,
-        DEFAULT_WINDOW_MS,
-    );
+    let after = errors(&outcomes);
     assert_eq!(
         after
             .findings
@@ -1327,16 +827,8 @@ fn diagnostics_reads_rebuild_marker_without_session_access() {
         .join(format!("diagnostics-marker-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let _store = broca_store::SqliteStore::open(root.join("run-index.db")).unwrap();
     std::fs::write(root.join("late-results-rebuild-required"), b"").unwrap();
-    let evidence = gather(
-        &root,
-        Ok(0),
-        0,
-        live::now_ms(),
-        broca_wal::WalConfig::LEGACY,
-    )
-    .unwrap();
+    let evidence = gather(&root, Ok(0), 0, live::now_ms()).unwrap();
     let reply = report(evidence, live::now_ms(), DEFAULT_WINDOW_MS);
     assert!(reply
         .findings
@@ -1346,8 +838,7 @@ fn diagnostics_reads_rebuild_marker_without_session_access() {
 
 #[test]
 fn diagnostics_names_repeated_held_delivery_failure() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    let mut evidence = healthy(&store, NOW - 1000);
+    let mut evidence = healthy();
     evidence.late_delivery_stuck =
         vec![json!({"module":"basal", "call_key":"lineage:4", "attempts":3})];
     let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
@@ -1359,38 +850,4 @@ fn diagnostics_names_repeated_held_delivery_failure() {
     assert_eq!(finding.severity, Severity::Error);
     assert_eq!(finding.count, 1);
     assert_eq!(finding.samples[0]["attempts"], 3);
-}
-
-#[test]
-fn diagnostics_untimed_overflow_is_explicit_in_finding_and_coverage() {
-    let store = broca_store::SqliteStore::open_in_memory().unwrap();
-    let mut evidence = healthy(&store, 0);
-    evidence.runs.untimed_errors = vec![
-        RunEvidence {
-            run_id: "legacy".into(),
-            state: "error".into(),
-            at_ms: None,
-            provider: None,
-            credential: None,
-            class: None,
-            code: None,
-            pause_reason: None,
-            interrupt_reason: None,
-        };
-        SCAN_LIMIT + 1
-    ];
-    let reply = report(evidence, NOW, DEFAULT_WINDOW_MS);
-    let finding = reply
-        .findings
-        .iter()
-        .find(|f| f.check == "data_quality")
-        .unwrap();
-    assert_eq!(finding.count, SCAN_LIMIT as u64);
-    assert_eq!(finding.severity, Severity::Info);
-    assert_eq!(
-        finding.samples[0]["truncated_checks"],
-        json!(["run_errors"])
-    );
-    assert!(reply.coverage["run_errors"].truncated);
-    assert_eq!(finding.samples[0]["scan_limit"], 20000);
 }

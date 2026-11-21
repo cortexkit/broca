@@ -870,6 +870,7 @@ impl StoreRuntime {
         if let Some(sink) = &self.send_states {
             actor = actor.with_send_states(Arc::clone(sink));
         }
+        actor = actor.with_run_outcomes();
         let first_episode = actor
             .first_episode_handle(&registry)
             .map_err(OpenError::Open)?;

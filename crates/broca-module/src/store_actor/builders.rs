@@ -110,6 +110,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self
     }
 
+    /// Reports how the session's runs end or pause to diagnostics from now on (see
+    /// [`crate::run_outcomes`]).
+    pub fn with_run_outcomes(mut self) -> Self {
+        crate::run_outcomes::observe(&mut self.session);
+        self
+    }
+
     /// Hands the send state notices of the session's durable records to `sink` from now on
     /// (see [`crate::store_send_states`]).
     pub fn with_send_states(

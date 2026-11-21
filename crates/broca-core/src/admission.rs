@@ -862,9 +862,6 @@ where
     Vec::<PendingSubmission>::deserialize(deserializer).map(Arc::new)
 }
 
-/// A recovery fence is not an admission seed, even when it wraps a partial checkpoint.
-pub const WAL_RECOVERY_FENCE_PREFIX: &str = "{\"wal_recovery_fence\":";
-
 #[cfg(test)]
 mod tests {
     use broca_protocol::{

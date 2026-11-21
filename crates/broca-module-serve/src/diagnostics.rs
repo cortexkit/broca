@@ -1,7 +1,7 @@
-//! Read-only self-diagnosis from bounded index reads and content-free process evidence.
+//! Read-only self-diagnosis from content-free process evidence.
 use broca_module::diagnostics::{self as live, Event, Fence, Snapshot};
+use broca_module::run_outcomes::{OutcomeKind, RunOutcome};
 use broca_protocol::{BindPrincipal, ScopeKind, SendScope};
-use broca_store::diagnostics::{Evidence as Runs, RunEvidence, SCAN_LIMIT};
 use broca_wire::diagnostics::{Coverage, Finding, Reply, Request, Severity, DEFAULT_WINDOW_MS};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -11,36 +11,15 @@ use subc_protocol::ErrorBody;
 
 pub use broca_wire::diagnostics::OP;
 pub const REPLY_LIMIT: usize = 65_536;
-enum RootSource {
-    Unselected(PathBuf),
-    Boot(broca_wal::state_format::OwnedStateRootDecision),
-}
-impl RootSource {
-    fn path(&self) -> &Path {
-        match self {
-            Self::Unselected(root) => root,
-            Self::Boot(decision) => decision.root(),
-        }
-    }
-}
-static ROOT: OnceLock<(RootSource, broca_wal::WalConfig)> = OnceLock::new();
-static READER: OnceLock<std::sync::Arc<dyn broca_store::diagnostics::DiagnosticEvidenceReader>> =
-    OnceLock::new();
+/// The most outcomes one check groups: what a ring holds.
+const SCAN_LIMIT: usize = live::CAP;
+static ROOT: OnceLock<PathBuf> = OnceLock::new();
 
-pub fn install(root: PathBuf, config: broca_wal::WalConfig) {
+/// Start the process's evidence rings and keep the state root the checks read files from.
+pub fn install(root: PathBuf) {
     crate::session_address_health::initialize();
     live::initialize();
-    let _ = ROOT.set((RootSource::Unselected(root), config));
-}
-
-/// Retain the boot capability for every request without another marker read.
-pub fn install_decided(
-    decision: broca_wal::state_format::OwnedStateRootDecision,
-    config: broca_wal::WalConfig,
-) {
-    crate::session_address_health::initialize();
-    live::initialize();
-    let _ = ROOT.set((RootSource::Boot(decision), config));
+    let _ = ROOT.set(root);
 }
 
 pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(), ErrorBody> {
@@ -67,8 +46,7 @@ pub fn admit(principal: Option<&BindPrincipal>, scope: &SendScope) -> Result<(),
 
 pub struct Evidence {
     pub tool_result_json_dumps: Result<broca_subc::tool_result_diagnostics::Snapshot, String>,
-    pub recovery_cuts: Vec<Finding>,
-    pub runs: Runs,
+    pub runs: Result<RunEvidence, String>,
     pub late_fence_ms: Option<i64>,
     pub late_delivery_stuck: Vec<Value>,
     pub retention: Result<Vec<Fence>, String>,
@@ -77,39 +55,20 @@ pub struct Evidence {
     pub rings: BTreeMap<String, Result<Snapshot, String>>,
 }
 
+/// The run outcomes the run checks read (see [`broca_module::run_outcomes`]).
+pub struct RunEvidence {
+    /// Those recorded in the request's window.
+    pub window: Snapshot<RunOutcome>,
+    /// Every one the ring still holds: a run paused before the window is still paused.
+    pub held: Vec<RunOutcome>,
+}
+
 pub fn gather(
     root: &Path,
     catalog_age_ms: Result<i64, String>,
     since: i64,
     now: i64,
-    config: broca_wal::WalConfig,
 ) -> Result<Evidence, ErrorBody> {
-    let store = broca_store::diagnostics::open_diagnostic_reader(root, config).map_err(|_| {
-        ErrorBody::new(
-            "store_error",
-            format!(
-                "diagnostics.findings cannot read {}",
-                broca_store::diagnostics::operational_database_name(root).unwrap_or("state-format")
-            ),
-        )
-    })?;
-    gather_with_reader(root, store.as_ref(), catalog_age_ms, since, now, config)
-}
-
-pub fn gather_with_reader(
-    root: &Path,
-    store: &dyn broca_store::diagnostics::DiagnosticEvidenceReader,
-    catalog_age_ms: Result<i64, String>,
-    since: i64,
-    now: i64,
-    config: broca_wal::WalConfig,
-) -> Result<Evidence, ErrorBody> {
-    let runs = store.diagnostic_evidence(since, now).map_err(|_| {
-        ErrorBody::new(
-            "store_error",
-            "diagnostics.findings cannot read indexed run evidence",
-        )
-    })?;
     let late_fence_ms = match std::fs::metadata(root.join("late-results-rebuild-required")) {
         Ok(meta) => Some(
             meta.modified()
@@ -126,14 +85,15 @@ pub fn gather_with_reader(
             ))
         }
     };
+    let runs = live::RUN_OUTCOMES.snapshot(since, now).and_then(|window| {
+        Ok(RunEvidence {
+            window,
+            held: live::RUN_OUTCOMES.snapshot(i64::MIN, now)?.events,
+        })
+    });
     Ok(Evidence {
         tool_result_json_dumps: broca_subc::tool_result_diagnostics::TOOL_RESULT_JSON_DUMPS
             .snapshot(since, now),
-        recovery_cuts: if config.is_overhaul() {
-            recovery_cut_findings(root, now)
-        } else {
-            Vec::new()
-        },
         runs,
         late_fence_ms,
         late_delivery_stuck: crate::held_runtime::health_gauges()["late_results_delivery_stuck"]
@@ -197,41 +157,13 @@ pub fn serving_reply(
     now: i64,
 ) -> Result<Reply, ErrorBody> {
     answer(params, principal, scope, now, |since| {
-        let (source, config) = ROOT.get().ok_or_else(|| {
+        let root = ROOT.get().ok_or_else(|| {
             ErrorBody::new(
                 "store_error",
-                "diagnostics.findings run-index source is not configured",
+                "diagnostics.findings state root is not configured",
             )
         })?;
-        let root = source.path();
-        if let Some(reader) = READER.get() {
-            gather_with_reader(root, reader.as_ref(), catalog_age, since, now, *config)
-        } else if let RootSource::Boot(decision) = source {
-            let decision = decision.borrowed();
-            let database = if decision.legacy().is_some() {
-                "run-index.db"
-            } else {
-                "broca.db"
-            };
-            let store = broca_store::diagnostics::open_diagnostic_reader_decided(decision, *config)
-                .map_err(|_| {
-                    ErrorBody::new(
-                        "store_error",
-                        format!("diagnostics.findings cannot read {database}"),
-                    )
-                })?;
-            gather_with_reader(root, store.as_ref(), catalog_age, since, now, *config)
-        } else {
-            let store = broca_store::SqliteStore::open_read_only(root.join("run-index.db"))
-                .map_err(|_| {
-                    ErrorBody::new(
-                        "store_error",
-                        "diagnostics.findings cannot read run-index.db",
-                    )
-                })?
-                .with_wal_config(*config);
-            gather_with_reader(root, &store, catalog_age, since, now, *config)
-        }
+        gather(root, catalog_age, since, now)
     })
 }
 
@@ -265,114 +197,25 @@ fn unavailable(check: &str, now: i64) -> Finding {
     f
 }
 
-/// Manifests are immutable recovery evidence. Read metadata only, with bounded
-/// traversal and file size; raw removed content never enters diagnostics.
-pub fn recovery_cut_findings(root: &Path, now: i64) -> Vec<Finding> {
-    use std::io::Read;
-    let mut directories = ["wal", "wal-ephemeral", "wal-durable"]
-        .map(|name| root.join(name))
-        .to_vec();
-    let mut findings = Vec::new();
-    let mut scanned = 0;
-    while let Some(directory) = directories.pop() {
-        let entries = match broca_wal::fs_ops::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                findings.push(unavailable("wal_recovery_cut", now));
-                break;
-            }
-        };
-        for entry in entries {
-            scanned += 1;
-            if scanned > SCAN_LIMIT {
-                findings.push(unavailable("wal_recovery_cut", now));
-                return findings;
-            }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    findings.push(unavailable("wal_recovery_cut", now));
-                    continue;
-                }
-            };
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(_) => {
-                    findings.push(unavailable("wal_recovery_cut", now));
-                    continue;
-                }
-            };
-            if kind.is_dir() {
-                directories.push(entry.path());
-                continue;
-            }
-            if !kind.is_file() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.contains(".cut-") || !name.ends_with(".json") {
-                continue;
-            }
-            let manifest = (|| {
-                let mut bytes = Vec::new();
-                broca_wal::fs_ops::File::open(entry.path())
-                    .ok()?
-                    .take(1_048_577)
-                    .read_to_end(&mut bytes)
-                    .ok()?;
-                if bytes.len() > 1_048_576 {
-                    return None;
-                }
-                serde_json::from_slice::<broca_wal::recovery::CutManifest>(&bytes).ok()
-            })();
-            let Some(manifest) = manifest else {
-                findings.push(unavailable("wal_recovery_cut", now));
-                continue;
-            };
-            if !manifest.integrity_valid() {
-                findings.push(unavailable("wal_recovery_cut", now));
-                continue;
-            }
-            let mut warning = finding("wal_recovery_cut", manifest.recovery.cut_id.clone(), Severity::Warn, now, now,
-                "WAL recovery preserved a damaged suffix; some tool-call attribution may have been lost.",
-                "Inspect the session and preserved .cut sidecar before manually repeating external effects. Set wal_recovery to refuse to disable automatic repair.");
-            warning.samples.push(json!({"session":manifest.session,"reason":manifest.recovery.reason.as_str(),
-                "cut_offset":manifest.recovery.cut_offset,"removed_bytes":manifest.recovery.removed_len,
-                "unattributed_tool_risk":manifest.recovery.unattributed_tool_risk}));
-            let raw = directory.join(&manifest.recovery.sidecar_basename);
-            let raw_available = !manifest.recovery.sidecar_basename.contains(['/', '\\'])
-                && broca_wal::fs_ops::File::open(&raw)
-                    .and_then(|file| file.metadata())
-                    .is_ok_and(|metadata| {
-                        metadata.is_file() && metadata.len() == manifest.recovery.removed_len
-                    });
-            if !raw_available {
-                warning
-                    .samples
-                    .push(json!({"removed_evidence":"unreadable"}));
-            }
-            if !manifest.recovery.unowned_calls.is_empty() {
-                warning.samples.push(json!({"outcome":"unknown",
-                    "unowned_calls":manifest.recovery.unowned_calls}));
-            }
-            findings.push(warning);
-        }
+/// The class and provider code of an error outcome, and the reason of an interruption.
+fn outcome_fields(outcome: &RunOutcome) -> (Option<&str>, Option<&str>, Option<&str>) {
+    match &outcome.kind {
+        OutcomeKind::Error { class, code } => (class.as_deref(), code.as_deref(), None),
+        OutcomeKind::Interrupted { reason } => (None, None, reason.as_deref()),
+        OutcomeKind::Paused { .. } | OutcomeKind::Resumed => (None, None, None),
     }
-    findings
 }
 
 fn group(
-    rows: &[RunEvidence],
+    rows: &[&RunOutcome],
     check: &str,
-    now: i64,
-    key: impl Fn(&RunEvidence) -> String,
+    key: impl Fn(&RunOutcome) -> String,
     hint: &str,
 ) -> Vec<Finding> {
     let mut groups = BTreeMap::<String, Finding>::new();
     for row in rows.iter().take(SCAN_LIMIT) {
         let key = key(row);
-        let at = row.at_ms.unwrap_or(now);
+        let at = row.at_ms;
         let f = groups.entry(key.clone()).or_insert_with(|| {
             let mut f = finding(check, key, Severity::Warn, at, at, "", hint);
             f.count = 0;
@@ -382,80 +225,85 @@ fn group(
         f.first_seen_ms = f.first_seen_ms.min(at);
         f.last_seen_ms = f.last_seen_ms.max(at);
         if f.samples.len() < 5 {
+            let (class, code, interrupt) = outcome_fields(row);
             f.samples.push(json!({"run_id":row.run_id,"at_ms":row.at_ms,
                 "provider_module_id":row.provider,"credential_id":row.credential,
-                "error_class":row.class,"error_code":row.code,"interrupt_reason":row.interrupt_reason}));
+                "error_class":class,"error_code":code,"interrupt_reason":interrupt}));
         }
     }
     groups.into_values().collect()
 }
 
-fn classifiable(row: &RunEvidence, check: &str) -> bool {
-    row.at_ms.is_some()
-        && match check {
-            "paused_runs" => row.pause_reason.is_some(),
-            "run_errors" => row.provider.is_some() && row.class.is_some(),
-            "interrupted_runs" => {
-                row.state == "transform_unavailable" || row.interrupt_reason.is_some()
-            }
-            _ => false,
-        }
-}
-
-fn data_quality(runs: &Runs, now: i64) -> Option<Finding> {
-    let mut counts = BTreeMap::<&str, u64>::new();
-    let mut missing = BTreeMap::<&str, u64>::new();
-    let mut oldest = None::<i64>;
-    let mut newest = None::<i64>;
-    let mut truncated_checks = std::collections::BTreeSet::new();
-    for (check, rows) in [
-        ("paused_runs", &runs.live),
-        ("run_errors", &runs.errors),
-        ("run_errors", &runs.untimed_errors),
-        ("interrupted_runs", &runs.interruptions),
-        ("interrupted_runs", &runs.untimed_interruptions),
-    ] {
-        if rows.len() > SCAN_LIMIT {
-            truncated_checks.insert(check);
-        }
-        for row in rows.iter().take(SCAN_LIMIT).filter(|row| {
-            (check != "paused_runs" || row.state == "paused") && !classifiable(row, check)
-        }) {
-            *counts.entry(check).or_default() += 1;
-            // Count NULL fields only among excluded rows. Optional fields may also be NULL on
-            // healthy rows; they do not by themselves make a row unclassifiable.
-            for (field, absent) in [
-                ("state_changed_ms", row.at_ms.is_none()),
-                ("provider_module_id", row.provider.is_none()),
-                ("credential_id", row.credential.is_none()),
-                ("error_class", row.class.is_none()),
-                ("error_code", row.code.is_none()),
-                ("pause_reason", row.pause_reason.is_none()),
-                ("interrupt_reason", row.interrupt_reason.is_none()),
-            ] {
-                if absent {
-                    *missing.entry(field).or_default() += 1;
-                }
-            }
-            if let Some(at) = row.at_ms {
-                oldest = Some(oldest.map_or(at, |old| old.min(at)));
-                newest = Some(newest.map_or(at, |new| new.max(at)));
-            }
-        }
+/// The paused-run, run-error and interrupted-run findings, and the coverage of the latter two.
+fn run_findings(
+    runs: &RunEvidence,
+    now: i64,
+    window: i64,
+    findings: &mut Vec<Finding>,
+    coverage: &mut BTreeMap<String, Coverage>,
+) {
+    // A run is still paused when the newest outcome it reported is its pause.
+    let mut newest = BTreeMap::<&str, &RunOutcome>::new();
+    for outcome in &runs.held {
+        newest.insert(&outcome.run_id, outcome);
     }
-    let count = counts.values().sum();
-    if count == 0 {
-        return None;
+    let paused: Vec<_> = newest
+        .into_values()
+        .filter(|outcome| matches!(outcome.kind, OutcomeKind::Paused { .. }))
+        .collect();
+    for mut f in group(&paused, "paused_runs", |r| {
+        json!([r.provider,r.credential]).to_string()
+    }, "Use broca-session status for a sampled run_id; inspect paused:auth_required and its frozen credential id. Only sessions opened since broca started report a pause from before then.") {
+        if now.saturating_sub(f.first_seen_ms) > 86_400_000 { f.severity = Severity::Error; }
+        f.summary = format!("{} runs remain paused for authentication or account availability.", f.count);
+        findings.push(f);
     }
-    let mut f = finding("data_quality", "legacy_run_index_rows".into(), Severity::Info, now, now,
-        "Indexed rows lack classification metadata or observation times; they are excluded from operational findings, not treated as failing runs.",
-        "Inspect run_index attribution and state_changed_ms. NULL fields may come from legacy or synthetic writers; do not infer an operational failure or invent an observation time.");
-    f.count = count;
-    f.samples
-        .push(json!({"counts_by_check":counts,"missing_fields":missing,
-        "oldest_row_ms":oldest,"newest_row_ms":newest,
-        "scan_limit":SCAN_LIMIT,"truncated_checks":truncated_checks}));
-    Some(f)
+    let dropped = if runs.window.truncated {
+        "; outcomes from the start of the window were dropped to bound memory"
+    } else {
+        ""
+    };
+    let errors: Vec<_> = runs
+        .window
+        .events
+        .iter()
+        .filter(|outcome| matches!(outcome.kind, OutcomeKind::Error { .. }))
+        .collect();
+    for mut f in group(&errors,"run_errors",|r| {
+        let (class, code, _) = outcome_fields(r);
+        json!([r.provider,class,code]).to_string()
+    }, "Use broca-session status for a sampled run_id; inspect its error class and provider code, not provider message text.") {
+        let sample = &f.samples[0];
+        let (floor,severity) = error_floor(sample["error_class"].as_str().unwrap_or("unattributed"),sample["error_code"].as_str().unwrap_or(""),window);
+        if f.count < floor { continue; }
+        f.severity = severity;
+        f.summary = format!("{} runs ended in error in the window{dropped}.",f.count);
+        findings.push(f);
+    }
+    let interruptions: Vec<_> = runs
+        .window
+        .events
+        .iter()
+        .filter(|outcome| {
+            matches!(&outcome.kind, OutcomeKind::Interrupted { reason }
+                if !matches!(reason.as_deref(), Some("runner_shutdown" | "runner_crash")))
+        })
+        .collect();
+    for mut f in group(&interruptions,"interrupted_runs",|r| {
+        outcome_fields(r).2.unwrap_or("unattributed").to_owned()
+    }, "Use broca-session status for the sampled run_id and inspect the broca lifecycle log; unknown causes cannot be classified as restart seals.") {
+        f.summary = format!("{} runs ended interrupted outside a restart seal{dropped}.",f.count);
+        findings.push(f);
+    }
+    for check in ["run_errors", "interrupted_runs"] {
+        coverage.insert(
+            check.into(),
+            Coverage {
+                since_ms: runs.window.since_ms,
+                truncated: runs.window.truncated,
+            },
+        );
+    }
 }
 
 // Calibration from the operator's 2026-10-28 seven-day session-log aggregate (1,359 error
@@ -520,32 +368,7 @@ fn error_floor(class: &str, code: &str, window: i64) -> (u64, Severity) {
 }
 
 pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
-    let mut findings = std::mem::take(&mut evidence.recovery_cuts);
-    for pending in &evidence.runs.pending_recovery {
-        let session = broca_core::wal_writer::agent_session_ref(&pending.session);
-        let (summary, hint) = if pending.evidence_unreadable {
-            ("A session's recovery metadata is unreadable; its indexed run summaries are withheld.",
-                "Inspect the session's recovery metadata and WAL before restoring or rebuilding its materialized views.")
-        } else {
-            ("WAL recovery is pending for a session; its indexed run summaries are withheld.",
-                "Inspect the session's WAL recovery error and reopen it with a writable, correctly configured owner to finish rebuilding its views.")
-        };
-        let mut warning = finding(
-            "wal_recovery_cut",
-            format!("pending:{session}"),
-            Severity::Warn,
-            now,
-            now,
-            summary,
-            hint,
-        );
-        warning.samples.push(
-            json!({"session":session,"pending":true,"cut_ids":&pending.cut_ids,
-            "evidence_unreadable":pending.evidence_unreadable}),
-        );
-        findings.push(warning);
-    }
-    findings.extend(data_quality(&evidence.runs, now));
+    let mut findings = Vec::new();
     let mut coverage = BTreeMap::new();
     match evidence.tool_result_json_dumps {
         Ok(snapshot) => {
@@ -596,113 +419,12 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
         }
         Err(_) => findings.push(unavailable("tool_result_json_dump", now)),
     }
-    let live_truncated = evidence.runs.live.len() > SCAN_LIMIT;
-    let paused: Vec<_> = evidence
-        .runs
-        .live
-        .iter()
-        .take(SCAN_LIMIT)
-        .filter(|r| {
-            r.state == "paused"
-                && classifiable(r, "paused_runs")
-                && (r.pause_reason.as_deref() == Some("auth_required")
-                    || r.code.as_deref() == Some("account_limit_exhausted"))
-        })
-        .cloned()
-        .collect();
-    for mut f in group(&paused, "paused_runs", now, |r| {
-        json!([r.provider,r.credential]).to_string()
-    }, "Use broca-session status for a sampled run_id; inspect paused:auth_required and its frozen credential id.") {
-        if now.saturating_sub(f.first_seen_ms) > 86_400_000 { f.severity = Severity::Error; }
-        f.summary = format!("{} runs remain paused for authentication or account availability.", f.count);
-        findings.push(f);
-    }
-    if live_truncated {
-        findings.push(unavailable("paused_runs", now));
-    }
-    let errors_truncated = evidence.runs.errors.len() > SCAN_LIMIT;
-    let errors: Vec<_> = evidence
-        .runs
-        .errors
-        .iter()
-        .take(SCAN_LIMIT)
-        .filter(|r| classifiable(r, "run_errors"))
-        .cloned()
-        .collect();
-    for mut f in group(&errors,"run_errors",now,|r| {
-        json!([r.provider,r.class,r.code]).to_string()
-    }, "Use broca-session status for a sampled run_id; inspect its error class and provider code, not provider message text.") {
-        let sample = &f.samples[0];
-        let (floor,severity) = error_floor(sample["error_class"].as_str().unwrap_or("unattributed"),sample["error_code"].as_str().unwrap_or(""),window);
-        if f.count < floor { continue; }
-        f.severity = severity;
-        f.summary = format!("{} runs ended in error in the indexed window{}.",f.count,
-            if errors_truncated { "; only the newest 20000 error rows were examined" } else { "" });
-        if let Some(sample) = f.samples.first_mut() {
-            sample["rows_without_attribution"] = json!(0);
-        }
-        findings.push(f);
-    }
-    let attributed_since = evidence
-        .runs
-        .errors
-        .iter()
-        .take(SCAN_LIMIT)
-        .filter(|r| classifiable(r, "run_errors"))
-        .filter_map(|r| r.at_ms)
-        .min()
-        .unwrap_or(now);
-    coverage.insert(
-        "run_errors".into(),
-        Coverage {
-            since_ms: attributed_since,
-            truncated: errors_truncated,
-        },
-    );
-    let interruptions: Vec<_> = evidence
-        .runs
-        .interruptions
-        .iter()
-        .take(SCAN_LIMIT)
-        .filter(|r| {
-            classifiable(r, "interrupted_runs")
-                && (r.state == "transform_unavailable"
-                    || !matches!(
-                        r.interrupt_reason.as_deref(),
-                        Some("runner_shutdown" | "runner_crash")
-                    ))
-        })
-        .cloned()
-        .collect();
-    for mut f in group(&interruptions,"interrupted_runs",now,|r| {
-        if r.state == "transform_unavailable" { r.state.clone() }
-        else { r.interrupt_reason.clone().expect("classified interruption") }
-    }, "Use broca-session status for the sampled run_id and inspect the broca lifecycle log; unknown causes cannot be classified as restart seals.") {
-        f.summary = format!("{} runs ended interrupted outside an attributed restart seal or could not reach the transform{}.",f.count,
-            if evidence.runs.interruptions.len() > SCAN_LIMIT { "; only the newest 20000 interruption rows were examined" } else { "" });
-        findings.push(f);
-    }
-    coverage.insert(
-        "interrupted_runs".into(),
-        Coverage {
-            since_ms: evidence
-                .runs
-                .interruptions
-                .iter()
-                .take(SCAN_LIMIT)
-                .filter(|r| classifiable(r, "interrupted_runs"))
-                .filter_map(|r| r.at_ms)
-                .min()
-                .unwrap_or(now),
-            truncated: evidence.runs.interruptions.len() > SCAN_LIMIT,
-        },
-    );
-    for (check, rows) in [
-        ("run_errors", &evidence.runs.untimed_errors),
-        ("interrupted_runs", &evidence.runs.untimed_interruptions),
-    ] {
-        if let Some(coverage) = coverage.get_mut(check) {
-            coverage.truncated |= rows.len() > SCAN_LIMIT;
+    match &evidence.runs {
+        Ok(runs) => run_findings(runs, now, window, &mut findings, &mut coverage),
+        Err(_) => {
+            for check in ["paused_runs", "run_errors", "interrupted_runs"] {
+                findings.push(unavailable(check, now));
+            }
         }
     }
     match evidence.retention {
