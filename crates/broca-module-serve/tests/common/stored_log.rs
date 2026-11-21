@@ -115,6 +115,8 @@ pub fn stored_spend_facts(state_root: &Path) -> Vec<serde_json::Value> {
 
 /// Every file under the new storage's roots in `state_root`, with its size: a snapshot two
 /// readings of which are equal exactly when nothing was written to any session in between.
+/// The recovery index's completeness marker is left out: the startup inventory writes it on its
+/// own schedule, which on a slow machine falls after a test's first reading.
 pub fn stored_files(state_root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, u64> {
     fn walk(dir: &Path, out: &mut std::collections::BTreeMap<std::path::PathBuf, u64>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -125,7 +127,7 @@ pub fn stored_files(state_root: &Path) -> std::collections::BTreeMap<std::path::
             let meta = entry.metadata().unwrap();
             if meta.is_dir() {
                 walk(&path, out);
-            } else {
+            } else if !path.ends_with("recovery-candidates/complete") {
                 out.insert(path, meta.len());
             }
         }
