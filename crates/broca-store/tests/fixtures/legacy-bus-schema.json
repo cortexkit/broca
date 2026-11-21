@@ -14,13 +14,5 @@
   [
     "bus_event_unpublished",
     "CREATE INDEX bus_event_unpublished ON bus_event_outbox(best_effort)\n            WHERE published_ms IS NULL AND best_effort=0"
-  ],
-  [
-    "compaction_notice_outbox",
-    "CREATE TABLE compaction_notice_outbox (\n            message_id TEXT PRIMARY KEY, session TEXT NOT NULL, subject TEXT NOT NULL,\n            headers TEXT NOT NULL, digest TEXT NOT NULL, at_ms INTEGER NOT NULL,\n            published_ms INTEGER\n         )"
-  ],
-  [
-    "compaction_notice_unpublished",
-    "CREATE INDEX compaction_notice_unpublished\n            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL"
   ]
 ]

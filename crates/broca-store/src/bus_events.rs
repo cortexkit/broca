@@ -63,7 +63,6 @@ pub struct Metrics {
     pub bus_events_published: AtomicU64,
     pub bus_outbox_depth: AtomicU64,
     /// Unpublished advance notices only. A publish receipt is not a consumer acknowledgement.
-    pub compaction_notice_outbox_pending: AtomicU64,
     pub bus_publish_failures: AtomicU64,
     pub bus_events_oversize: AtomicU64,
     pub bus_outbox_dropped: AtomicU64,
@@ -74,7 +73,6 @@ impl Metrics {
         serde_json::json!({
             "bus_events_published": self.bus_events_published.load(Ordering::Relaxed),
             "bus_outbox_depth": self.bus_outbox_depth.load(Ordering::Relaxed),
-            "compaction_notice_outbox_pending": self.compaction_notice_outbox_pending.load(Ordering::Relaxed),
             "bus_publish_failures": self.bus_publish_failures.load(Ordering::Relaxed),
             "bus_events_oversize": self.bus_events_oversize.load(Ordering::Relaxed),
             "bus_outbox_dropped": self.bus_outbox_dropped.load(Ordering::Relaxed),
@@ -120,15 +118,6 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
          CREATE INDEX IF NOT EXISTS bus_event_unpublished ON bus_event_outbox(best_effort)
             WHERE published_ms IS NULL AND best_effort=0;
          CREATE INDEX IF NOT EXISTS bus_event_age ON bus_event_outbox(at_ms);
-         -- Compaction advance notices (compaction-provider/v1 §5) waiting for the bus. A notice is headers only: the bus message id names the session
-         -- and the notice's sequence number, and the bus digest is the notice digest.
-         CREATE TABLE IF NOT EXISTS compaction_notice_outbox (
-            message_id TEXT PRIMARY KEY, session TEXT NOT NULL, subject TEXT NOT NULL,
-            headers TEXT NOT NULL, digest TEXT NOT NULL, at_ms INTEGER NOT NULL,
-            published_ms INTEGER
-         );
-         CREATE INDEX IF NOT EXISTS compaction_notice_unpublished
-            ON compaction_notice_outbox(at_ms) WHERE published_ms IS NULL;
          -- Send state notices (`event.broca.send_state.v1.{sender}`), one row per change of a
          -- keyed send. The message id is the notice's own (`{session_ref}:{send_id}:{seq}`), so
          -- recording a change twice adds nothing. Published after run events, in insertion order.
@@ -361,11 +350,6 @@ impl SqliteStore {
             bus_events: &self.bus_events,
             legacy: true,
         }
-    }
-
-    #[cfg(test)]
-    fn resync_bus_depth(&self) -> Result<(), StoreError> {
-        self.event_store().resync_bus_depth()
     }
 
     pub async fn drain_bus_event(
@@ -676,36 +660,6 @@ impl EventStore<'_> {
         }
     }
 
-    /// The oldest compaction advance notice not yet published, once no run event is pending.
-    #[cfg(test)]
-    fn pending_compaction_notice(&self) -> Result<Option<Publication>, StoreError> {
-        let row: Option<(String, String, String, String)> = self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT message_id,subject,headers,digest FROM compaction_notice_outbox \
-                 INDEXED BY compaction_notice_unpublished WHERE published_ms IS NULL \
-                 ORDER BY at_ms, rowid LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        row.map(|(event_key, subject, headers, digest)| {
-            Ok(Publication {
-                inline: false,
-                event_key,
-                subject,
-                headers: serde_json::from_str(&headers)?,
-                body: Vec::new(),
-                digest: Some(digest.parse().map_err(|_| {
-                    StoreError::BusEvent("stored notice digest is not SHA-256".into())
-                })?),
-            })
-        })
-        .transpose()
-    }
-
     /// Replace queued run events older than [`STALE_BACKLOG_MS`] with one `run.skipped` marker
     /// per session. Call it when a bus connection comes up, before the first publish on it.
     ///
@@ -828,7 +782,7 @@ impl EventStore<'_> {
         _receipt: PublishReceipt,
         now_ms: u64,
     ) -> Result<(), StoreError> {
-        let (lifecycle, lifecycle_updated, notices_updated, sends_updated) = self.write_with_locked_effect(false, |conn| {
+        let (lifecycle, lifecycle_updated, sends_updated) = self.write_with_locked_effect(false, |conn| {
         let lifecycle: Option<bool> = conn
             .query_row(
                 "SELECT best_effort=0 FROM bus_event_outbox WHERE event_key=?1 AND published_ms IS NULL",
@@ -840,19 +794,14 @@ impl EventStore<'_> {
             "UPDATE bus_event_outbox SET published_ms=?2 WHERE event_key=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
         )? as u64;
-        let notices_updated = conn.execute(
-            "UPDATE compaction_notice_outbox SET published_ms=?2 \
-                 WHERE message_id=?1 AND published_ms IS NULL",
-            params![event.event_key, now_ms],
-        )? as u64;
         // A send state notice keeps no gauge: it is counted only as published.
         let sends_updated = conn.execute(
             "UPDATE send_state_outbox SET published_ms=?2 WHERE message_id=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
         )? as u64;
-        Ok((lifecycle, lifecycle_updated, notices_updated, sends_updated))
-        }, |(_, _, notices_updated, _)| self.lower_notice_depth(*notices_updated))?;
-        let updated = lifecycle_updated + notices_updated + sends_updated;
+        Ok((lifecycle, lifecycle_updated, sends_updated))
+        }, |_| ())?;
+        let updated = lifecycle_updated + sends_updated;
         self.bus_metrics()
             .bus_events_published
             .fetch_add(updated, Ordering::Relaxed);
@@ -863,16 +812,12 @@ impl EventStore<'_> {
     }
 
     pub fn prune_bus_events(&self, now_ms: u64) -> Result<usize, StoreError> {
-        let (deleted, dropped, _) = self.write_with_locked_effect(false, |conn| {
+        let (deleted, dropped) = self.write_with_locked_effect(false, |conn| {
         let cutoff = now_ms.saturating_sub(RETENTION_MS);
         let dropped: u64 = conn.query_row(
             "SELECT count(*) FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 AND at_ms<?1",
             [cutoff],
             |r| r.get(0),
-        )?;
-        let notices_dropped: u64 = conn.query_row(
-            "SELECT count(*) FROM compaction_notice_outbox INDEXED BY compaction_notice_unpublished WHERE published_ms IS NULL AND at_ms<?1",
-            [cutoff], |r| r.get(0),
         )?;
         let sends_dropped: u64 = conn.query_row(
             "SELECT count(*) FROM send_state_outbox INDEXED BY send_state_unpublished WHERE published_ms IS NULL AND at_ms<?1",
@@ -882,13 +827,9 @@ impl EventStore<'_> {
             tracing::warn!(target: "bus", dropped = sends_dropped, "dropping send state notices older than 24 hours without a publish acknowledgement");
         }
         let deleted = conn.execute("DELETE FROM bus_event_outbox WHERE at_ms<?1", [cutoff])?
-            + conn.execute(
-                "DELETE FROM compaction_notice_outbox WHERE at_ms<?1",
-                [cutoff],
-            )?
             + conn.execute("DELETE FROM send_state_outbox WHERE at_ms<?1", [cutoff])?;
-        Ok((deleted, dropped, notices_dropped))
-        }, |(_, _, notices_dropped)| self.lower_notice_depth(*notices_dropped))?;
+        Ok((deleted, dropped))
+        }, |_| ())?;
         if dropped > 0 {
             self.lower_bus_depth(dropped);
             self.bus_metrics()
@@ -910,13 +851,6 @@ impl EventStore<'_> {
             [],
             |r| r.get(0),
         )?;
-        let notices = conn.query_row(
-            "SELECT count(*) FROM compaction_notice_outbox INDEXED BY compaction_notice_unpublished WHERE published_ms IS NULL",
-            [], |r| r.get(0),
-        )?;
-        self.bus_metrics()
-            .compaction_notice_outbox_pending
-            .store(notices, Ordering::Relaxed);
         self.bus_metrics()
             .bus_outbox_depth
             .store(depth, Ordering::Relaxed);
@@ -935,62 +869,6 @@ impl EventStore<'_> {
             current = seen;
         }
     }
-
-    fn lower_notice_depth(&self, by: u64) {
-        let depth = &self.bus_metrics().compaction_notice_outbox_pending;
-        let mut current = depth.load(Ordering::Relaxed);
-        while let Err(seen) = depth.compare_exchange_weak(
-            current,
-            current.saturating_sub(by),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            current = seen;
-        }
-    }
-}
-
-/// Queue one recorded compaction advance notice for publication, as the WAL recorded it. A
-/// notice projected again (a republish after a crash) has the same message id and is ignored.
-/// A notice the role would refuse is dropped: the provider would drop it too, and the next
-/// well-formed notice wakes it. Returns whether a row was added.
-#[cfg(test)]
-fn insert_notice(
-    conn: &Connection,
-    account: &AccountNames,
-    session: &BindIdentity,
-    headers: &std::collections::BTreeMap<String, String>,
-    at_ms: u64,
-    now_ms: u64,
-) -> Result<bool, StoreError> {
-    use broca_core::compaction_provider::notice::{AdvanceNotice, ADVANCED_EVENT, EVENT_VERSION};
-    let notice = match AdvanceNotice::from_headers(headers) {
-        Ok(notice) if notice.session_ref == agent_session_ref(session) => notice,
-        _ => {
-            tracing::warn!(target: "bus", "dropping a recorded advance notice the role refuses");
-            return Ok(false);
-        }
-    };
-    // A notice recovered from a run older than the retention window would only be pruned.
-    if at_ms != 0 && at_ms.saturating_add(RETENTION_MS) < now_ms {
-        return Ok(false);
-    }
-    let subject = account
-        .event_subject("broca", ADVANCED_EVENT, EVENT_VERSION)
-        .map_err(|e| StoreError::BusEvent(e.to_string()))?;
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO compaction_notice_outbox(message_id,session,subject,headers,digest,at_ms) \
-         VALUES(?1,?2,?3,?4,?5,?6)",
-        params![
-            notice.message_id(),
-            serde_json::to_string(session)?,
-            subject,
-            serde_json::to_string(&notice.to_headers())?,
-            notice.digest(),
-            now_ms,
-        ],
-    )?;
-    Ok(inserted == 1)
 }
 
 /// Insert one outbox row; returns its key and whether the row is new.
@@ -1029,92 +907,12 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/legacy-bus-schema.json")).unwrap();
         let store = SqliteStore::open_in_memory().unwrap();
         let conn = store.conn.lock().unwrap();
-        let actual = conn.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND (name LIKE 'bus_event_%' OR name LIKE 'compaction_notice_%') ORDER BY name").unwrap()
+        let actual = conn.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND name LIKE 'bus_event_%' ORDER BY name").unwrap()
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap()
             .collect::<rusqlite::Result<Vec<_>>>().unwrap();
         assert_eq!(actual, expected);
     }
 
-    fn notice_gauge_precedes_unlock(operation: &str) {
-        use broca_core::compaction_provider::notice::AdvanceNotice;
-        let store = enabled();
-        let notice = AdvanceNotice::new(
-            agent_session_ref(&session()),
-            1,
-            "epoch",
-            0,
-            "a".repeat(64),
-            10,
-            "model",
-        );
-        seed_historical_notice(&store, &notice, 1000);
-        let observations = Arc::new(Mutex::new(Vec::new()));
-        let captured = observations.clone();
-        let metrics = store.bus_metrics_arc();
-        *store.bus_events.before_write_unlock.lock().unwrap() = Some(Box::new(move |conn| {
-            let pending: u64 = conn
-                .query_row(
-                    "SELECT count(*) FROM compaction_notice_outbox WHERE published_ms IS NULL",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            captured.lock().unwrap().push((
-                metrics
-                    .compaction_notice_outbox_pending
-                    .load(Ordering::Relaxed),
-                pending,
-            ));
-        }));
-        match operation {
-            "ack" => {
-                let notice = store
-                    .event_store()
-                    .pending_compaction_notice()
-                    .unwrap()
-                    .unwrap();
-                store
-                    .acknowledge_bus_event(&notice, PublishReceipt::new(1, false), 1100)
-                    .unwrap();
-            }
-            "prune" => {
-                store.prune_bus_events(1001 + RETENTION_MS).unwrap();
-            }
-            _ => unreachable!(),
-        }
-        *store.bus_events.before_write_unlock.lock().unwrap() = None;
-        let expected = 0;
-        assert_eq!(
-            *observations.lock().unwrap(),
-            [(expected, expected)],
-            "notice gauge must match committed rows before releasing the connection guard"
-        );
-    }
-
-    #[test]
-    fn legacy_notice_ack_gauge_precedes_unlock() {
-        notice_gauge_precedes_unlock("ack");
-    }
-    #[test]
-    fn legacy_notice_prune_gauge_precedes_unlock() {
-        notice_gauge_precedes_unlock("prune");
-    }
-    fn seed_historical_notice(
-        store: &SqliteStore,
-        notice: &broca_core::compaction_provider::notice::AdvanceNotice,
-        at: u64,
-    ) {
-        assert!(insert_notice(
-            &store.conn.lock().unwrap(),
-            &AccountNames::derive("box_test").unwrap(),
-            &session(),
-            &notice.to_headers(),
-            at,
-            at
-        )
-        .unwrap());
-        store.resync_bus_depth().unwrap();
-    }
     use broca_protocol::RunFinishReason;
     use std::sync::atomic::AtomicBool;
 
@@ -1306,45 +1104,6 @@ mod tests {
                 .bus_events_published
                 .load(Ordering::Relaxed),
             1
-        );
-    }
-
-    #[test]
-    fn pending_notice_count_tracks_pruning_without_counting_published_notices() {
-        use broca_core::compaction_provider::notice::AdvanceNotice;
-        let store = enabled();
-        let notice = AdvanceNotice::new(
-            agent_session_ref(&session()),
-            1,
-            "lineage",
-            0,
-            "ab".repeat(32),
-            12,
-            "model",
-        );
-        seed_historical_notice(&store, &notice, 1000);
-        assert_eq!(
-            store
-                .bus_metrics()
-                .compaction_notice_outbox_pending
-                .load(Ordering::Relaxed),
-            1
-        );
-        store.prune_bus_events(RETENTION_MS + 1001).unwrap();
-        assert_eq!(
-            store
-                .bus_metrics()
-                .compaction_notice_outbox_pending
-                .load(Ordering::Relaxed),
-            0
-        );
-        store.resync_bus_depth().unwrap();
-        assert_eq!(
-            store
-                .bus_metrics()
-                .compaction_notice_outbox_pending
-                .load(Ordering::Relaxed),
-            0
         );
     }
 
