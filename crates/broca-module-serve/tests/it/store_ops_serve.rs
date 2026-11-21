@@ -351,10 +351,14 @@ impl Rig {
         )
         .await
         .unwrap();
-        let opener =
-            DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), executor)
-                .with_idle_ttl(Duration::from_millis(100))
-                .with_store_runtime(Arc::new(runtime));
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(Arc::new(
+                runtime,
+            ))),
+        )
+        .with_idle_ttl(Duration::from_millis(100));
         let registry = LineageRegistry::new(Arc::new(opener));
         // A bind resolves the session's address through the deployment's inventory, which
         // today's store keeps.

@@ -205,9 +205,12 @@ async fn registry_and_wal_inner(
         hold: hold.clone(),
     });
     let runtime = store_exec::store_runtime(dir, exec.clone()).await;
-    let opener = DefaultOpener::new(lease, exec)
-        .with_store_runtime(runtime.clone())
-        .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1)));
+    let opener = DefaultOpener::new(
+        lease,
+        exec,
+        std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
+    )
+    .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1)));
     broca_store::session_refs::migrate(
         &dir.join("store.db"),
         &broca_store::session_refs::StoredSessions::new(dir),
@@ -246,9 +249,12 @@ async fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_st
             resolver: resolver.clone(),
         }),
     );
-    let opener = DefaultOpener::new(lease, exec_opener)
-        .with_store_runtime(runtime)
-        .with_charge_basis_resolver(resolver);
+    let opener = DefaultOpener::new(
+        lease,
+        exec_opener,
+        std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
+    )
+    .with_charge_basis_resolver(resolver);
     broca_store::session_refs::migrate(
         &dir.join("store.db"),
         &broca_store::session_refs::StoredSessions::new(dir),
@@ -2933,9 +2939,14 @@ async fn read_route_manifest_and_page_roundtrip() {
         reply_text: "one-shot answer".into(),
     });
     let opener = Arc::new(
-        DefaultOpener::new(lease, exec.clone())
-            .with_store_runtime(store_exec::store_runtime(&dir, exec).await)
-            .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
+        DefaultOpener::new(
+            lease,
+            exec.clone(),
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(
+                store_exec::store_runtime(&dir, exec).await,
+            )),
+        )
+        .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
     );
     let reg = Arc::new(test_registry(LineageRegistry::new(opener)));
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -3093,10 +3104,13 @@ async fn same_send_id_same_prompt_reuses_one_episode() {
     let runtime = store_exec::store_runtime(&dir, exec.clone()).await;
     let wal_sessions = Sessions(runtime.clone());
     let reg = Arc::new(test_registry(LineageRegistry::new(Arc::new(
-        DefaultOpener::new(lease, exec)
-            .with_idle_ttl(Duration::from_millis(50))
-            .with_store_runtime(runtime)
-            .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
+        DefaultOpener::new(
+            lease,
+            exec,
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
+        )
+        .with_idle_ttl(Duration::from_millis(50))
+        .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
     ))));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
@@ -3634,9 +3648,12 @@ async fn project_observation_wire(import: bool) {
     });
     let runtime = store_exec::store_runtime(&dir, exec.clone()).await;
     let opener = Arc::new(
-        DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), exec)
-            .with_store_runtime(runtime.clone())
-            .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
+        DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            exec,
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
+        )
+        .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
     );
     let reg = Arc::new(test_registry(LineageRegistry::new(opener)));
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -3885,9 +3902,12 @@ impl PrincipalRig {
         });
         let runtime = store_exec::store_runtime(&dir, exec.clone()).await;
         let opener = Arc::new(
-            DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), exec)
-                .with_store_runtime(runtime.clone())
-                .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
+            DefaultOpener::new(
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                exec,
+                std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
+            )
+            .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
         );
         let reg = Arc::new(test_registry(LineageRegistry::new(opener)));
         let (client, server) = tokio::io::duplex(64 * 1024);
@@ -4545,9 +4565,12 @@ async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_ser
     });
     let runtime = store_exec::store_runtime(&dir, exec.clone()).await;
     let opener = Arc::new(
-        DefaultOpener::new(lease, exec.clone())
-            .with_store_runtime(runtime.clone())
-            .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
+        DefaultOpener::new(
+            lease,
+            exec.clone(),
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
+        )
+        .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| (ChargeBasis::Unknown, 1))),
     );
     let reg = Arc::new(test_registry(LineageRegistry::new(opener)));
     let (client, server) = tokio::io::duplex(64 * 1024);

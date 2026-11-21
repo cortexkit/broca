@@ -527,10 +527,14 @@ impl Rig {
             index: Arc::clone(&export) as Arc<dyn broca_core::ExportIndex>,
             resolver: Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 4)),
         });
-        let opener =
-            DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), executor)
-                .with_idle_ttl(Duration::from_millis(100))
-                .with_store_runtime(Arc::new(runtime));
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(Arc::new(
+                runtime,
+            ))),
+        )
+        .with_idle_ttl(Duration::from_millis(100));
         let registry = LineageRegistry::new(Arc::new(opener));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(

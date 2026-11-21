@@ -256,11 +256,14 @@ impl Rig {
             .unwrap(),
         );
         let opener = Arc::new(
-            DefaultOpener::new(Arc::new(FileLeaseStore::new(dir.join("leases"))), exec)
-                .with_store_runtime(runtime)
-                .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
-                    (broca_core::ChargeBasis::Unknown, 1)
-                })),
+            DefaultOpener::new(
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+                exec,
+                std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
+            )
+            .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
+                (broca_core::ChargeBasis::Unknown, 1)
+            })),
         );
         let registry = Arc::new(LineageRegistry::new(opener));
         broca_store::session_refs::migrate(

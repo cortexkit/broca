@@ -13,7 +13,19 @@ struct Opener {
 
 #[async_trait::async_trait]
 impl LineageOpener for Opener {
+    /// A session store whose runtime never opens: this opener keeps no sessions.
+    fn store_slot(&self) -> &std::sync::Arc<crate::store_open::StoreSlot> {
+        static SLOT: std::sync::OnceLock<std::sync::Arc<crate::store_open::StoreSlot>> =
+            std::sync::OnceLock::new();
+        SLOT.get_or_init(|| {
+            std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+                std::path::Path::new("/nonexistent-broca-test-store"),
+                1,
+            ))
+        })
+    }
     fn serves_from_store(&self, _: &LineageKey) -> Result<bool, OpenError> {
+        // Stands in for a head the session store keeps, without writing one.
         Ok(self.store)
     }
 

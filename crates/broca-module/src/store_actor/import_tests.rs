@@ -827,9 +827,9 @@ async fn the_registry_creates_an_imported_session_in_the_new_storage() {
             crate::opener::DefaultOpener::new(
                 Arc::new(FileLeaseStore::new(dir.join("leases"))),
                 Arc::clone(&executor),
+                std::sync::Arc::new(crate::store_open::StoreSlot::loaded(runtime)),
             )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(runtime),
+            .with_idle_ttl(IDLE),
         )
     };
     let key = broca_protocol::BindIdentity::new(dir.join("project"), "broca", "alfonso:head:a1");
@@ -884,9 +884,9 @@ async fn an_import_meets_the_scope_reservation_of_the_session_it_creates() {
         crate::opener::DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             executor,
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::clone(&runtime))),
         )
-        .with_idle_ttl(IDLE)
-        .with_store_runtime(Arc::clone(&runtime)),
+        .with_idle_ttl(IDLE),
     ));
     let inventory = super::tests::Inventory::open(&dir, &dir);
     registry.set_session_address_inventory(Arc::clone(&inventory.store));
@@ -977,9 +977,9 @@ async fn an_imported_head_is_created_in_the_durable_root_and_reopens_from_it() {
             crate::opener::DefaultOpener::new(
                 Arc::new(FileLeaseStore::new(dir.join("leases"))),
                 Arc::clone(&executor),
+                std::sync::Arc::new(crate::store_open::StoreSlot::loaded(runtime)),
             )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(runtime),
+            .with_idle_ttl(IDLE),
         ))
     };
     let open = || async {

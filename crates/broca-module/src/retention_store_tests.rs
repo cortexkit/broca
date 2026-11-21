@@ -81,9 +81,11 @@ impl Rig {
                     resolver: Arc::new(|_: &str, _: &str| (broca_core::ChargeBasis::MeteredApi, 4)),
                 }),
         );
-        let opener = Arc::new(
-            DefaultOpener::new(leases, Arc::new(NoRuns)).with_store_runtime(runtime.clone()),
-        );
+        let opener = Arc::new(DefaultOpener::new(
+            leases,
+            Arc::new(NoRuns),
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(runtime.clone())),
+        ));
         let registry = LineageRegistry::new(opener.clone());
         registry.set_retention_service(service.clone());
         Self {

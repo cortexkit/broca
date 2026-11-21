@@ -97,7 +97,14 @@ async fn serve_until_hello(
     let dir = scratch(tag);
     let lease = Arc::new(FileLeaseStore::new(dir.join("leases")));
     let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
-        DefaultOpener::new(lease, Arc::new(NoRuns)),
+        DefaultOpener::new(
+            lease,
+            Arc::new(NoRuns),
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+                std::path::Path::new("/nonexistent-broca-test-store"),
+                1,
+            )),
+        ),
     ))));
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut client_read, _client_write) = tokio::io::split(client);

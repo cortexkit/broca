@@ -191,8 +191,8 @@ impl Fixture {
         let opener = DefaultOpener::new(
             Arc::new(FileLeaseStore::new(rig.dir.join("leases"))),
             executor,
-        )
-        .with_store_runtime(runtime);
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
+        );
         let registry = Arc::new(LineageRegistry::new(Arc::new(opener)));
         let health = plane.clone();
         registry.set_tool_route_health(Arc::new(move |open| health.tool_routes_health(open)));

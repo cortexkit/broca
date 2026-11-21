@@ -717,11 +717,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(routing) = &classifier_router {
         routing.client.set_route_facts(bus_connector.clone());
     }
-    let mut opener_builder = broca_module::DefaultOpener::new(lease_store, executor)
-        .with_backup_classes(backup_class_names)
-        .with_charge_basis_resolver(charge_basis_table.clone())
-        .with_store_slot(Arc::clone(&store_slot))
-        .with_step_events(step_events.clone());
+    let mut opener_builder =
+        broca_module::DefaultOpener::new(lease_store, executor, Arc::clone(&store_slot))
+            .with_backup_classes(backup_class_names)
+            .with_charge_basis_resolver(charge_basis_table.clone())
+            .with_step_events(step_events.clone());
     if let Some(ttl) = idle_ttl {
         opener_builder = opener_builder.with_idle_ttl(ttl);
     }

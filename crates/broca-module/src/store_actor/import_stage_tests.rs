@@ -49,9 +49,9 @@ async fn module(dir: &Path, cipher: Cipher) -> Module {
         crate::opener::DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             executor,
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::clone(&runtime))),
         )
-        .with_idle_ttl(IDLE)
-        .with_store_runtime(Arc::clone(&runtime)),
+        .with_idle_ttl(IDLE),
     ));
     Module { runtime, registry }
 }

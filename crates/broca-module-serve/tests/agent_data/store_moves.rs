@@ -44,8 +44,8 @@ async fn rig_awaiting_key(
         broca_module::opener::DefaultOpener::new(
             Arc::new(broca_core::FileLeaseStore::new(path.join("leases"))),
             Arc::new(NoRuns),
-        )
-        .with_store_slot(slot.clone()),
+            slot.clone(),
+        ),
     )));
     registry.set_session_address_inventory(index.clone());
     let service = Arc::new(AgentDataService::new(

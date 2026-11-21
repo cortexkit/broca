@@ -203,11 +203,6 @@ impl Rig {
             error: Mutex::new(None),
             hold: Mutex::new(None),
         });
-        let opener = DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            executor.clone(),
-        )
-        .with_idle_ttl(Duration::from_millis(100));
         let runtime = broca_module::store_open::StoreRuntime::open(
             &dir,
             broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
@@ -216,7 +211,14 @@ impl Rig {
         )
         .await
         .unwrap();
-        let opener = opener.with_store_runtime(Arc::new(runtime));
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor.clone(),
+            Arc::new(broca_module::store_open::StoreSlot::loaded(Arc::new(
+                runtime,
+            ))),
+        )
+        .with_idle_ttl(Duration::from_millis(100));
         let registry = LineageRegistry::new(Arc::new(opener));
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(

@@ -103,9 +103,9 @@ async fn side_answering(
         crate::opener::DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             executor,
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
         )
-        .with_idle_ttl(IDLE)
-        .with_store_runtime(Arc::new(runtime)),
+        .with_idle_ttl(IDLE),
     ));
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Side {

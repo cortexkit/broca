@@ -194,6 +194,10 @@ mod tests {
                     broca_module::opener::DefaultOpener::new(
                         Arc::new(broca_core::FileLeaseStore::new("target/scratch/leases")),
                         Arc::new(NoRuns),
+                        std::sync::Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+                            std::path::Path::new("/nonexistent-broca-test-store"),
+                            1,
+                        )),
                     ),
                 )),
                 index: Arc::new(broca_store::SqliteStore::open_in_memory().unwrap()),

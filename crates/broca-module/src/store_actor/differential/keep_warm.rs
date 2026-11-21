@@ -205,9 +205,9 @@ async fn side_events(cipher: Cipher, events: Option<Arc<crate::step_events::Step
     let mut opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
         executor,
+        std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::clone(&runtime))),
     )
-    .with_idle_ttl(IDLE)
-    .with_store_runtime(Arc::clone(&runtime));
+    .with_idle_ttl(IDLE);
     if let Some(events) = events {
         opener = opener.with_step_events(events);
     }

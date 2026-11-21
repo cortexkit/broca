@@ -38,9 +38,12 @@ async fn retained(cipher: Cipher, idle: Duration, gate: Option<Arc<Notify>>) -> 
         .unwrap(),
     );
     let registry = LineageRegistry::new(Arc::new(
-        crate::opener::DefaultOpener::new(leases, executor.clone())
-            .with_idle_ttl(idle)
-            .with_store_runtime(runtime.clone()),
+        crate::opener::DefaultOpener::new(
+            leases,
+            executor.clone(),
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(runtime.clone())),
+        )
+        .with_idle_ttl(idle),
     ));
     registry.set_retention_service(service.clone());
     let key = BindIdentity::new(dir.join("project"), "retention-differential", "s1");
@@ -333,13 +336,11 @@ async fn expiry_reads_before_the_key_load_never_become_absent(cipher: Cipher) {
         .await
         .unwrap(),
     );
-    let registry = LineageRegistry::new(Arc::new(
-        crate::opener::DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(rig.module.dir.join("leases"))),
-            executor,
-        )
-        .with_store_runtime(runtime),
-    ));
+    let registry = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(rig.module.dir.join("leases"))),
+        executor,
+        std::sync::Arc::new(crate::store_open::StoreSlot::loaded(runtime)),
+    )));
     let error = registry
         .read(SessionReadRequest::new(rig.module.key.clone(), None, None))
         .await

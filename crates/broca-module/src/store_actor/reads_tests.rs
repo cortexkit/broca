@@ -476,9 +476,9 @@ async fn module_with(make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecu
         crate::opener::DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             executor,
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
         )
-        .with_idle_ttl(OPEN)
-        .with_store_runtime(Arc::new(runtime)),
+        .with_idle_ttl(OPEN),
     ));
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     Module {

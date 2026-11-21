@@ -64,10 +64,9 @@ async fn key_rig(name: &str) -> KeyRig {
     let registry = broca_module::LineageRegistry::new(Arc::new(
         broca_module::DefaultOpener::new(
             Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
-            Arc::new(NeverRuns),
-        )
+            Arc::new(NeverRuns), Arc::clone(&slot))
         .with_idle_ttl(Duration::from_secs(600))
-        .with_store_slot(Arc::clone(&slot)),
+        ,
     ));
     KeyRig {
         root,

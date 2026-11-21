@@ -41,18 +41,21 @@ impl TierServeRig {
         )
         .unwrap();
         let executor: Arc<dyn RunExecutor> = Arc::new(live);
-        let opener = DefaultOpener::new(Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))), Arc::clone(&executor));
         let runtime = Arc::new(
             broca_module::store_open::StoreRuntime::open(
                 root,
                 broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-                executor,
+                Arc::clone(&executor),
                 std::time::Duration::from_millis(100),
             )
             .await
             .unwrap(),
         );
-        let opener = opener.with_store_runtime(Arc::clone(&runtime));
+        let opener = DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
+            executor,
+            Arc::new(broca_module::store_open::StoreSlot::loaded(Arc::clone(&runtime))),
+        );
         let registry = LineageRegistry::new(Arc::new(opener));
         let registry = Arc::new(registry);
         registry.set_session_address_inventory(store);

@@ -77,7 +77,14 @@ async fn paused_on(label: &str, routed: bool) -> ProbeFixture {
     let root =
         broca_test_support::scratch_root().join(format!("sign-in-{label}-{}", std::process::id()));
     let leases = Arc::new(broca_core::FileLeaseStore::new(root.join("leases")));
-    let opener = crate::opener::DefaultOpener::new(leases, runner.clone());
+    let opener = crate::opener::DefaultOpener::new(
+        leases,
+        runner.clone(),
+        std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+            std::path::Path::new("/nonexistent-broca-test-store"),
+            1,
+        )),
+    );
     let registry = crate::registry::LineageRegistry::new(Arc::new(opener));
     let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
         .await

@@ -72,9 +72,12 @@ fn module_backing_up(
     let retention =
         Arc::new(crate::retention::RetentionService::new(root, leases.clone()).unwrap());
     let opener = Arc::new(
-        DefaultOpener::new(leases, Arc::new(NoRuns))
-            .with_backup_classes(backup_classes)
-            .with_store_runtime(runtime),
+        DefaultOpener::new(
+            leases,
+            Arc::new(NoRuns),
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(runtime)),
+        )
+        .with_backup_classes(backup_classes),
     );
     let registry = LineageRegistry::new(opener.clone());
     registry.set_retention_service(retention);

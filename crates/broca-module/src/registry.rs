@@ -294,37 +294,47 @@ pub trait LineageOpener: Send + Sync {
     {
         Ok(None)
     }
-    /// Read-only access to the derived run index, without acquiring a session writer.
-    /// The runtime serving sessions kept in the session store, when this opener has one.
+    /// The session store this opener serves sessions from and creates them in.
+    fn store_slot(&self) -> &Arc<crate::store_open::StoreSlot>;
+    /// The session store's runtime, once it has opened. It opens at the module's start, before
+    /// any request is served, unless that open failed; then it opens when the deployment key
+    /// loads.
     fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
-        None
+        self.store_slot().runtime()
     }
-    /// Why a session can't be created in the session store right now although this opener keeps
-    /// one: its deployment key hasn't loaded (the first seconds after a start), answered as the
-    /// retryable `key_unavailable`. `None` when it can create one, or keeps no new storage.
-    fn store_creation_pending(&self) -> Option<OpenError> {
-        None
+    /// The runtime a new session is created through, or why none can be created yet: the
+    /// retryable `key_unavailable` while the deployment key of encrypted sessions still loads
+    /// (the first seconds after a start).
+    fn store_creating(&self) -> Result<Arc<crate::store_open::StoreRuntime>, OpenError> {
+        let slot = self.store_slot();
+        slot.creating_runtime()
+            .ok_or_else(|| crate::store_open::key_unavailable(slot.key_id()))
     }
     /// Where model calls are published as step events, when this opener publishes them.
     fn step_events(&self) -> Option<Arc<crate::step_events::StepEvents>> {
         None
     }
-    /// The runtime holding session `key`, if the session store keeps it; `None` when no runtime
-    /// holds it. A session held by the session store is refused `key_unavailable` while its
-    /// deployment key hasn't loaded. A head that can't be checked is an error, never `None`.
+    /// The runtime holding session `key`, if the session store keeps it; `None` for a session
+    /// it doesn't keep. A session it keeps is refused `key_unavailable` while its deployment key
+    /// hasn't loaded. A head that can't be checked is an error, never `None`.
     fn store_holding(
         &self,
-        _key: &LineageKey,
+        key: &LineageKey,
     ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
-        Ok(None)
+        self.store_slot().holding(key)
     }
-    fn check_move(&self, _key: &LineageKey, _write: bool) -> Result<(), OpenError> {
-        Ok(())
+    /// Refuses a session that is moving to or from this computer, or has moved away; `write`
+    /// says whether the caller would change it.
+    fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
+        match self.store_holding(key)? {
+            Some(store) => store.check_move(key, write),
+            None => Ok(()),
+        }
     }
-    /// Whether this opener serves `key` from the session storage: the session's head exists and
-    /// the opener has a store runtime. A head that can't be checked is an error, never `false`.
-    fn serves_from_store(&self, _key: &LineageKey) -> Result<bool, OpenError> {
-        Ok(false)
+    /// Whether the session store keeps `key`. A head that can't be checked is an error, never
+    /// `false`.
+    fn serves_from_store(&self, key: &LineageKey) -> Result<bool, OpenError> {
+        Ok(self.store_holding(key)?.is_some())
     }
     fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
         None
@@ -1193,7 +1203,7 @@ impl LineageRegistry {
     }
 
     /// What serves `session.fork_*` on heads kept in the session store, dated by retention's
-    /// clock. Refuses on a module without the session store, which serves no fork.
+    /// clock. Refused retryably until the session store's runtime has opened.
     pub fn fork_manager(
         &self,
     ) -> Result<Arc<crate::fork_answer::ForkManager>, crate::fork_answer::ForkError> {
@@ -1201,7 +1211,9 @@ impl LineageRegistry {
             return Ok(Arc::clone(forks));
         }
         let runtime = self.store_runtime().ok_or_else(|| {
-            crate::fork_answer::ForkError::Unsupported("this module keeps no new storage".into())
+            crate::fork_answer::ForkError::Transient(
+                "the session store hasn't opened yet; retry once it has".into(),
+            )
         })?;
         // Retention's clock when the daemon installed it; else the clock it would install, read
         // from the same state root.
@@ -1231,17 +1243,10 @@ impl LineageRegistry {
         self.inner.opener.backup_classes()
     }
 
-    /// Why a session can't be created in the session store right now, when it can't: the
-    /// retryable `key_unavailable` while its deployment key still loads.
-    pub(crate) fn store_creation_pending(&self) -> Option<OpenError> {
-        self.inner.opener.store_creation_pending()
-    }
-
-    pub(crate) fn store_can_create(&self) -> bool {
-        self.inner
-            .opener
-            .store_runtime()
-            .is_some_and(|runtime| runtime.can_create())
+    /// The runtime a new session is created through, or the retryable `key_unavailable` while
+    /// the deployment key of encrypted sessions still loads.
+    pub(crate) fn store_creating(&self) -> Result<Arc<crate::store_open::StoreRuntime>, OpenError> {
+        self.inner.opener.store_creating()
     }
 
     pub fn new(opener: Arc<dyn LineageOpener>) -> Self {
@@ -1934,15 +1939,12 @@ impl LineageRegistry {
             if let Some(policy) = policy.as_object().filter(|policy| {
                 policy.contains_key(cortexkit_role_llm_runner::app_readers::PLAN_READERS)
             }) {
-                let supported = self.store_holding(key)?.is_some() || self.store_can_create();
                 // A session that can't be created yet (its key still loading after a start) is
                 // refused as retryable, as the opener refuses it.
-                if !supported {
-                    if let Some(pending) = self.store_creation_pending() {
-                        return Err(pending);
-                    }
+                if self.store_holding(key)?.is_none() {
+                    self.store_creating()?;
                 }
-                if let Err(error) = crate::reader_admission::check_plan(policy, supported) {
+                if let Err(error) = crate::reader_admission::check_plan(policy, true) {
                     let message = match error {
                         crate::serve::ServeError::InvalidParams { message, .. } => message,
                         error => return Err(OpenError::Open(error.to_string())),
@@ -2069,7 +2071,7 @@ impl LineageRegistry {
         command: crate::store_import::StoreCommand,
     ) -> Result<crate::store_import::StoreOutcome, OpenError> {
         use crate::actor::LineageCmd;
-        use crate::store_import::{ImportRefusal, StoreCommand, StoreOutcome};
+        use crate::store_import::{StoreCommand, StoreOutcome};
         let creates = matches!(command, StoreCommand::Import(_));
         // An import that asks for retention creates its session in the ephemeral store, as a
         // send that does.
@@ -2077,11 +2079,8 @@ impl LineageRegistry {
             StoreCommand::Import(import) => import.params.retention,
             _ => None,
         };
-        if creates && self.store_runtime().is_none() {
-            return Ok(StoreOutcome::Refused(ImportRefusal::new(
-                "new_storage_unavailable",
-                "this module doesn't create sessions in the new storage",
-            )));
+        if creates {
+            self.store_creating()?;
         }
         loop {
             if creates {
@@ -3227,6 +3226,17 @@ mod tests {
     struct NeverOpener;
     #[async_trait]
     impl LineageOpener for NeverOpener {
+        /// A session store whose runtime never opens: this opener keeps no sessions.
+        fn store_slot(&self) -> &std::sync::Arc<crate::store_open::StoreSlot> {
+            static SLOT: std::sync::OnceLock<std::sync::Arc<crate::store_open::StoreSlot>> =
+                std::sync::OnceLock::new();
+            SLOT.get_or_init(|| {
+                std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+                    std::path::Path::new("/nonexistent-broca-test-store"),
+                    1,
+                ))
+            })
+        }
         async fn open(
             &self,
             _key: &LineageKey,
@@ -3246,6 +3256,17 @@ mod tests {
 
     #[async_trait]
     impl LineageOpener for TransportOpener {
+        /// A session store whose runtime never opens: this opener keeps no sessions.
+        fn store_slot(&self) -> &std::sync::Arc<crate::store_open::StoreSlot> {
+            static SLOT: std::sync::OnceLock<std::sync::Arc<crate::store_open::StoreSlot>> =
+                std::sync::OnceLock::new();
+            SLOT.get_or_init(|| {
+                std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+                    std::path::Path::new("/nonexistent-broca-test-store"),
+                    1,
+                ))
+            })
+        }
         fn on_session_deleted(&self, _: &LineageKey) {
             self.route_deletions.fetch_add(1, Ordering::SeqCst);
         }
@@ -3323,6 +3344,17 @@ mod tests {
 
     #[async_trait]
     impl LineageOpener for GaugeOpener {
+        /// A session store whose runtime never opens: this opener keeps no sessions.
+        fn store_slot(&self) -> &std::sync::Arc<crate::store_open::StoreSlot> {
+            static SLOT: std::sync::OnceLock<std::sync::Arc<crate::store_open::StoreSlot>> =
+                std::sync::OnceLock::new();
+            SLOT.get_or_init(|| {
+                std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+                    std::path::Path::new("/nonexistent-broca-test-store"),
+                    1,
+                ))
+            })
+        }
         async fn open(
             &self,
             _key: &LineageKey,
@@ -3422,6 +3454,17 @@ mod tests {
 
     #[async_trait]
     impl LineageOpener for LeaseHeldOpener {
+        /// A session store whose runtime never opens: this opener keeps no sessions.
+        fn store_slot(&self) -> &std::sync::Arc<crate::store_open::StoreSlot> {
+            static SLOT: std::sync::OnceLock<std::sync::Arc<crate::store_open::StoreSlot>> =
+                std::sync::OnceLock::new();
+            SLOT.get_or_init(|| {
+                std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+                    std::path::Path::new("/nonexistent-broca-test-store"),
+                    1,
+                ))
+            })
+        }
         async fn open(
             &self,
             key: &LineageKey,
@@ -3472,6 +3515,17 @@ mod tests {
 
     #[async_trait]
     impl LineageOpener for GatedOpener {
+        /// A session store whose runtime never opens: this opener keeps no sessions.
+        fn store_slot(&self) -> &std::sync::Arc<crate::store_open::StoreSlot> {
+            static SLOT: std::sync::OnceLock<std::sync::Arc<crate::store_open::StoreSlot>> =
+                std::sync::OnceLock::new();
+            SLOT.get_or_init(|| {
+                std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+                    std::path::Path::new("/nonexistent-broca-test-store"),
+                    1,
+                ))
+            })
+        }
         async fn open(
             &self,
             _key: &LineageKey,

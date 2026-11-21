@@ -250,7 +250,7 @@ impl Drop for Rig {
 impl Rig {
     /// A module on a fresh state root whose new storage creates sessions. With `store` false,
     /// it has no new storage at all.
-    async fn start(tag: &str, store: bool) -> Self {
+    async fn start(tag: &str) -> Self {
         let dir = broca_test_support::scratch_root().join(format!(
             "broca-head-import-serve-{}-{tag}",
             std::process::id()
@@ -259,38 +259,32 @@ impl Rig {
         std::fs::create_dir_all(&dir).unwrap();
         let runner = HeadRunner::default();
         let executor: Arc<dyn RunExecutor> = Arc::new(runner.clone());
-        let mut opener = DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            executor.clone(),
+        let runtime = Arc::new(
+            broca_module::store_open::StoreRuntime::open(
+                &dir,
+                broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+                executor.clone(),
+                Duration::from_millis(100),
+            )
+            .await
+            .unwrap(),
         );
-        let mut runtime = None;
-        if store {
-            let opened = Arc::new(
-                broca_module::store_open::StoreRuntime::open(
-                    &dir,
-                    broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-                    executor,
-                    Duration::from_millis(100),
-                )
-                .await
-                .unwrap(),
-            );
-            opener = opener.with_store_runtime(opened.clone());
-            runtime = Some(opened);
-        }
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            executor,
+            Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
+        );
         let registry = LineageRegistry::new(Arc::new(opener));
-        if let Some(runtime) = runtime {
-            registry.set_store_restorer(Arc::new(
-                broca_module_serve::store_restore::StoreRestore::new(
-                    registry.clone(),
-                    &dir,
-                    Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
-                    Arc::new(FileLeaseStore::new(dir.join("leases"))),
-                ),
-            ));
-        }
-        // A bind resolves the session's address through the deployment's inventory, which
-        // today's store keeps.
+        registry.set_store_restorer(Arc::new(
+            broca_module_serve::store_restore::StoreRestore::new(
+                registry.clone(),
+                &dir,
+                Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
+                Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            ),
+        ));
+        // A bind resolves the session's address through the session-address inventory, kept in
+        // this deployment's SQLite store.
         let store = Arc::new(broca_store::SqliteStore::open(dir.join("store.db")).unwrap());
         broca_store::session_refs::migrate(
             &dir.join("store.db"),
@@ -638,7 +632,7 @@ fn opencode1_source_with_text(
 
 #[tokio::test]
 async fn opencode1_extract_import_install_view_and_first_owner_send_keep_history() {
-    let mut rig = Rig::start("opencode1", true).await;
+    let mut rig = Rig::start("opencode1").await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let params = opencode1_source(&rig, "extract-head", None);
     let imported = rig.result(1, "session.import", params.clone()).await;
@@ -820,14 +814,11 @@ async fn opencode1_extract_import_install_view_and_first_owner_send_keep_history
 #[tokio::test]
 async fn opencode1_old_open_calls_import_but_last_row_open_calls_keep_the_extract() {
     for last in [false, true] {
-        let mut rig = Rig::start(
-            if last {
-                "opencode1-open-tail"
-            } else {
-                "opencode1-open-old"
-            },
-            true,
-        )
+        let mut rig = Rig::start(if last {
+            "opencode1-open-tail"
+        } else {
+            "opencode1-open-old"
+        })
         .await;
         rig.bind(1, core(), Some(stamp(core()))).await;
         let mut params = opencode1_source(&rig, "open-call", None);
@@ -876,7 +867,7 @@ async fn opencode1_old_open_calls_import_but_last_row_open_calls_keep_the_extrac
 #[tokio::test]
 #[ignore = "synthetic 25k-message extract/import timing, run explicitly"]
 async fn opencode1_extract_import_25k_timing() {
-    let mut rig = Rig::start("opencode1-25k", true).await;
+    let mut rig = Rig::start("opencode1-25k").await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let params = opencode1_source(&rig, "timing-25k", Some(25_000));
     let started = std::time::Instant::now();
@@ -895,7 +886,7 @@ async fn opencode1_extract_import_25k_timing() {
 #[tokio::test]
 async fn a_move_list_too_large_for_one_frame_is_served_in_pages_through_serve() {
     let samples = std::env::var_os("BROCA_IMPORT_MOVES_SAMPLES").map(PathBuf::from);
-    let mut rig = Rig::start("opencode1-paged-moves", true).await;
+    let mut rig = Rig::start("opencode1-paged-moves").await;
     // The first page imports 100,000 messages, which an unoptimized build on a shared CI runner
     // takes longer than the rig's usual 20 s to do.
     rig.reply_within = Duration::from_secs(180);
@@ -985,7 +976,7 @@ async fn opencode1_capture_head_import_wire_samples() {
     let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.cortexkit/internal-docs/investigations/head-import-samples");
     std::fs::create_dir_all(&folder).unwrap();
-    let mut rig = Rig::start("opencode1-wire-samples", true).await;
+    let mut rig = Rig::start("opencode1-wire-samples").await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let params = opencode1_source(&rig, "wire-synthetic-head", None);
     let path = PathBuf::from(params["source"]["path"].as_str().unwrap());
@@ -1234,7 +1225,7 @@ async fn opencode1_capture_head_import_wire_samples() {
 #[tokio::test]
 async fn an_import_is_stamped_with_wall_clock_time_and_its_retention_is_checked() {
     use sha2::Digest as _;
-    let mut rig = Rig::start("import-time", true).await;
+    let mut rig = Rig::start("import-time").await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let mut params = rig.import_params("imp-time");
     params["retention"] = serde_json::json!(broca_module::retention::MAX_RETENTION_SECONDS + 1);
@@ -1267,7 +1258,7 @@ async fn an_import_is_stamped_with_wall_clock_time_and_its_retention_is_checked(
 
 #[tokio::test]
 async fn an_owner_imports_a_head_and_installs_its_first_view_through_serve() {
-    let mut rig = Rig::start("import", true).await;
+    let mut rig = Rig::start("import").await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let params = rig.import_params("imp-1");
     let reply = rig.result(1, "session.import", params.clone()).await;
@@ -1414,7 +1405,7 @@ async fn thalamus_imported_heads_keep_calls_and_notices_in_wire_reads() {
             .iter()
             .find(|send| send["template"] == "note")
             .unwrap();
-        let mut rig = Rig::start(host, true).await;
+        let mut rig = Rig::start(host).await;
         rig.bind(1, core(), Some(stamp(core()))).await;
         let folder = rig.import_folder();
         std::fs::create_dir_all(&folder).unwrap();
@@ -1618,7 +1609,7 @@ async fn thalamus_call_side_file_keeps_pins_times_and_unknown_facts_through_serv
             call.insert("unanswered".into(), serde_json::json!("cancelled"));
         }
         let tag = format!("call-facts-{host}-{closure}");
-        let mut rig = Rig::start(&tag, true).await;
+        let mut rig = Rig::start(&tag).await;
         rig.bind(1, core(), Some(stamp(core()))).await;
         let folder = rig.import_folder();
         std::fs::create_dir_all(&folder).unwrap();
@@ -1712,7 +1703,7 @@ async fn thalamus_call_side_file_keeps_pins_times_and_unknown_facts_through_serv
 /// and the file is left alone.
 #[tokio::test]
 async fn an_import_from_outside_the_import_folder_is_refused_through_serve() {
-    let mut rig = Rig::start("outside", true).await;
+    let mut rig = Rig::start("outside").await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let mut params = rig.import_params("imp-1");
     let outside = rig.dir.join("elsewhere.json");
@@ -1734,7 +1725,7 @@ async fn an_import_from_outside_the_import_folder_is_refused_through_serve() {
 /// stored owner: a stranger is refused as not the owner, and the owner's cancel is answered.
 #[tokio::test]
 async fn a_store_session_serves_its_ops_and_checks_owners_from_the_store() {
-    let mut rig = Rig::start("gate", true).await;
+    let mut rig = Rig::start("gate").await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let params = rig.import_params("imp-1");
     let before = broca_core::clock::epoch_millis().unwrap();
@@ -1829,7 +1820,7 @@ fn files_ending(dir: &std::path::Path, suffix: &str) -> Vec<PathBuf> {
 /// without the imported messages.
 #[tokio::test]
 async fn a_restore_is_operator_only_keeps_a_whole_session_and_cuts_one_lacking_a_file() {
-    let mut rig = Rig::start("restore", true).await;
+    let mut rig = Rig::start("restore").await;
     rig.bind(1, core(), Some(stamp(core()))).await;
     let params = rig.import_params("imp-1");
     rig.result(1, "session.import", params).await;

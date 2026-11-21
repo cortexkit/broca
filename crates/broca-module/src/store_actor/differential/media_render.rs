@@ -426,9 +426,9 @@ async fn registry(
         crate::opener::DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             executor,
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(runtime)),
         )
-        .with_idle_ttl(super::IDLE)
-        .with_store_runtime(runtime),
+        .with_idle_ttl(super::IDLE),
     ))
 }
 

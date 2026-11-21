@@ -38,7 +38,6 @@ impl Drop for Module {
 }
 
 pub(super) async fn module(
-    store: bool,
     steps: Vec<Vec<NormalizedEvent>>,
     reservation: Option<&ScopeReservation>,
 ) -> Module {
@@ -52,22 +51,20 @@ pub(super) async fn module(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let executor: Arc<dyn RunExecutor> = Arc::new(executor(steps, None));
-    let mut opener = crate::opener::DefaultOpener::new(
-        Arc::new(FileLeaseStore::new(dir.join("leases"))),
+    let runtime = crate::store_open::StoreRuntime::open(
+        &dir,
+        broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
         Arc::clone(&executor),
+        IDLE,
+    )
+    .await
+    .unwrap();
+    let opener = crate::opener::DefaultOpener::new(
+        Arc::new(FileLeaseStore::new(dir.join("leases"))),
+        executor,
+        Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
     )
     .with_idle_ttl(IDLE);
-    if store {
-        let runtime = crate::store_open::StoreRuntime::open(
-            &dir,
-            broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
-            executor,
-            IDLE,
-        )
-        .await
-        .unwrap();
-        opener = opener.with_store_runtime(Arc::new(runtime));
-    }
     let registry = LineageRegistry::new(Arc::new(opener));
     let inventory = Inventory::open(&dir, &dir);
     registry.set_session_address_inventory(Arc::clone(&inventory.store));
@@ -207,7 +204,6 @@ fn sent_by(
 #[tokio::test]
 async fn a_head_starts_in_the_durable_root_of_the_new_storage_and_reopens_from_it() {
     let module = module(
-        true,
         vec![text_step("a1", "hello"), text_step("a2", "again")],
         None,
     )
@@ -297,7 +293,7 @@ async fn a_head_created_by_an_ordered_send_an_interrupt_or_a_sign_in_resume_answ
         ),
     ];
     for (label, delivery, kind, order) in cases {
-        let store = module(true, vec![text_step("a1", "hello")], None).await;
+        let store = module(vec![text_step("a1", "hello")], None).await;
         let new = head_send(&store, request("first"), delivery, kind, order).await;
         assert!(
             matches!(
@@ -325,7 +321,7 @@ async fn a_started_head_answers_later_sends_from_its_history_not_its_reservation
         scope_ref: "head-1".into(),
     };
     let steps = || vec![text_step("a1", "hello"), text_step("a2", "again")];
-    let store = module(true, steps(), Some(&reservation)).await;
+    let store = module(steps(), Some(&reservation)).await;
     let mut answers = Vec::new();
     for module in [&store] {
         let sent = sent_by("owner", core(), stamped(core(), "head-1", 1));
@@ -390,7 +386,7 @@ async fn only_the_reserving_scope_starts_a_reserved_head_as_on_todays_storage() 
         owner: core(),
         scope_ref: "head-1".into(),
     };
-    let store = module(true, steps(), Some(&reservation)).await;
+    let store = module(steps(), Some(&reservation)).await;
     for (label, principal, scope) in [
         ("unstamped", other(), SendScope::Unstamped),
         ("another owner", other(), stamped(other(), "head-1", 1)),
@@ -448,7 +444,7 @@ async fn an_undecodable_reservation_refuses_a_head_send_as_transient() {
         owner: core(),
         scope_ref: "head-1".into(),
     };
-    let store = module(true, vec![text_step("a1", "hello")], Some(&reservation)).await;
+    let store = module(vec![text_step("a1", "hello")], Some(&reservation)).await;
     let mut outcomes = Vec::new();
     for module in [&store] {
         module.inventory.damage(&module.key);

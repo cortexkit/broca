@@ -172,8 +172,8 @@ async fn rig(
         broca_module::opener::DefaultOpener::new(
             Arc::new(broca_core::FileLeaseStore::new(path.join("leases"))),
             Arc::new(NoRuns),
-        )
-        .with_store_runtime(runtime),
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(runtime)),
+        ),
     )));
     registry.set_session_address_inventory(index.clone());
     let service = Arc::new(AgentDataService::new(

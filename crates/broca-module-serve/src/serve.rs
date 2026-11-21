@@ -3812,17 +3812,13 @@ where
                 let error = ServeError::RetentionInvalid(detail);
                 return send_serve_error(writer, ver, channel, epoch, corr, &error).await;
             }
+            // The roots belong to the session store's runtime, which opens at the module's start
+            // or, when that open failed, once the deployment key loads.
             let Some(roots) = handler.import_roots() else {
-                return send_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "new_storage_unavailable",
-                    "this module doesn't create sessions in the new storage",
-                )
-                .await;
+                let error = ServeError::Transient(
+                    "the session store hasn't opened yet; retry once it has".into(),
+                );
+                return send_serve_error(writer, ver, channel, epoch, corr, &error).await;
             };
             let command = broca_module::store_import::StoreCommand::Import(Box::new(
                 broca_module::store_import::ImportCommand {
@@ -8460,7 +8456,7 @@ mod tests {
         }
     }
 
-    struct RefusingOpener;
+    use super::test_openers::RefusingOpener;
 
     #[tokio::test]
     async fn headerless_control_deliveries_keep_streaming_without_a_resume_proof() {
@@ -8482,21 +8478,6 @@ mod tests {
             serde_json::to_value(cursor).unwrap(),
             serde_json::json!({"wal_seq":1,"sub_index":0})
         );
-    }
-
-    #[async_trait::async_trait]
-    impl broca_module::registry::LineageOpener for RefusingOpener {
-        async fn open(
-            &self,
-            _key: &BrocaBindIdentity,
-            _gen: u64,
-            _registry: broca_module::registry::RegistryHandle,
-        ) -> Result<broca_module::registry::ActorHandle, broca_module::registry::OpenError>
-        {
-            Err(broca_module::registry::OpenError::Open(
-                "this test opens no lineage".into(),
-            ))
-        }
     }
 
     async fn next_written(rx: &mut EgressReceiver<Frame>) -> Frame {
@@ -10754,3 +10735,7 @@ mod withdrawal_health_tests;
 #[cfg(test)]
 #[path = "serve_run_id_tests.rs"]
 mod run_id_tests;
+
+#[cfg(test)]
+#[path = "serve_test_openers.rs"]
+mod test_openers;

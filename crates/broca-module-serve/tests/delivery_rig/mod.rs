@@ -895,11 +895,6 @@ impl Rig {
             script: script.clone(),
             hook_plane: hook_plane.clone(),
         });
-        let opener = DefaultOpener::new(
-            Arc::new(FileLeaseStore::new(dir.join("leases"))),
-            exec.clone(),
-        )
-        .with_idle_ttl(idle_ttl);
         let runtime = Arc::new(
             broca_module::store_open::StoreRuntime::open(
                 &dir,
@@ -916,11 +911,15 @@ impl Rig {
         );
         // Every session is kept in the session store. It writes usage exports the way the module
         // does: one fact per finished run, into the run index's export table.
-        let opener = opener
-            .with_store_runtime(runtime.clone())
-            .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
-                (broca_core::ChargeBasis::Unknown, 1)
-            }));
+        let opener = DefaultOpener::new(
+            Arc::new(FileLeaseStore::new(dir.join("leases"))),
+            exec.clone(),
+            Arc::new(broca_module::store_open::StoreSlot::loaded(runtime.clone())),
+        )
+        .with_idle_ttl(idle_ttl)
+        .with_charge_basis_resolver(Arc::new(|_: &str, _: &str| {
+            (broca_core::ChargeBasis::Unknown, 1)
+        }));
         let opener = Arc::new(opener);
         let registry = Arc::new(LineageRegistry::new(opener));
         registry.set_session_address_inventory(store.clone());

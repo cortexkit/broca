@@ -25,21 +25,26 @@ pub struct DefaultOpener<L: LeaseStore> {
     executor: Arc<dyn RunExecutor>,
     idle_ttl: Duration,
     charge_basis_resolver: Option<Arc<dyn broca_core::ChargeBasisResolver + Send + Sync>>,
-    /// Serves sessions kept in the session storage, and starts new ones there when the registry
-    /// marks their creating send. `None` serves no session.
-    store: Option<Arc<crate::store_open::StoreSlot>>,
+    /// Serves sessions kept in the session store, and starts new ones there.
+    store: Arc<crate::store_open::StoreSlot>,
     step_events: Option<Arc<crate::step_events::StepEvents>>,
 }
 
 impl<L: LeaseStore> DefaultOpener<L> {
-    pub fn new(lease_store: Arc<L>, executor: Arc<dyn RunExecutor>) -> Self {
+    /// Serves sessions through `store`, whose runtime opens without the deployment key and is
+    /// given the key once it loads; until then an encrypted session is refused `key_unavailable`.
+    pub fn new(
+        lease_store: Arc<L>,
+        executor: Arc<dyn RunExecutor>,
+        store: Arc<crate::store_open::StoreSlot>,
+    ) -> Self {
         Self {
             lease_store,
             backup_classes: vec!["head".into()],
             executor,
             idle_ttl: IDLE_TTL,
             charge_basis_resolver: None,
-            store: None,
+            store,
             step_events: None,
         }
     }
@@ -53,19 +58,6 @@ impl<L: LeaseStore> DefaultOpener<L> {
     /// Install the independent, lossy attempt publisher on both storage paths.
     pub fn with_step_events(mut self, events: Arc<crate::step_events::StepEvents>) -> Self {
         self.step_events = Some(events);
-        self
-    }
-
-    /// Serves sessions kept in the session store through `store`.
-    pub fn with_store_runtime(mut self, store: Arc<crate::store_open::StoreRuntime>) -> Self {
-        self.store = Some(Arc::new(crate::store_open::StoreSlot::loaded(store)));
-        self
-    }
-
-    /// Serves sessions kept in the session store through `slot`, whose runtime is installed once
-    /// the deployment key loads. Until then those sessions are refused `key_unavailable`.
-    pub fn with_store_slot(mut self, slot: Arc<crate::store_open::StoreSlot>) -> Self {
-        self.store = Some(slot);
         self
     }
 
@@ -105,27 +97,11 @@ impl<L: LeaseStore + 'static> LineageOpener for DefaultOpener<L> {
     fn on_session_deleted(&self, session: &LineageKey) {
         self.executor.on_session_deleted(session);
     }
-    fn store_runtime(&self) -> Option<Arc<crate::store_open::StoreRuntime>> {
-        self.store.as_ref().and_then(|slot| slot.runtime())
-    }
-    fn store_creation_pending(&self) -> Option<OpenError> {
-        let slot = self.store.as_ref()?;
-        match slot.creating_runtime() {
-            Some(_) => None,
-            None => Some(crate::store_open::key_unavailable(slot.key_id())),
-        }
+    fn store_slot(&self) -> &Arc<crate::store_open::StoreSlot> {
+        &self.store
     }
     fn step_events(&self) -> Option<Arc<crate::step_events::StepEvents>> {
         self.step_events.clone()
-    }
-    fn store_holding(
-        &self,
-        key: &LineageKey,
-    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, OpenError> {
-        match &self.store {
-            Some(slot) => slot.holding(key),
-            None => Ok(None),
-        }
     }
     fn retire_session_transport(&self, session: &LineageKey) {
         self.executor.retire_session_transport(session);
@@ -144,15 +120,6 @@ impl<L: LeaseStore + 'static> LineageOpener for DefaultOpener<L> {
     ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, broca_core::RunError>
     {
         self.executor.media_profile(request).await
-    }
-    fn check_move(&self, key: &LineageKey, write: bool) -> Result<(), OpenError> {
-        match self.store_holding(key)? {
-            Some(store) => store.check_move(key, write),
-            None => Ok(()),
-        }
-    }
-    fn serves_from_store(&self, key: &LineageKey) -> Result<bool, OpenError> {
-        Ok(self.store_holding(key)?.is_some())
     }
     fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
         self.executor.elicitation_plane()
@@ -220,11 +187,7 @@ impl<L: LeaseStore + 'static> DefaultOpener<L> {
         session_class: Option<String>,
         status: bool,
     ) -> Result<ActorHandle, OpenError> {
-        // Every session lives in the session store: one it doesn't hold, and that no creating send
-        // or import marked, doesn't exist.
-        let Some(slot) = &self.store else {
-            return Err(OpenError::UnknownSession);
-        };
+        let slot = &self.store;
         debug_assert!(
             key.validate_keyable().is_ok(),
             "DefaultOpener identity must be validated before durable key derivation"

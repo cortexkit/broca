@@ -1128,9 +1128,9 @@ async fn module_options_with_render(
     let mut opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
         executor,
+        std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
     )
-    .with_idle_ttl(idle_ttl)
-    .with_store_runtime(Arc::new(runtime));
+    .with_idle_ttl(idle_ttl);
     if let Some(events) = step_events {
         opener = opener.with_step_events(events);
     }

@@ -11,6 +11,17 @@ use broca_module::serve::{
 struct NoFlowActor;
 #[async_trait::async_trait]
 impl broca_module::registry::LineageOpener for NoFlowActor {
+    /// A session store whose runtime never opens: this opener keeps no sessions.
+    fn store_slot(&self) -> &std::sync::Arc<broca_module::store_open::StoreSlot> {
+        static SLOT: std::sync::OnceLock<std::sync::Arc<broca_module::store_open::StoreSlot>> =
+            std::sync::OnceLock::new();
+        SLOT.get_or_init(|| {
+            std::sync::Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+                std::path::Path::new("/nonexistent-broca-test-store"),
+                1,
+            ))
+        })
+    }
     async fn open(
         &self,
         _: &BrocaBindIdentity,

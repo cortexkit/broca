@@ -118,13 +118,12 @@ impl Rig {
         std::fs::create_dir_all(&root).unwrap();
         let executor = Arc::new(Continuing::default());
         let slot = Arc::new(StoreSlot::awaiting_key(&root, 1).creating(Cipher::None));
-        let registry = broca_module::LineageRegistry::new(Arc::new(
-            broca_module::DefaultOpener::new(
+        let registry =
+            broca_module::LineageRegistry::new(Arc::new(broca_module::DefaultOpener::new(
                 Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
                 executor.clone(),
-            )
-            .with_store_slot(slot.clone()),
-        ));
+                slot.clone(),
+            )));
         registry.enable_restart_resumes();
         let rig = Self {
             root,

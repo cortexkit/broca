@@ -295,8 +295,10 @@ async fn session(tag: &str, steps: Vec<Vec<NormalizedEvent>>, tagged: bool) -> S
     let opener = DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
         executor.clone(),
-    )
-    .with_store_runtime(Arc::new(runtime));
+        std::sync::Arc::new(broca_module::store_open::StoreSlot::loaded(Arc::new(
+            runtime,
+        ))),
+    );
     let registry = LineageRegistry::new(Arc::new(opener));
     let bind = BindIdentity::new(dir.join("project"), "runner", "transport");
     executor.plane.invalidate_route(&bind);

@@ -218,9 +218,9 @@ impl Side {
             crate::opener::DefaultOpener::new(
                 Arc::new(FileLeaseStore::new(dir.join("leases"))),
                 executor,
+                std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
             )
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::new(runtime)),
+            .with_idle_ttl(IDLE),
         ));
         Self {
             dir,

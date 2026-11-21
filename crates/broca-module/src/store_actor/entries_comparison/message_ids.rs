@@ -395,8 +395,8 @@ async fn message_ids_cancelled_step_omits_the_member() {
     let opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
         executor,
+        std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
     )
-    .with_store_runtime(Arc::new(runtime))
     .with_step_events(events);
     let side = Side {
         key: BindIdentity::new(

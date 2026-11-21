@@ -1985,8 +1985,8 @@ pub trait ServeHandler: Send + Sync {
         Err(ServeError::Import("session.import is unsupported".into()))
     }
 
-    /// `session.import` from a file source, and `session.install_view`: commands only a session
-    /// kept in the session store serves. A handler without the session store refuses them by name.
+    /// `session.import` from a file source, and `session.install_view`: commands the session
+    /// store serves. A handler that keeps no sessions refuses them.
     async fn store_command(
         &self,
         _session: &LineageKey,
@@ -1994,8 +1994,8 @@ pub trait ServeHandler: Send + Sync {
     ) -> Result<crate::store_import::StoreOutcome, ServeError> {
         Ok(crate::store_import::StoreOutcome::Refused(
             crate::store_import::ImportRefusal::new(
-                "new_storage_unavailable",
-                "this module doesn't create sessions in the new storage",
+                "unsupported",
+                "this handler keeps no sessions",
             ),
         ))
     }
@@ -2600,18 +2600,13 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         _class: Option<&str>,
     ) -> Result<bool, ServeError> {
-        if self.store_holding(session)?.is_some() {
-            return Ok(true);
-        }
         // A session that can't be created yet (its key still loading after a start) is refused
         // as retryable, as the opener and the send's own admission refuse it, never answered "not
         // supported", which refuses the plan for good.
-        if !self.store_can_create() {
-            if let Some(pending) = self.store_creation_pending() {
-                return Err(pending.into());
-            }
+        if self.store_holding(session)?.is_none() {
+            self.store_creating()?;
         }
-        Ok(self.store_can_create())
+        Ok(true)
     }
     async fn authorize_session_read(
         &self,

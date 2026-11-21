@@ -79,7 +79,6 @@ async fn stays_open(module: &Module, deliveries: &mut mpsc::Receiver<Delivery>, 
 #[tokio::test]
 async fn a_subscriber_holds_an_idle_head_open_until_it_leaves() {
     let module = module(
-        true,
         vec![text_step("a1", "hello"), text_step("a2", "again")],
         None,
     )
@@ -133,7 +132,7 @@ async fn a_subscriber_holds_an_idle_head_open_until_it_leaves() {
 /// that names a cursor can't wait: a cursor only names a session that exists.
 #[tokio::test]
 async fn a_subscriber_before_the_first_send_follows_the_session_once_it_exists() {
-    let module = module(true, vec![text_step("a1", "hello")], None).await;
+    let module = module(vec![text_step("a1", "hello")], None).await;
     let mut deliveries = subscribed(&module).await;
     let (cursor_sink, _cursor_deliveries) = mpsc::channel(16);
     let refused = module
@@ -176,7 +175,7 @@ async fn a_subscriber_before_the_first_send_follows_the_session_once_it_exists()
 /// A module stop closes a head a subscriber holds open, and ends the subscription.
 #[tokio::test]
 async fn a_module_stop_ends_a_subscription_holding_a_head_open() {
-    let module = module(true, vec![text_step("a1", "hello")], None).await;
+    let module = module(vec![text_step("a1", "hello")], None).await;
     let first = send(
         &module,
         "r1",

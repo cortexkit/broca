@@ -301,9 +301,12 @@ impl Side {
         )
         .await
         .unwrap();
-        let opener = crate::opener::DefaultOpener::new(leases, executor.clone())
-            .with_idle_ttl(IDLE)
-            .with_store_runtime(Arc::new(runtime));
+        let opener = crate::opener::DefaultOpener::new(
+            leases,
+            executor.clone(),
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
+        )
+        .with_idle_ttl(IDLE);
         let registry = LineageRegistry::new(Arc::new(opener));
         registry.set_retention_service(service);
         registry.enable_restart_resumes();
@@ -555,6 +558,10 @@ async fn account_limit_timer_requires_the_durable_source_evidence() {
     let not_ready = LineageRegistry::new(Arc::new(crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(side.dir.join("leases"))),
         side.executor.clone(),
+        std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+            std::path::Path::new("/nonexistent-broca-test-store"),
+            1,
+        )),
     )));
     assert!(!not_ready.handle().restart_resume_ready());
     actor.registry = Some(not_ready.handle());

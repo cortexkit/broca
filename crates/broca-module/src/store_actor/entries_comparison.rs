@@ -297,18 +297,19 @@ async fn side_with_events(
         compaction: compaction.then(|| Arc::new(ReadyProvider)),
         hooks: hooks.then(|| Arc::new(Passes) as Arc<dyn broca_core::HookPlane>),
     });
+    let runtime =
+        crate::store_open::StoreRuntime::open(&dir, deployment, Arc::clone(&executor), idle)
+            .await
+            .unwrap();
     let mut opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
-        Arc::clone(&executor),
+        executor,
+        Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
     )
     .with_idle_ttl(idle);
     if let Some(events) = step_events {
         opener = opener.with_step_events(events);
     }
-    let runtime = crate::store_open::StoreRuntime::open(&dir, deployment, executor, idle)
-        .await
-        .unwrap();
-    opener = opener.with_store_runtime(Arc::new(runtime));
     let registry = LineageRegistry::new(Arc::new(opener));
     let key = BindIdentity::new(dir.join("project"), "store-entries", "s1");
     Side {

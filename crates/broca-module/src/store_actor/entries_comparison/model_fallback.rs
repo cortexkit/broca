@@ -35,9 +35,9 @@ async fn session(steps: Vec<Vec<NormalizedEvent>>) -> Side {
     let opener = crate::opener::DefaultOpener::new(
         Arc::new(FileLeaseStore::new(dir.join("leases"))),
         executor,
+        std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
     )
-    .with_idle_ttl(idle)
-    .with_store_runtime(Arc::new(runtime));
+    .with_idle_ttl(idle);
     Side {
         registry: LineageRegistry::new(Arc::new(opener)),
         key: BindIdentity::new(dir.join("project"), "model-fallback", "s1"),

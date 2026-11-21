@@ -78,9 +78,9 @@ async fn module_with(name: &str, billing: Option<StoreBilling>, new_sessions: Ci
         DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             Arc::clone(&executor),
+            Arc::clone(&slot),
         )
-        .with_idle_ttl(OPEN)
-        .with_store_slot(Arc::clone(&slot)),
+        .with_idle_ttl(OPEN),
     ));
     let setup = StoreRuntimeSetup {
         state_root: dir.clone(),
