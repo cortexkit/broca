@@ -322,69 +322,6 @@ impl LlmToolsConfig {
     }
 }
 
-/// Boot-only reader-first rollout switch for compaction notice pricing and chain resets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompactionSignalsConfig {
-    pub enabled: bool,
-}
-
-impl Default for CompactionSignalsConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-impl CompactionSignalsConfig {
-    /// Its section of broca's settings.
-    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
-        Self::parse(settings.text())
-    }
-
-    pub fn parse(text: &str) -> Result<Self, String> {
-        #[derive(serde::Deserialize)]
-        struct File {
-            #[serde(default = "enabled")]
-            compaction_signals: bool,
-        }
-        fn enabled() -> bool {
-            true
-        }
-        let text = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        serde_json::from_str::<File>(&text)
-            .map(|file| Self {
-                enabled: file.compaction_signals,
-            })
-            .map_err(|e| format!("parse compaction_signals: {e}"))
-    }
-}
-
-#[cfg(test)]
-mod compaction_signals_config_tests {
-    use super::CompactionSignalsConfig as Config;
-    #[test]
-    fn default_on_and_explicit_off_are_strict_booleans() {
-        for text in ["{}", r#"{"compaction_signals":true}"#] {
-            assert!(Config::parse(text).unwrap().enabled);
-        }
-        assert!(
-            !Config::parse("{/* rollback */ \"compaction_signals\":false,}")
-                .unwrap()
-                .enabled
-        );
-        for text in [
-            r#"{"compaction_signals":null}"#,
-            r#"{"compaction_signals":"false"}"#,
-            r#"{"compaction_signals":0}"#,
-        ] {
-            assert!(Config::parse(text)
-                .unwrap_err()
-                .contains("compaction_signals"));
-        }
-    }
-}
-
 /// The `anthropic_fallbacks` key of `broca.jsonc`: the operator switches for content-filter
 /// fallback on Anthropic OAuth runs.
 ///

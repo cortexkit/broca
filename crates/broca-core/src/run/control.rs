@@ -151,10 +151,6 @@ pub struct RunControl {
     pub compaction_plane: Option<Arc<dyn crate::compaction::CompactionPlane>>,
     /// The budget for the compaction Setup call. Default uses COMPACTION_CALL_BUDGET_MS.
     pub compaction_config: crate::compaction::CompactionConfig,
-    /// Set at boot. Whether compaction notices carry the provider's cost of editing earlier
-    /// history (`HistoryEditCost`), and whether a provider that must resend the whole history
-    /// after an edit is asked to reset its request chain before the next render.
-    pub compaction_signals: bool,
     /// Views fetched from the session's compaction provider, offered at each step boundary.
     /// Absent, the session renders Setup's message and the views it already applied.
     pub compaction_views: Option<Arc<dyn crate::compaction::CompactionViews>>,
@@ -184,7 +180,6 @@ impl Default for RunControl {
             compaction_plane: None,
             compaction_views: None,
             compaction_config: Default::default(),
-            compaction_signals: true,
             #[cfg(feature = "test-clock")]
             test_compaction: None,
             provider_call_timeout: None,

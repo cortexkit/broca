@@ -146,6 +146,7 @@ fn removed_keys_go_with_a_note_each() {
         "wal_archive_idle_retention_days": 30,
         "session_conversion": {"enabled": false},
         "account_limit_pause": true,
+        "compaction_signals": false,
         "bus_run_events_enabled": true,
     })))
     .unwrap();
@@ -153,7 +154,7 @@ fn removed_keys_go_with_a_note_each() {
         Value::Object(converted.document),
         json!({"bus_run_events_enabled": true})
     );
-    assert_eq!(converted.notes.len(), 5, "{:?}", converted.notes);
+    assert_eq!(converted.notes.len(), 6, "{:?}", converted.notes);
 }
 
 #[test]

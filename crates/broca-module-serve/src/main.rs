@@ -176,9 +176,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let bus_event_config =
         broca_module_serve::bus_events::Config::from_settings(&settings).map_err(ServeIoError)?;
-    let compaction_signals =
-        broca_module_serve::config::CompactionSignalsConfig::from_settings(&settings)
-            .map_err(ServeIoError)?;
     let backup_classes = broca_module_serve::session_class::BackupClasses::from_settings(&settings)
         .map_err(ServeIoError)?;
     let provider_overrides =
@@ -648,7 +645,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     executor_impl = executor_impl.with_context_management(context_management);
-    executor_impl = executor_impl.with_compaction_signals(compaction_signals.enabled);
     let vault_auditor = executor_impl.vault_auditor();
     let store_reader = run_index
         .clone()

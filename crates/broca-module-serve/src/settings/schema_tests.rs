@@ -6,8 +6,8 @@ use subc_config::{Layer, Schema, ValidationContext};
 
 use super::{Settings, SCHEMA};
 use crate::config::{
-    AnthropicFallbackConfig, ClassifierRoutingConfig, CompactionSignalsConfig, ImportConfig,
-    ServiceTierConfig, SessionStorageConfig, StorageSyncConfig,
+    AnthropicFallbackConfig, ClassifierRoutingConfig, ImportConfig, ServiceTierConfig,
+    SessionStorageConfig, StorageSyncConfig,
 };
 
 fn schema() -> Schema {
@@ -55,7 +55,6 @@ fn the_schema_defaults_are_the_readers_defaults() {
         ClassifierRoutingConfig,
         StorageSyncConfig,
         ServiceTierConfig,
-        CompactionSignalsConfig,
         SessionStorageConfig,
         AnthropicFallbackConfig,
         crate::bus_events::Config,

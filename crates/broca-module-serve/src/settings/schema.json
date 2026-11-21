@@ -65,15 +65,6 @@
         "user"
       ]
     },
-    "compaction_signals": {
-      "type": "boolean",
-      "description": "Send the compaction provider notice prices and cache-chain resets.",
-      "default": true,
-      "x-ck-apply": "module_restart",
-      "x-ck-layers": [
-        "user"
-      ]
-    },
     "bus_run_events_enabled": {
       "type": "boolean",
       "description": "Publish run starts and ends on the message bus.",

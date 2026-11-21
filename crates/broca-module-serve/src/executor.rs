@@ -2175,7 +2175,6 @@ pub struct LiveLoopExecutor {
     hooks: Option<Arc<broca_subc::SubcHookPlane>>,
     compaction_plane: Option<Arc<broca_subc::SubcCompactionPlane>>,
     compaction_views: Arc<broca_core::ViewReadyInbox>,
-    compaction_signals: bool,
     elicitation_plane: Option<Arc<broca_subc::consent::ScopedConsentPlane>>,
     /// Where provider-held calls wait for their late results; see `held_runtime`.
     provider_held_lifecycle: Option<Arc<broca_module::held_slots::HeldSlots>>,
@@ -2229,7 +2228,6 @@ impl LiveLoopExecutor {
             hooks: None,
             compaction_plane: None,
             compaction_views: Arc::default(),
-            compaction_signals: true,
             elicitation_plane: None,
             provider_held_lifecycle: None,
             provider_client: build_provider_http_client(),
@@ -2286,11 +2284,6 @@ impl LiveLoopExecutor {
         compaction: Arc<broca_subc::SubcCompactionPlane>,
     ) -> Self {
         self.compaction_plane = Some(compaction);
-        self
-    }
-
-    pub fn with_compaction_signals(mut self, enabled: bool) -> Self {
-        self.compaction_signals = enabled;
         self
     }
 
@@ -2992,7 +2985,6 @@ impl LiveLoopExecutor {
         // later resume re-gets the SAME credential (the loop ignores it on a resume —
         // the value is already durable). Mock stays None; a real run carries the
         // method-qualified vault credential id.
-        control.compaction_signals = self.compaction_signals;
         control.max_same_account_wait = self.max_same_account_wait;
         control.account_limit_pause = self.max_same_account_wait.enabled();
         control.hook_plane = self.hook_plane();

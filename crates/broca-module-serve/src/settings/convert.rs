@@ -56,6 +56,10 @@ const REMOVED: &[(&str, &str)] = &[
         "charge_basis_mapping_version",
         "the charge basis version is always the shipped one",
     ),
+    (
+        "compaction_signals",
+        "notice prices and cache-chain resets are always sent; nothing read the switch",
+    ),
 ];
 
 /// `document` in the schema's shapes.

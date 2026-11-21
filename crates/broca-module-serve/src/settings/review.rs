@@ -53,10 +53,6 @@ const READERS: &[Reader] = &[
         crate::config::ClassifierRoutingConfig
     ),
     reader!(
-        ["compaction_signals"],
-        crate::config::CompactionSignalsConfig
-    ),
-    reader!(
         ["context_management"],
         crate::context_management::ContextManagementConfig
     ),
