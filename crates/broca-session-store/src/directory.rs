@@ -149,7 +149,6 @@ fn holds_ordinal(first: Option<u64>, last: Option<u64>, ordinal: u64) -> bool {
         .is_some_and(|(first, last)| first <= ordinal && ordinal <= last)
 }
 
-/// Reads and writes one session's directory pages.
 /// Directory pages one operation has read, by object name, so the operation reads each page
 /// once. Kept only for the operation: a later change writes new pages under new names.
 #[derive(Default)]
@@ -193,6 +192,12 @@ impl PageMemo {
         page: &PageRef,
     ) -> Result<std::sync::Arc<Page>, DirectoryError> {
         if let Some(read) = self.0.get(&page.object) {
+            // The same level check `Pages::read` makes on a fresh read. Without it, a page that
+            // names itself (or a page above it) one level down would be served from here at
+            // its own level, and a walk down the tree would loop forever.
+            if read.level != page.level {
+                return Err(DirectoryError::Corrupt(page.object.clone()));
+            }
             return Ok(std::sync::Arc::clone(read));
         }
         let read = std::sync::Arc::new(pages.read(page).await?);
@@ -227,6 +232,7 @@ pub struct Abandoned {
     pub segments: Vec<String>,
 }
 
+/// Reads and writes one session's directory pages.
 impl<B: SessionBackend> Pages<'_, B> {
     pub async fn read(&self, page: &PageRef) -> Result<Page, DirectoryError> {
         let sealed = self

@@ -10,6 +10,7 @@ cipher_tests!(
     an_out_of_order_entry_refuses,
     ordinal_lookups_walk_a_deep_tree,
     a_range_walk_reads_only_the_pages_that_overlap_it,
+    a_page_naming_itself_below_refuses_every_walk,
 );
 
 use super::{DirEntry, DirectoryError, Pages};
@@ -203,4 +204,64 @@ fn a_range_walk_reads_only_the_pages_that_overlap_it(cipher: Cipher) {
             "the walk to the tip reads every page"
         );
     });
+}
+
+/// A damaged directory whose root names itself as its own child, one level down, refuses every
+/// lookup instead of looping. Each lookup reads through one memo, and the memo already holds the
+/// root at its real level when the child reference names it again. Each walk runs on its own
+/// thread with a deadline, so a regression fails here rather than hanging the suite.
+fn a_page_naming_itself_below_refuses_every_walk(cipher: Cipher) {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        block_on(self_naming_root(cipher));
+        done.send(()).unwrap();
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("a walk of a self-naming directory never ended");
+}
+
+async fn self_naming_root(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    let addr = SessionAddr("a".into());
+    backend.write_head(&addr, b"h", None, 1).await.unwrap();
+    let key = FrameKey::for_tests(cipher, 1, &[7; 32]);
+    let session = Id128([1; 16]);
+    let pages = Pages {
+        backend: &backend,
+        addr: &addr,
+        session,
+        key: &key,
+        fanout: 3,
+    };
+    let child = super::PageRef {
+        object: "p0".into(),
+        level: 1,
+        first_seq: 0,
+        last_seq: 100,
+        count: 1,
+        first_ordinal: Some(0),
+        last_ordinal: Some(100),
+    };
+    let root_page = super::Page {
+        level: 2,
+        entries: Vec::new(),
+        children: vec![child.clone()],
+    };
+    use crate::codec::Message as _;
+    let sealed = key.seal_unit(&super::aad(&session, "p0"), &root_page.encode());
+    backend.put_object(&addr, "p0", &sealed, 1).await.unwrap();
+    let root = super::PageRef { level: 2, ..child };
+    assert!(matches!(
+        pages.find(Some(&root), 50).await,
+        Err(DirectoryError::Corrupt(_))
+    ));
+    assert!(matches!(
+        pages.find_before(Some(&root), 50).await,
+        Err(DirectoryError::Corrupt(_))
+    ));
+    assert!(matches!(
+        pages.find_ordinal(Some(&root), 50).await,
+        Err(DirectoryError::Corrupt(_))
+    ));
 }
