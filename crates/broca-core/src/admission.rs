@@ -14,25 +14,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::PendingSubmission;
 
-pub(crate) fn attempt_credential_for_send(
-    frozen: &broca_wal::record::AttemptCredential,
-    served_account_ref: Option<String>,
-    auth_refreshed: bool,
-) -> broca_wal::record::AttemptCredential {
-    broca_wal::record::AttemptCredential {
-        credential_ref: if auth_refreshed {
-            None
-        } else {
-            frozen
-                .auth_selection
-                .as_ref()
-                .and_then(|auth| auth.resolved_credential_id.clone())
-        },
-        account_ref: served_account_ref,
-        ..frozen.clone()
-    }
-}
-
 fn logical_input(request: &SubmissionRequest) -> std::borrow::Cow<'_, [Message]> {
     if request.content.is_empty() {
         return std::borrow::Cow::Borrowed(&request.input);

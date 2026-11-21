@@ -29,7 +29,6 @@ pub mod context;
 pub mod creation_times;
 pub mod delivery_order;
 pub mod display_facts;
-pub mod durability_counters;
 pub mod fresh_start;
 pub mod head;
 pub use head::is_mode3_log;
@@ -177,15 +176,12 @@ pub use tool_results::outcome_unknown_result;
 pub use tool_results::{no_dispatch_result, not_dispatched_result};
 pub use wal_writer::ProjectionAdmission;
 pub use wal_writer::{
-    agent_session_ref, session_addr, FileWalStore, ReadOnlyWalReader, RecordObserver,
-    SessionRefIndex, WalHandle, WalStore,
+    agent_session_ref, session_addr, FileWalStore, ReadOnlyWalReader, SessionRefIndex, WalStore,
 };
 pub use wal_writer::{
     session_projection_incomplete, ProjectionRepair, SESSION_PROJECTION_INCOMPLETE,
 };
-pub use wal_writer::{
-    session_storage_refusal, ObservedRecord, RecordOutcome, WalWriteError, WAL_MANIFEST_FILENAME,
-};
+pub use wal_writer::{session_storage_refusal, WAL_MANIFEST_FILENAME};
 
 pub mod account_limit_pause;
 pub use account_limit_pause::{

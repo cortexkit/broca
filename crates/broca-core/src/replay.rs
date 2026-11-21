@@ -3379,8 +3379,6 @@ mod steer_tests;
 #[cfg(test)]
 pub(crate) mod deferred_tests {
     use super::*;
-    use broca_protocol::ToolOutput;
-
     use broca_wal::{DeferredAsk, DeferredExecutor, OnExpiry};
 
     pub(crate) fn prepared(id: &str, batch: &str) -> WalRecord {
@@ -3406,37 +3404,6 @@ pub(crate) mod deferred_tests {
                 material_damage: false,
                 late_execution: LateExecution::Execute,
             },
-        }
-    }
-
-    pub(crate) fn result(id: &str, text: &str) -> Arc<ToolResult> {
-        Arc::new(ToolResult {
-            tool_call_id: ToolCallId(id.into()),
-            output: ToolOutput::Text { text: text.into() },
-            is_error: false,
-        })
-    }
-
-    pub(crate) fn approval(id: &str, key: &str, decision: DeferredDecision) -> WalRecord {
-        WalRecord::ApprovalRecorded {
-            closed_at_ms: None,
-            tags: None,
-            call_key: key.into(),
-            call_id: ToolCallId(id.into()),
-            elicitation_id: Some(format!("q-{id}")),
-            decision,
-            approval_digest: (decision == DeferredDecision::Approved).then(|| "digest".into()),
-            closing_result: (decision != DeferredDecision::Approved).then(|| {
-                result(
-                    id,
-                    match decision {
-                        DeferredDecision::Declined => "pre_tool_declined",
-                        DeferredDecision::Expired => "pre_tool_expired",
-                        DeferredDecision::Unavailable => "pre_tool_unavailable",
-                        _ => unreachable!(),
-                    },
-                )
-            }),
         }
     }
 }

@@ -43,10 +43,7 @@ impl broca_core::HookPlane for ObservedHook {
 }
 
 async fn controlled_hook_deadlines() {
-    use broca_core::{
-        hooks::{HookPlan, HookRuntime, Trace},
-        WalStore,
-    };
+    use broca_core::hooks::{HookPlan, HookRuntime, Trace};
     use cortexkit_role_step_transform_provider::hook::Subject;
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct OpeningHook {
@@ -112,8 +109,6 @@ async fn controlled_hook_deadlines() {
             std::process::id()
         ));
         let bind = broca_protocol::BindIdentity::new(&root, "caller", "clock");
-        let store = broca_core::FileWalStore::new(root.join("wal"));
-        let writer = broca_core::WalHandle::spawn(store.open(&bind).unwrap(), 1).unwrap();
         let runtime = HookRuntime {
             scope: None,
             plan: &plan,
@@ -169,7 +164,6 @@ async fn controlled_hook_deadlines() {
             "a cancelled route must never dispatch later"
         );
         drop(chain);
-        writer.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 }

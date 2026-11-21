@@ -1,14 +1,10 @@
 //! Best-effort, content-free `step.finished.v1` hints, separate from durable billing.
 //!
-//! Normal close reports this writer's open reservations after `WriterClosed` syncs.
-//! After a crash, opening a writer deliberately emits no predecessor hints: replaying
-//! a session for a live hint defeats bounded activation reads. Durable readers still
-//! classify those reservations as possibly billed. The offset index can later answer
-//! "open reservations at the last boundary" cheaply to close this live-view gap.
+//! Each session's append observer (`store`) builds a step's hint from the session's own
+//! records and hands it over once those records are durable. A hint is never retried or
+//! queued on disk: a crash or a full queue loses the hint, never the billing evidence.
 
 use async_trait::async_trait;
-use broca_core::wal_writer::{DurableAttempt, RecordObserver};
-use broca_wal::record::BillingAttemptOutcome;
 use cortexkit_role_llm_runner::step_events::{StepFinished, StepRef};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -31,8 +27,7 @@ pub trait StepEventPublisher: Send + Sync + 'static {
 }
 
 pub struct StepEvents {
-    tx: tokio::sync::mpsc::Sender<DurableAttempt>,
-    store_tx: tokio::sync::mpsc::Sender<StepFinished>,
+    tx: tokio::sync::mpsc::Sender<StepFinished>,
     dropped: Arc<AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -67,22 +62,15 @@ impl StepEvents {
         publisher: Arc<dyn StepEventPublisher>,
     ) -> Self {
         let runner = runner.to_owned();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
-        let (store_tx, mut store_rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StepFinished>(QUEUE_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let task_dropped = dropped.clone();
         let task = tokio::spawn(async move {
             let mut last_warning = None;
-            loop {
-                let event = tokio::select! {
-                    Some(attempt) = rx.recv() => event(&runner, &attempt),
-                    Some(event) = store_rx.recv() => Some(event),
-                    else => break,
-                };
+            while let Some(event) = rx.recv().await {
                 let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                    let body = event
-                        .and_then(|event| serde_json::to_vec(&event).ok())
-                        .ok_or("invalid step event evidence")?;
+                    let body =
+                        serde_json::to_vec(&event).map_err(|_| "invalid step event evidence")?;
                     let subject = match &subject {
                         Some(subject) => subject.clone(),
                         None => publisher.live_subject(&runner).await?,
@@ -91,7 +79,8 @@ impl StepEvents {
                 })
                 .await;
                 if !matches!(result, Ok(Ok(()))) {
-                    // No retry: the WAL is authority, and a hint must not build a backlog.
+                    // No retry: the session's records are the authority, and a hint must not
+                    // build a backlog.
                     task_dropped.fetch_add(1, Ordering::Relaxed);
                     let now = tokio::time::Instant::now();
                     if last_warning.is_none_or(|last| {
@@ -103,25 +92,16 @@ impl StepEvents {
                 }
             }
         });
-        Self {
-            tx,
-            store_tx,
-            dropped,
-            task,
-        }
+        Self { tx, dropped, task }
     }
 
     /// Publishes the step event of a fork attempt's model call, best effort as every step event
     /// is. It is an ordinary event of the fork's own session and the attempt's own run, which
     /// keep it apart from the head's steps.
     pub(crate) fn publish_fork(&self, event: StepFinished) {
-        if event.check().is_err() || self.store_tx.try_send(event).is_err() {
+        if event.check().is_err() || self.tx.try_send(event).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    pub fn observe(&self, observer: RecordObserver) -> RecordObserver {
-        observer.with_step_events(self.tx.clone(), self.dropped.clone())
     }
 
     pub(crate) fn store_observer(
@@ -136,7 +116,7 @@ impl StepEvents {
             bind,
             incarnation,
             first_live_seq,
-            self.store_tx.clone(),
+            self.tx.clone(),
             self.dropped.clone(),
             parts,
             warm_stops,
@@ -144,7 +124,7 @@ impl StepEvents {
     }
 
     /// Queue overflows, disconnected receivers, invalid evidence and failed publishes.
-    /// Activation can expose this counter in health without involving the WAL writer.
+    /// Health reports this counter.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -190,69 +170,6 @@ impl Facts<'_> {
             .with_attempt_id(self.attempt_id),
         )
     }
-}
-
-fn event(runner: &str, attempt: &DurableAttempt) -> Option<StepFinished> {
-    let reservation = &attempt.reservation;
-    let envelope = &attempt.envelope;
-    let writer = attempt.writer_id?;
-    let writer = writer
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let position = StepRef::new(
-        runner,
-        &reservation.session.session_ref,
-        format!("{}.{writer}", attempt.lineage?),
-        attempt.seq,
-    );
-    let terminal_status = if attempt.interrupted_at_ms.is_some() {
-        "interrupted"
-    } else {
-        match envelope.outcome {
-            BillingAttemptOutcome::Complete => "completed",
-            BillingAttemptOutcome::Cancelled => "cancelled",
-            BillingAttemptOutcome::Unknown | BillingAttemptOutcome::SealedInFlight => "interrupted",
-            _ => "failed",
-        }
-    };
-    let event = Facts {
-        position,
-        run_id: &reservation.run_id.0,
-        step_id: reservation.step_id.0,
-        attempt: reservation.attempt,
-        status: terminal_status,
-        harness: &reservation.session.bind.harness,
-        session: &reservation.session.bind.session,
-        provider: &reservation.provider,
-        model: envelope
-            .model_used
-            .as_ref()
-            .unwrap_or(&reservation.model_sent),
-        started_at_ms: envelope.sent_at_ms.unwrap_or(reservation.reserved_at_ms),
-        finished_at_ms: attempt.interrupted_at_ms.or(envelope.finished_at_ms)?,
-        attempt_id: attempt.attempt_id.as_str(),
-    }
-    .build()?;
-    let mut event = finish(event, envelope, terminal_status == "interrupted");
-    event.work_class = reservation.run.work_class.clone();
-    event.request_body_bytes = Some(reservation.request_body_bytes);
-    event.context_limit = reservation.run.context_limit;
-    event
-        .route_decision_id
-        .clone_from(&attempt.route_decision_id);
-    event.sent_to_last_content_ms = attempt.sent_to_last_content_ms;
-    event.first_to_last_content_ms = attempt.first_to_last_content_ms;
-    if let Some(cache) = &attempt.cache {
-        event.cache = cache_report(
-            &cache.frozen_render_config,
-            &event.provider,
-            cache.keep_warm.as_ref(),
-            cache.stop_reason.as_deref(),
-        );
-    }
-    event.check().ok()?;
-    Some(event)
 }
 
 fn cache_report(
@@ -353,67 +270,58 @@ pub fn fork_step_event(step: &ForkStep<'_>) -> Option<StepFinished> {
         attempt_id: &attempt_id,
     }
     .build()?;
-    let envelope = broca_wal::record::AttemptEnvelope {
+    let measured = Measured {
         usage: Some(step.usage),
         finish_reason: step.finish_reason,
         // Usage is canonical: recorded reasoning is a subset of output, not extra output.
         reasoning_included_in_output: step.usage.reasoning_tokens.map(|_| true),
         ..Default::default()
     };
-    let event = finish(event, &envelope, false);
+    let event = finish(event, &measured);
     event.check().ok()?;
     Some(event)
 }
 
-/// Both storages use the same usage projection. Missing or interrupted evidence stays absent.
-fn finish(
-    mut event: StepFinished,
-    envelope: &broca_wal::record::AttemptEnvelope,
-    interrupted: bool,
-) -> StepFinished {
-    if !interrupted {
-        let mut usage = envelope.usage.unwrap_or_default();
-        let mut split_5m = envelope.cache_write_5m_tokens;
-        let mut split_1h = envelope.cache_write_1h_tokens;
-        if let Some(models) = &envelope.usage_by_model {
-            usage = Default::default();
-            split_5m = Some(0u64);
-            split_1h = Some(0u64);
-            for model in models {
-                usage += model.usage;
-                split_5m = split_5m
-                    .zip(model.cache_write_5m_tokens)
-                    .and_then(|(sum, n)| sum.checked_add(n));
-                split_1h = split_1h
-                    .zip(model.cache_write_1h_tokens)
-                    .and_then(|(sum, n)| sum.checked_add(n));
-            }
-        }
-        // A partial split is not a breakdown of the total; keep both lifetimes unknown.
-        if split_5m
-            .zip(split_1h)
-            .and_then(|(a, b)| a.checked_add(b))
-            .is_none_or(|sum| Some(sum) != usage.cache_write_tokens)
-        {
-            split_5m = None;
-            split_1h = None;
-        }
-        event.input_tokens = usage.input_tokens;
-        event.cached_input_tokens = usage.cached_input_tokens;
-        event.cache_write_tokens = usage.cache_write_tokens;
-        event.output_tokens = usage.output_tokens;
-        event.reasoning_tokens = usage.reasoning_tokens;
-        event.cache_write_5m_tokens = split_5m;
-        event.cache_write_1h_tokens = split_1h;
-        event.reasoning_included_in_output = envelope.reasoning_included_in_output;
-        event.provider_request_id = envelope.vendor_request_id.clone();
-        event.finish_reason = envelope.finish_reason.and_then(|reason| {
-            serde_json::to_value(reason)
-                .ok()?
-                .as_str()
-                .map(str::to_owned)
-        });
+/// What a step measured, as [`finish`] reports it. Absent values stay absent.
+#[derive(Default)]
+struct Measured {
+    usage: Option<broca_protocol::Usage>,
+    finish_reason: Option<broca_protocol::FinishReason>,
+    reasoning_included_in_output: Option<bool>,
+    cache_write_5m_tokens: Option<u64>,
+    cache_write_1h_tokens: Option<u64>,
+}
+
+/// Puts a finished step's usage on its event. Usage the step did not measure stays absent.
+fn finish(mut event: StepFinished, measured: &Measured) -> StepFinished {
+    let usage = measured.usage.unwrap_or_default();
+    let (mut split_5m, mut split_1h) = (
+        measured.cache_write_5m_tokens,
+        measured.cache_write_1h_tokens,
+    );
+    // A partial split is not a breakdown of the total; keep both lifetimes unknown.
+    if split_5m
+        .zip(split_1h)
+        .and_then(|(a, b)| a.checked_add(b))
+        .is_none_or(|sum| Some(sum) != usage.cache_write_tokens)
+    {
+        split_5m = None;
+        split_1h = None;
     }
+    event.input_tokens = usage.input_tokens;
+    event.cached_input_tokens = usage.cached_input_tokens;
+    event.cache_write_tokens = usage.cache_write_tokens;
+    event.output_tokens = usage.output_tokens;
+    event.reasoning_tokens = usage.reasoning_tokens;
+    event.cache_write_5m_tokens = split_5m;
+    event.cache_write_1h_tokens = split_1h;
+    event.reasoning_included_in_output = measured.reasoning_included_in_output;
+    event.finish_reason = measured.finish_reason.and_then(|reason| {
+        serde_json::to_value(reason)
+            .ok()?
+            .as_str()
+            .map(str::to_owned)
+    });
     event
 }
 
@@ -422,139 +330,7 @@ mod store;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_wal::{FileWal, Wal};
     use serde_json::{json, Value};
-
-    fn vectors() -> Value {
-        serde_json::from_str(cortexkit_role_llm_runner::vectors::file("step-events.json").unwrap())
-            .unwrap()
-    }
-
-    fn fixture(full: bool) -> DurableAttempt {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = broca_test_support::scratch_root().join(format!(
-            "step-event-vector-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let wal = FileWal::open(root.join("session.wal")).unwrap();
-        let lineage = wal.lineage_id();
-        drop(wal);
-        std::fs::remove_dir_all(root).unwrap();
-        let vector = &vectors()[if full { "full" } else { "minimal" }];
-        let reservation = serde_json::from_value(json!({
-            "run_id":"run_a", "step_id":7, "attempt":if full {1} else {0},
-            "send_index":1, "warm":false, "reserved_at_ms":vector["started_at_ms"],
-            "provider":"provider_a", "endpoint_host":"example.com", "model_sent":"model_a",
-            "credential":{"credential_ref":"private-credential"},
-            "session":{"project_root":"/private/project", "harness":"host_a", "session":"session_a", "session_ref":"runner_session_a"},
-            "run":if full {json!({"work_class":"future_work_class", "context_limit":200000})} else {json!({})},
-            "request_body_bytes":4096, "compressed":false
-        })).unwrap();
-        let mut envelope = json!({"sent":true, "response_bytes":100, "outcome":"complete",
-            "sent_at_ms":vector["started_at_ms"], "finished_at_ms":vector["finished_at_ms"]});
-        if full {
-            envelope.as_object_mut().unwrap().extend(json!({
-                "vendor_request_id":"request_a", "finish_reason":"stop",
-                "usage":{"input_tokens":100, "cached_input_tokens":50, "cache_write_tokens":30, "output_tokens":20, "reasoning_tokens":7},
-                "cache_write_5m_tokens":10, "cache_write_1h_tokens":20,
-                "reasoning_included_in_output":true,
-                "usage_raw":{"prompt":"must not escape", "error":"private text"}
-            }).as_object().unwrap().clone());
-        }
-        DurableAttempt {
-            seq: if full { 42 } else { 43 },
-            lineage,
-            writer_id: Some([0x11; 16]),
-            interrupted_at_ms: None,
-            attempt_id: serde_json::from_value(json!("0123456789abcdef0123456789abcdef")).unwrap(),
-            reservation: Box::new(reservation),
-            envelope: Box::new(serde_json::from_value(envelope).unwrap()),
-            route_decision_id: None,
-            sent_to_last_content_ms: None,
-            first_to_last_content_ms: None,
-            cache: None,
-        }
-    }
-
-    #[test]
-    fn synthetic_step_cache_samples() {
-        use broca_protocol::request::KeepWarm::{Auto, Off};
-        use broca_provider::{
-            spec::WireFamilyId,
-            wire::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax},
-        };
-        let dir = std::env::var_os("BROCA_STEP_CACHE_SAMPLES_DIR").map(std::path::PathBuf::from);
-        if let Some(dir) = &dir {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        for (name, provider, model) in [
-            ("anthropic-5m-off", "anthropic", "claude-synthetic"),
-            ("anthropic-1h-off", "anthropic", "claude-synthetic"),
-            ("chatgpt-implicit-off", "openai-chatgpt", "gpt-synthetic"),
-            ("anthropic-5m-auto-on", "anthropic", "claude-synthetic"),
-            ("anthropic-5m-auto-stopped", "anthropic", "claude-synthetic"),
-        ] {
-            let mut attempt = fixture(true);
-            attempt.reservation.provider = provider.into();
-            attempt.reservation.model_sent = model.into();
-            let chatgpt = provider == "openai-chatgpt";
-            let ttl = if name.contains("1h") {
-                CacheTtl::OneHour
-            } else {
-                CacheTtl::FiveMinutes
-            };
-            let policy = CachePolicy {
-                version: 1,
-                class: CacheClass::Markers {
-                    syntax: MarkerSyntax::AnthropicCacheControl,
-                    ttl,
-                    max_breakpoints: 4,
-                    lookback_blocks: 20,
-                    tail: None,
-                    omit_ttl: ttl == CacheTtl::FiveMinutes,
-                },
-            };
-            let family = if chatgpt {
-                WireFamilyId::OpenAiResponsesChatgpt
-            } else {
-                WireFamilyId::AnthropicMessages
-            };
-            let stopped = name.ends_with("stopped");
-            attempt.cache = Some(broca_core::wal_writer::StepEventCache {
-                frozen_render_config: json!({"family_id":family, "cache":if chatgpt { Value::Null } else { serde_json::to_value(policy).unwrap() }}),
-                keep_warm: Some(if name.contains("auto") { Auto } else { Off }),
-                stop_reason: stopped.then(|| "budget".into()),
-            });
-            let event = event("runner_a", &attempt).unwrap();
-            let value = serde_json::to_value(&event).unwrap();
-            if chatgpt {
-                assert_eq!(value["cache"]["implicit"], true);
-                assert!(value["cache"].get("ttl_ms").is_none());
-            } else {
-                assert_eq!(
-                    value["cache"]["ttl_ms"],
-                    if ttl == CacheTtl::OneHour {
-                        3_600_000
-                    } else {
-                        300_000
-                    }
-                );
-            }
-            assert_eq!(
-                value["cache"]["warming"]["on"],
-                name.contains("auto") && !stopped
-            );
-            assert_eq!(
-                value["cache"]["warming"].get("stop_reason"),
-                stopped.then_some(&json!("cost-cap"))
-            );
-            let body = serde_json::to_vec_pretty(&event).unwrap();
-            if let Some(dir) = &dir {
-                std::fs::write(dir.join(format!("{name}.json")), body).unwrap();
-            }
-        }
-    }
 
     #[test]
     fn warming_report_preserves_unknown_and_maps_only_session_stops() {
@@ -604,138 +380,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn multi_model_cache_write_split_requires_every_model_and_exact_total() {
-        let mut attempt = fixture(true);
-        for (second, total, expected) in [
-            (
-                json!({"model_used":"b", "usage":{"cache_write_tokens":7}}),
-                37,
-                None,
-            ),
-            (
-                json!({"model_used":"b", "usage":{"cache_write_tokens":7}, "cache_write_5m_tokens":3, "cache_write_1h_tokens":4}),
-                37,
-                Some((13, 24)),
-            ),
-            (
-                json!({"model_used":"b", "usage":{"cache_write_tokens":8}, "cache_write_5m_tokens":3, "cache_write_1h_tokens":4}),
-                38,
-                None,
-            ),
-            (
-                json!({"model_used":"b", "usage":{"cache_write_tokens":7}, "cache_write_5m_tokens":3}),
-                37,
-                None,
-            ),
-        ] {
-            attempt.envelope.usage_by_model = Some(serde_json::from_value(json!([
-                {"model_used":"a", "usage":{"cache_write_tokens":30}, "cache_write_5m_tokens":10, "cache_write_1h_tokens":20}, second
-            ])).unwrap());
-            let event = event("runner_a", &attempt).unwrap();
-            assert_eq!(event.cache_write_tokens, Some(total));
-            assert_eq!(
-                event.cache_write_5m_tokens.zip(event.cache_write_1h_tokens),
-                expected
-            );
-            if expected.is_none() {
-                let body = serde_json::to_value(event).unwrap();
-                assert!(body.get("cache_write_5m_tokens").is_none());
-                assert!(body.get("cache_write_1h_tokens").is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn golden_body_matches_role_step_events_vectors() {
-        for full in [false, true] {
-            let attempt = fixture(full);
-            let event = event("runner_a", &attempt).unwrap();
-            let mut expected = vectors()[if full { "full" } else { "minimal" }].clone();
-            // The vectors use invented host identities; broca uses its WAL position and
-            // numeric step id, and always joins on the durable random attempt identity.
-            expected["log_incarnation"] = json!(format!(
-                "{}.11111111111111111111111111111111",
-                attempt.lineage.unwrap()
-            ));
-            expected["step_id"] = json!("7");
-            expected["attempt_id"] = json!("0123456789abcdef0123456789abcdef");
-            expected["terminal_status"] = json!("completed");
-            expected["request_body_bytes"] = json!(4096);
-            if full {
-                expected.as_object_mut().unwrap().remove("harness_step_ref");
-                expected["finish_reason"] = json!("stop");
-            }
-            let actual = serde_json::to_value(&event).unwrap();
-            assert_eq!(actual, expected);
-            for member in vectors()["refused_members"].as_array().unwrap() {
-                for name in member.as_object().unwrap().keys() {
-                    assert!(actual.get(name).is_none(), "content member {name} escaped");
-                }
-            }
-            let decoded = cortexkit_role_llm_runner::step_events::decode_step_finished(
-                "ck.account_a.live.runner_a.step.finished.v1",
-                &serde_json::to_vec(&event).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(decoded, event);
-        }
-    }
-
-    #[test]
-    fn recorded_content_intervals_and_decision_are_optional_and_checked() {
-        let mut attempt = fixture(false);
-        attempt.route_decision_id = Some("frozen-caller".into());
-        attempt.sent_to_last_content_ms = Some(80);
-        attempt.first_to_last_content_ms = Some(60);
-        let value = serde_json::to_value(event("runner_a", &attempt).unwrap()).unwrap();
-        assert_eq!(value["route_decision_id"], "frozen-caller");
-        assert_eq!(value["sent_to_last_content_ms"], 80);
-        assert_eq!(value["first_to_last_content_ms"], 60);
-        let absent = serde_json::to_value(event("runner_a", &fixture(false)).unwrap()).unwrap();
-        for key in [
-            "route_decision_id",
-            "sent_to_last_content_ms",
-            "first_to_last_content_ms",
-        ] {
-            assert!(absent.get(key).is_none(), "{key}");
-        }
-        attempt.first_to_last_content_ms = Some(81);
-        assert!(event("runner_a", &attempt).is_none());
-    }
-
-    #[test]
-    fn interrupted_reservation_has_no_invented_usage_or_new_position() {
-        let mut attempt = fixture(false);
-        attempt.interrupted_at_ms = Some(1790000003000);
-        let event = event("runner_a", &attempt).unwrap();
-        assert_eq!(event.terminal_status, "interrupted");
-        assert_eq!(event.seq, 43);
-        assert_eq!(
-            event.attempt_id.as_deref(),
-            Some("0123456789abcdef0123456789abcdef")
-        );
-        assert_eq!(event.input_tokens, None);
-        assert_eq!(event.finished_at_ms, 1790000003000);
-        attempt.interrupted_at_ms = None;
-        attempt.envelope.outcome = BillingAttemptOutcome::SealedInFlight;
-        attempt.envelope.usage =
-            Some(serde_json::from_value(json!({"input_tokens": 100})).unwrap());
-        let event = super::event("runner_a", &attempt).unwrap();
-        assert_eq!(event.terminal_status, "interrupted");
-        assert_eq!(event.input_tokens, None);
-    }
-
-    #[test]
-    fn missing_identity_or_finish_time_drops_hint_instead_of_inventing_facts() {
-        let mut attempt = fixture(false);
-        attempt.writer_id = None;
-        assert!(event("runner_a", &attempt).is_none());
-        attempt.writer_id = Some([0x11; 16]);
-        attempt.envelope.finished_at_ms = None;
-        assert!(event("runner_a", &attempt).is_none());
-    }
-
     struct Publisher {
         calls: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
         fail: bool,
@@ -752,6 +396,26 @@ mod tests {
         }
     }
 
+    /// A valid step hint, as a session's observer hands it to the publisher.
+    fn hint() -> StepFinished {
+        Facts {
+            position: StepRef::new("broca", "runner_session_a", "log_a", 43),
+            run_id: "run_a",
+            step_id: 7,
+            attempt: 0,
+            status: "completed",
+            harness: "host_a",
+            session: "session_a",
+            provider: "provider_a",
+            model: "model_a",
+            started_at_ms: 1_790_000_001_001,
+            finished_at_ms: 1_790_000_002_000,
+            attempt_id: "0123456789abcdef0123456789abcdef",
+        }
+        .build()
+        .unwrap()
+    }
+
     #[test]
     fn shipping_build_wires_the_bus_publisher() {
         let main = include_str!("../../broca-module-serve/src/main.rs");
@@ -765,13 +429,13 @@ mod tests {
         let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel();
         let events = StepEvents::start(
             "account_a",
-            "runner_a",
+            "broca",
             Arc::new(Publisher { calls, fail: true }),
         )
         .unwrap();
-        events.tx.try_send(fixture(false)).unwrap();
+        events.tx.try_send(hint()).unwrap();
         let (subject, body) = inbox.recv().await.unwrap();
-        assert_eq!(subject, "ck.account_a.live.runner_a.step.finished.v1");
+        assert_eq!(subject, "ck.account_a.live.broca.step.finished.v1");
         cortexkit_role_llm_runner::step_events::decode_step_finished(&subject, &body).unwrap();
         assert_eq!(events.dropped(), 1);
         assert!(inbox.try_recv().is_err(), "failed hint was retried");
@@ -781,7 +445,7 @@ mod tests {
     async fn unavailable_bus_drops_hints_without_publishing() {
         let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel();
         let events = StepEvents::start_on_bus(Arc::new(Publisher { calls, fail: false }));
-        events.tx.try_send(fixture(false)).unwrap();
+        events.tx.try_send(hint()).unwrap();
         broca_test_support::wait_until("the hint without a bus account is dropped", || async {
             if events.dropped() == 1 {
                 Ok(())
@@ -838,12 +502,12 @@ mod tests {
         }
         .build()
         .unwrap();
-        let envelope = broca_wal::record::AttemptEnvelope {
+        let measured = Measured {
             usage: Some(usage),
             finish_reason: Some(broca_protocol::content::FinishReason::Stop),
             ..Default::default()
         };
-        (fork, finish(ordinary, &envelope, false))
+        (fork, finish(ordinary, &measured))
     }
 
     #[test]

@@ -49,8 +49,6 @@ use {
     broca_protocol::Usage,
 };
 
-use crate::wal_writer::WalWriteError;
-
 mod control;
 pub use control::RunControl;
 
@@ -537,22 +535,6 @@ impl std::fmt::Display for RunError {
     }
 }
 
-impl From<WalWriteError> for RunError {
-    fn from(e: WalWriteError) -> Self {
-        match e {
-            WalWriteError::Failed(detail) => RunError::Wal(detail),
-            WalWriteError::RelocationIncomplete { reason } => RunError::Transient(reason),
-            WalWriteError::ProofPathUnavailable => {
-                RunError::Wal(WalWriteError::ProofPathUnavailable.to_string())
-            }
-            WalWriteError::SessionTooLarge { max_bytes } => RunError::SessionTooLarge { max_bytes },
-            WalWriteError::RetainedSessionTooLarge { max_bytes } => {
-                RunError::RetainedSessionTooLarge { max_bytes }
-            }
-        }
-    }
-}
-
 impl From<broca_wal::WalError> for RunError {
     /// Keep a newer-writer refusal typed so admission can class it permanent. Every other WAL
     /// failure, corruption included, stays [`RunError::Wal`] with its text, exactly as before.
@@ -631,10 +613,6 @@ pub struct PhysicalSend {
 /// Implementations must not hold writer locks across an await. Warms can use the same seam.
 #[async_trait::async_trait]
 pub trait AttemptHook: Send + Sync {
-    #[cfg(feature = "test-clock")]
-    fn set_warm_permission_gate_for_test(&self, _gate: Arc<crate::cache_warm::WarmPermissionGate>) {
-        panic!("permission gate requires a warm journal");
-    }
     async fn before_send(
         &self,
         send: PhysicalSend,

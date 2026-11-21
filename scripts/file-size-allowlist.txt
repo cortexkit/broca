@@ -3,7 +3,6 @@
 # this file. Lower or drop an entry when its file shrinks.
 13609 crates/broca-provider/src/transport.rs provider HTTP and socket transport; split retry, socket and stream
 10909 crates/broca-module-serve/src/serve.rs every route's handler; split by operation family
-5785 crates/broca-core/src/wal_writer.rs the WAL's writer (the write-ahead log the session store replaced); deleted with the WAL code
     6637 crates/broca-session-loop/src/run.rs the run loop; split into model step, tool batch and between-step work (compaction views, messages sent into a running run)
 6350 crates/broca-wire/src/lib.rs wire types of every op; split by op family
 7068 crates/broca-wal/src/file_wal.rs the WAL's file store (the write-ahead log the session store replaced); deleted with the WAL code
