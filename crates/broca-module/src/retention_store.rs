@@ -447,14 +447,6 @@ impl RetentionService {
         now_ms: u64,
     ) -> Result<bool, String> {
         let state_root = runtime.state_root();
-        // A move whose journal still names the session hasn't finished; the move, or startup,
-        // finishes it first.
-        if broca_wal::session_storage_move_journal(state_root, &addr.0)
-            .try_exists()
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(false);
-        }
         // A head in two roots is damage, which is never resolved by deleting one of them.
         if broca_wal::session_storage_class(state_root, &addr.0)
             .map_err(|error| error.to_string())?
@@ -539,12 +531,6 @@ impl RetentionService {
         else {
             return Ok(OperatorDeletion::Absent);
         };
-        if broca_wal::session_storage_move_journal(state_root, &addr.0)
-            .try_exists()
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(OperatorDeletion::Held);
-        }
         if let Some(why) = residence_blocks_deletion(runtime, key)? {
             return Ok(OperatorDeletion::Busy(why));
         }

@@ -353,8 +353,7 @@ fn sessions_on_one_plan_hold_no_more_copies_of_its_tool_list_than_the_budget() {
         }
         (answers, actors)
     });
-    let report =
-        crate::memory_report::assemble(answers, 0, 0, Default::default(), Default::default());
+    let report = crate::memory_report::assemble(answers, 0, Default::default(), Default::default());
     let tools = report
         .setup_parts
         .iter()
@@ -463,7 +462,6 @@ fn the_report_of_a_synthetic_store_carries_sizes_and_counts_only() {
     let settled = crate::store_status::SettledRuns::default();
     let report = crate::memory_report::assemble(
         vec![actor.memory()],
-        1,
         0,
         views.memory(|view| view.held_bytes().total()),
         settled.memory(),
@@ -471,7 +469,6 @@ fn the_report_of_a_synthetic_store_carries_sizes_and_counts_only() {
     let json = serde_json::to_string_pretty(&report).unwrap();
     println!("{json}");
     assert_eq!(report.sessions.len(), 1);
-    assert_eq!(report.legacy_sessions, 1);
     assert_eq!(report.largest, [ADDR]);
     assert_eq!(
         report.sessions[0].window_messages,

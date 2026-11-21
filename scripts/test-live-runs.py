@@ -26,9 +26,9 @@ def session(address: str, run_id: str | None = None, session_class: str = "mason
     return row
 
 
-def report(sessions: list[dict], *, unanswered: int = 0, legacy: int = 0) -> dict:
+def report(sessions: list[dict], *, unanswered: int = 0) -> dict:
     return {"sessions": sessions, "running_sessions": sum(s["run_in_progress"] for s in sessions),
-            "unanswered_sessions": unanswered, "legacy_sessions": legacy, "totals": {},
+            "unanswered_sessions": unanswered, "totals": {},
             "largest": [], "setup_parts": [], "closed_session_views": {}, "settled_runs": {}}
 
 
@@ -113,11 +113,6 @@ class LiveRunsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("cannot compare: no memory report (exit 1): ERROR the daemon is not running",
                       result.stderr)
-
-    def test_a_session_on_the_old_storage_cannot_compare(self):
-        result = self.run_gate(report([session("a1")], legacy=1))
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("1 session(s) are open on the old storage (the WAL)", result.stderr)
 
     def test_a_missing_client_cannot_compare(self):
         self.client.unlink()

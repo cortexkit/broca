@@ -645,7 +645,6 @@ async fn memory_report_answers_only_the_operator_and_opens_no_session() {
     assert_eq!(answered.header.ty, FrameType::Response);
     let body: serde_json::Value = serde_json::from_slice(&answered.body).unwrap();
     assert_eq!(body["result"]["sessions"], serde_json::json!([]));
-    assert_eq!(body["result"]["legacy_sessions"], 0);
     assert!(body["result"]["settled_runs"]["max_entries"].is_u64());
     // An option the op does not have is refused, not ignored.
     write_req_epoch(

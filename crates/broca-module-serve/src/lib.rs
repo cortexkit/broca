@@ -56,7 +56,6 @@ pub mod state_root;
 pub mod state_root_lock;
 pub mod step_events;
 pub mod store_key;
-pub mod store_layout;
 pub mod store_restore;
 pub mod system_one;
 pub mod transport_config;

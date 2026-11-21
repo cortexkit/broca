@@ -100,15 +100,6 @@ def main() -> int:
         unanswered = report.get("unanswered_sessions", 0)
         if not unanswered:
             break
-    legacy = report.get("legacy_sessions", 0)
-    if legacy:
-        print(
-            f"cannot compare: {legacy} session(s) are open on the old storage (the WAL), which "
-            "this report does not cover",
-            file=sys.stderr,
-        )
-        return 2
-
     live = [session for session in report["sessions"] if session.get("run_in_progress")]
     print(f"sessions open      {len(report['sessions'])}")
     print(f"live runs          {len(live)}")

@@ -22,8 +22,6 @@ pub const LARGEST: usize = 10;
 pub enum MemoryAnswer {
     /// A session in the session store, sized.
     Store(Box<ActorMemory>),
-    /// A session counted by the report but not sized.
-    Legacy,
     /// An actor closing its session, which the report counts as unanswered.
     Closing,
 }
@@ -49,11 +47,10 @@ pub struct SetupHeld {
     pub bytes: usize,
 }
 
-/// The report from the actors' answers, the count of sessions and unanswered sessions, and the
-/// store runtime's caches.
+/// The report from the actors' answers, the count of sessions that didn't answer, and the store
+/// runtime's caches.
 pub fn assemble(
     answers: Vec<ActorMemory>,
-    legacy_sessions: u64,
     unanswered_sessions: u64,
     closed_session_views: MemoryCache,
     settled_runs: MemoryCache,
@@ -111,7 +108,6 @@ pub fn assemble(
         sessions,
         running_sessions,
         unanswered_sessions,
-        legacy_sessions,
         totals,
         largest,
         setup_parts,
@@ -139,11 +135,10 @@ impl crate::LineageRegistry {
             tokio::time::timeout(ACTOR_WAIT, asked).await.ok().flatten()
         });
         let mut answers = Vec::new();
-        let (mut legacy, mut unanswered) = (0, 0);
+        let mut unanswered = 0;
         for answer in futures::future::join_all(asks).await {
             match answer {
                 Some(MemoryAnswer::Store(memory)) => answers.push(*memory),
-                Some(MemoryAnswer::Legacy) => legacy += 1,
                 Some(MemoryAnswer::Closing) | None => unanswered += 1,
             }
         }
@@ -155,7 +150,7 @@ impl crate::LineageRegistry {
             ),
             None => Default::default(),
         };
-        let mut report = assemble(answers, legacy, unanswered, views, settled);
+        let mut report = assemble(answers, unanswered, views, settled);
         report.setup_stores = setup_stores;
         report
     }

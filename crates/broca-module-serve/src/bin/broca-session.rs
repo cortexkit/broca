@@ -1466,12 +1466,10 @@ fn memory_table(report: &broca_module_serve::wire::MemoryReport) -> String {
         &report.totals,
     ));
     out.push_str(&format!(
-        "{} sessions on the new storage ({} with a run in progress), {} on today's storage, {} \
-         unanswered. Sessions with a run in progress hold their run's entries and request on top \
+        "{} sessions ({} with a run in progress), {} unanswered. Sessions with a run in progress hold their run's entries and request on top \
          of an idle session's bytes.\n",
         report.sessions.len(),
         report.running_sessions,
-        report.legacy_sessions,
         report.unanswered_sessions
     ));
     if !report.setup_parts.is_empty() {

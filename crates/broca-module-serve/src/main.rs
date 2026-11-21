@@ -301,10 +301,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let plane = SubcToolPlane::new(tool_conn, consumer_routes.tool_module.clone());
 
-    // The coordinator: a registry over file-backed lease + WAL stores + the durable run
-    // index, driving the real agentic loop. The module owns its state_root -- the lease, WAL,
-    // and store partition are its durability domain, and the WAL is the system of record: the
-    // store is a projection that can be rebuilt from it, while nothing can rebuild the WAL.
+    // The coordinator: a registry over the session store, the file leases and the run index.
+    // The module owns its state_root: the leases and the session store are its durability
+    // domain, and the session store is the system of record. The run index holds projections
+    // and export facts beside it.
     //
     // `state_root` was resolved at startup: BROCA_STATE_ROOT when set, otherwise the durable
     // data home, `<data home>/cortexkit/broca`, and never the daemon's runtime directory, whose
@@ -312,17 +312,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // default location is a contract with another module, not a local preference.
     // Create the state root up front so the SQLite run index can open its file (the file
     // stores create their own subdirs lazily, but SqliteStore::open needs the dir to exist).
-    // A state root from before the session store had storage classes keeps every session in
-    // one folder tree. Before the class roots are created, that tree becomes the durable root,
-    // once: creating the durable root first would leave the old tree where backups no longer
-    // capture it.
-    broca_module_serve::store_layout::class_single_folder_tree(&state_root).map_err(|error| {
-        ServeIoError(format!(
-            "the new storage's single-folder tree in {} couldn't be made its durable root: \
-             {error}",
-            state_root.display()
-        ))
-    })?;
     create_state_directories(&state_root)?;
     // The catalog only guides external backup capture; a filesystem refusal must not take
     // session service offline.

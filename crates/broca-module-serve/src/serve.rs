@@ -3934,7 +3934,7 @@ where
                         channel,
                         epoch,
                         corr,
-                        NOT_SERVED_ON_OLD_STORAGE,
+                        NO_SESSION_STORE,
                         "session.tag_map is served only by a handler with the session store",
                     )
                     .await
@@ -3984,7 +3984,7 @@ where
                         channel,
                         epoch,
                         corr,
-                        NOT_SERVED_ON_OLD_STORAGE,
+                        NO_SESSION_STORE,
                         "session.request_dump is served only by a handler with the session store",
                     )
                     .await
@@ -4028,7 +4028,7 @@ where
                         channel,
                         epoch,
                         corr,
-                        NOT_SERVED_ON_OLD_STORAGE,
+                        NO_SESSION_STORE,
                         "session.delete is served only by a handler with the session store",
                     )
                     .await
@@ -4371,7 +4371,7 @@ where
                         channel,
                         epoch,
                         corr,
-                        NOT_SERVED_ON_OLD_STORAGE,
+                        NO_SESSION_STORE,
                         "session.plan_view is served only by a handler with the session store",
                     )
                     .await
@@ -5678,7 +5678,7 @@ const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 
 /// The refusal of an op only the session store serves, from a handler that has no session
 /// store. Only test handlers lack one.
-const NOT_SERVED_ON_OLD_STORAGE: &str = "not_served_on_old_storage";
+const NO_SESSION_STORE: &str = "no_session_store";
 
 /// Whether `method` is served for a session in the session store. Every other op is refused
 /// with `not_served_on_new_storage` for such a session. An op joins this list in the change
