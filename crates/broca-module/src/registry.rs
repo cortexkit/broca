@@ -1,14 +1,14 @@
-//! The lineage registry: process-global admission for one actor per session.
+//! The session registry: process-global admission for one actor per session.
 //!
 //! Every `session.*`/`run.*` op for a session is routed through this registry so a
-//! teardown can never race a concurrent op. The registry mutex is held ONLY for the fast
-//! state check + slot transition (never across the slow lease-acquire/replay). It admits
-//! exactly one `Opening` per session (double-reopen coalesce), tags each `Open` slot with
-//! a GENERATION (so a stale handle a racing op grabbed can be detected), and serializes
-//! Open↔Closing↔Closed. Actor teardown stops subscribers and the WAL writer before
+//! teardown can never race a concurrent op. The registry mutex is held only for the fast
+//! state check and slot transition, never across the slow lease acquire and session load. It
+//! admits exactly one `Opening` per session (concurrent opens share it), tags each `Open` slot
+//! with a generation (so a stale handle a racing op grabbed can be detected), and serializes
+//! Open↔Closing↔Closed. Actor teardown stops subscribers and closes the session before
 //! releasing the lease, so a replacement actor cannot overlap the old writer or routes.
 //!
-//! See `docs/lineage-actor-coordinator.md` §1.
+//! See `docs/session-actors.md` §2.
 
 use broca_diagnostics::JobKind;
 

@@ -1,11 +1,11 @@
-//! broca as a subc module: the session-lineage coordinator.
+//! broca as a subc module: the session actors and their registry.
 //!
-//! One in-process ACTOR per open session owns that session's durable substrate (lease +
-//! WAL + store partition) for its lifetime and runs the agentic loop on behalf of
-//! consumers. A process-global registry admits exactly one actor per session and
-//! mediates open/close. Fan-out streams a run's control/display events to subscribers
-//! with per-subscriber backpressure. The `session.*`/`run.*` serve types live here; subc
-//! owns the wire mechanics (see `docs/lineage-actor-coordinator.md`).
+//! One in-process actor per open session holds that session's lease and its open session in
+//! the session store for its lifetime, and runs the agentic loop on behalf of consumers. A
+//! process-global registry admits exactly one actor per session and mediates open/close.
+//! Fan-out streams a run's control and display events to subscribers with per-subscriber
+//! backpressure. The `session.*`/`run.*` handlers live here; subc owns the wire mechanics (see
+//! `docs/session-actors.md`).
 #![forbid(unsafe_code)]
 
 // The memory budget tests count what their thread allocates (see `broca_test_support::alloc`).
