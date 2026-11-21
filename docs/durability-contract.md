@@ -1,7 +1,8 @@
 # Durability contract
 
-This document defines the authoritative record set and replay semantics.
-See `docs/wal-and-resume-design.md` for on-disk encoding and task mechanics.
+This document defines the record set and replay semantics of the old log format, whose record
+types broca still carries in `broca-records` while that code is removed. Sessions are kept in the
+session store; its layout, sync points, sealed history and resume are in `docs/session-store.md`.
 
 Roots marked `broca-state/2` are no longer served: startup names the removed
 staging format and requires a fresh state root. The version-4/overhaul WAL rules
@@ -41,7 +42,7 @@ a strong per-record **digest (SHA-256/BLAKE3, NOT crc32)** over header +
 payload. Replay validates monotonic `seq` and the digest; `fence` is retained as a
 forensic lease-tenure stamp and is not a replay gate.
 Fence/dedup keys are **COMPOUND**: `session/run/batch/tool_call_id`, never
-bare `tool_call_id`. Encoding + size caps: `docs/wal-and-resume-design.md` §1.
+bare `tool_call_id`.
 Every session WAL has a total-byte ceiling of **1 GiB (1,073,741,824 bytes)**,
 shared by append and recovery. Admission reserves lineage metadata and a bounded
 terminal before accepting ordinary records. A byte-budget refusal writes nothing,
@@ -446,9 +447,9 @@ PROVIDER-INVALID (Anthropic rejects it).
    prefix, and durably tombstone attributed tool calls under `wal-recovery/v1`.
    The visibility proof names the damage reason but is never a safety boundary.
    `wal_recovery: "refuse"` rejects damaged overhaul files without changing them.
-   See `wal-and-resume-design.md` for crash ordering, immutable manifests and the
-   non-blocking `unattributed_tool_risk` warning when storage damage destroyed
-   attribution. Unknown must-understand features refuse in either mode. For legacy
+   When storage damage destroyed attribution, recovery adds the non-blocking
+   `unattributed_tool_risk` warning. Unknown must-understand features refuse in
+   either mode. For legacy
    recovery, a digest-verified frame that this reader cannot interpret
     is intact authority data, not evidence of crash damage: it refuses replay/open,
     even at EOF, and is never repaired or truncated. Trailing lineage metadata
@@ -516,7 +517,7 @@ PROVIDER-INVALID (Anthropic rejects it).
 5. **In-flight model step** (no `model_step_finished`) → re-run cleanly (no record);
    `stream_gen` abandons dead-generation assembly.
 6. **Effective context = materialized-store prefix ⊕ in-WAL tail, by WAL SEQ
-   watermark** (read ATOMICALLY — see `wal-and-resume-design.md` §4), NOT by
+   watermark** (read ATOMICALLY), NOT by
    `step_id` (too coarse: it drops or double-includes same-step records).
 
 ## 5. Single writer + finalization (lease)

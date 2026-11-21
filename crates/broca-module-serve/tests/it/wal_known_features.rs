@@ -41,7 +41,7 @@ fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
     // server-side and client-side content-filter fallback, credential selections frozen
     // with their auth method, a step's output cap lowered to fit its context limit, and the
     // stamped version 4 frame header, writer lifecycle, late-visibility proofs and
-    // durable RecoveryCut records and per-ride rendering envelopes (see docs/wal-and-resume-design.md).
+    // durable RecoveryCut records and per-ride rendering envelopes.
     // It also lists the newer session storage, which this build refuses by name rather than serves.
     assert_eq!(
         expected,
