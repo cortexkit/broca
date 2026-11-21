@@ -1518,10 +1518,6 @@ pub enum StoppingAt {
 /// failures describe lease or store problems; `SendIdReuse` is a typed request rejection.
 #[derive(Debug, Clone)]
 pub enum ServeError {
-    SessionLogMissing {
-        session: String,
-        harness: String,
-    },
     Upload(broca_core::media_uploads::UploadError),
     MediaTooLarge(cortexkit_role_llm_runner::errors::MediaTooLargeDetail),
     ContextCeiling(broca_protocol::ContextCeilingDetail),
@@ -1550,26 +1546,13 @@ pub enum ServeError {
     /// after the restart. It says nothing about whether an earlier request with the same send
     /// id was admitted: a keyed resend is answered from the record once broca serves again.
     ModuleStopping(StoppingAt),
-    /// The store proves history exists, but neither live nor archived WAL can cover it.
-    HistoryUnreachable {
-        session_ref: String,
-        reason: String,
-    },
     /// A whole message or model-view atomic group would exceed one encoded subc frame.
     ReplyTooLarge(ReplyTooLargeDetail),
-    /// The session's WAL holds a frame that requires WAL features this build does not know
-    /// (`missing`): a newer broca wrote it. Nothing was written and retrying cannot help, so
-    /// it answers with its own wire code rather than [`ServeError::Open`]. `reason` is the
-    /// text [`ServeError::Open`] would have carried, so the message reads exactly as before.
     RetainedSessionTooLarge {
         max_bytes: u64,
     },
     SessionTooLarge {
         max_bytes: u64,
-    },
-    WalNewerWriter {
-        missing: Vec<String>,
-        reason: String,
     },
     /// The queued submission named by a deterministic send identity was durably retracted.
     SendRetracted {
@@ -1681,9 +1664,6 @@ pub enum ServeError {
 impl From<OpenError> for ServeError {
     fn from(e: OpenError) -> Self {
         match e {
-            OpenError::SessionLogMissing {
-                session, harness, ..
-            } => Self::SessionLogMissing { session, harness },
             OpenError::SessionMoving { cut_id } => Self::SessionMoving { cut_id },
             OpenError::SessionMoved { holder } => Self::SessionMoved { holder },
             OpenError::Expired { expired_at_ms } => ServeError::Expired { expired_at_ms },
@@ -1699,16 +1679,6 @@ impl From<OpenError> for ServeError {
             OpenError::Open(s) => ServeError::Open(s, None),
             OpenError::ModuleStopping => ServeError::ModuleStopping(StoppingAt::Open),
             OpenError::Classified { reason, class } => ServeError::Open(reason, Some(class)),
-            OpenError::HistoryUnreachable {
-                session_ref,
-                reason,
-            } => ServeError::HistoryUnreachable {
-                session_ref,
-                reason,
-            },
-            OpenError::NewerWriter { missing, reason } => {
-                ServeError::WalNewerWriter { missing, reason }
-            }
             OpenError::NotServedOnNewStorage { feature } => {
                 ServeError::NotServedOnNewStorage { feature }
             }
@@ -1722,7 +1692,6 @@ impl std::fmt::Display for ServeError {
         match self {
             ServeError::CredentialsUnavailable => write!(f, "the vault credential listing has not loaded yet"),
             ServeError::CredentialAmbiguous { credential, candidate_ids } => write!(f, "credential {credential} is ambiguous: {}", candidate_ids.join(", ")),
-            ServeError::SessionLogMissing { session, harness } => OpenError::SessionLogMissing { session: session.clone(), harness: harness.clone(), read: None }.fmt(f),
             Self::Upload(error) => error.fmt(f),
             Self::MediaTooLarge(_) => f.write_str("committed image exceeds a reported image limit"),
             ServeError::UnknownSend => write!(f, "send_id is not recorded for this caller"),
@@ -1738,11 +1707,7 @@ impl std::fmt::Display for ServeError {
             ServeError::ServiceTierInvalid { message, .. } => f.write_str(message),
             ServeError::SessionTooLarge { max_bytes } => write!(f, "session log cannot exceed {max_bytes} bytes"),
             ServeError::RetainedSessionTooLarge { max_bytes } => write!(f, "retained session log cannot exceed {max_bytes} bytes"),
-            ServeError::Open(s, _)
-            | ServeError::HistoryUnreachable { reason: s, .. }
-            | ServeError::WalNewerWriter { reason: s, .. } => {
-                write!(f, "open failed: {s}")
-            }
+            ServeError::Open(s, _) => write!(f, "open failed: {s}"),
             ServeError::ReplyTooLarge(_) => {
                 f.write_str("the session.read reply exceeds the transport frame limit")
             }
@@ -3188,9 +3153,6 @@ impl ServeHandler for crate::LineageRegistry {
             }
             SendOutcome::RetainedSessionTooLarge { max_bytes } => {
                 Err(ServeError::RetainedSessionTooLarge { max_bytes })
-            }
-            SendOutcome::NewerWriter { missing, reason } => {
-                Err(ServeError::WalNewerWriter { missing, reason })
             }
             SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
             SendOutcome::CredentialsUnavailable => Err(ServeError::CredentialsUnavailable),

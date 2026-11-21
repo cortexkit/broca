@@ -1576,12 +1576,9 @@ and `open_transient.json` under `crates/broca-wire/tests/golden/`.
 A log holding a record kind or a must-understand field this build does not know was written by
 a newer broca. Release placement refuses such a downgrade before it happens: the state root's
 feature floor lists what its logs need, and a build that does not know every entry is not
-placed. The `wal_newer_writer` code (pinned by `crates/broca-wire/tests/golden/wal_newer_writer.json`)
-named the same refusal for the old log format.
+placed.
 
-`session.read`'s permanent `history_unreachable` refusal is described in section 15 and
-pinned by `crates/broca-wire/tests/golden/session_read.history_unreachable.json`. When the
-session is already open, `session.subscribe` attaches and then replays its records in the
+When the session is already open, `session.subscribe` attaches and then replays its records in the
 stream; a record it cannot read there ends the stream with `subscribe_replay_failed`.
 
 ## 11. Submission lifecycle + durable queue + retract
@@ -1840,11 +1837,6 @@ Accounting event IDs use `lineage_id:wal_seq`, and timestamps are not join keys.
 `head: {wal_seq, sub_index, incarnation, digest}` is the last durable control unit covered by
 that same view. `session.subscribe {from: head}` therefore
 starts strictly after the read snapshot without a race, gap, or duplicate.
-
-The `history_unreachable` refusal (`class: "permanent"`, pinned by
-`crates/broca-wire/tests/golden/session_read.history_unreachable.json`) named a session whose
-stored rows outlived its old-format log. The session store keeps a session's history in one
-place, so it no longer arises.
 
 An explicit `from_ordinal` is one-based (`0` aliases `1`) and returns the forward range
 `[from_ordinal, from_ordinal + limit)`, capped at the transcript's end. With no cursor the newest
@@ -2695,8 +2687,7 @@ storage. That storage keeps each attempt's request digest, not its bytes. Each s
 from the session's records the way a warm-up rebuilds a recorded request, rendered with the
 run's frozen render config, and written only when its SHA-256 equals the digest the step's last
 attempt recorded. A written file is therefore the body the provider received. Another caller is
-refused `operator_required` before anything reads the session; a session today's storage keeps
-is refused `not_served_on_old_storage`.
+refused `operator_required` before anything reads the session.
 
 Request: `{"run_id": "<run id>"}`. A run the session holds no attempt of is refused
 `unknown_run`; an unknown field is refused `invalid_params`. The bodies go to
@@ -2865,7 +2856,7 @@ transport records why the socket has no usable completion receipt in the attempt
 attempt use that same retirement decision, not an elapsed-gap guess. A retry or refusal
 discovered during sending does not re-enter this boundary and never announces a new
 chain-reset request. Cache warms neither produce these signals nor replace the previous model
-request's [segment-hash fingerprint](cache-dump.md#offline-cache-diagnosis).
+request's [cache-evidence fingerprint](cache-evidence.md).
 
 ## Retired ride-placement trial
 

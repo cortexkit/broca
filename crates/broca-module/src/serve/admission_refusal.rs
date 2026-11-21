@@ -128,15 +128,6 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
             "retained_session_too_large",
             Some(json!({"class": "permanent", "max_bytes": max_bytes})),
         ),
-        ServeError::WalNewerWriter { missing, .. } => (
-            broca_wire::WAL_NEWER_WRITER,
-            Some(
-                serde_json::to_value(broca_wire::WalNewerWriterDetail::NewerWriter {
-                    missing: missing.clone(),
-                })
-                .unwrap(),
-            ),
-        ),
         ServeError::DeliveryRefused { code, .. } => (*code, Some(json!({"field": "delivery"}))),
         ServeError::NotServedOnNewStorage { feature } => (
             crate::store_entries::NOT_SERVED_ON_NEW_STORAGE,
@@ -231,10 +222,6 @@ pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
         RunError::RetainedSessionTooLarge { max_bytes } => {
             ServeError::RetainedSessionTooLarge { max_bytes }
         }
-        RunError::NewerWriter { ref missing } => ServeError::WalNewerWriter {
-            missing: missing.clone(),
-            reason: error.to_string(),
-        },
         RunError::SendIdReuse { differing } => ServeError::SendIdReuse {
             differing: differing.into(),
         },

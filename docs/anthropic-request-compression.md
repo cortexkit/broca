@@ -23,7 +23,7 @@ attempt, retries included, pads and compresses again. Cache warms to the same ho
 same treatment.
 
 The encoding exists only on the wire. Rendering, request dumps, `request_body_len` and
-`request_body_sha256` in attempt records, the WAL and resume all see the uncompressed
+`request_body_sha256` in attempt records, the session's records and resume all see the uncompressed
 rendered bytes.
 
 ### Fallback after a refusal

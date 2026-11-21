@@ -111,25 +111,6 @@ pub enum OpenError {
         reason: String,
         class: broca_protocol::ErrorClass,
     },
-    /// The store proves this session has history, but no live or archived WAL can cover it.
-    HistoryUnreachable {
-        session_ref: String,
-        reason: String,
-    },
-    SessionLogMissing {
-        session: String,
-        harness: String,
-        read: Option<HistoryReadContext>,
-    },
-    /// The session's WAL holds a complete frame that requires WAL features this build does not
-    /// know (`missing`): a newer broca wrote it. Kept apart from [`OpenError::Open`] because the
-    /// remedy differs: retrying cannot help, only placing a build that knows the features can.
-    /// `reason` is the exact text [`OpenError::Open`] would have carried, so the rendered
-    /// message is unchanged.
-    NewerWriter {
-        missing: Vec<String>,
-        reason: String,
-    },
     /// A send creating a head asked for `feature`, which the new storage doesn't serve on a
     /// session's creating send yet. A head starts nowhere else, so it is refused, permanently,
     /// before any session is opened or created.
@@ -141,22 +122,19 @@ pub enum OpenError {
     UnknownSession,
 }
 
-/// Metadata from a successful would-be empty read. It carries no message content
-/// and lets serving retain established cursor refusals before a history refusal.
-#[derive(Debug, Clone)]
-pub struct HistoryReadContext {
-    pub lineage_id: Option<String>,
-    pub prompt_len: Option<u64>,
-    pub tags_await_setup: bool,
-}
-
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HistoryRewriting => f.write_str("history is being rewritten; retry after its writer finishes recovery"),
-            Self::HistoryChanged => f.write_str("history changed while the page was read; read the newest page"),
+            Self::HistoryRewriting => {
+                f.write_str("history is being rewritten; retry after its writer finishes recovery")
+            }
+            Self::HistoryChanged => {
+                f.write_str("history changed while the page was read; read the newest page")
+            }
             Self::SessionMoving { cut_id } => write!(f, "session_moving {{cutId: {cut_id}}}"),
-            Self::SessionMoved { holder: Some(holder) } => {
+            Self::SessionMoved {
+                holder: Some(holder),
+            } => {
                 write!(f, "session_moved {{holder: {holder}}}")
             }
             Self::SessionMoved { holder: None } => f.write_str("session_moved"),
@@ -164,18 +142,13 @@ impl std::fmt::Display for OpenError {
             OpenError::RetentionInvalid(_) => write!(f, "invalid retention"),
             OpenError::SessionClassInvalid(message) => f.write_str(message),
             OpenError::LeaseHeld(s) => write!(f, "session '{s}' held by a live writer"),
-            OpenError::SessionLogMissing { session, harness, .. } => write!(f,
-                "session_log_missing: session {session:?} in harness {harness:?} has history but no log; stop broca and inspect store-maintenance repair-session-root STATE_ROOT --harness {harness:?} --session {session:?}"),
-            OpenError::Open(s)
-            | OpenError::Classified { reason: s, .. }
-            | OpenError::HistoryUnreachable { reason: s, .. }
-            | OpenError::NewerWriter { reason: s, .. } => {
+            OpenError::Open(s) | OpenError::Classified { reason: s, .. } => {
                 write!(f, "open failed: {s}")
             }
             OpenError::ModuleStopping => f.write_str("open failed: module is stopping"),
-            OpenError::NotServedOnNewStorage { feature } => f.write_str(
-                &crate::store_actor::unserved_message(feature),
-            ),
+            OpenError::NotServedOnNewStorage { feature } => {
+                f.write_str(&crate::store_actor::unserved_message(feature))
+            }
             OpenError::UnknownSession => f.write_str("session does not exist"),
         }
     }
@@ -541,7 +514,7 @@ pub enum CutLockMode {
     /// lease to the guard; the guard commits its slot closed when released. Other actors
     /// pause as for `Inspect`; a busy actor refuses without changing its writer.
     Mutate,
-    /// A restore from backup replaces the session (`fence_store_move`): any idle actor closes,
+    /// A restore from backup replaces the session (`fence_for_restore`): any idle actor closes,
     /// tearing down its subscribers and joining its writer, and hands its session lease to the
     /// guard, whether its writer or the actor itself held it. A busy actor refuses without
     /// changing its writer.
@@ -1210,7 +1183,7 @@ impl LineageRegistry {
         // publishes it; the store answers for every session it serves. Both are known in
         // memory, so this check reads nothing.
         if !self.inner.opener.serves_from_store(key)? {
-            if let Some(refusal) = self.inner.store_moves.refusal(key) {
+            if let Some(refusal) = self.inner.restore_fences.refusal(key) {
                 return Err(refusal);
             }
         }
@@ -1296,7 +1269,7 @@ impl LineageRegistry {
                 retention: std::sync::OnceLock::new(),
                 forks: std::sync::OnceLock::new(),
                 owners: Mutex::new(HashMap::new()),
-                store_moves: Default::default(),
+                restore_fences: Default::default(),
                 store_restorer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 close_started: tokio::sync::watch::channel(0).0,
@@ -2795,10 +2768,10 @@ impl LineageRegistry {
     /// calls: open the session if it is closed (its open-time recovery runs first), then ask its
     /// actor to resume a run paused on held calls. A live run needs nothing more.
     pub async fn resume_held_run(&self, session: &LineageKey) -> Result<(), String> {
-        // A move into the new storage holds this session: the delivery is retried on a later
-        // pull, which finds the session where the move left it.
-        if self.inner.store_moves.fenced(session) {
-            return Err("session_moving: a move into the new storage holds this session".into());
+        // A restore holds this session: the delivery is retried on a later pull, which finds
+        // the session as the restore left it.
+        if self.inner.restore_fences.fenced(session) {
+            return Err("session_moving: a restore holds this session".into());
         }
         for _ in 0..3 {
             let handle = self
@@ -3200,7 +3173,7 @@ impl RegistryHandle {
 struct Inner {
     /// The sessions a move into the new storage holds (see `store_move`), by address, and the
     /// reads in flight per address that take no session lease, which such a move waits out.
-    store_moves: store_move::MoveFences,
+    restore_fences: store_move::RestoreFences,
     /// What runs `session.restore_from_backup`, installed by the daemon with its stores.
     store_restorer: std::sync::OnceLock<Arc<dyn store_restore::StoreRestorer>>,
     session_address_inventory: std::sync::OnceLock<Arc<dyn broca_store::SessionAddressResolver>>,

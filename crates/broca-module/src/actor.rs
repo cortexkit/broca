@@ -332,14 +332,6 @@ pub(crate) fn admission_refusal_outcome(error: RunError) -> SendOutcome {
         RunError::RetainedSessionTooLarge { max_bytes } => {
             SendOutcome::RetainedSessionTooLarge { max_bytes }
         }
-        RunError::NewerWriter { missing } => {
-            // The same text the generic arm below renders for this refusal.
-            let reason = RunError::NewerWriter {
-                missing: missing.clone(),
-            }
-            .to_string();
-            SendOutcome::NewerWriter { missing, reason }
-        }
         error => SendOutcome::ClassifiedError {
             class: error.admission_error_class(),
             reason: error.to_string(),

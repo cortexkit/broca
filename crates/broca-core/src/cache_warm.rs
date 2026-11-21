@@ -7,15 +7,11 @@
 //!
 //! This module holds the provider-agnostic half: the exact bytes of the request in flight (kept
 //! in memory by the run's transport), the per-session clock that says when the cache was last
-//! refreshed, the reconstruction of the most recent request from the WAL when no run holds it in
-//! memory, and the facts the WAL can answer before anything is sent.
+//! refreshed, and what a warm sent or why it failed.
 
 use std::sync::{Arc, Mutex};
 
-use broca_protocol::{
-    error::ProviderError, AttemptOutcome, CallOptions, RunId, StepContext, StepId, ToolChoice,
-    Usage,
-};
+use broca_protocol::{error::ProviderError, AttemptOutcome, CallOptions, RunId, StepId, Usage};
 use broca_wal::{RunConfig, WalRecord};
 
 /// A warm is refused, and nothing sent, when less than this much of the cache's estimated
@@ -225,16 +221,6 @@ pub fn warm_budget_needs_pricing(envelope: &broca_wal::record::AttemptEnvelope) 
         })
 }
 
-/// The same reservation and measured outcome used by live and restarted warm-budget pricing.
-/// The reservation identifies the actual model, which can differ from the episode's model.
-#[derive(Debug, Clone)]
-pub struct FailedWarmAttempt {
-    pub reservation: broca_wal::record::AttemptReservation,
-    pub envelope: broca_wal::record::AttemptEnvelope,
-    /// Marker TTL captured when the actual frozen route was prepared; absent means unknown.
-    pub ttl_ms: Option<u64>,
-}
-
 /// Warm-only send facts taken from the exact frozen render route used for the request.
 #[derive(Debug, Clone, Default)]
 pub struct WarmSendPolicy {
@@ -277,37 +263,6 @@ pub struct RecordedRequest {
     pub route: Option<broca_wal::StepRoute>,
 }
 
-/// Why the most recent request cannot be rebuilt from the WAL.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecordedRequestError {
-    /// The session never sent a model request.
-    NoStep,
-    /// A request was sent, but the WAL cannot reproduce it.
-    Unavailable(String),
-}
-
-/// Whether the WAL records any model request at all.
-pub fn has_model_step(records: &[WalRecord]) -> bool {
-    records.iter().any(|record| {
-        matches!(
-            record,
-            WalRecord::ModelAttemptFinished { .. } | WalRecord::ModelStepFinished { .. }
-        )
-    })
-}
-
-/// The config of the episode starting at `start`, with its refreezes before `end` applied.
-fn effective_config(records: &[WalRecord], start: usize, end: usize) -> Option<(RunId, RunConfig)> {
-    let WalRecord::RunStarted { run_id, config, .. } = &records[start] else {
-        return None;
-    };
-    let mut config = (**config).clone();
-    for record in &records[start..end] {
-        fold_refreeze(&mut config, record);
-    }
-    Some((run_id.clone(), config))
-}
-
 pub(crate) fn fold_refreeze(config: &mut RunConfig, record: &WalRecord) {
     match record {
         WalRecord::RunConfigRefrozen {
@@ -323,226 +278,6 @@ pub(crate) fn fold_refreeze(config: &mut RunConfig, record: &WalRecord) {
         }
         _ => {}
     }
-}
-
-pub fn last_recorded_request_with_lineage(
-    records: &[WalRecord],
-    lineage: Option<&str>,
-) -> Result<RecordedRequest, RecordedRequestError> {
-    let mode3 = crate::is_mode3_log(records.iter());
-    let Some(attempt_at) = records
-        .iter()
-        .rposition(|record| matches!(record, WalRecord::ModelAttemptFinished { .. }))
-    else {
-        return Err(if has_model_step(records) {
-            RecordedRequestError::Unavailable(
-                "the session's model steps carry no record of the request bytes they sent".into(),
-            )
-        } else {
-            RecordedRequestError::NoStep
-        });
-    };
-    let WalRecord::ModelAttemptFinished {
-        step_id,
-        request_body_sha256,
-        ..
-    } = &records[attempt_at]
-    else {
-        unreachable!("the position found is an attempt record");
-    };
-    let start = records[..attempt_at]
-        .iter()
-        .rposition(|record| matches!(record, WalRecord::RunStarted { .. }))
-        .ok_or_else(|| {
-            RecordedRequestError::Unavailable(
-                "the episode that sent the request is not in the WAL".into(),
-            )
-        })?;
-    let step_started = records[start..attempt_at]
-        .iter()
-        .rposition(|record| matches!(record, WalRecord::StepStarted { step_id: s } if s == step_id))
-        .map(|offset| start + offset)
-        .ok_or_else(|| {
-            RecordedRequestError::Unavailable(format!(
-                "the WAL has no step_started record for step {}",
-                step_id.0
-            ))
-        })?;
-    let (run_id, config) = effective_config(records, start, attempt_at).ok_or_else(|| {
-        RecordedRequestError::Unavailable("the episode's run_started is unreadable".into())
-    })?;
-    let committed_route = records[attempt_at..]
-        .iter()
-        .find_map(|record| match record {
-            WalRecord::ModelStepFinished {
-                step_id: committed,
-                fallback,
-                ..
-            } if committed == step_id => Some(fallback.route.clone()),
-            _ => None,
-        });
-    // A refusal recorded before the attempt means the attempt is the step's re-send.
-    let resent_after_refusal =
-        records[step_started..attempt_at]
-            .iter()
-            .find_map(|record| match record {
-                WalRecord::ModelStepRefused {
-                    step_id: refused,
-                    schedule,
-                    ..
-                } if refused == step_id => Some(broca_wal::StepRoute {
-                    model: schedule.fallback.clone(),
-                    reason: broca_wal::StepRouteReason::Refusal,
-                }),
-                _ => None,
-            });
-
-    let mut prior = crate::replay::replay(&records[..step_started])
-        .map_err(|error| RecordedRequestError::Unavailable(format!("replay the WAL: {error}")))?;
-    // The live loop decorates repeated tool results before sending them; replay keeps the raw
-    // results, so the same decoration is reapplied per episode.
-    let spans = prior.episode_step_spans.clone().ok_or_else(|| {
-        RecordedRequestError::Unavailable("the replayed prompt has no episode boundaries".into())
-    })?;
-    for span in spans {
-        if span.end <= prior.prompt.len() {
-            crate::run::restore_repetition_guidance(&mut prior.prompt[span]);
-        }
-    }
-    // A step that has not committed went where the schedule pointed when it opened. Whether
-    // the run was eligible for the fallback is not in the WAL, so this is a best guess, which
-    // the caller's digest comparison confirms before anything is sent.
-    let route = match committed_route {
-        Some(route) => route,
-        None => resent_after_refusal.or_else(|| {
-            prior
-                .refusal_fallback
-                .as_ref()
-                .filter(|schedule| {
-                    schedule.source == config.model
-                        && crate::refusal_fallback::route(Some(schedule), true)
-                            == crate::refusal_fallback::StepRoute::Fallback
-                })
-                .map(|schedule| broca_wal::StepRoute {
-                    model: schedule.fallback.clone(),
-                    reason: broca_wal::StepRouteReason::Schedule,
-                })
-        }),
-    };
-    let mut prompt = prior.prompt;
-    // Steers written before the step opened are rendered by that step; replay of the records
-    // before `step_started` holds them back as pending. The step numbered them as it placed
-    // them, so the rebuild numbers them the same way.
-    let placed = prompt.len();
-    prompt.extend(prior.pending_steers);
-    crate::tags::TagNumbering::number_appended(&mut prompt, placed, &config).map_err(|error| {
-        RecordedRequestError::Unavailable(format!("number the held-back steers: {error}"))
-    })?;
-    broca_protocol::content::stamp_ordinals_from(&mut prompt, 0);
-    // A run frozen with `render_tags` sent its tagged user and tool-result text with the tag
-    // prefix, after the guidance above; the rebuilt request must carry the same bytes. Any run
-    // sent the model's text cleaned where an earlier run under the computed rules cleans it.
-    if !mode3 && config.render_tags {
-        broca_protocol::tags::render_tags_into(
-            &mut prompt,
-            broca_protocol::tags::TagRendering::for_render_config(&config.frozen_render_config),
-        );
-    } else if !mode3 {
-        broca_protocol::tags::clean_computed_into(&mut prompt);
-    }
-    // The one turn a budget allows after its finalize message renders with tool calls disabled.
-    let tool_choice = if prior.budget_finalize_pending {
-        ToolChoice::None
-    } else {
-        config.tool_choice.clone()
-    };
-    let mut opts = CallOptions {
-        declared_markers: Vec::new(),
-        ephemeral_session: crate::retention::is_retention_records(records),
-        prompt,
-        tools: Arc::clone(&config.tools),
-        tool_choice: Arc::new(tool_choice),
-        response_format: Arc::new(config.response_format.clone()),
-        generation: Arc::new(config.generation.clone()),
-        provider_options: Arc::new(config.provider_options.clone()),
-        step_context: Some(StepContext {
-            session_address: None,
-            credential_id: None,
-            account_ref: None,
-            run_id: run_id.0.clone(),
-            step_index: step_id.0,
-            // A cap the step lowered to fit its context limit is part of the bytes it sent.
-            max_output_tokens: crate::output_reservation::recorded_cap(
-                &records[..attempt_at],
-                *step_id,
-            ),
-        }),
-        target_model: Some(
-            route
-                .as_ref()
-                .map_or_else(|| config.model.clone(), |route| route.model.clone()),
-        ),
-        marker_order_version: prior.marker_order_version,
-        render_episodes: Arc::new(broca_protocol::request::RenderHistory {
-            signed_floor: prior
-                .signed_floor
-                .known()
-                .and_then(crate::signed_floor::SignedFloor::floor),
-            ..prior.render_episodes.unwrap_or_default().into()
-        }),
-    };
-    // Compaction may apply after StepStarted and before the attempt. Recover the view
-    // through the attempt boundary, not just the prompt boundary used for steers.
-    if mode3 {
-        let lineage = lineage.ok_or_else(|| {
-            RecordedRequestError::Unavailable(
-                "mode-3 request reconstruction requires the WAL lineage".into(),
-            )
-        })?;
-        let frames: Vec<_> = records[..attempt_at]
-            .iter()
-            .enumerate()
-            .map(|(index, record)| broca_wal::FramedRecord {
-                seq: index as u64 + 1,
-                fence: 0,
-                record: record.clone(),
-            })
-            .collect();
-        let session = frames
-            .iter()
-            .find_map(|frame| match &frame.record {
-                WalRecord::RunStarted { session, .. } => Some(session),
-                _ => None,
-            })
-            .expect("run found above");
-        let state = crate::compaction_v2::session::load(session, &frames)
-            .map_err(RecordedRequestError::Unavailable)?;
-        opts = crate::compaction_v2::render::request_options(
-            &frames,
-            lineage,
-            opts,
-            state.view_for_step(step_id.0),
-        )
-        .map_err(RecordedRequestError::Unavailable)?;
-    } else {
-        let compaction = crate::replay::replay(&records[..attempt_at])
-            .map_err(|error| {
-                RecordedRequestError::Unavailable(format!("replay compaction: {error}"))
-            })?
-            .compaction;
-        if let Some(state) = compaction.state() {
-            opts = crate::compaction::model_options(&opts, state)
-                .map_err(|error| RecordedRequestError::Unavailable(error.to_string()))?;
-        }
-    }
-    Ok(RecordedRequest {
-        run_id,
-        step_id: *step_id,
-        config,
-        opts,
-        request_body_sha256: request_body_sha256.clone(),
-        route,
-    })
 }
 
 #[cfg(test)]

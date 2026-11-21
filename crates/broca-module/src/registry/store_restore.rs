@@ -1,8 +1,8 @@
 //! What restoring sessions from a backup needs from the registry: a place for the daemon to
 //! install the restore (`store_restore` in `broca-module-serve`), which runs
-//! `session.restore_from_backup`. The restore holds a session it repairs with the same fence a
-//! move into the new storage takes ([`LineageRegistry::fence_store_move`]): no actor serves it
-//! and no other owner holds its lease while restore writes.
+//! `session.restore_from_backup`. The restore holds a session it repairs with
+//! [`LineageRegistry::fence_for_restore`]: no actor serves it and no other owner holds its lease
+//! while restore writes.
 
 use std::sync::Arc;
 

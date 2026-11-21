@@ -5532,12 +5532,9 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::ServiceTierInvalid { .. } => "invalid_params".into(),
         ServeError::SessionHeld(_) => "session_held".into(),
         ServeError::Open(_, _) => "open_failed".into(),
-        ServeError::HistoryUnreachable { .. } => broca_wire::HISTORY_UNREACHABLE.into(),
-        ServeError::SessionLogMissing { .. } => "session_log_missing".into(),
         ServeError::ReplyTooLarge(_) => broca_wire::REPLY_TOO_LARGE.into(),
         ServeError::RetainedSessionTooLarge { .. } => "retained_session_too_large".into(),
         ServeError::SessionTooLarge { .. } => "session_too_large".into(),
-        ServeError::WalNewerWriter { .. } => broca_wire::WAL_NEWER_WRITER.into(),
         ServeError::SendRetracted { .. } => "send_retracted".into(),
         ServeError::SendEnded { .. } => "send_ended".into(),
         ServeError::DeliveryRefused { code, .. } => (*code).into(),
@@ -5822,20 +5819,12 @@ async fn send_serve_error(
         return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
     }
     let code = match err {
-        ServeError::SessionLogMissing { session, harness } => {
-            crate::session_address_health::record_missing(session, harness);
-            let body = ErrorBody::new("session_log_missing", err.to_string()).with_detail(
-                serde_json::json!({"class":"permanent", "session":session, "harness":harness}),
-            );
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
-        }
         ServeError::Upload(_)
         | ServeError::CredentialsUnavailable
         | ServeError::CredentialAmbiguous { .. }
         | ServeError::SessionTooLarge { .. }
         | ServeError::RetainedSessionTooLarge { .. }
         | ServeError::Open(_, _)
-        | ServeError::WalNewerWriter { .. }
         | ServeError::VariantUnsupported(_)
         | ServeError::ToolAliasInvalid(_)
         | ServeError::DeliveryRefused { .. }
@@ -5864,14 +5853,6 @@ async fn send_serve_error(
                 err.to_string(),
             )
             .with_detail(serde_json::to_value(detail).map_err(|e| ServeIoError(e.to_string()))?);
-            return send_error_body(writer, ver, channel, epoch, corr, body).await;
-        }
-        ServeError::HistoryUnreachable { session_ref, .. } => {
-            let body = ErrorBody::new(broca_wire::HISTORY_UNREACHABLE, err.to_string())
-                .with_detail(serde_json::json!({
-                    "class": "permanent",
-                    "session_ref": session_ref,
-                }));
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::Expired { expired_at_ms } => {
@@ -7818,43 +7799,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_log_missing_is_named_permanent_and_counted() {
-        let before = crate::session_address_health::health()["session_log_missing"]
-            .as_u64()
-            .unwrap();
-        let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
-        send_serve_error(
-            &tx,
-            PROTOCOL_VERSION,
-            7,
-            3,
-            11,
-            &ServeError::SessionLogMissing {
-                session: "cktui-missing".into(),
-                harness: "broca".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let frame = rx.recv().await.unwrap();
-        assert_eq!(frame.header.ty, FrameType::Error);
-        let error: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(error["code"], "session_log_missing");
-        assert_eq!(error["detail"]["class"], "permanent");
-        assert!(error["message"].as_str().unwrap().contains("cktui-missing"));
-        assert!(error["message"]
-            .as_str()
-            .unwrap()
-            .contains("store-maintenance repair-session-root"));
-        assert!(
-            crate::session_address_health::health()["session_log_missing"]
-                .as_u64()
-                .unwrap()
-                > before
-        );
-    }
-
-    #[tokio::test]
     async fn variant_unsupported_error_body_pins_wire_bytes() {
         let refusal = broca_core::run::VariantRefusal {
             model: "anthropic/claude-opus-5".into(),
@@ -7906,50 +7850,6 @@ mod tests {
         let frame = rx.recv().await.unwrap();
         assert_eq!(frame.header.ty, FrameType::Error);
         assert_eq!(frame.body.as_slice(), br#"{"code":"tool_alias_invalid","message":"tool_alias_invalid: tool \"bash\": alias collides","detail":{"class":"permanent","tool":"bash"}}"#);
-    }
-
-    /// The served newer-writer refusal is byte for byte `broca-wire/tests/golden/
-    /// wal_newer_writer.json`, and its error class is permanent (a caller must not retry it).
-    /// The reason is the golden's own text: the code and detail are the contract, the message
-    /// only carries it.
-    #[tokio::test]
-    async fn wal_newer_writer_error_body_is_the_pinned_golden() {
-        let missing = vec!["probe-unknown/v1".to_string()];
-        assert_eq!(
-            broca_core::RunError::NewerWriter {
-                missing: missing.clone()
-            }
-            .admission_error_class(),
-            broca_protocol::error::ErrorClass::Permanent
-        );
-        let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
-        send_serve_error(
-            &tx,
-            PROTOCOL_VERSION,
-            7,
-            3,
-            11,
-            &ServeError::WalNewerWriter {
-                missing,
-                reason: "wal range-read failed: wal written by a newer broca (NewerWriter): the \
-                         version 3 frame at offset 69 requires features this build does not \
-                         know: probe-unknown/v1"
-                    .into(),
-            },
-        )
-        .await
-        .unwrap();
-        let frame = rx.recv().await.unwrap();
-        assert_eq!(frame.header.ty, FrameType::Error);
-        let golden = std::fs::read(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../broca-wire/tests/golden/wal_newer_writer.json"),
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(frame.body).unwrap(),
-            String::from_utf8(golden).unwrap()
-        );
     }
 
     #[tokio::test]

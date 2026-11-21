@@ -22,7 +22,7 @@
 //! applies its restart backoff, instead of a second process sitting blocked on a root another
 //! one is serving.
 //!
-//! The command-line tools (store-maintenance, wal-fold, broca-session) do not take this lock.
+//! The command-line tools (`broca-session`, `ck-import`) do not take this lock.
 
 use std::fmt;
 use std::fs::{File, TryLockError};

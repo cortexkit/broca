@@ -46,7 +46,7 @@ pub struct SkipSummary {
 }
 
 /// The body of a `run.skipped` marker: which of one session's events were not published.
-/// `from_seq` and `to_seq` are the first and last skipped events in WAL order; `from_ms` and
+/// `from_seq` and `to_seq` are the first and last skipped events in record order; `from_ms` and
 /// `to_ms` are the earliest and latest of their own clocks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkipMarker {
@@ -899,10 +899,10 @@ impl EventStore<'_> {
         Ok(deleted)
     }
 
-    /// Set the depth gauge from the table, once per enable or period start. Every other change
+    /// Set the depth gauge from the table, once when events are enabled. Every other change
     /// moves the counter with the row it inserts, publishes or prunes: the count is a pass over
-    /// every pending row, and running it per projection held the shared connection for the
-    /// length of that pass while every other store operation waited.
+    /// every pending row, and running it for every recorded batch would hold the shared
+    /// connection for the length of that pass while every other store operation waited.
     fn resync_bus_depth(&self) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let depth = conn.query_row(
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     /// The depth gauge follows the rows each call inserts and acknowledges; it is not counted
-    /// again from the table on every projection.
+    /// again from the table on every recording.
     #[test]
     fn bus_outbox_depth_moves_with_its_own_rows_without_a_recount() {
         let store = enabled();
@@ -1359,7 +1359,7 @@ mod tests {
             1
         );
         // Set the `bus_outbox_depth` gauge to 100 while `bus_event_outbox` holds one pending
-        // row. A projection that counts only its own new row leaves 101; one that recounted
+        // row. A recording that counts only its own new row leaves 101; one that recounted
         // the table would set 2.
         store
             .bus_metrics()
@@ -1375,7 +1375,7 @@ mod tests {
         assert_eq!(
             store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
             101,
-            "a projection must add its own rows, not recount the table"
+            "a recording must add its own rows, not recount the table"
         );
         let next = store.pending_bus_event().unwrap().unwrap();
         store

@@ -5,32 +5,6 @@ use std::cell::Cell;
 const NOW: i64 = 200_000_000;
 
 #[test]
-fn diagnostics_missing_session_log_names_the_session_as_an_error() {
-    let mut evidence = healthy();
-    evidence.rings.insert(
-        "session_log_missing".into(),
-        Ok(Snapshot {
-            since_ms: NOW - 1000,
-            truncated: false,
-            events: vec![Event {
-                at_ms: NOW - 1,
-                module: "broca/cktui-missing".into(),
-                code: "session_log_missing".into(),
-            }],
-        }),
-    );
-    let reply = report(evidence, NOW, 1000);
-    let finding = reply
-        .findings
-        .iter()
-        .find(|finding| finding.check == "session_log_missing")
-        .unwrap();
-    assert_eq!(finding.severity, Severity::Error);
-    assert!(finding.summary.contains("cktui-missing"));
-    assert!(finding.hint.contains("repair-session-root"));
-}
-
-#[test]
 fn diagnostics_address_unavailability_is_an_error_from_the_first_refusal_per_reason() {
     let mut evidence = healthy();
     evidence.rings.insert(

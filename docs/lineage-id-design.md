@@ -10,7 +10,7 @@ reads it. A resettable counter cannot identify a durable object.
 
 ## What can recreate a lineage without any transcript event
 
-Broca keys a WAL file by FNV-1a over `(project_root, harness, session)`. Rename the project
+Broca keys a session's storage by FNV-1a over `(project_root, harness, session)`. Rename the project
 directory and the same session id hashes to a DIFFERENT file: the old transcript is stranded and
 the new key reads as an empty lineage. Nothing records it, because from the new key's
 perspective nothing happened.
@@ -18,7 +18,7 @@ perspective nothing happened.
 
 ## The design
 
-A durable opaque `lineage_id`, minted ONCE when the WAL is created and persisted with it.
+A durable opaque `lineage_id`, minted ONCE when the session is created and persisted with it.
 Equality permits after-ordinal continuation; mismatch or absence answers `cursor_expired`.
 `head` stays what it is, the delta cursor.
 
@@ -43,7 +43,7 @@ as copy-then-delete, two files would briefly share an id, and a copy outliving i
 be identity forgery. Any future re-key tooling has to satisfy this, and it is the requirement
 most likely to be violated by someone writing a "safer" version that copies first.
 
-Anything that CREATES a WAL mints a fresh id with no inheritance path, so a lineage appearing at
+Anything that CREATES a session mints a fresh id with no inheritance path, so a lineage appearing at
 a key that once held a different one is a new object with a new id.
 
 ### No backfill on read

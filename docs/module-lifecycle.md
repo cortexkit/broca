@@ -20,14 +20,14 @@ Shutdown must therefore count actors' work, not just the daemon's forwarded RPCs
    own routes. A held final frame parks its run `tool_held`; shutdown leaves that obligation
    open for the late result after restart, rather than writing an Interrupted terminal.
 2. At the next clean step-entry boundary, `on_restart: "resume"` runs durably
-   write `RunPaused{Restart}`; other runs write `RunFinished{Interrupted}`. No
+   write a `Pause{reason: restart}` record; other runs end `interrupted`. No
    cancellation or final seal is triggered by the drain notice. The wall-clock
    `deadline_ms` is logged, not used to start a timer: it is the daemon's drain
    ceiling, not broca's post-GOODBYE budget.
 3. The daemon probes `health.check`. Broca's manifest `self_signals` entry named
    `runs_in_flight` has `kind: "busy"` and
    `anchored_to: {"health_gauges":{"gauges":["runs_in_flight","opening","closing","system_one_batches_in_flight"]}}`.
-   These are existing registry counters in `metrics`, not WAL-derived estimates.
+   These are existing registry counters in `metrics`, not estimates read from records.
    Opening actors may still be admitting work; closing actors may still be
    syncing/joining their writers. Idle open actors and paused runs are **not**
    busy. A restart-paused actor stays open but clears `runs_in_flight`.

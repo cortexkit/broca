@@ -347,18 +347,11 @@ pub enum SendOutcome {
     /// The send was refused because the module is stopping; it did nothing (see
     /// [`crate::serve::ServeError::ModuleStopping`]).
     ModuleStopping(crate::serve::StoppingAt),
-    /// Admission refused the send because the session's WAL holds a frame that requires WAL
-    /// features this build does not know (`missing`). Nothing was written. `reason` is the
-    /// text [`SendOutcome::Error`] would have carried for the same refusal.
     RetainedSessionTooLarge {
         max_bytes: u64,
     },
     SessionTooLarge {
         max_bytes: u64,
-    },
-    NewerWriter {
-        missing: Vec<String>,
-        reason: String,
     },
     /// Admission failed before any durable write because a dependency is temporarily unavailable.
     Transient(String),

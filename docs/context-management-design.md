@@ -6,7 +6,7 @@ is available.
 
 **Current behaviour of `{"transform": ...}`:** broca does not serve it; per-step role contracts
 (step-transform and compaction providers) take its place. It still decodes, because older
-`RunStarted` records carry it. Admission, resume and boot refuse it by name with
+`RunStart` records carry it. Admission, resume and boot refuse it by name with
 `context_management_unavailable`, rather than running the session as `"none"`. Sections below
 that describe the transform mode are the design record, not current behaviour.
 
@@ -26,7 +26,7 @@ A `context_management` field on `session.send`:
 
 Rules:
 
-- **Frozen at admission onto `RunStarted`,** like the tool surface, cache policy and stop
+- **Frozen at admission onto `RunStart`,** like the tool surface, cache policy and stop
   conditions. Resume renders from the frozen value, never from process configuration.
 - **The first episode binds the session.** A later send that omits the field inherits the frozen
   value, the way an omitted tool surface is inherited.
@@ -41,7 +41,7 @@ Rules:
   already froze its value.
 - **A session created before this change** has no frozen value, and keeps what it had: the
   process default at its admission. Record which, so resume doesn't depend on today's env.
-  Nothing durable recorded that default (the transform is never WAL-recorded, and
+  Nothing durable recorded that default (the transform is never recorded, and
   `context_limit` is frozen whether or not a transform ran), so the settled rule is: such a
   session's next new episode binds to the running process's `BROCA_TRANSFORM_MODULE` (`"none"`
   when unset) and freezes it; `broca.jsonc` never reaches it, because a

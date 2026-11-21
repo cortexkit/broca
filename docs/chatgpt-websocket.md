@@ -192,7 +192,7 @@ uses the existing accounted recovery path.
 New `model_attempt_finished` records contain optional `transport` (`websocket` or `https`).
 Old records decode with the field absent and re-encode byte-identically. The existing
 `request_body_len` and `request_body_sha256` still cover the canonical rendered body,
-so cache-dump and prefix/cache identity are unchanged. `websocket_request` separately
+so request dumps and prefix/cache identity are unchanged. `websocket_request` separately
 records the length and SHA-256 of the exact UTF-8 request payload before compression.
 Codex-profile frames additionally record continuation, suffix item count (zero on full input),
 connection generation, previous-ID presence, confirmed physical send count and full-input
@@ -201,7 +201,7 @@ reason. These nested fields, and run starts/refreezes carrying the profile, requ
 
 `full_input_reason` is absent on continuations. Broca emits the following closed
 vocabulary on full-input Codex frames; readers decode it as an **open string** so
-later reasons do not prevent an older broca from reading the WAL after rollback:
+later reasons do not prevent an older broca from reading the session after rollback:
 
 | Value | Evidence at the transport decision |
 | --- | --- |
@@ -228,7 +228,7 @@ precedence over age retirement. A known receipt-compatibility failure always tak
 precedence over a missing-receipt cause.
 
 Optional `cache_evidence` on the attempt contains the canonical full-request
-comparison described in [cache-dump.md](cache-dump.md#offline-cache-diagnosis).
+comparison described in [cache evidence](cache-evidence.md).
 It is independent of the socket frame: a full-input resend can still extend the
 previous logical request exactly. No new log feature requiring reader support is
 needed for this informational field; older record readers ignore it.
@@ -262,7 +262,7 @@ the wait for the first event and the tail through attempt end, including cancell
 preceding the longest gap, or `request_sent` for the initial wait. Event names use the
 same bounded safe-name policy as chunk-error diagnostics and are withheld for ephemeral
 sessions. An unsent attempt has absent timings. This is separate from the narrower
-real-output content classification recorded in the write-ahead log (WAL).
+real-output content classification recorded on the attempt.
 
 The SSE summary uses the `provider.sse.attempt` target, at INFO for failed attempts or
 attempts longer than 120 seconds and DEBUG for shorter successes, like the WebSocket
@@ -288,12 +288,11 @@ do not change request bytes, durable attempt records, retries or deadlines.
 ## Tests
 
 Offline socket tests are in `crates/broca-provider/src/transport_websocket_tests.rs`.
-They exercise a complete tool turn through the real core/WAL, reuse, restart/reconnect,
+They exercise a complete tool turn, reuse, restart/reconnect,
 close diagnostics/deadline, refused-upgrade fallback, sticky fallback, cancellation,
 shutdown-seal handover, identical canonical body hashes, exact handshake headers,
 turn-state metadata, token rotation, upgrade auth recovery, durable auth/account pauses,
-and shared virtual-time idle bounds. Existing WAL pinned-byte tests
-retain every old record unchanged and include present/absent transport evidence.
+and shared virtual-time idle bounds.
 
 
 Targeted regression tests cover:

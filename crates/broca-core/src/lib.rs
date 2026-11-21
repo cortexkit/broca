@@ -151,7 +151,6 @@ pub use account_report::AccountReporter;
 pub use broca_wal::{AccountDecision, AuthSelection, RunConfig, VaultReadOp, VaultRequest};
 // Re-exported so resume APIs can name the run id recovered for the last episode.
 pub use broca_protocol::RunId;
-pub use cache_warm::RecordedRequestError;
 pub use cache_warm::{
     CacheClock, CacheClockReading, RecordedRequest, SentRequest, WarmFailure, WarmSent,
 };

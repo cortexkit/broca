@@ -6,9 +6,8 @@
 //! Each session asked for is first checked without holding it. A session whose head and
 //! everything it names are there is reported kept and its session data is never written. An
 //! unfinished kept session is registered for background recovery. A session that
-//! lacks a file is held with the fence a move into the new storage takes
-//! ([`LineageRegistry::fence_store_move`]): an idle actor serving it closes, a busy one refuses,
-//! and no other owner holds its lease. Then it is restored, which checks it again. Normal loading
+//! lacks a file is held with [`LineageRegistry::fence_for_restore`]: an idle actor serving it
+//! closes, a busy one refuses, and no other owner holds its lease. Then it is restored, which checks it again. Normal loading
 //! never falls back to an older head; only this operator operation does.
 //!
 //! Every session gets one report: its class, address and identity, its outcome, the facts behind
@@ -166,7 +165,7 @@ impl StoreRestore {
         }
         let fence = match self
             .registry
-            .fence_store_move(&bind, self.leases.as_ref())
+            .fence_for_restore(&bind, self.leases.as_ref())
             .await
         {
             Ok(fence) => fence,

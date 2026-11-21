@@ -1798,7 +1798,7 @@ async fn a_store_session_serves_its_ops_and_checks_owners_from_the_store() {
         .await;
     let body = String::from_utf8_lossy(&reply.body).into_owned();
     assert!(
-        !body.contains("wal_newer_writer") && !body.contains("not_served_on_new_storage"),
+        !body.contains("not_served_on_new_storage"),
         "the owner's cancel reaches the store actor: {body}"
     );
 }

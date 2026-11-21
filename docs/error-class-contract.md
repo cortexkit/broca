@@ -185,7 +185,7 @@ broca specifics:
 
 - The canonical enum is `ErrorClass` in `crates/broca-protocol/src/error.rs`.
 - The `Auth` arm's wire spelling is `auth_required`, with `auth` accepted on read
-  indefinitely (serde alias) so WAL records written before the rename replay clean.
+  indefinitely (serde alias) so records written before the rename read clean.
 - `ErrorClass::shared_class()` is the boundary mapping for cross-producer
   consumers. Durable provider records keep the closed producer enum; caller error
   wrappers and served refusal class fields decode through open strings.
@@ -196,10 +196,8 @@ broca specifics:
   |---|---|---|
   | `variant_unsupported` | `permanent` | `{model, variant, defined, class: "permanent"}` |
   | `tool_alias_invalid` | `permanent` | `{tool, class: "permanent"}` |
-  | `wal_newer_writer` | `permanent` | `{kind: "newer_writer", missing: [<feature names>]}` |
   | `agent_run_scopes_unsupported` | `permanent` | `{<session scope>}` |
-  | `session_log_missing` | `detail.class: permanent` | `{class, session, harness}`; a writer would recreate historical content or a read would falsely report empty history; existing named refusals and valid index answers keep precedence; stop broca and inspect `store-maintenance repair-session-root` |
-  | `projection_not_ready` | `detail.class: transient` | `{class}`; the compaction entry projection is incomplete, so `session.entries` or the entry read for `session.apply_view` may succeed after the projection is rebuilt |
+  | `projection_not_ready` | `detail.class: transient` | `{class}`; the provider catalog that decides compaction entry attribution could not be read, so `session.entries` may succeed on retry |
   | `transient` | `detail.class: transient` | `{class, cause?}`; a dependency the request needs has not answered or loaded yet (for a send: the model catalog, a credential lookup), so the same request may succeed on retry. Callers retry by this code alone. `cause` is present only where broca names the dependency: `cause: "credentials_unavailable"` means broca's vault credential listing has not loaded yet; `cause: "module_stopping"` means broca refused the request because it is stopping, the request did nothing and may be repeated after the restart (it says nothing about whether an earlier request with the same `send_id` was admitted) |
 
 - Principal-specific admission refusals `flow_scope_required` and `sender_not_owner` carry a
@@ -281,55 +279,19 @@ broca specifics:
   `crates/broca-wire/tests/golden/routing_unavailable.*.json`, which the real serve path's
   replies are compared with.
 
-  `wal_newer_writer` means the session's WAL holds a complete frame that requires WAL
-  features this build does not know: a newer broca wrote it. The bytes are intact and
-  nothing was written, so retrying cannot help; the remedy is to place a build that
-  knows every name in `missing`. With `missing: ["session-storage/v1"]` it means the session
-  is kept in broca's newer session storage, which this build doesn't serve. It is not in any
-  retryable set. When the materialized
-  store proves a session has history but neither live nor archived WAL can cover it,
-  `session.read` answers `history_unreachable`, class `permanent`, with `session_ref` and
-  no filesystem paths. Every other failure to open a session's WAL, corruption included,
-  stays `open_failed`. The `history_unreachable` and `wal_newer_writer` bodies are pinned by
-  their corresponding `crates/broca-wire/tests/golden/` fixtures.
+  A log holding a record kind or must-understand field this build does not know was written
+  by a newer broca; release placement refuses that downgrade through the state root's feature
+  floor, so a served session never reaches it. Every failure to open a session, corruption
+  included, is `open_failed`.
 
   `open_failed` carries optional `detail.class` in the four-class shared vocabulary.
   Admission and run-resolution causes use `RunError::admission_error_class`, never message
   matching. A send refused before its run starts gets the same typed refusal (its own code,
   detail and class) whichever storage keeps the session and whether or not it carries a fetch
-  plan; a run task that panicked or was aborted before its start stays unclassified. Typed temporary WAL I/O (`Interrupted`, `WouldBlock`, `TimedOut`) is transient:
-  the same read can succeed on retry. Unsupported handler operations are permanent.
-  Opaque storage/write/replay/lifecycle errors remain unclassified, including corruption;
-  neither a generic WAL error nor replay failure establishes retryability. A newer writer
-  retains its dedicated code and unchanged body. When class is absent, no detail is added
-  and legacy bytes are unchanged. Consumers must not invent a default class; they may keep
+  plan; a run task that panicked or was aborted before its start stays unclassified. An open
+  that may succeed when repeated (the session store's key still loading, for example) answers
+  the retryable code `transient` with `detail.cause`. Unsupported handler operations are
+  permanent. Opaque storage, write and lifecycle errors remain unclassified, including
+  corruption; no generic storage error establishes retryability. When class is absent, no
+  detail is added. Consumers must not invent a default class; they may keep
   their legacy fallback for unclassified errors. All other error bodies are unchanged.
-
-### `open_failed` construction inventory
-
-`broca-module::ServeError::Open` has 14 production construction sites in
-`crates/broca-module/src/serve.rs`, pinned by
-`open_failed_classes::every_open_failed_site_chooses_a_class`:
-
-| Site | Class | Reason |
-| --- | --- | --- |
-| `final_message_of`, missing RunStarted | absent | Missing history supplies no retryable I/O cause. |
-| `final_message_of`, replay failure | absent | Replay errors are not evidence that retry can succeed. |
-| `final_message_of`, missing assistant | absent | Transcript shape alone does not establish a remedy. |
-| `From<OpenError>`, `Open` | absent | Lease, write, replay and lifecycle causes were erased. |
-| `From<OpenError>`, `Classified` | carried | Typed temporary WAL read I/O can succeed on retry. |
-| default `head` | permanent | The handler does not implement the operation. |
-| default `warm` | permanent | The handler does not implement the operation. |
-| default `run_result` | permanent | The handler does not implement the operation. |
-| default `baseline` | permanent | The handler does not implement the operation. |
-| `send`, `Error` | absent | Actor storage, replay and lifecycle failures are opaque strings. |
-| `send`, `ClassifiedError` | `admission_error_class()` | The original admission/run-resolution `RunError` knows the remedy. |
-| `retract`, `Error` | absent | Combined WAL read/write errors have erased causes. |
-| `subscribe`, `Error` | absent | Attachment errors combine replay and channel failures. |
-| `warm`, `Error` | absent | Combined replay, storage and actor failures have erased causes. |
-
-The read classifier only marks `Interrupted`, `WouldBlock` and `TimedOut` transient;
-permission errors and other I/O remain unknown. Corrupt WAL bodies remain byte-identical.
-`WalOpenError::Failed` erases its cause in `WalWriteError`, so writes and recovery/proof
-failures stay unknown rather than guessing from their message. `NewerWriter` is handled
-separately before either conversion and never gains `detail.class` here.

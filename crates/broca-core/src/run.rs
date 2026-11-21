@@ -287,14 +287,6 @@ pub enum RunError {
     SessionTooLarge {
         max_bytes: u64,
     },
-    /// The session's WAL holds a frame that requires WAL features this build does not know
-    /// (`missing`): a newer broca build wrote this session. The bytes are intact, so this is
-    /// not corruption, and nothing about the session changes between retries. Only placing a
-    /// build that knows every missing feature lets it resume, which is why it is classed
-    /// permanent rather than retried like a WAL I/O failure.
-    NewerWriter {
-        missing: Vec<String>,
-    },
     /// The run task PANICKED (unwound) before producing a terminal — synthesized by a
     /// drop-guard on the run-driving task so a panic still reports a terminal to the
     /// coordinator (otherwise the coordinator would wait forever for a result that never
@@ -457,7 +449,6 @@ impl RunError {
             | Self::ContextManagementUnavailable { .. }
             | Self::RetainedSessionTooLarge { .. }
             | Self::SessionTooLarge { .. }
-            | Self::NewerWriter { .. }
             | Self::TagNumbering(_) => ErrorClass::Permanent,
             Self::LeaseHeld(_)
             | Self::CredentialsUnavailable
@@ -481,18 +472,6 @@ impl std::fmt::Display for RunError {
             RunError::RetainedSessionTooLarge { max_bytes } => write!(f, "{}", broca_wal::size_limit::error(*max_bytes).message),
             RunError::SessionTooLarge { max_bytes } => write!(f, "{}", broca_wal::size_limit::scoped_error(*max_bytes, broca_wal::size_limit::SizeScope::Session).message),
             RunError::Wal(s) => write!(f, "wal failure: {s}"),
-            RunError::NewerWriter { missing } if missing.iter().any(|name| name == broca_wal::COMPACTION_V2_FEATURE) => write!(
-                f,
-                "newer_writer: session requires {} and needs a newer build to run; it is read-only on this build",
-                missing.join(", ")
-            ),
-            RunError::NewerWriter { missing } => write!(
-                f,
-                "newer_writer: a newer broca build wrote this session's WAL, which requires WAL \
-                 features this build does not know: {}. Retrying cannot help; resume the session \
-                 on a build that knows them",
-                missing.join(", ")
-            ),
             RunError::Panicked => write!(f, "run task panicked before producing a terminal"),
             RunError::TagNumbering(overflow) => write!(f, "{overflow}"),
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),

@@ -85,13 +85,11 @@ impl Gate {
 #[derive(Default)]
 struct State {
     loader: Option<Arc<dyn broca_core::provider::CachePredecessorLoader>>,
-    lineage: Option<String>,
     seeded: bool,
     locator: Option<String>,
     view: Option<u64>,
     previous: Option<Previous>,
     accepted_by_account: HashMap<String, u64>,
-    accepted_loaded: bool,
     accepted_evidence: HashMap<String, broca_core::provider::AcceptedSendEvidence>,
 }
 
@@ -102,8 +100,6 @@ impl State {
             AcceptedSendEvidence::At(*sent)
         } else if let Some(evidence) = self.accepted_evidence.get(account) {
             *evidence
-        } else if self.accepted_loaded {
-            AcceptedSendEvidence::None
         } else {
             AcceptedSendEvidence::NotLoaded
         }
@@ -181,123 +177,6 @@ impl Session {
         state.accepted_evidence.insert(account.to_owned(), evidence);
     }
 
-    pub(super) fn needs_seed(&self, lineage: Option<&str>) -> bool {
-        let state = self.0.lock().unwrap();
-        !state.seeded || state.lineage.as_deref() != lineage
-    }
-
-    pub(super) fn seed(&self, frames: &[broca_wal::FramedRecord], lineage: Option<String>) {
-        let mut previous = None;
-        let mut locator = None;
-        let mut view = None;
-        let mut previous_view = None;
-        let mut accepted_by_account = HashMap::new();
-        let records: Vec<_> = frames.iter().map(|f| f.record.clone()).collect();
-        for frame in frames {
-            match &frame.record {
-                broca_wal::WalRecord::CompactionViewApplied { view_version, .. } => {
-                    view = Some(*view_version)
-                }
-                broca_wal::WalRecord::ModelAttemptFinished {
-                    http_status,
-                    sent_at_ms,
-                    served_account_ref,
-                    envelope,
-                    reservation,
-                    ..
-                } => {
-                    locator = lineage.as_ref().map(|id| format!("{id}:{}", frame.seq));
-                    previous_view = view;
-                    let sent = envelope
-                        .as_deref()
-                        .and_then(|e| e.sent_at_ms)
-                        .or(*sent_at_ms);
-                    let account = reservation
-                        .as_deref()
-                        .and_then(|r| r.credential.account_ref.as_deref())
-                        .or(served_account_ref.as_deref());
-                    note_accepted(&mut accepted_by_account, *http_status, sent, account);
-                }
-                _ => {}
-            }
-        }
-        let rebuilt = broca_core::cache_warm::last_recorded_request_with_lineage(
-            &records,
-            lineage.as_deref(),
-        )
-        .ok()
-        .and_then(|recorded| {
-            let provider = recorded
-                .route
-                .as_ref()
-                .map_or(&recorded.config.model, |route| &route.model)
-                .provider_module_id
-                .clone();
-            let frozen: FrozenRenderConfig =
-                serde_json::from_value(recorded.config.frozen_render_config).ok()?;
-            let frozen = if recorded.route.is_some() {
-                frozen.refusal_fallback?.frozen
-            } else {
-                frozen
-            };
-            let mut provenance = broca_protocol::render_provenance::RenderProvenance::default();
-            let body = crate::registry::wire_family(frozen.family_id)?.render_with_provenance(
-                &frozen,
-                &recorded.opts,
-                Some(&mut provenance),
-            );
-            (RequestDigest::of(&body).sha256 == recorded.request_body_sha256)
-                .then_some((frozen, body, provider, provenance))
-        });
-        if let Some((frozen, body, provider, provenance)) = rebuilt {
-            if let Some((sent, account)) =
-                frames.iter().rev().find_map(|frame| match &frame.record {
-                    broca_wal::WalRecord::ModelAttemptFinished {
-                        sent_at_ms,
-                        served_account_ref,
-                        reservation,
-                        envelope,
-                        ..
-                    } => Some((
-                        envelope
-                            .as_deref()
-                            .and_then(|e| e.sent_at_ms)
-                            .or(*sent_at_ms),
-                        reservation
-                            .as_deref()
-                            .and_then(|r| r.credential.account_ref.clone())
-                            .or_else(|| served_account_ref.clone()),
-                    )),
-                    _ => None,
-                })
-            {
-                previous = fingerprint(frozen.family_id, &body)
-                    .ok()
-                    .map(|fingerprint| fingerprint.with_provenance(&provenance))
-                    .map(|fingerprint| Previous {
-                        fingerprint,
-                        family: frozen.family_id,
-                        sent,
-                        model: format!("{provider}/{}", frozen.wire_model_id),
-                        account,
-                        ttl: ttl(&frozen),
-                        view: previous_view,
-                    });
-            }
-        }
-        *self.0.lock().unwrap() = State {
-            loader: None,
-            lineage,
-            seeded: true,
-            locator,
-            view,
-            previous,
-            accepted_by_account,
-            accepted_loaded: true,
-            accepted_evidence: HashMap::new(),
-        };
-    }
-
     pub(super) fn set_view(&self, view: Option<u64>) {
         self.0.lock().unwrap().view = view;
     }
@@ -324,15 +203,7 @@ impl Session {
             .copied()
     }
     pub(super) fn recorded(&self, locator: Option<String>) {
-        let mut state = self.0.lock().unwrap();
-        // A fresh writer can establish its lineage on the first append, after cold seeding.
-        if state.lineage.is_none() {
-            state.lineage = locator
-                .as_deref()
-                .and_then(|s| s.rsplit_once(':'))
-                .map(|(lineage, _)| lineage.to_owned());
-        }
-        state.locator = locator;
+        self.0.lock().unwrap().locator = locator;
     }
 
     fn finish(
@@ -691,9 +562,9 @@ mod tests {
         assert_eq!(sessions.accepted_at_ms(&bind, "a"), None);
         let session = sessions.bind(&bind);
         assert_eq!(sessions.accepted_at_ms(&bind, "a"), None);
-        session.seed(&[], Some("lineage".into()));
+        session.seed_accepted_send("a", broca_core::provider::AcceptedSendEvidence::None);
         assert_eq!(sessions.accepted_at_ms(&bind, "a"), Some(None));
-        assert_eq!(sessions.accepted_at_ms(&bind, "other"), Some(None));
+        assert_eq!(sessions.accepted_at_ms(&bind, "other"), None);
         note_accepted(
             &mut session.0.lock().unwrap().accepted_by_account,
             Some(200),
@@ -701,7 +572,8 @@ mod tests {
             Some("a"),
         );
         assert_eq!(sessions.accepted_at_ms(&bind, "a"), Some(Some(1000)));
-        assert_eq!(sessions.accepted_at_ms(&bind, "other"), Some(None));
+        // Each account is loaded on its own: a send accepted on "a" says nothing about "other".
+        assert_eq!(sessions.accepted_at_ms(&bind, "other"), None);
     }
 
     fn previous() -> Previous {
@@ -754,18 +626,6 @@ mod tests {
         assert_eq!(stable["model_changed"], false);
     }
 
-    #[test]
-    fn cache_evidence_unknown_history_is_seeded_once_per_session() {
-        let session = Session::default();
-        assert!(session.needs_seed(Some("lineage")));
-        session.seed(&[], Some("lineage".into()));
-        assert!(
-            !session.needs_seed(Some("lineage")),
-            "a verified empty predecessor does not trigger repeated reads"
-        );
-        assert!(session.needs_seed(Some("different-lineage")));
-    }
-
     #[tokio::test]
     async fn cache_evidence_live_metadata_and_abort_gap_do_not_retain_a_body() {
         let frozen = Arc::new(crate::families::frozen_config_for_family(
@@ -789,11 +649,11 @@ mod tests {
         let pending = Pending::default();
         pending.prepare(&request);
         assert!(
-            session.needs_seed(None),
+            !session.0.lock().unwrap().seeded,
             "an aborted task cannot leave an older predecessor reusable"
         );
         drop(pending);
-        assert!(session.needs_seed(None));
+        assert!(!session.0.lock().unwrap().seeded);
         let evidence = session
             .finish(
                 Some(previous()),
@@ -814,7 +674,7 @@ mod tests {
         assert_eq!(evidence["account_changed"], true);
         assert_eq!(evidence["view"], json!({"previous":1,"applied":2}));
         session.recorded(Some("lineage:42".into()));
-        assert!(!session.needs_seed(Some("lineage")));
+        assert!(session.0.lock().unwrap().seeded);
         let old = session.0.lock().unwrap().previous.take();
         assert!(session
             .finish(old, Err("unavailable".into()), &frozen, "new", None, None)
@@ -834,9 +694,8 @@ mod tests {
         );
     }
     #[test]
-    fn accepted_account_clock_tracks_all_2xx_sends_and_seeds_prior_runs() {
+    fn accepted_account_clock_tracks_all_2xx_sends() {
         let session = Session::default();
-        let mut frames = Vec::new();
         for (account, status, sent, outcome) in [
             ("a", Some(200), Some(100), "complete"),
             ("b", Some(200), Some(200), "eof_before_completion"),
@@ -854,22 +713,9 @@ mod tests {
             }))
             .unwrap();
             session.annotate(&mut attempt);
-            frames.push(broca_wal::FramedRecord {
-                seq: frames.len() as u64 + 1,
-                fence: 1,
-                record: broca_wal::WalRecord::model_attempt_finished(
-                    broca_protocol::StepId(1),
-                    attempt,
-                ),
-            });
         }
         assert_eq!(session.last_accepted_at_ms("a"), Some(300));
         assert_eq!(session.last_accepted_at_ms("b"), Some(200));
         assert_eq!(session.last_accepted_at_ms("other"), None);
-        let restarted = Session::default();
-        restarted.seed(&frames, Some("lineage".into()));
-        assert_eq!(restarted.last_accepted_at_ms("a"), Some(300));
-        assert_eq!(restarted.last_accepted_at_ms("b"), Some(200));
-        assert_eq!(restarted.last_accepted_at_ms("other"), None);
     }
 }

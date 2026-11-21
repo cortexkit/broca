@@ -121,17 +121,6 @@ pub trait Provider: Send + Sync {
     /// comparison after a restart needs its predecessor. Installing it performs no history reads.
     fn set_cache_predecessor_loader(&self, _loader: Arc<dyn CachePredecessorLoader>) {}
 
-    /// Restore the bound session's diagnostic predecessor once per WAL lineage, or after
-    /// an aborted in-flight attempt left its predecessor state unavailable.
-    fn cache_evidence_needs_seed(&self, _lineage: Option<&str>) -> bool {
-        false
-    }
-    async fn seed_cache_evidence(
-        &self,
-        _frames: Vec<broca_wal::FramedRecord>,
-        _lineage: Option<String>,
-    ) {
-    }
     /// The applied Magic Context compaction view version is diagnostic, not rendered input.
     fn set_cache_evidence_view(&self, _view: Option<u64>) {}
     fn annotate_cache_evidence(&self, _attempt: &mut broca_protocol::ModelAttempt) {}
@@ -468,16 +457,6 @@ impl Provider for Box<dyn Provider> {
         (**self).set_cache_predecessor_loader(loader)
     }
 
-    fn cache_evidence_needs_seed(&self, lineage: Option<&str>) -> bool {
-        (**self).cache_evidence_needs_seed(lineage)
-    }
-    async fn seed_cache_evidence(
-        &self,
-        frames: Vec<broca_wal::FramedRecord>,
-        lineage: Option<String>,
-    ) {
-        (**self).seed_cache_evidence(frames, lineage).await
-    }
     fn set_cache_evidence_view(&self, view: Option<u64>) {
         (**self).set_cache_evidence_view(view)
     }

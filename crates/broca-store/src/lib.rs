@@ -170,10 +170,8 @@ pub struct SqliteStore {
 
 /// Restrict a store file and its sqlite sidecars to the owner.
 ///
-/// Best-effort by design: a store that opens but cannot be chmod'd should still serve, and
-/// the failure is visible to an operator through `store-maintenance private-mode`, which
-/// reports what it could not tighten. Silently degrading is the wrong trade only if nothing
-/// else reports it, and something does.
+/// Best-effort by design: a store that opens but cannot be chmod'd should still serve. A file
+/// left with wider permissions is logged at WARN, naming it, so the degradation is visible.
 fn restrict_to_owner(path: &Path) {
     #[cfg(unix)]
     {
@@ -185,8 +183,11 @@ fn restrict_to_owner(path: &Path) {
             path.with_extension("db-shm"),
         ] {
             if candidate.exists() {
-                let _ =
-                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600));
+                if let Err(error) =
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+                {
+                    tracing::warn!(path = %candidate.display(), %error, "could not restrict a store file to its owner");
+                }
             }
         }
     }

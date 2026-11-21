@@ -1366,25 +1366,6 @@ impl<F: WireFamily + 'static> Provider for LiveProvider<F> {
         *self.cache_predecessor_loader.lock().unwrap() = Some(loader);
     }
 
-    fn cache_evidence_needs_seed(&self, lineage: Option<&str>) -> bool {
-        self.cache_session
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|s| s.needs_seed(lineage))
-    }
-
-    async fn seed_cache_evidence(
-        &self,
-        frames: Vec<broca_wal::FramedRecord>,
-        lineage: Option<String>,
-    ) {
-        let session = self.cache_session.lock().unwrap().clone();
-        if let Some(session) = session {
-            let _ = tokio::task::spawn_blocking(move || session.seed(&frames, lineage)).await;
-        }
-    }
-
     fn set_cache_evidence_view(&self, view: Option<u64>) {
         if let Some(session) = self.cache_session.lock().unwrap().as_ref() {
             session.set_view(view);

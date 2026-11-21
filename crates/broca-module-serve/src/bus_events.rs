@@ -1,4 +1,5 @@
-//! WAL-to-outbox projection and the asynchronous ck-bus claim-check publisher.
+//! Run events from session writers into the outbox, and the asynchronous ck-bus claim-check
+//! publisher that drains it.
 
 use async_trait::async_trait;
 use broca_module::{
@@ -481,7 +482,7 @@ impl Service {
                         }
                     }
                     if !skip_due && tokio::time::Instant::now() >= retry_at {
-                        // One sequential publisher preserves each run's WAL order through retries.
+                        // One sequential publisher preserves each run's record order through retries.
                         // A pass drains until the outbox is empty or its budget is spent, so a
                         // backlog clears at the broker's pace rather than a fixed count per pass.
                         let drain_started = tokio::time::Instant::now();

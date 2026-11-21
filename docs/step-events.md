@@ -25,15 +25,13 @@ on the attempt whose reply placed that message. Failed attempts (including those
 retried), cancelled or interrupted attempts, warm-ups (idle or in a tool wait),
 and attempts that placed no message omit the member entirely, not as `null`.
 The id is opaque, with 1–256 visible ASCII bytes; it is neither a provider message
-id nor an attempt or harness step reference. Legacy WAL storage remains unchanged
-and does not emit `message_id`.
+id nor an attempt or harness step reference.
 Attempts accepted after cutting trailing whitespace from tool arguments also
 omit `message_id`: their events currently publish as `failed` before their
 assistant message is placed.
 
-Today's WAL observer is installed alongside, not instead of, transcript fanout.
-The new-storage observer buffers only attempt metadata until the append's
-durability barrier. A completed model attempt receives the usage its durable
+The step-event observer is installed alongside, not instead of, transcript fanout. It buffers
+only attempt metadata until the append's durability barrier. A completed model attempt receives the usage its durable
 step-end records; an interrupted attempt carries no usage. Warm request sizes
 are included only when measured by the sender. Unknown measurements stay absent.
 New-storage model attempts do not record physical request size, so that optional

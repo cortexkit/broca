@@ -25,7 +25,8 @@ unsafe code. The only dependency is Windows-only `windows-sys`.
   harden that directory or SQLite's external temporary files.
 - Existing broad Windows trees are not silently narrowed at open. WAL and SQLite opens
   now refuse insecure or unreadable ACLs; SQLite also refuses broader parent grants or
-  missing inheritance. `store-maintenance private-mode` is the explicit repair path.
+  missing inheritance. Nothing repairs them on open; `broca_owner_only::repair` is the
+  explicit repair path.
 - Windows repair preserves every object's owner field, replaces only its DACL with
   account+SYSTEM access, and never follows reparse points. Kernel-object DACL updates do
   not propagate automatically; the walker inspects each descendant itself. A skipped
