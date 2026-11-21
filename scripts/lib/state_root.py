@@ -15,9 +15,6 @@ Every operator script that locates the state root goes through default_state_roo
 copy of the rule on this side too. scripts/test-state-root.py checks that no script spells the old
 hard-coded path any more, and that the shell reader in wal-floor.sh agrees with this one.
 
-The liveness probe passes the daemon's environment and platform explicitly; it must not
-substitute the maintenance tool's home directory for the daemon's.
-
 Operator config uses default_config_home(), a separate ladder matching the supervisor's
 config resolver: XDG_CONFIG_HOME, Windows APPDATA or USERPROFILE/AppData/Roaming, then
 HOME/.config. Configured relative paths are honoured; an all-unset environment is not guessed.

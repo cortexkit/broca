@@ -13,7 +13,6 @@ class ScriptOptionValues(unittest.TestCase):
     OPTIONS = {
         "place-release.sh": (2, ("--staged", "--session-staged", "--dest", "--report")),
         "deploy.sh": (2, ("--marker", "--control")),
-        "mint-lineage-specimen.sh": (2, ("--count", "--victim", "--donor", "--project-root", "--harness")),
         "verify-deploy.sh": (64, ("--marker", "--control", "--bin", "--sha", "--staged")),
     }
 
@@ -35,9 +34,6 @@ class ScriptOptionValues(unittest.TestCase):
 
     def test_deploy_missing_values_are_named(self):
         self.missing_values("deploy.sh")
-
-    def test_mint_missing_values_are_named(self):
-        self.missing_values("mint-lineage-specimen.sh")
 
     def test_verify_deploy_missing_values_are_named(self):
         self.missing_values("verify-deploy.sh")

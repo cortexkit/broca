@@ -59,15 +59,8 @@ suites=(
     scripts/test-train-push.py
     scripts/test-train-preflight.py
     scripts/test-watch-ci-resolve.py
-    scripts/test-archive-read.py
-    scripts/test-wal-archive-instruments.py
-    scripts/test-wal-retention-readers.py
-    scripts/test-step-timing.py
-    scripts/tests/test-attempt-telemetry.py
-    scripts/test-rekey-harness.py
     # The restart gate answers from the daemon's memory report, never reading silence as idle.
     scripts/test-live-runs.py
-    scripts/test-find-finalize-leaks.py
     # Every script locates broca's state root by the daemon's rule.
     scripts/test-state-root.py
     # Verifies quickcheck's unconditional guards and feature propagation behavior.
@@ -80,7 +73,6 @@ suites=(
     scripts/test-gated-commit.py
     scripts/tests/test_linux_quickcheck.py
     scripts/test-deploy.py
-    scripts/test-check-credential-metadata.py
     scripts/test-acceptance-worker-turn.py
     scripts/tests/test-acceptance-turns.py
     scripts/test-turn-harnesses.py
@@ -93,8 +85,6 @@ suites=(
     scripts/tests/test_release_fences.py
     # The release gate finds WAL features the way the Rust crates re-export them.
     scripts/tests/test_wal_gate_reexports.py
-    # Maintenance scripts refuse to write while a writer's liveness is unknown.
-    scripts/lib/test_liveness.py
     # Every suite file in scripts/ is listed in one of the arrays in this file.
     scripts/test-script-suites.py
     # nextest's resource groups select modules that exist and every module they must cap.

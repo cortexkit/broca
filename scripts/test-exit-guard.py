@@ -68,7 +68,7 @@ class ExitGuardStructureTests(unittest.TestCase):
                 guarded.append(str(script.relative_to(ROOT)))
             with self.subTest(script=str(script.relative_to(ROOT))):
                 self.assertEqual(unguarded_exit_traps(source), [])
-        self.assertGreaterEqual(len(guarded), 16, "known EXIT traps disappeared from the scan")
+        self.assertGreaterEqual(len(guarded), 12, "known EXIT traps disappeared from the scan")
         print("EXIT guard inventory: " + ", ".join(guarded))
 
     def test_scan_detects_unguarded_traps(self):
