@@ -3013,6 +3013,17 @@ mod tests {
         // When an operator plan tier took effect, on tiers that have a start (claustrum
         // a7679aa7). Unread for the same reason as `plan_tier`.
         plan_tier_since_ms: Option<u64>,
+        // A GitHub App row's App id and slug (claustrum f7aaa05a). Unread: such a row serves no
+        // model vendor, so account selection never offers it.
+        github_app: Option<StrictGithubApp>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct StrictGithubApp {
+        app_id: String,
+        slug: String,
     }
 
     #[derive(Deserialize)]
