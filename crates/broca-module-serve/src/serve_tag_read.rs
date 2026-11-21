@@ -40,7 +40,7 @@ pub(super) async fn tag_read<H: ServeHandler + 'static>(
                 epoch,
                 corr,
                 NOT_SERVED_ON_NEW_STORAGE,
-                "a tag read is served only for a session kept in the new storage",
+                "a tag read is served only by a handler with the session store",
             )
             .await
         }

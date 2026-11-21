@@ -3923,7 +3923,9 @@ where
                 }
             };
             match handler.tag_map(session, &params).await {
-                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(Some(reply)) => {
+                    send_json_response(writer, ver, channel, epoch, corr, &reply).await
+                }
                 Ok(None) => {
                     send_error(
                         writer,
@@ -3932,7 +3934,7 @@ where
                         epoch,
                         corr,
                         NOT_SERVED_ON_OLD_STORAGE,
-                        "session.tag_map serves sessions kept in the new storage only, and this session is kept on today's storage",
+                        "session.tag_map is served only by a handler with the session store",
                     )
                     .await
                 }
@@ -3971,7 +3973,9 @@ where
                     }
                 };
             match handler.request_dump(session, &params.run_id).await {
-                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(Some(reply)) => {
+                    send_json_response(writer, ver, channel, epoch, corr, &reply).await
+                }
                 Ok(None) => {
                     send_error(
                         writer,
@@ -3980,7 +3984,7 @@ where
                         epoch,
                         corr,
                         NOT_SERVED_ON_OLD_STORAGE,
-                        "session.request_dump serves sessions kept in the new storage only, and this session is kept on today's storage",
+                        "session.request_dump is served only by a handler with the session store",
                     )
                     .await
                 }
@@ -4013,7 +4017,9 @@ where
                 }
             };
             match handler.delete_session(session, paused_run).await {
-                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
+                Ok(Some(reply)) => {
+                    send_json_response(writer, ver, channel, epoch, corr, &reply).await
+                }
                 Ok(None) => {
                     send_error(
                         writer,
@@ -4022,7 +4028,7 @@ where
                         epoch,
                         corr,
                         NOT_SERVED_ON_OLD_STORAGE,
-                        "session.delete serves sessions kept in the new storage only, and this session is kept on today's storage",
+                        "session.delete is served only by a handler with the session store",
                     )
                     .await
                 }
@@ -4354,17 +4360,45 @@ where
                     .await;
             }
             match handler.plan_view(session).await {
-                Ok(Some(reply)) => send_json_response(writer, ver, channel, epoch, corr, &reply).await,
-                Ok(None) => send_error(
-                    writer, ver, channel, epoch, corr, NOT_SERVED_ON_OLD_STORAGE,
-                    "session.plan_view serves sessions kept in the new storage only, and this session is kept on today's storage",
-                ).await,
-                Err(broca_module::store_plan_view::Error::NoPlan) => send_error(
-                    writer, ver, channel, epoch, corr, "no_plan", "the session has no plan manifest",
-                ).await,
-                Err(broca_module::store_plan_view::Error::TooLarge) => send_error(
-                    writer, ver, channel, epoch, corr, "too_large", "the plan view exceeds the transport frame limit",
-                ).await,
+                Ok(Some(reply)) => {
+                    send_json_response(writer, ver, channel, epoch, corr, &reply).await
+                }
+                Ok(None) => {
+                    send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        NOT_SERVED_ON_OLD_STORAGE,
+                        "session.plan_view is served only by a handler with the session store",
+                    )
+                    .await
+                }
+                Err(broca_module::store_plan_view::Error::NoPlan) => {
+                    send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "no_plan",
+                        "the session has no plan manifest",
+                    )
+                    .await
+                }
+                Err(broca_module::store_plan_view::Error::TooLarge) => {
+                    send_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "too_large",
+                        "the plan view exceeds the transport frame limit",
+                    )
+                    .await
+                }
                 Err(broca_module::store_plan_view::Error::Serve(error)) => {
                     send_serve_error(writer, ver, channel, epoch, corr, &error).await
                 }

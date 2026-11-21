@@ -1,5 +1,5 @@
-//! `session.read {tag, call_key}` (llm-runner `tag_read`) over a session kept in the new
-//! storage, through the module's registry: a number the model cites in a call resolves to the
+//! `session.read {tag, call_key}` (llm-runner `tag_read`) over a session kept in the session
+//! store, through the module's registry: a number the model cites in a call resolves to the
 //! part the request that made the call showed under it, and to nothing else.
 
 use std::collections::BTreeSet;
@@ -186,6 +186,22 @@ async fn a_key_no_call_has_is_unknown_call() {
         refusal_code(tag_read(&side, tag, "no-such-call").await),
         UNKNOWN_CALL
     );
+}
+
+/// A session the store doesn't hold has no call, so a tag read of it names none, and a
+/// request dump of any run of it names no run.
+#[tokio::test]
+async fn a_session_never_written_has_no_call_and_no_run() {
+    let mut side = side(Vec::new(), false, false).await;
+    side.key = BindIdentity::new("/project", "test", "never-written");
+    assert_eq!(
+        refusal_code(tag_read(&side, 1, "any-call").await),
+        UNKNOWN_CALL
+    );
+    match crate::serve::ServeHandler::request_dump(&side.registry, &side.key, "any-run").await {
+        Err(ServeError::UnknownRun(run)) => assert_eq!(run, "any-run"),
+        other => panic!("expected unknown_run, got {other:?}"),
+    }
 }
 
 /// A revert that removes the call's message removes the call from the session's history: its

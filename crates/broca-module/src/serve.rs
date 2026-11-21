@@ -2018,8 +2018,7 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// `session.tag_map`: which message and part each part number of the session belongs to
-    /// (see `store_tag_map`). `None` for a session today's storage keeps, which the operation
-    /// doesn't serve; a handler without the session store keeps every session there.
+    /// (see `store_tag_map`). `None` for a handler without the session store.
     async fn tag_map(
         &self,
         _session: &LineageKey,
@@ -2045,7 +2044,7 @@ pub trait ServeHandler: Send + Sync {
 
     /// `session.request_dump`: rebuilds the request each step of run `run_id` sent and writes
     /// the bodies that match their recorded digests (see `store_request_dump`). `None` for a
-    /// session today's storage keeps, which the operation doesn't serve.
+    /// handler without the session store.
     async fn request_dump(
         &self,
         _session: &LineageKey,
@@ -2055,8 +2054,7 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// `session.delete`: deletes the session for the operator when it holds no work a deletion
-    /// would lose (see `retention_store`). `None` for a session today's storage keeps, which the
-    /// operation doesn't serve.
+    /// would lose (see `retention_store`). `None` for a handler without the session store.
     async fn delete_session(
         &self,
         _session: &LineageKey,
@@ -3358,7 +3356,11 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<Option<cortexkit_role_llm_runner::tag_read::TagReadAnswer>, ServeError> {
         self.check_expired(session, None).await?;
         let Some(store) = self.store_holding(session)? else {
-            return Ok(None);
+            // A session the store doesn't hold has no call, so none has this key.
+            return Err(ServeError::TagReadRefused {
+                code: cortexkit_role_llm_runner::errors::UNKNOWN_CALL,
+                message: format!("no call has key {}", request.call_key),
+            });
         };
         crate::store_tag_read::check_owner(self, session, request, principal, scope).await?;
         let Some(view) = store.current_view(session).await? else {
@@ -3404,7 +3406,8 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<Option<broca_wire::request_dump::RequestDumpResponse>, ServeError> {
         match self.store_holding(session)? {
             Some(store) => crate::store_request_dump::serve(&store, session, run_id).await,
-            None => Ok(None),
+            // A session the store doesn't hold has no run to rebuild.
+            None => Err(ServeError::UnknownRun(run_id.to_owned())),
         }
     }
 
