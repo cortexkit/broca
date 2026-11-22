@@ -1567,7 +1567,13 @@ async fn in_memory_reads_refuse_only_where_they_did_before() {
     .unwrap();
     let refreshed = m
         .registry
-        .route_session_refresh(&m.key, 1, "on_prefix_rebuild".into(), Box::new(manifest))
+        .route_session_refresh(
+            &m.key,
+            1,
+            "on_prefix_rebuild".into(),
+            Box::new(manifest),
+            Vec::new(),
+        )
         .await
         .unwrap();
     assert!(

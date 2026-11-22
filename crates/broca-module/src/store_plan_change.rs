@@ -62,6 +62,7 @@ pub(crate) async fn facts<B: SessionBackend>(
                         .unwrap_or_default()
                         .to_owned(),
                     policy: refresh.policy,
+                    refetch: refresh.refetch,
                     run_in_progress: refresh.run_in_progress,
                     applies_from_next_run: refresh.applies_from_next_run,
                 }),

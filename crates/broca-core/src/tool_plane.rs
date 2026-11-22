@@ -243,6 +243,16 @@ pub fn permanent_refusal_output(
 #[derive(Debug, Clone)]
 pub enum DispatchResult {
     Completed(ToolResult),
+    /// The provider received the call and refused it with a refusal whose code and detail the
+    /// call's outcome records, so the control lane can name it: today only
+    /// `tool_major_changed`, the provider now serving a different major of the tool. `result`
+    /// is the error result the model sees; `detail` is [`refusal_detail`]. Like any refusal of
+    /// a received call, it is never re-sent.
+    Refused {
+        result: ToolResult,
+        code: String,
+        detail: serde_json::Value,
+    },
     NotSent {
         reason: String,
     },
@@ -271,6 +281,19 @@ pub enum DispatchResult {
         result: ToolResult,
         carrier: String,
     },
+}
+
+/// What the outcome of a call its provider refused records as its detail: the provider that
+/// refused it and the refusal's own detail, `{provider, refusal}`. A `tool_major_changed`
+/// refusal's detail is `{tool, expected, current}`, the pin the call carried and the provider's
+/// current one.
+pub fn refusal_detail(provider: &str, detail: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut recorded = serde_json::Map::new();
+    recorded.insert("provider".into(), provider.into());
+    if let Some(detail) = detail {
+        recorded.insert("refusal".into(), detail.clone());
+    }
+    serde_json::Value::Object(recorded)
 }
 
 /// Run signals carried to an approved adapter's final physical-send boundary.
@@ -457,6 +480,18 @@ impl ToolOpenGuard {
 
 pub use broca_wal::{FrozenProviderDeclarations, PlanManifest};
 
+/// One tool's current definition, which a run at a prefix rebuild takes in place of the one
+/// its session froze ([`ToolPlane::compatible_tools`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompatibleTool {
+    /// The plan provider serving the tool.
+    pub provider: String,
+    /// The tool as the provider's catalog now answers it, under the same name.
+    pub tool: broca_protocol::request::Tool,
+    /// Its pin under that definition: the same major, the current digest and semantics.
+    pub pin: DispatchSchemaPin,
+}
+
 /// The tool-dispatch contract. One batch = one assistant turn's tool calls.
 #[async_trait]
 pub trait ToolPlane: Send + Sync {
@@ -469,6 +504,16 @@ pub trait ToolPlane: Send + Sync {
         _manifest: &broca_wal::PlanManifest,
     ) -> std::collections::BTreeMap<String, broca_wal::FrozenProviderDeclarations> {
         Default::default()
+    }
+
+    /// The current definitions of `manifest`'s versioned tools that a fresh run at a prefix
+    /// rebuild takes (llm-runner `tool_versions`): each tool whose provider now serves the same
+    /// major as its frozen pin, under a different description, input schema or schema digest.
+    /// Read from what [`Self::run_transport`] just read for the same run, so it asks no
+    /// provider again. A tool whose provider could not be read, or that changed major, is not
+    /// listed and keeps its frozen definition. Adapters without discovery list none.
+    async fn compatible_tools(&self, _manifest: &broca_wal::PlanManifest) -> Vec<CompatibleTool> {
+        Vec::new()
     }
 
     /// Prepare routing state for this batch before dispatch starts. `calls` is

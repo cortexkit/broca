@@ -276,6 +276,7 @@ fn one_of_each() -> Vec<Record> {
             setup: vec![],
             manifest: None,
             selection: Some(serde_json::json!({"provider": "p", "model": "m"})),
+            refetch: Vec::new(),
         }),
         Record::RefreshPolicy(RefreshPolicy {
             generation: 2,

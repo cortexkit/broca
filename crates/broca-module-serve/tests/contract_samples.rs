@@ -258,6 +258,80 @@ async fn tool_identity_contract_samples() {
     rig.finish().await;
 }
 
+/// A call its provider refuses because it now serves another major of the tool: the call's
+/// lifecycle carries its `tp2` pin, and a `tool_changed` frame, on a `message_boundary` unit of
+/// the call's message, names the provider and both pins (llm-runner 0.9 `tool_versions`).
+#[tokio::test]
+async fn tool_changed_contract_samples() {
+    use std::time::Duration;
+    let mut rig = Rig::start("contract-tool-changed-samples").await;
+    let digest =
+        cortexkit_role_tool_provider::catalog::schema_digest(&json!({"type":"object"})).unwrap();
+    *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
+        schema_digest: digest.clone(),
+        semantics: 1,
+        major: Some(2),
+    });
+    let expected = format!("tp2:work:{digest}:2");
+    let current = format!("tp2:work:{}:3", "b".repeat(64));
+    let refusal = json!({"tool": "work", "expected": expected, "current": current});
+    rig.script.tool_results.lock().unwrap().insert(
+        "sample-call".into(),
+        broca_core::tool_plane::DispatchResult::Refused {
+            result: broca_protocol::content::ToolResult {
+                tool_call_id: broca_protocol::ToolCallId("sample-call".into()),
+                output: broca_protocol::content::ToolOutput::error(
+                    "tool/route rejected: tool_major_changed — this tool changed incompatibly",
+                ),
+                is_error: true,
+            },
+            code: "tool_major_changed".into(),
+            detail: broca_core::tool_plane::refusal_detail(
+                delivery_rig::WORK_MODULE,
+                Some(&refusal),
+            ),
+        },
+    );
+    rig.script
+        .push(&[Step::Call("sample-call"), Step::Text("synthetic answer")]);
+    rig.send("sample-send", "synthetic prompt", None).await;
+    rig.wait_idle().await;
+    let frames = rig
+        .subscribe_collect_until(
+            8,
+            json!({"from":"start"}),
+            Duration::from_millis(30),
+            |frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == "run_finished")
+            },
+        )
+        .await;
+    let event = |kind: &str| {
+        frames
+            .iter()
+            .find(|frame| {
+                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|value| value["event"]["type"] == kind)
+            })
+            .unwrap_or_else(|| panic!("a {kind} frame"))
+    };
+    let changed = event("tool_changed");
+    let value: serde_json::Value = serde_json::from_slice(&changed.body).unwrap();
+    assert_eq!(
+        value["event"],
+        json!({"type": "tool_changed", "provider": delivery_rig::WORK_MODULE, "tool": "work",
+               "expected": expected, "current": current})
+    );
+    assert_eq!(value["unit"]["type"], "message_boundary");
+    capture("tool_changed.frame.json", &changed.body);
+    let finished = event("tool_finished");
+    let value: serde_json::Value = serde_json::from_slice(&finished.body).unwrap();
+    assert_eq!(value["event"]["schema_pin"], expected);
+    capture("tool_finished.tp2.frame.json", &finished.body);
+    rig.finish().await;
+}
+
 async fn subscribe_refusal(rig: &mut Rig, from: serde_json::Value, code: &str) {
     let frames = rig
         .subscribe_collect(

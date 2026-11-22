@@ -4595,40 +4595,16 @@ where
             }
         }
         OP_REFRESH => {
-            let request: cortexkit_role_llm_runner::session_change::RefreshRequest =
-                match serde_json::from_value(req.params.clone()) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        let field = broca_wire::failing_field::<
-                            cortexkit_role_llm_runner::session_change::RefreshRequest,
-                        >(&req.params, &error);
-                        return send_invalid_params(
-                            writer,
-                            ver,
-                            channel,
-                            epoch,
-                            corr,
-                            field,
-                            &error.to_string(),
-                        )
-                        .await;
-                    }
-                };
             let advertised = handler
                 .plan_admitter()
                 .is_some_and(|admitter| admitter.admits_output_refs());
-            if let Some((field, message)) = serve_refresh::params_refusal(&request, advertised) {
-                return send_invalid_params(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    Some(field.into()),
-                    &message,
-                )
-                .await;
-            }
+            let request = match serve_refresh::decode(&req.params, advertised) {
+                Ok(request) => request,
+                Err((field, message)) => {
+                    return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
+                        .await;
+                }
+            };
             match handler
                 .session_refresh(
                     session,
@@ -4637,6 +4613,7 @@ where
                     request.plan,
                     request.policy,
                     request.generation,
+                    request.refetch.unwrap_or_default(),
                 )
                 .await
             {

@@ -2465,8 +2465,10 @@ pub trait ServeHandler: Send + Sync {
         None
     }
 
-    /// Accept a `session.refresh`: fetch, record durably, and hold pending. Implemented by
-    /// the registry through the lineage actor; the default has no session to refresh.
+    /// Accept a `session.refresh`: fetch, record durably, and hold pending. `refetch` is the
+    /// providers it asked to read afresh, empty when it named none. Implemented by the
+    /// registry through the lineage actor; the default has no session to refresh.
+    #[allow(clippy::too_many_arguments)]
     async fn session_refresh(
         &self,
         _session: &LineageKey,
@@ -2475,6 +2477,7 @@ pub trait ServeHandler: Send + Sync {
         _plan: serde_json::Map<String, serde_json::Value>,
         _policy: String,
         _generation: u64,
+        _refetch: Vec<String>,
     ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
         Err(SessionChangeError::unsupported("session.refresh"))
     }
@@ -3751,6 +3754,7 @@ impl ServeHandler for crate::LineageRegistry {
         plan: serde_json::Map<String, serde_json::Value>,
         policy: String,
         generation: u64,
+        refetch: Vec<String>,
     ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
         use cortexkit_role_llm_runner::{rungs, session_change};
         let supported = self
@@ -3795,9 +3799,13 @@ impl ServeHandler for crate::LineageRegistry {
                 message: "the plan is not canonical JSON".into(),
             }
         })?;
-        if let Some((run_in_progress, applies_from_next_run)) =
-            crate::plan_change::refresh_order(&read.facts, generation, &plan_identity, &policy)?
-        {
+        if let Some((run_in_progress, applies_from_next_run)) = crate::plan_change::refresh_order(
+            &read.facts,
+            generation,
+            &plan_identity,
+            &policy,
+            &refetch,
+        )? {
             return Ok(session_change::RefreshReply::new(
                 cortexkit_role_llm_runner::baseline::PendingChange {
                     generation,
@@ -3906,6 +3914,7 @@ impl ServeHandler for crate::LineageRegistry {
                 generation,
                 policy.clone(),
                 Box::new(admitted.manifest),
+                refetch,
             )
             .await
         {

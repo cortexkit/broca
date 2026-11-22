@@ -344,6 +344,8 @@ struct Prepared {
     /// The pending plan refresh the run applies by freezing its manifest, which its start's
     /// batch records.
     applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
+    /// Whether the run starts at a prefix rebuild or applies a pending change.
+    rebuild_point: bool,
 }
 
 /// What a run drained from the queue starts from.
@@ -1966,9 +1968,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 generation,
                 policy,
                 manifest,
+                refetch,
                 reply,
             } => {
-                let _ = reply.send(self.session_refresh(generation, policy, manifest).await);
+                let _ = reply.send(
+                    self.session_refresh(generation, policy, manifest, refetch)
+                        .await,
+                );
                 false
             }
             LineageCmd::SessionRefreshPolicy {
@@ -2217,6 +2223,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             input_hooks: prepared.hooks,
             pre_model_error: prepared.pre_model_error,
             applies_refresh: prepared.applies_refresh,
+            rebuild_point: prepared.rebuild_point,
             ..Default::default()
         };
         let tool_media = Arc::new(broca_session_loop::PendingMedia::default());
@@ -2729,13 +2736,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &self,
         model: &broca_protocol::ModelHandle,
         variant: Option<&str>,
-    ) -> Result<
-        (
-            Option<Arc<broca_wal::PlanManifest>>,
-            Option<broca_protocol::session_change::AppliedChange>,
-        ),
-        SendOutcome,
-    > {
+    ) -> Result<crate::plan_change::RunPlan, SendOutcome> {
         use broca_fetch_plan::session_change::{
             applies_at_run_start, model_key, Applying, EffectiveState, PendingState,
         };
@@ -2805,7 +2806,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             )
             .applied_change()
         });
-        Ok((manifest, applies))
+        let operations = self.session.operations();
+        let rebuild_point = applies.is_some()
+            || crate::plan_change::run_rebuilds_prefix(
+                plan.last_model.as_deref(),
+                &model_key(model),
+                plan.flushed_since_accept,
+                crate::plan_change::view_waiting(operations),
+                operations.last_cache_send.as_ref(),
+                (self.now_ms)(),
+            );
+        Ok((manifest, applies, rebuild_point))
     }
 
     /// Freezes the session's fetch plan into a run about to start according to
@@ -2820,10 +2831,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         start.prepared.tools_were_omitted = tools_were_omitted;
         let first_run = self.session.operations().owner.needs_admission();
         if !first_run {
-            let (manifest, applies) =
+            let (manifest, applies, rebuild_point) =
                 self.run_plan(&start.request.model, start.request.variant.as_deref())?;
             start.manifest = manifest;
             start.prepared.applies_refresh = applies;
+            start.prepared.rebuild_point = rebuild_point;
         }
         crate::plan_episode::require_confining_scope(
             start.manifest.as_deref(),
@@ -3956,6 +3968,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         generation: u64,
         policy: String,
         manifest: Box<broca_wal::PlanManifest>,
+        refetch: Vec<String>,
     ) -> crate::actor::SessionRefreshOutcome {
         use crate::actor::SessionRefreshOutcome;
         use crate::plan_change::RefreshAcceptance;
@@ -3968,6 +3981,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             generation,
             &policy,
             &manifest,
+            &refetch,
             self.run.is_some(),
         ) {
             RefreshAcceptance::Repeat {
@@ -3999,6 +4013,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             setup,
             manifest: rest,
             selection: broca_session_loop::plan::recorded_selection(&manifest),
+            refetch,
         });
         match self.append_own(record).await {
             Ok(()) => {
@@ -4928,6 +4943,8 @@ mod subscribed_heads_tests;
 mod tests;
 #[cfg(test)]
 mod tool_calls_tests;
+#[cfg(test)]
+mod tool_changed_tests;
 
 /// The account route `start`'s run was admitted under, as its config members keep it; `None` for a
 /// run admitted without one. A member that doesn't decode reads as no route, which refuses every

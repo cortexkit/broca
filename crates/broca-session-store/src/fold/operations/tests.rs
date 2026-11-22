@@ -757,6 +757,7 @@ fn refresh(generation: u64, identity: &str, selection: Option<serde_json::Value>
         setup: Vec::new(),
         manifest: Some(serde_json::json!({"plan_identity": identity})),
         selection,
+        refetch: Vec::new(),
     })
 }
 

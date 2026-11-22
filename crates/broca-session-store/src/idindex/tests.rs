@@ -165,6 +165,7 @@ fn records_name_their_ids() {
         setup: Vec::new(),
         manifest: None,
         selection: None,
+        refetch: Vec::new(),
     });
     assert_eq!(
         ids(&refresh),

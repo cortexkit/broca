@@ -997,6 +997,7 @@ async fn plan_view_wire_serves_applied_and_pending_plans_without_operator_requir
                 1,
                 "immediately".into(),
                 Box::new(Arc::try_unwrap(inspection_plan("applied").manifest.unwrap()).unwrap()),
+                Vec::new(),
             )
             .await
             .unwrap(),
@@ -1021,6 +1022,7 @@ async fn plan_view_wire_serves_applied_and_pending_plans_without_operator_requir
                 2,
                 "on_prefix_rebuild".into(),
                 Box::new(Arc::try_unwrap(inspection_plan("pending").manifest.unwrap()).unwrap()),
+                Vec::new(),
             )
             .await
             .unwrap(),

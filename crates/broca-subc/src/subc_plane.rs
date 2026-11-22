@@ -2271,6 +2271,18 @@ impl SubcToolPlane {
                     .lock()
                     .unwrap()
                     .insert(&ctx.batch_id, fence_key, result.clone());
+                // A new major is recorded by code and detail, so the call's outcome names the
+                // pin it carried and the provider's current one.
+                if msg.code() == cortexkit_role_tool_provider::errors::TOOL_MAJOR_CHANGED {
+                    return DispatchResult::Refused {
+                        result,
+                        code: msg.code().to_owned(),
+                        detail: broca_core::tool_plane::refusal_detail(
+                            module_id,
+                            msg.provider_detail(),
+                        ),
+                    };
+                }
                 DispatchResult::Completed(result)
             }
             Err(ConnError::StaleRouteHandle(_)) => {
@@ -3959,6 +3971,13 @@ impl ToolPlane for SubcToolPlane {
         manifest: &broca_core::tool_plane::PlanManifest,
     ) -> BTreeMap<String, broca_core::tool_plane::FrozenProviderDeclarations> {
         self.refresh_run_transport(bind, scope, manifest).await
+    }
+
+    async fn compatible_tools(
+        &self,
+        manifest: &broca_core::tool_plane::PlanManifest,
+    ) -> Vec<broca_core::tool_plane::CompatibleTool> {
+        run_transport::compatible_tools(manifest)
     }
 
     async fn batch_started(

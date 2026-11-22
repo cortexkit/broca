@@ -446,6 +446,7 @@ fn noting(noter: &Arc<Noter>) -> Planes {
         hooks: Some(Arc::clone(noter) as Arc<dyn HookPlane>),
         compaction: None,
         tool_gate: None,
+        major_changed: None,
     }
 }
 
@@ -912,6 +913,7 @@ fn compacting(compactor: &Arc<Compactor>) -> Planes {
         hooks: None,
         compaction: Some(Arc::clone(compactor) as Arc<dyn broca_core::CompactionPlane>),
         tool_gate: None,
+        major_changed: None,
     }
 }
 

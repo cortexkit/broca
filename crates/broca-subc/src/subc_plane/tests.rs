@@ -4556,6 +4556,49 @@ mod scope_carrier {
         assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1, "never re-sent");
         assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 1);
     }
+
+    /// A provider now serving another major of the tool refuses the call `tool_major_changed`.
+    /// The refusal is the call's error result, never re-sent, and comes back with its code and
+    /// a detail naming the refusing provider beside the refusal's own pins, which the call's
+    /// outcome records for the control lane.
+    #[tokio::test(start_paused = true)]
+    async fn a_major_change_refusal_is_returned_with_its_provider_and_pins() {
+        let refusal = serde_json::json!({
+            "tool": "read",
+            "expected": format!("tp2:read:{}:2", "a".repeat(64)),
+            "current": format!("tp2:read:{}:3", "b".repeat(64)),
+        });
+        let body = serde_json::json!({
+            "code": "tool_major_changed",
+            "message": "this tool changed incompatibly",
+            "detail": refusal,
+        });
+        let (conn, plane, _) = rig(vec![
+            Err(ConnError::Rejected(
+                crate::connection::RejectedMessage::from_error_frame_body_for_test(
+                    &serde_json::to_vec(&body).unwrap(),
+                ),
+            )),
+            successful_tool_reply("a second send"),
+        ]);
+        let (scoped, read) = started(&plane).await;
+        match plane.dispatch(&scoped, &read).await {
+            DispatchResult::Refused {
+                result,
+                code,
+                detail,
+            } => {
+                assert!(result.is_error);
+                assert_eq!(code, "tool_major_changed");
+                assert_eq!(
+                    detail,
+                    serde_json::json!({"provider": "aft", "refusal": refusal})
+                );
+            }
+            other => panic!("expected the refusal with its detail, got {other:?}"),
+        }
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1, "never re-sent");
+    }
 }
 
 /// A scope frozen under a renamed module's old id: after the daemon retires the old id, the

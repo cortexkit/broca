@@ -191,6 +191,7 @@ fn calls() -> Vec<ToolCall> {
 fn completed(result: DispatchResult) -> ToolResult {
     match result {
         DispatchResult::Completed(result) => result,
+        DispatchResult::Refused { code, .. } => panic!("tool call was refused: {code}"),
         DispatchResult::NotSent { reason } => panic!("tool was not sent: {reason}"),
         DispatchResult::SentButOutcomeUnknown { reason } => {
             panic!("tool outcome was unknown: {reason}")

@@ -1372,6 +1372,7 @@ async fn a_caller_dropped_from_the_plan_loses_its_forks_for_good() {
                         &format!("plan-{}", generation + 1),
                         json!({ "fork_callers": callers }),
                     )),
+                    Vec::new(),
                 )
                 .await
                 .unwrap();

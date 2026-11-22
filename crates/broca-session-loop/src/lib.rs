@@ -46,6 +46,7 @@ pub mod output;
 pub mod owner;
 pub mod parts;
 pub mod plan;
+pub mod plan_tools;
 pub mod queue;
 mod refusal;
 mod repetition;
@@ -69,3 +70,5 @@ mod shared_text_tests;
 mod step_budget_tests;
 #[cfg(test)]
 mod step_limit_tests;
+#[cfg(test)]
+mod tool_versions_tests;

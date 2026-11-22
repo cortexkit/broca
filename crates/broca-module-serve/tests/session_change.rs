@@ -694,7 +694,8 @@ async fn concurrent_identical_refreshes_fetch_and_write_once() {
             &scope,
             next.clone(),
             "immediately".into(),
-            1
+            1,
+            Vec::new(),
         ),
         registry.session_refresh(
             &rig.session,
@@ -702,7 +703,8 @@ async fn concurrent_identical_refreshes_fetch_and_write_once() {
             &scope,
             next,
             "immediately".into(),
-            1
+            1,
+            Vec::new(),
         ),
     );
     assert_eq!(one, two);

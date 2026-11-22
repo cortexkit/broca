@@ -203,6 +203,7 @@ async fn refresh(
             generation,
             policy: policy.into(),
             manifest: Box::new(manifest),
+            refetch: Vec::new(),
             reply,
         })
         .unwrap();
@@ -544,4 +545,53 @@ async fn plan_view_unverifiable_join_keeps_stored_text_without_offsets() {
         drop(commands);
         served.await.unwrap();
     }
+}
+
+/// A run takes a versioned tool's newer same-major definition only where its prompt is written
+/// afresh anyway: when it applies a pending change, or at a prefix rebuild such as a model
+/// switch, with or without a change waiting. The actor tells the run which it is; any other run
+/// keeps the session's tools.
+#[tokio::test]
+async fn a_run_is_told_it_starts_at_a_prefix_rebuild_or_applies_a_change() {
+    let executor = executor(
+        vec![
+            text_step("a", "first"),
+            text_step("b", "second"),
+            text_step("c", "third"),
+            text_step("d", "fourth"),
+            text_step("e", "fifth"),
+        ],
+        None,
+    );
+    let points = Arc::clone(&executor.rebuild_points);
+    let (commands, served) = start(executor).await;
+    send(&commands, "r1", Some(manifest("first", false))).await;
+    idle(&commands).await;
+    refresh(&commands, 1, "immediately", manifest("second", false)).await;
+    send(&commands, "r2", None).await;
+    idle(&commands).await;
+    send(&commands, "r3", None).await;
+    idle(&commands).await;
+    refresh(&commands, 2, "on_prefix_rebuild", manifest("third", false)).await;
+    let mut request = untooled("switch models");
+    request.model = broca_protocol::ModelHandle::new("stub", "m2");
+    assert!(matches!(
+        super::tests::send_with(&commands, "r4", request, crate::actor::SendKey::Minted).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    let mut request = untooled("switch back");
+    request.model = broca_protocol::ModelHandle::new("stub", "m");
+    assert!(matches!(
+        super::tests::send_with(&commands, "r5", request, crate::actor::SendKey::Minted).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert_eq!(
+        *points.lock().unwrap(),
+        [false, true, false, true, true],
+        "first run, applied refresh, plain run, model switch applying a change, model switch"
+    );
+    drop(commands);
+    served.await.unwrap();
 }

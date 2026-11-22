@@ -126,6 +126,10 @@ pub struct RunControl {
     /// the run's start; this crate's WAL loop ignores it, because it works the application out
     /// again from the WAL.
     pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
+    /// Whether a fresh run starts at a prefix rebuild of its session, or applies a pending
+    /// plan change: the points where it takes a versioned tool's same-major definition
+    /// (llm-runner `tool_versions`). Not frozen: a run read back from its start has none.
+    pub rebuild_point: bool,
     /// Told the WAL position of a fresh run's `RunStarted` once it is durable, and of each
     /// provider attempt record as it is appended, so the caller can report them to the routing
     /// module that chooses provider accounts. `None` reports nothing; either way the loop writes
@@ -195,6 +199,7 @@ impl Default for RunControl {
             manifest: None,
             manifest_system_override: false,
             applies_refresh: None,
+            rebuild_point: false,
             account_reporter: None,
             keep_warm: None,
             elicitation_plane: None,

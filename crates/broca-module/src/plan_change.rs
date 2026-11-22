@@ -17,6 +17,8 @@ use crate::serve::SessionChangeError;
 pub(crate) struct Accepted {
     pub plan_identity: String,
     pub policy: String,
+    /// The providers it asked to read afresh, empty when it named none.
+    pub refetch: Vec<String>,
     pub run_in_progress: bool,
     pub applies_from_next_run: bool,
 }
@@ -72,25 +74,32 @@ impl ChangeFacts {
     }
 }
 
-/// Where a refresh of `generation`, whose plan has `plan_identity`, stands against what the
-/// session accepted: an identical repeat of an accepted refresh, answered with the flags it was
-/// answered with (`Some`); a new generation (`None`); or a stale one, refused.
+/// Where a refresh of `generation`, whose plan has `plan_identity` and which asked to read
+/// `refetch` afresh, stands against what the session accepted: an identical repeat of an
+/// accepted refresh, answered with the flags it was answered with (`Some`); a new generation
+/// (`None`); or a stale one, refused. An empty `refetch` is a refresh that named none.
 pub(crate) fn refresh_order(
     facts: &ChangeFacts,
     generation: u64,
     plan_identity: &str,
     policy: &str,
+    refetch: &[String],
 ) -> Result<Option<(bool, bool)>, SessionChangeError> {
-    use cortexkit_role_llm_runner::session_change::{refresh_order, RefreshOrder};
-    let earlier = facts
-        .accepted
-        .as_ref()
-        .map(|accepted| (accepted.plan_identity.as_str(), accepted.policy.as_str()));
-    match refresh_order(
+    use cortexkit_role_llm_runner::session_change::{refresh_order_with_refetch, RefreshOrder};
+    fn named(list: &[String]) -> Option<&[String]> {
+        (!list.is_empty()).then_some(list)
+    }
+    let earlier = facts.accepted.as_ref().map(|accepted| {
+        (
+            accepted.plan_identity.as_str(),
+            accepted.policy.as_str(),
+            named(accepted.refetch.as_slice()),
+        )
+    });
+    match refresh_order_with_refetch(
         facts.accepted_generation,
         generation,
-        plan_identity,
-        policy,
+        (plan_identity, policy, named(refetch)),
         earlier,
     ) {
         RefreshOrder::Repeat => {
@@ -138,9 +147,10 @@ pub(crate) fn accept_refresh(
     generation: u64,
     policy: &str,
     manifest: &PlanManifest,
+    refetch: &[String],
     run_in_progress: bool,
 ) -> RefreshAcceptance {
-    match refresh_order(facts, generation, &manifest.plan_identity, policy) {
+    match refresh_order(facts, generation, &manifest.plan_identity, policy, refetch) {
         Ok(Some((run_in_progress, applies_from_next_run))) => {
             return RefreshAcceptance::Repeat {
                 run_in_progress,
@@ -302,6 +312,51 @@ pub(crate) fn prefix_rebuilt(
         )
 }
 
+/// Whether a run start on the model keyed `model` writes its session's prompt afresh, so a
+/// versioned tool's newer same-major definition can be taken there at no extra cost
+/// (llm-runner `tool_versions`): the run changes model from the previous run's
+/// (`last_model`), a flush is waiting (`flushed`), a newer compaction view than the latest
+/// step rendered waits to apply at its first step (`view_waiting`), or the prompt cache has
+/// provably lapsed (`last_cache`, as in [`prefix_rebuilt`]). Unlike the rebuild a pending change
+/// waits for, which counts from the change's acceptance, this is about this run start only.
+pub(crate) fn run_rebuilds_prefix(
+    last_model: Option<&str>,
+    model: &str,
+    flushed: bool,
+    view_waiting: bool,
+    last_cache: Option<&broca_session_store::fold::operations::CacheSend>,
+    now_ms: u64,
+) -> bool {
+    last_model.is_some_and(|last| last != model)
+        || flushed
+        || view_waiting
+        || broca_core::compaction_v2::conditions::cache_proven_expired(
+            last_cache.and_then(|send| send.requested_ttl_ms),
+            last_cache.map(|send| send.sent_at_ms),
+            now_ms,
+        )
+}
+
+/// Whether the compaction provider handed over a newer view than the latest step rendered,
+/// which the next run's first step applies.
+pub(crate) fn view_waiting(operations: &broca_session_store::fold::operations::Operations) -> bool {
+    operations.view_accepted.as_ref().is_some_and(|accepted| {
+        operations
+            .view_applied
+            .as_ref()
+            .is_none_or(|applied| applied.view.version < accepted.version)
+    })
+}
+
+/// The plan a new run of a session that already ran freezes (`StoreActor::run_plan`): its
+/// manifest, the pending change it applies, and whether it starts at a prefix rebuild or
+/// applies that change.
+pub(crate) type RunPlan = (
+    Option<Arc<PlanManifest>>,
+    Option<broca_protocol::session_change::AppliedChange>,
+    bool,
+);
+
 /// The pending change, when it applies at a run start on `model`: `rebuild` and `flushed` say
 /// whether a prefix rebuild and a flush happened since it was accepted, and `last_model` is the
 /// previous run's model key.
@@ -451,6 +506,7 @@ mod tests {
             accepted: Some(Accepted {
                 plan_identity: "plan-2".into(),
                 policy: "immediately".into(),
+                refetch: Vec::new(),
                 run_in_progress: true,
                 applies_from_next_run: true,
             }),
@@ -462,19 +518,57 @@ mod tests {
     fn a_refresh_is_a_repeat_new_or_stale_by_what_was_accepted() {
         let facts = facts();
         assert_eq!(
-            refresh_order(&facts, 2, "plan-2", "immediately"),
+            refresh_order(&facts, 2, "plan-2", "immediately", &[]),
             Ok(Some((true, true)))
         );
-        assert_eq!(refresh_order(&facts, 3, "plan-3", "immediately"), Ok(None));
         assert_eq!(
-            refresh_order(&facts, 2, "plan-other", "immediately"),
+            refresh_order(&facts, 3, "plan-3", "immediately", &[]),
+            Ok(None)
+        );
+        assert_eq!(
+            refresh_order(&facts, 2, "plan-other", "immediately", &[]),
             Err(SessionChangeError::GenerationStale { accepted: 2 })
         );
         let mut older = facts;
         older.accepted = None;
         assert_eq!(
-            refresh_order(&older, 1, "plan-1", "immediately"),
+            refresh_order(&older, 1, "plan-1", "immediately", &[]),
             Err(SessionChangeError::GenerationStale { accepted: 2 })
+        );
+    }
+
+    /// The providers a refresh asked to read afresh are part of what it repeats: the same
+    /// list, in the same order, is a repeat, and any other list under that generation is stale.
+    #[test]
+    fn a_refresh_repeats_only_with_the_same_refetch_list() {
+        let mut facts = facts();
+        facts.accepted.as_mut().unwrap().refetch = vec!["aft".into(), "plexus".into()];
+        let list = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            refresh_order(
+                &facts,
+                2,
+                "plan-2",
+                "immediately",
+                &list(&["aft", "plexus"])
+            ),
+            Ok(Some((true, true)))
+        );
+        for other in [list(&[]), list(&["aft"]), list(&["plexus", "aft"])] {
+            assert_eq!(
+                refresh_order(&facts, 2, "plan-2", "immediately", &other),
+                Err(SessionChangeError::GenerationStale { accepted: 2 }),
+                "{other:?}"
+            );
+        }
+        assert_eq!(
+            refresh_order(&facts, 3, "plan-2", "immediately", &list(&["aft"])),
+            Ok(None)
         );
     }
 
@@ -483,7 +577,7 @@ mod tests {
         let mut facts = facts();
         let next = manifest("plan-3", &["a"], "text");
         assert_eq!(
-            accept_refresh(&facts, 3, "on_prefix_rebuild", &next, false),
+            accept_refresh(&facts, 3, "on_prefix_rebuild", &next, &[], false),
             RefreshAcceptance::Accept {
                 run_in_progress: false,
                 applies_from_next_run: false
@@ -491,7 +585,7 @@ mod tests {
         );
         facts.flushed = true;
         assert_eq!(
-            accept_refresh(&facts, 3, "on_prefix_rebuild", &next, true),
+            accept_refresh(&facts, 3, "on_prefix_rebuild", &next, &[], true),
             RefreshAcceptance::Accept {
                 run_in_progress: true,
                 applies_from_next_run: true
@@ -503,6 +597,7 @@ mod tests {
                 2,
                 "immediately",
                 &manifest("plan-2", &[], ""),
+                &[],
                 false
             ),
             RefreshAcceptance::Repeat {
@@ -520,7 +615,7 @@ mod tests {
             broca_wal::OpaqueJson::from_json_text(r#"{"compaction_item":{"provider":"p"}}"#)
                 .unwrap();
         assert!(matches!(
-            accept_refresh(&facts, 3, "immediately", &compacting, false),
+            accept_refresh(&facts, 3, "immediately", &compacting, &[], false),
             RefreshAcceptance::Refused(SessionChangeError::InvalidParams { field, .. })
                 if field == "plan.compaction_item"
         ));
@@ -530,6 +625,7 @@ mod tests {
                 3,
                 "on_system_rebuild",
                 &manifest("plan-3", &["b"], "text"),
+                &[],
                 false
             ),
             RefreshAcceptance::Refused(SessionChangeError::RungUnsupported {
@@ -781,7 +877,7 @@ mod tests {
             ..ChangeFacts::default()
         };
         assert_eq!(
-            accept_refresh(&today, 1, "immediately", &adding, false),
+            accept_refresh(&today, 1, "immediately", &adding, &[], false),
             RefreshAcceptance::Refused(fixed.clone())
         );
         let store = ChangeFacts {
@@ -797,17 +893,18 @@ mod tests {
             1,
             "immediately",
             &adding,
+            &[],
             false
         )));
         let mut cut = store.clone();
         cut.enrollment.as_mut().unwrap().window_whole = false;
         assert_eq!(
-            accept_refresh(&cut, 1, "immediately", &adding, false),
+            accept_refresh(&cut, 1, "immediately", &adding, &[], false),
             not_addable(Refusal::WindowNotWhole)
         );
         let silent = with_item("silent", "", Some(item.clone()));
         assert_eq!(
-            accept_refresh(&store, 1, "immediately", &silent, false),
+            accept_refresh(&store, 1, "immediately", &silent, &[], false),
             not_addable(Refusal::NoSystemText)
         );
         let mut quiet = store.clone();
@@ -817,6 +914,7 @@ mod tests {
             1,
             "immediately",
             &silent,
+            &[],
             false
         )));
         let pending = ChangeFacts {
@@ -834,6 +932,7 @@ mod tests {
             2,
             "immediately",
             &again,
+            &[],
             false
         )));
         let mut other = item.clone();
@@ -843,7 +942,7 @@ mod tests {
             with_item("changed", "text", Some(other)),
         ] {
             assert_eq!(
-                accept_refresh(&pending, 2, "immediately", &next, false),
+                accept_refresh(&pending, 2, "immediately", &next, &[], false),
                 RefreshAcceptance::Refused(fixed.clone())
             );
             let today_pending = ChangeFacts {
@@ -851,7 +950,7 @@ mod tests {
                 ..pending.clone()
             };
             assert_eq!(
-                accept_refresh(&today_pending, 2, "immediately", &next, false),
+                accept_refresh(&today_pending, 2, "immediately", &next, &[], false),
                 RefreshAcceptance::Refused(fixed.clone())
             );
         }
@@ -919,6 +1018,31 @@ mod tests {
     /// say one happened, when the change adds a compaction provider, or when the session's
     /// prompt cache has provably lapsed: no request reached it within the lifetime it asked
     /// for. A cache with no lifetime, or none sent yet, proves nothing.
+    /// A run start rebuilds its prefix when it switches model, a flush or a newer view waits,
+    /// or the cache lapsed; a plain next run on the same model rebuilds nothing.
+    #[test]
+    fn a_run_start_rebuilds_its_prefix_by_what_changed_since_the_last_run() {
+        use broca_session_store::fold::operations::CacheSend;
+        let sent = CacheSend {
+            sent_at_ms: 1_000,
+            run_id: "r1".into(),
+            requested_ttl_ms: Some(3_600_000),
+        };
+        let fresh = Some(&sent);
+        let rebuilds = |last: Option<&str>, flushed, view, now| {
+            run_rebuilds_prefix(last, "stub:m", flushed, view, fresh, now)
+        };
+        assert!(!rebuilds(Some("stub:m"), false, false, 2_000));
+        assert!(
+            !rebuilds(None, false, false, 2_000),
+            "a first run has no prefix to rebuild"
+        );
+        assert!(rebuilds(Some("stub:other"), false, false, 2_000));
+        assert!(rebuilds(Some("stub:m"), true, false, 2_000));
+        assert!(rebuilds(Some("stub:m"), false, true, 2_000));
+        assert!(rebuilds(Some("stub:m"), false, false, 3_601_000));
+    }
+
     #[test]
     fn a_lapsed_prompt_cache_counts_as_a_prefix_rebuild() {
         use broca_session_store::fold::operations::CacheSend;

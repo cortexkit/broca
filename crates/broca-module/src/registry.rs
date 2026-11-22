@@ -2334,6 +2334,7 @@ impl LineageRegistry {
         generation: u64,
         policy: String,
         manifest: Box<broca_wal::PlanManifest>,
+        refetch: Vec<String>,
     ) -> Result<crate::actor::SessionRefreshOutcome, OpenError> {
         use crate::actor::{LineageCmd, SessionRefreshOutcome};
         loop {
@@ -2345,6 +2346,7 @@ impl LineageRegistry {
                 generation,
                 policy: policy.clone(),
                 manifest: manifest.clone(),
+                refetch: refetch.clone(),
                 reply,
             };
             if handle.send(cmd).await.is_err() {

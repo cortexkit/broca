@@ -1105,6 +1105,10 @@ message! {
         /// leaves its model to the session, and `session.head`, follow the latest refresh that
         /// chooses one.
         7 opt selection: serde_json::Value,
+        /// The providers the refresh asked to read afresh (llm-runner `refetch`), in the order it
+        /// named them; empty when it named none. Only an identical repeat of this refresh reads
+        /// it, so a build without the field may skip it.
+        8 rep refetch: String,
     }
 }
 

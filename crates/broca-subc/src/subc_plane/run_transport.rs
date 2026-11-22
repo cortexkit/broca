@@ -1,5 +1,5 @@
 use super::*;
-use broca_core::tool_plane::{FrozenProviderDeclarations, PlanManifest};
+use broca_core::tool_plane::{CompatibleTool, FrozenProviderDeclarations, PlanManifest};
 use broca_fetch_plan::admit::{decode_transport_catalog, ToolCatalog, OPTIONAL_TOOL_BUDGET};
 use std::sync::LazyLock;
 
@@ -92,6 +92,53 @@ fn drifted_tool<'a>(
             };
             (!unchanged).then_some(tool.name.as_str())
         })
+}
+
+/// `manifest`'s versioned tools whose provider's newest catalog read serves the same major
+/// under another definition ([`broca_core::tool_plane::ToolPlane::compatible_tools`]). Reads only
+/// what [`SubcToolPlane::refresh_run_transport`] cached for each `(provider, preset)`.
+pub(super) fn compatible_tools(manifest: &PlanManifest) -> Vec<CompatibleTool> {
+    let Ok(dispatch) =
+        ToolManifest::from_shared_tools(Arc::clone(&manifest.tools)).with_plan_manifest(manifest)
+    else {
+        return Vec::new();
+    };
+    manifest
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            let provider = tool.module.as_deref()?;
+            let frozen = dispatch
+                .provider_declarations(provider)?
+                .schema_pins
+                .as_ref()?
+                .get(&tool.name)?;
+            let major = frozen.major?;
+            let key = (
+                provider.to_owned(),
+                dispatch.provider_preset(provider).map(str::to_owned),
+            );
+            let slot = CACHE.lock().unwrap().get(&key).cloned()?;
+            let current = slot.state.lock().unwrap().latest.clone()?;
+            let pin = current.catalog.schema_pins.get(&tool.name)?;
+            if pin.major != Some(major) {
+                return None;
+            }
+            let now = current
+                .catalog
+                .tools
+                .iter()
+                .find(|now| now.name == tool.name)?;
+            let unchanged = now.description == tool.description
+                && now.input_schema == tool.input_schema
+                && pin.schema_digest == frozen.schema_digest;
+            (!unchanged).then(|| CompatibleTool {
+                provider: provider.to_owned(),
+                tool: now.clone(),
+                pin: pin.clone(),
+            })
+        })
+        .collect()
 }
 
 impl SubcToolPlane {

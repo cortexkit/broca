@@ -316,3 +316,74 @@ async fn run_transport_schema_drift_freezes_the_whole_provider_with_definition_f
         );
     }
 }
+
+/// A versioned catalog of one `bash` tool at `version`, with `description`.
+fn versioned_catalog(version: &str, description: &str, digest: char) -> serde_json::Value {
+    json!({"generation":"one","catalog_digest":version,"tools":[{
+        "name":"bash","description":description,"input_schema":{"type":"object"},
+        "schema_digest":digest.to_string().repeat(64),"semantics":1,"version":version,
+        "capabilities":[]
+    }]})
+}
+
+/// A frozen plan whose provider answered `versioned_catalog(version, ...)`.
+fn versioned_plan(provider: &str, version: &str) -> PlanManifest {
+    let mut plan = plan(provider, true);
+    let (catalog, declarations) = broca_fetch_plan::admit::decode_transport_catalog(
+        provider,
+        versioned_catalog(version, "Run work", 'a'),
+        true,
+        true,
+    )
+    .unwrap();
+    let mut tools = catalog.tools;
+    for tool in &mut tools {
+        tool.module.get_or_insert_with(|| provider.to_owned());
+    }
+    plan.tools = tools.clone().into();
+    plan.fetches[0].outcome = FetchOutcome::Answered {
+        catalog_digest: version.into(),
+        tools: tools.into(),
+        text: None,
+        result_ops: None,
+        reply: None,
+        declarations_frozen: Some(Box::new(declarations)),
+        reference_slots: None,
+    };
+    plan
+}
+
+/// The newest catalog read for a run names the versioned tools a run at a prefix rebuild may
+/// take: a new minor or patch with another definition is listed with its current pin; the
+/// same definition, or a new major, is not.
+#[tokio::test(start_paused = true)]
+async fn compatible_tools_are_same_major_tools_the_newest_read_defines_differently() {
+    for (current, listed) in [
+        (
+            versioned_catalog("2.2.0", "Run work, with a timeout", 'b'),
+            true,
+        ),
+        (versioned_catalog("2.1.1", "Run work", 'a'), false),
+        (versioned_catalog("3.0.0", "Run other work", 'c'), false),
+    ] {
+        let provider = format!("transport-versions-{}", current["catalog_digest"]);
+        let plan = versioned_plan(&provider, "2.1.0");
+        let conn =
+            ScriptedToolPlaneConnection::new(vec![inventory(&provider)], vec![Ok(current.clone())]);
+        let plane = SubcToolPlane::with_connection(conn.clone(), &provider);
+        assert!(
+            plane.compatible_tools(&plan).await.is_empty(),
+            "nothing read yet"
+        );
+        let bind = BindIdentity::new("/project", "test", "versions");
+        plane.run_transport(&bind, None, &plan).await;
+        let compatible = plane.compatible_tools(&plan).await;
+        assert_eq!(compatible.len(), usize::from(listed), "{current}");
+        if listed {
+            assert_eq!(compatible[0].provider, provider);
+            assert_eq!(compatible[0].tool.description, "Run work, with a timeout");
+            assert_eq!(compatible[0].pin.major, Some(2));
+            assert_eq!(compatible[0].pin.schema_digest, "b".repeat(64));
+        }
+    }
+}

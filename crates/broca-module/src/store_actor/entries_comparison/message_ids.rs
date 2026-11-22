@@ -295,7 +295,13 @@ async fn message_ids_use_served_facts_after_compaction_enrolment() {
     refreshed.plan_identity = "synthetic-enrolled-plan".into();
     let answer = side
         .registry
-        .route_session_refresh(&side.key, 1, "immediately".into(), Box::new(refreshed))
+        .route_session_refresh(
+            &side.key,
+            1,
+            "immediately".into(),
+            Box::new(refreshed),
+            Vec::new(),
+        )
         .await
         .unwrap();
     assert!(

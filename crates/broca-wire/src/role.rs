@@ -429,6 +429,10 @@ pub fn broca_role_describe_with_writers(
         // A mid-session plan change: refresh, its policy and a prefix flush. All three
         // ops are served together, owner-only; the group is declared only then.
         cortexkit_role_llm_runner::capabilities::SESSION_CHANGE,
+        // A versioned tool's calls carry its major (`tp2`); a call refused for a new major
+        // raises `tool_changed`; a refresh can name providers to read afresh; and a run at a
+        // prefix rebuild takes a same-major tool's current definition.
+        cortexkit_role_llm_runner::capabilities::TOOL_VERSIONS,
         // Ordered sends can land beside tool results, as turn-scoped template text on a
         // confirmed route, at a running step boundary, or when an idle session starts.
         DELIVERY_ORDER_GROUP,
@@ -1450,7 +1454,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "d08e9062721203e0997b1651246dac7e0f9bf3aecc45b7959ccbb4a6182ed0f1",
+            "39526e1e2367baa9f51710b7c6b30144eefc2b2d72ea45fa1f96b1c0b91ede78",
         );
     }
 
@@ -1647,7 +1651,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "0b23965ed0b9af8763aa403498d4700555471aa488068a07fa13b023c95b0d47";
+        "1a43475b5649f775c9648ef22652ab47cec48e4017134647fef4bb83f93eff3a";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

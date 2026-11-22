@@ -301,6 +301,9 @@ pub(super) struct LoopExecutor {
     /// The count of the person's steers the actor handed the latest run, as the module's
     /// executor hands it to the run's tool calls.
     pub(super) person_steers: std::sync::Mutex<Option<broca_core::tool_plane::PersonSteers>>,
+    /// Whether each run the actor started was at a prefix rebuild or applied a pending change
+    /// (`RunControl::rebuild_point`), in order.
+    pub(super) rebuild_points: Arc<std::sync::Mutex<Vec<bool>>>,
 }
 
 /// Waits for the media the actor sends a run, without rendering any.
@@ -341,6 +344,9 @@ pub(super) struct Planes {
     pub(super) hooks: Option<Arc<dyn broca_core::HookPlane>>,
     pub(super) compaction: Option<Arc<dyn broca_core::CompactionPlane>>,
     pub(super) tool_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    /// When set, `read`'s provider refuses each call because it now serves another major of
+    /// the tool, with this refusal detail.
+    pub(super) major_changed: Option<serde_json::Value>,
 }
 
 /// The test executors' tool plane: the stub plane answering the `read` tool with `text`, whose
@@ -348,6 +354,7 @@ pub(super) struct Planes {
 pub(super) struct GatedTools {
     inner: StubToolPlane,
     gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    major_changed: Option<serde_json::Value>,
 }
 
 impl GatedTools {
@@ -355,6 +362,7 @@ impl GatedTools {
         Self {
             inner: StubToolPlane::new().with_canned_text("read", text),
             gate,
+            major_changed: None,
         }
     }
 }
@@ -378,6 +386,19 @@ impl broca_core::tool_plane::ToolPlane for GatedTools {
         if let Some((reached, release)) = &self.gate {
             reached.notify_one();
             release.notified().await;
+        }
+        if let Some(refusal) = &self.major_changed {
+            return broca_core::tool_plane::DispatchResult::Refused {
+                result: broca_protocol::content::ToolResult {
+                    tool_call_id: call.tool_call_id.clone(),
+                    output: broca_protocol::content::ToolOutput::error(
+                        "tool/route rejected: tool_major_changed",
+                    ),
+                    is_error: true,
+                },
+                code: "tool_major_changed".into(),
+                detail: broca_core::tool_plane::refusal_detail("aft", Some(refusal)),
+            };
         }
         self.inner.dispatch(ctx, call).await
     }
@@ -409,6 +430,7 @@ pub(super) fn executor(
         tool_text: "file contents".into(),
         waits_for_media: false,
         person_steers: Default::default(),
+        rebuild_points: Default::default(),
     }
 }
 
@@ -453,6 +475,12 @@ impl RunExecutor for LoopExecutor {
         // The module's executor admits a run's context limit from the caller's override when
         // the send names one.
         control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
+        if mode == StoreRunMode::Fresh {
+            self.rebuild_points
+                .lock()
+                .unwrap()
+                .push(control.rebuild_point);
+        }
         if let (Some((reached, release)), Some(_)) = (&self.drain_gate, &req.submission_id) {
             reached.notify_one();
             release.notified().await;
@@ -477,7 +505,8 @@ impl RunExecutor for LoopExecutor {
                     .map_err(StoreRunError::Admission)?,
                 )
             };
-            let tools = GatedTools::new(&self.tool_text, self.planes.tool_gate.clone());
+            let mut tools = GatedTools::new(&self.tool_text, self.planes.tool_gate.clone());
+            tools.major_changed.clone_from(&self.planes.major_changed);
             // The wall clock, as the module's executor reads it: a queued ordered send's expiry
             // is judged at a run's boundaries by the same clock the run reads.
             let now = || {

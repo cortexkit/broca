@@ -395,6 +395,7 @@ async fn app_readers_absence_preserves_admission_and_unattested_callers_fail_clo
             1,
             "on_prefix_rebuild".into(),
             Box::new(Arc::try_unwrap(frozen(&restricted).manifest.unwrap()).unwrap()),
+            Vec::new(),
         )
         .await
         .unwrap();

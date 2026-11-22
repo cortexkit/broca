@@ -890,6 +890,7 @@ mod records {
         setup,
         manifest,
         selection,
+        refetch,
     });
     crate::fuzzing::gen::fields!(StructuredResult { run_id, result });
     crate::fuzzing::gen::fields!(Resumed {

@@ -73,6 +73,8 @@ mod call_plan;
 use call_plan::{hook_plan, plan_calls, CallPlan};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
+mod resolved;
+use resolved::{resolve, Resolved};
 mod stops;
 use stops::{hard_stop, stop_before_batch, stopped_batch, stopped_batch_in};
 mod start_config;
@@ -187,6 +189,11 @@ pub struct Admission {
     /// run's input in the batch of its start. Like `pre_model_error`, a run read back from its
     /// start has none: the record that followed the start keeps it.
     pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
+    /// Whether the run starts at a prefix rebuild of its session or applies a pending plan
+    /// change, where it takes a versioned tool's current same-major definition (see
+    /// `crate::plan::take_compatible_tools`). Not frozen: a run read back from its start reads
+    /// false, and keeps the tools its start recorded.
+    pub rebuild_point: bool,
     /// Whether the run is a head's turn (`RunRequest::head_turn`), which a continue request
     /// at a usage wall or sign-in loss tells routing. Not frozen: a run read back from its
     /// start reads false.
@@ -436,11 +443,22 @@ where
     // moves onto it at the first run whose plan names a compaction provider: that run enrolls
     // it (see `crate::enroll`).
     let mut admission = admission;
-    if let Some(manifest) = &admission.manifest {
+    if let Some(manifest) = admission.manifest.clone() {
         admission.transport = seams
             .tools
-            .run_transport(&seams.bind, admission.send.scope.as_ref(), manifest)
+            .run_transport(&seams.bind, admission.send.scope.as_ref(), &manifest)
             .await;
+        // A prefix rebuild writes the prompt afresh, so the run takes a versioned tool's
+        // same-major definition there; its start records the tools it took.
+        if admission.rebuild_point {
+            let changes = seams.tools.compatible_tools(&manifest).await;
+            if let Some((taken, tools)) =
+                crate::plan_tools::take_compatible_tools(&manifest, &admission.tools, &changes)
+            {
+                admission.manifest = Some(Arc::new(taken));
+                admission.tools = tools;
+            }
+        }
     }
     let contract =
         crate::admit::session_contract(writer.operations(), admission.compaction_plan_version);
@@ -1664,6 +1682,7 @@ pub fn admission_of_start(
         },
         pre_model_error: None,
         applies_refresh: None,
+        rebuild_point: false,
         head_turn: false,
     })
 }
@@ -5784,30 +5803,6 @@ struct DispatchPlan<'p> {
     changes: Option<&'p crate::compaction::Changes<'p>>,
 }
 
-/// What a call resolved to, before the batch takes it: the result and outcome, the code the
-/// outcome records, and what its post-tool hooks did.
-struct Resolved {
-    result: ToolResult,
-    outcome: CallOutcome,
-    reason: Option<String>,
-    hooks: Option<Value>,
-    /// The provider of a call handed back for the person's steer, whose later terminal for it
-    /// becomes a notice (see [`DispatchResult::Yielded`]).
-    yielded_by: Option<String>,
-}
-
-impl From<(ToolResult, CallOutcome)> for Resolved {
-    fn from((result, outcome): (ToolResult, CallOutcome)) -> Self {
-        Self {
-            result,
-            outcome,
-            reason: None,
-            hooks: None,
-            yielded_by: None,
-        }
-    }
-}
-
 /// One call's answer, once it is appended. The batch's end needs only how the call ended.
 struct Answer {
     outcome: CallOutcome,
@@ -6039,6 +6034,7 @@ async fn settle<W: Writer, P, T: ToolPlane>(
         result,
         outcome,
         reason,
+        detail,
         hooks,
         yielded_by,
     } = resolved;
@@ -6061,6 +6057,7 @@ async fn settle<W: Writer, P, T: ToolPlane>(
         );
         if let Some(Record::ToolOutcome(record)) = records.last_mut() {
             record.hooks = hooks.map(Into::into);
+            record.detail = detail.map(Into::into);
             record.yielded_by = yielded_by.clone();
         }
         writer.append(&records, true).await?;
@@ -6093,6 +6090,7 @@ async fn settle<W: Writer, P, T: ToolPlane>(
         );
         if let Some(Record::ToolOutcome(record)) = records.last_mut() {
             record.hooks = hooks.map(Into::into);
+            record.detail = detail.map(Into::into);
         }
         writer.append(&records, true).await?;
     }
@@ -6192,6 +6190,19 @@ async fn answered(
             yielded_by: Some(carrier),
             ..post_tool(plan.hooks, plan.step_id, call, call_key, result).await
         },
+        // The refusal's code is the outcome's reason unless a post-tool hook gave one.
+        DispatchResult::Refused {
+            result,
+            code,
+            detail,
+        } => {
+            let resolved = post_tool(plan.hooks, plan.step_id, call, call_key, result).await;
+            Resolved {
+                reason: resolved.reason.clone().or(Some(code)),
+                detail: Some(detail),
+                ..resolved
+            }
+        }
         DispatchResult::ScopeDrained { ref reason, .. } => {
             let reason = Some(reason.clone());
             Resolved {
@@ -6293,52 +6304,9 @@ async fn post_tool(
         result,
         outcome: CallOutcome::Completed,
         reason,
+        detail: None,
         hooks: hooks.map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes")),
         yielded_by: None,
-    }
-}
-
-/// A call's result and outcome from what the tool plane said:
-/// - a result is the tool's own answer;
-/// - never sent is safe: the model gets an error result and may try again;
-/// - sent with no result may have had its effect: the model gets an error result, the outcome
-///   is unknown, and the run stops.
-fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, CallOutcome) {
-    let error = |message: String| ToolResult {
-        tool_call_id: call.tool_call_id.clone(),
-        output: ToolOutput::error(message),
-        is_error: true,
-    };
-    match result {
-        DispatchResult::Completed(result) | DispatchResult::Yielded { result, .. } => {
-            (result, CallOutcome::Completed)
-        }
-        DispatchResult::NotSent { reason } => (
-            error(format!("tool not dispatched: {reason}")),
-            CallOutcome::Completed,
-        ),
-        DispatchResult::SentButOutcomeUnknown { reason } => (
-            error(format!(
-                "tool outcome unknown (interrupted for review): {reason}"
-            )),
-            CallOutcome::Unknown,
-        ),
-        // Never sent, so the refusal is definite: the model sees it and the run goes on.
-        DispatchResult::ScopeDrained {
-            reason,
-            sent: false,
-        } => (
-            broca_core::tool_results::route_drained_result(&call.tool_call_id, &reason),
-            CallOutcome::Completed,
-        ),
-        // Sent with no result: the side effect may have applied, as with any lost reply.
-        DispatchResult::ScopeDrained { reason, sent: true } => (
-            error(format!(
-                "tool outcome unknown (interrupted for review): its route was drained \
-                 ({reason}) after the call was sent"
-            )),
-            CallOutcome::Unknown,
-        ),
     }
 }
 

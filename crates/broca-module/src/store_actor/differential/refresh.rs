@@ -182,6 +182,7 @@ async fn drive(
                         *generation,
                         (*policy).into(),
                         Box::new(manifest.clone()),
+                        Vec::new(),
                     )
                     .await
                     .expect("the refresh is routed")

@@ -176,6 +176,9 @@ pub enum LineageCmd {
         generation: u64,
         policy: String,
         manifest: Box<broca_wal::PlanManifest>,
+        /// The providers the refresh asked to read afresh (llm-runner `refetch`), empty when
+        /// it named none; part of what an identical repeat repeats.
+        refetch: Vec<String>,
         reply: oneshot::Sender<SessionRefreshOutcome>,
     },
     /// Change when the pending plan takes effect, durable before its reply. Idempotent on `send_id`.

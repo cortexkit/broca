@@ -492,6 +492,7 @@ impl StoreControl {
                         schema_pin: None,
                     });
                     self.terminal(&result, name, outcome.finished_at_ms, own, units);
+                    self.tool_changed(outcome, units);
                 }
                 let status = self
                     .held
@@ -826,6 +827,44 @@ impl StoreControl {
                 units.boundary(owner, finished(owner));
             }
         }
+    }
+
+    /// A `tool_changed` event for a call its provider refused because it now serves another
+    /// major of the tool: the provider and both pins, as the outcome recorded them from the
+    /// refusal ([`broca_core::tool_plane::refusal_detail`]). It rides a boundary of the
+    /// assistant message that made the call, as the call's lifecycle events do.
+    fn tool_changed(
+        &self,
+        outcome: &broca_session_store::record::ToolOutcome,
+        units: &mut Units<'_>,
+    ) {
+        if outcome.reason.as_deref()
+            != Some(cortexkit_role_tool_provider::errors::TOOL_MAJOR_CHANGED)
+        {
+            return;
+        }
+        let Some(mid) = self.assistant_mid.clone() else {
+            return;
+        };
+        let Some(detail) = outcome.detail.as_ref().map(|detail| detail.parse()) else {
+            return;
+        };
+        let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
+        let refusal = &detail["refusal"];
+        let (Some(provider), Some(tool), Some(expected), Some(current)) = (
+            text(&detail["provider"]),
+            text(&refusal["tool"]),
+            text(&refusal["expected"]),
+            text(&refusal["current"]),
+        ) else {
+            return;
+        };
+        units.boundary(
+            &mid,
+            LiveEvent::ToolChanged(cortexkit_role_llm_runner::live::ToolChanged::new(
+                provider, tool, expected, current,
+            )),
+        );
     }
 
     fn batch_end(&mut self, units: &mut Units<'_>) {
