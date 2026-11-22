@@ -13,18 +13,18 @@ use super::LoopError;
 /// state read the typed fields; every other field the provider measured is kept as diagnostics
 /// telemetry under the name it has on the provider's evidence. Billing details are absent: no
 /// attempt in this loop is billed through a reservation yet.
-/// `requested_ttl_ms` is the cache lifetime the run's requests ask for, recorded on an attempt
-/// that reached the cache.
-/// `account_limit_pause` is the run's frozen consent to a timed same-account pause: with it, an
-/// attempt the provider refused for the account's limit records that limit's disposition, as
-/// `account_limit_pause::attempt_record` does.
+/// `context` holds what every attempt of the step shares ([`AttemptContext`]).
 pub(super) fn attempt_record(
     run_id: &str,
     step_id: u64,
     attempt: ModelAttempt,
-    requested_ttl_ms: Option<u64>,
-    account_limit_pause: bool,
+    context: &AttemptContext,
 ) -> Result<Record, LoopError> {
+    let AttemptContext {
+        requested_ttl_ms,
+        account_limit_pause,
+        request,
+    } = context;
     let disposition = account_limit_pause
         .then(|| {
             attempt
@@ -95,7 +95,67 @@ pub(super) fn attempt_record(
         telemetry: telemetry.map(Into::into),
         reached_cache: reached.then_some(true),
         requested_cache_ttl_ms: requested_ttl_ms.filter(|_| reached),
+        tools_digest: Some(request.tools_digest.clone()),
+        system_digest: Some(request.system_digest.clone()),
+        signed_floor: request.signed_floor.clone(),
     }))
+}
+
+/// What every attempt of one step records alike.
+#[derive(Debug, Clone, Default)]
+pub(super) struct AttemptContext {
+    /// The cache lifetime the run's requests ask for, recorded on an attempt that reached the
+    /// cache.
+    pub requested_ttl_ms: Option<u64>,
+    /// The run's frozen consent to a timed same-account pause: with it, an attempt the provider
+    /// refused for the account's limit records that limit's disposition, as
+    /// `account_limit_pause::attempt_record` does.
+    pub account_limit_pause: bool,
+    /// What the step's request offered.
+    pub request: RequestFacts,
+}
+
+/// What a step's request offers its provider, for the step events that compare requests: its
+/// tool list and system text as content digests, and the entry the session's signed floor goes
+/// through. A digest covers content only; the step event folds in the provider, model and render
+/// config that turned it into bytes (`step_events::store` in broca-module).
+#[derive(Debug, Clone, Default)]
+pub(super) struct RequestFacts {
+    pub tools_digest: String,
+    pub system_digest: String,
+    pub signed_floor: Option<String>,
+}
+
+impl RequestFacts {
+    /// The facts of `opts`, with the session's signed floor at `signed_floor` (an entry id). The
+    /// system text is the system messages leading the prompt; a turn-scoped system message
+    /// further on is conversation, not system text. Neither digest covers cache markers, which
+    /// live on messages beside their content.
+    pub(super) fn of(
+        opts: &broca_protocol::request::CallOptions,
+        signed_floor: Option<String>,
+    ) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let digest = |value: serde_json::Value| {
+            Sha256::digest(value.to_string().as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let system: Vec<_> = opts
+            .prompt
+            .iter()
+            .take_while(|message| {
+                message.role == broca_protocol::content::Role::System && !message.turn_system
+            })
+            .map(|message| &message.content)
+            .collect();
+        Self {
+            tools_digest: digest(json!(opts.tools.as_slice())),
+            system_digest: digest(json!(system)),
+            signed_floor,
+        }
+    }
 }
 
 /// The digest a 64-character hex string spells, or `None`.
@@ -114,6 +174,54 @@ fn hex_digest(text: &str) -> Option<Digest> {
 mod tests {
     use super::*;
     use broca_protocol::InputTransformation;
+
+    /// The system digest covers the system messages leading the prompt and nothing after them;
+    /// a cache marker or a later turn-scoped system message leaves it unchanged. The tool digest
+    /// follows the tool list.
+    #[test]
+    fn request_facts_digest_the_leading_system_text_and_the_tool_list() {
+        use broca_protocol::content::{ContentBlock, Message, Role};
+        let text = |role, text: &str| Message {
+            turn_system: false,
+            cache_prefix_blocks: None,
+            origin: None,
+            ordinal: None,
+            tags: Default::default(),
+            role,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        };
+        let base = broca_protocol::request::CallOptions::new(vec![
+            text(Role::System, "be brief"),
+            text(Role::User, "hello"),
+        ]);
+        let facts = RequestFacts::of(&base, Some("m-1".into()));
+        assert_eq!(facts.signed_floor.as_deref(), Some("m-1"));
+        assert_eq!(facts.system_digest.len(), 64);
+        let mut later = base.clone();
+        later.prompt[0].cache_prefix_blocks = Some(1);
+        let mut reminder = text(Role::System, "a reminder");
+        reminder.turn_system = true;
+        later.prompt.push(reminder);
+        later.prompt.push(text(Role::User, "more"));
+        let same = RequestFacts::of(&later, None);
+        assert_eq!(same.system_digest, facts.system_digest);
+        assert_eq!(same.tools_digest, facts.tools_digest);
+        let mut other = base.clone();
+        other.prompt[0] = text(Role::System, "be thorough");
+        assert_ne!(
+            RequestFacts::of(&other, None).system_digest,
+            facts.system_digest
+        );
+        let mut tooled = base;
+        tooled.tools = std::sync::Arc::new(vec![serde_json::from_value(json!({
+            "name": "read", "description": "reads a file", "input_schema": {"type": "object"},
+        }))
+        .unwrap()]);
+        assert_ne!(
+            RequestFacts::of(&tooled, None).tools_digest,
+            facts.tools_digest
+        );
+    }
 
     fn model_attempt(report: Option<Vec<InputTransformation>>, unmeasured: bool) -> ModelAttempt {
         ModelAttempt {
@@ -143,7 +251,7 @@ mod tests {
 
     /// What the attempt's evidence for the usage export reads back from the record.
     fn read_back(attempt: ModelAttempt) -> Option<Vec<InputTransformation>> {
-        let record = attempt_record("run", 1, attempt, None, false).unwrap();
+        let record = attempt_record("run", 1, attempt, &AttemptContext::default()).unwrap();
         let evidence = crate::billing::attempt_evidence(&[(5, record)], "run");
         assert_eq!(evidence.len(), 1);
         evidence.into_iter().next().unwrap().input_transformations

@@ -9,6 +9,9 @@ fn cached_attempt(account: &str, status: u32, sent: u64) -> broca_session_store:
         last_content_at_ms: None, transport: None, served_account_ref: Some(account.into()),
         billing: None, telemetry: None, reached_cache: Some((200..300).contains(&status)),
         requested_cache_ttl_ms: None,
+        tools_digest: None,
+        system_digest: None,
+        signed_floor: None,
     })
 }
 

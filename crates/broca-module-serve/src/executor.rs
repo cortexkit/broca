@@ -1622,10 +1622,14 @@ impl broca_session_loop::account_move::AccountContinue<Box<dyn broca_core::provi
                 "the offered credential's provider or auth method does not match the run",
             );
         }
-        let decision = broca_core::AccountDecision {
-            decision_id: Some(offer.decision_id.clone()),
-            ..previous.clone()
-        };
+        let decision = broca_module_serve::account_routing::routed_decision(
+            &broca_core::AccountDecision {
+                decision_id: Some(offer.decision_id.clone()),
+                ..previous.clone()
+            },
+            &offer.account,
+            &offer.credential_id,
+        );
         let config = match self.moved_config(wall, &offer, &decision) {
             Ok(config) => config,
             Err(error) => return refuse(&error),
@@ -3967,6 +3971,16 @@ impl LiveLoopExecutor {
                 // admission.
                 account_decision: match account {
                     AccountChoice::NotApplicable => frozen_decision.cloned(),
+                    AccountChoice::Routed {
+                        account_id,
+                        credential_id,
+                        decision,
+                        ..
+                    } => Some(broca_module_serve::account_routing::routed_decision(
+                        decision,
+                        account_id,
+                        credential_id,
+                    )),
                     chosen => chosen.decision().cloned(),
                 },
                 // Frozen only when `credential_id` is the vault's own id, so that a resume

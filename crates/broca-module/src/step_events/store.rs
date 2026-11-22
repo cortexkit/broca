@@ -18,6 +18,45 @@ struct Run {
     route_decision_id: Option<String>,
     frozen_render_config: serde_json::Value,
     keep_warm: Option<broca_protocol::request::KeepWarm>,
+    /// The reference to the account routing admitted the run on, as its latest auth selection
+    /// names it (`routed_ref`); `None` when routing didn't choose the run's account.
+    account_ref: Option<String>,
+}
+
+/// A request digest the run loop recorded (`Attempt::tools_digest`, `system_digest`: content
+/// only), joined with what turns that content into provider bytes. [`rendered_with`] joins the
+/// run's render config when the attempt is seen, and [`served_by`] the provider and model that
+/// served it once the step's end names them, so two steps' digests are equal only when the
+/// provider received the same bytes (llm-runner's `tools_digest` and `system_digest`).
+fn joined(parts: &[&str]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"broca.step-request.v1");
+    for part in parts {
+        hash.update([0]);
+        hash.update(part.as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn rendered_with(content: &str, render_config: &serde_json::Value) -> String {
+    joined(&[content, &render_config.to_string()])
+}
+
+fn served_by(rendered: &str, provider: &str, model: &str) -> String {
+    joined(&[rendered, provider, model])
+}
+
+/// The routing reference an auth selection carries (`AccountDecision::routed_ref`).
+fn routed_ref(selection: Option<&serde_json::Value>) -> Option<String> {
+    selection?
+        .get("account_decision")?
+        .get("routed_ref")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 impl Run {
@@ -115,6 +154,9 @@ pub(crate) struct Observer {
     parts: broca_session_loop::parts::SharedParts,
     warm_stops: super::WarmStops,
     message_ids: broca_session_loop::entries::MessageIds,
+    /// The compaction view each assistant message a step placed was written under, by message
+    /// id, until its step's end reports it: the view the step's request carried (0 for none).
+    views: BTreeMap<String, u64>,
 }
 
 impl Observer {
@@ -140,6 +182,7 @@ impl Observer {
             parts,
             warm_stops,
             message_ids: Default::default(),
+            views: BTreeMap::new(),
         }
     }
 
@@ -176,14 +219,25 @@ impl Observer {
                     .and_then(|v| v.get("work_class"))
                     .and_then(|v| v.as_str())
                     .map(str::to_owned),
+                account_ref: routed_ref(start.auth_selection.as_ref()),
             },
         );
     }
 
-    pub(crate) fn seed_run(&mut self, start: &RunStart, refrozen: Option<&serde_json::Value>) {
+    /// Seeds the run a session opens with: its start, and the render config and auth selection
+    /// it was refrozen with since (`Run::refrozen_render`, `Run::refrozen_auth`).
+    pub(crate) fn seed_run(
+        &mut self,
+        start: &RunStart,
+        refrozen: Option<&serde_json::Value>,
+        refrozen_auth: Option<&serde_json::Value>,
+    ) {
         self.run_start(start);
         if let Some(config) = refrozen.and_then(|refrozen| refrozen.get("render_config")) {
             self.refrozen(&start.run_id, config);
+        }
+        if let (Some(selection), Some(run)) = (refrozen_auth, self.runs.get_mut(&start.run_id)) {
+            run.account_ref = routed_ref(Some(selection));
         }
     }
 
@@ -238,6 +292,7 @@ impl Observer {
             Appended::Synced => self.synced(position),
             Appended::Replaced => {
                 self.message_ids.clear();
+                self.views.clear();
                 self.unsynced.clear();
                 self.completed.clear();
             }
@@ -249,6 +304,21 @@ impl Observer {
             Record::RunStart(start) => self.run_start(start),
             Record::ConfigRefrozen(refrozen) => {
                 self.refrozen(&refrozen.run_id, &refrozen.render_config);
+            }
+            // The run moved to another account; its later requests name that one.
+            Record::AuthRefrozen(refrozen) => {
+                if let Some(run) = self.runs.get_mut(&refrozen.run_id) {
+                    run.account_ref = routed_ref(Some(&refrozen.auth_selection));
+                }
+            }
+            Record::EntryFacts(facts) if facts.native => {
+                self.views.insert(
+                    facts.mid.clone(),
+                    facts
+                        .generated_under
+                        .as_ref()
+                        .map_or(0, |view| view.version),
+                );
             }
             Record::Attempt(attempt) => {
                 let Some(id) = &attempt.attempt_id else {
@@ -303,6 +373,17 @@ impl Observer {
                 event.work_class.clone_from(&run.work_class);
                 event.context_limit = run.context_limit;
                 event.route_decision_id.clone_from(&run.route_decision_id);
+                event.account_ref.clone_from(&run.account_ref);
+                event.warm_up = Some(false);
+                event.signed_floor.clone_from(&attempt.signed_floor);
+                // Joined with the step's provider and model when the event is sent (`synced`).
+                let rendered = |content: &Option<String>| {
+                    content
+                        .as_deref()
+                        .map(|content| rendered_with(content, &run.frozen_render_config))
+                };
+                event.tools_digest = rendered(&attempt.tools_digest);
+                event.system_digest = rendered(&attempt.system_digest);
                 event.cache = self.cache(&event);
                 (
                     event.sent_to_last_content_ms,
@@ -330,6 +411,8 @@ impl Observer {
                         // Only the final completed attempt supplied the reply placed by this step.
                         if index == last {
                             event.message_id.clone_from(&message_id);
+                            event.view_version =
+                                message_id.as_ref().and_then(|mid| self.views.remove(mid));
                             if event.message_id.is_none() {
                                 tracing::warn!(target: "broca.step_events",
                                     session_addr = %broca_core::session_addr(&self.bind),
@@ -389,6 +472,8 @@ impl Observer {
                 event.work_class.clone_from(&run.work_class);
                 event.context_limit = run.context_limit;
                 event.route_decision_id.clone_from(&run.route_decision_id);
+                event.account_ref.clone_from(&run.account_ref);
+                event.warm_up = Some(true);
                 event.cache = self.cache(&event);
                 let measured = Measured {
                     usage: Some(warmed.usage),
@@ -399,6 +484,8 @@ impl Observer {
             }
             Record::RunEnd(end) => {
                 self.message_ids.forget_run(&end.run_id);
+                // A message left unreported belongs to a step that never ended.
+                self.views.clear();
                 let keys: Vec<_> = self
                     .completed
                     .keys()
@@ -418,7 +505,12 @@ impl Observer {
     }
 
     fn synced(&mut self, position: broca_session_store::session::AppendPosition) {
-        for event in self.unsynced.drain(..) {
+        for mut event in self.unsynced.drain(..) {
+            for digest in [&mut event.tools_digest, &mut event.system_digest] {
+                if let Some(rendered) = digest.as_deref() {
+                    *digest = Some(served_by(rendered, &event.provider, &event.model));
+                }
+            }
             let Some(id) = event.attempt_id.as_ref() else {
                 continue;
             };
@@ -510,9 +602,9 @@ mod tests {
             100,
             200,
         );
-        observer.seed_run(start, None);
+        observer.seed_run(start, None, None);
         assert_eq!(observer.cache(&event).unwrap().ttl_ms, Some(300_000));
-        observer.seed_run(start, run.refrozen_render.as_ref());
+        observer.seed_run(start, run.refrozen_render.as_ref(), None);
         assert_eq!(
             serde_json::to_value(observer.cache(&event)).unwrap(),
             json!({"ttl_ms":3_600_000,"warming":{"on":true}})
@@ -660,7 +752,138 @@ mod tests {
             telemetry: None,
             reached_cache: None,
             requested_cache_ttl_ms: None,
+            tools_digest: None,
+            system_digest: None,
+            signed_floor: None,
         }
+    }
+
+    /// The step event of each attempt carries the facts that explain a cache rewrite: the
+    /// routed account's reference (following an account move), whether it was a warm-up, the
+    /// view its request carried, its request digests joined with the route that rendered them,
+    /// and the signed floor.
+    #[test]
+    fn step_events_carry_the_rewrite_facts_of_their_request() {
+        use broca_session_store::record::{AuthRefrozen, ViewRef};
+        let routed = |account: &str| {
+            json!({"credential_id": "credential-a", "account_decision": {
+                "path": "routed",
+                "routed_ref": cortexkit_role_llm_runner::step_events::account_ref(account, "credential-a"),
+            }})
+        };
+        let mut start = run_start(handle("provider_a", "model_a"), Vec::new(), json!({}), None);
+        start.auth_selection = Some(routed("account-a"));
+        let facts = |mid: &str, view: Option<u64>| {
+            let Record::EntryFacts(facts) = crate::store_media::tests::facts(3, mid.into()) else {
+                unreachable!()
+            };
+            let mut facts = (*facts).clone();
+            facts.native = true;
+            facts.generated_under = view.map(|version| {
+                ViewRef {
+                    version,
+                    checksum: "synthetic".into(),
+                }
+                .into()
+            });
+            Record::EntryFacts(Arc::new(facts))
+        };
+        let with_request = |mut attempt: Attempt, tools: &str| {
+            attempt.tools_digest = Some(tools.into());
+            attempt.system_digest = Some("system-content".into());
+            attempt.signed_floor = Some("m-floor".into());
+            attempt
+        };
+        let mut second = with_request(attempt(1, "complete", Some(30), 40), "tools-content");
+        second.step_id = 8;
+        second.attempt_id = Some("fedcba9876543210fedcba9876543210".into());
+        let mut rig = Rig::new(Default::default(), &[]);
+        rig.observer.message_ids.note(vec![
+            broca_session_loop::entries::PlacedMessage {
+                run_id: "run".into(),
+                step_id: 7,
+                mid: "m-7".into(),
+            },
+            broca_session_loop::entries::PlacedMessage {
+                run_id: "run".into(),
+                step_id: 8,
+                mid: "m-8".into(),
+            },
+        ]);
+        let sent = rig.sent(&[
+            Record::RunStart(Box::new(start)),
+            Record::Attempt(with_request(
+                attempt(1, "complete", Some(10), 20),
+                "tools-content",
+            )),
+            facts("m-7", Some(3)),
+            Record::StepEnd(step_end(None, None)),
+            Record::AuthRefrozen(AuthRefrozen {
+                run_id: "run".into(),
+                ts_ms: None,
+                auth_selection: routed("account-b"),
+            }),
+            Record::Attempt(second),
+            facts("m-8", None),
+            Record::StepEnd(StepEnd {
+                step_id: 8,
+                ..step_end(None, None)
+            }),
+        ]);
+        let [first, second] = sent.as_slice() else {
+            panic!("one event per completed step: {sent:?}");
+        };
+        let account_refs: Vec<_> = vectors()["account_refs"].as_array().unwrap().clone();
+        assert_eq!(
+            first.account_ref.as_deref(),
+            account_refs[0]["account_ref"].as_str(),
+            "the contract's known answer for account-a/credential-a"
+        );
+        assert_eq!(
+            second.account_ref.as_deref(),
+            Some(
+                cortexkit_role_llm_runner::step_events::account_ref("account-b", "credential-a")
+                    .as_str()
+            ),
+            "a moved run's later steps name the account it moved to"
+        );
+        assert_eq!((first.warm_up, second.warm_up), (Some(false), Some(false)));
+        assert_eq!(
+            (first.view_version, second.view_version),
+            (Some(3), Some(0))
+        );
+        assert_eq!(first.signed_floor.as_deref(), Some("m-floor"));
+        // The same content on the same route digests alike; the digest is never the content's.
+        assert_eq!(first.tools_digest, second.tools_digest);
+        assert_eq!(first.system_digest, second.system_digest);
+        assert_ne!(first.tools_digest, first.system_digest);
+        assert_ne!(first.tools_digest.as_deref(), Some("tools-content"));
+        for (step, event) in [(7, first), (8, second)] {
+            event.check().unwrap();
+            // Reader samples, serialized as the publisher serializes a step event.
+            if let Some(dir) = std::env::var_os("BROCA_STEP_EVENT_SAMPLES_DIR") {
+                let dir = std::path::PathBuf::from(dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let body = serde_json::to_vec(event).unwrap();
+                std::fs::write(dir.join(format!("rewrite-facts-step-{step}.json")), body).unwrap();
+            }
+        }
+    }
+
+    /// A digest names the route that turned its content into bytes: the same content served
+    /// by another model, or rendered under another config, digests differently.
+    #[test]
+    fn a_request_digest_differs_by_model_and_render_config() {
+        let rendered = rendered_with("tools-content", &json!({"a": 1}));
+        assert_ne!(rendered, rendered_with("tools-content", &json!({"a": 2})));
+        assert_ne!(
+            served_by(&rendered, "provider_a", "model_a"),
+            served_by(&rendered, "provider_a", "model_b")
+        );
+        assert_eq!(
+            served_by(&rendered, "provider_a", "model_a"),
+            served_by(&rendered, "provider_a", "model_a")
+        );
     }
 
     /// The end of step 7, with `usage` and its per-iteration cache lifetimes in `fallback`.
@@ -803,6 +1026,8 @@ mod tests {
             expected["step_id"] = json!("7");
             expected["attempt_id"] = json!("0123456789abcdef0123456789abcdef");
             expected["terminal_status"] = json!("completed");
+            // broca knows a step it ran isn't a warm-up, and says so.
+            expected["warm_up"] = json!(false);
             if full {
                 // The stored step has no assistant entry in this test, and new storage records
                 // neither the provider's request id nor a physical body length.

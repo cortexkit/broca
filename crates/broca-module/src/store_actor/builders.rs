@@ -161,7 +161,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .with_message_ids(message_ids);
         if let Some(run) = self.session.operations().run.as_ref() {
             if let Some(start) = run.start.as_ref() {
-                observer.seed_run(start, run.refrozen_render.as_ref());
+                observer.seed_run(
+                    start,
+                    run.refrozen_render.as_ref(),
+                    run.refrozen_auth.as_ref(),
+                );
             }
         }
         self.session

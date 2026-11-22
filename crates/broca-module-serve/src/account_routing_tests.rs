@@ -1292,6 +1292,7 @@ async fn a_routing_answer_names_the_credential_and_the_decision() {
                 path: "routed".into(),
                 admission_id: Some("run-1".into()),
                 decision_id: Some("acd-7".into()),
+                routed_ref: None,
             },
             view_digest: "vault-view-1".into(),
         }
@@ -1712,6 +1713,7 @@ async fn auth_required_admits_for_a_fresh_login() {
             path: "auth_required".into(),
             admission_id: None,
             decision_id: Some("acd-9".into()),
+            routed_ref: None,
         })
     );
 }
@@ -2406,6 +2408,7 @@ async fn legacy_unheld_admissions_never_start_reporters_or_report_sealed_runs() 
             path: path.into(),
             admission_id: Some("fabricated-by-an-older-runner".into()),
             decision_id: None,
+            routed_ref: None,
         };
         let started = report_key_limit(Arc::clone(&client), &decision);
         report_sealed(
@@ -3298,6 +3301,7 @@ async fn a_sealed_run_reports_its_interrupted_terminal_once() {
             path: "routed".into(),
             admission_id: Some("run-1".into()),
             decision_id: None,
+            routed_ref: None,
         })))),
     );
     // No admission id (the break-glass path), or no selection at all: nothing is reported.
@@ -3309,6 +3313,7 @@ async fn a_sealed_run_reports_its_interrupted_terminal_once() {
             path: "legacy_static".into(),
             admission_id: None,
             decision_id: None,
+            routed_ref: None,
         })))),
     );
     report_sealed(Arc::clone(&client), &sealed(None));

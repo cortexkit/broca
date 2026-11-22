@@ -18,4 +18,5 @@ Object {
     "session": String("s1"),
     "step_id": String("1"),
     "terminal_status": String("completed"),
+    "warm_up": Bool(true),
 }

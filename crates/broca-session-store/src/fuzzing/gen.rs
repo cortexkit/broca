@@ -806,7 +806,10 @@ mod records {
         billing,
         telemetry,
         reached_cache,
-        requested_cache_ttl_ms
+        requested_cache_ttl_ms,
+        tools_digest,
+        system_digest,
+        signed_floor
     });
     crate::fuzzing::gen::fields!(BatchStart {
         run_id,

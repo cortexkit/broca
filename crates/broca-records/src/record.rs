@@ -4241,6 +4241,11 @@ pub struct AccountDecision {
     /// Routing's id for the decision that chose the account, when routing chose it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_id: Option<String>,
+    /// The content-free reference to the account and credential routing admitted the run on
+    /// (llm-runner's `step_events::account_ref`), which the run's step events carry. Present only
+    /// when routing chose the account; never the raw ids, which can carry account labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_ref: Option<String>,
 }
 
 /// Origin of an admission's routing affinity. Unknown strings survive WAL replay.

@@ -61,7 +61,7 @@ use crate::parts::{canonical, Parts};
 use crate::writer::Writer;
 
 mod attempt;
-use attempt::attempt_record;
+use attempt::{attempt_record, AttemptContext, RequestFacts};
 mod display;
 use display::restream;
 mod warming;
@@ -4254,6 +4254,13 @@ async fn model_step<W: Writer, P: Provider, T>(
         }
     }
     let _in_flight = InFlight(seams.step_progress.as_ref());
+    let floor = crate::compaction::floor_through(writer, &[], opts.render_episodes.signed_floor);
+    let request = RequestFacts::of(&opts, floor.await?);
+    let context = AttemptContext {
+        requested_ttl_ms,
+        account_limit_pause,
+        request,
+    };
     // A run's keep-warm may ask its calls to note each request their transport sends on its
     // seal, so a warm re-sends those bytes.
     let send_seal = seams
@@ -4398,17 +4405,9 @@ async fn model_step<W: Writer, P: Provider, T>(
                 retries_used,
             })) => break Err(StepFailure::Error(Box::new(error), retries_used, limited)),
             Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt })) => {
-                limited = record_attempt(
-                    writer,
-                    seams,
-                    run_id,
-                    step_id,
-                    attempt,
-                    requested_ttl_ms,
-                    account_limit_pause,
-                    selection,
-                )
-                .await?;
+                limited =
+                    record_attempt(writer, seams, run_id, step_id, attempt, &context, selection)
+                        .await?;
             }
             None => {
                 break Err(StepFailure::Error(
@@ -4440,14 +4439,7 @@ async fn model_step<W: Writer, P: Provider, T>(
                         event
                     {
                         record_attempt(
-                            writer,
-                            seams,
-                            run_id,
-                            step_id,
-                            attempt,
-                            requested_ttl_ms,
-                            account_limit_pause,
-                            selection,
+                            writer, seams, run_id, step_id, attempt, &context, selection,
                         )
                         .await?;
                     }
@@ -4475,8 +4467,7 @@ async fn record_attempt<W: Writer, P: Provider, T>(
     run_id: &str,
     step_id: u64,
     mut attempt: broca_protocol::ModelAttempt,
-    requested_ttl_ms: Option<u64>,
-    account_limit_pause: bool,
+    context: &AttemptContext,
     selection: Option<&broca_wal::AuthSelection>,
 ) -> Result<Option<Box<FailedAccountLimitAttempt>>, LoopError> {
     if let Some(warm) = &seams.keep_warm {
@@ -4494,13 +4485,7 @@ async fn record_attempt<W: Writer, P: Provider, T>(
     // is appended.
     let seq = writer
         .append(
-            &[attempt_record(
-                run_id,
-                step_id,
-                attempt.clone(),
-                requested_ttl_ms,
-                account_limit_pause,
-            )?],
+            &[attempt_record(run_id, step_id, attempt.clone(), context)?],
             durable,
         )
         .await?;

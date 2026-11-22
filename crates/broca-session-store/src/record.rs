@@ -843,6 +843,17 @@ message! {
         /// run's frozen render config when it records the attempt. Only this lifetime can prove
         /// the cache expired. Absent when the request named none.
         20 opt requested_cache_ttl_ms: u64,
+        /// Lowercase hex SHA-256 digests of the request's tool list and of the system messages
+        /// leading its prompt, without cache markers, as the run loop built them
+        /// (`run::attempt::RequestFacts`). Step events fold in the route that rendered them.
+        /// Absent on attempts recorded before they were.
+        21 opt tools_digest: String,
+        22 opt system_digest: String,
+        /// The session's signed floor when the request was built, as the id of the entry it goes
+        /// through: requests send no signed reasoning of that entry or any before it, because a
+        /// run changed the tool set after that reasoning was generated. Absent when the session
+        /// had no floor (`broca_core::compaction_v2::host::signed_floor`).
+        23 opt signed_floor: String,
     }
 }
 

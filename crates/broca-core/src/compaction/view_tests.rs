@@ -152,6 +152,7 @@ fn routed_selection(account_ref: &str) -> broca_wal::AuthSelection {
             path: broca_wal::ACCOUNT_DECISION_ROUTED.to_owned(),
             admission_id: Some("admission".into()),
             decision_id: Some("decision".into()),
+            routed_ref: None,
         }),
         auth_method: Some("oauth".into()),
     }
@@ -170,6 +171,7 @@ fn static_selection() -> broca_wal::AuthSelection {
             path: broca_wal::ACCOUNT_DECISION_SINGLE_CANDIDATE.to_owned(),
             admission_id: Some("admission".into()),
             decision_id: None,
+            routed_ref: None,
         }),
         auth_method: None,
     }

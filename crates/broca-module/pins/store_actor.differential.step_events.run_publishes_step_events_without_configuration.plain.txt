@@ -12,5 +12,8 @@ Object {
     "runner": String("broca"),
     "session": String("s1"),
     "step_id": String("1"),
+    "system_digest": String("fa3a6d81633b19093d5ccb02294fe906e4ade2ae49b9ccb1eae1126658f9dc0b"),
     "terminal_status": String("completed"),
+    "tools_digest": String("46921d77595ab911d3aff6e4bc55218529e9025607eeaeecc3772b3424cc81d8"),
+    "warm_up": Bool(false),
 }

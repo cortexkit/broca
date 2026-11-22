@@ -1897,6 +1897,23 @@ fn decision(
         path: path.to_string(),
         admission_id,
         decision_id,
+        routed_ref: None,
+    }
+}
+
+/// `decision` for a run routing admitted on `account_id` and `credential_id`, exactly as routing
+/// named them: it carries their content-free reference, which the run's step events report.
+pub fn routed_decision(
+    decision: &AccountDecision,
+    account_id: &str,
+    credential_id: &str,
+) -> AccountDecision {
+    AccountDecision {
+        routed_ref: Some(cortexkit_role_llm_runner::step_events::account_ref(
+            account_id,
+            credential_id,
+        )),
+        ..decision.clone()
     }
 }
 

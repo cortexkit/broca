@@ -299,6 +299,9 @@ impl Writer {
             telemetry: None,
             reached_cache: Some(true),
             requested_cache_ttl_ms: None,
+            tools_digest: None,
+            system_digest: None,
+            signed_floor: None,
         })
     }
 

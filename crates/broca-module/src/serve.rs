@@ -4307,6 +4307,7 @@ mod paused_auth_tests {
                             conversation_key_source: None,
                             admission_id: None,
                             decision_id: None,
+                            routed_ref: None,
                         }),
                     }),
                     ride_wait_deadline_ms: None,

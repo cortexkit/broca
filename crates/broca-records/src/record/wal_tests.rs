@@ -432,6 +432,7 @@ mod schema_tests {
                 path: ACCOUNT_DECISION_ROUTED.into(),
                 admission_id: Some("run-1".into()),
                 decision_id: Some("acd-1".into()),
+                routed_ref: None,
             }),
         };
         assert_eq!(serde_json::to_string(&selection).unwrap(), STORED);

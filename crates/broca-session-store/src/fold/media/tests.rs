@@ -242,6 +242,9 @@ pub(crate) fn attempt(run: &str, step: u64) -> Record {
         telemetry: None,
         reached_cache: None,
         requested_cache_ttl_ms: None,
+        tools_digest: None,
+        system_digest: None,
+        signed_floor: None,
     })
 }
 
