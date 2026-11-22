@@ -73,6 +73,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // logger exists, rather than here, so the probes that follow keep working in a shell that
     // inherited the variable without the pipe.
     let launch_nonce = subc_os::launch_nonce();
+    // TAKE THE REGISTRATION CHANNEL NOW TOO, for the same reason: the daemon's socket for broca
+    // stays inheritable until it is taken. broca registers over it when the daemon gave one; see
+    // `broca_subc::registration`. Its errors are reported once the logger exists, below.
+    let registration_channel = broca_subc::registration::adopt();
     // Reject stray invocations before opening logs or reading config: discovery probes are
     // not daemon boots and must not leave records in the operator's production log.
     let args = parse_launch_args(std::env::args_os().skip(1)).unwrap_or_else(|error| {
@@ -135,6 +139,18 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!(target: "lifecycle", "refusing to start: launch nonce: {error}");
         return Err(ServeIoError(format!("launch nonce: {error}")).into());
     }
+    // A channel the daemon handed over that can't be used stops the start, as a broken nonce
+    // handoff does: registering over the connection file instead would hide it.
+    let registration_channel = match registration_channel {
+        Ok(channel) => channel,
+        Err(error) => {
+            tracing::error!(target: "lifecycle", "refusing to start: {error}");
+            return Err(ServeIoError(error).into());
+        }
+    };
+    if let Some(refusal) = broca_subc::registration::refusal() {
+        tracing::warn!(target: "lifecycle", %refusal, "registration channel not adopted; registering with the launch nonce");
+    }
     // Before any broca.jsonc loader: each of them reads a missing file as "no overrides".
     broca_module_serve::config_home::require_explicit_file(
         broca_module_serve::cache_routing::CONFIG_PATH_ENV,
@@ -156,7 +172,14 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // The start writes into the state root (the old settings file's saved copy) before the
     // settings arrive, so it takes the lock first.
     lock_state_root(&state_root)?;
-    let (settings, gated) = match start_gated(&conn_path, &module_id, mock_provider_path).await? {
+    let (settings, gated) = match start_gated(
+        &conn_path,
+        registration_channel,
+        &module_id,
+        mock_provider_path,
+    )
+    .await?
+    {
         Some(started) => started,
         None => return Ok(()),
     };
@@ -1013,8 +1036,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     };
-    let (read_half, write_half, registered) =
-        (gated.read_half, gated.write_half, Some(gated.registration));
+    let (read_half, write_half) = gated.connection.hand_over().await;
+    let registered = Some(gated.registration);
     let serving = broca_module_serve::serve::serve_connection_with_llm_tools(
         read_half,
         write_half,
@@ -1126,7 +1149,16 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                     report
                 );
             }
-            result?;
+            let end = result?;
+            // A registration channel can't be dialled again, so a broca that loses it must be
+            // started anew, and the daemon's supervisor treats a clean exit it didn't ask for as a
+            // stop. Only the daemon's own GOODBYE ends such a broca cleanly.
+            if broca_subc::registration::adopted() && !matches!(end, ServeEnd::Goodbye) {
+                return Err(ServeIoError(format!(
+                    "the daemon ended broca's registration channel without GOODBYE (cause: {cause})"
+                ))
+                .into());
+            }
         }
     }
     Ok(())
@@ -1216,8 +1248,7 @@ fn lock_state_root(state_root: &std::path::Path) -> Result<(), ServeIoError> {
 
 /// The module connection registered unready, waiting to serve once broca is built.
 struct Gated {
-    read_half: tokio::io::ReadHalf<TcpStream>,
-    write_half: tokio::io::WriteHalf<TcpStream>,
+    connection: Arc<broca_module_serve::module_connection::ModuleConnection>,
     registration: broca_module_serve::serve::GatedRegistration,
     /// What HELLO declared broca consumes: the settings can't change it any more.
     consumer_routes: ConsumerRoutes,
@@ -1281,6 +1312,7 @@ fn move_settings_file(
 /// else `broca.jsonc`. `None` when the daemon stopped broca before any view arrived.
 async fn start_gated(
     conn_path: &PathBuf,
+    channel: Option<Box<dyn broca_subc::registration::DaemonStream>>,
     module_id: &str,
     mock_provider_path: bool,
 ) -> Result<Option<(broca_module_serve::settings::Settings, Gated)>, ServeIoError> {
@@ -1308,7 +1340,8 @@ async fn start_gated(
         (Some(path), true) => path.clone(),
         _ => move_settings_file(old_file.as_deref(), conn_path)?,
     };
-    let (mut read_half, mut write_half) = tokio::io::split(connect(conn_path).await?);
+    let (mut read_half, mut write_half) =
+        tokio::io::split(registered_stream(conn_path, channel).await?);
     let ack = broca_module_serve::serve::register_unready(
         &mut read_half,
         &mut write_half,
@@ -1352,12 +1385,21 @@ async fn start_gated(
         let settings = Settings::read(&user_file).map_err(ServeIoError)?;
         (settings, gate::Gate::ungated(ack.negotiated_ver))
     };
+    let connection = Arc::new(
+        broca_module_serve::module_connection::ModuleConnection::new(
+            Box::new(read_half.unsplit(write_half)),
+            gate.clone(),
+        ),
+    );
+    if broca_subc::registration::adopted() {
+        broca_subc::registration::install_minter(connection.clone());
+        tracing::info!(target: "lifecycle", "registered over the daemon's registration channel");
+    }
     let registration = broca_module_serve::serve::GatedRegistration { ack, gate };
     Ok(Some((
         settings,
         Gated {
-            read_half,
-            write_half,
+            connection,
             registration,
             consumer_routes,
         },
@@ -1403,6 +1445,22 @@ where
 {
     // Checking for an obsolete file is safe even for mocks: no credential values are read.
     load()
+}
+
+/// The stream broca registers on, authenticated: the registration channel when the daemon gave
+/// one, else a socket dialled from the connection file. The handshake is the same on both.
+async fn registered_stream(
+    conn_path: &PathBuf,
+    channel: Option<Box<dyn broca_subc::registration::DaemonStream>>,
+) -> Result<Box<dyn broca_subc::registration::DaemonStream>, ServeIoError> {
+    let Some(mut channel) = channel else {
+        return Ok(Box::new(connect(conn_path).await?));
+    };
+    let conn = connection_file::read(conn_path).map_err(|e| ServeIoError(e.to_string()))?;
+    authenticate_client(&mut channel, &conn, AUTH_DEADLINE)
+        .await
+        .map_err(|e| ServeIoError(format!("authenticate on the registration channel: {e}")))?;
+    Ok(channel)
 }
 
 async fn connect(conn_path: &PathBuf) -> Result<TcpStream, ServeIoError> {

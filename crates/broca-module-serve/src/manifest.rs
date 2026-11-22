@@ -131,8 +131,12 @@ fn build_provenance() -> Option<ManifestProvenance> {
 /// Taken from the accessor's cached answer, the same one HELLO and route opens use, so it names
 /// the source of the nonce broca actually presents. `None` when there is no nonce (broca was not
 /// started by the daemon) or it could not be read; an absent field means "did not say", which is
-/// honest, where a guess would count a module as switched when it is not.
+/// honest, where a guess would count a module as switched when it is not. `None` too when broca
+/// registered over its registration channel: it then presents no nonce at all.
 pub fn launch_nonce_source() -> Option<LaunchNonceSource> {
+    if broca_subc::registration::adopted() {
+        return None;
+    }
     let nonce = subc_os::launch_nonce().ok().flatten()?;
     Some(reported_launch_nonce_source(nonce.source()))
 }

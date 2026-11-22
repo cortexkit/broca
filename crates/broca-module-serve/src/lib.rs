@@ -37,6 +37,7 @@ pub mod keep_warm_quota;
 pub mod llm_tools;
 pub mod management_admission;
 pub mod manifest;
+pub mod module_connection;
 pub mod opencode_go_identity;
 pub mod provider_overrides;
 pub mod refusal_fallback_config;

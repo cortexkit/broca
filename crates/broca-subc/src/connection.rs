@@ -1293,15 +1293,17 @@ impl SubcConnection {
             .remove(call_key)
     }
 
-    /// The module id of the consumer identity this connection presents on route opens, or
-    /// `None` when it presents none. With an identity, the daemon attests each route as the
-    /// `Reserved` principal of that module; without one, every route arrives as `Direct`, and a
-    /// target that authorizes by principal (the credential vault's grants) cannot authorize it.
+    /// The module whose `Reserved` principal the daemon attests this connection's routes as, or
+    /// `None` when they arrive as `Direct`. That is the module of the consumer identity the
+    /// connection presents on route opens, or, for a broca registered over its registration
+    /// channel, broca's own module: every connection it opens is bound to it by a claim. A target
+    /// that authorizes by principal (the credential vault's grants) can't authorize a `Direct`
+    /// route.
     pub fn consumer_module_id(&self) -> Option<&str> {
-        self.shared
-            .consumer_identity
-            .as_ref()
-            .map(|identity| identity.module_id.as_str())
+        match &self.shared.consumer_identity {
+            Some(identity) => Some(identity.module_id.as_str()),
+            None => crate::registration::bound_module_id(),
+        }
     }
 
     #[cfg(test)]
@@ -3081,6 +3083,8 @@ async fn open_authenticated_socket(
     authenticate_client(&mut stream, &conn, AUTH_DEADLINE)
         .await
         .map_err(|e| ConnError::Transport(format!("authenticate: {e}")))?;
+    // A broca registered over its registration channel binds each connection with a claim.
+    crate::registration::bind(&mut stream).await?;
     Ok(stream.into_split())
 }
 
@@ -4774,7 +4778,15 @@ pub(crate) fn route_failure_is_known_dead(error: &ConnError) -> bool {
 /// the pipe, as in a process a module spawned), the route presents no identity and stays Direct.
 /// It never falls back to the environment copy of the nonce, which would let that process act
 /// as the module.
+///
+/// A broca registered over its registration channel presents no identity: each of its
+/// connections is bound to broca's spawn by a claim when it opens (see [`crate::registration`]),
+/// and the registration contract forbids an identity on a connection bound that way.
 pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> {
+    // A connection bound by a claim must present no identity: the claim already names broca.
+    if crate::registration::adopted() {
+        return None;
+    }
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
         .ok()
         .filter(|v| !v.is_empty())?;

@@ -10,6 +10,10 @@ pub fn hello_manifest(
     image_references: bool,
 ) -> subc_protocol::manifest::ModuleManifest {
     let mut manifest = crate::manifest::manifest_configured(module_id, consumer_routes);
+    // Says broca registers over the daemon's registration channel, as it does when given one.
+    if broca_subc::registration::adopted() {
+        manifest.registration_channel = Some(true);
+    }
     if image_references {
         for role in &mut manifest.provides {
             if let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } = role {
@@ -64,6 +68,13 @@ where
     expect_hello_ack(reader).await
 }
 
+/// A module connection that already registered unready through the settings gate: its HELLO
+/// acknowledgement, and the gate that makes it ready once the serve loop runs.
+pub struct GatedRegistration {
+    pub ack: ModuleHelloAckBody,
+    pub gate: Arc<crate::settings::gate::Gate>,
+}
+
 pub(super) async fn send_hello(
     writer: &EgressSender<Frame>,
     module_id: &str,
@@ -89,7 +100,13 @@ pub(super) async fn send_hello(
 /// the descriptor again. A named descriptor that could not be read fails HELLO with the
 /// accessor's own message; it never falls back to the environment copy, because that would hide
 /// a broken handoff and let a process that inherited only the variable register as broca.
+///
+/// None when broca registers over its registration channel: the channel itself shows the daemon
+/// which spawn is speaking, and HELLO there carries no nonce.
 fn hello_launch_nonce() -> Result<Option<String>, ServeIoError> {
+    if broca_subc::registration::adopted() {
+        return Ok(None);
+    }
     match subc_os::launch_nonce() {
         Ok(nonce) => Ok(nonce.map(|nonce| nonce.value().to_string())),
         Err(error) => Err(ServeIoError(format!("launch nonce: {error}"))),

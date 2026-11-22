@@ -501,7 +501,7 @@ mod serve_refresh;
 #[path = "serve_tag_read.rs"]
 mod serve_tag_read;
 use hello::{expect_hello_ack, send_hello};
-pub use hello::{hello_manifest, register_unready};
+pub use hello::{hello_manifest, register_unready, GatedRegistration};
 
 /// What a `route.bind` said about its caller beyond the session identity. Both values are
 /// recorded on the `RunStarted` of every send or import made over the route, and neither keys
@@ -1084,6 +1084,9 @@ where
     // lineage-scoped subscription's parked forward task would keep the egress open forever
     // and hang the connection on teardown.
     let conn_cancel = CancellationToken::new();
+    let gate = registered
+        .as_ref()
+        .map(|registered| registered.gate.clone());
     let frame_loop = stall::READER.scope(
         stall_state,
         run_frame_loop(
@@ -1121,9 +1124,13 @@ where
         result = frame_loop => result,
     };
     drop(reader_lifetime);
-    // Before the egress queue can close: the describer holds a sender on it.
+    // Before the egress queue can close: the describer and the gate hold senders on it, and the
+    // gate outlives this connection (broca's claim minter keeps it).
     if let Some(describer) = &scope_describer {
         describer.detach();
+    }
+    if let Some(gate) = &gate {
+        gate.detach();
     }
     conn_cancel.cancel();
     drop(tx);
@@ -1302,13 +1309,6 @@ where
     request_tasks.abort_all();
     while request_tasks.join_next().await.is_some() {}
     loop_result
-}
-
-/// A module connection that already registered unready through the settings gate: its HELLO
-/// acknowledgement, and the gate that makes it ready once the serve loop runs.
-pub struct GatedRegistration {
-    pub ack: ModuleHelloAckBody,
-    pub gate: Arc<crate::settings::gate::Gate>,
 }
 
 /// Read one frame and hand the reader back with it, so the frame loop can keep a single read

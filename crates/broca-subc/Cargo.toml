@@ -30,9 +30,9 @@ cortexkit-role-step-transform-provider = { workspace = true }
 subc-protocol = { workspace = true }
 subc-transport = { workspace = true }
 subc-control = { workspace = true }
-# The launch-nonce accessor. The daemon hands a module its nonce over an inherited pipe that
-# can be read only once, so every reader in the process (HELLO here in broca-module-serve,
-# route opens here) must share this crate's one cached read.
+# The launch-nonce accessor and the registration channel. The daemon hands a module each of
+# them once (an inherited pipe or stream), so every reader in the process (HELLO in
+# broca-module-serve, route opens and claims here) shares this crate's one cached take.
 subc-os = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

@@ -31,6 +31,7 @@ pub mod late_results;
 pub mod plan_fetch;
 pub mod private_content;
 mod provider_catalog;
+pub mod registration;
 mod role_route;
 mod role_route_diagnostics;
 mod route_close;

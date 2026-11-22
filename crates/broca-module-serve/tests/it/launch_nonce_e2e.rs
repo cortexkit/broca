@@ -1,21 +1,28 @@
-//! The real daemon spawns the real broca with ONLY the launch-nonce descriptor, and both of
-//! broca's nonce readers pass the daemon's own checks.
+//! The real daemon spawns the real broca, and broca proves it is broca to the daemon by exactly one
+//! of the two means the daemon hands it: its registration channel, or its launch nonce.
 //!
-//! The daemon hands a module its launch nonce twice: as an inherited pipe named by
-//! `SUBC_LAUNCH_NONCE_FD`, and as the environment copy `SUBC_LAUNCH_NONCE` it keeps setting while
-//! modules move to the pipe. Here a wrapper removes the environment copy before exec'ing broca, so
-//! the pipe is the only place the nonce can come from. Then:
+//! The daemon starts a module with both: a private socket already connected to it
+//! (`SUBC_REGISTRATION_FD`), and a launch nonce, as an inherited pipe (`SUBC_LAUNCH_NONCE_FD`) and
+//! as the environment copy `SUBC_LAUNCH_NONCE`. Each test runs broca through a wrapper that removes
+//! all but one of them before exec'ing broca:
 //!
-//! - HELLO: broca is configured `reserved`, so the daemon registers it only if its HELLO echoes
-//!   the nonce it spawned it with. Broca becoming live is that check passing.
+//! - Only the registration channel: broca says HELLO on the channel with no nonce, and each other
+//!   connection it opens presents a claim minted over the channel.
+//! - Only the nonce pipe: broca dials the connection file, its HELLO echoes the nonce, and its
+//!   route opens present it.
+//!
+//! Then, in both:
+//!
+//! - HELLO: broca is configured `reserved`, so the daemon registers it only from its channel or
+//!   with the nonce it spawned it with. Broca becoming live is that check passing.
 //! - Route open: broca opens a route to the tool module after HELLO, when a run's model calls a
-//!   tool (a stand-in model answers the first request with one call to `read`). The
-//!   daemon attests the route as `reserved:broca` only if the route open presents the same nonce,
-//!   and relays that principal to the tool module, whose stub records it. A route open that read
-//!   the environment would present nothing here, and arrive as `direct`.
+//!   tool (a stand-in model answers the first request with one call to `read`). The daemon
+//!   attests the route as `reserved:broca` only if the connection is claim-bound to broca's spawn
+//!   or the route open presents the nonce, and relays that principal to the tool module, whose
+//!   stub records it. Anything else arrives as `direct`.
 //!
-//! UNIX ONLY: the daemon passes the descriptor on macOS and Linux; Windows keeps only the
-//! environment copy.
+//! UNIX ONLY: the daemon passes descriptors on macOS and Linux; on Windows both are named pipes,
+//! which this wrapper can't remove.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -102,6 +109,34 @@ fn require_subc() -> bool {
     std::env::var_os("BROCA_REQUIRE_SUBC").is_some()
 }
 
+/// Which of the daemon's means of proving broca's identity the wrapper leaves broca.
+#[derive(Clone, Copy)]
+enum Kept {
+    /// The registration channel; both nonce copies are removed.
+    RegistrationChannel,
+    /// The nonce pipe; the channel and the nonce's environment copy are removed.
+    NoncePipe,
+}
+
+impl Kept {
+    /// The variable naming the descriptor broca keeps, which the wrapper records.
+    fn variable(self) -> &'static str {
+        match self {
+            Self::RegistrationChannel => "SUBC_REGISTRATION_FD",
+            Self::NoncePipe => "SUBC_LAUNCH_NONCE_FD",
+        }
+    }
+
+    /// The `env -u` arguments that remove the rest. The removed descriptors stay open in broca,
+    /// unnamed, so nothing reads them.
+    fn removed(self) -> &'static str {
+        match self {
+            Self::RegistrationChannel => "-u SUBC_LAUNCH_NONCE -u SUBC_LAUNCH_NONCE_FD",
+            Self::NoncePipe => "-u SUBC_LAUNCH_NONCE -u SUBC_REGISTRATION_FD",
+        }
+    }
+}
+
 struct Rig {
     child: Child,
     dir: PathBuf,
@@ -119,7 +154,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    async fn start() -> Option<Self> {
+    async fn start(kept: Kept) -> Option<Self> {
         let subc_core = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         let fake_aft = sibling_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
         for bin in [&subc_core, &fake_aft] {
@@ -144,8 +179,11 @@ impl Rig {
         // daemon would be refused; without a module id no identity is presented at all.
         std::env::remove_var("SUBC_MODULE_ID");
 
-        let dir = broca_test_support::scratch_root()
-            .join(format!("broca-launch-nonce-e2e-{}", std::process::id()));
+        let dir = broca_test_support::scratch_root().join(format!(
+            "broca-launch-nonce-e2e-{}-{}",
+            kept.variable(),
+            std::process::id()
+        ));
         broca_test_support::remove_rig_dir(&dir);
         let config_home = dir.join("config");
         let runtime_dir = dir.join("runtime");
@@ -157,16 +195,20 @@ impl Rig {
         std::fs::create_dir_all(config_path.parent().unwrap()).expect("create subc config dir");
         std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
 
-        // The wrapper records what the daemon named as the descriptor, so a daemon that stopped
-        // passing it fails this test by name instead of leaving broca with no nonce at all, then
-        // removes the environment copy and becomes broca. The descriptor survives both execs:
-        // the daemon cleared its close-on-exec flag, and neither the shell nor `env` closes it.
-        let wrapper = dir.join("broca-without-env-nonce.sh");
+        // The wrapper records what the daemon named as the kept descriptor, so a daemon that
+        // stopped passing it fails this test by name instead of leaving broca with no means at
+        // all, then removes the others and becomes broca. The descriptor survives both execs: the
+        // daemon cleared its close-on-exec flag, and neither the shell nor `env` closes it.
+        let wrapper = dir.join("broca-keeping-one.sh");
         std::fs::write(
             &wrapper,
-            "#!/bin/sh\n\
-             printf '%s' \"${SUBC_LAUNCH_NONCE_FD:-}\" > \"$CK_TEST_FD_RECORD\"\n\
-             exec env -u SUBC_LAUNCH_NONCE \"$CK_REAL_BROCA_BIN\" \"$@\"\n",
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s' \"${{{variable}:-}}\" > \"$CK_TEST_FD_RECORD\"\n\
+                 exec env {removed} \"$CK_REAL_BROCA_BIN\" \"$@\"\n",
+                variable = kept.variable(),
+                removed = kept.removed(),
+            ),
         )
         .expect("write the broca wrapper");
         {
@@ -195,8 +237,8 @@ impl Rig {
                 "broca": {
                     "program": wrapper,
                     "args": [],
-                    // Reserved: the daemon registers this id only for a HELLO that echoes the
-                    // nonce it spawned the process with.
+                    // Reserved: the daemon registers this id only for a HELLO on the channel it
+                    // spawned the process with, or one that echoes the nonce it gave it.
                     "reserved": true,
                     "env": {
                         "CK_REAL_BROCA_BIN": module_bin,
@@ -287,24 +329,38 @@ fn attach_events(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// WITH ONLY THE DESCRIPTOR, THE DAEMON ACCEPTS BROCA'S HELLO AND ATTESTS ITS LATER TOOL ROUTE AS
-/// `reserved:broca`.
+/// WITH ONLY THE REGISTRATION CHANNEL, THE DAEMON ACCEPTS BROCA'S HELLO AND ATTESTS ITS LATER TOOL
+/// ROUTE, ON A CLAIM-BOUND CONNECTION, AS `reserved:broca`.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_only_the_registration_channel_hello_registers_and_a_later_route_is_attested_as_broca()
+{
+    registers_and_attests_a_later_route(Kept::RegistrationChannel).await;
+}
+
+/// WITH ONLY THE NONCE DESCRIPTOR, THE DAEMON ACCEPTS BROCA'S HELLO AND ATTESTS ITS LATER TOOL
+/// ROUTE AS `reserved:broca`.
 #[tokio::test(flavor = "multi_thread")]
 async fn with_only_the_descriptor_hello_registers_and_a_later_route_is_attested_as_broca() {
-    let Some(rig) = Rig::start().await else {
+    registers_and_attests_a_later_route(Kept::NoncePipe).await;
+}
+
+async fn registers_and_attests_a_later_route(kept: Kept) {
+    let Some(rig) = Rig::start(kept).await else {
         return;
     };
     let live = rig.broca_is_live().await;
     let named = std::fs::read_to_string(&rig.fd_record).unwrap_or_default();
     assert!(
         !named.is_empty(),
-        "the daemon named no launch-nonce descriptor for broca, so this rig tests nothing: \
-         broca had neither the pipe nor the environment copy"
+        "the daemon named no {} for broca, so this rig tests nothing: broca had no way to prove \
+         who it is",
+        kept.variable()
     );
     assert!(
         live,
-        "broca never registered. It is reserved, so the daemon refuses a HELLO that does not \
-         echo the nonce it was handed over descriptor {named}"
+        "broca never registered. It is reserved, so the daemon refuses a HELLO that comes \
+         neither on its channel nor with its nonce; broca kept only {} {named}",
+        kept.variable()
     );
 
     // A tool-bearing send makes broca open its tool route (a detached warm bind), after HELLO.
@@ -375,8 +431,9 @@ async fn with_only_the_descriptor_hello_registers_and_a_later_route_is_attested_
         assert_eq!(
             attach["principal"],
             serde_json::json!({"kind": "reserved", "module_id": "broca"}),
-            "the daemon attests a route as reserved:broca only when the route open presents the \
-             nonce broca was spawned with; this one did not: {attach}"
+            "the daemon attests a route as reserved:broca only on a connection bound to broca's \
+             spawn by a claim, or when the route open presents the nonce broca was spawned with; \
+             this one was neither: {attach}"
         );
     }
 }

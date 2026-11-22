@@ -75,6 +75,8 @@ struct Calls {
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     /// The serve loop's outgoing queue, once it runs.
     writer: Mutex<Option<broca_diagnostics::Sender<Frame>>>,
+    /// Woken when `writer` is set, for a request made before the serve loop runs.
+    writer_set: tokio::sync::Notify,
     ver: u8,
 }
 
@@ -84,6 +86,7 @@ impl Calls {
             next_corr: AtomicU64::new(FIRST_GATE_CORR),
             pending: Mutex::new(HashMap::new()),
             writer: Mutex::new(None),
+            writer_set: tokio::sync::Notify::new(),
             ver,
         }
     }
@@ -135,11 +138,22 @@ impl Calls {
         true
     }
 
-    /// Sends `body` through the serve loop's queue and waits for its answer.
+    /// Sends `body` through the serve loop's queue and waits for its answer. A request made after
+    /// the serve loop took the connection but before it set its queue here (a claim for a
+    /// connection opened just then) waits for the queue.
     async fn call(&self, body: &impl Serialize) -> Result<Reply, ServeIoError> {
-        let writer = self.writer.lock().unwrap().clone().ok_or_else(|| {
-            ServeIoError("the settings gate's request has no connection to go out on".into())
-        })?;
+        let writer = loop {
+            // Created before the check, so a queue set between the two still wakes it.
+            let set = self.writer_set.notified();
+            if let Some(writer) = self.writer.lock().unwrap().clone() {
+                break writer;
+            }
+            if tokio::time::timeout(CALL_TIMEOUT, set).await.is_err() {
+                return Err(ServeIoError(
+                    "the settings gate's request has no connection to go out on".into(),
+                ));
+            }
+        };
         let (frame, rx) = self.begin(body)?;
         let corr = frame.header.corr;
         if writer.send(frame).await.is_err() {
@@ -422,9 +436,30 @@ impl Gate {
         frame.header.channel == 0 && op(&frame.body).as_deref() == Some(CONFIG_CHANGED_OP)
     }
 
+    /// Lets go of the serve loop's outgoing queue when the loop ends, so the queue can close and
+    /// its writer finish. A request made after this waits for a queue that never comes and fails.
+    pub fn detach(&self) {
+        *self.calls.writer.lock().unwrap() = None;
+    }
+
     /// Takes `frame` when it answers one of the gate's own requests.
     pub fn on_frame(&self, frame: &Frame) -> bool {
         self.calls.on_frame(frame)
+    }
+
+    /// A channel-0 request frame for `body`, numbered among the gate's own, and the receiver its
+    /// answer arrives on once [`Self::on_frame`] takes it. For a caller that writes and reads the
+    /// module connection itself, before the serve loop runs.
+    pub(crate) fn begin_request(
+        &self,
+        body: &impl Serialize,
+    ) -> Result<(Frame, oneshot::Receiver<Reply>), ServeIoError> {
+        self.calls.begin(body)
+    }
+
+    /// Sends `body` on channel 0 through the serve loop and waits for the daemon's answer.
+    pub(crate) async fn request(&self, body: &impl Serialize) -> Result<Reply, ServeIoError> {
+        self.calls.call(body).await
     }
 
     /// broca's answer to a `config.review` request, or `None` for any other channel-0 request.
@@ -441,6 +476,7 @@ impl Gate {
         provides: Vec<subc_protocol::manifest::ProviderRole>,
     ) -> Result<(), ServeIoError> {
         *self.calls.writer.lock().unwrap() = Some(writer);
+        self.calls.writer_set.notify_waiters();
         let update = ModuleControlRequestFromModule::CatalogUpdate {
             provides,
             capabilities: None,
