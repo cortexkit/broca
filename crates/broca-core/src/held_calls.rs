@@ -2,7 +2,6 @@
 
 use broca_protocol::PauseReason;
 use broca_protocol::{BatchId, ToolCallId};
-use broca_records::record::WalRecord;
 use std::collections::HashMap;
 
 /// One ordered held-call fold for status reads and durable subscribe status events.
@@ -119,73 +118,6 @@ impl HeldCallsProjection {
         tool_call_id: &ToolCallId,
     ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
         self.remove(batch_id, tool_call_id)
-    }
-
-    /// Only list changes return a snapshot, including the change to an empty list.
-    pub(crate) fn observe(
-        &mut self,
-        record: &WalRecord,
-    ) -> Option<cortexkit_role_llm_runner::run::RunStatus> {
-        match record {
-            WalRecord::RunStarted { .. } => self.run_started(),
-            WalRecord::StepStarted { .. } => self.step_started(),
-            WalRecord::RunPaused { reason, .. } => self.paused(*reason),
-            WalRecord::RunFinished { reason, .. } => return self.run_finished(*reason),
-            WalRecord::ToolBatchFinished { .. } => self.batch_finished(),
-            WalRecord::ModelStepFinished {
-                assistant_message, ..
-            } => self.step_finished(assistant_message.tool_calls()),
-            WalRecord::ToolDispatchIntent {
-                tool_call_id,
-                tool_name,
-                ..
-            } => self.intent(tool_call_id, tool_name.as_deref()),
-            WalRecord::ToolCallProviderHeld {
-                batch_id,
-                tool_call_id,
-                call_key,
-                module,
-                reason,
-                held_at_ms,
-                ..
-            } => {
-                return self.held(
-                    batch_id,
-                    tool_call_id,
-                    call_key,
-                    module,
-                    reason,
-                    *held_at_ms,
-                )
-            }
-            WalRecord::ToolResult {
-                batch_id, result, ..
-            } => return self.remove(batch_id, &result.tool_call_id),
-            WalRecord::ToolNoDispatch {
-                batch_id,
-                tool_call_id,
-                ..
-            } => return self.remove(batch_id, tool_call_id),
-            WalRecord::RecoveryCut { recovery } => self.recovery_cut(&recovery.runs),
-            WalRecord::RecoveryCallClosed {
-                run_id,
-                call_key,
-                tool_call_id,
-                batch_id,
-                step_id,
-                ..
-            } => {
-                return self.recovery_call_closed(
-                    run_id,
-                    call_key.as_ref(),
-                    tool_call_id,
-                    batch_id.clone(),
-                    *step_id,
-                )
-            }
-            _ => {}
-        }
-        None
     }
 
     /// A recovery found `runs` with calls whose outcome is unknown.

@@ -59,8 +59,6 @@ pub enum VaultFactsAttribution<'a> {
     WitnessMismatch,
 }
 
-impl VaultBillingFacts {}
-
 fn nonblank(value: &str) -> bool {
     !value.trim().is_empty()
 }

@@ -284,7 +284,7 @@ mod gated {
     }
 
     #[test]
-    fn tail_first_render_matches_golden_and_resumes_byte_identically() {
+    fn tail_first_render_matches_golden() {
         let mut frozen = anthropic_frozen_config("claude-opus-4-8");
         frozen.cache = Some(anthropic_cache_policy());
         let mut opts = cache_marker_request();
@@ -296,30 +296,6 @@ mod gated {
                 .trim_end()
                 .as_bytes()
         );
-        for version in [None, Some(1)] {
-            opts.marker_order_version = version;
-            let start: broca_records::record::WalRecord = serde_json::from_value(json!({
-                "type": "run_started", "run_id": "r1",
-                "session": {"project_root": "/tmp/p", "harness": "h", "session": "s"},
-                "marker_order_version": version,
-                "config": {
-                    "model": {"provider_module_id": "anthropic", "model_id": "claude-opus-4-8"},
-                    "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
-                    "response_format": {"type": "text"}, "context_epoch": 0, "renderer_version": 1
-                },
-                "input": opts.prompt, "origin": {"kind": "fresh"}
-            }))
-            .unwrap();
-            let persisted = serde_json::to_vec(&start).unwrap();
-            let decoded = serde_json::from_slice(&persisted).unwrap();
-            let replay = broca_core::replay::replay(&[decoded]).unwrap();
-            let mut resumed = CallOptions::new(replay.prompt);
-            resumed.marker_order_version = replay.marker_order_version;
-            assert_eq!(
-                AnthropicMessages.render(&frozen, &resumed),
-                AnthropicMessages.render(&frozen, &opts)
-            );
-        }
     }
 
     fn anthropic_cache_policy() -> CachePolicy {

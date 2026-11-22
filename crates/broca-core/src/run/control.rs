@@ -159,8 +159,6 @@ pub struct RunControl {
     pub test_compaction: Option<crate::compaction::test_control::Config>,
 }
 
-impl RunControl {}
-
 impl Default for RunControl {
     fn default() -> Self {
         Self {

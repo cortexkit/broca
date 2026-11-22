@@ -1,16 +1,16 @@
-//! The saved index round trip: an engine driven over a scripted history of the old storage's
-//! records, saved through [`to_stored`] and the store's own encoding, and restored through
+//! The saved index round trip: an engine driven over a scripted history of the session store's
+//! media events, saved through [`to_stored`] and the store's own encoding, and restored through
 //! [`from_stored`], holds the same facts and the same aging state, with its limits, its open
 //! step and where its media are stored.
 
 use broca_core::media_request::SessionMedia;
 use broca_core::media_store::{MediaBytes, MediaReadError};
 use broca_protocol::content::{ContentBlock, MediaRef, Message, Role};
-use broca_protocol::media_event::MediaLimits;
+use broca_protocol::media_event::{MediaEvent, MediaInput, MediaLimits, MediaMessage, MediaPart};
+use broca_protocol::{StepId, ToolCallId};
 use broca_provider::media_profile::{select_media_profile, AgingThresholds, MediaQuirk};
 use broca_provider::media_request::MediaAging;
 use broca_provider::spec::{InputModalities, WireFamilyId};
-use broca_records::record::WalRecord;
 use broca_session_store::codec::{Id128, Message as _};
 use broca_session_store::record::MediaObject;
 use broca_session_store::session::StoredMediaIndex;
@@ -36,10 +36,6 @@ fn image(name: &str, size: u64) -> MediaRef {
     .unwrap()
 }
 
-fn record(value: serde_json::Value) -> WalRecord {
-    serde_json::from_value(value).unwrap()
-}
-
 fn person(reference: &MediaRef) -> Message {
     Message::new(
         Role::User,
@@ -52,88 +48,75 @@ fn person(reference: &MediaRef) -> Message {
     )
 }
 
-fn tool_result(call: &str, reference: &MediaRef) -> WalRecord {
-    record(
-        json!({"type": "tool_result", "batch_id": "batch", "outcome": "completed",
-        "result": {"tool_call_id": call, "is_error": false, "output": {"kind": "parts",
-            "parts": [{"kind": "text", "text": "screen"},
-                      {"kind": "media", "media": reference}]}}}),
-    )
-}
-
-fn step(n: u64) -> WalRecord {
-    WalRecord::StepStarted {
-        step_id: broca_protocol::StepId(n),
+/// A shown screenshot result: a text part, then the image, in the results message at `ordinal`.
+fn tool_result(record: u64, call: &str, ordinal: u64, reference: &MediaRef) -> MediaEvent {
+    MediaEvent::ToolResult {
+        record,
+        call: ToolCallId(call.into()),
+        ordinal: Some(ordinal),
+        shown: true,
+        media: vec![MediaPart {
+            part: 1,
+            reference: reference.clone(),
+        }],
     }
 }
 
-/// Folds `records` through the old storage's entry point, under the limits each run froze.
-fn fold(records: &[WalRecord], limits: &MediaLimits) -> (SessionMedia, MediaAging) {
+/// Feeds `events` to a new engine under the limits the first run froze, as an open session does.
+fn fold(events: &[MediaEvent], limits: &MediaLimits) -> (SessionMedia, MediaAging) {
     let mut media = SessionMedia::new(NoBytes);
     let mut aging = MediaAging::default();
     let mut active = serde_json::from_value(limits.0.clone()).unwrap();
-    for record in records {
+    for event in events {
         aging
-            .fold_wal_record(&mut active, &mut media, record)
+            .fold_media_event(&mut active, &mut media, event)
             .unwrap();
     }
     (media, aging)
 }
 
+/// The number of records [`history`] stands for: its events name records up to this one.
+const HISTORY_RECORDS: u64 = 11;
+
 /// A history whose engine holds every kind of state the saved index carries: a person's image
-/// protected for the open step, tool images aged out, a batch whose call was planned twice, an
-/// image a first-protocol compaction replaced (so its selection is saved as it stands), and an
-/// accepted message not placed yet.
-fn history(limits: &MediaLimits) -> Vec<WalRecord> {
-    let first = image("a", 4_000);
+/// protected for the open step, tool images aged out, a batch whose call was planned twice, and
+/// an accepted message not placed yet. Each event names the record that states it: the run's
+/// start (1), step 1 (2) and its answer at ordinal 1 (3), the batch (4) and its two results in
+/// the results message at ordinal 2 (5, 6), the batch's end (7), a steer (8), step 2 (9) that
+/// places the steer at ordinal 3, a failed attempt (10), and a second steer (11).
+fn history(limits: &MediaLimits) -> Vec<MediaEvent> {
+    let first = person(&image("a", 4_000));
     let screens = [image("b", 4_000), image("c", 4_000)];
-    let steered = image("d", 4_000);
-    let held = image("e", 4_000);
-    let replacement = Message::new(
-        Role::User,
-        vec![
-            ContentBlock::Text {
-                text: "summary".into(),
-            },
-            ContentBlock::Media(first.clone()),
-        ],
-    );
     vec![
-        record(json!({
-            "type": "run_started", "run_id": "run",
-            "session": {"project_root": "/fixture", "harness": "media", "session": "session"},
-            "config": {"model": broca_protocol::ModelHandle::new("anthropic", "claude"),
-                "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
-                "response_format": {"type": "text"}, "context_epoch": 0, "renderer_version": 1,
-                "frozen_render_config": {"media": limits.0}},
-            "input": [person(&first)], "origin": {"kind": "fresh"}
-        })),
-        step(1),
-        record(json!({"type": "model_step_finished", "step_id": 1,
-            "assistant_message": {"message_id": "answer1", "content": [
-                {"type": "tool_call", "tool_call_id": "one", "tool_name": "screen", "input": {}},
-                {"type": "tool_call", "tool_call_id": "two", "tool_name": "screen", "input": {}}]},
-            "usage": broca_protocol::Usage::default()})),
-        record(
-            json!({"type": "tool_batch_started", "step_id": 1, "batch_id": "batch",
-            "planned_calls": ["one", "two", "one"]}),
-        ),
-        tool_result("one", &screens[0]),
-        tool_result("two", &screens[1]),
-        record(json!({"type": "tool_batch_finished", "batch_id": "batch"})),
-        record(json!({"type": "steered", "input": [person(&steered)]})),
-        step(2),
-        record(
-            json!({"type": "model_attempt_finished", "step_id": 2, "attempt": 1,
-            "outcome": "http_error", "ts_ms": 1, "request_body_len": 0,
-            "request_body_sha256": "a", "response_body_len": 0, "response_body_sha256": "b"}),
-        ),
-        record(json!({
-            "type": "compaction_message", "provider": "compactor", "kind": "setup",
-            "compaction_id": "media-view", "version": 1, "range": {"from": 0, "to": 1},
-            "replacement": [replacement], "sha256": "fixture"
-        })),
-        record(json!({"type": "steered", "input": [person(&held)]})),
+        MediaEvent::RunStart {
+            record: 1,
+            inputs: vec![MediaInput {
+                message: 0,
+                ordinal: 0,
+                skeleton: MediaMessage::of(&first),
+            }],
+            limits: Some(limits.clone()),
+        },
+        MediaEvent::StepStart { step: StepId(1) },
+        MediaEvent::StepEnd,
+        MediaEvent::BatchStart {
+            calls: ["one", "two", "one"]
+                .map(|call| ToolCallId(call.into()))
+                .into(),
+        },
+        tool_result(5, "one", 2, &screens[0]),
+        tool_result(6, "two", 2, &screens[1]),
+        MediaEvent::Accepted {
+            record: 8,
+            messages: vec![MediaMessage::of(&person(&image("d", 4_000)))],
+        },
+        MediaEvent::Placed { first: 3 },
+        MediaEvent::StepStart { step: StepId(2) },
+        MediaEvent::AttemptEnd,
+        MediaEvent::Accepted {
+            record: 11,
+            messages: vec![MediaMessage::of(&person(&image("e", 4_000)))],
+        },
     ]
 }
 
@@ -176,8 +159,8 @@ fn objects() -> Vec<(String, MediaObject)> {
 #[test]
 fn a_saved_index_restores_the_engine_it_was_saved_from() {
     let limits = limits();
-    let records = history(&limits);
-    let (media, aging) = fold(&records, &limits);
+    let events = history(&limits);
+    let (media, aging) = fold(&events, &limits);
     let facts = media.facts();
     let saved_aging = aging.state();
     // The history must hold what the round trip is meant to carry.
@@ -186,15 +169,9 @@ fn a_saved_index_restores_the_engine_it_was_saved_from() {
         !facts.pending.is_empty() && !facts.held.is_empty(),
         "an accepted image"
     );
-    assert!(!facts.replacements.is_empty(), "a replaced image");
-    assert_eq!(facts.covered, Some(0));
     assert!(!saved_aging.aged.is_empty(), "an aged image");
     assert!(!saved_aging.shown.is_empty());
     let state = media.index_state();
-    assert!(
-        state.selection.is_some(),
-        "a selection a compaction decided"
-    );
     assert_eq!(
         state.batch.len(),
         3,
@@ -205,7 +182,7 @@ fn a_saved_index_restores_the_engine_it_was_saved_from() {
     let index = to_stored(&media, &aging, Some(&limits), true, &objects);
     // Through the store's own encoding, as a seal writes it and an open reads it.
     let index = StoredMediaIndex::decode(&index.encode()).unwrap();
-    index.check(records.len() as u64).unwrap();
+    index.check(HISTORY_RECORDS).unwrap();
     assert!(!index.holds_no_media());
 
     let restored = from_stored(&index).unwrap();
@@ -224,10 +201,10 @@ fn a_saved_index_restores_the_engine_it_was_saved_from() {
 #[test]
 fn an_engine_without_a_compaction_saves_no_selection() {
     let limits = limits();
-    let mut records = history(&limits);
-    // Up to the attempt: no compaction yet.
-    records.truncate(10);
-    let (media, aging) = fold(&records, &limits);
+    let mut events = history(&limits);
+    // Up to the attempt, before the second steer.
+    events.truncate(10);
+    let (media, aging) = fold(&events, &limits);
     let index = to_stored(&media, &aging, None, false, &[]);
     assert_eq!(index.selection, None);
     assert_eq!(index.covered, None);
@@ -245,8 +222,7 @@ fn an_engine_without_a_compaction_saves_no_selection() {
 #[test]
 fn a_damaged_index_is_refused_not_restored() {
     let limits = limits();
-    let records = history(&limits);
-    let (media, aging) = fold(&records, &limits);
+    let (media, aging) = fold(&history(&limits), &limits);
     let index = to_stored(&media, &aging, Some(&limits), true, &[]);
 
     let mut named = index.clone();

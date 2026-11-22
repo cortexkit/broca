@@ -18,16 +18,12 @@
 
 use broca_protocol::{ContentBlock, Message, Role, Usage};
 use broca_records::{
-    record::CompactionMessageKind, record::CompactionRange, record::CompactionStabilityRank,
-    record::CompactionStrip, record::CompactionWait, record::CompactionWaitExit,
-    record::OpaqueJson, record::WalRecord,
+    record::CompactionRange, record::CompactionStabilityRank, record::CompactionStrip,
+    record::CompactionWait, record::CompactionWaitExit, record::OpaqueJson,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 pub use broca_records::record::MAX_REPLACEMENT_BYTES;
 mod media;
@@ -55,59 +51,6 @@ pub enum CompactionCheckpoint {
     Captures(CapturedMedia),
     State(Box<CompactionState>),
 }
-impl CompactionCheckpoint {
-    /// The prefix length comes from canonical replay at this record, not from the
-    /// replacement range or provider cursor (which can lag behind a capped page).
-    pub fn fold_at(&mut self, record: &WalRecord, prefix_len: u64) {
-        self.fold(record);
-        if let Self::State(state) = self {
-            state.capture_thinking_boundary(record, prefix_len);
-        }
-    }
-
-    pub fn state(&self) -> Option<&CompactionState> {
-        match self {
-            Self::None | Self::Captures(_) => None,
-            Self::State(state) => Some(state),
-        }
-    }
-    pub fn fold(&mut self, record: &WalRecord) {
-        if matches!(
-            record,
-            WalRecord::CompactionMessage {
-                kind: CompactionMessageKind::Setup,
-                ..
-            }
-        ) {
-            let captured = self.captured().cloned().unwrap_or_default();
-            *self = Self::State(Box::new(CompactionState {
-                captured,
-                ..Default::default()
-            }));
-        }
-        match self {
-            Self::State(state) => state.fold(record),
-            Self::Captures(captured) => captured.fold(record),
-            Self::None => {
-                if CapturedMedia::captures_any(record) {
-                    let mut captured = CapturedMedia::default();
-                    captured.fold(record);
-                    if !captured.is_empty() {
-                        *self = Self::Captures(captured);
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn captured(&self) -> Option<&CapturedMedia> {
-        match self {
-            Self::None => None,
-            Self::Captures(captured) => Some(captured),
-            Self::State(state) => Some(&state.captured),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppliedCompaction {
@@ -126,7 +69,6 @@ pub struct AppliedCompaction {
 fn unknown_thinking_boundary() -> u64 {
     u64::MAX
 }
-impl AppliedCompaction {}
 
 /// A wait the removed synchronous client opened. Recovery still seals one left open by a crash,
 /// without calling any provider (see `runtime::seal_recorded_wait`).
@@ -216,183 +158,6 @@ pub struct CompactionState {
     #[serde(skip)]
     pub current_service_tier: Option<String>,
 }
-impl CompactionState {
-    pub fn capture_thinking_boundary(&mut self, record: &WalRecord, prefix_len: u64) {
-        if matches!(record, WalRecord::CompactionMessage { .. }) {
-            if let Some(applied) = &mut self.applied {
-                applied.thinking_prefix_len = prefix_len;
-            }
-        }
-    }
-
-    pub fn fold(&mut self, record: &WalRecord) {
-        self.captured.fold(record);
-        self.history.fold(record);
-        match record {
-            WalRecord::RunStarted { config, .. } => {
-                self.ceiling_check = None;
-                self.ride_wait = None;
-                // The run's frozen account, when it names a subscription account with a
-                // vault-served account id. Unknown selections leave the previous known
-                // account in place only by not clearing it here: an unknown run has no
-                // account fact, so `current_account` becomes `None` while
-                // `announced_account` keeps the last known account for the next known run
-                // to compare against.
-                self.current_account = config
-                    .auth_selection
-                    .as_ref()
-                    .and_then(view::selection_account_label);
-            }
-            WalRecord::RunAuthRefrozen { auth_selection, .. } => {
-                self.current_account = view::selection_account_label(auth_selection);
-            }
-            WalRecord::CompactionRideWait {
-                step_id,
-                deadline_ms,
-            } => self.ride_wait = Some((*step_id, *deadline_ms)),
-            // A wait ends when its ride resolves, and never outlives its step or its run.
-            WalRecord::CompactionRideWaitEnded { .. }
-            | WalRecord::ModelStepFinished { .. }
-            | WalRecord::RunPaused { .. } => self.ride_wait = None,
-            WalRecord::ContextCeilingWait {
-                step_id,
-                deadline_ms,
-                unavailable,
-            } => {
-                self.ceiling_check = Some(CeilingCheck::Waiting {
-                    step_id: *step_id,
-                    deadline_ms: *deadline_ms,
-                    unavailable: *unavailable,
-                });
-            }
-            WalRecord::ContextCeilingDecided { step_id, detail } => {
-                self.ceiling_check = Some(CeilingCheck::Decided {
-                    step_id: *step_id,
-                    detail: detail.clone(),
-                });
-            }
-            WalRecord::CompactionRequest { provider, .. } => {
-                self.provider.clone_from(provider);
-            }
-            WalRecord::CompactionMessage {
-                provider,
-                kind,
-                compaction_id,
-                version,
-                range,
-                replacement,
-                sha256,
-                call_when,
-                stability,
-                ceiling,
-                tag_checkpoint,
-                ride_wait_ms,
-                view_features,
-                view_due,
-                ..
-            } => {
-                self.provider.clone_from(provider);
-                if *kind == CompactionMessageKind::Setup {
-                    self.call_when.clone_from(call_when);
-                    self.stability = stability.clone().unwrap_or_default();
-                    self.ceiling.clone_from(ceiling);
-                    self.tag_checkpoint.clone_from(tag_checkpoint);
-                    self.ride_wait_ms = *ride_wait_ms;
-                    self.view_features.clone_from(view_features);
-                    self.view_due.clone_from(view_due);
-                }
-                self.applied = Some(AppliedCompaction {
-                    compaction_id: compaction_id.clone(),
-                    version: *version,
-                    range: *range,
-                    replacement: Arc::clone(replacement),
-                    sha256: sha256.clone().into_boxed_str(),
-                    thinking_prefix_len: unknown_thinking_boundary(),
-                });
-            }
-            WalRecord::CompactionAnswer {
-                provider,
-                request_id,
-                disposition,
-                wait,
-                ..
-            } => {
-                self.provider.clone_from(provider);
-                if *disposition == broca_records::record::CompactionDisposition::Wait {
-                    self.open_wait = wait.clone().map(|wait| OpenCompactionWait {
-                        request_id: request_id.clone(),
-                        wait,
-                        terminal_exit: None,
-                    });
-                }
-            }
-            WalRecord::CompactionWait { exited, .. } => {
-                if matches!(
-                    exited,
-                    CompactionWaitExit::Ready | CompactionWaitExit::Bound | CompactionWaitExit::Cap
-                ) {
-                    self.open_wait = None;
-                } else if let Some(wait) = &mut self.open_wait {
-                    wait.terminal_exit = Some(*exited);
-                }
-            }
-            WalRecord::CompactionViewApplied {
-                provider,
-                view,
-                choice,
-                ..
-            } => {
-                self.provider.clone_from(provider);
-                // The writer only records a view it decoded, so a view that does not decode
-                // here is a corrupt WAL. Keep rendering what was rendered before rather than
-                // guess at the record's meaning.
-                if let Some(applied) = view::AppliedView::decode(view, choice) {
-                    if self.view_due.as_ref().is_some_and(|due| {
-                        due.version == applied.view.view_version
-                            && due.digest == applied.view.digest
-                    }) {
-                        self.view_due = None;
-                    }
-                    if let broca_records::record::CompactionViewChoice::Companion { edit, strip } =
-                        choice
-                    {
-                        self.strips.push(*strip);
-                        self.unannounced.push(
-                            crate::compaction_provider::notice::Event::ViewCompanion {
-                                view_version: applied.view.view_version,
-                                edit: edit.clone(),
-                            }
-                            .token(),
-                        );
-                    }
-                    self.view = Some(applied);
-                }
-            }
-            WalRecord::CompactionNotice { seq, headers } => {
-                self.notice_seq = *seq;
-                self.announced = Some(view::Announced::from_headers(headers));
-                self.unannounced.clear();
-                // The last notice's account is the run's account when it was recorded,
-                // when that run's account is known. Unknown runs leave the last known
-                // account in place, so a later known run compares against it rather than
-                // against nothing. The first notice with a known account therefore baselines
-                // without an event: with no prior notice there is no change.
-                if let Some(current) = self.current_account.clone() {
-                    self.announced_account = Some(current);
-                }
-            }
-            WalRecord::RunFinished { .. } => {
-                if matches!(self.ceiling_check, Some(CeilingCheck::Waiting { .. })) {
-                    self.ceiling_check = None;
-                }
-                self.open_wait = None;
-                self.ride_wait = None;
-            }
-            _ => {}
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CeilingCheck {
     Waiting {
@@ -418,68 +183,6 @@ pub struct CompactionHistory {
     pub current_request_bytes: Option<usize>,
     pub previous_request_bytes: Option<usize>,
 }
-impl CompactionHistory {
-    pub fn fold(&mut self, record: &WalRecord) {
-        match record {
-            WalRecord::RunStarted { config, .. } => self.current_model = Some(config.model.clone()),
-            WalRecord::ModelAttemptFinished {
-                ts_ms,
-                request_body_len,
-                ..
-            } => {
-                self.completed_at = *ts_ms;
-                self.current_request_bytes = usize::try_from(*request_body_len).ok();
-            }
-            WalRecord::ModelStepFinished {
-                usage, fallback, ..
-            } => {
-                let requested = fallback
-                    .route
-                    .as_ref()
-                    .map(|route| &route.model)
-                    .or(self.current_model.as_ref());
-                // Checkpoints retain one prompt measurement, not the sum of prompts
-                // sent to every serving model during a server-side handoff.
-                let native = requested.and_then(|requested| {
-                    broca_protocol::usage::model_usage(
-                        fallback
-                            .served_model
-                            .as_deref()
-                            .unwrap_or(&requested.model_id),
-                        *usage,
-                        fallback.usage_iterations.as_deref(),
-                    )
-                    .last()
-                    .map(|(model, usage)| {
-                        (
-                            broca_protocol::ModelHandle::new(&requested.provider_module_id, *model),
-                            *usage,
-                        )
-                    })
-                });
-                self.previous_native_usage = native.as_ref().map(|(_, usage)| *usage);
-                self.previous_model = native.map(|(model, _)| model);
-                self.previous_provider_code = None;
-                self.previous_error = false;
-                self.previous_request_bytes = self.current_request_bytes;
-            }
-            WalRecord::RunFinished {
-                reason: broca_protocol::RunFinishReason::Error,
-                error: Some(error),
-                ..
-            } => {
-                self.previous_error = true;
-                self.previous_provider_code = error.provider_code.clone();
-            }
-            WalRecord::RunFinished {
-                reason: broca_protocol::RunFinishReason::Error,
-                ..
-            } => self.previous_error = true,
-            _ => {}
-        }
-    }
-}
-
 pub fn has_compaction(manifest: &broca_records::record::PlanManifest) -> bool {
     serde_json::from_str::<Value>(manifest.plan.as_json_text())
         .ok()
@@ -666,106 +369,6 @@ pub(crate) fn is_signed(block: &ContentBlock) -> bool {
         } | ContentBlock::RedactedReasoning { .. }
             | ContentBlock::TextWithState { .. }
     )
-}
-
-/// Slice only the fully stamped, guidance-folded prompt. Replacement messages retain their
-/// applied bytes and have no positional ordinal; raw tail ordinals are never restamped.
-///
-/// A session with an applied asynchronous view renders that view ([`view::render`]);
-/// otherwise Setup's initial message, or the replacement the synchronous client last applied,
-/// stands in for its range, exactly as before views existed.
-pub fn model_options(
-    opts: &broca_protocol::CallOptions,
-    state: &CompactionState,
-) -> Result<broca_protocol::CallOptions, view::ViewNotRenderable> {
-    let systems: Vec<_> = opts
-        .prompt
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| (m.role == Role::System).then_some(i))
-        .collect();
-    model_options_indexed(opts, state, &systems)
-}
-
-pub(crate) fn model_options_indexed(
-    opts: &broca_protocol::CallOptions,
-    state: &CompactionState,
-    systems: &[usize],
-) -> Result<broca_protocol::CallOptions, view::ViewNotRenderable> {
-    if let Some(view) = view::render(opts, state, systems) {
-        return view;
-    }
-    let Some(applied) = &state.applied else {
-        return Ok(opts.clone());
-    };
-    let mut prompt: Vec<_> = systems.iter().map(|&i| opts.prompt[i].clone()).collect();
-    let replacement_start = prompt.len();
-    prompt.extend(applied.replacement.iter().cloned().map(|mut m| {
-        m.ordinal = None;
-        m
-    }));
-    let tail_start = prompt.len();
-    prompt.extend(
-        view::ordinal_range(&opts.prompt, applied.range.to, u64::MAX)
-            .iter()
-            .filter(|m| m.role != Role::System)
-            .cloned(),
-    );
-    state.captured.enforce(&mut prompt);
-    let mut view = opts.with_prompt(prompt);
-    view.declared_markers = state
-        .stability
-        .iter()
-        .filter(|rank| (rank.index as usize) < applied.replacement.len())
-        .map(|rank| broca_protocol::request::DeclaredMessageMarker {
-            message_index: replacement_start + rank.index as usize,
-            rank: rank.rank,
-        })
-        .collect();
-    // The renderer's episode coordinates are indexes, unlike transcript ordinals. Map only
-    // retained raw messages; replacement messages must not inherit episode decorations.
-    view.render_episodes = Arc::new(broca_protocol::request::RenderHistory {
-        raw_ordinals: false,
-        compaction_prefix_len: Some(applied.thinking_prefix_len),
-        signed_floor: opts.render_episodes.signed_floor,
-        episodes: retained_episodes(opts, &view.prompt, tail_start),
-    });
-    Ok(view)
-}
-
-/// Translate only episodes represented by retained transcript messages. Searching the episode
-/// boundaries from each retained ordinal avoids walking episodes hidden by a compaction view.
-fn retained_episodes(
-    opts: &broca_protocol::CallOptions,
-    prompt: &[Message],
-    start: usize,
-) -> Vec<broca_protocol::request::EpisodeRenderInput> {
-    let mut kept = BTreeMap::new();
-    let mut positions = BTreeMap::new();
-    for (position, message) in prompt.iter().enumerate().skip(start) {
-        let Some(ordinal) = message.ordinal else {
-            continue;
-        };
-        positions.entry(ordinal).or_insert(position);
-        let end = opts
-            .render_episodes
-            .partition_point(|episode| episode.prompt_start as u64 <= ordinal);
-        if let Some(index) = end.checked_sub(1) {
-            kept.entry(index).or_insert(position);
-        }
-    }
-    kept.into_iter()
-        .map(|(index, position)| {
-            let episode = &opts.render_episodes[index];
-            broca_protocol::request::EpisodeRenderInput {
-                prompt_start: position,
-                first_user: episode
-                    .first_user
-                    .and_then(|first| positions.get(&(first as u64)).copied()),
-                frozen_config: episode.frozen_config.clone(),
-            }
-        })
-        .collect()
 }
 
 pub type CompactionItem = (

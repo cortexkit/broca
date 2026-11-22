@@ -4330,8 +4330,6 @@ pub struct VaultRequest {
     pub op: Option<VaultReadOp>,
 }
 
-impl VaultRequest {}
-
 /// The vault read operation a [`VaultRequest`] was sent as. Serialized as a bare string:
 /// `"get"`, `"get_scoped"`, or, for [`VaultReadOp::Unknown`], the string it was read from.
 ///

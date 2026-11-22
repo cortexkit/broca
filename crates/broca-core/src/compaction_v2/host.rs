@@ -208,23 +208,6 @@ pub fn last_prompt<'e>(
     })
 }
 
-/// Billed iterations can include a refused request on another model. Only the last
-/// serving model's prompt measures context fill; single-model steps need no override.
-/// A last model that reports zero for every input count gives `None`, as `step_usage` treats
-/// zero as unmeasured: a real request always has a prompt, and a fill of 0 would read as empty.
-pub fn fallback_fill(
-    served_model: &str,
-    usage: broca_protocol::Usage,
-    usage_iterations: Option<&[broca_protocol::usage::UsageIteration]>,
-) -> Option<u64> {
-    let serving = broca_protocol::usage::model_usage(served_model, usage, usage_iterations);
-    let (last_model, last_usage) = serving.last()?;
-    if !serving.iter().any(|(model, _)| model != last_model) {
-        return None;
-    }
-    super::metadata::step_usage(*last_usage)?.prompt_tokens
-}
-
 pub fn image_reference(
     image: &super::protocol::view::InsertedImage,
 ) -> Result<broca_protocol::MediaRef, String> {

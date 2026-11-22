@@ -13,5 +13,3 @@ pub struct Config {
     #[serde(skip)]
     pub root: PathBuf,
 }
-
-impl Config {}

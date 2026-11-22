@@ -130,8 +130,6 @@ pub struct ViewReadyInbox {
     newest: std::sync::Mutex<HashMap<String, ViewReady>>,
 }
 
-impl ViewReadyInbox {}
-
 impl CompactionViews for ViewReadyInbox {
     fn newest_ready(
         &self,

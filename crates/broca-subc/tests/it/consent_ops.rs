@@ -145,14 +145,10 @@ fn assert_drained(serving: &Serving, count: usize) {
 }
 
 #[tokio::test]
-async fn request_get_and_withdraw_match_the_frozen_vectors_on_a_real_route() {
+async fn request_and_withdraw_match_the_frozen_vectors_on_a_real_route() {
     let filing = exchange(
         "broca/held-call-request.json",
         "upstream/consent-requester-v2/cerebellum-reply.json",
-    );
-    let get = exchange(
-        "upstream/consent-requester-v2/cerebellum-get-request.json",
-        "upstream/consent-requester-v2/cerebellum-get-reply.json",
     );
     let withdraw = exchange(
         "upstream/consent-requester-v1/withdraw-request.json",
@@ -160,12 +156,7 @@ async fn request_get_and_withdraw_match_the_frozen_vectors_on_a_real_route() {
     );
     let Some(serving) = start(
         "consent-vectors",
-        vec![
-            filing.clone(),
-            get.clone(),
-            withdraw.clone(),
-            withdraw.clone(),
-        ],
+        vec![filing.clone(), withdraw.clone(), withdraw.clone()],
     )
     .await
     else {
@@ -180,12 +171,6 @@ async fn request_get_and_withdraw_match_the_frozen_vectors_on_a_real_route() {
         serde_json::to_value(reply).unwrap(),
         filing["reply"]["result"]
     );
-    let record = serving.client.get("el_1").await.unwrap();
-    assert!(!record.is_terminal());
-    assert_eq!(
-        serde_json::to_value(record).unwrap(),
-        get["reply"]["result"]
-    );
     for _ in 0..2 {
         match serving.client.withdraw("el_2").await {
             WithdrawalReply::Acknowledged(record) => {
@@ -197,8 +182,7 @@ async fn request_get_and_withdraw_match_the_frozen_vectors_on_a_real_route() {
             other => panic!("withdrawal should acknowledge, including a repeat: {other:?}"),
         }
     }
-    assert_drained(&serving, 4);
-    serving.client.close().await.unwrap();
+    assert_drained(&serving, 3);
 }
 
 #[tokio::test]

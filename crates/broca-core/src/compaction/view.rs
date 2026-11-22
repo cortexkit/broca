@@ -7,17 +7,14 @@
 //! `CompactionNotice`) before anything renders or publishes it, so a resumed run renders the
 //! same bytes without asking the provider again.
 
-use std::collections::BTreeMap;
-
 use broca_protocol::{tags::part_key, ContentBlock, Message, Role};
-use broca_records::{record::CompactionStrip, record::CompactionViewChoice, record::OpaqueJson};
+use broca_records::{record::CompactionStrip, record::CompactionViewChoice};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{is_signed, native_message, native_schema_message, CompactionState};
 use {
-    crate::compaction_provider::notice::headers, crate::compaction_provider::view::CompactionView,
-    crate::compaction_provider::view::ViewProblem,
+    crate::compaction_provider::view::CompactionView, crate::compaction_provider::view::ViewProblem,
 };
 
 /// A view the session applied, and how.
@@ -25,16 +22,6 @@ use {
 pub struct AppliedView {
     pub view: CompactionView,
     pub choice: CompactionViewChoice,
-}
-
-impl AppliedView {
-    /// Decode a recorded view. `None` when the record's view does not decode.
-    pub(crate) fn decode(view: &OpaqueJson, choice: &CompactionViewChoice) -> Option<Self> {
-        Some(Self {
-            view: serde_json::from_str(view.as_json_text()).ok()?,
-            choice: choice.clone(),
-        })
-    }
 }
 
 /// What the newest recorded notice announced: enough to tell whether a later boundary has
@@ -57,24 +44,6 @@ pub struct Announced {
 
 fn hidden_service_tier(value: &Option<String>) -> bool {
     !broca_protocol::service_tier_enabled() || value.is_none()
-}
-
-impl Announced {
-    pub(crate) fn from_headers(map: &BTreeMap<String, String>) -> Self {
-        let number = |name: &str| map.get(name).and_then(|value| value.parse().ok());
-        Self {
-            est_tokens: number(headers::EST_TOKENS),
-            window: number(headers::WINDOW),
-            lineage_id: map.get(headers::LINEAGE_ID).cloned(),
-            through_ordinal: number(headers::THROUGH_ORDINAL),
-            applied_view_version: number(headers::APPLIED_VIEW_VERSION),
-            model: map.get(headers::MODEL).cloned(),
-            history_edit_cost: map.get(headers::HISTORY_EDIT_COST).cloned(),
-            service_tier: broca_protocol::service_tier_enabled()
-                .then(|| map.get(headers::SERVICE_TIER).cloned())
-                .flatten(),
-        }
-    }
 }
 
 /// The transcript messages of `prompt`: every message with an ordinal, in order, except
@@ -450,8 +419,6 @@ pub enum Decision {
     Superseded,
 }
 
-impl Decision {}
-
 /// A recorded view that does not assemble over the prompt being rendered. It assembled when it
 /// was applied, over the same prompt, so this means the prompt changed under it. Rendering
 /// anything else (Setup's head, no strips) would send bytes no recorded decision covers, so it
@@ -470,56 +437,6 @@ impl std::fmt::Display for ViewNotRenderable {
             self.view_version, self.problem
         )
     }
-}
-
-/// The prompt a request sends under the session's applied view: the runner's own system
-/// messages, then the view's history with every recorded strip applied. `None` when the
-/// session has no applied view.
-pub(crate) fn render(
-    opts: &broca_protocol::CallOptions,
-    state: &CompactionState,
-    systems: &[usize],
-) -> Option<Result<broca_protocol::CallOptions, ViewNotRenderable>> {
-    if let Some(due) = &state.view_due {
-        return Some(Err(ViewNotRenderable {
-            view_version: due.version,
-            problem: AssemblyProblem::Refused(
-                crate::compaction_provider::setup::VIEW_DUE_UNAPPLIED,
-            ),
-        }));
-    }
-    let applied = state.view.as_ref()?;
-    let mut history = match assemble_captured(
-        &applied.view,
-        &opts.prompt,
-        &state.captured,
-        state.view_features.as_deref().unwrap_or_default(),
-    ) {
-        Ok(history) => history,
-        Err(problem) => {
-            return Some(Err(ViewNotRenderable {
-                view_version: applied.view.view_version,
-                problem,
-            }))
-        }
-    };
-    apply_strips(&mut history, &state.strips, strips_copies(state));
-    let mut prompt: Vec<_> = systems.iter().map(|&i| opts.prompt[i].clone()).collect();
-    let history_start = prompt.len();
-    prompt.extend(history);
-    let mut view = opts.with_prompt(prompt);
-    // Episode decorations follow the transcript messages the view keeps; the provider's own
-    // messages never inherit one.
-    view.render_episodes = std::sync::Arc::new(broca_protocol::request::RenderHistory {
-        raw_ordinals: false,
-        compaction_prefix_len: state
-            .applied
-            .as_ref()
-            .map(|applied| applied.thinking_prefix_len),
-        signed_floor: opts.render_episodes.signed_floor,
-        episodes: super::retained_episodes(opts, &view.prompt, history_start),
-    });
-    Some(Ok(view))
 }
 
 /// The context limit a model provider's refusal states, when its text states one:

@@ -1,9 +1,11 @@
-//! Recorded Codex effort-update choices, WAL replay, and identical serialized input prefixes.
+//! The ChatGPT backend's reasoning-effort updates: a run whose effort differs from the one in
+//! force gets a `configuration_update` input item before its first user message, and each
+//! request's serialized input stays a byte prefix of the next request's.
 use std::sync::Arc;
 
 use broca_protocol::{
-    caller::RunFinishReason, request::ModelHandle, BindIdentity, CallOptions, ContentBlock,
-    Message, Role, RunId, Usage,
+    request::{EpisodeRenderInput, RenderHistory},
+    CallOptions, ContentBlock, Message, Role,
 };
 use broca_provider::{
     families::{
@@ -12,7 +14,6 @@ use broca_provider::{
     policy::ReasoningPolicy,
     wire::{FrozenRenderConfig, WireFamily},
 };
-use broca_records::{record::RunConfig, record::RunOrigin, record::WalRecord};
 use serde_json::{json, Value};
 
 fn config(model: &str, effort: &str, admitted: bool) -> FrozenRenderConfig {
@@ -25,120 +26,78 @@ fn config(model: &str, effort: &str, admitted: bool) -> FrozenRenderConfig {
     frozen
 }
 
-fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> WalRecord {
-    let frozen = config(model, effort, admitted);
-    WalRecord::RunStarted {
-        message_marks: None,
-        compaction_plan_version: None,
-        sent_by: None,
-        written_at_ms: None,
-        tags: None,
-        session_class: None,
-        retention: None,
-        hooks: None,
-        title: None,
-        on_restart: None,
-        keep_warm: None,
-        marker_order_version: None,
-        manifest: None,
-        scope: None,
-        send_id: None,
-        request_identity_digest: None,
-        project_id: None,
-        principal: None,
-        ts_ms: None,
-        run_id: RunId(format!("run-{effort}")),
-        session: BindIdentity::new("/tmp/p", "h", "s"),
-        config: Box::new(RunConfig {
-            global_system: None,
-            account_route: None,
-            route_decision_id: None,
-            served_provider: None,
-            account_limit_pause: false,
-            turn_directives_v1: None,
-            render_tags: false,
-            computed_tags: None,
-            model: ModelHandle::new("chatgpt", model),
-            tools: vec![].into(),
-            tool_choice: Default::default(),
-            generation: Default::default(),
-            response_format: Default::default(),
-            provider_options: Value::Null,
-            cache_tiers: Value::Null,
-            context_epoch: 0,
-            renderer_version: frozen.renderer_version,
-            frozen_render_config: serde_json::to_value(&frozen).unwrap(),
-            auth_selection: None,
-            tools_were_omitted: false,
-            budget: None,
-            context_limit: None,
-            work_class: None,
-            variant: None,
-            service_tier: None,
-            stop_when: vec![],
-            context_management: None,
-        }),
-        input: role
-            .map(|role| Message {
+/// One run of a session: the render config it was admitted with, as its run start stores it,
+/// and its input, one message named after the run's effort (or none).
+#[derive(Clone)]
+struct Run {
+    frozen_config: Value,
+    effort: String,
+    role: Option<Role>,
+}
+
+fn start(model: &str, effort: &str, admitted: bool, role: Option<Role>) -> Run {
+    Run {
+        frozen_config: serde_json::to_value(config(model, effort, admitted)).unwrap(),
+        effort: effort.into(),
+        role,
+    }
+}
+
+fn records(model: &str, efforts: &[&str], admitted: bool) -> Vec<Run> {
+    efforts
+        .iter()
+        .map(|effort| start(model, effort, admitted, Some(Role::User)))
+        .collect()
+}
+
+/// The newest run's request: every run's input in order, each message at its position in the
+/// session, with every run's place and render config as the run loop passes them, rendered
+/// under the newest run's config.
+fn request(runs: &[Run]) -> (FrozenRenderConfig, CallOptions) {
+    let mut prompt = Vec::new();
+    let mut episodes = Vec::new();
+    for run in runs {
+        let prompt_start = prompt.len();
+        if let Some(role) = run.role {
+            prompt.push(Message {
                 turn_system: false,
                 role,
                 content: vec![ContentBlock::Text {
-                    text: format!("episode-{effort}").into(),
+                    text: format!("episode-{}", run.effort).into(),
                 }],
                 origin: None,
-                ordinal: None,
+                ordinal: Some(prompt_start as u64),
                 tags: Default::default(),
                 cache_prefix_blocks: None,
-            })
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into(),
-        origin: RunOrigin::Fresh,
-        submission_id: None,
-    }
-}
-
-fn finish() -> WalRecord {
-    WalRecord::RunFinished {
-        interrupt_reason: None,
-        ts_ms: None,
-        reason: RunFinishReason::Completed,
-        usage: Usage::default(),
-        error: None,
-        retries_used: 0,
-    }
-}
-
-fn records(model: &str, efforts: &[&str], admitted: bool) -> Vec<WalRecord> {
-    let mut out = Vec::new();
-    for effort in efforts {
-        if !out.is_empty() {
-            out.push(finish());
+            });
         }
-        out.push(start(model, effort, admitted, Some(Role::User)));
+        episodes.push(EpisodeRenderInput {
+            prompt_start,
+            first_user: (run.role == Some(Role::User)).then_some(prompt_start),
+            frozen_config: run.frozen_config.clone(),
+        });
     }
-    out
+    let frozen = serde_json::from_value(runs.last().unwrap().frozen_config.clone()).unwrap();
+    let mut opts = CallOptions::new(prompt);
+    opts.render_episodes = Arc::new(RenderHistory::from(episodes));
+    (frozen, opts)
 }
 
-fn render(records: &[WalRecord]) -> Vec<u8> {
-    let prior = broca_core::replay::replay(records).unwrap();
-    let frozen: FrozenRenderConfig =
-        serde_json::from_value(prior.run_config.unwrap().frozen_render_config).unwrap();
-    let mut opts = CallOptions::new(prior.prompt);
-    opts.render_episodes = Arc::new(prior.render_episodes.unwrap().into());
+fn render(runs: &[Run]) -> Vec<u8> {
+    let (frozen, opts) = request(runs);
     OpenAiResponsesChatgpt.render(&frozen, &opts)
 }
 
-fn body(records: &[WalRecord]) -> Value {
-    serde_json::from_slice(&render(records)).unwrap()
+fn body(runs: &[Run]) -> Value {
+    serde_json::from_slice(&render(runs)).unwrap()
 }
-fn input_bytes(records: &[WalRecord]) -> Vec<u8> {
+fn input_bytes(runs: &[Run]) -> Vec<u8> {
     #[derive(serde::Deserialize)]
     struct WireInput<'a> {
         #[serde(borrow)]
         input: &'a serde_json::value::RawValue,
     }
-    let bytes = render(records);
+    let bytes = render(runs);
     let wire: WireInput<'_> = serde_json::from_slice(&bytes).unwrap();
     wire.input.get().as_bytes().to_vec()
 }
@@ -179,7 +138,7 @@ fn return_to_initial_effort_inserts_a_second_update() {
 #[test]
 fn earlier_update_remains_in_serialized_prefix_when_third_effort_is_unchanged() {
     let rows = records("gpt-6.1-sol", &["xhigh", "high", "high"], true);
-    let second = input_bytes(&rows[..3]);
+    let second = input_bytes(&rows[..2]);
     let third = input_bytes(&rows);
     assert!(
         third.starts_with(&second[..second.len() - 1]),
@@ -212,34 +171,24 @@ fn pre_change_session_and_new_append_keep_legacy_bytes() {
     let mut rows = records("gpt-6.1-sol", &["xhigh", "high"], false);
     let old = render(&rows);
     assert_eq!(old, br#"{"include":["reasoning.encrypted_content"],"input":[{"content":"episode-xhigh","role":"user","type":"message"},{"content":"episode-high","role":"user","type":"message"}],"model":"gpt-6.1-sol","reasoning":{"effort":"high","summary":"auto"},"store":false,"stream":true}"#);
-    // An old serialized blob lacks the additive admission choice entirely.
+    // A run started before the admission choice existed stores a config without it.
     for row in &mut rows {
-        if let WalRecord::RunStarted { config, .. } = row {
-            assert!(config
-                .frozen_render_config
-                .get("chatgpt_effort_updates")
-                .is_none());
-            config
-                .frozen_render_config
-                .as_object_mut()
-                .unwrap()
-                .remove("chatgpt_effort_updates");
-        }
-    }
-    let decoded: Vec<WalRecord> =
-        serde_json::from_slice(&serde_json::to_vec(&rows).unwrap()).unwrap();
-    assert_eq!(render(&decoded), old);
-    assert_eq!(body(&decoded)["reasoning"]["effort"], "high");
-    rows.push(finish());
-    rows.push(start("gpt-6.1-sol", "xhigh", true, Some(Role::User)));
-    let current = render(&rows);
-    if let WalRecord::RunStarted { config, .. } = rows.last_mut().unwrap() {
-        config
-            .frozen_render_config
+        assert_eq!(row.frozen_config["chatgpt_effort_updates"], false);
+        row.frozen_config
             .as_object_mut()
             .unwrap()
             .remove("chatgpt_effort_updates");
     }
+    assert_eq!(render(&rows), old);
+    assert_eq!(body(&rows)["reasoning"]["effort"], "high");
+    rows.push(start("gpt-6.1-sol", "xhigh", true, Some(Role::User)));
+    let current = render(&rows);
+    rows.last_mut()
+        .unwrap()
+        .frozen_config
+        .as_object_mut()
+        .unwrap()
+        .remove("chatgpt_effort_updates");
     assert_eq!(
         render(&rows),
         current,
@@ -248,23 +197,10 @@ fn pre_change_session_and_new_append_keep_legacy_bytes() {
 }
 
 #[test]
-fn crash_mid_second_episode_replays_identical_request_bytes() {
-    let rows = records("gpt-6.1-sol", &["xhigh", "high"], true);
-    let before_crash = render(&rows);
-    // RunStarted is durable before a model call; a crash before its commit leaves this prefix.
-    let decoded: Vec<WalRecord> =
-        serde_json::from_slice(&serde_json::to_vec(&rows).unwrap()).unwrap();
-    assert_eq!(render(&decoded), before_crash);
-    assert_eq!(body(&decoded)["input"][1], update("high"));
-}
-
-#[test]
 fn userless_and_empty_episodes_use_stable_user_separators() {
     let mut rows = records("gpt-6.1-sol", &["xhigh"], true);
-    rows.push(finish());
     rows.push(start("gpt-6.1-sol", "high", true, None));
     let second = input_bytes(&rows);
-    rows.push(finish());
     rows.push(start("gpt-6.1-sol", "xhigh", true, Some(Role::Assistant)));
     let third = input_bytes(&rows);
     assert!(third.starts_with(&second[..second.len() - 1]));
@@ -285,12 +221,7 @@ fn unchanged_effort_has_identical_legacy_bytes() {
 
 #[test]
 fn transformed_synthetic_rows_do_not_move_episode_updates() {
-    let rows = records("gpt-6.1-sol", &["xhigh", "high"], true);
-    let prior = broca_core::replay::replay(&rows).unwrap();
-    let frozen: FrozenRenderConfig =
-        serde_json::from_value(prior.run_config.unwrap().frozen_render_config).unwrap();
-    let mut opts = CallOptions::new(prior.prompt);
-    opts.render_episodes = Arc::new(prior.render_episodes.unwrap().into());
+    let (frozen, opts) = request(&records("gpt-6.1-sol", &["xhigh", "high"], true));
     let mut head = opts.prompt[0].clone();
     head.ordinal = None;
     head.role = Role::System;
@@ -303,12 +234,7 @@ fn transformed_synthetic_rows_do_not_move_episode_updates() {
 
 #[test]
 fn dropped_user_messages_still_separate_transformed_updates() {
-    let rows = records("gpt-6.1-sol", &["xhigh", "high", "xhigh"], true);
-    let prior = broca_core::replay::replay(&rows).unwrap();
-    let frozen: FrozenRenderConfig =
-        serde_json::from_value(prior.run_config.unwrap().frozen_render_config).unwrap();
-    let mut opts = CallOptions::new(prior.prompt);
-    opts.render_episodes = Arc::new(prior.render_episodes.unwrap().into());
+    let (frozen, opts) = request(&records("gpt-6.1-sol", &["xhigh", "high", "xhigh"], true));
     let rendered = OpenAiResponsesChatgpt.shape(&frozen, &opts.with_prompt(vec![]));
     assert_eq!(rendered["input"][0], update("high"));
     assert_eq!(rendered["input"][1]["role"], "user");
@@ -336,12 +262,9 @@ fn reduced_episodes_render_the_same_bytes_as_every_episode() {
         let mut rows = Vec::new();
         let mut effort = efforts[next(4) as usize];
         for run in 0..runs {
-            if run > 0 {
-                rows.push(finish());
-                // Mostly the same effort as the run before, as real sessions are.
-                if next(4) == 0 {
-                    effort = efforts[next(4) as usize];
-                }
+            // Mostly the same effort as the run before, as real sessions are.
+            if run > 0 && next(4) == 0 {
+                effort = efforts[next(4) as usize];
             }
             let admitted = next(10) != 0;
             rows.push(start(
@@ -351,16 +274,10 @@ fn reduced_episodes_render_the_same_bytes_as_every_episode() {
                 (next(5) != 0).then_some(Role::User),
             ));
         }
-        let prior = broca_core::replay::replay(&rows).unwrap();
-        let frozen: FrozenRenderConfig =
-            serde_json::from_value(prior.run_config.unwrap().frozen_render_config).unwrap();
-        let mut history: broca_protocol::request::RenderHistory =
-            prior.render_episodes.unwrap().into();
+        let (frozen, opts) = request(&rows);
+        let mut history = RenderHistory::clone(&opts.render_episodes);
         history.raw_ordinals = true;
-        let mut prompt = prior.prompt.clone();
-        for (index, message) in prompt.iter_mut().enumerate() {
-            message.ordinal = Some(index as u64);
-        }
+        let prompt = opts.prompt.clone();
         let first_kept = next(prompt.len() as u64 + 1) as usize;
         let kept: Vec<Message> = prompt[first_kept..].to_vec();
         let mut whole = CallOptions::new(kept.clone());

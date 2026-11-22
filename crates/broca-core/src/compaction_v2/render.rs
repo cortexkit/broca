@@ -40,40 +40,6 @@ pub fn prompt_with_rides(
     render_planned(stored, entries, rides, &edits, plan, image, None)
 }
 
-/// Plan the complete applied view, including permission to strip newer signatures.
-/// Reverts filter obsolete edit targets, but preserve `built_through`: it marks the
-/// last message the provider had read when it authorized stripping newer signatures.
-/// `floor` is the session's signed floor (`host::view_floor`), which the plan honours as the
-/// view checks do; the request's own strip removes the parts it covers.
-pub fn prompt_view_with_rides(
-    stored: &[Message],
-    entries: &[Entry],
-    rides: &super::entries::RideEnvelopes,
-    view: Option<&View>,
-    rules: &ProviderRules,
-    floor: cortexkit_compaction_view::rules::Floor<'_>,
-    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
-) -> Result<Vec<Message>, String> {
-    prompt_view_kept(stored, entries, rides, view, rules, floor, image, None)
-}
-
-/// [`prompt_view_with_rides`], reusing what `kept` holds of the entries an earlier render
-/// rendered, and keeping what this one renders for the next (see [`RenderCache`]).
-#[allow(clippy::too_many_arguments)]
-pub fn prompt_view_kept(
-    stored: &[Message],
-    entries: &[Entry],
-    rides: &super::entries::RideEnvelopes,
-    view: Option<&View>,
-    rules: &ProviderRules,
-    floor: cortexkit_compaction_view::rules::Floor<'_>,
-    image: impl FnMut(&InsertedImage) -> Result<MediaRef, String>,
-    kept: Option<&RenderCache>,
-) -> Result<Vec<Message>, String> {
-    let (edits, plan) = plan_for_render(entries, view, rules, floor)?;
-    render_planned(stored, entries, rides, &edits, plan, image, kept)
-}
-
 /// Renders `plan`, which [`plan_for_render`] made with `edits`, over `stored`, as
 /// [`prompt_view_kept`] does after planning: for a caller that reads the plan first (see
 /// [`released_but_read`]).

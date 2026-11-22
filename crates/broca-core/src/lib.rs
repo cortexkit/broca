@@ -18,7 +18,6 @@ pub mod budget_kernel;
 pub use budget_kernel::{next_due, DueFiring};
 pub mod cache_warm;
 /// Which copy of a tool call each durable record answers, and the key current readers give it.
-pub mod call_identity;
 pub mod capability;
 pub mod clock;
 pub mod compaction;
@@ -120,13 +119,10 @@ pub use queue::{insert_in_drain_order, PendingSubmission};
 pub use render::CANONICAL_RENDERER_VERSION;
 pub use render::{canonical_request_bytes, request_digest, request_digest_hex};
 pub use replay::{
-    deferred_call_obligations, reconcile_run_state, replay, LateApprovalView, OpenCallState,
-    ReconciledRunState, ReplayError,
-};
-pub use replay::{
     DeferredCallObligations, DeferredCallProjection, OpenToolBatch, OwedWithdrawal, PendingTurn,
     PreparedCall, ProjectedDeferredCall, ReplayResolution, ReplayState,
 };
+pub use replay::{LateApprovalView, OpenCallState, ReconciledRunState, ReplayError};
 pub use resume::DeferredCloseKind;
 pub use retention::is_retention_lineage;
 pub use retention::LineageRetention;

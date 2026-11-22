@@ -27,15 +27,11 @@
 
 use broca_protocol::{
     content::{ContentBlock, Message, Role},
-    request::{CallOptions, GenerationConfig, ModelHandle, ResponseFormat, ToolChoice},
-    BindIdentity, RunFinishReason, RunId, Usage,
+    request::{CallOptions, ModelHandle},
 };
 use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
 use broca_provider::policy::{CrossModelThinking, ReasoningPolicy};
 use broca_provider::wire::{FrozenRenderConfig, WireFamily};
-use broca_records::{
-    record::RunConfig, record::RunOrigin, record::SeedOriginKind, record::WalRecord,
-};
 use serde_json::Value;
 
 const PROVIDER: &str = "anthropic";
@@ -319,89 +315,5 @@ fn keep_all_scope_strips_only_the_foreign_signed_thinking() {
             .iter()
             .any(|b| b["type"] == "thinking"),
         "a same-model signature must be echoed under keep-all; got {native:#?}"
-    );
-}
-
-#[test]
-fn imported_seed_replay_strips_foreign_signed_reasoning_on_cross_model_render() {
-    let records = vec![
-        WalRecord::RunStarted {
-            message_marks: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: None,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            compaction_plan_version: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
-            ts_ms: None,
-            run_id: RunId("run-import".into()),
-            session: BindIdentity::new("/project", "runner", "imported"),
-            config: Box::new(RunConfig {
-                account_route: None,
-                global_system: None,
-                route_decision_id: None,
-                served_provider: None,
-                account_limit_pause: false,
-                turn_directives_v1: None,
-                render_tags: false,
-                computed_tags: None,
-                model: ModelHandle::new("import", "import"),
-                tools: Vec::new().into(),
-                tool_choice: ToolChoice::None,
-                generation: GenerationConfig::default(),
-                response_format: ResponseFormat::default(),
-                provider_options: Value::Null,
-                cache_tiers: Value::Null,
-                context_epoch: 0,
-                renderer_version: 0,
-                frozen_render_config: Value::Null,
-                auth_selection: None,
-                tools_were_omitted: false,
-                budget: None,
-                context_limit: None,
-                work_class: None,
-                variant: None,
-                service_tier: None,
-                stop_when: Vec::new(),
-                context_management: None,
-            }),
-            input: prompt_with_signed_thinking_from(foreign_origin()).into(),
-            origin: RunOrigin::SeededFrom {
-                origin_kind: SeedOriginKind::Import,
-                source_ref: "cc:session-1".into(),
-                origin_device_pseudonym: None,
-                base_seq: None,
-            },
-            submission_id: None,
-        },
-        WalRecord::RunFinished {
-            interrupt_reason: None,
-            ts_ms: None,
-            reason: RunFinishReason::Completed,
-            usage: Usage::default(),
-            error: None,
-            retries_used: 0,
-        },
-    ];
-    let replayed = broca_core::replay(&records).expect("replay imported episode");
-    let frozen = anthropic_frozen_config(MODEL_Y);
-    let mut opts = CallOptions::new(replayed.prompt);
-    opts.target_model = Some(origin(MODEL_Y));
-    let body: Value = serde_json::from_slice(&AnthropicMessages.render(&frozen, &opts)).unwrap();
-    let messages = body["messages"].as_array().cloned().unwrap_or_default();
-    assert!(
-        !has_thinking_block(&messages),
-        "a foreign signature carried through import replay must not reach the target model"
     );
 }

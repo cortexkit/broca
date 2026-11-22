@@ -1,4 +1,5 @@
-//! Real codec → framed WAL → core replay → outbound bytes, with synthetic opaque provider state.
+//! Real codec → the stored assistant message → outbound bytes, with synthetic opaque provider
+//! state.
 
 use broca_protocol::{
     content::{AssistantMessage, ContentBlock, Role},
@@ -13,8 +14,7 @@ use broca_provider::{
     },
     wire::{FrozenRenderConfig, WireFamily},
 };
-use broca_records::record::WalRecord;
-use broca_wal::framing::{decode_next, encode, DecodeStep, PROVIDER_TEXT_STATE_FEATURE};
+use broca_records::record::NoDispatchReason;
 use serde_json::{json, Value};
 
 fn decoded(
@@ -39,60 +39,28 @@ fn decoded(
         .expect("fixture produces a complete assistant message")
 }
 
-fn replayed(frozen: &FrozenRenderConfig, message: &AssistantMessage) -> CallOptions {
+/// The request the next step sends after `message`: the answer as the run stores it, then, when
+/// it called tools, a denied result for each call, as a run that refused them records.
+fn replayed(message: &AssistantMessage) -> CallOptions {
     let model = ModelHandle::new("fixture-provider", "model");
-    let mut records: Vec<WalRecord> = vec![serde_json::from_value(json!({
-        "type":"run_started", "run_id":"state", "session":{"project_root":"/tmp/provider-state","harness":"test","session":"state"},
-        "config":{"model":model,"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":frozen.renderer_version,"frozen_render_config":frozen},
-        "input":[],"origin":{"kind":"fresh"}
-    })).unwrap(), serde_json::from_value(json!({
-        "type":"model_step_finished","step_id":1,"assistant_message":message,"usage":{},"retries_used":0
-    })).unwrap()];
-    let calls: Vec<_> = message
+    let mut prompt = vec![broca_protocol::content::Message::assistant_from(
+        message.content.clone(),
+        model.clone(),
+    )];
+    let denied = NoDispatchReason::Denied {
+        reason: "fixture".into(),
+    };
+    let results: Vec<_> = message
         .tool_calls()
-        .map(|call| call.tool_call_id.0.clone())
-        .collect();
-    if !calls.is_empty() {
-        records.push(serde_json::from_value(json!({"type":"tool_batch_started","batch_id":"b","step_id":1,"planned_calls":calls})).unwrap());
-        for call in calls {
-            records.push(serde_json::from_value(json!({"type":"tool_no_dispatch","batch_id":"b","tool_call_id":call,"reason":{"kind":"denied","reason":"fixture"}})).unwrap());
-        }
-        records.push(
-            serde_json::from_value(json!({"type":"tool_batch_finished","batch_id":"b"})).unwrap(),
-        );
-    }
-    let restored: Vec<_> = records
-        .iter()
-        .enumerate()
-        .map(|(index, record)| {
-            let bytes = encode(index as u64 + 1, 1, record).unwrap();
-            let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
-                panic!("framed WAL record")
-            };
-            assert_eq!(
-                serde_json::to_vec(&framed.record).unwrap(),
-                serde_json::to_vec(record).unwrap()
-            );
-            framed.record
+        .map(|call| {
+            ContentBlock::ToolResult(broca_core::no_dispatch_result(&call.tool_call_id, &denied))
         })
         .collect();
-    for record in &restored[..2] {
-        assert!(record
-            .required_features()
-            .contains(&PROVIDER_TEXT_STATE_FEATURE));
+    if !results.is_empty() {
+        prompt.push(broca_protocol::content::Message::new(Role::Tool, results));
     }
-    let state = broca_core::replay(&restored).unwrap();
-    let assistant = state
-        .prompt
-        .iter()
-        .find(|message| message.role == Role::Assistant)
-        .unwrap();
-    assert_eq!(assistant.origin, Some(model.clone()));
-    assert_eq!(
-        assistant.content, message.content,
-        "replay must preserve state bytes and item identity"
-    );
-    let mut opts = CallOptions::new(state.prompt);
+    broca_protocol::content::stamp_ordinals(&mut prompt);
+    let mut opts = CallOptions::new(prompt);
     opts.target_model = Some(model);
     opts.step_context = Some(broca_protocol::StepContext {
         session_address: None,
@@ -126,7 +94,7 @@ fn responses_roundtrip(family: &dyn WireFamily, frozen: FrozenRenderConfig) {
         })
         .collect();
     assert_eq!(ids, ["msg_preamble", "msg_answer", "msg_empty", "msg_tail"]);
-    let opts = replayed(&frozen, &message);
+    let opts = replayed(&message);
     let body: Value = serde_json::from_slice(&family.render(&frozen, &opts)).unwrap();
     assert_eq!(
         broca_protocol::canonical_json_bytes(&body["input"]),
@@ -157,7 +125,7 @@ fn gemini_roundtrip(family: &dyn WireFamily, mut frozen: FrozenRenderConfig, wra
     assert!(
         matches!(&message.content[1], ContentBlock::TextWithState {text,..} if text.is_empty())
     );
-    let opts = replayed(&frozen, &message);
+    let opts = replayed(&message);
     let body: Value = serde_json::from_slice(&family.render(&frozen, &opts)).unwrap();
     let contents = if wrapped {
         &body["request"]["contents"]
@@ -233,22 +201,22 @@ fn assert_state_gates(
 }
 
 #[test]
-fn responses_phase_survives_wal_replay() {
+fn responses_phase_is_sent_back() {
     responses_roundtrip(&OpenAiResponses, openai_responses_frozen_config("model"));
 }
 #[test]
-fn chatgpt_phase_survives_wal_replay() {
+fn chatgpt_phase_is_sent_back() {
     responses_roundtrip(
         &OpenAiResponsesChatgpt,
         openai_responses_chatgpt_frozen_config("model"),
     );
 }
 #[test]
-fn gemini_signed_text_survives_wal_replay() {
+fn gemini_signed_text_is_sent_back() {
     gemini_roundtrip(&Gemini, gemini_frozen_config("model"), false);
 }
 #[test]
-fn codeassist_signed_text_survives_wal_replay() {
+fn codeassist_signed_text_is_sent_back() {
     gemini_roundtrip(
         &GoogleCodeAssist,
         google_codeassist_frozen_config("model"),
@@ -291,20 +259,8 @@ fn legacy_frozen_configs_keep_pre_state_decode_and_render_bytes() {
             .content
             .iter()
             .all(|block| !matches!(block, ContentBlock::TextWithState { .. })));
-        let record: WalRecord = serde_json::from_value(json!({"type":"model_step_finished","step_id":1,"assistant_message":message,"usage":{},"retries_used":0})).unwrap();
-        assert!(record.required_features().is_empty());
-        let bytes = encode(1, 1, &record).unwrap();
-        let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
-            panic!("legacy record")
-        };
-        let WalRecord::ModelStepFinished {
-            assistant_message, ..
-        } = framed.record
-        else {
-            panic!("legacy assistant")
-        };
         let mut opts = CallOptions::new(vec![broca_protocol::content::Message::assistant_from(
-            assistant_message.content.clone(),
+            message.content.clone(),
             ModelHandle::new("fixture-provider", "model"),
         )]);
         opts.target_model = Some(ModelHandle::new("fixture-provider", "model"));
@@ -338,11 +294,11 @@ fn legacy_frozen_configs_keep_pre_state_decode_and_render_bytes() {
 
 /// A Responses step whose reasoning item carries summary text: the live stream shows that text
 /// on the display lane, but that changes neither what is stored nor what is sent back.
-/// The step is decoded by the real normalizer, framed into the WAL, replayed, and rendered; the
+/// The step is decoded by the real normalizer and rendered after the person's message; the
 /// stored block must be the provider's raw item and the rebuilt request must echo it unchanged,
 /// for both the stateless (`store: false`) and the legacy continuation shapes.
 #[test]
-fn responses_reasoning_summary_request_bytes_survive_wal_replay() {
+fn responses_reasoning_summary_request_bytes_are_sent_back() {
     const ITEM: &str = r#"{"id":"rs_summary","type":"reasoning","summary":[{"type":"summary_text","text":"**Planning** I will check the inputs."},{"type":"summary_text","text":"**Answering** The inputs are fine."}],"encrypted_content":"synthetic-cipher"}"#;
     let model = ModelHandle::new("fixture-provider", "model");
     for stateless in [true, false] {
@@ -367,38 +323,21 @@ fn responses_reasoning_summary_request_bytes_survive_wal_replay() {
         ];
         assert_eq!(message.content, stored, "the step stores only the raw item");
 
-        let records: Vec<WalRecord> = vec![
-            serde_json::from_value(json!({
-                "type":"run_started", "run_id":"summary", "session":{"project_root":"/tmp/provider-state","harness":"test","session":"summary"},
-                "config":{"model":model,"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":frozen.renderer_version,"frozen_render_config":frozen},
-                "input":[{"role":"user","content":[{"type":"text","text":"check"}]}],"origin":{"kind":"fresh"}
-            }))
-            .unwrap(),
-            serde_json::from_value(json!({
-                "type":"model_step_finished","step_id":1,"assistant_message":message,"usage":{},"retries_used":0
-            }))
-            .unwrap(),
+        let mut prompt = vec![
+            broca_protocol::content::Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "check".into(),
+                }],
+            ),
+            broca_protocol::content::Message::assistant_from(
+                message.content.clone(),
+                model.clone(),
+            ),
         ];
-        let restored: Vec<_> = records
-            .iter()
-            .enumerate()
-            .map(|(index, record)| {
-                let bytes = encode(index as u64 + 1, 1, record).unwrap();
-                let DecodeStep::Record { framed, .. } = decode_next(&bytes) else {
-                    panic!("framed WAL record")
-                };
-                framed.record
-            })
-            .collect();
-        let state = broca_core::replay(&restored).unwrap();
-        let assistant = state
-            .prompt
-            .iter()
-            .find(|message| message.role == Role::Assistant)
-            .unwrap();
-        assert_eq!(assistant.content, stored, "replay keeps the stored item");
+        broca_protocol::content::stamp_ordinals(&mut prompt);
 
-        let mut opts = CallOptions::new(state.prompt);
+        let mut opts = CallOptions::new(prompt);
         opts.target_model = Some(model.clone());
         opts.step_context = Some(broca_protocol::StepContext {
             session_address: None,

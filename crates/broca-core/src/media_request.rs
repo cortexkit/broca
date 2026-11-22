@@ -11,11 +11,10 @@ use broca_protocol::{
     media_event::{MediaEvent, MediaMessage},
     ContentBlock, MediaRef, Message, StepId, ToolCallId, ToolOutput, ToolOutputPart,
 };
-use broca_records::record::WalRecord;
 use serde::{Deserialize, Serialize};
 
 use crate::media_store::{MediaBytes, MediaReadError};
-use crate::placement::{AppendKind, Placement, PlacementAction};
+use crate::placement::Placement;
 use compact::{MessageCopy, RefId, References};
 
 mod compact;
@@ -240,147 +239,6 @@ pub struct SessionMedia {
 }
 
 impl SessionMedia {
-    fn index_replacements(&mut self) {
-        use crate::compaction_provider::view::ViewRange;
-        if self.restored_selection.is_some() {
-            return;
-        }
-        self.replacements.clear();
-        if let Some(applied) = &self.compaction.view {
-            for range in &applied.view.ranges {
-                if let ViewRange::Replace { from, to, bytes } = range {
-                    if let Ok(messages) = serde_json::from_str::<Vec<Message>>(bytes) {
-                        for message in messages {
-                            let refs: Vec<_> = crate::compaction::media_refs(&message.content)
-                                .cloned()
-                                .collect();
-                            if !refs.is_empty() {
-                                self.replacements.push((refs, *from, *to));
-                            }
-                        }
-                    }
-                }
-            }
-        } else if let Some(applied) = &self.compaction.applied {
-            for message in applied.replacement.iter() {
-                let refs: Vec<_> = crate::compaction::media_refs(&message.content)
-                    .cloned()
-                    .collect();
-                if !refs.is_empty() {
-                    self.replacements
-                        .push((refs, applied.range.from, applied.range.to));
-                }
-            }
-        }
-    }
-
-    /// The engine is fed a record. An engine fed only events until now gives its compaction
-    /// state every reference it captured, which is what that state would hold had the
-    /// events added them as they came.
-    fn feed_records(&mut self) {
-        if self.feed == Feed::Events {
-            for reference in self.refs.iter() {
-                self.compaction.captured.insert(reference);
-            }
-        }
-        self.feed = Feed::Records;
-    }
-
-    /// Fold in durable WAL order, including records with no media. The positional placement
-    /// kernel is shared with replay so held steers cannot acquire a premature ordinal.
-    pub fn fold(&mut self, record: &WalRecord) -> Result<(), String> {
-        self.feed_records();
-        let tool_ordinal = self.placement.held_tool_result_ordinal();
-        let actions = self.placement.observe(record)?;
-        self.compaction.fold(record);
-        self.records += 1;
-        match record {
-            WalRecord::RunStarted { input, .. } => {
-                self.start_run();
-                let first = actions
-                    .iter()
-                    .find_map(|action| match action {
-                        PlacementAction::Append {
-                            first,
-                            kind: AppendKind::Input,
-                            ..
-                        } => Some(*first),
-                        _ => None,
-                    })
-                    .expect("RunStarted places input");
-                for (i, message) in input.iter().enumerate() {
-                    let ids = self.capture_message(message, i, Some(first + i as u64), true);
-                    self.pending.extend(ids);
-                }
-            }
-            WalRecord::Steered { input, .. }
-            | WalRecord::SendDelivered {
-                input: Some(input), ..
-            } => {
-                for (i, message) in input.iter().enumerate() {
-                    let ids = self.capture_message(message, i, None, true);
-                    self.pending.extend(ids.iter().copied());
-                    self.steers.push(ids);
-                }
-            }
-            // Queue media become prompt occurrences only at the consuming RunStarted.
-            WalRecord::ToolBatchStarted { planned_calls, .. } => {
-                self.order_batch(planned_calls.iter().cloned());
-            }
-            WalRecord::ToolResult { result, .. } | WalRecord::LateResult { result, .. } => {
-                if let ToolOutput::Parts { parts } = &result.output {
-                    let shown = matches!(record, WalRecord::ToolResult { .. });
-                    self.capture_tool_result(
-                        &result.tool_call_id,
-                        tool_ordinal,
-                        shown,
-                        || {
-                            let mut result = (**result).clone();
-                            if let ToolOutput::Parts { parts } = &mut result.output {
-                                for part in parts {
-                                    if let ToolOutputPart::Text { text } = part {
-                                        *text = Default::default();
-                                    }
-                                }
-                            }
-                            result
-                        },
-                        parts
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(part, value)| match value {
-                                ToolOutputPart::Media { media } => Some((part, media)),
-                                ToolOutputPart::Text { .. } => None,
-                            }),
-                    );
-                }
-            }
-            _ => {}
-        }
-        for action in actions {
-            if let PlacementAction::PlaceHeld { first, .. } = action {
-                self.place_held(first);
-            }
-        }
-        if let WalRecord::StepStarted { step_id } = record {
-            self.start_step(*step_id);
-        }
-        if matches!(
-            record,
-            WalRecord::CompactionMessage { .. } | WalRecord::CompactionViewApplied { .. }
-        ) {
-            if matches!(record, WalRecord::CompactionViewApplied { .. }) || !self.restored_view {
-                self.restored_selection = None;
-                self.restored_covered = None;
-                self.restored_view = false;
-            }
-            self.index_replacements();
-            self.changes
-                .push(MediaChange::View(self.selected_bindings()));
-        }
-        Ok(())
-    }
-
     pub fn new(store: impl MediaBytes + 'static) -> Self {
         Self::metadata(Some(std::sync::Arc::new(store)))
     }

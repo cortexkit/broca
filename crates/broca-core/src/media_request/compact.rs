@@ -24,6 +24,7 @@ pub(crate) struct References {
 
 impl References {
     /// Every reference, in the order first captured.
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &MediaRef> {
         self.refs.iter()
     }

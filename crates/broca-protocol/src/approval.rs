@@ -32,5 +32,3 @@ pub enum ApprovalResponse {
         reason: String,
     },
 }
-
-impl ApprovalResponse {}

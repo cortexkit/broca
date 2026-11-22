@@ -23,7 +23,6 @@
 //! writes nothing and renders exactly as before.
 
 use broca_protocol::{ModelHandle, StepId};
-use broca_records::record::WalRecord;
 
 /// The smallest output cap the loop lowers a request to when the request did not ask for less.
 /// Below this a reasoning model typically spends the whole reservation thinking and returns a
@@ -77,37 +76,6 @@ pub struct OutputReservationHistory {
 }
 
 impl OutputReservationHistory {
-    pub fn fold(&mut self, record: &WalRecord) {
-        match record {
-            WalRecord::RunStarted { config, .. } => self.start_run(&config.model),
-            WalRecord::ModelAttemptFinished {
-                request_body_len, ..
-            } => self.note_attempt(*request_body_len),
-            WalRecord::ModelStepFinished {
-                usage, fallback, ..
-            } => {
-                let model = fallback
-                    .route
-                    .as_ref()
-                    .map(|route| &route.model)
-                    .or(self.current_model.as_ref())
-                    .cloned();
-                self.note_served_step(
-                    *usage,
-                    model.as_ref(),
-                    fallback.served_model.as_deref(),
-                    fallback.usage_iterations.as_deref(),
-                );
-            }
-            WalRecord::OutputReservationClamped {
-                step_id,
-                max_output_tokens,
-                ..
-            } => self.note_recorded(*step_id, *max_output_tokens),
-            _ => {}
-        }
-    }
-
     /// A run's `RunStarted`: the run loop calls this for the record it writes itself.
     pub fn start_run(&mut self, model: &ModelHandle) {
         self.current_model = Some(model.clone());
@@ -119,35 +87,6 @@ impl OutputReservationHistory {
     /// A `ModelAttemptFinished` record with this rendered body length.
     pub fn note_attempt(&mut self, request_body_len: u64) {
         self.attempt_bytes = Some(request_body_len);
-    }
-
-    /// Use the last serving iteration's prompt occupancy, never the sum of prompts
-    /// sent to different tokenizers. Bind the measurement to that iteration's model.
-    pub fn note_served_step(
-        &mut self,
-        usage: broca_protocol::Usage,
-        requested: Option<&ModelHandle>,
-        served_model: Option<&str>,
-        iterations: Option<&[broca_protocol::usage::UsageIteration]>,
-    ) {
-        let measured = requested.and_then(|requested| {
-            broca_protocol::usage::model_usage(
-                served_model.unwrap_or(&requested.model_id),
-                usage,
-                iterations,
-            )
-            .last()
-            .map(|(model, usage)| {
-                (
-                    *usage,
-                    ModelHandle::new(&requested.provider_module_id, *model),
-                )
-            })
-        });
-        match measured {
-            Some((usage, model)) => self.note_step(usage, Some(&model)),
-            None => self.note_step(broca_protocol::Usage::default(), None),
-        }
     }
 
     /// A `ModelStepFinished` record with usage measured on `model`, or `None` when the
@@ -181,76 +120,5 @@ impl OutputReservationHistory {
     }
 }
 
-/// The cap recorded for `step_id` among `records`, searching back from the end to the current
-/// run's `RunStarted` (step ids restart with each run). A rebuild of a step's request from the
-/// WAL passes the records up to the attempt it reproduces.
-pub fn recorded_cap(records: &[WalRecord], step_id: StepId) -> Option<u32> {
-    for record in records.iter().rev() {
-        match record {
-            WalRecord::OutputReservationClamped {
-                step_id: recorded,
-                max_output_tokens,
-                ..
-            } if *recorded == step_id => return Some(*max_output_tokens),
-            WalRecord::RunStarted { .. } => return None,
-            _ => {}
-        }
-    }
-    None
-}
-
 /// The `provider_code` of [`output_reservation_overflow`].
 pub const OUTPUT_RESERVATION_OVERFLOW_CODE: &str = "output_reservation_exceeds_context";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn records(json: &[serde_json::Value]) -> Vec<WalRecord> {
-        json.iter()
-            .map(|value| serde_json::from_value(value.clone()).unwrap())
-            .collect()
-    }
-
-    fn run_started(model: &str) -> serde_json::Value {
-        serde_json::json!({"type":"run_started","run_id":"r","session":{"project_root":"/p","harness":"h","session":"s"},"config":{"model":{"provider_module_id":"p","model_id":model},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":1},"input":[],"origin":{"kind":"fresh"}})
-    }
-
-    fn attempt(step: u64, len: u64) -> serde_json::Value {
-        serde_json::json!({"type":"model_attempt_finished","step_id":step,"attempt":0,"request_body_len":len,"request_body_sha256":"aa","response_body_len":0,"response_body_sha256":"bb","outcome":"complete","ts_ms":1})
-    }
-
-    fn step(step: u64, input: Option<u64>) -> serde_json::Value {
-        let usage = match input {
-            Some(input) => serde_json::json!({"input_tokens": input, "output_tokens": 5}),
-            None => serde_json::json!({}),
-        };
-        serde_json::json!({"type":"model_step_finished","step_id":step,"assistant_message":{"message_id":"m","content":[]},"usage":usage,"retries_used":0})
-    }
-
-    #[test]
-    fn a_recorded_cap_applies_to_its_own_step_of_its_own_run() {
-        let clamp = serde_json::json!({"type":"output_reservation_clamped","step_id":2,"max_output_tokens":9000,"estimated_input_tokens":1,"context_limit":2});
-        let wal = records(&[run_started("m"), clamp.clone()]);
-        let mut history = OutputReservationHistory::default();
-        for record in &wal {
-            history.fold(record);
-        }
-        assert_eq!(history.recorded_for(StepId(2)), Some(9_000));
-        assert_eq!(history.recorded_for(StepId(3)), None);
-        assert_eq!(recorded_cap(&wal, StepId(2)), Some(9_000));
-        // Once the step finishes, or another run starts, the cap no longer applies.
-        let finished = records(&[attempt(2, 1), step(2, Some(1))]);
-        let mut done = history.clone();
-        for record in &finished {
-            done.fold(record);
-        }
-        assert_eq!(done.recorded_for(StepId(2)), None);
-        let next_run = records(&[run_started("m")]);
-        history.fold(&next_run[0]);
-        assert_eq!(history.recorded_for(StepId(2)), None);
-        let mut later = wal.clone();
-        later.extend(next_run);
-        assert_eq!(recorded_cap(&later, StepId(2)), None);
-    }
-}

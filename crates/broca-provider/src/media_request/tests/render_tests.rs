@@ -26,7 +26,7 @@ fn native_requests_measure_complete_bytes_and_fail_closed_at_the_cap() {
         },
     );
     let prompt = vec![person];
-    let session = fixture.session(&[start(&prompt), step(1)]);
+    let session = fixture.session(History::default().start(&prompt).step(1));
     for (id, family) in families() {
         let mut frozen = frozen_config_for_family(id, "model");
         let mut profile = profile();
@@ -87,8 +87,12 @@ fn tagged_text_image_text_stays_numbered_once_across_retry_and_replay() {
         &mut 6,
     )
     .unwrap();
-    let records = [start(&[]), step(1), tool_record(&tool), step(2)];
-    let prompt = vec![tool];
+    let records = || {
+        let mut history = History::default();
+        history.start(&[]).step(1).tool(&tool).step(2);
+        history
+    };
+    let prompt = vec![tool.clone()];
     for (id, family) in families() {
         let mut frozen = frozen_config_for_family(id, "model");
         let profile = select_media_profile(
@@ -111,7 +115,7 @@ fn tagged_text_image_text_stays_numbered_once_across_retry_and_replay() {
             prompt
         };
         let run = || {
-            let session = fixture.session(&records);
+            let session = fixture.session(&mut records());
             let (mut bundle, _) = planned(&session, &profile, &prompt, &mut MediaAging::default());
             let opts = CallOptions::new(prompt.clone());
             let first =
@@ -166,7 +170,13 @@ fn image_only_tag_label_does_not_detach_the_prepared_payload() {
     )
     .unwrap();
     let prompt = vec![tool];
-    let session = fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+    let session = fixture.session(
+        History::default()
+            .start(&[])
+            .step(1)
+            .tool(&prompt[0])
+            .step(2),
+    );
     for (id, family) in families() {
         let mut frozen = frozen_config_for_family(id, "model");
         let profile = select_media_profile(
@@ -253,7 +263,13 @@ async fn failed_image_capture_keeps_the_numbered_label_before_its_failure_line()
     .unwrap();
     assert_eq!(tool.part_tags().unwrap().parts, vec![Some(7)]);
     let prompt = vec![tool];
-    let session = fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+    let session = fixture.session(
+        History::default()
+            .start(&[])
+            .step(1)
+            .tool(&prompt[0])
+            .step(2),
+    );
     for id in [
         WireFamilyId::AnthropicMessages,
         WireFamilyId::OpenAiResponses,
@@ -320,7 +336,13 @@ fn prepared_image_text_numbers_original_text_not_media_marker() {
     )
     .unwrap();
     let prompt = vec![tool];
-    let session = fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+    let session = fixture.session(
+        History::default()
+            .start(&[])
+            .step(1)
+            .tool(&prompt[0])
+            .step(2),
+    );
     let id = WireFamilyId::OpenAiChat;
     let mut frozen = frozen_config_for_family(id, "model");
     let profile = select_media_profile(
@@ -421,8 +443,13 @@ fn prepared_tool_tag_table_preserves_text_targets_and_image_labels_on_every_fami
                 )
                 .unwrap();
                 let prompt = vec![tool];
-                let session =
-                    fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+                let session = fixture.session(
+                    History::default()
+                        .start(&[])
+                        .step(1)
+                        .tool(&prompt[0])
+                        .step(2),
+                );
                 let mut frozen = frozen_config_for_family(id, "gemini-3.0-flash");
                 if id == WireFamilyId::GoogleCodeAssist {
                     frozen.project_id = Some("tag-fixture".into());
@@ -535,7 +562,13 @@ fn media_free_marker_looking_text_keeps_legacy_render_bytes() {
     )
     .unwrap();
     let prompt = vec![tool];
-    let session = fixture.session(&[start(&[]), step(1), tool_record(&prompt[0]), step(2)]);
+    let session = fixture.session(
+        History::default()
+            .start(&[])
+            .step(1)
+            .tool(&prompt[0])
+            .step(2),
+    );
     let frozen = frozen_config_for_family(WireFamilyId::OpenAiChat, "model");
     let mut opts = CallOptions::new(prompt.clone());
     let tags = |prompt: &[Message]| {
@@ -591,7 +624,7 @@ fn native_media_provenance_uses_the_same_bytes_and_durable_source_for_every_fami
         })
         .collect();
     history.push(person.clone());
-    let session = fixture.session(&[start(&history), step(1)]);
+    let session = fixture.session(History::default().start(&history).step(1));
     let prompt = vec![person];
     for id in [
         WireFamilyId::AnthropicMessages,
@@ -645,7 +678,6 @@ fn frozen_profiles_leave_text_only_request_bytes_unchanged_in_every_family() {
     use broca_protocol::{
         CallOptions, ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult,
     };
-    let fixture = Fixture::new();
     let mut opts = CallOptions::new(vec![
         Message::new(
             Role::User,
@@ -718,13 +750,7 @@ fn frozen_profiles_leave_text_only_request_bytes_unchanged_in_every_family() {
             InputModalities::from_value(&json!(["text", "image", "pdf", "audio", "video"])),
             Some(128000),
         ));
-        let live = crate::media_request::LiveMedia::new(
-            fixture.store.clone(),
-            Box::new(|_| panic!("text-only rendering must not read WAL or media captures")),
-        );
-        let actual = live
-            .render(&serde_json::to_value(with).unwrap(), &opts, false, true)
-            .unwrap();
+        let actual = family.render(&with, &opts);
         assert_eq!(
             actual, expected,
             "{id:?}: profile metadata changed text-only request bytes"

@@ -11,9 +11,8 @@
 
 use broca_core::media_request::SessionMedia;
 use broca_protocol::media_event::{MediaEvent, MediaLimits};
-use broca_protocol::{CallOptions, ProviderError};
+use broca_protocol::{CallOptions, ErrorClass, ProviderError};
 
-use super::live::refusal;
 use super::{prepare, AgingEvent, MediaAging};
 use crate::{media_profile::MediaProfile, wire::FrozenRenderConfig};
 
@@ -50,17 +49,6 @@ impl MediaIndex {
             profile,
             step_open,
         }
-    }
-
-    /// What the index holds, estimated as `broca_core::media_request::held` estimates the
-    /// engine: its inline size, the engine and the aging state. The heap of the media limits in
-    /// force is left to the caller, which can walk a profile's serialized form.
-    pub fn held_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            - std::mem::size_of::<SessionMedia>()
-            - std::mem::size_of::<MediaAging>()
-            + self.session.held_bytes()
-            + self.aging.held_bytes()
     }
 
     pub fn session(&self) -> &SessionMedia {
@@ -200,4 +188,27 @@ fn tagged(
         broca_protocol::tags::clean_computed_into(&mut prompt);
     }
     prompt
+}
+
+/// A permanent refusal with `code` as its provider code: what a request whose media can't be
+/// rendered gets.
+fn refusal(code: &str, message: String) -> Box<ProviderError> {
+    Box::new(ProviderError {
+        class: ErrorClass::Permanent,
+        message,
+        provider_code: Some(code.into()),
+        provider_details: None,
+        cause: None,
+        provider_subcode: None,
+        refusal: None,
+        status: None,
+        retry_after_secs: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+        account_continue: None,
+    })
 }

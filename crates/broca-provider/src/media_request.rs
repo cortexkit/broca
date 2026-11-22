@@ -19,9 +19,7 @@ use broca_protocol::{
 use crate::media_profile::{MediaCarrier, MediaProfile};
 
 mod index;
-mod live;
 pub use index::{media_profile, render_without_index, MediaIndex};
-pub use live::LiveMedia;
 
 /// An occurrence in the assembled prompt. Replacement messages can repeat a captured reference;
 /// each repetition counts against the budget even though the object is read from one digest.
@@ -86,44 +84,6 @@ pub struct MediaAging {
 }
 
 impl MediaAging {
-    /// Rebuild from durable records, without hydrating historical requests or writing an
-    /// aging record. Compaction changes re-select reference metadata; unchanged steps fold
-    /// only their new media. The caller supplies the current episode's frozen profile, not
-    /// the current catalog. A changed recorded profile reselects metadata under its new costs;
-    /// another episode with the same profile keeps the aging prefix.
-    pub fn replay_wal(
-        profile: &MediaProfile,
-        session: &mut SessionMedia,
-        records: &[broca_records::record::WalRecord],
-    ) -> Result<Self, String> {
-        let mut state = Self::default();
-        let mut step_open = false;
-        let mut active = profile.clone();
-        for record in records {
-            state.fold_wal_record(&mut active, session, record)?;
-            match record {
-                broca_records::record::WalRecord::RunStarted { .. } => step_open = false,
-                broca_records::record::WalRecord::StepStarted { .. } => step_open = true,
-                broca_records::record::WalRecord::ModelStepFinished { .. } => step_open = false,
-                _ => {}
-            }
-        }
-        if step_open {
-            state.apply(&active, AgingEvent::Boundary);
-        }
-        Ok(state)
-    }
-
-    /// What the aging state holds: its inline size and [`MediaAging::held_parts`].
-    pub fn held_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self
-                .held_parts()
-                .iter()
-                .map(|(_, bytes)| bytes)
-                .sum::<usize>()
-    }
-
     /// The heap the aging state holds, by part, estimated as the engine's own state is (see
     /// `broca_core::media_request::held`): the occurrences shown with their costs, the
     /// unprotected and aged ones.
@@ -229,52 +189,6 @@ impl MediaAging {
         }
     }
 
-    /// The incremental equivalent of replay, used by a live session after each durable tail.
-    pub fn fold_wal_record(
-        &mut self,
-        active: &mut MediaProfile,
-        session: &mut SessionMedia,
-        record: &broca_records::record::WalRecord,
-    ) -> Result<(), String> {
-        session.fold(record)?;
-        let frozen = match record {
-            broca_records::record::WalRecord::RunStarted { config, .. } => {
-                Some(&config.frozen_render_config)
-            }
-            broca_records::record::WalRecord::RunConfigRefrozen {
-                frozen_render_config,
-                ..
-            } => Some(frozen_render_config),
-            _ => None,
-        };
-        let next: Option<MediaProfile> = frozen
-            .and_then(|frozen| frozen.get("media"))
-            .filter(|value| !value.is_null())
-            .map(|value| {
-                serde_json::from_value(value.clone())
-                    .map_err(|error| format!("invalid frozen media profile: {error}"))
-            })
-            .transpose()?;
-        if let Some(next) = next.filter(|next| next != active) {
-            *active = next;
-            *self = Self::default();
-            self.reconcile_view(active, &session.selected_bindings());
-            session.take_changes();
-        } else {
-            self.fold_changes(active, session.take_changes());
-        }
-        match record {
-            broca_records::record::WalRecord::ModelAttemptFinished { .. } => {
-                self.apply(active, AgingEvent::Boundary)
-            }
-            broca_records::record::WalRecord::ModelStepFinished { .. } => {
-                self.apply(active, AgingEvent::Boundary);
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
     /// [`Self::fold_wal_record`] for a content-free event instead of an old record: the
     /// session applies the event, new media limits restart aging under the new costs, the
     /// session's changes are folded, and the end of an attempt or a step is an aging boundary.
@@ -332,14 +246,6 @@ impl MediaAging {
             self.remove(id);
         }
         self.aged.retain(|id| !gone(id.capture));
-    }
-
-    pub fn replay(profile: &MediaProfile, events: impl IntoIterator<Item = AgingEvent>) -> Self {
-        let mut state = Self::default();
-        for event in events {
-            state.apply(profile, event);
-        }
-        state
     }
 
     pub fn apply(&mut self, profile: &MediaProfile, event: AgingEvent) {
@@ -415,6 +321,13 @@ impl MediaAging {
         self.shown.range(first..=last).map(|(id, _)| *id)
     }
 
+    pub fn totals(&self) -> MediaCost {
+        MediaCost {
+            bytes: self.bytes,
+            tokens: self.tokens,
+        }
+    }
+
     pub fn is_aged(&self, id: Occurrence) -> bool {
         self.aged.contains(&id)
     }
@@ -470,13 +383,6 @@ impl MediaAging {
         aging.bytes = bytes;
         aging.tokens = tokens;
         Ok(aging)
-    }
-
-    pub fn totals(&self) -> MediaCost {
-        MediaCost {
-            bytes: self.bytes,
-            tokens: self.tokens,
-        }
     }
 }
 

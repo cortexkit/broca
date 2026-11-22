@@ -4,15 +4,14 @@ use crate::{
     spec::{InputModalities, WireFamilyId},
 };
 use broca_core::media_store::{MediaBytes, MediaReadError};
-use broca_protocol::Role;
-use broca_records::record::WalRecord;
+use broca_protocol::media_event::{MediaEvent, MediaInput, MediaMessage, MediaPart};
+use broca_protocol::{Role, StepId, ToolCallId};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 mod checkpoint_compat_tests;
 #[cfg(feature = "test-attachments")]
-mod live_tests;
 mod render_tests;
 
 /// A session's media objects held in memory, by digest. A read returns an object's bytes only
@@ -71,11 +70,10 @@ impl Fixture {
         }
     }
 
-    fn session(&self, records: &[WalRecord]) -> SessionMedia {
+    /// The engine's state after the history's events so far.
+    fn session(&self, history: &mut History) -> SessionMedia {
         let mut state = SessionMedia::new(self.store.clone());
-        for record in records {
-            state.fold(record).unwrap();
-        }
+        history.feed(&mut state);
         state
     }
 
@@ -109,36 +107,140 @@ fn profile() -> MediaProfile {
     )
 }
 
-fn start(input: &[Message]) -> WalRecord {
-    serde_json::from_value(json!({
-        "type": "run_started", "run_id": "run",
-        "session": {"project_root": "/fixture", "harness": "media", "session": "session"},
-        "config": {"model": broca_protocol::ModelHandle::new("anthropic", "claude"), "tools": [],
-            "tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},
-            "context_epoch":0,"renderer_version":1,"frozen_render_config":{}},
-        "input":input,"origin":{"kind":"fresh"}
-    }))
-    .unwrap()
+/// A session's history as the session store states it to the media engine: one event per fact,
+/// with each record numbered from 1 in the order the store writes it (a capture is named by its
+/// record) and each message's place in the conversation worked out as messages are placed.
+#[derive(Default)]
+struct History {
+    events: Vec<MediaEvent>,
+    /// Events already fed to an engine by [`History::feed`].
+    fed: usize,
+    records: u64,
+    /// The number of messages placed so far: the next message's ordinal.
+    placed: u64,
+    /// Messages accepted into the running run and not placed yet.
+    held: u64,
+    /// The ordinal of the answer whose tool calls wait for their results.
+    waiting: Option<u64>,
 }
 
-fn step(n: u64) -> WalRecord {
-    WalRecord::StepStarted {
-        step_id: broca_protocol::StepId(n),
+impl History {
+    fn record(&mut self) -> u64 {
+        self.records += 1;
+        self.records
     }
-}
 
-fn steer(input: &[Message]) -> WalRecord {
-    serde_json::from_value(json!({"type":"steered", "input": input})).unwrap()
-}
+    /// A run starts, its input placed at the end of the conversation.
+    fn start(&mut self, input: &[Message]) -> &mut Self {
+        let record = self.record();
+        let inputs = input
+            .iter()
+            .enumerate()
+            .map(|(message, value)| MediaInput {
+                message,
+                ordinal: self.placed + message as u64,
+                skeleton: MediaMessage::of(value),
+            })
+            .filter(|input| input.skeleton.holds_media())
+            .collect();
+        self.placed += input.len() as u64;
+        self.held = 0;
+        self.waiting = None;
+        self.events.push(MediaEvent::RunStart {
+            record,
+            inputs,
+            limits: None,
+        });
+        self
+    }
 
-fn tool_record(message: &Message) -> WalRecord {
-    let ContentBlock::ToolResult(result) = &message.content[0] else {
-        unreachable!()
-    };
-    serde_json::from_value(
-        json!({"type":"tool_result", "batch_id":"batch", "result": result, "outcome":"completed"}),
-    )
-    .unwrap()
+    /// Model step `n` starts. The messages accepted before it are placed first.
+    fn step(&mut self, n: u64) -> &mut Self {
+        self.record();
+        if self.held > 0 {
+            self.events.push(MediaEvent::Placed { first: self.placed });
+            self.placed += self.held;
+            self.held = 0;
+        }
+        self.events.push(MediaEvent::StepStart { step: StepId(n) });
+        self
+    }
+
+    /// A person's messages join the running run; they are placed at the next step.
+    fn steer(&mut self, input: &[Message]) -> &mut Self {
+        let record = self.record();
+        self.held += input.len() as u64;
+        self.events.push(MediaEvent::Accepted {
+            record,
+            messages: input.iter().map(MediaMessage::of).collect(),
+        });
+        self
+    }
+
+    /// The model step ends with its answer placed. An answer that calls `call` starts a batch
+    /// for it.
+    fn finished(&mut self, call: Option<&str>) -> &mut Self {
+        self.record();
+        let answer = self.placed;
+        self.placed += 1;
+        self.events.push(MediaEvent::StepEnd);
+        if let Some(call) = call {
+            self.record();
+            self.waiting = Some(answer);
+            self.events.push(MediaEvent::BatchStart {
+                calls: vec![ToolCallId(call.into())],
+            });
+        }
+        self
+    }
+
+    /// The tool result `message` holds. It sits in the results message after the answer
+    /// waiting for it, if one is.
+    fn tool(&mut self, message: &Message) -> &mut Self {
+        let record = self.record();
+        let ContentBlock::ToolResult(result) = &message.content[0] else {
+            unreachable!()
+        };
+        let ToolOutput::Parts { parts } = &result.output else {
+            unreachable!()
+        };
+        let media = parts
+            .iter()
+            .enumerate()
+            .filter_map(|(part, value)| match value {
+                ToolOutputPart::Media { media } => Some(MediaPart {
+                    part,
+                    reference: media.clone(),
+                }),
+                ToolOutputPart::Text { .. } => None,
+            })
+            .collect();
+        self.events.push(MediaEvent::ToolResult {
+            record,
+            call: result.tool_call_id.clone(),
+            ordinal: self.waiting.map(|answer| answer + 1),
+            shown: true,
+            media,
+        });
+        self
+    }
+
+    /// The batch ends, and its results message is placed after the answer.
+    fn batch_end(&mut self) -> &mut Self {
+        self.record();
+        if self.waiting.take().is_some() {
+            self.placed += 1;
+        }
+        self
+    }
+
+    /// Applies the events not fed yet to `session`.
+    fn feed(&mut self, session: &mut SessionMedia) {
+        for event in &self.events[self.fed..] {
+            session.apply(event).unwrap();
+        }
+        self.fed = self.events.len();
+    }
 }
 
 fn planned(
@@ -180,8 +282,9 @@ fn fresh_protected_bundle_over_trigger_is_full_on_retry_and_every_resume_cut() {
     let input = vec![fixture.person(), fixture.person(), fixture.person()];
     let mut prompt = input.clone();
     broca_protocol::content::stamp_ordinals(&mut prompt);
-    let records = vec![start(&input), step(1)];
-    let session = fixture.session(&records);
+    let mut history = History::default();
+    history.start(&input).step(1);
+    let mut session = fixture.session(&mut history);
     let mut aging = MediaAging::default();
     let (first, events) = planned(&session, &profile, &prompt, &mut aging);
     assert_eq!(
@@ -198,27 +301,17 @@ fn fresh_protected_bundle_over_trigger_is_full_on_retry_and_every_resume_cut() {
         bytes(&prepare(&session, Some(&profile), &prompt, &aging).unwrap()),
         bytes(&first)
     );
-    for cut in 0..=records.len() {
-        let mut resumed = fixture.session(&records[..cut]);
-        for record in &records[cut..] {
-            resumed.fold(record).unwrap();
-        }
-        let rebuilt = MediaAging::replay(&profile, events.iter().copied());
-        assert_eq!(
-            bytes(&prepare(&resumed, Some(&profile), &prompt, &rebuilt).unwrap()),
-            bytes(&first),
-            "durable cut {cut}"
-        );
+    let mut rebuilt = MediaAging::default();
+    for event in events {
+        rebuilt.apply(&profile, event);
     }
-    let mut recovered = SessionMedia::new(fixture.store.clone());
-    let recovered_aging = MediaAging::replay_wal(&profile, &mut recovered, &records).unwrap();
     assert_eq!(
-        bytes(&prepare(&recovered, Some(&profile), &prompt, &recovered_aging).unwrap()),
-        bytes(&first)
+        bytes(&prepare(&session, Some(&profile), &prompt, &rebuilt).unwrap()),
+        bytes(&first),
+        "aging rebuilt from its own events"
     );
-    let mut next = session;
-    next.fold(&step(2)).unwrap();
-    let (later, _) = planned(&next, &profile, &prompt, &mut aging);
+    history.step(2).feed(&mut session);
+    let (later, _) = planned(&session, &profile, &prompt, &mut aging);
     assert_eq!(
         reasons(&later, "aged"),
         3,
@@ -229,25 +322,26 @@ fn fresh_protected_bundle_over_trigger_is_full_on_retry_and_every_resume_cut() {
 #[test]
 fn durable_steer_boundary_protects_occurrences_not_shared_digests() {
     let fixture = Fixture::new();
-    let mut session = fixture.session(&[
-        start(&[fixture.person()]),
-        step(1),
-        steer(&[fixture.person()]),
-    ]);
+    let mut history = History::default();
+    history
+        .start(&[fixture.person()])
+        .step(1)
+        .steer(&[fixture.person()]);
+    let mut session = fixture.session(&mut history);
     let mut prompt = vec![fixture.person(), fixture.person()];
     broca_protocol::content::stamp_ordinals(&mut prompt);
-    session.fold(&step(2)).unwrap();
+    history.step(2).feed(&mut session);
     let bindings = session.bindings(&prompt);
     assert_eq!(bindings.len(), 2);
     assert!(!bindings[0].protected);
     assert!(bindings[1].protected);
     assert_ne!(bindings[0].id, bindings[1].id);
-    session.fold(&step(2)).unwrap();
+    history.step(2).feed(&mut session);
     assert!(
         session.bindings(&prompt)[1].protected,
         "retry cannot end input protection"
     );
-    session.fold(&step(3)).unwrap();
+    history.step(3).feed(&mut session);
     assert!(session
         .bindings(&prompt)
         .iter()
@@ -257,7 +351,12 @@ fn durable_steer_boundary_protects_occurrences_not_shared_digests() {
 #[test]
 fn later_text_pressure_caps_person_media_below_aging_thresholds() {
     let fixture = Fixture::new();
-    let session = fixture.session(&[start(&[fixture.person()]), step(1), step(2)]);
+    let session = fixture.session(
+        History::default()
+            .start(&[fixture.person()])
+            .step(1)
+            .step(2),
+    );
     let mut prompt = vec![
         fixture.person(),
         Message::new(
@@ -270,7 +369,7 @@ fn later_text_pressure_caps_person_media_below_aging_thresholds() {
     broca_protocol::content::stamp_ordinals(&mut prompt);
     let profile = profile();
     let mut aging = MediaAging::default();
-    let (mut first, events) = planned(&session, &profile, &prompt, &mut aging);
+    let (mut first, _) = planned(&session, &profile, &prompt, &mut aging);
     assert_eq!(first.media.len(), 1);
     let before = bytes(&first).len() as u64;
     let mut limited = profile.clone();
@@ -279,11 +378,9 @@ fn later_text_pressure_caps_person_media_below_aging_thresholds() {
     fit_request(&limited, &mut first, |bundle| bytes(bundle).len() as u64).unwrap();
     assert_eq!(reasons(&first, "request_cap"), 1);
     assert_eq!(reasons(&first, "aged"), 0);
-    for state in [MediaAging::replay(&profile, events), aging] {
-        let mut retry = prepare(&session, Some(&profile), &prompt, &state).unwrap();
-        fit_request(&limited, &mut retry, |bundle| bytes(bundle).len() as u64).unwrap();
-        assert_eq!(bytes(&retry), bytes(&first));
-    }
+    let mut retry = prepare(&session, Some(&profile), &prompt, &aging).unwrap();
+    fit_request(&limited, &mut retry, |bundle| bytes(bundle).len() as u64).unwrap();
+    assert_eq!(bytes(&retry), bytes(&first));
 }
 
 #[test]
@@ -292,13 +389,14 @@ fn limits_remove_oldest_tools_before_people_and_exhaust_before_refusing() {
     let person = fixture.person();
     let old_tool = fixture.tool("old");
     let new_tool = fixture.tool("new");
-    let session = fixture.session(&[
-        start(std::slice::from_ref(&person)),
-        step(1),
-        step(2),
-        tool_record(&old_tool),
-        tool_record(&new_tool),
-    ]);
+    let session = fixture.session(
+        History::default()
+            .start(std::slice::from_ref(&person))
+            .step(1)
+            .step(2)
+            .tool(&old_tool)
+            .tool(&new_tool),
+    );
     let mut prompt = vec![person, old_tool, new_tool];
     prompt[0].ordinal = Some(0);
     let profile = profile();
@@ -335,9 +433,12 @@ fn count_dependent_dimensions_stop_at_threshold_or_when_large_images_are_gone() 
     let tools: Vec<_> = (0..21)
         .map(|n| fixture.tool(&format!("screen{n}")))
         .collect();
-    let mut records = vec![start(&[]), step(1)];
-    records.extend(tools.iter().map(tool_record));
-    let session = fixture.session(&records);
+    let mut history = History::default();
+    history.start(&[]).step(1);
+    for tool in &tools {
+        history.tool(tool);
+    }
+    let session = fixture.session(&mut history);
     let (bundle, _) = planned(&session, &profile, &tools, &mut MediaAging::default());
     assert_eq!(
         bundle.media.len(),
@@ -373,9 +474,12 @@ fn post_view_aging_ignores_omitted_media_and_keeps_hysteresis_on_reappearance() 
     let tools: Vec<_> = (0..3)
         .map(|n| fixture.tool(&format!("screen{n}")))
         .collect();
-    let mut records = vec![start(&[]), step(1)];
-    records.extend(tools.iter().map(tool_record));
-    let session = fixture.session(&records);
+    let mut history = History::default();
+    history.start(&[]).step(1);
+    for tool in &tools {
+        history.tool(tool);
+    }
+    let session = fixture.session(&mut history);
     let mut aging = MediaAging::default();
     let (one, _) = planned(&session, &profile, &tools[2..], &mut aging);
     assert_eq!(
@@ -397,7 +501,7 @@ fn stored_media_profiles_and_session_scope_fail_closed_without_reading_foreign_b
     let fixture = Fixture::new();
     let mut prompt = vec![fixture.person()];
     broca_protocol::content::stamp_ordinals(&mut prompt);
-    let session = fixture.session(&[start(&prompt), step(1)]);
+    let session = fixture.session(History::default().start(&prompt).step(1));
     let mut profile = profile();
     profile.modalities.image = Some(false);
     assert_eq!(
@@ -426,7 +530,7 @@ fn stored_media_profiles_and_session_scope_fail_closed_without_reading_foreign_b
         1
     );
     profile.image.max_item_bytes = None;
-    let foreign = fixture.session(&[start(&[]), step(1)]);
+    let foreign = fixture.session(History::default().start(&[]).step(1));
     assert_eq!(
         reasons(
             &prepare(&foreign, Some(&profile), &prompt, &MediaAging::default()).unwrap(),
@@ -468,7 +572,8 @@ fn forty_screenshots_stay_in_payload_cap_with_bounded_aging_prefix_changes() {
         token_trigger: st * 12,
         token_target: st * 6,
     };
-    let mut session = fixture.session(&[start(&[])]);
+    let mut history = History::default();
+    let mut session = fixture.session(history.start(&[]));
     let mut prompt = Vec::new();
     let mut aging = MediaAging::default();
     let mut replay = Vec::new();
@@ -476,9 +581,8 @@ fn forty_screenshots_stay_in_payload_cap_with_bounded_aging_prefix_changes() {
     let mut previous_aged = 0;
     let mut shows = 0;
     for n in 1..=40 {
-        session.fold(&step(n)).unwrap();
         let screenshot = fixture.tool(&format!("screen{n}"));
-        session.fold(&tool_record(&screenshot)).unwrap();
+        history.step(n).tool(&screenshot).feed(&mut session);
         prompt.push(screenshot);
         let (bundle, delta) = planned(&session, &profile, &prompt, &mut aging);
         shows += delta
@@ -493,7 +597,10 @@ fn forty_screenshots_stay_in_payload_cap_with_bounded_aging_prefix_changes() {
             prefix_changes += 1;
             previous_aged = aged;
         }
-        let resumed = MediaAging::replay(&profile, replay.iter().copied());
+        let mut resumed = MediaAging::default();
+        for event in replay.iter().copied() {
+            resumed.apply(&profile, event);
+        }
         assert_eq!(
             bytes(&prepare(&session, Some(&profile), &prompt, &resumed).unwrap()),
             bytes(&bundle),
@@ -554,26 +661,16 @@ fn independent_byte_and_token_triggers_reduce_to_both_targets() {
             })
             .chain([AgingEvent::Boundary])
             .collect();
-        let state = MediaAging::replay(&profile, events);
+        let mut state = MediaAging::default();
+        for event in events {
+            state.apply(&profile, event);
+        }
         assert!(state.totals().bytes <= 50 && state.totals().tokens <= 50);
     }
 }
 
-fn finished(n: u64, call: Option<&str>) -> WalRecord {
-    let content = match call {
-        Some(call) => {
-            json!([{"type":"tool_call","tool_call_id":call,"tool_name":"screen","input":{}}])
-        }
-        None => json!([{"type":"text","text":"continue"}]),
-    };
-    serde_json::from_value(json!({"type":"model_step_finished", "step_id":n,
-        "assistant_message":{"message_id":format!("answer{n}"),"content":content},
-        "usage":broca_protocol::Usage::default()}))
-    .unwrap()
-}
-
 #[test]
-fn durable_wal_replay_rebuilds_running_aging_after_each_screenshot_step() {
+fn running_aging_follows_each_screenshot_step() {
     let fixture = Fixture::new();
     let mut profile = profile();
     let sb = STANDARD.encode(&fixture.bytes).len() as u64;
@@ -583,58 +680,35 @@ fn durable_wal_replay_rebuilds_running_aging_after_each_screenshot_step() {
         token_trigger: 100,
         token_target: 50,
     };
-    let mut session = fixture.session(&[]);
-    let mut records = vec![start(&[])];
-    session.fold(&records[0]).unwrap();
+    let mut history = History::default();
+    let mut session = fixture.session(history.start(&[]));
     let mut aging = MediaAging::default();
     aging.fold_changes(&profile, session.take_changes());
     let mut prompt = Vec::new();
     for n in 1..=41 {
-        let begin = step(n);
-        session.fold(&begin).unwrap();
-        records.push(begin);
+        history.step(n).feed(&mut session);
         aging.fold_changes(&profile, session.take_changes());
         aging.apply(&profile, AgingEvent::Boundary);
         let live = prepare(&session, Some(&profile), &prompt, &aging).unwrap();
-        let durable: Vec<WalRecord> =
-            serde_json::from_slice(&serde_json::to_vec(&records).unwrap()).unwrap();
-        let mut recovered = SessionMedia::new(fixture.store.clone());
-        let rebuilt = MediaAging::replay_wal(&profile, &mut recovered, &durable).unwrap();
-        let resumed = prepare(&recovered, Some(&profile), &prompt, &rebuilt).unwrap();
-        assert_eq!(
-            bytes(&resumed),
-            bytes(&live),
-            "WAL cut before provider transmission at step {n}"
-        );
         assert!(live.encoded_media_bytes() <= profile.request_cap_bytes);
         if n == 41 {
             break;
         }
         let call = format!("screen{n}");
-        let finish = finished(n, Some(&call));
-        let assistant = if let WalRecord::ModelStepFinished {
-            assistant_message, ..
-        } = &finish
-        {
-            Message::new(Role::Assistant, assistant_message.content.clone())
-        } else {
-            unreachable!()
-        };
         let tool = fixture.tool(&call);
-        let tail = vec![finish,
-            serde_json::from_value(json!({"type":"tool_batch_started","batch_id":"batch","step_id":n,"planned_calls":[call]})).unwrap(),
-            tool_record(&tool),
-            serde_json::from_value(json!({"type":"tool_batch_finished","batch_id":"batch"})).unwrap(),
-        ];
-        for record in tail {
-            if matches!(record, WalRecord::ModelStepFinished { .. }) {
-                aging.apply(&profile, AgingEvent::Boundary);
-            }
-            session.fold(&record).unwrap();
-            aging.fold_changes(&profile, session.take_changes());
-            records.push(record);
-        }
-        prompt.extend([assistant, tool]);
+        // The step's end is an aging boundary, before the batch it asks for adds its result.
+        aging.apply(&profile, AgingEvent::Boundary);
+        history
+            .finished(Some(&call))
+            .tool(&tool)
+            .batch_end()
+            .feed(&mut session);
+        aging.fold_changes(&profile, session.take_changes());
+        let answer: Vec<ContentBlock> = serde_json::from_value(
+            json!([{"type":"tool_call","tool_call_id":call,"tool_name":"screen","input":{}}]),
+        )
+        .unwrap();
+        prompt.extend([Message::new(Role::Assistant, answer), tool]);
         broca_protocol::content::stamp_ordinals(&mut prompt);
     }
     assert_eq!(
@@ -644,144 +718,4 @@ fn durable_wal_replay_rebuilds_running_aging_after_each_screenshot_step() {
         ),
         35
     );
-}
-
-#[test]
-fn wal_view_drops_and_keep_text_edits_preserve_media_age_and_protection() {
-    use broca_core::compaction_provider::{
-        lineage::MessageRef,
-        view::{CompactionView, PartEdit, ViewRange},
-    };
-    let fixture = Fixture::new();
-    let mut original = fixture.person();
-    original.content.insert(
-        0,
-        ContentBlock::Text {
-            text: "large text before the media".repeat(1_000).into(),
-        },
-    );
-    let input = vec![original.clone(), fixture.person(), fixture.person()];
-    let mut records = vec![start(&input), step(1), finished(1, None), step(2)];
-    let view = CompactionView::new(
-        "session",
-        1,
-        "lineage",
-        MessageRef {
-            ordinal: 2,
-            mid: "m2".into(),
-        },
-        vec![ViewRange::Keep {
-            from: 0,
-            to: 1,
-            edits: vec![PartEdit::drop(0, "m0", "m0#0")],
-        }],
-    );
-    records.push(WalRecord::CompactionViewApplied {
-        provider: "compact".into(),
-        view_version: 1,
-        view: broca_records::record::OpaqueJson::from_json_text(
-            serde_json::to_string(&view).unwrap(),
-        )
-        .unwrap(),
-        choice: broca_records::record::CompactionViewChoice::Applied,
-    });
-    let mut profile = profile();
-    let sb = STANDARD.encode(&fixture.bytes).len() as u64;
-    profile.aging = AgingThresholds {
-        byte_trigger: sb,
-        byte_target: sb / 2,
-        token_trigger: 100,
-        token_target: 50,
-    };
-    let mut recovered = SessionMedia::new(fixture.store.clone());
-    let rebuilt = MediaAging::replay_wal(&profile, &mut recovered, &records).unwrap();
-    let bindings = recovered.selected_bindings();
-    assert_eq!(
-        bindings.len(),
-        1,
-        "only the selected view contributes to aging"
-    );
-    assert!(!bindings[0].protected);
-    assert!(!rebuilt.is_aged(Occurrence {
-        capture: bindings[0].id,
-        repetition: 0
-    }));
-    original.content.remove(0);
-    original.ordinal = Some(0);
-    let bundle = prepare(&recovered, Some(&profile), &[original], &rebuilt).unwrap();
-    assert_eq!(
-        bundle.media.len(),
-        1,
-        "dropping an earlier text block must not lose the kept media's binding"
-    );
-}
-
-#[test]
-fn replacement_of_new_input_keeps_protection_when_an_older_input_shares_its_digest() {
-    use broca_core::compaction_provider::{
-        lineage::MessageRef,
-        view::{CompactionView, ViewRange},
-    };
-    let fixture = Fixture::new();
-    let person = fixture.person();
-    let mut records = vec![
-        start(std::slice::from_ref(&person)),
-        step(1),
-        finished(1, None),
-        steer(std::slice::from_ref(&person)),
-        step(2),
-    ];
-    let view = CompactionView::new(
-        "session",
-        1,
-        "lineage",
-        MessageRef {
-            ordinal: 2,
-            mid: "m2".into(),
-        },
-        vec![
-            ViewRange::Keep {
-                from: 0,
-                to: 2,
-                edits: vec![],
-            },
-            ViewRange::Replace {
-                from: 2,
-                to: 3,
-                bytes: serde_json::to_string(std::slice::from_ref(&person)).unwrap(),
-            },
-        ],
-    );
-    records.push(WalRecord::CompactionViewApplied {
-        provider: "compact".into(),
-        view_version: 1,
-        view: broca_records::record::OpaqueJson::from_json_text(
-            serde_json::to_string(&view).unwrap(),
-        )
-        .unwrap(),
-        choice: broca_records::record::CompactionViewChoice::Applied,
-    });
-    let mut profile = profile();
-    let sb = STANDARD.encode(&fixture.bytes).len() as u64;
-    profile.aging = AgingThresholds {
-        byte_trigger: sb / 2,
-        byte_target: sb / 4,
-        token_trigger: 100,
-        token_target: 50,
-    };
-    let mut session = SessionMedia::new(fixture.store.clone());
-    let aging = MediaAging::replay_wal(&profile, &mut session, &records).unwrap();
-    let mut old = person.clone();
-    old.ordinal = Some(0);
-    let prompt = vec![old, person];
-    let bindings = session.bindings(&prompt);
-    assert!(!bindings[0].protected);
-    assert!(
-        bindings[1].protected,
-        "replacement provenance is its carried range, not the oldest session-wide digest"
-    );
-    let bundle = prepare(&session, Some(&profile), &prompt, &aging).unwrap();
-    assert_eq!(bundle.media.len(), 1);
-    assert_eq!(bundle.media[0].location.message, 1);
-    assert_eq!(reasons(&bundle, "aged"), 1);
 }

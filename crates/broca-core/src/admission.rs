@@ -680,8 +680,6 @@ pub struct EffortHistoryV1 {
     pub changed: bool,
 }
 
-impl EffortHistoryV1 {}
-
 /// Version-one admission projection at an exact WAL sequence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdmissionCheckpointV1 {
@@ -810,10 +808,6 @@ impl AdmissionCheckpointV1 {
         }
     }
 }
-
-impl AdmissionCheckpointV1 {}
-
-impl AdmissionCheckpointV1 {}
 
 impl Default for AdmissionCheckpointV1 {
     fn default() -> Self {

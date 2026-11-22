@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use broca_protocol::{ContentBlock, MediaMarkerReason, MediaRef, Message};
-use broca_records::record::WalRecord;
 use serde::{Deserialize, Serialize};
 
 /// Exact, metadata-only captures, indexed by digest. Repeated uses of a capture take one entry.
@@ -22,29 +21,6 @@ impl CapturedMedia {
             })
     }
 
-    /// Detect capture-bearing records before allocating an index. Most records, including
-    /// every record in a media-free session, need no capture collection at all.
-    pub(crate) fn captures_any(record: &WalRecord) -> bool {
-        match record {
-            WalRecord::RunStarted { input, .. } | WalRecord::Steered { input, .. } => input
-                .iter()
-                .any(|message| super::media_refs(&message.content).next().is_some()),
-            WalRecord::Queued { request, .. } => request
-                .input
-                .iter()
-                .any(|message| super::media_refs(&message.content).next().is_some()),
-            WalRecord::ToolResult { result, .. } | WalRecord::LateResult { result, .. } => {
-                matches!(&result.output, broca_protocol::ToolOutput::Parts { parts }
-                    if parts.iter().any(|part| matches!(part, broca_protocol::ToolOutputPart::Media { .. })))
-            }
-            _ => false,
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     pub(crate) fn contains(&self, reference: &MediaRef) -> bool {
         self.0
             .get(&reference.sha256)
@@ -61,35 +37,6 @@ impl CapturedMedia {
                 references.reserve_exact(1);
             }
             references.push(reference.clone());
-        }
-    }
-
-    pub(crate) fn fold(&mut self, record: &WalRecord) {
-        match record {
-            WalRecord::RunStarted { input, .. } | WalRecord::Steered { input, .. } => {
-                self.messages(input);
-            }
-            WalRecord::Queued { request, .. } => self.messages(&request.input),
-            WalRecord::ToolResult { result, .. } | WalRecord::LateResult { result, .. } => {
-                if let broca_protocol::ToolOutput::Parts { parts } = &result.output {
-                    for part in parts {
-                        if let broca_protocol::ToolOutputPart::Media { media } = part {
-                            self.insert(media);
-                        }
-                    }
-                }
-            }
-            // Provider-written replacements, views and model output cannot capture objects.
-            _ => {}
-        }
-    }
-
-    fn messages(&mut self, messages: &[Message]) {
-        for reference in messages
-            .iter()
-            .flat_map(|message| super::media_refs(&message.content))
-        {
-            self.insert(reference);
         }
     }
 

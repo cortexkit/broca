@@ -3,7 +3,6 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use broca_core::tool_plane::ApprovalExecution;
 use broca_protocol::{BindIdentity, SessionScope};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -46,12 +45,6 @@ pub struct ConsentRecord {
     pub state: ConsentState,
     #[serde(flatten)]
     pub fields: BTreeMap<String, Value>,
-}
-
-impl ConsentRecord {
-    pub fn is_terminal(&self) -> bool {
-        self.state != ConsentState::Pending
-    }
 }
 
 #[derive(Debug)]
@@ -180,10 +173,6 @@ impl ConsentClient {
         Ok(Self::on_route(conn, route, REPLY_TIMEOUT))
     }
 
-    pub async fn close(&self) -> Result<(), ConsentError> {
-        self.conn.route_close(&self.route).await.map_err(Into::into)
-    }
-
     pub async fn request(&self, params: &Value) -> Result<FilingReply, ConsentError> {
         self.call("consent.request", params, self.reply_timeout)
             .await
@@ -214,16 +203,6 @@ impl ConsentClient {
         Ok(page)
     }
 
-    pub async fn get(&self, id: &str) -> Result<ConsentRecord, ConsentError> {
-        self.record(
-            "consent.get",
-            &json!({"elicitation_id": id}),
-            id,
-            self.reply_timeout,
-        )
-        .await
-    }
-
     pub async fn r#await(&self, id: &str, wait_ms: u64) -> Result<ConsentRecord, ConsentError> {
         let wait_ms = wait_ms.min(120_000);
         self.record(
@@ -231,30 +210,6 @@ impl ConsentClient {
             &json!({"elicitation_id": id, "timeout_ms": wait_ms}),
             id,
             Duration::from_millis(wait_ms) + self.reply_timeout,
-        )
-        .await
-    }
-
-    pub async fn detach(&self, id: &str) -> Result<ConsentRecord, ConsentError> {
-        self.record("consent.detach", &json!({"id": id}), id, self.reply_timeout)
-            .await
-    }
-
-    pub async fn report_execution(
-        &self,
-        id: &str,
-        execution: ApprovalExecution,
-    ) -> Result<ConsentRecord, ConsentError> {
-        let execution = match execution {
-            ApprovalExecution::Executed => "executed",
-            ApprovalExecution::ApprovedNotExecuted => "approved_not_executed",
-            ApprovalExecution::OutcomeUnknown => "outcome_unknown",
-        };
-        self.record(
-            "consent.report_execution",
-            &json!({"elicitation_id": id, "execution": execution}),
-            id,
-            self.reply_timeout,
         )
         .await
     }
@@ -418,43 +373,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consent_detach_and_non_success_reports_use_contract_fields() {
-        let (client, mut module) = client();
-        // The vendored Cingulate corpus lacks detach and non-success report vectors.
-        // These fields follow consent-late-answer-v1's detach and
-        // consent-requester-v1's report_execution sections instead.
-        let (record, ()) = tokio::join!(client.detach("el_1"), async {
-            let request = module.next_request().await;
-            assert_eq!(
-                request.body,
-                br#"{"method":"consent.detach","params":{"id":"el_1"}}"#
-            );
-            assert!(module.reply(
-                &request,
-                bytes("upstream/consent-requester-v2/cerebellum-get-reply.json")
-            ));
-        });
-        assert!(!record.unwrap().is_terminal());
-        for (execution, value) in [
-            (
-                ApprovalExecution::ApprovedNotExecuted,
-                "approved_not_executed",
-            ),
-            (ApprovalExecution::OutcomeUnknown, "outcome_unknown"),
-        ] {
-            let (record, ()) = tokio::join!(client.report_execution("el_1", execution), async {
-                let request = module.next_request().await;
-                assert_eq!(request.body, format!(r#"{{"method":"consent.report_execution","params":{{"elicitation_id":"el_1","execution":"{value}"}}}}"#).as_bytes());
-                let mut reply =
-                    fixture("upstream/consent-requester-v1/report-execution-reply.json");
-                reply["result"]["execution"] = json!(value);
-                assert!(module.reply(&request, serde_json::to_vec(&reply).unwrap()));
-            });
-            assert_eq!(record.unwrap().fields["execution"], value);
-        }
-    }
-
-    #[tokio::test]
     async fn consent_numeric_feed_keeps_continuation_and_refusals() {
         let (client, mut module) = client();
         let (page, ()) = tokio::join!(client.answers(7), async {
@@ -484,30 +402,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consent_get_await_answers_preserve_upstream_bodies() {
+    async fn consent_await_answers_preserve_upstream_bodies() {
         for prefix in ["cerebellum", "cerebellum-ref"] {
             let (client, mut module) = client();
             let root = format!("upstream/consent-requester-v2/{prefix}");
-            let request = format!("{root}-get-request.json");
-            let reply = format!("{root}-get-reply.json");
-            let (record, ()) =
-                tokio::join!(client.get("el_1"), respond(&mut module, &request, &reply));
-            let record = record.unwrap();
-            assert_eq!(
-                serde_json::to_vec(&json!({"result":record})).unwrap(),
-                wire(&reply)
-            );
             let request = format!("{root}-await-request.json");
             let reply = format!("{root}-await-reply.json");
             let (record, ()) = tokio::join!(
                 client.r#await("el_1", 0),
                 respond(&mut module, &request, &reply)
             );
+            // The reply is the pending card unchanged: a timeout grants nothing.
             let record = record.unwrap();
-            assert!(
-                !record.is_terminal(),
-                "a timeout on a pending card grants nothing"
-            );
             assert_eq!(
                 serde_json::to_vec(&json!({"result":record})).unwrap(),
                 wire(&reply)
@@ -524,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consent_withdraw_and_execution_match_upstream_bodies() {
+    async fn consent_withdraw_matches_upstream_bodies() {
         let (client, mut module) = client();
         let (reply, ()) = tokio::join!(
             client.withdraw("el_2"),
@@ -540,18 +446,6 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&json!({"result":record})).unwrap(),
             wire("upstream/consent-requester-v1/withdraw-reply.json")
-        );
-        let (reply, ()) = tokio::join!(
-            client.report_execution("el_1", ApprovalExecution::Executed),
-            respond(
-                &mut module,
-                "upstream/consent-requester-v1/report-execution-request.json",
-                "upstream/consent-requester-v1/report-execution-reply.json"
-            )
-        );
-        assert_eq!(
-            serde_json::to_vec(&json!({"result":reply.unwrap()})).unwrap(),
-            wire("upstream/consent-requester-v1/report-execution-reply.json")
         );
     }
 

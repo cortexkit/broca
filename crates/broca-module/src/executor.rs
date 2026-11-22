@@ -493,5 +493,3 @@ pub enum WarmError {
     /// A dependency, such as the credential source, failed before anything was sent.
     Unavailable(String),
 }
-
-impl WarmError {}

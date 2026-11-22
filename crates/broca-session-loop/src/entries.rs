@@ -1083,8 +1083,7 @@ impl CallEvent {
 }
 
 /// The facts of the tool turn whose assistant message, at `ordinal`, made the calls in
-/// `assistant`, from what its calls recorded (`events`), using `broca_core::display_facts` and
-/// `broca_core::call_identity`:
+/// `assistant`, from what its calls recorded (`events`), using `broca_core::display_facts`:
 ///
 /// - Each copy of a call id has its own identity: an intent takes the first copy not yet sent or
 ///   closed, a refusal the first without a key, and a result the first not yet closed. A copy

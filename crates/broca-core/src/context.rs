@@ -473,7 +473,6 @@ fn recover_run_config(framed: &[FramedRecord]) -> Option<crate::RunConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay::replay;
 
     use broca_records::{
         record::AuthSelection, record::DispatchOutcome, record::RunConfig, record::WalRecord,
@@ -648,25 +647,6 @@ mod tests {
                 retries_used: 0,
             },
         ]
-    }
-
-    /// Non-vacuousness: a full replay stamps EVERY message with a durable ordinal — 0, 1, 2…
-    /// in lineage order — not `None`. (The merge-equality tests prove the fast path stamps
-    /// IDENTICALLY, but both could be `None`-but-equal without this.)
-    #[test]
-    fn replay_stamps_sequential_ordinals() {
-        let wal = sample_wal();
-        let prompt = replay(&wal).expect("replay").prompt;
-        assert!(!prompt.is_empty(), "the sample lineage produces messages");
-        for (i, m) in prompt.iter().enumerate() {
-            assert_eq!(
-                m.ordinal,
-                Some(i as u64),
-                "message {i} must carry ordinal {i}"
-            );
-            // The opaque mid is the `m<ordinal>` form, `#`-free.
-            assert_eq!(m.mid().as_deref(), Some(format!("m{i}").as_str()));
-        }
     }
 
     fn framed(records: &[WalRecord]) -> Vec<FramedRecord> {

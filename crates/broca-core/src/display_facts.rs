@@ -24,5 +24,3 @@ pub struct DisplayFacts {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub native_tool_outputs: BTreeMap<u32, broca_protocol::ToolOutput>,
 }
-
-impl DisplayFacts {}

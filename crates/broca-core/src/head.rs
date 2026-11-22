@@ -70,8 +70,6 @@ impl Default for HeadProjection {
     }
 }
 
-impl HeadProjection {}
-
 /// The plan's senders as `session.head` reads them: each sender's grants without its templates,
 /// which only admission reads.
 pub fn head_senders(

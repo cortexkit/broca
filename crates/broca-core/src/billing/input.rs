@@ -78,13 +78,3 @@ pub enum BillingEvent {
         trigger: Option<String>,
     },
 }
-
-impl BillingEvent {
-    /// The run this record starts, if it is a start.
-    pub fn started_run(&self) -> Option<&RunId> {
-        match self {
-            BillingEvent::RunStarted { run_id, .. } => Some(run_id),
-            _ => None,
-        }
-    }
-}
