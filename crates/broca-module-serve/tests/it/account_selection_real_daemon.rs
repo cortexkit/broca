@@ -2136,6 +2136,12 @@ fn selection(frames: &[FramedRecord]) -> Value {
     serde_json::to_value(started).unwrap()
 }
 
+/// The reference a run's frozen account decision carries for the account and credential routing
+/// admitted it on, and its step events report.
+fn routed_ref(account_id: &str, credential_id: &str) -> String {
+    cortexkit_role_llm_runner::step_events::account_ref(account_id, credential_id)
+}
+
 fn session_affinity(frames: &[FramedRecord]) -> String {
     let session = frames
         .iter()
@@ -2257,7 +2263,7 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
     let mut chosen = selection(&frames);
     assert_eq!(
         chosen["account_decision"],
-        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e" })
+        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e", "routed_ref": routed_ref("acct-a", "oauth:anthropic") })
     );
     chosen.as_object_mut().unwrap().remove("account_decision");
     assert_eq!(
@@ -2324,7 +2330,7 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
     assert_eq!(chosen["credential_id"], "oauth:anthropic:acct-b");
     assert_eq!(
         chosen["account_decision"],
-        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e" })
+        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e", "routed_ref": routed_ref("acct-b", "oauth:anthropic:acct-b") })
     );
     assert_eq!(
         rig.vault.scoped_reads().last().map(String::as_str),
@@ -2365,7 +2371,7 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
     assert_eq!(chosen["credential_id"], "oauth:anthropic:spare");
     assert_eq!(
         chosen["account_decision"],
-        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e" })
+        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e", "routed_ref": routed_ref("acct-s", "oauth:anthropic:spare") })
     );
     let offered: Vec<Value> = rig.routing.requests.lock().unwrap()[pinned_mark..]
         .iter()
@@ -2631,7 +2637,7 @@ async fn routing_decides_reports_and_never_blocks_admission_through_the_real_dae
     assert_eq!(chosen["credential_id"], "oauth:anthropic:spare");
     assert_eq!(
         chosen["account_decision"],
-        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e" })
+        json!({ "conversation_key": session_affinity(&frames), "conversation_key_source": "session", "path": "routed", "admission_id": run_id, "decision_id": "acd-e2e", "routed_ref": routed_ref("acct-s", "oauth:anthropic:spare") })
     );
     let asked: Vec<Value> = rig
         .routing
