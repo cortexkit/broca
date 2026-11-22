@@ -412,7 +412,10 @@ pub struct Session<B: SessionBackend> {
     log: Id128,
     poisoned: bool,
     pub conversation: Conversation,
-    pub operations: Operations,
+    /// Boxed: this state (what the session's ledger records add up to: its runs, tool calls and
+    /// queued sends) is most of a session's size, and a session is moved by value through every
+    /// open and load, so holding it inline made each of those moves copy it.
+    pub operations: Box<Operations>,
     /// The ids the open log's ledger records name, so `find_id` finds ids not sealed yet (see
     /// [`OpenIds`]).
     open_ids: OpenIds,
@@ -647,7 +650,7 @@ impl<B: SessionBackend> Session<B> {
             log,
             poisoned: false,
             conversation,
-            operations,
+            operations: Box::new(operations),
             open_ids: OpenIds::new(idindex::hash_key(key)),
             window: OpenLogIndex::default(),
             imported: Default::default(),
@@ -870,7 +873,7 @@ impl<B: SessionBackend> Session<B> {
             log: open.change,
             poisoned: false,
             conversation,
-            operations,
+            operations: Box::new(operations),
             open_ids,
             window,
             imported: Default::default(),

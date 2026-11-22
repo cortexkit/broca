@@ -441,7 +441,7 @@ impl<B: SessionBackend> Session<B> {
         let mut at_cut = at_cut;
         at_cut.enrolled(self.operations.enrolled_through());
         // The commit settles the intent, so state carried past it has no open change.
-        let mut settled = self.operations.clone();
+        let mut settled = Operations::clone(&self.operations);
         settled.open_change = None;
         // The media index current through the intent, saved with the new checkpoint; an index the
         // checkpoint no longer names is deleted with the rest of what the change replaced.
@@ -773,7 +773,7 @@ impl<B: SessionBackend> Session<B> {
         self.log = change;
         self.encoder = created.encoder;
         self.conversation = created.conversation;
-        self.operations = created.operations;
+        *self.operations = created.operations;
         // Every ledger record the old log held is sealed, and its ids are in the index now;
         // facts of messages that left the window are found through the directory.
         self.open_ids = created.open_ids;

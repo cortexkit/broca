@@ -596,7 +596,7 @@ impl<B: SessionBackend> Session<B> {
             log: open.change,
             poisoned: false,
             conversation: checkpoint.conversation.clone(),
-            operations: settled.clone(),
+            operations: Box::new(settled.clone()),
             open_ids: OpenIds::new(idindex::hash_key(&key)),
             window: OpenLogIndex::from_checkpoint(activity_ms, intent_seq + 1),
             imported: Default::default(),

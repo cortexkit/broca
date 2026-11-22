@@ -49,7 +49,7 @@ fn a_runs_copies_of_the_window_share_its_text() {
     // The fold a session and a run each run over the same records.
     let fold = || {
         let mut conversation: Conversation = base.clone();
-        let mut operations: Operations = base_operations.clone();
+        let mut operations: Operations = Operations::clone(&base_operations);
         for (seq, record) in &records {
             if record.stream() == Stream::Transcript {
                 broca_session_store::session::apply(

@@ -983,7 +983,7 @@ async fn run_case(case: Case) -> Ran {
         asked: routing.asked.into_inner().unwrap(),
         adopted: routing.adopted.into_inner().unwrap(),
         segments,
-        operations: session.operations.clone(),
+        operations: Operations::clone(&session.operations),
     }
 }
 

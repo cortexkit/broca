@@ -371,7 +371,7 @@ impl<B: SessionBackend> Session<B> {
             .cloned()
             .collect();
         ledger.push((reverted_seq, reverted.clone()));
-        let mut settled = self.operations.clone();
+        let mut settled = crate::fold::operations::Operations::clone(&self.operations);
         settled.open_change = None;
         // The undo's cut, folded into the media fold the new log starts from. It names no saved
         // index: the engine's state after the cut isn't the store's to compute.
