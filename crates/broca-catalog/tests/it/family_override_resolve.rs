@@ -7,10 +7,10 @@
 //!
 //! No network: it inspects the resolved provider's RENDERED bytes (the boxed provider exposes
 //! `render_request`), so it needs no live credential — a dummy token suffices.
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 use crate::common;
 
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 mod gated {
 
     use super::common;

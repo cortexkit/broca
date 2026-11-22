@@ -81,7 +81,7 @@ impl CredentialHosts {
     /// encrypted (`https` or `wss`) unless it goes to the local machine: a listed host reached
     /// over plain `http` would send the credential and the prompt in the clear.
     pub fn check_url(&self, url: &str) -> Result<(), Box<ProviderError>> {
-        let parsed = reqwest::Url::parse(url).ok();
+        let parsed = url::Url::parse(url).ok();
         let host = parsed
             .as_ref()
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase));

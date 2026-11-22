@@ -26,7 +26,6 @@
 //!     rates renamed to fireworks' mode name `priority`, so a priced tier meets a provider with
 //!     no broca mapping.
 
-#[cfg(feature = "live")]
 mod gated {
     use std::sync::{Arc, Once};
 

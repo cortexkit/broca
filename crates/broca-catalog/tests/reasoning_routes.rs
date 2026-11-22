@@ -1,5 +1,5 @@
 //! A separate binary because live resolution installs a process-global catalog fixture.
-#![cfg(all(feature = "bundled-catalog", feature = "live"))]
+#![cfg(feature = "bundled-catalog")]
 
 use std::sync::{Arc, Once};
 

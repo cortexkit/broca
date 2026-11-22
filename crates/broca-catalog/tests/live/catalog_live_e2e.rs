@@ -11,10 +11,10 @@
 //! OpenAiChat purely from `base_url` (config, not code). Each target requires
 //! `BROCA_LIVE_TESTS=1` and a vault dev-tools handle. Missing consent or credentials
 //! skips cleanly; secrets are never echoed.
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 use crate::common;
 
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 mod gated {
 
     use super::common;

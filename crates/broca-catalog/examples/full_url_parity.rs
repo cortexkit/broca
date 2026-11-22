@@ -1,14 +1,8 @@
 //! Compare complete renderer URLs against the immutable pre-migration route oracle.
-#[cfg(not(feature = "live"))]
-fn main() {
-    panic!("full_url_parity requires --features live");
-}
-#[cfg(feature = "live")]
 fn main() {
     audit::run();
 }
 
-#[cfg(feature = "live")]
 mod audit {
     use broca_catalog::live::{
         AuthMethod, AuthMode, EpisodeRenderConfig, ResolveOptions, WireFamilyId,

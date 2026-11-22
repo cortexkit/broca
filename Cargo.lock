@@ -565,6 +565,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tungstenite",
+ "url",
  "uuid",
  "xxhash-rust",
 ]

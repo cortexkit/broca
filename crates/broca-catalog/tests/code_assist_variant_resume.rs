@@ -4,7 +4,6 @@
 //! This is its own test binary because it replaces the process-global catalog mid-test, which
 //! would race the other suites that share one installed catalog.
 
-#[cfg(feature = "live")]
 mod gated {
     use std::sync::Arc;
 

@@ -20,7 +20,6 @@ printf 'integration selection (fixture families stay in CI/Mac):\n%s\n' "$portab
 features=(
   -F broca-provider/live
   -F broca-provider/test-harness
-  -F broca-catalog/live
   -F broca-module-serve/test-clock
 )
 cargo fmt --all -- --check

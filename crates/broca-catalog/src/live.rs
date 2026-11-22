@@ -2523,7 +2523,7 @@ fn chatgpt_account_id(token: &str) -> Option<String> {
 #[path = "live_gateway_tests.rs"]
 mod gateway_tests;
 
-#[cfg(all(test, feature = "live"))]
+#[cfg(test)]
 mod tests {
     #[test]
     fn temperature_catalog_resolution_and_join_use_current_model_facts() {

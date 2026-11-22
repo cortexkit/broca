@@ -61,7 +61,7 @@ commit, regardless of the sibling checkout's current branch or working tree.
 Run the adjacent unit tests with output to see counts and every one-sided row:
 
 ```sh
-cargo test --locked -p broca-catalog -F broca-catalog/live --lib family::agreement_tests:: -- --nocapture
+cargo test --locked -p broca-catalog --lib family::agreement_tests:: -- --nocapture
 ```
 
 The `live` feature makes the production serving layer's auth-method mapping

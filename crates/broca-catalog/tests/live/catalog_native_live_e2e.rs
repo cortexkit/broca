@@ -11,10 +11,10 @@
 //!
 //! Requires `BROCA_LIVE_TESTS=1` and a vault dev-tools handle for `oauth:anthropic`.
 //! Skips cleanly when either is absent. Secrets are never echoed.
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 use crate::common;
 
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 mod gated {
 
     use super::common;

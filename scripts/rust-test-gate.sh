@@ -44,7 +44,6 @@ fi
 cargo_feature_args=(
   -F broca-provider/live
   -F broca-provider/test-harness
-  -F broca-catalog/live
   -F broca-module-serve/test-clock
   -F broca-module-serve/test-loopback-credentials
 )

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # the workspace: a later `-p` invocation would resolve a different feature graph.
 FEATURES = [
     "-F", "broca-provider/live", "-F", "broca-provider/test-harness",
-    "-F", "broca-catalog/live", "-F", "broca-module-serve/test-clock",
+    "-F", "broca-module-serve/test-clock",
 ]
 FIXED = ["--workspace", "--locked", *FEATURES]
 

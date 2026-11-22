@@ -1,5 +1,4 @@
 //! Unrouted Go rows refuse from the missing fact, without a local model-name hold.
-#![cfg(feature = "live")]
 use broca_catalog::{
     live::{AuthMode, EpisodeRenderConfig, ResolveOptions},
     CatalogCache, FusiformCatalogResponse,

@@ -107,7 +107,7 @@ const NATIVE_FAMILIES: &[(&str, WireFamilyId)] = &[
     ("google", WireFamilyId::Gemini),
 ];
 
-#[cfg(all(test, feature = "live"))]
+#[cfg(test)]
 #[path = "family_agreement_tests.rs"]
 mod agreement_tests;
 

@@ -52,6 +52,7 @@ pub enum ExpiringRefresh<T> {
 pub type ExpiringRefreshFuture<'a, T> =
     Pin<Box<dyn Future<Output = ExpiringRefresh<T>> + Send + 'a>>;
 
+#[cfg(feature = "live")]
 pub(crate) fn needs_reauth_error() -> broca_protocol::ProviderError {
     broca_protocol::ProviderError {
         class: broca_protocol::ErrorClass::Auth,

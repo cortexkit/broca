@@ -1,5 +1,4 @@
 //! Native endpoint facts are authoritative for new runs, not already recorded bundles.
-#![cfg(feature = "live")]
 use broca_catalog::{
     live::{AuthMode, EpisodeRenderConfig, FrozenRenderConfig, ResolveOptions},
     CatalogCache, FusiformCatalogResponse,

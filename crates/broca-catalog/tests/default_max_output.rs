@@ -4,7 +4,6 @@
 //! The catalog is installed from a fusiform `catalog.get` document, so every case also goes
 //! through the shipped decode of `limit.output`: a null there must reach resolution as "unknown"
 //! and select the fallback, never a zero cap.
-#[cfg(feature = "live")]
 mod gated {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Once};

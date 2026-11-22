@@ -1,5 +1,4 @@
 //! Routing is chosen before a new run is recorded; resumes reuse the complete recorded bundle.
-#![cfg(feature = "live")]
 
 use std::sync::Arc;
 

@@ -204,7 +204,7 @@ class QuickcheckGuards(unittest.TestCase):
         self.assertNotIn("quickcheck guards OK", result.stdout)
         self.assertNotIn("quickcheck OK:", result.stdout)
 
-    def test_changed_catalog_runs_feature_gated_integration_targets(self):
+    def test_changed_catalog_runs_its_listed_integration_targets(self):
         result, events = self.run_quickcheck("broca-catalog")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         integration_calls = [call for call in events if call[:1] == ["test"] and "--test" in call]
@@ -213,7 +213,6 @@ class QuickcheckGuards(unittest.TestCase):
             if "reasoning_variants" in call and "-p" in call and call[call.index("-p") + 1] == "broca-catalog"
         )
         self.assertEqual(catalog_call[catalog_call.index("--test") + 1], "reasoning_variants")
-        self.assertIn("broca-catalog/live", catalog_call)
 
 
 if __name__ == "__main__":

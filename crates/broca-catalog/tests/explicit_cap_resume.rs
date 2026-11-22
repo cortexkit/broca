@@ -1,6 +1,5 @@
 //! An admitted episode keeps its output cap when the live catalog changes.
 
-#[cfg(feature = "live")]
 mod gated {
     use std::collections::BTreeMap;
     use std::sync::Arc;

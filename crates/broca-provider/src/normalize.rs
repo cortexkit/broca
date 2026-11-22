@@ -50,6 +50,7 @@ impl ResponseEvidence {
         }
     }
 
+    #[cfg(feature = "live")]
     pub(crate) fn observe_served_model(&mut self, served: &str) {
         if let Some(source) = self.model_used.clone().filter(|source| source != served) {
             self.observe_handoff(&source, served);

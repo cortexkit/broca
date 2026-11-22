@@ -38,6 +38,9 @@ broca-diagnostics = { path = "../broca-diagnostics" }
 # token-streaming hot path. Already in the tree as a runtime transitive dep of
 # serde_json, so this declares what is compiled rather than adding a crate.
 memchr = "2"
+# URL parsing for the credential host check, which runs with or without the live transport.
+# reqwest re-exports the same crate as `reqwest::Url`, so the lockfile gains nothing.
+url = "2"
 broca-protocol = { path = "../broca-protocol" }
 # Shared CK request decode types; feature-free and no transport dependencies.
 broca-ck = { path = "../broca-ck" }

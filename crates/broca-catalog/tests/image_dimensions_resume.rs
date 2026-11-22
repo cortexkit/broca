@@ -1,6 +1,5 @@
 //! Catalog pixel bounds are admission inputs, never resume-time render inputs.
 
-#[cfg(feature = "live")]
 mod gated {
     use std::{collections::BTreeMap, sync::Arc};
 

@@ -126,7 +126,7 @@ clean() {
   [[ -z "$dirty" ]] || { printf '%s\n' "$dirty"; git diff; return 1; }
 }
 
-features=(-F broca-provider/live -F broca-provider/test-harness -F broca-catalog/live -F broca-module-serve/test-clock)
+features=(-F broca-provider/live -F broca-provider/test-harness -F broca-module-serve/test-clock)
 
 # nextest 0.9.138 can omit a full-weight test with mixed groups at 8 threads:
 # the aimock weight-4 test never starts, while every printed test is PASS.

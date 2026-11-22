@@ -654,7 +654,7 @@ with (pathlib.Path(os.environ['FIXTURE'])/'lint-calls').open('a') as output:
             self.assertEqual(command[:4], ['clippy', '--locked', '--workspace', '--all-targets'])
             self.assertEqual(command[-3:], ['--', '-D', 'warnings'])
             for feature in ('broca-provider/live', 'broca-provider/test-harness',
-                            'broca-catalog/live', 'broca-module-serve/test-clock'):
+                            'broca-module-serve/test-clock'):
                 self.assertIn(feature, command)
         self.assertNotIn('--target', calls[1])
         self.assertEqual(calls[2][calls[2].index('--target')+1], 'x86_64-pc-windows-gnu')

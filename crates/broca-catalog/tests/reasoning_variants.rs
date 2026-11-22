@@ -27,7 +27,6 @@
 //! - Native endpoint fields in the synthetic fixtures keep reasoning tests independent of
 //!   SDK endpoint defaults. Live routing decode vectors are tested separately.
 
-#[cfg(feature = "live")]
 mod gated {
     use std::sync::{Arc, Once};
 

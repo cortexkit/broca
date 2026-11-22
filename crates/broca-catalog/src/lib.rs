@@ -18,11 +18,8 @@
 #![forbid(unsafe_code)]
 
 pub mod family;
-#[cfg(feature = "live")]
 pub mod keep_warm;
 /// The catalog → live provider bridge (resolve a model id + auth into a runnable provider).
-/// Behind `live` because it pulls the provider's live transport.
-#[cfg(feature = "live")]
 pub mod live;
 pub mod merge;
 pub mod routing;

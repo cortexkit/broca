@@ -46,7 +46,6 @@ for c in "$@"; do
     broca-provider)
       FEATURES+=("-F" "broca-provider/live" "-F" "broca-provider/test-harness")
       ;;
-    broca-catalog) FEATURES+=("-F" "broca-catalog/live") ;;
     broca-core|broca-module|broca-module-serve) FEATURES+=("-F" "$c/test-clock") ;;
   esac
 done

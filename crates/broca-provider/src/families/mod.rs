@@ -278,6 +278,7 @@ pub fn fresh_admission_config_error(
 }
 
 /// Resolve a new run's sampling setting without changing how recorded runs render.
+#[cfg(feature = "live")]
 pub fn admit_temperature(
     frozen: &FrozenRenderConfig,
     policy: broca_core::provider::TemperaturePolicy,

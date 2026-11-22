@@ -55,7 +55,7 @@ getrandom = "0.3"
 # real model + real tools (replacing the placeholder), so they are the module binary's
 # real-deployment deps, not just the wire adapter's.
 broca-subc = { path = "../broca-subc" }
-broca-catalog = { path = "../broca-catalog", features = ["live"] }
+broca-catalog = { path = "../broca-catalog" }
 broca-store = { path = "../broca-store" }
 cortexkit-bus-naming.workspace = true
 cortexkit-bus-trait.workspace = true

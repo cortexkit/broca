@@ -11,11 +11,11 @@ broca-module-serve|it|state_root_isolation::every_broca_spawn_site_pins_its_stat
 # Ensures only the shared state-root resolver reads the state-root environment variable.
 broca-module-serve|it|state_root_isolation::only_the_shared_resolver_names_the_state_root|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/state_root_isolation.rs|only_the_shared_resolver_names_the_state_root|Checks production environment reads remain behind the shared state-root resolver.
 # Pins the embedded served-payload fixture's wire shape.
-broca-catalog|it|fusiform_wire_fixture::|broca-catalog/live|crates/broca-catalog/tests/it/fusiform_wire_fixture.rs|the_served_shape_carries_the_facts_broca_consumes|Checks local catalog payload fixture data without network access.
+broca-catalog|it|fusiform_wire_fixture::|-|crates/broca-catalog/tests/it/fusiform_wire_fixture.rs|the_served_shape_carries_the_facts_broca_consumes|Checks local catalog payload fixture data without network access.
 # Checks row endpoints and refusal of withheld routing facts.
-broca-catalog|it|base_url_pins::|broca-catalog/live|crates/broca-catalog/tests/it/base_url_pins.rs|served_apis_freeze_to_equivalent_full_request_urls|Checks served full URLs under SDK/renderer conventions and named missing-fact refusals.
+broca-catalog|it|base_url_pins::|-|crates/broca-catalog/tests/it/base_url_pins.rs|served_apis_freeze_to_equivalent_full_request_urls|Checks served full URLs under SDK/renderer conventions and named missing-fact refusals.
 # Checks authored renderer exceptions rather than copied provider inventories.
-broca-catalog|it|wire_family_pins::|broca-catalog/live|crates/broca-catalog/tests/it/wire_family_pins.rs|overlay_cannot_restore_local_model_format_tables|Prevents a local model-format table from reappearing.
+broca-catalog|it|wire_family_pins::|-|crates/broca-catalog/tests/it/wire_family_pins.rs|overlay_cannot_restore_local_model_format_tables|Prevents a local model-format table from reappearing.
 # Checks fixture cases for rig-test filtering without compiling workspace test binaries.
 python|scripts/test-portable-test-selection.py|PortableRigSelectionTests.test_exact_rig_test_exclusion_keeps_guard_test_selected|-|scripts/test-portable-test-selection.py|test_exact_rig_test_exclusion_keeps_guard_test_selected|Exercises the rig-selection filter's fixture-backed selection check; the full inventory remains in the workspace gate.
 # Adapter coverage must match the declared attachments group without starting a native daemon.

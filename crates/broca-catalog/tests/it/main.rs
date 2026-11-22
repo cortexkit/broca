@@ -14,7 +14,7 @@
 //! - `tests/live`: the live suite, which calls real provider APIs; the Rust gate excludes it by
 //!   binary name.
 
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 #[path = "../common/mod.rs"]
 mod common;
 

@@ -8,13 +8,13 @@
 //! binary: every test executable is linked separately and, on macOS, pays a code-signing check on its
 //! first run.
 
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 #[path = "../common/mod.rs"]
 mod common;
 
 mod catalog_live_e2e;
 mod catalog_native_live_e2e;
 
-#[cfg(all(feature = "bundled-catalog", feature = "live"))]
+#[cfg(feature = "bundled-catalog")]
 #[path = "../../../broca-provider/tests/live_common/vault.rs"]
 mod vault;

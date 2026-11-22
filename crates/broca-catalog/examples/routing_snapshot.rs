@@ -2,17 +2,10 @@
 //! The output can be compared with a later catalog build before removing routing data.
 //! This captures the tuple baseline; `full_url_parity` is the blocking URL gate because
 //! equal bases do not prove that two family paths produce the same request URL.
-#[cfg(not(feature = "live"))]
-fn main() {
-    panic!("routing_snapshot requires --features live");
-}
-
-#[cfg(feature = "live")]
 fn main() {
     gated::run();
 }
 
-#[cfg(feature = "live")]
 mod gated {
     use std::{env, fs, sync::Arc};
 

@@ -23,10 +23,12 @@ const GOOGLE_INVALID_ARGUMENT: &str = "INVALID_ARGUMENT";
 // Anthropic's production HTTP 400 text, observed on 11 November 2026. A message must consist
 // entirely of a messages.<index>.content.<index>: path followed by one of these exact refusals;
 // a substring could instead be request content echoed inside an unrelated validation error.
+#[cfg(feature = "live")]
 const SIGNED_REASONING_REJECTION_MESSAGES: &[&str] = &[
     "`thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
 ];
 
+#[cfg(feature = "live")]
 fn signed_reasoning_rejected(message: &str) -> bool {
     let Some(path) = message.strip_prefix("messages.") else {
         return false;
@@ -46,6 +48,7 @@ fn signed_reasoning_rejected(message: &str) -> bool {
 
 /// Refine only Anthropic's request-validation refusals with a broca-owned routing cause.
 /// Match the entire structured message, never copy provider text into the cause.
+#[cfg(feature = "live")]
 pub(crate) fn classify_anthropic_request_invalid(
     error: ProviderError,
     error_object: Option<&Value>,
