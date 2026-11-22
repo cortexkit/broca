@@ -1663,6 +1663,7 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
         media: vec![],
         message_marks: None,
         named_speaker: None,
+        kept_notice: None,
     }));
     store_session_with(&rig, &session, seeded, broca_wal::StorageClass::Durable).await;
     broca_core::SessionRefIndex::record_session(

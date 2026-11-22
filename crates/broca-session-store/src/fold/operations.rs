@@ -240,6 +240,9 @@ crate::message! {
         11 opt [must] named_speaker: bool,
         /// The caller-visible id of the send whose messages wait here. Unknown on older checkpoints.
         12 opt send_id: String,
+        /// True, and present, exactly when `message_marks` keeps the notice, as
+        /// `EntryFacts::kept_notice` says.
+        13 opt [must] kept_notice: bool,
     }
 }
 
@@ -732,6 +735,9 @@ crate::message! {
         9 opt waits_for_run: bool,
         /// When an ordered send's list stops being deliverable (its `expires_at_ms`).
         10 opt expires_at_ms: u64,
+        /// True, and present, exactly when `message_marks` keeps the notice, as
+        /// `EntryFacts::kept_notice` says.
+        11 opt [must] kept_notice: bool,
     }
 }
 
@@ -1619,6 +1625,7 @@ impl Operations {
                     ),
                     message_marks: send.message_marks.clone(),
                     named_speaker: crate::record::marks_name_speaker(send.message_marks.as_ref()),
+                    kept_notice: crate::record::marks_kept_notice(send.message_marks.as_ref()),
                     waits_for_run,
                     expires_at_ms,
                 };
@@ -2227,6 +2234,7 @@ impl Operations {
                     media: steer.media.clone(),
                     message_marks: steer.message_marks.clone(),
                     named_speaker: crate::record::marks_name_speaker(steer.message_marks.as_ref()),
+                    kept_notice: crate::record::marks_kept_notice(steer.message_marks.as_ref()),
                 });
             }
             Record::Delivery(delivery) if !delivery.input.is_empty() => {
@@ -2250,6 +2258,7 @@ impl Operations {
                     // ordered send, which a session in the session store doesn't take yet.
                     media: Vec::new(),
                     named_speaker: crate::record::marks_name_speaker(message_marks.as_ref()),
+                    kept_notice: crate::record::marks_kept_notice(message_marks.as_ref()),
                     message_marks,
                 })
             }

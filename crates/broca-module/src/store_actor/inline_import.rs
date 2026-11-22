@@ -111,6 +111,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             imported_ids: None,
             message_marks: None,
             named_speaker: None,
+            kept_notice: None,
         };
         let mut records = vec![Record::RunStart(Box::new(start))];
         for message in messages {

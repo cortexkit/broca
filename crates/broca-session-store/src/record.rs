@@ -449,6 +449,12 @@ message! {
         /// The caller's send id, or the returned submission id of an unkeyed send. Display
         /// metadata only: absent when unknown, and never part of a message's content identity.
         25 opt send_id: String,
+        /// True, and present, exactly when `marks` keeps the notice (llm-runner's
+        /// `notice_keep`: the scope owner marked it as the person's own words). It carries nothing
+        /// a reader uses: the mark is in `marks`. Its must-understand bit makes a reader that
+        /// predates kept notices refuse the record rather than serve the notice unkept, which
+        /// would let a compaction provider drop it.
+        26 opt [must] kept_notice: bool,
     }
 }
 
@@ -660,6 +666,9 @@ message! {
         /// record rather than serve the speaker without its name. Absent otherwise, so a record
         /// without a name keeps the bytes it had before names existed.
         30 opt [must] named_speaker: bool,
+        /// True, and present, exactly when `message_marks` keeps the notice, as
+        /// `EntryFacts::kept_notice` says.
+        31 opt [must] kept_notice: bool,
     }
 }
 
@@ -1086,6 +1095,9 @@ message! {
         /// record rather than serve the speaker without its name. Absent otherwise, so a record
         /// without a name keeps the bytes it had before names existed.
         12 opt [must] named_speaker: bool,
+        /// True, and present, exactly when `message_marks` keeps the notice, as
+        /// `EntryFacts::kept_notice` says.
+        13 opt [must] kept_notice: bool,
     }
 }
 
@@ -1455,6 +1467,9 @@ message! {
         /// record rather than serve the speaker without its name. Absent otherwise, so a record
         /// without a name keeps the bytes it had before names existed.
         7 opt [must] named_speaker: bool,
+        /// True, and present, exactly when `message_marks` keeps the notice, as
+        /// `EntryFacts::kept_notice` says.
+        8 opt [must] kept_notice: bool,
     }
 }
 
@@ -1989,6 +2004,15 @@ pub fn named_speaker(speaks_for: Option<&serde_json::Value>) -> Option<bool> {
 /// [`named_speaker`] for a send's stored marks (llm-runner's `MessageMarks` JSON).
 pub fn marks_name_speaker(marks: Option<&serde_json::Value>) -> Option<bool> {
     named_speaker(marks.and_then(|marks| marks.get("speaks_for")))
+}
+
+/// The value of a `kept_notice` field beside a send's stored marks (llm-runner's `MessageMarks`
+/// JSON): `Some(true)` when the marks keep the notice, else `None`. Every writer of marks sets
+/// its sibling field from this, so a kept notice is never stored without the must-understand
+/// bit that keeps it from older readers.
+pub fn marks_kept_notice(marks: Option<&serde_json::Value>) -> Option<bool> {
+    (marks.and_then(|marks| marks.get("keep")) == Some(&serde_json::Value::Bool(true)))
+        .then_some(true)
 }
 
 #[cfg(test)]

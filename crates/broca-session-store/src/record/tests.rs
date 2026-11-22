@@ -121,6 +121,7 @@ fn one_of_each() -> Vec<Record> {
         }),
         Record::RunStart(Box::new(RunStart {
             named_speaker: None,
+            kept_notice: None,
             imported_ids: None,
             message_marks: None,
             run_id: "run-1".into(),
@@ -251,6 +252,7 @@ fn one_of_each() -> Vec<Record> {
         }),
         Record::QueuedSend(QueuedSend {
             named_speaker: None,
+            kept_notice: None,
             media: Vec::new(),
             submission_id: "sub".into(),
             send_id: Some("s2".into()),

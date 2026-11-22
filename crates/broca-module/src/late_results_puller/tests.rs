@@ -183,6 +183,7 @@ fn run_start(run: &str) -> Record {
         imported_ids: None,
         message_marks: None,
         named_speaker: None,
+        kept_notice: None,
         run_id: run.into(),
         model: serde_json::from_value(json!({"provider_module_id": "p", "model_id": "m"})).unwrap(),
         setup: Vec::new(),

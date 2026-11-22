@@ -131,6 +131,7 @@ fn model() -> ModelHandle {
 fn start(run: &str, setup: Vec<crate::record::PartRef>) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
+        kept_notice: None,
         imported_ids: None,
         message_marks: None,
         run_id: run.into(),

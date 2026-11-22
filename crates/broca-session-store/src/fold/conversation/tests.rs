@@ -362,6 +362,7 @@ fn facts(ordinal: u64, tag_base: u64) -> Record {
     Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
+        kept_notice: None,
         client_message_id: None,
         sender: None,
         marks: None,

@@ -20,6 +20,7 @@ fn start(run: &str, seeded: bool) -> Record {
         imported_ids: None,
         message_marks: None,
         named_speaker: None,
+        kept_notice: None,
         run_id: run.into(),
         model: serde_json::from_value(json!({"provider_module_id": "anthropic", "model_id": "m"}))
             .unwrap(),

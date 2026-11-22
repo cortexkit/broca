@@ -952,6 +952,9 @@ pub fn with_facts_and_messages(
                     named_speaker: broca_session_store::record::marks_name_speaker(
                         facts.send.marks.as_ref(),
                     ),
+                    kept_notice: broca_session_store::record::marks_kept_notice(
+                        facts.send.marks.as_ref(),
+                    ),
                     marks: facts.send.marks.map(Into::into),
                     no_display_facts: None,
                     reasoning_summaries: message.map(reasoning_summaries).unwrap_or_default(),
@@ -2137,6 +2140,7 @@ mod lifetime_tag_high_tests {
                 facts: Some(std::sync::Arc::new(EntryFacts {
                     send_id: None,
                     named_speaker: None,
+                    kept_notice: None,
                     ordinal,
                     written_at_ms: None,
                     tag_base: if ordinal == 2 { tag_base } else { 0 },
@@ -2222,6 +2226,7 @@ mod send_id_tests {
                     request_identity_digest: None,
                     message_marks: None,
                     named_speaker: None,
+                    kept_notice: None,
                     send_id: Some(id.into()),
                     waits_for_run: None,
                     expires_at_ms: None,

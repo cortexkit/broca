@@ -49,6 +49,7 @@ fn model() -> ModelHandle {
 fn start(run: &str, send: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
+        kept_notice: None,
         imported_ids: None,
         message_marks: None,
         run_id: run.into(),
@@ -132,6 +133,7 @@ fn facts(ordinal: u64, mid: String) -> Record {
     Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
+        kept_notice: None,
         client_message_id: None,
         sender: None,
         marks: None,
@@ -474,6 +476,7 @@ fn a_revert_refuses_open_work_and_wrong_targets(cipher: Cipher) {
             .append(
                 &[Record::QueuedSend(QueuedSend {
                     named_speaker: None,
+                    kept_notice: None,
                     media: Vec::new(),
                     submission_id: "sub".into(),
                     send_id: Some("queued".into()),

@@ -4509,6 +4509,7 @@ fn ordered_with(id: &str, order: Value, text: &str, supersedes: Option<&str>) ->
         Record::QueuedSend(QueuedSend {
             media: Vec::new(),
             named_speaker: None,
+            kept_notice: None,
             message_marks: None,
             submission_id: id.into(),
             send_id: None,
@@ -4576,6 +4577,7 @@ impl SteerSink for NewSink {
             .unwrap()
             .push(Record::Steer(broca_session_store::record::Steer {
                 named_speaker: None,
+                kept_notice: None,
                 media: Vec::new(),
                 input,
                 written_at_ms,

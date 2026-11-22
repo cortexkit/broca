@@ -156,6 +156,7 @@ fn store_start(run: &str, retention: Option<u64>, ts: u64) -> Record {
         imported_ids: None,
         message_marks: None,
         named_speaker: None,
+        kept_notice: None,
         run_id: run.into(),
         model: serde_json::from_value(
             serde_json::json!({"provider_module_id": "p", "model_id": "m"}),
@@ -214,6 +215,7 @@ fn store_queued(retention: Option<u64>, ts: u64) -> Record {
         media: Vec::new(),
         message_marks: None,
         named_speaker: None,
+        kept_notice: None,
         submission_id: "queued".into(),
         send_id: None,
         input: Vec::new(),

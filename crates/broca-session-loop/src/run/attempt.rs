@@ -7,7 +7,7 @@ use broca_protocol::ModelAttempt;
 use broca_session_store::codec::Digest;
 use broca_session_store::record::{Attempt, Record};
 
-use super::{hex_digest, LoopError};
+use super::LoopError;
 
 /// One HTTP attempt's record, from the provider's evidence. Billing and the session's folded
 /// state read the typed fields; every other field the provider measured is kept as diagnostics
@@ -96,6 +96,18 @@ pub(super) fn attempt_record(
         reached_cache: reached.then_some(true),
         requested_cache_ttl_ms: requested_ttl_ms.filter(|_| reached),
     }))
+}
+
+/// The digest a 64-character hex string spells, or `None`.
+fn hex_digest(text: &str) -> Option<Digest> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, pair) in text.as_bytes().chunks(2).enumerate() {
+        out[index] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(Digest(out))
 }
 
 #[cfg(test)]

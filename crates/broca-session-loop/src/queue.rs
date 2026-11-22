@@ -103,6 +103,7 @@ pub fn queued_send(
         receipt: receipt.map(Into::into),
         delivery,
         named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        kept_notice: broca_session_store::record::marks_kept_notice(message_marks.as_ref()),
         message_marks,
     })
 }
@@ -178,6 +179,7 @@ pub fn steer(
         tags_v1: None,
         receipt: receipt.map(Into::into),
         named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        kept_notice: broca_session_store::record::marks_kept_notice(message_marks.as_ref()),
         message_marks,
     })
 }

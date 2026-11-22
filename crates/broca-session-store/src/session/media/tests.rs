@@ -67,6 +67,7 @@ fn image(bytes: &[u8]) -> MediaRef {
 fn start(run: &str, send: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
+        kept_notice: None,
         imported_ids: None,
         message_marks: None,
         run_id: run.into(),
@@ -154,6 +155,7 @@ fn facts(ordinal: u64, mid: String) -> Record {
     Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
+        kept_notice: None,
         client_message_id: None,
         sender: None,
         marks: None,
@@ -567,6 +569,7 @@ fn photo_message(text: &str, images: &[&[u8]]) -> Message {
 fn queued(submission: &str, images: &[&[u8]]) -> Record {
     Record::QueuedSend(QueuedSend {
         named_speaker: None,
+        kept_notice: None,
         media: Vec::new(),
         submission_id: submission.into(),
         send_id: None,
@@ -630,6 +633,7 @@ fn a_sends_media_are_stored_under_its_record_and_its_copies_point_at_them(cipher
 
         let steer = Record::Steer(Steer {
             named_speaker: None,
+            kept_notice: None,
             media: Vec::new(),
             input: vec![photo_message("steer look", &[b])],
             written_at_ms: None,

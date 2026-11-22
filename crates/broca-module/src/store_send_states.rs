@@ -298,6 +298,7 @@ mod tests {
     fn queued(submission: &str, send_id: Option<&str>, sent_by: serde_json::Value) -> Record {
         Record::QueuedSend(QueuedSend {
             named_speaker: None,
+            kept_notice: None,
             media: Vec::new(),
             submission_id: submission.into(),
             send_id: send_id.map(str::to_owned),
@@ -319,6 +320,7 @@ mod tests {
             imported_ids: None,
             message_marks: None,
             named_speaker: None,
+            kept_notice: None,
             run_id: run.into(),
             model: serde_json::from_value(json!({"provider_module_id": "p", "model_id": "m"}))
                 .unwrap(),

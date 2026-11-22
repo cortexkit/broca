@@ -56,6 +56,7 @@ async fn history<'a>(
         setup: vec![setup],
         renderer_version: 1,
         named_speaker: None,
+        kept_notice: None,
         imported_ids: None,
         message_marks: None,
         submission_id: None,

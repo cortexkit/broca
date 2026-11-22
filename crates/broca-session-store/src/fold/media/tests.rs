@@ -102,6 +102,7 @@ pub(crate) fn render_config() -> PartRef {
 pub(crate) fn start(run: &str, setup: Vec<PartRef>, seeded: bool) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
+        kept_notice: None,
         run_id: run.into(),
         model: model(),
         setup,
@@ -184,6 +185,7 @@ pub(crate) fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
+        kept_notice: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: 0,
@@ -380,6 +382,7 @@ pub(crate) fn steer(messages: Vec<Message>) -> Record {
         media: Vec::new(),
         message_marks: None,
         named_speaker: None,
+        kept_notice: None,
     })
 }
 

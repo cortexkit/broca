@@ -63,6 +63,7 @@ fn image(bytes: &[u8]) -> MediaRef {
 fn start(run: &str, seeded: bool) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
+        kept_notice: None,
         run_id: run.into(),
         model: model(),
         setup: Vec::new(),
@@ -129,6 +130,7 @@ fn facts(ordinal: u64, mid: &str) -> Record {
     Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
+        kept_notice: None,
         ordinal,
         written_at_ms: Some(ordinal),
         tag_base: 0,

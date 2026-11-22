@@ -50,6 +50,7 @@ fn model() -> ModelHandle {
 fn start(run: &str, send: Option<&str>) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
+        kept_notice: None,
         imported_ids: None,
         message_marks: None,
         run_id: run.into(),
@@ -113,6 +114,7 @@ fn records_name_their_ids() {
     );
     let steer = Record::Steer(Steer {
         named_speaker: None,
+        kept_notice: None,
         media: Vec::new(),
         input: Vec::new(),
         written_at_ms: None,
@@ -138,6 +140,7 @@ fn records_name_their_ids() {
     );
     let queued = Record::QueuedSend(QueuedSend {
         named_speaker: None,
+        kept_notice: None,
         media: Vec::new(),
         submission_id: "sub-9".into(),
         send_id: Some("send-9".into()),

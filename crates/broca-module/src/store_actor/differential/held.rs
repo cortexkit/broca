@@ -924,6 +924,7 @@ async fn startup_recovery_work_ignores_idle_store_sessions() {
                     .append(
                         &[Record::RunStart(Box::new(RunStart {
                             named_speaker: None,
+                            kept_notice: None,
                             imported_ids: None,
                             message_marks: None,
                             run_id: "orphan".into(),

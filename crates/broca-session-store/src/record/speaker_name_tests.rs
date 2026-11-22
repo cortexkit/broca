@@ -37,6 +37,7 @@ fn entry_facts(marks: serde_json::Value) -> EntryFacts {
     EntryFacts {
         send_id: None,
         named_speaker: None,
+        kept_notice: None,
         ordinal: 3,
         written_at_ms: Some(10),
         tag_base: 2,
@@ -92,6 +93,7 @@ fn marked() -> Vec<Record> {
         Record::EntryFacts(std::sync::Arc::new(entry_facts(marks.clone()))),
         Record::RunStart(Box::new(RunStart {
             named_speaker: None,
+            kept_notice: None,
             imported_ids: None,
             message_marks: Some(marks.clone()),
             run_id: "run-1".into(),
@@ -126,6 +128,7 @@ fn marked() -> Vec<Record> {
         })),
         Record::QueuedSend(QueuedSend {
             named_speaker: None,
+            kept_notice: None,
             media: Vec::new(),
             submission_id: "sub".into(),
             send_id: Some("s2".into()),
@@ -140,6 +143,7 @@ fn marked() -> Vec<Record> {
         }),
         Record::Steer(Steer {
             named_speaker: None,
+            kept_notice: None,
             input: vec![text("steer")],
             written_at_ms: Some(5),
             tags_v1: None,
@@ -185,6 +189,7 @@ fn marked_fold_entries() -> (
         crate::fold::operations::PendingInput {
             send_id: None,
             named_speaker: None,
+            kept_notice: None,
             seq: Some(4),
             placement: Placement::Steer,
             messages: vec![text("steer")],
@@ -199,6 +204,7 @@ fn marked_fold_entries() -> (
         crate::fold::operations::Pending {
             send_id: None,
             named_speaker: None,
+            kept_notice: None,
             submission_id: "sub".into(),
             interrupt: false,
             ordered: true,
@@ -509,6 +515,135 @@ fn a_reader_before_speaker_names_refuses_a_named_speaker() {
     let refused = SteerBeforeNames::decode(&named.encode()).unwrap_err();
     assert!(
         matches!(refused.kind, DecodeErrorKind::MustUnderstand { field: 7 }),
+        "{refused:?}"
+    );
+}
+
+/// Where each record that keeps a send's marks keeps its `kept_notice` flag.
+fn kept_path(record: &Record) -> u32 {
+    match record {
+        Record::EntryFacts(_) => 26,
+        Record::RunStart(_) => 31,
+        Record::QueuedSend(_) => 13,
+        Record::Steer(_) => 8,
+        other => panic!("unexpected record {}", other.name()),
+    }
+}
+
+/// The records of [`marked`] that keep a send's marks, each with a kept notice as a writer
+/// stores it: `keep` in the marks, and the flag set beside them.
+fn kept_records() -> Vec<Record> {
+    let kept = || json!({"notice": true, "keep": true});
+    marked()
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::ResultAppend(_) => None,
+            Record::EntryFacts(mut facts) => {
+                let facts_mut = std::sync::Arc::make_mut(&mut facts);
+                facts_mut.marks = Some(kept().into());
+                facts_mut.named_speaker = None;
+                facts_mut.kept_notice = marks_kept_notice(facts_mut.marks.as_deref());
+                Some(Record::EntryFacts(facts))
+            }
+            Record::RunStart(mut start) => {
+                start.message_marks = Some(kept());
+                start.named_speaker = None;
+                start.kept_notice = marks_kept_notice(start.message_marks.as_ref());
+                Some(Record::RunStart(start))
+            }
+            Record::QueuedSend(mut send) => {
+                send.message_marks = Some(kept());
+                send.named_speaker = None;
+                send.kept_notice = marks_kept_notice(send.message_marks.as_ref());
+                Some(Record::QueuedSend(send))
+            }
+            Record::Steer(mut steer) => {
+                steer.message_marks = Some(kept());
+                steer.named_speaker = None;
+                steer.kept_notice = marks_kept_notice(steer.message_marks.as_ref());
+                Some(Record::Steer(steer))
+            }
+            other => panic!("unexpected record {}", other.name()),
+        })
+        .collect()
+}
+
+#[test]
+fn kept_notice_flags_are_set_only_for_kept_marks() {
+    assert_eq!(marks_kept_notice(None), None);
+    assert_eq!(marks_kept_notice(Some(&json!({"notice": true}))), None);
+    assert_eq!(
+        marks_kept_notice(Some(&json!({"notice": true, "keep": false}))),
+        None
+    );
+    assert_eq!(
+        marks_kept_notice(Some(&json!({"notice": true, "keep": true}))),
+        Some(true)
+    );
+}
+
+/// A kept notice is stored beside a must-understand field, so a reader that predates kept
+/// notices refuses the record instead of serving the notice unkept; this reader reads it back.
+#[test]
+fn kept_notices_round_trip_beside_a_must_understand_field() {
+    for record in kept_records() {
+        let name = record.name();
+        let body = record.encode_body();
+        assert_eq!(must_bit(&body, kept_path(&record)), Some(true), "{name}");
+        let back = Record::decode(record.kind(), &body).unwrap();
+        assert_eq!(back, record, "{name}");
+        assert!(
+            serde_json::to_string(&back)
+                .unwrap()
+                .contains("\"keep\":true"),
+            "{name}"
+        );
+    }
+    for record in marked()
+        .into_iter()
+        .filter(|record| !matches!(record, Record::ResultAppend(_)))
+    {
+        // Marks that keep nothing never write the field.
+        let body = record.encode_body();
+        assert_eq!(
+            must_bit(&body, kept_path(&record)),
+            None,
+            "{}",
+            record.name()
+        );
+    }
+}
+
+crate::message! {
+    /// `Steer` as builds before kept notices declared it.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct SteerBeforeKept {
+        1 rep input: Message,
+        2 opt written_at_ms: u64,
+        3 opt tags_v1: serde_json::Value,
+        4 opt receipt: serde_json::Value,
+        5 rep [must] media: SendMedia,
+        6 opt [must] message_marks: serde_json::Value,
+        7 opt [must] named_speaker: bool,
+    }
+}
+
+/// A reader that predates kept notices reads an unkept steer as before, and refuses a kept one
+/// by the flag's field number rather than serve the notice unkept.
+#[test]
+fn a_reader_before_kept_notices_refuses_a_kept_notice() {
+    use crate::codec::{DecodeErrorKind, Message as _};
+    let Record::Steer(unkept) = marked().pop().unwrap() else {
+        panic!("the last marked record is a steer")
+    };
+    let old = SteerBeforeKept::decode(&unkept.encode()).unwrap();
+    assert_eq!(old.message_marks, unkept.message_marks);
+    let Record::Steer(kept) = kept_records().pop().unwrap() else {
+        panic!("the last kept record is a steer")
+    };
+    let refused = SteerBeforeKept::decode(&kept.encode()).unwrap_err();
+    assert!(
+        matches!(refused.kind, DecodeErrorKind::MustUnderstand { field: 8 }),
         "{refused:?}"
     );
 }

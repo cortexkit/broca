@@ -299,6 +299,7 @@ mod tests {
             imported_ids: None,
             message_marks: None,
             named_speaker: None,
+            kept_notice: None,
         }
     }
 

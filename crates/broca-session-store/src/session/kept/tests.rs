@@ -55,6 +55,7 @@ fn model() -> ModelHandle {
 fn start(run: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
+        kept_notice: None,
         imported_ids: None,
         message_marks: None,
         run_id: run.into(),
@@ -605,6 +606,7 @@ fn queued(submission: &str) -> Record {
         media: Vec::new(),
         message_marks: None,
         named_speaker: None,
+        kept_notice: None,
     })
 }
 
@@ -613,6 +615,7 @@ fn facts(ordinal: u64) -> Record {
     Record::EntryFacts(std::sync::Arc::new(EntryFacts {
         send_id: None,
         named_speaker: None,
+        kept_notice: None,
         client_message_id: None,
         sender: None,
         marks: None,

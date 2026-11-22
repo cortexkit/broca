@@ -272,6 +272,7 @@ impl Writer {
             legacy_view_seq: None,
             notices: Vec::new(),
             named_speaker: None,
+            kept_notice: None,
             send_id: None,
         }
     }
@@ -532,6 +533,7 @@ fn usage() -> Usage {
 fn run_start(run_id: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
         named_speaker: None,
+        kept_notice: None,
         imported_ids: None,
         message_marks: None,
         run_id: run_id.to_owned(),

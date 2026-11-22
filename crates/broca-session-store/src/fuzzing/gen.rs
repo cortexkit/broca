@@ -694,6 +694,7 @@ mod records {
         runner_tag_base,
         legacy_view_seq,
         named_speaker,
+        kept_notice,
     });
     crate::fuzzing::gen::fields!(RideNotice {
         part,
@@ -746,6 +747,7 @@ mod records {
         imported_ids,
         message_marks,
         named_speaker,
+        kept_notice,
     });
     crate::fuzzing::gen::fields!(RunEnd {
         run_id,
@@ -881,6 +883,7 @@ mod records {
         media,
         message_marks,
         named_speaker,
+        kept_notice,
     });
     crate::fuzzing::gen::fields!(SessionRefresh {
         generation,
@@ -940,6 +943,7 @@ mod records {
         media,
         message_marks,
         named_speaker,
+        kept_notice,
     });
     crate::fuzzing::gen::fields!(Delivery {
         submission_id,
@@ -1208,6 +1212,7 @@ mod operations {
         media,
         message_marks,
         named_speaker,
+        kept_notice,
     });
     crate::fuzzing::gen::fields!(NaturalEnd { stop, extendable });
     crate::fuzzing::gen::fields!(Budget {
@@ -1276,6 +1281,7 @@ mod operations {
         request_identity_digest,
         message_marks,
         named_speaker,
+        kept_notice,
         waits_for_run,
         expires_at_ms,
     });

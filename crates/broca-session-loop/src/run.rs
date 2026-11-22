@@ -3640,6 +3640,7 @@ async fn admit<W: Writer>(
     records.push(Record::RunStart(Box::new(RunStart {
         imported_ids: None,
         named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
+        kept_notice: broca_session_store::record::marks_kept_notice(message_marks.as_ref()),
         message_marks,
         run_id: admission.run_id.clone(),
         model: admission.model.clone(),
@@ -6567,16 +6568,4 @@ fn placed_copies(operations: &Operations, run_id: &str) -> Vec<Record> {
                 })
         })
         .collect()
-}
-
-/// The digest a 64-character hex string spells, or `None`.
-fn hex_digest(text: &str) -> Option<Digest> {
-    if text.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (index, pair) in text.as_bytes().chunks(2).enumerate() {
-        out[index] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-    }
-    Some(Digest(out))
 }

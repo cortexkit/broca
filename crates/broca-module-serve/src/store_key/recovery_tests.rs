@@ -217,6 +217,7 @@ impl Rig {
                         imported_ids: None,
                         message_marks: None,
                         named_speaker: None,
+                        kept_notice: None,
                     })),
                     Record::Pause(Pause {
                         run_id: run_id.clone(),
