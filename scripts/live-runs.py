@@ -2,7 +2,7 @@
 """Report the runs broca is running right now, asked of the running daemon.
 
 Answers the one question a deploy needs: will restarting broca cut work in progress? Every session
-lives in the new storage, whose logs are encrypted with a key only the daemon holds, so no file
+lives in the session store, whose logs are encrypted with a key only the daemon holds, so no file
 read can answer it. The daemon can: its memory report lists every open session and names the run
 each one has in progress. A session with no actor has no run in progress, because a run lives in
 its session's actor.
@@ -12,8 +12,8 @@ wait. Its session may be running, so it counts against a restart like a live run
 asked again a few times first, and an actor still silent is listed as unanswered.
 
 Exit 0 when nothing is live, 1 when a run is live or an actor didn't answer, 2 when the question
-cannot be answered at all: the daemon gave no report, or a session is still open on the old
-storage (the WAL), which the report counts but does not size or follow. A gate that cannot tell must not read as a clear gate.
+cannot be answered at all because the daemon gave no report. A gate that cannot tell must not
+read as a clear gate.
 
 Output, one run per line, which place-release.sh reads:
 
