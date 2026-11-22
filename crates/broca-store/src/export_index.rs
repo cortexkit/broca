@@ -915,25 +915,6 @@ pub(crate) mod tests {
     use broca_records::{record::AuthSelection, record::RunConfig};
     use serde_json::Value;
 
-    fn with_billing_floor_store(test: impl FnOnce(&dyn Fn() -> SqliteStore)) {
-        let root = broca_test_support::scratch_root().join(format!(
-            "broca-billing-floor-{}-{}",
-            std::process::id(),
-            test_fixture_nonce()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let db = root.join("store.db");
-        test(&|| SqliteStore::open(&db).unwrap());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn billing_floor_bills_resumed_local_and_post_activation_runs() {
-        with_billing_floor_store(|make| {
-            crate::conformance::billing_floor_preserves_local_and_new_runs(make)
-        });
-    }
-
     pub(crate) fn config(usage_policy: &str) -> RunConfig {
         RunConfig {
             global_system: None,

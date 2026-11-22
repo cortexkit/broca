@@ -13,9 +13,6 @@ use broca_core::{ChargeBasis, ExportCursor, ExportError, ExportIndex};
 use broca_protocol::{caller::RunFinishReason, request::ModelHandle, BindIdentity, RunId};
 use broca_records::{record::AuthSelection, record::RunConfig};
 
-mod billing_floor;
-pub use billing_floor::billing_floor_preserves_local_and_new_runs;
-
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Run the usage-export conformance suite against a fresh store. This is intentionally small

@@ -50,24 +50,6 @@ pub fn lease_key_for(session: &BindIdentity) -> LeaseKey {
     )
 }
 
-/// Hold for the entire mutating fold, resume, or unfold operation. Report-only
-/// callers must not acquire this lease. The OS lock releases on process death;
-/// the persisted epoch is forensic metadata, not a TTL or a stale-file lock.
-///
-/// This is the premise of archive::read_newest_member's start-stamp precedence,
-/// not operator hygiene: A stalls, B snapshots X, a writer appends Y, then A
-/// snapshots XY and unlinks. Without serialization B's newer stamp serves X.
-/// Unsealed resume must also take a fresh stamp, since locks do not span crashes.
-pub fn acquire_archive_pass(
-    state_root: &std::path::Path,
-) -> Result<Box<dyn LeaseHandle>, LeaseError> {
-    FileLeaseStore::new(state_root.join("leases")).acquire(&LeaseKey::new(
-        "broca",
-        "wal-archive",
-        "fold-pass",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,20 +60,6 @@ mod tests {
             harness: harness.into(),
             session: session.into(),
         }
-    }
-
-    #[test]
-    fn archive_pass_lease_excludes_other_operators_and_releases_on_drop() {
-        let root = broca_test_support::scratch_root()
-            .join(format!("broca-fold-lock-{}", std::process::id()));
-        let first = acquire_archive_pass(&root).unwrap();
-        assert!(matches!(
-            acquire_archive_pass(&root),
-            Err(LeaseError::Held { .. })
-        ));
-        drop(first);
-        drop(acquire_archive_pass(&root).unwrap());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

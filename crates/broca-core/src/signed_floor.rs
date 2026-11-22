@@ -126,14 +126,7 @@ pub enum FloorFold {
     Known(SignedFloor),
 }
 
-impl FloorFold {
-    /// Fold the next run, when the earlier ones are known.
-    pub fn observe_run(&mut self, start: u64, digest: String) {
-        if let Self::Known(floor) = self {
-            floor.observe_run(start, digest);
-        }
-    }
-}
+impl FloorFold {}
 
 /// The tool-set facts an admission checkpoint folds from its lineage's run starts, so an append
 /// admitted from the checkpoint knows the floor without replaying the WAL. The checkpoint counts

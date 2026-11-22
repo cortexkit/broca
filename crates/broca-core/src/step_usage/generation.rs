@@ -1,5 +1,4 @@
 use broca_protocol::{usage::GenerationUsage, StepId, Usage};
-use broca_records::record::WalRecord;
 
 #[derive(Debug, Clone)]
 pub(super) struct AttemptTiming {
@@ -38,24 +37,7 @@ pub struct StepServed<'a> {
     pub speed_used: Option<&'a str>,
 }
 
-impl<'a> StepServed<'a> {
-    pub(super) fn of(record: &'a WalRecord) -> Option<Self> {
-        let WalRecord::ModelStepFinished {
-            step_id,
-            service_tier_used,
-            speed_used,
-            ..
-        } = record
-        else {
-            return None;
-        };
-        Some(Self {
-            step_id: *step_id,
-            service_tier_used: service_tier_used.as_deref(),
-            speed_used: speed_used.as_deref(),
-        })
-    }
-}
+impl<'a> StepServed<'a> {}
 
 pub(super) fn record(
     entries: &mut Vec<GenerationUsage>,

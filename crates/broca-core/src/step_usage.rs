@@ -1,80 +1,6 @@
 //! Completed-step usage, generation timing and normalized provider finish reasons.
 
-use broca_protocol::{RunId, Usage};
-use broca_records::record::WalRecord;
-
-/// A completed-step usage fold for one run id. The same durable records feed
-/// cold reconciliation and the live writer's small status projection.
-#[derive(Debug, Clone)]
-pub struct RunUsageProjection {
-    run_id: RunId,
-    active: bool,
-    model: Option<(broca_protocol::request::ModelHandle, Option<String>)>,
-    steps: RunUsageSteps,
-    pub usage: broca_protocol::usage::RunUsage,
-}
-
-impl RunUsageProjection {
-    pub fn new(run_id: RunId) -> Self {
-        Self {
-            run_id,
-            active: false,
-            model: None,
-            steps: RunUsageSteps::default(),
-            usage: Default::default(),
-        }
-    }
-
-    pub fn observe(&mut self, record: &WalRecord) {
-        match record {
-            WalRecord::RunStarted { run_id, config, .. } => {
-                self.active = run_id == &self.run_id;
-                if self.active {
-                    self.model = Some((config.model.clone(), config.variant.clone()));
-                    self.steps
-                        .run_started(&mut self.usage, &config.frozen_render_config);
-                }
-                self.steps.boundary();
-            }
-            WalRecord::StepStarted { .. } if self.active => self.steps.boundary(),
-            WalRecord::ModelAttemptFinished {
-                step_id,
-                sent_at_ms,
-                content_progress,
-                envelope,
-                ..
-            } if self.active => {
-                let served = envelope.as_ref().and_then(|envelope| {
-                    envelope
-                        .speed_used
-                        .as_deref()
-                        .or(envelope.service_tier_used.as_deref())
-                });
-                self.steps.attempt(
-                    *step_id,
-                    *sent_at_ms,
-                    content_progress.first_content_at_ms,
-                    content_progress.last_content_at_ms,
-                    served,
-                );
-            }
-            WalRecord::ModelStepFinished { .. } | WalRecord::ModelStepRefused { .. }
-                if self.active =>
-            {
-                let by_model = self.model.as_ref().map(|(model, variant)| {
-                    let variant = variant.as_deref().filter(|value| !value.is_empty());
-                    crate::refusal_fallback::usage_by_model(model, variant, record)
-                });
-                self.steps.step_ended(
-                    &mut self.usage,
-                    generation::StepServed::of(record),
-                    by_model.as_deref(),
-                );
-            }
-            _ => {}
-        }
-    }
-}
+use broca_protocol::Usage;
 
 pub use generation::StepServed;
 
@@ -83,9 +9,8 @@ pub use generation::StepServed;
 pub type ModelShare<'a> = (&'a str, &'a str, Option<&'a str>, Usage);
 
 /// The usage arithmetic of one run's completed steps, apart from how its records are read: what
-/// `run.status` and `run.result` serve as the run's `usage`. [`RunUsageProjection`] feeds it from
-/// WAL records, and a session-store projection feeds it from its own records, so both count a
-/// run's steps, service tiers and generation timing by the same rules.
+/// `run.status` and `run.result` serve as the run's `usage`. The session store's projection
+/// feeds it from its records, counting a run's steps, service tiers and generation timing.
 #[derive(Debug, Clone, Default)]
 pub struct RunUsageSteps {
     final_attempt: Option<generation::AttemptTiming>,

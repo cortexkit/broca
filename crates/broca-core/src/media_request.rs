@@ -14,16 +14,10 @@ use broca_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::media_store::{MediaBytes, MediaReadError};
-use crate::placement::Placement;
 use compact::{MessageCopy, RefId, References};
 
 mod compact;
 pub mod held;
-mod seed;
-
-impl seed::MediaCheckpoint {}
-pub use seed::DurableMediaSeed;
-pub use seed::{MediaCheckpoint, MediaHistory};
 
 /// A capture occurrence, not a digest. Two admissions of identical bytes have different ids
 /// and can have different protection lifetimes.
@@ -207,7 +201,6 @@ pub struct MediaIndexState {
 #[derive(Debug, Clone)]
 pub struct SessionMedia {
     store: Option<std::sync::Arc<dyn MediaBytes>>,
-    placement: Placement,
     records: u64,
     boundary: u64,
     last_step: Option<StepId>,
@@ -246,7 +239,6 @@ impl SessionMedia {
     fn metadata(store: Option<std::sync::Arc<dyn MediaBytes>>) -> Self {
         Self {
             store,
-            placement: Placement::default(),
             records: 0,
             boundary: 0,
             last_step: None,

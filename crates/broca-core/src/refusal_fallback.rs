@@ -12,10 +12,7 @@
 //! it.
 
 use broca_protocol::request::ModelHandle;
-use broca_records::{
-    record::RefusalFallbackPhase, record::RefusalFallbackSchedule, record::StepFallback,
-    record::WalRecord,
-};
+use broca_records::{record::RefusalFallbackPhase, record::RefusalFallbackSchedule};
 
 /// Committed fallback responses in a round before the first doubling.
 pub const ROUND_STEPS: u32 = 10;
@@ -166,33 +163,6 @@ pub struct StepServing<'a> {
 }
 
 impl<'a> StepServing<'a> {
-    /// What a step record says about how it was served. `None` for a record that carries no
-    /// step usage.
-    pub fn of_record(record: &'a WalRecord) -> Option<Self> {
-        match record {
-            WalRecord::ModelStepFinished {
-                usage, fallback, ..
-            } => Some(Self {
-                route_model: fallback.route.as_ref().map(|route| &route.model),
-                served_model: fallback.served_model.as_deref(),
-                usage: *usage,
-                iterations: fallback.usage_iterations.as_deref(),
-            }),
-            WalRecord::ModelStepRefused {
-                usage,
-                served_model,
-                usage_iterations,
-                ..
-            } => Some(Self {
-                route_model: None,
-                served_model: served_model.as_deref(),
-                usage: *usage,
-                iterations: usage_iterations.as_deref(),
-            }),
-            _ => None,
-        }
-    }
-
     /// What a spend-fact builder's step record says about how it was served. `None` for a
     /// record that carries no step usage.
     pub fn of_event(event: &'a crate::billing::BillingEvent) -> Option<Self> {
@@ -271,45 +241,6 @@ impl<'a> StepServing<'a> {
             })
             .collect()
     }
-}
-
-/// Usage entries for a durable step record (`StepServing::usage_by_model`).
-pub fn usage_by_model<'a>(
-    episode_model: &'a ModelHandle,
-    episode_variant: Option<&'a str>,
-    record: &'a WalRecord,
-) -> Vec<(&'a str, &'a str, Option<&'a str>, broca_protocol::Usage)> {
-    StepServing::of_record(record)
-        .map(|serving| serving.usage_by_model(episode_model, episode_variant))
-        .unwrap_or_default()
-}
-
-/// Total usage of a durable step, including logs written before iteration totals
-/// were stored in the top-level usage member.
-pub fn total_step_usage(record: &WalRecord) -> Option<broca_protocol::Usage> {
-    match record {
-        WalRecord::ModelStepFinished {
-            usage, fallback, ..
-        } => Some(broca_protocol::usage::step_usage(
-            *usage,
-            fallback.usage_iterations.as_deref(),
-        )),
-        WalRecord::ModelStepRefused {
-            usage,
-            usage_iterations,
-            ..
-        } => Some(broca_protocol::usage::step_usage(
-            *usage,
-            usage_iterations.as_deref(),
-        )),
-        _ => None,
-    }
-}
-
-/// The model that answered a committed step, when it was not the episode's own: the
-/// client-side fallback model the step was routed to.
-pub fn step_origin(fallback: &StepFallback) -> Option<&ModelHandle> {
-    fallback.route.as_ref().map(|route| &route.model)
 }
 
 #[cfg(test)]

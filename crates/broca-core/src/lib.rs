@@ -15,7 +15,7 @@ pub mod admission;
 pub mod attempt_id;
 pub mod billing;
 pub mod budget_kernel;
-pub use budget_kernel::{next_due, DueFiring};
+pub use budget_kernel::DueFiring;
 pub mod cache_warm;
 /// Which copy of a tool call each durable record answers, and the key current readers give it.
 pub mod capability;
@@ -62,7 +62,6 @@ pub use context::state_for_terminal;
 pub use context::StorePageReadError;
 pub use replay::RunAttribution;
 pub mod resume;
-pub mod retention;
 pub mod run;
 pub mod scope_admission;
 pub mod session_refs;
@@ -85,10 +84,10 @@ pub use admission::{
     BudgetReplayStateV1, FirstEpisodeV1, SessionOwnershipV1, BUDGET_REPLAY_STATE_VERSION,
 };
 
-pub use admission::{send_identity_digest, AdmissionCheckpointV1, LastEpisodeV1};
+pub use admission::send_identity_digest;
 pub use billing::{
-    charge_basis_overrides_digest, compute_segments_for_run, imported_run_ids, ChargeBasis,
-    ChargeBasisResolver, ModelShare, SpendSegment, NO_CHARGE_BASIS_OVERRIDES,
+    charge_basis_overrides_digest, compute_segments_for_run, ChargeBasis, ChargeBasisResolver,
+    ModelShare, SpendSegment, NO_CHARGE_BASIS_OVERRIDES,
 };
 pub use billing::{compute_run_billing, RunBilling, TimestampPrecision, USAGE_POLICY_VERSION};
 pub use capability::CapabilityViolation;
@@ -100,10 +99,10 @@ pub use compaction::{
     ProviderCapabilities, ViewReadyInbox, MAX_REPLACEMENT_BYTES,
 };
 pub use context::{
-    emit_lineage_usage_exports, ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage,
-    RunEventBodies, RunIndexState, SessionInventory, SessionReadLineageState, SessionReadMessage,
-    SessionReadPage, SessionReadReason, SessionReadStateKind, SessionRefResolver, SessionRefs,
-    TagLocation, SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
+    ExportCursor, ExportError, ExportFact, ExportIndex, ExportPage, RunEventBodies, RunIndexState,
+    SessionInventory, SessionReadLineageState, SessionReadMessage, SessionReadPage,
+    SessionReadReason, SessionReadStateKind, SessionRefResolver, SessionRefs, TagLocation,
+    SESSION_READ_DEFAULT_LIMIT, SESSION_READ_MAX_LIMIT,
 };
 pub use context::{ModelEntry, ReadView};
 pub use hooks::{HookPlane, HookUnavailable, STEP_TRANSFORM_HOOK_CAP};
@@ -114,8 +113,8 @@ pub use import::{
 pub use lease::{lease_key_for, FileLeaseStore, LeaseError, LeaseHandle, LeaseStore};
 pub use projection::Cursor;
 pub use provider::{Provider, StubProvider};
-pub use queue::pending_submissions;
-pub use queue::{insert_in_drain_order, PendingSubmission};
+
+pub use queue::PendingSubmission;
 pub use render::CANONICAL_RENDERER_VERSION;
 pub use render::{canonical_request_bytes, request_digest, request_digest_hex};
 pub use replay::{
@@ -124,8 +123,7 @@ pub use replay::{
 };
 pub use replay::{LateApprovalView, OpenCallState, ReconciledRunState, ReplayError};
 pub use resume::DeferredCloseKind;
-pub use retention::is_retention_lineage;
-pub use retention::LineageRetention;
+
 pub use scope_admission::{
     decide_scope, AdoptionRefusal, OwnerMismatch, ScopeDecision, ScopeRefusal,
 };
@@ -155,13 +153,12 @@ pub use session_refs::{
 };
 pub use shutdown_seal::SealedAttempt;
 pub use shutdown_seal::ShutdownSeal;
-pub use step_usage::RunUsageProjection;
 pub use stub_plane::StubEvent;
 pub use stub_plane::{StubReply, StubToolPlane};
 pub use tags::LineageTags;
 pub use tool_plane::{BatchCtx, DispatchResult, ToolPlane, ToolPlaneError};
-pub use tool_results::outcome_unknown_result;
-pub use tool_results::{no_dispatch_result, not_dispatched_result};
+
+pub use tool_results::{no_dispatch_result, not_dispatched_result, outcome_unknown_result};
 
 pub mod account_limit_pause;
 pub use account_limit_pause::{

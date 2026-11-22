@@ -10,7 +10,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-mod checkpoint_compat_tests;
 #[cfg(feature = "test-attachments")]
 mod render_tests;
 

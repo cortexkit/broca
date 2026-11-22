@@ -12,41 +12,13 @@ use broca_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub mod attempt;
 mod fact_session;
 pub mod input;
 
 pub use input::{BillingEvent, BillingRecord};
-
-/// When installing a session WAL received from another machine, select its
-/// `RunStarted` ids that are absent from this machine's current session WAL.
-/// `incoming` contains the verified source WAL prefix through the move's frozen
-/// byte offset; `local` contains the WAL that installation will replace, if any.
-/// Durably record the result with [`crate::ExportIndex::record_imported_runs`]
-/// before publishing the received WAL.
-///
-/// This is set membership, not a sequence or timestamp floor. An unfinished local
-/// episode must stay billable if installation fails and the old WAL resumes.
-/// The caller supplies only the verified cut's records through its end offset.
-pub fn imported_run_ids(incoming: &[BillingRecord], local: &[BillingRecord]) -> Vec<RunId> {
-    fn started_ids(records: &[BillingRecord]) -> BTreeSet<String> {
-        records
-            .iter()
-            .filter_map(|frame| match &frame.event {
-                BillingEvent::RunStarted { run_id, .. } => Some(run_id.0.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    started_ids(incoming)
-        .difference(&started_ids(local))
-        .cloned()
-        .map(RunId)
-        .collect()
-}
 
 /// Version of the canonical provider-usage interpretation that counts xAI's sibling
 /// reasoning tokens separately. Runs frozen under earlier policies remain unversioned.
@@ -1177,27 +1149,6 @@ mod tests {
             *retries_used = retries;
         }
         vec![start, handoff, end]
-    }
-
-    #[test]
-    fn imported_run_floor_is_incoming_minus_local_started_ids() {
-        let local = vec![started(1, "z-local-unfinished", Some(900))];
-        let incoming = vec![
-            local[0].clone(),
-            started(5, "a-imported", Some(1)),
-            started(8, "b-imported", None),
-            started(9, "a-imported", Some(1000)),
-            frame(10, BillingEvent::RunPaused { ts_ms: None }),
-        ];
-        assert_eq!(
-            imported_run_ids(&incoming, &local),
-            vec![RunId("a-imported".into()), RunId("b-imported".into())]
-        );
-        assert!(imported_run_ids(&incoming, &incoming).is_empty());
-        assert_eq!(
-            imported_run_ids(&local, &[]),
-            vec![RunId("z-local-unfinished".into())]
-        );
     }
 
     #[test]

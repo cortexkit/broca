@@ -118,16 +118,6 @@ fn capture(capture: &Entry) -> usize {
 }
 
 impl SessionMedia {
-    /// What the engine holds in all: its inline size and [`SessionMedia::held_parts`].
-    pub fn held_bytes(&self) -> usize {
-        size_of::<Self>()
-            + self
-                .held_parts()
-                .iter()
-                .map(|(_, bytes)| bytes)
-                .sum::<usize>()
-    }
-
     /// The heap the engine holds, by part: its table of references, its captures, its lookups
     /// by reference, position and tool call, the captures waiting for or holding protection,
     /// the messages it keeps as skeletons, the references its compaction state may render, and

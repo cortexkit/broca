@@ -139,20 +139,6 @@ pub fn carrier_mode3<'a>(
         .map(|result| &result.tool_call_id)
 }
 
-/// Append `text` to the rendered copy of a tool result. Only text and error outputs carry a
-/// delivery (see [`carrier`]); any other output is left unchanged.
-pub fn append_to_result(result: &mut ToolResult, text: &str) {
-    match &mut result.output {
-        ToolOutput::Text { text: output } => *output = output.appended(text),
-        ToolOutput::Error { message, .. } => message.push_str(text),
-        ToolOutput::Json { .. } | ToolOutput::Denied { .. } => {}
-        // The Rendering contract keeps multipart results in source order, including appended text.
-        ToolOutput::Parts { parts } => {
-            parts.push(broca_protocol::ToolOutputPart::Text { text: text.into() })
-        }
-    }
-}
-
 /// New ride envelopes preserve the native content list; legacy deliveries keep their
 /// original renderer because a resumed model request must not acquire different bytes.
 pub fn append_ride(
@@ -205,49 +191,6 @@ pub(crate) fn append_ride_output(
         }
         ToolOutput::Denied { reason } => *output = ToolOutput::error(rides::append(reason, rides)),
     }
-}
-
-pub fn apply_ride_to_prompt(
-    prompt: &mut [Message],
-    call: &ToolCallId,
-    ride: &broca_records::record::RideMetadata,
-    text: &str,
-) -> bool {
-    if let Some(message) = prompt
-        .iter_mut()
-        .rfind(|message| message.role == Role::Tool)
-    {
-        for block in message.content.iter_mut().rev() {
-            if let ContentBlock::ToolResult(result) = block {
-                if &result.tool_call_id == call {
-                    append_ride(result, ride, text);
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Apply a `tool_result` delivery to the newest tool message of `prompt` that holds the named
-/// result. Returns whether a result was found. Replay calls this at the delivery record, which
-/// follows the batch's `ToolBatchFinished`, so the tool message is the prompt's newest one.
-pub fn apply_to_prompt(prompt: &mut [Message], tool_call_id: &ToolCallId, text: &str) -> bool {
-    for message in prompt.iter_mut().rev() {
-        if message.role != Role::Tool {
-            continue;
-        }
-        for block in &mut message.content {
-            if let ContentBlock::ToolResult(result) = block {
-                if &result.tool_call_id == tool_call_id {
-                    append_to_result(result, text);
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-    false
 }
 
 /// One queued ordered send, as the running turn sees it.
@@ -319,14 +262,6 @@ mod tests {
         }
     }
 
-    fn text_result(id: &str, text: &str) -> ToolResult {
-        ToolResult {
-            tool_call_id: ToolCallId(id.into()),
-            output: ToolOutput::Text { text: text.into() },
-            is_error: false,
-        }
-    }
-
     /// The first possible mode wins; `turn_system` always falls through in this build; a list
     /// without `idle_start` is never chosen on an idle session.
     #[test]
@@ -363,55 +298,6 @@ mod tests {
             choose_mode(&order(&[IdleStart]), Boundary::STEP, true),
             None
         );
-    }
-
-    /// The carrier is the batch's last text or error result; the appended text is applied to
-    /// exactly that one result of the newest tool message.
-    #[test]
-    fn a_tool_result_delivery_appends_to_exactly_one_result() {
-        let json = ToolResult {
-            tool_call_id: ToolCallId("t3".into()),
-            output: ToolOutput::Json {
-                value: serde_json::json!({"a": 1}).into(),
-            },
-            is_error: false,
-        };
-        let results = [text_result("t1", "one"), text_result("t2", "two"), json];
-        assert_eq!(carrier(&results), Some(&ToolCallId("t2".into())));
-        let mut prompt = vec![
-            Message::new(Role::User, vec![ContentBlock::Text { text: "hi".into() }]),
-            Message::new(
-                Role::Tool,
-                results
-                    .iter()
-                    .cloned()
-                    .map(ContentBlock::ToolResult)
-                    .collect(),
-            ),
-        ];
-        assert!(apply_to_prompt(
-            &mut prompt,
-            &ToolCallId("t2".into()),
-            "\n\nnote"
-        ));
-        let ContentBlock::ToolResult(first) = &prompt[1].content[0] else {
-            panic!()
-        };
-        let ContentBlock::ToolResult(second) = &prompt[1].content[1] else {
-            panic!()
-        };
-        assert_eq!(first.output, ToolOutput::Text { text: "one".into() });
-        assert_eq!(
-            second.output,
-            ToolOutput::Text {
-                text: "two\n\nnote".into()
-            }
-        );
-        assert!(!apply_to_prompt(
-            &mut prompt,
-            &ToolCallId("missing".into()),
-            "x"
-        ));
     }
 
     #[test]
@@ -546,63 +432,6 @@ mod ride_v2_tests {
                 },
                 "{}",
                 case["name"]
-            );
-        }
-    }
-
-    #[test]
-    fn rides_v2_keep_old_and_new_multipart_rules() {
-        let source = serde_json::json!([{"image":"opaque"},{"text":"caption"}]);
-        let mut old = ToolResult {
-            tool_call_id: ToolCallId("call".into()),
-            output: ToolOutput::Parts {
-                parts: parts(&source),
-            },
-            is_error: false,
-        };
-        append_to_result(&mut old, "\n\nnote");
-        assert_eq!(
-            old.output,
-            ToolOutput::Parts {
-                parts: parts(
-                    &serde_json::json!([{"image":"opaque"},{"text":"caption"},{"text":"\n\nnote"}])
-                )
-            }
-        );
-        for (input, expected) in [
-            (
-                source,
-                serde_json::json!([{"image":"opaque"},{"text":"caption\n\nnote"}]),
-            ),
-            (
-                serde_json::json!([{"text":"caption"},{"image":"opaque"}]),
-                serde_json::json!([{"text":"caption"},{"image":"opaque"},{"text":"\n\nnote"}]),
-            ),
-        ] {
-            let ride: broca_records::record::RideMetadata = serde_json::from_value(
-                serde_json::json!({"call_key":"log:7","send_id":"send","sender":"sender","forms":["tool_result"],"form":"append"}),
-            )
-            .unwrap();
-            let (call, text) = (ToolCallId("call".into()), "\n\nnote");
-            let mut prompt = vec![Message::new(
-                Role::Tool,
-                vec![ContentBlock::ToolResult(ToolResult {
-                    tool_call_id: call.clone(),
-                    output: ToolOutput::Parts {
-                        parts: parts(&input),
-                    },
-                    is_error: false,
-                })],
-            )];
-            assert!(apply_ride_to_prompt(&mut prompt, &call, &ride, text));
-            let ContentBlock::ToolResult(result) = &prompt[0].content[0] else {
-                unreachable!()
-            };
-            assert_eq!(
-                result.output,
-                ToolOutput::Parts {
-                    parts: parts(&expected)
-                }
             );
         }
     }

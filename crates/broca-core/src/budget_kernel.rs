@@ -1,21 +1,16 @@
 //! Deterministic budget transitions over durable events, shared by admission, replay and live execution.
 
-use broca_protocol::{
-    request::{BudgetConfig, BudgetKind},
-    RunId,
-};
-use broca_records::record::WalRecord;
+use broca_protocol::request::{BudgetConfig, BudgetKind};
 
 use serde::{Deserialize, Serialize};
 
-/// Version of the durable budget state carried by an admission checkpoint.
+/// Version of the budget state's shape.
 pub const BUDGET_REPLAY_STATE_VERSION: u32 = 1;
 
-/// Per-episode budget facts required to resume from a materialized WAL watermark.
-///
-/// `None` on [`crate::LastEpisodeV1`] means a checkpoint predates this state or encountered a
-/// budget record that cannot be attributed unambiguously. Callers must replay the complete WAL
-/// in either case rather than infer a firing history.
+/// A run's tool-call budget so far, so each reminder fires once: how many tool calls the run
+/// made, which of `BudgetConfig::nudges` (reminder texts sent into the run at a tool-call count)
+/// it has sent, and whether the finalize reminder (`finalize_text`, sent at
+/// `finalize_at_tool_calls` to tell the model to finish) has fired.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetReplayStateV1 {
     pub version: u32,
@@ -47,15 +42,6 @@ impl Default for BudgetReplayStateV1 {
     }
 }
 
-/// Borrowed episode context and mutable budget facts. A firing records a threshold, not a
-/// nudge index, so applying it requires the frozen config and the episode identity.
-/// These references do not resolve config or access the WAL.
-pub(crate) struct State<'a> {
-    pub facts: &'a mut BudgetReplayStateV1,
-    pub config: Option<&'a BudgetConfig>,
-    pub run_id: Option<&'a RunId>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A firing the budget has due: its threshold, kind, nudge index and text.
 pub struct Due {
@@ -72,16 +58,6 @@ pub struct Due {
 pub struct DueFiring {
     pub nudge_index: Option<usize>,
     pub text: String,
-}
-
-pub fn next_due(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Option<DueFiring> {
-    decide(state, config)
-        .into_iter()
-        .next()
-        .map(|due| DueFiring {
-            nudge_index: due.index,
-            text: due.text,
-        })
 }
 
 /// Return all outstanding firings in threshold order, with nudges before a tied finalize.
@@ -117,71 +93,4 @@ pub fn decide(state: &BudgetReplayStateV1, config: &BudgetConfig) -> Vec<Due> {
         )
     });
     due
-}
-
-/// Fold one durable event. Invalid firings leave the facts unchanged; callers choose
-/// whether to discard an untrustworthy checkpoint or reject a corrupt replay.
-pub(crate) fn apply(state: State<'_>, record: &WalRecord) -> Result<(), String> {
-    let facts = state.facts;
-    match record {
-        WalRecord::RunStarted { .. } => *facts = BudgetReplayStateV1::fresh(),
-        WalRecord::ModelStepFinished {
-            assistant_message, ..
-        } => {
-            facts.tool_call_count += assistant_message.tool_calls().count() as u64;
-            // The finalize allowance is spent once its model response is durable.
-            facts.finalize_pending = false;
-        }
-        WalRecord::BudgetFired {
-            run_id,
-            kind,
-            threshold,
-            ..
-        } => {
-            let config = state
-                .config
-                .ok_or("BudgetFired has no frozen budget config")?;
-            if state.run_id != Some(run_id) {
-                return Err("BudgetFired run_id does not match the current episode".into());
-            }
-            if facts.tool_call_count < *threshold {
-                return Err(format!(
-                    "BudgetFired threshold {threshold} is early at tool-call count {}",
-                    facts.tool_call_count
-                ));
-            }
-            if facts
-                .budget_last_threshold
-                .is_some_and(|last| *threshold < last)
-            {
-                return Err(format!(
-                    "BudgetFired threshold {threshold} is reordered after threshold {}",
-                    facts.budget_last_threshold.unwrap_or_default()
-                ));
-            }
-            let expected = decide(facts, config)
-                .into_iter()
-                .next()
-                .ok_or("BudgetFired is duplicate or no firing is due")?;
-            if expected.threshold != *threshold || expected.kind != *kind {
-                return Err(format!(
-                    "BudgetFired is out of expected order: expected {:?} at threshold {}",
-                    expected.kind, expected.threshold
-                ));
-            }
-            match expected.index {
-                Some(index) => {
-                    facts.fired_nudge_indices.push(index);
-                    facts.fired_nudge_indices.sort_unstable();
-                }
-                None => {
-                    facts.finalize_fired = true;
-                    facts.finalize_pending = true;
-                }
-            }
-            facts.budget_last_threshold = Some(*threshold);
-        }
-        _ => {}
-    }
-    Ok(())
 }

@@ -7,12 +7,9 @@ use std::sync::Arc;
 
 use broca_protocol::{
     canonical_json_bytes, content::Message, request::SubmissionRequest, BindPrincipal, RunId,
-    SessionScope, SubmissionId, Usage,
+    SessionScope,
 };
-use broca_records::record::RunConfig;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-use crate::PendingSubmission;
+use serde::{Deserialize, Serialize};
 
 fn logical_input(request: &SubmissionRequest) -> std::borrow::Cow<'_, [Message]> {
     if request.content.is_empty() {
@@ -474,55 +471,7 @@ pub fn send_identity_difference_with_conversation_key(
     .or_else(|| inherited_difference(&stored.inherit_frozen, &requested.inherit_frozen))
 }
 
-/// The last episode's coarse durable state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EpisodeDisposition {
-    Running,
-    Paused,
-    Finished,
-}
-
 pub use crate::budget_kernel::{BudgetReplayStateV1, BUDGET_REPLAY_STATE_VERSION};
-
-/// Admission facts for the last episode at a materialization watermark.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LastEpisodeV1 {
-    /// Timed pause evidence restored from a checkpoint; waking still requires validation against the WAL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_limit_pause: Option<Box<broca_records::record::AccountLimitPause>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cancel_at: Option<broca_records::record::RunCancelAt>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_restart: Option<broca_protocol::request::OnRestart>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pause_reason: Option<broca_protocol::PauseReason>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep_warm: Option<broca_protocol::request::KeepWarm>,
-    /// Recorded in the admission checkpoint so later episodes inherit the session's cache marker order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub marker_order_version: Option<u32>,
-    pub run_id: RunId,
-    /// Effective config: the `RunStarted` value plus a valid pre-call refreeze, if present.
-    pub config: RunConfig,
-    pub input: Vec<Message>,
-    pub provider_call_started: bool,
-    pub config_refrozen: bool,
-    pub disposition: EpisodeDisposition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
-    #[serde(default)]
-    pub retries_used: u32,
-    /// Missing means legacy or untrustworthy budget state and must never seed an incremental run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_replay_state: Option<BudgetReplayStateV1>,
-    /// The request identity digest the episode's `RunStarted` recorded, so re-driving the
-    /// episode after a restart keeps the identity a keyed retry is compared against without
-    /// asking the run index. Missing for sends that cannot repeat, for records written before
-    /// the field, and in checkpoints stored before it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_identity_digest: Option<String>,
-}
 
 /// Who has driven a session, folded from every one of its `RunStarted` records.
 ///
@@ -678,174 +627,6 @@ impl SessionOwnershipV1 {
             reservation: None,
         }
     }
-}
-
-/// Track the first frozen model and reasoning-effort settings and whether any episode changed them.
-/// This constant-size history lets unchanged sessions avoid a full WAL read at admission.
-/// Stored in the existing checkpoint JSON, not in a new store table or column.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct EffortHistoryV1 {
-    pub first_config: serde_json::Value,
-    /// Separate presence from JSON null, which is a valid legacy frozen config.
-    pub has_first: bool,
-    pub changed: bool,
-}
-
-/// Version-one admission projection at an exact WAL sequence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AdmissionCheckpointV1 {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recovery_cuts: Vec<broca_records::recovery::RecoveryCut>,
-    /// Reference-only media resume state, omitted for media-free histories. A captured-reference
-    /// index without a valid matching seed requires a named, counted full-replay repair.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media: Option<crate::media_request::DurableMediaSeed>,
-    /// Missing on older checkpoints: reconstruct from the full WAL before extending totals.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head: Option<crate::head::HeadProjection>,
-    /// Whether any deferred call occurred in the complete prefix. Missing means an older
-    /// checkpoint cannot show whether a call before its watermark still needs an answer,
-    /// a withdrawal, or a late execution report.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub has_deferred_calls: Option<bool>,
-    /// Session input-token sum, frozen cap and missing-usage flag, independent of episode count.
-    /// Checkpoints without this field must be rebuilt from the complete WAL before admission.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_budget: Option<crate::input_budget::InputTokenBudget>,
-    /// The session_class label recorded by the session's first send. Absence also
-    /// represents checkpoints created before WALs recorded session classes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_class: Option<String>,
-    /// Sequence of the last record folded into this checkpoint.
-    pub at_seq: u64,
-    pub last_episode: Option<LastEpisodeV1>,
-    /// Durable queued submissions that have not been retracted or consumed, in WAL order.
-    /// Shared ownership keeps reconstruction-snapshot clones from copying full request payloads;
-    /// the custom serde functions preserve the version-one JSON array byte shape.
-    #[serde(
-        serialize_with = "serialize_pending_fifo",
-        deserialize_with = "deserialize_pending_fifo"
-    )]
-    pub pending_fifo: Arc<Vec<PendingSubmission>>,
-    /// Who has driven the session, over its whole history. Always present in a checkpoint this
-    /// build folds. `None` only in a checkpoint stored by a build without this field, whose
-    /// history summary is unknown: admission (`load_prior_wal_snapshot`) and projection then
-    /// fold the complete WAL instead of building on it, and projection stores the repaired
-    /// checkpoint. Serialized last, after every field an older build knows; an older build
-    /// ignores it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ownership: Option<SessionOwnershipV1>,
-    /// Missing means an older checkpoint cannot prove that historical efforts were unchanged.
-    /// Folding every recorded episode keeps only the first config and a sticky change bit,
-    /// so the summary does not grow with the WAL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort_history: Option<EffortHistoryV1>,
-    /// Proof folded from the first run in a complete WAL. Older checkpoints lack
-    /// it and must be repaired from the WAL before projecting a content-bearing tail.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lineage_retention: Option<crate::LineageRetention>,
-    /// Absent is an incomplete summary and must never be repaired from only a WAL tail.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<crate::compaction::CompactionCheckpoint>,
-    /// The lineage's runner-tag state (see [`crate::tags`]), folded from its origin: whether its
-    /// records are tagged and the tag the next part gets. Absent in a checkpoint stored before
-    /// tags existed, or folded from a WAL tail, which must be repaired from the complete WAL
-    /// before a writer may tag anything, or it could reuse a number.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tags: Option<crate::tags::LineageTags>,
-    /// The `DeliveryOrdered` record whose `Queued` record has not been folded yet. The two are
-    /// written in one barrier, but a running turn's own records can land between them, and a
-    /// checkpoint can be cut there; the `Queued` record takes its order from here when it comes.
-    ///
-    /// The session's actor writes the pair back to back, so a record only the actor writes
-    /// (`RunStarted`, `Queued`, `Retracted`, `Steered`, another `DeliveryOrdered`) arriving first
-    /// means the `Queued` record was lost to a torn tail: the entry is dropped then, and never
-    /// outlives the next thing the session's actor writes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_order: Option<StagedOrder>,
-    /// The complete WAL's reservation fold, including measurements before the store watermark.
-    /// Missing on older checkpoints; a tail alone cannot recover an earlier measured request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_reservation: Option<crate::output_reservation::OutputReservationHistory>,
-    /// Whether this complete prefix contains any model attempt, across all episodes.
-    /// Missing on older checkpoints means unknown, never proof that no request was sent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub has_model_attempt: Option<bool>,
-    /// The newest run's tool set and whether any run ever changed it, so an append admitted
-    /// from this checkpoint on a route that binds reasoning to its prefix knows where kept
-    /// signed reasoning stops (`crate::signed_floor`). Unknown on a checkpoint stored before the
-    /// field existed or folded from a WAL tail: admission then folds the complete WAL, and never
-    /// reads the absence as "unchanged". A digest only, never tool text. Serialized last, so an
-    /// older build, whose decoder ignores members it doesn't know, reads the rest unchanged.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::signed_floor::ToolSetHistory::is_unknown"
-    )]
-    pub tool_set_history: crate::signed_floor::ToolSetHistory,
-}
-
-/// A `DeliveryOrdered` record set aside for the `Queued` record that follows it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StagedOrder {
-    pub submission_id: SubmissionId,
-    pub order: broca_protocol::DeliveryOrder,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sent_by: Option<broca_protocol::BindPrincipal>,
-}
-
-impl AdmissionCheckpointV1 {
-    pub fn empty() -> Self {
-        Self {
-            recovery_cuts: Vec::new(),
-            media: None,
-            head: Some(crate::head::HeadProjection::default()),
-            has_deferred_calls: Some(false),
-            input_budget: Some(crate::input_budget::InputTokenBudget::default()),
-            session_class: None,
-            at_seq: 0,
-            last_episode: None,
-            ownership: Some(SessionOwnershipV1::default()),
-            effort_history: Some(EffortHistoryV1::default()),
-            lineage_retention: Some(crate::LineageRetention::Unstarted),
-            pending_fifo: Arc::new(Vec::new()),
-            compaction: Some(crate::compaction::CompactionCheckpoint::None),
-            tags: Some(crate::tags::LineageTags::unstarted()),
-            pending_order: None,
-            output_reservation: Some(
-                crate::output_reservation::OutputReservationHistory::default(),
-            ),
-            has_model_attempt: Some(false),
-            tool_set_history: crate::signed_floor::ToolSetHistory::Known(Default::default()),
-        }
-    }
-}
-
-impl Default for AdmissionCheckpointV1 {
-    fn default() -> Self {
-        let mut checkpoint = Self::empty();
-        // A default value is not proof that a historical prefix contained no attempts.
-        checkpoint.has_model_attempt = None;
-        checkpoint
-    }
-}
-
-fn serialize_pending_fifo<S>(
-    pending: &Arc<Vec<PendingSubmission>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    pending.as_ref().serialize(serializer)
-}
-
-fn deserialize_pending_fifo<'de, D>(
-    deserializer: D,
-) -> Result<Arc<Vec<PendingSubmission>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Vec::<PendingSubmission>::deserialize(deserializer).map(Arc::new)
 }
 
 #[cfg(test)]

@@ -287,7 +287,7 @@ mod tests {
     use super::*;
     use broca_protocol::request::{CallOptions, ServiceTier};
     use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
-    use broca_provider::wire::{CacheClass, CachePolicy, CacheTtl, MarkerSyntax, WireFamily};
+    use broca_provider::wire::{CacheClass, CacheTtl, WireFamily};
     use cortexkit_role_llm_runner::cache::{Cache, Ttl};
     use sha2::{Digest, Sha256};
 
@@ -853,56 +853,6 @@ mod tests {
             }
         }
         assert_eq!(count_cache_control(&body), 1);
-    }
-
-    #[test]
-    fn queued_prompt_block_boundary_renders_identically_after_durable_round_trip() {
-        let mut params = make_send_params(None, "");
-        params.prompt_blocks = Some(vec!["invariant head".into(), "varying tail".into()]);
-        let request = params
-            .into_send_request(BindIdentity::new("/tmp", "h", "s"), RunId("r".into()))
-            .unwrap();
-        let submission = *request.request;
-        let mut frozen = anthropic_frozen_config("claude-opus-4-8");
-        frozen.cache = Some(CachePolicy {
-            version: 1,
-            class: CacheClass::Markers {
-                syntax: MarkerSyntax::AnthropicCacheControl,
-                ttl: CacheTtl::FiveMinutes,
-                max_breakpoints: 4,
-                lookback_blocks: 20,
-                tail: None,
-                omit_ttl: false,
-            },
-        });
-        let fresh = AnthropicMessages.shape(&frozen, &CallOptions::new(submission.input.clone()));
-        let queued = broca_records::record::WalRecord::Queued {
-            message_marks: None,
-            sent_by: None,
-            written_at_ms: None,
-            retention: None,
-            ts_ms: None,
-            hooks: None,
-            title: None,
-            keep_warm: None,
-            conversation_key: None,
-            send_id: None,
-            delivery: None,
-            submission_id: broca_protocol::SubmissionId("queued".into()),
-            request: Box::new(submission),
-            request_identity_digest: None,
-            principal: None,
-        };
-        let durable_bytes = serde_json::to_vec(&queued).unwrap();
-        let replayed: broca_records::record::WalRecord =
-            serde_json::from_slice(&durable_bytes).unwrap();
-        let drained = broca_core::pending_submissions(&[replayed])
-            .pop()
-            .expect("queued request survives replay");
-        let after_drain =
-            AnthropicMessages.shape(&frozen, &CallOptions::new(drained.request.input));
-
-        assert_eq!(after_drain, fresh);
     }
 
     #[test]

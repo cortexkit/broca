@@ -122,45 +122,7 @@ pub enum RunIndexState {
     TransformUnavailable,
 }
 
-impl RunIndexState {
-    /// Parse a stored state string (the inverse of [`as_str`](Self::as_str)).
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "active" => RunIndexState::Active,
-            "paused" => RunIndexState::Paused,
-            "interrupted" => RunIndexState::Interrupted,
-            "completed" => RunIndexState::Completed,
-            "max_steps" => RunIndexState::MaxSteps,
-            "budget_exhausted" => RunIndexState::BudgetExhausted,
-            "context_ceiling" => RunIndexState::ContextCeiling,
-            "cancelled" => RunIndexState::Cancelled,
-            "error" => RunIndexState::Error,
-            "transform_unavailable" => RunIndexState::TransformUnavailable,
-            _ => return None,
-        })
-    }
-
-    /// The wire/storage string for this state.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RunIndexState::Active => "active",
-            RunIndexState::Paused => "paused",
-            RunIndexState::Interrupted => "interrupted",
-            RunIndexState::Completed => "completed",
-            RunIndexState::MaxSteps => "max_steps",
-            RunIndexState::BudgetExhausted => "budget_exhausted",
-            RunIndexState::ContextCeiling => "context_ceiling",
-            RunIndexState::Cancelled => "cancelled",
-            RunIndexState::Error => "error",
-            RunIndexState::TransformUnavailable => "transform_unavailable",
-        }
-    }
-
-    /// Whether this state is terminal: the run reached an end.
-    pub fn is_terminal(&self) -> bool {
-        !matches!(self, RunIndexState::Active | RunIndexState::Paused)
-    }
-}
+impl RunIndexState {}
 
 /// A source-bound position in the daemon-wide usage export stream.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -283,35 +245,6 @@ pub trait ExportIndex: Send + Sync {
     fn source_epoch(&self) -> u64;
 
     fn source_instance_id(&self) -> &str;
-}
-
-/// Export every terminal run in this WAL before deleting its lineage, including
-/// runs with existing facts. Passing the whole lineage preserves later warm facts;
-/// the backend's immutable fact-id uniqueness makes repeating emission harmless.
-/// This deliberately does not consult the missing-facts outbox or run index.
-pub fn emit_lineage_usage_exports(
-    index: &dyn ExportIndex,
-    records: &[crate::billing::BillingRecord],
-    resolver: &dyn ChargeBasisResolver,
-) -> Result<usize, ExportError> {
-    use crate::billing::BillingEvent;
-    let mut current = None;
-    let mut emitted = std::collections::HashSet::new();
-    for frame in records {
-        match &frame.event {
-            BillingEvent::RunStarted { run_id, .. } => current = Some(run_id),
-            BillingEvent::RunFinished { .. } => {
-                let Some(run_id) = current.take() else {
-                    continue;
-                };
-                if emitted.insert(run_id.clone()) {
-                    index.emit_run(records, run_id, resolver)?;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(emitted.len())
 }
 
 /// One message returned by `session.read`: the normal serialized message plus its durable

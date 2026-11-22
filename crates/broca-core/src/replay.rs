@@ -20,7 +20,6 @@
 //!  - no Prepared, intent or terminal → safe to re-dispatch.
 
 pub use crate::held_calls::HeldCallsProjection;
-pub use crate::step_usage::RunUsageProjection;
 pub use crate::step_usage::{
     content_timing_intervals, reported_step_usage, step_finish, ModelShare, RunUsageSteps,
     StepServed,

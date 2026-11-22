@@ -16,8 +16,7 @@
 //! The object is the store's own encoding, versioned by an envelope: `MediaIndexObject` holds the
 //! version and the encoded body, so a reader tells a version it doesn't know from damage before
 //! decoding the body. It is sealed under the session's key with its name, as an import's id map
-//! is (see `import`). It is not the JSON media checkpoint the old storage keeps in its own log
-//! (`broca_core`'s `MediaCheckpoint`), and nothing reads one as the other.
+//! is (see `import`).
 
 use broca_protocol::content::{MediaRef, Role};
 use broca_protocol::ids::ToolCallId;
