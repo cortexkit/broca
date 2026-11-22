@@ -26,15 +26,15 @@ class CatalogApiFence(unittest.TestCase):
         for name in ("install_for_test", "install_parsed_for_test"):
             source = f"pub fn probe() {{ let _ = broca_catalog::CatalogCache::{name}; }}"
             with self.subTest(api=name):
-                admitted = api_probe("broca-catalog", source, features=("live", "test-support"))
+                admitted = api_probe("broca-catalog", source, features=("test-support",))
                 self.assertEqual(admitted.returncode, 0, admitted.stderr)
-                refused = api_probe("broca-catalog", source, features=("live",))
+                refused = api_probe("broca-catalog", source)
                 self.assertNotEqual(refused.returncode, 0, refused.stderr)
                 self.assertIn(name, refused.stderr)
                 self.assertIn("E0599", refused.stderr)
 
     def test_catalog_test_support_is_forbidden_without_debug_assertions(self):
-        result, _ = build("broca-catalog", features=("live", "test-support"), release=True)
+        result, _ = build("broca-catalog", features=("test-support",), release=True)
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("catalog test-support cannot be enabled in a release build", result.stdout)
 
