@@ -39,7 +39,9 @@ use crate::late_results_store::{
 mod stored;
 pub(crate) use stored::is_notice_send_id;
 use stored::StoredLineage;
-pub use stored::{notice_send_id, rebuild_store_from_sessions_with_progress};
+pub use stored::{
+    held_call_records, notice_send_id, rebuild_store_from_sessions_with_progress, HeldCallRecords,
+};
 
 /// How often a started feed is pulled.
 pub const PULL_INTERVAL: Duration = Duration::from_secs(3);
@@ -267,6 +269,11 @@ impl Puller {
 pub struct LateResultsIntake {
     store: Arc<LateResultsStore>,
     session_store: Mutex<Option<Arc<crate::store_open::StoreRuntime>>>,
+    /// The registry whose open actors answer reads of their sessions, once installed (see
+    /// [`Self::set_registry`]). A puller polls every session it holds calls for each round, and
+    /// a running session moves between rounds, so reading it as stored would load the whole
+    /// view again each time.
+    registry: Mutex<Option<Arc<crate::LineageRegistry>>>,
     /// The module id the daemon attests for this process: the feed's custodian. Without one no
     /// plain key is sent and no feed is pulled.
     consumer_module: String,
@@ -298,6 +305,7 @@ impl LateResultsIntake {
         Arc::new(Self {
             store,
             session_store: Mutex::new(None),
+            registry: Mutex::new(None),
             consumer_module: consumer_module.into(),
             delivery,
             feed,
@@ -311,6 +319,18 @@ impl LateResultsIntake {
     /// Install the reader that owns session-store sessions before recovering their feeds.
     pub fn set_session_store(&self, runtime: Arc<crate::store_open::StoreRuntime>) {
         *self.session_store.lock().expect("session store") = Some(runtime);
+    }
+
+    /// Install the registry whose open actors answer the intake's reads of their sessions from
+    /// memory. Until it is installed, every session is read as stored.
+    pub fn set_registry(&self, registry: Arc<crate::LineageRegistry>) {
+        *self.registry.lock().expect("registry") = Some(registry);
+    }
+
+    /// Read every session as stored again, as before [`Self::set_registry`].
+    #[cfg(test)]
+    pub(crate) fn forget_registry(&self) {
+        *self.registry.lock().expect("registry") = None;
     }
 
     /// Mark the store as being rebuilt (or done).
@@ -446,6 +466,7 @@ impl LateResultsIntake {
         rows: &[RegistrationRow],
     ) -> LineageView {
         let runtime = self.session_store.lock().expect("session store").clone();
+        let registry = self.registry.lock().expect("registry").clone();
         let source = match runtime {
             // The store isn't installed yet: nothing about the session is known.
             None => Source::Unknown,
@@ -455,7 +476,9 @@ impl LateResultsIntake {
                     .filter(|row| row.call.bind == registration.bind)
                     .map(|row| row.call.call_key.clone())
                     .collect();
-                match StoredLineage::read(&runtime, &registration.bind, keys).await {
+                match StoredLineage::read(&runtime, registry.as_deref(), &registration.bind, keys)
+                    .await
+                {
                     Some(stored) => Source::Stored(stored),
                     // A session with a registered call ran, so a store that holds no head for
                     // it deleted it: nothing of it can be delivered any more.
@@ -1211,7 +1234,7 @@ pub(crate) async fn settled_watches(
     bind: &BindIdentity,
     keys: &[String],
 ) -> Option<Vec<SettledWatch>> {
-    let lineage = StoredLineage::read(runtime, bind, keys.iter().cloned().collect()).await?;
+    let lineage = StoredLineage::read(runtime, None, bind, keys.to_vec()).await?;
     if matches!(lineage, StoredLineage::Unreadable) {
         return None;
     }

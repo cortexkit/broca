@@ -1000,7 +1000,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
     // Late results reach a run through its session's actor, so delivery waits for the registry.
+    // The intake reads an open session through its actor too, from memory.
     held_resumer.bind(registry.clone());
+    held_runtime.intake.set_registry(registry.clone());
     // Boot recovery for provider-held calls runs off the startup path, once the dependency
     // routes are registered: a lost intake store is rebuilt from the live WALs first, every
     // registered session is opened so its open-time recovery runs, and then each module that

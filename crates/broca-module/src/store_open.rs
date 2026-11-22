@@ -607,7 +607,6 @@ impl StoreRuntime {
         key: &BindIdentity,
         request: crate::store_reads::StoreReadRequest,
     ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
-        use crate::store_reads::{execute, ReadContext, StoreReadOutcome};
         let run = match &request {
             crate::store_reads::StoreReadRequest::RunAdmission(run)
             | crate::store_reads::StoreReadRequest::RunStatus(run)
@@ -645,65 +644,11 @@ impl StoreRuntime {
                 Box::pin(registry.actor_for_mode(key, None, None, true)).await?;
             }
         }
-        // A read resolves setup parts in the root and mode of the session it reads.
-        let context = |view: &crate::store_read::StoredView<LocalBackend>,
-                       held: bool,
-                       open: bool,
-                       live_step,
-                       entry_speaks_for| ReadContext {
-            labels: crate::store_awaits::Labels(Some(self.executor.clone())),
-            token_counts: None,
-            parts: self.parts_for(class, view.head().cipher()),
-            held,
-            open,
-            settled: Some((self.settled_runs(), &addr)),
-            session_name: &key.session,
-            live_step,
-            // A failed projection remains the page's refusal, after its request/facts checks.
-            stream_head: view.stream_head().ok(),
-            entry_speaks_for,
-        };
-        for _ in 0..POSITION_TRIES {
-            let Some(handle) = registry.open_handle(key) else {
-                break;
-            };
-            let (reply, answer) = tokio::sync::oneshot::channel();
-            let command = crate::actor::LineageCmd::StoreRead {
-                request: Box::new(request.clone()),
-                reply,
-            };
-            let outcome = match handle.send(command).await {
-                Ok(()) => answer.await.ok(),
-                Err(_) => None,
-            };
-            match outcome {
-                Some(StoreReadOutcome::Served(reply)) => return Ok(Some(*reply)),
-                Some(StoreReadOutcome::Refused(error)) => return Err(error),
-                Some(StoreReadOutcome::Stored {
-                    position,
-                    live_step,
-                    entry_speaks_for,
-                }) => match if let Some(view) =
-                    probed.as_ref().filter(|view| view.position() == position)
-                {
-                    Ok(Arc::clone(view))
-                } else {
-                    self.view_at(key, class, position).await
-                } {
-                    Ok(view) => {
-                        let counts = self.views.token_counts(&addr);
-                        let mut context =
-                            context(&view, true, true, live_step.as_ref(), entry_speaks_for);
-                        context.token_counts = Some(&counts);
-                        return Ok(Some(execute(&view, &context, &request).await));
-                    }
-                    // The actor sealed since it answered: ask it again.
-                    Err(SessionError::Moved) => continue,
-                    Err(error) => return Err(view_error(error).into()),
-                },
-                // The actor closed under the read: read the session as no actor holds it.
-                Some(StoreReadOutcome::Reopen) | None => break,
-            }
+        if let Some(answer) = self
+            .read_by_actor(registry, key, class, &request, probed.as_ref())
+            .await
+        {
+            return answer.map(Some);
         }
         // The recovery probe already loaded this immutable position. Recheck its position,
         // not its contents, so a view too large to cache is still loaded only once per read.
@@ -733,20 +678,149 @@ impl StoreRuntime {
             // snapshot; a later read will reopen it through the same barrier.
             return Err(view_error(SessionError::NeedsRecovery).into());
         }
-        let slot = registry.slot_state(key);
-        // No actor answered, so none holds a Setup: a compaction read asks the catalog.
-        let attribution =
-            crate::store_entries::EntryAttribution::Catalog(self.executor.compaction_plane());
+        Ok(Some(
+            self.read_stored(key, class, &view, registry.slot_state(key), &request)
+                .await,
+        ))
+    }
+
+    /// Serves `request`, a read broca makes for itself (see `StoreReadRequest::is_internal`), on
+    /// the session `key`: by its store actor, from memory, when the `registry` holds one open,
+    /// else from the session as stored. Unlike [`read`](Self::read) it checks no expiry and
+    /// opens no actor for a recovery: a session that needs one refuses, and the caller reads it
+    /// again later. An actor that refuses the read leaves it to the session as stored. `None`
+    /// for a session the store doesn't hold.
+    pub(crate) async fn read_own(
+        &self,
+        registry: Option<&crate::LineageRegistry>,
+        key: &BindIdentity,
+        request: &crate::store_reads::StoreReadRequest,
+    ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
+        let Some(class) = self.class_of(key)? else {
+            return Ok(None);
+        };
+        if let Some(registry) = registry {
+            if let Some(Ok(reply)) = self
+                .read_by_actor(registry, key, class, request, None)
+                .await
+            {
+                return Ok(Some(reply));
+            }
+        }
+        let Some(view) = self.current_view_in(key, class).await.map_err(view_error)? else {
+            return Ok(None);
+        };
+        let slot = registry.and_then(|registry| registry.slot_state(key));
+        Ok(Some(
+            self.read_stored(key, class, &view, slot, request).await,
+        ))
+    }
+
+    /// Asks the store actor of the session `key`, kept in the root of `class`, to serve
+    /// `request`: from memory, or from the session as stored at the position the actor names
+    /// when the read needs history it doesn't hold (`probed` when that is where it was loaded).
+    /// `None` when no actor holds the session or it closed before answering, so the session is
+    /// read as no actor holds it.
+    async fn read_by_actor(
+        &self,
+        registry: &crate::LineageRegistry,
+        key: &BindIdentity,
+        class: StorageClass,
+        request: &crate::store_reads::StoreReadRequest,
+        probed: Option<&crate::store_read::StoredLocalView>,
+    ) -> Option<Result<crate::store_reads::StoreReadReply, crate::serve::ServeError>> {
+        use crate::store_reads::{execute, StoreReadOutcome};
+        let addr = broca_core::session_addr(key);
+        for _ in 0..POSITION_TRIES {
+            let handle = registry.open_handle(key)?;
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let command = crate::actor::LineageCmd::StoreRead {
+                request: Box::new(request.clone()),
+                reply,
+            };
+            let outcome = match handle.send(command).await {
+                Ok(()) => answer.await.ok(),
+                Err(_) => None,
+            };
+            match outcome {
+                Some(StoreReadOutcome::Served(reply)) => return Some(Ok(*reply)),
+                Some(StoreReadOutcome::Refused(error)) => return Some(Err(error)),
+                Some(StoreReadOutcome::Stored {
+                    position,
+                    live_step,
+                    entry_speaks_for,
+                }) => match if let Some(view) = probed.filter(|view| view.position() == position) {
+                    Ok(Arc::clone(view))
+                } else {
+                    self.view_at(key, class, position).await
+                } {
+                    Ok(view) => {
+                        let counts = self.views.token_counts(&addr);
+                        let mut context = self.read_context(key, &addr, class, &view);
+                        context.held = true;
+                        context.open = true;
+                        context.live_step = live_step.as_ref();
+                        context.entry_speaks_for = entry_speaks_for;
+                        context.token_counts = Some(&counts);
+                        return Some(Ok(execute(&view, &context, request).await));
+                    }
+                    // The actor sealed since it answered: ask it again.
+                    Err(SessionError::Moved) => continue,
+                    Err(error) => return Some(Err(view_error(error).into())),
+                },
+                // The actor closed under the read: read the session as no actor holds it.
+                Some(StoreReadOutcome::Reopen) | None => return None,
+            }
+        }
+        None
+    }
+
+    /// Serves `request` from `view`, the session `key` as stored in the root of `class`, whose
+    /// registry `slot` (`registry.slot_state`) tells a live run from one a crash cut off.
+    async fn read_stored(
+        &self,
+        key: &BindIdentity,
+        class: StorageClass,
+        view: &crate::store_read::StoredView<LocalBackend>,
+        slot: Option<&'static str>,
+        request: &crate::store_reads::StoreReadRequest,
+    ) -> crate::store_reads::StoreReadReply {
+        let addr = broca_core::session_addr(key);
         let counts = self.views.token_counts(&addr);
-        let mut context = context(
-            &view,
-            slot.is_some(),
-            slot == Some("open"),
-            None,
-            attribution,
-        );
+        let mut context = self.read_context(key, &addr, class, view);
+        context.held = slot.is_some();
+        context.open = slot == Some("open");
         context.token_counts = Some(&counts);
-        Ok(Some(execute(&view, &context, &request).await))
+        crate::store_reads::execute(view, &context, request).await
+    }
+
+    /// What a read of `view`, the session `key` at address `addr` in the root of `class`, needs
+    /// besides the session, as no actor holds it: the caller sets what an actor knows.
+    fn read_context<'a>(
+        &'a self,
+        key: &'a BindIdentity,
+        addr: &'a str,
+        class: StorageClass,
+        view: &crate::store_read::StoredView<LocalBackend>,
+    ) -> crate::store_reads::ReadContext<'a> {
+        crate::store_reads::ReadContext {
+            labels: crate::store_awaits::Labels(Some(self.executor.clone())),
+            token_counts: None,
+            // A read resolves setup parts in the root and mode of the session it reads.
+            parts: self.parts_for(class, view.head().cipher()),
+            held: false,
+            open: false,
+            settled: Some((self.settled_runs(), addr)),
+            session_name: &key.session,
+            live_step: None,
+            // A stream head the view couldn't project is left for the page to project again, so
+            // that failure refuses the page, after its request and facts checks.
+            stream_head: view.stream_head().ok(),
+            // No actor answered, so none holds a Setup: a compaction read asks the catalog.
+            entry_speaks_for: crate::store_entries::EntryAttribution::Catalog(
+                self.executor.compaction_plane(),
+            ),
+        }
     }
 
     /// Opens the session `key` as the actor for registry slot `gen`: creating it in the root of

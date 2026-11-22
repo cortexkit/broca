@@ -37,11 +37,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         if !request.is_authorization() {
             // Flush before caller reads so their subscribe cursor includes the durable controls
-            // projected from every returned record.
+            // projected from every returned record. Broca's own reads take no cursor, so they
+            // leave the subscriber projection unseeded.
             if let Some(refused) = crate::store_reads::durable_for_read(&mut self.session).await {
                 return refused;
             }
-            if let Some(fanout) = self.fanout.as_mut() {
+            if let Some(fanout) = self.fanout.as_mut().filter(|_| !request.is_internal()) {
                 fanout.ensure_seeded(&self.session);
             }
         }

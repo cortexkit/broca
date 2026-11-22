@@ -102,6 +102,10 @@ pub enum StoreReadRequest {
     Baseline,
     /// The applied manifest and dated requests under it, without opening an actor.
     PlanView,
+    /// The ledger records the late-results intake classifies the provider-held calls named by
+    /// `call_keys` by (see `late_results_puller::stored::held_call_records`). Broca reads it for
+    /// itself, for no caller.
+    HeldCalls { call_keys: Vec<String> },
 }
 
 impl StoreReadRequest {
@@ -112,6 +116,12 @@ impl StoreReadRequest {
                 | Self::AuthorizationSubmissionSender(_)
                 | Self::AuthorizationRead(_)
         )
+    }
+
+    /// Whether broca reads it for itself: it needs durable records like a caller's read, but
+    /// no subscribe cursor comes with its answer, so it doesn't seed the subscriber projection.
+    pub(crate) fn is_internal(&self) -> bool {
+        matches!(self, Self::HeldCalls { .. })
     }
 }
 
@@ -186,6 +196,7 @@ pub enum StoreReadReply {
     /// `None` before the session's first run.
     Baseline(Result<Option<Box<crate::store_plan_change::BaselineFacts>>, String>),
     PlanView(Result<broca_wire::plan_view::PlanViewResponse, crate::store_plan_view::Error>),
+    HeldCalls(Result<crate::late_results_puller::HeldCallRecords, String>),
 }
 
 /// A medium a record of the session names: its reference, and its bytes or why they couldn't be
@@ -427,6 +438,11 @@ pub async fn execute<B: SessionBackend>(
         StoreReadRequest::PlanView => {
             StoreReadReply::PlanView(crate::store_plan_view::build(session, ctx.parts).await)
         }
+        StoreReadRequest::HeldCalls { call_keys } => StoreReadReply::HeldCalls(
+            crate::late_results_puller::held_call_records(session, call_keys)
+                .await
+                .map_err(|error| format!("{error:?}")),
+        ),
     }
 }
 

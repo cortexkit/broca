@@ -1,8 +1,10 @@
 //! Late-result eligibility comes from the session's own durable records, not a WAL projection.
 
 use super::*;
+use broca_session_store::backend::SessionBackend;
 use broca_session_store::fold::operations::{Resolution, Run};
 use broca_session_store::record::{CallOutcome, Record, ToolHeld, ToolIntent};
+use broca_session_store::session::{Session, SessionError};
 
 /// Extend a lost-database rebuild with every backup class's `broca-session-store` inventory.
 /// Only the latest open batch can still accept an answer; read its durable dispatch records
@@ -213,44 +215,68 @@ pub fn is_notice_send_id(send_id: &str) -> bool {
     send_id.starts_with(NOTICE_SEND_ID_PREFIX)
 }
 
+/// The records the intake classifies a session's registered calls by: the session's ledger from
+/// the run start of the run that made the oldest of them on, oldest first, and the session's
+/// latest run as its records fold it.
+#[derive(Debug)]
+pub struct HeldCallRecords {
+    records: Vec<(u64, Record)>,
+    run: Option<Box<Run>>,
+}
+
+/// The [`HeldCallRecords`] of the calls `call_keys` names in `session`. The read walks the ledger
+/// back from its newest record and stops at the run start of the oldest call's run: it holds
+/// every record of the runs the calls were made in, and nothing earlier.
+pub async fn held_call_records<B: SessionBackend>(
+    session: &Session<B>,
+    call_keys: &[String],
+) -> Result<HeldCallRecords, SessionError> {
+    let mut keys: HashSet<&str> = call_keys.iter().map(String::as_str).collect();
+    let mut oldest_run = None;
+    let mut records = session
+        .ledger_tail_until(|record| match record {
+            Record::ToolIntent(intent) => {
+                if intent
+                    .call_key
+                    .as_deref()
+                    .is_some_and(|key| keys.remove(key))
+                    && keys.is_empty()
+                {
+                    oldest_run = Some(intent.run_id.clone());
+                }
+                false
+            }
+            Record::RunStart(start) => oldest_run.as_ref() == Some(&start.run_id),
+            _ => false,
+        })
+        .await?;
+    records.reverse();
+    Ok(HeldCallRecords {
+        records,
+        run: session.operations.run.clone().map(Box::new),
+    })
+}
+
 impl StoredLineage {
+    /// The session `bind` as the intake classifies its registered calls `keys`: `None` when the
+    /// store holds no session there. An open session's actor answers from memory when the
+    /// `registry` is given; otherwise the session is read as stored.
     pub(super) async fn read(
         runtime: &crate::store_open::StoreRuntime,
+        registry: Option<&crate::LineageRegistry>,
         bind: &BindIdentity,
-        mut keys: HashSet<String>,
+        keys: Vec<String>,
     ) -> Option<Self> {
-        match runtime.current_view(bind).await {
+        let request = crate::store_reads::StoreReadRequest::HeldCalls { call_keys: keys };
+        match runtime.read_own(registry, bind, &request).await {
             Ok(None) => None,
-            Ok(Some(view)) => {
-                // Stop at the oldest registered intent's run boundary. The shared snapshot
-                // must include every key it classifies, but no earlier runs or transcript.
-                let mut oldest_run = None;
-                let records = view
-                    .ledger_tail_until(|record| match record {
-                        Record::ToolIntent(intent) => {
-                            if intent.call_key.as_ref().is_some_and(|key| keys.remove(key))
-                                && keys.is_empty()
-                            {
-                                oldest_run = Some(intent.run_id.clone());
-                            }
-                            false
-                        }
-                        Record::RunStart(start) => oldest_run.as_ref() == Some(&start.run_id),
-                        _ => false,
-                    })
-                    .await;
-                Some(match records {
-                    Ok(mut records) => {
-                        records.reverse();
-                        Self::Readable {
-                            records,
-                            run: view.operations.run.clone().map(Box::new),
-                        }
-                    }
-                    Err(_) => Self::Unreadable,
+            Ok(Some(crate::store_reads::StoreReadReply::HeldCalls(Ok(held)))) => {
+                Some(Self::Readable {
+                    records: held.records,
+                    run: held.run,
                 })
             }
-            Err(_) => Some(Self::Unreadable),
+            Ok(Some(_)) | Err(_) => Some(Self::Unreadable),
         }
     }
 

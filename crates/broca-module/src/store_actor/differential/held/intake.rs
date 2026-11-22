@@ -138,6 +138,7 @@ impl Intake {
         });
         let intake = LateResultsIntake::new(store.clone(), "broca", delivery.clone(), feed.clone());
         intake.set_session_store(side.registry.store_runtime().unwrap());
+        intake.set_registry(Arc::new(side.registry.clone()));
         Self {
             intake,
             feed,
@@ -516,6 +517,72 @@ async fn new_storage_feed_resumes_held_run_and_duplicate_is_noop(cipher: Cipher)
     resumes(true, cipher).await;
 }
 
+/// While a session's actor is open, the intake reads its held calls from the actor's memory and
+/// loads no view of the session: a running session moves between pulls, so a view loaded for one
+/// pull would be stale by the next and load again.
+#[tokio::test]
+async fn open_session_held_calls_are_read_from_its_actor() {
+    let side = Side::new(
+        true,
+        Cipher::XChaCha20Poly1305,
+        vec![
+            super::super::super::tests::read_step("m1"),
+            super::super::super::tests::text_step("m2", "done"),
+        ],
+    )
+    .await;
+    side.send().await;
+    side.idle().await;
+    let rig = Intake::new(&side).await;
+    assert!(
+        side.registry.open_handle(&side.key).is_some(),
+        "the held run's actor stays open"
+    );
+    let runtime = side.registry.store_runtime().unwrap();
+    let loads = || runtime.views().memory(|_| 0).loads.unwrap();
+    let before = loads();
+    assert!(
+        rig.intake.module_holds_calls("tools").await.unwrap(),
+        "the held call keeps the feed"
+    );
+    let request = crate::store_reads::StoreReadRequest::HeldCalls {
+        call_keys: vec![rig.key.clone()],
+    };
+    let held = |reply| match reply {
+        Some(crate::store_reads::StoreReadReply::HeldCalls(Ok(held))) => format!("{held:?}"),
+        _ => panic!("the session's held calls must read"),
+    };
+    let from_actor = held(
+        runtime
+            .read_own(Some(&side.registry), &side.key, &request)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        loads(),
+        before,
+        "the open actor answers, so no view of the session loads"
+    );
+    // The actor's answer is the one the session as stored gives.
+    let as_stored = held(runtime.read_own(None, &side.key, &request).await.unwrap());
+    assert_eq!(from_actor, as_stored);
+    let before = loads();
+    rig.tick().await;
+    assert_eq!(
+        rig.delivery.calls.load(Ordering::SeqCst),
+        1,
+        "the feed delivers the held answer"
+    );
+    assert_eq!(
+        loads(),
+        before,
+        "the pull classifies the entry from the open actor too"
+    );
+    side.idle().await;
+    assert_eq!(side.result().await["state"], "completed");
+    assert!(side.registry.stop_and_seal().await);
+}
+
 #[tokio::test]
 async fn encrypted_cancelled_held_run_settles_late_feed_without_delivery_alike() {
     use broca_session_store::record::{Record, Stream};
@@ -791,6 +858,10 @@ async fn unreadable_new_storage_blocks_feed_and_retirement() {
     .await
     .unwrap();
     rig.intake.set_session_store(Arc::new(unloaded));
+    // The side's registry still holds the session open under a store that reads it. A store
+    // that can't read the session never has an actor open on it, so the intake reads it as
+    // stored, through the store that can't.
+    rig.intake.forget_registry();
     rig.tick().await;
     assert_eq!(rig.delivery.calls.load(Ordering::SeqCst), 0);
     assert!(rig.feed.acks.lock().unwrap().is_empty());
