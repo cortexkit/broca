@@ -1,7 +1,8 @@
 //! Ordered provider-held call status, independent of the run loop driving it.
 
+use broca_protocol::PauseReason;
 use broca_protocol::{BatchId, ToolCallId};
-use broca_wal::{PauseReason, WalRecord};
+use broca_records::record::WalRecord;
 use std::collections::HashMap;
 
 /// One ordered held-call fold for status reads and durable subscribe status events.

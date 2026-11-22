@@ -1732,10 +1732,10 @@ async fn dispatch_uses_the_routed_providers_frozen_preset() {
             .collect(),
     );
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
-    let mut frozen = broca_wal::PlanManifest {
+    let mut frozen = broca_records::record::PlanManifest {
         rich_ui: None,
         declarations: Vec::new(),
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             serde_json::json!({"tool_items": [
                 {"provider": "other", "preset": "head"}, {"provider": "aft", "preset": "worker"}
             ]})
@@ -1759,7 +1759,8 @@ async fn dispatch_uses_the_routed_providers_frozen_preset() {
         .with_plan_manifest(&frozen)
         .unwrap();
     // Mutating a later plan value cannot change the already constructed manifest.
-    frozen.plan = broca_wal::OpaqueJson::from_json_text(r#"{"tool_items": []}"#).unwrap();
+    frozen.plan =
+        broca_records::record::OpaqueJson::from_json_text(r#"{"tool_items": []}"#).unwrap();
     let ctx = batch_ctx_for("preset", "project", "planned");
     for name in ["read", "look"] {
         let call = call(name);
@@ -3043,10 +3044,10 @@ async fn a_non_compaction_hook_providers_tool_and_hook_routes_share_one_identity
         .unwrap()
         .extend([("dual".into(), 1), ("only-tools".into(), 1)]);
     let ctx = batch_ctx("hook-tool-identity");
-    let manifest = broca_wal::PlanManifest {
+    let manifest = broca_records::record::PlanManifest {
         rich_ui: None,
         declarations: Vec::new(),
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             serde_json::json!({
                 "tool_items":[{"provider":"dual"},{"provider":"only-tools"}],
                 "step_transform_items":[{"provider":"dual","subscriptions":[]}],
@@ -3207,7 +3208,7 @@ async fn reply_deadline_vectors_reach_real_dispatch_selection() {
             serde_json::json!({"read": case["reply"]})
         };
         let tool = serde_json::json!({"name":"read", "description":"probe", "input_schema": vectors["input_schema"], "module":"aft", "execution_mode":"parallel"});
-        let frozen: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+        let frozen: broca_records::record::PlanManifest = serde_json::from_value(serde_json::json!({
                 "plan": r#"{"tool_items":[{"provider":"aft","preset":"worker"}]}"#,
                 "plan_identity":"", "composition_digest":"", "fetches":[{
                     "provider":"aft", "catalog_digest":"", "tools":[tool], "reply":reply
@@ -3266,7 +3267,7 @@ async fn reply_deadline_vectors_reach_real_dispatch_selection() {
 async fn send_declared_reply_reaches_dispatch_deadline() {
     let plan_reply = |max_ms: u64| {
         let tool = serde_json::json!({"name":"read", "description":"probe", "input_schema":{}, "module":"aft", "execution_mode":"parallel", "reply":{"max_ms":1_800_000}});
-        let frozen: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+        let frozen: broca_records::record::PlanManifest = serde_json::from_value(serde_json::json!({
                 "plan": r#"{"tool_items":[{"provider":"aft","preset":"worker"}]}"#,
                 "plan_identity":"", "composition_digest":"", "fetches":[{
                     "provider":"aft", "catalog_digest":"", "tools":[tool], "reply":{"read":{"max_ms":max_ms}}
@@ -4739,7 +4740,7 @@ mod call_keepalive {
         (module.next_request().await, keepalive)
     }
 
-    fn frozen_manifest(keepalive: bool, reply: Option<u64>) -> broca_wal::PlanManifest {
+    fn frozen_manifest(keepalive: bool, reply: Option<u64>) -> broca_records::record::PlanManifest {
         let tool = serde_json::json!({
             "name":"read", "description":"probe", "input_schema": {"type":"object"},
             "module":"aft", "execution_mode":"parallel"
@@ -4752,13 +4753,14 @@ mod call_keepalive {
         if let Some(max_ms) = reply {
             fetch["reply"] = serde_json::json!({"read":{"max_ms":max_ms}});
         }
-        let manifest: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
-            "plan":r#"{"tool_items":[{"provider":"aft"}]}"#,
-            "plan_identity":"identity", "composition_digest":"composition",
-            "fetches":[fetch], "tools":[tool], "system_text":"", "system_digest":"",
-            "join_version":1, "role_versions":{}
-        }))
-        .unwrap();
+        let manifest: broca_records::record::PlanManifest =
+            serde_json::from_value(serde_json::json!({
+                "plan":r#"{"tool_items":[{"provider":"aft"}]}"#,
+                "plan_identity":"identity", "composition_digest":"composition",
+                "fetches":[fetch], "tools":[tool], "system_text":"", "system_digest":"",
+                "join_version":1, "role_versions":{}
+            }))
+            .unwrap();
         // Resume reads only the stored promise, not the provider's current catalog.
         serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap()
     }
@@ -4813,7 +4815,8 @@ mod call_keepalive {
                 if !case["reply"].is_null() {
                     frozen["fetches"][0]["reply"] = serde_json::json!({"read":case["reply"]});
                 }
-                let frozen: broca_wal::PlanManifest = serde_json::from_value(frozen).unwrap();
+                let frozen: broca_records::record::PlanManifest =
+                    serde_json::from_value(frozen).unwrap();
                 let manifest = ToolManifest::from_tools(frozen.tools.as_ref().clone())
                     .with_plan_manifest(&frozen)
                     .unwrap();
@@ -4859,7 +4862,7 @@ mod call_keepalive {
             value["tools"][0]["name"] = serde_json::json!(name);
             value["fetches"][0]["tools"][0]["name"] = serde_json::json!(name);
             value["fetches"][0]["reply"] = serde_json::json!({name:{"max_ms":2_040_000}});
-            let plan: broca_wal::PlanManifest = serde_json::from_value(value).unwrap();
+            let plan: broca_records::record::PlanManifest = serde_json::from_value(value).unwrap();
             let manifest = ToolManifest::from_tools(plan.tools.as_ref().clone())
                 .with_plan_manifest(&plan)
                 .unwrap();

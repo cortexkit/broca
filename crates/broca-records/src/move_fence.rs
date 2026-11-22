@@ -1,9 +1,10 @@
-//! Content-free files protecting session WALs during moves between machines.
-//! A cut id identifies one move batch. `.moving` names the batch freezing writes;
-//! `.moved` names the destination machine holding the session and hides old bytes
-//! from reads as well. Unfinished release/activate operations recorded in cut JSON
-//! also freeze writes, including new WALs with no sidecar yet. Older builds that
-//! only enforce these protections inspect the files without completing or undoing
+//! Content-free files that stop writes to a session while it moves to another computer, and
+//! the small durable-file helpers they are written with.
+//! A cut id identifies one move batch. `.moving` names the batch freezing writes; `.moved`
+//! names the destination computer holding the session and hides the session from reads as
+//! well. Unfinished release or activate operations recorded in a cut's JSON under
+//! `agent-data/cuts/` also freeze writes, including to a session with no fence file yet. Older
+//! builds that only enforce these protections inspect the files without completing or undoing
 //! the move, so downgrading cannot resume a partly installed session.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -558,7 +559,7 @@ pub fn digest(bytes: &[u8]) -> String {
 }
 
 #[cfg(all(feature = "test-io-trace", not(debug_assertions)))]
-compile_error!("test-io-trace is a test-only migration feature and must not ship");
+compile_error!("test-io-trace is a test-only feature and must not ship");
 #[cfg(any(test, feature = "test-io-trace"))]
 #[doc(hidden)]
 pub mod io_trace;

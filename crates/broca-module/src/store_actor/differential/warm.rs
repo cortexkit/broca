@@ -61,7 +61,7 @@ pub(super) fn warmable() -> FrozenRenderConfig {
 pub(super) struct FamilyDeclarer;
 
 impl CacheDeclarer for FamilyDeclarer {
-    fn declare(&self, config: &broca_wal::RunConfig) -> Option<CacheDeclaration> {
+    fn declare(&self, config: &broca_records::record::RunConfig) -> Option<CacheDeclaration> {
         let frozen: FrozenRenderConfig =
             serde_json::from_value(config.frozen_render_config.clone()).ok()?;
         let declared = broca_provider::cache_warm::cache_declaration(
@@ -133,7 +133,7 @@ struct Loops {
 impl RunExecutor for Loops {
     fn warm_costs(
         &self,
-        _: &broca_wal::RunConfig,
+        _: &broca_records::record::RunConfig,
         _: u64,
         _: u64,
     ) -> Result<broca_core::keep_warm::WarmCosts, String> {

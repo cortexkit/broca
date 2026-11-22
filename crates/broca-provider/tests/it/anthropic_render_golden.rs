@@ -298,7 +298,7 @@ mod gated {
         );
         for version in [None, Some(1)] {
             opts.marker_order_version = version;
-            let start: broca_wal::WalRecord = serde_json::from_value(json!({
+            let start: broca_records::record::WalRecord = serde_json::from_value(json!({
                 "type": "run_started", "run_id": "r1",
                 "session": {"project_root": "/tmp/p", "harness": "h", "session": "s"},
                 "marker_order_version": version,

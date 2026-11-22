@@ -26,7 +26,7 @@ async fn recorded(
     };
     let identity = subject.bind_identity(session);
     let address = broca_core::session_addr(&identity);
-    let class = broca_wal::session_storage_class(&live.state_root, &address)
+    let class = broca_records::session_storage::session_storage_class(&live.state_root, &address)
         .map_err(|error| HarnessError::new(error.to_string()))?;
     let Some(class) = class else {
         return Err(HarnessError::new(

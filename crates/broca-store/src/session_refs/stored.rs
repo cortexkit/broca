@@ -2,8 +2,8 @@
 //! folder of each storage class's session store, and the bind identity its head names.
 
 use broca_protocol::BindIdentity;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
-use broca_wal::StorageClass;
 use std::collections::BTreeSet;
 use std::path::Path;
 

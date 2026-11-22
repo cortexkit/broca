@@ -394,7 +394,7 @@ struct Walk<'a> {
     indeterminate: broca_core::projection::IndeterminateToolCalls,
     pending_steer_ids: Vec<String>,
     found: Option<ReconciledRunState>,
-    auth_selection: Option<broca_wal::AuthSelection>,
+    auth_selection: Option<broca_records::record::AuthSelection>,
     title: Option<String>,
     budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
     context_ceiling: Option<broca_protocol::ContextCeilingDetail>,
@@ -645,7 +645,7 @@ impl<'a> Walk<'a> {
             }
             Record::Retraction(retraction) => {
                 if let Some(failure) = retraction.failure.as_ref() {
-                    let failure: broca_wal::QueuedAdmissionFailure =
+                    let failure: broca_records::record::QueuedAdmissionFailure =
                         decode(failure, "a queued send's admission failure")?;
                     if failure.run_id.0 == self.run_id {
                         self.found = Some(admission_failed(failure.error));
@@ -1490,8 +1490,10 @@ impl Reader<'_> {
             None => broca_wire::RunStatusResponse::Unknown.into(),
             Some(QueuedSendFate::Pending) => RunStatusReply::Send(QueuedSendState::Pending),
             Some(QueuedSendFate::Ended(reason)) => RunStatusReply::Send(match reason {
-                broca_wal::record::SendEndReason::Superseded { .. } => QueuedSendState::Superseded,
-                broca_wal::record::SendEndReason::Expired => QueuedSendState::Expired,
+                broca_records::record::SendEndReason::Superseded { .. } => {
+                    QueuedSendState::Superseded
+                }
+                broca_records::record::SendEndReason::Expired => QueuedSendState::Expired,
             }),
             Some(QueuedSendFate::Retracted) => RunStatusReply::Send(QueuedSendState::Retracted),
             // Delivered into a run that was already going: the send is part of that run now,
@@ -2276,7 +2278,7 @@ impl Reader<'_> {
         for (_, record) in lookup.submission(own_run).await? {
             if let Record::Retraction(retraction) = record {
                 if let Some(failure) = retraction.failure.as_ref() {
-                    let failure: broca_wal::QueuedAdmissionFailure =
+                    let failure: broca_records::record::QueuedAdmissionFailure =
                         decode(failure, "a queued send's admission failure")?;
                     if retraction.submission_id == submission_id.0 && &failure.run_id == own_run {
                         return Ok(Some(self.run_outcome(session, own_run, None, false).await?));

@@ -269,7 +269,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         entries: &[v2::protocol::read::Entry],
         latest: Option<&ProviderView>,
         view: &ProviderView,
-        config: &broca_wal::RunConfig,
+        config: &broca_records::record::RunConfig,
         floor: Option<&str>,
     ) -> Result<(), String> {
         if crate::store_read::transcript_len(&self.session) > CROSS_CHECK_ENTRIES {

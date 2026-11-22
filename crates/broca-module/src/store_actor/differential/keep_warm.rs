@@ -52,7 +52,7 @@ impl RunExecutor for Loops {
 
     fn warm_costs(
         &self,
-        _config: &broca_wal::RunConfig,
+        _config: &broca_records::record::RunConfig,
         _prefix_tokens: u64,
         _ttl_ms: u64,
     ) -> Result<broca_core::keep_warm::WarmCosts, String> {
@@ -62,7 +62,7 @@ impl RunExecutor for Loops {
         })
     }
 
-    fn warm_after_send_ms(&self, _config: &broca_wal::RunConfig) -> Option<u64> {
+    fn warm_after_send_ms(&self, _config: &broca_records::record::RunConfig) -> Option<u64> {
         Some(WARM_AFTER_MS)
     }
 
@@ -121,9 +121,9 @@ impl RunExecutor for Loops {
         if let (Some(hook), Some(id)) = (job.attempt_hook, id) {
             hook.warm_finished(
                 id,
-                broca_wal::record::AttemptEnvelope {
-                    sent: broca_wal::record::AttemptSent::Yes,
-                    outcome: broca_wal::record::BillingAttemptOutcome::Complete,
+                broca_records::record::AttemptEnvelope {
+                    sent: broca_records::record::AttemptSent::Yes,
+                    outcome: broca_records::record::BillingAttemptOutcome::Complete,
                     sent_at_ms: Some(sent.sent_at_ms),
                     finished_at_ms: Some(crate::actor::epoch_ms()),
                     usage: Some(sent.usage),

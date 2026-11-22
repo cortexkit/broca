@@ -32,7 +32,7 @@ impl StoreBilling {
     /// `crate::fork_spend`). Returns once the insert has committed.
     pub async fn insert_records(
         &self,
-        records: Vec<broca_wal::FramedRecord>,
+        records: Vec<broca_core::billing::BillingRecord>,
         run_id: &str,
     ) -> Result<(), String> {
         let index = Arc::clone(&self.index);

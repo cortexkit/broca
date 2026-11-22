@@ -19,7 +19,6 @@ use broca_protocol::BindIdentity;
 use broca_session_store::fold::conversation::Delivered;
 use broca_session_store::fold::operations::{Estimate, Operations};
 use broca_session_store::record::{Marker, Record, View, ViewApplied};
-use broca_wal::WalRecord;
 
 use crate::run::{Admission, LoopError, Seams};
 use crate::writer::Writer;
@@ -97,48 +96,43 @@ pub fn restore(
 ) -> Result<State, String> {
     let mut state = State::default();
     for (_, record) in records {
-        let today = match record {
-            Record::RunStart(_) => {
-                state.begin_run();
-                continue;
-            }
-            Record::StepStart(step) => {
-                state.start_step(step.step_id);
-                continue;
-            }
-            Record::View(view) => WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
-                version: view.version,
-                checksum: view.checksum.clone(),
-                edits: serde_json::from_value(view.edits.clone().parse())
-                    .map_err(|error| format!("a stored compaction view's edits: {error}"))?,
-                built_through: view.built_through.clone(),
-                new_signed: view.new_signed.clone(),
-                applied_by: view.applied_by.clone(),
-            }),
-            Record::ViewApplied(applied) => WalRecord::CompactionViewAppliedV2 {
-                step_id: applied.step_id,
-                version: applied.version,
-                checksum: applied.checksum.clone(),
-            },
-            Record::Marker(marker) => WalRecord::CompactionMarker {
-                harness: marker
+        match record {
+            Record::RunStart(_) => state.begin_run(),
+            Record::StepStart(step) => state.start_step(step.step_id),
+            Record::View(view) => v2::fold::restore_view(
+                &mut state,
+                view.version,
+                view.checksum.clone(),
+                &serde_json::from_value::<Vec<broca_records::record::StoredViewEdit>>(
+                    view.edits.clone().parse(),
+                )
+                .map_err(|error| format!("a stored compaction view's edits: {error}"))?,
+                view.built_through.clone(),
+                view.new_signed.clone(),
+                view.applied_by.clone(),
+            )?,
+            Record::ViewApplied(applied) => v2::fold::restore_applied(
+                &mut state,
+                applied.step_id,
+                applied.version,
+                &applied.checksum,
+            )?,
+            Record::Marker(marker) => v2::fold::restore_marker(
+                &mut state,
+                marker
                     .harness
-                    .clone()
+                    .as_deref()
                     .ok_or("a compaction marker names no session")?,
-                session: marker
+                marker
                     .session
-                    .clone()
+                    .as_deref()
                     .ok_or("a compaction marker names no session")?,
-                view_version: marker.view_version,
-                first_kept_mid: marker.first_kept_mid.clone(),
-                first_kept_ordinal: marker.first_kept_ordinal,
-                checkpoint: marker.checkpoint,
-            },
-            _ => continue,
-        };
-        v2::fold::fold(&mut state, &today, bind)?;
+                marker.view_version,
+                bind,
+            )?,
+            _ => {}
+        }
     }
-    v2::fold::validate_identity(&state, bind)?;
     let accepted = operations
         .view_accepted
         .as_ref()
@@ -1493,7 +1487,7 @@ pub fn history(estimate: &Estimate) -> CompactionHistory {
     if !estimate.stepped {
         return history;
     }
-    let fallback: broca_wal::record::StepFallback = estimate
+    let fallback: broca_records::record::StepFallback = estimate
         .step_fallback
         .clone()
         .and_then(|value| serde_json::from_value(value).ok())

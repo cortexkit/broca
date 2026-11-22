@@ -11,13 +11,13 @@ use crate::session_cmd::SendOutcome;
 pub(crate) struct PreparedInput {
     pub at_ms: Option<u64>,
     pub input: Vec<broca_protocol::Message>,
-    pub hooks: Option<Box<broca_wal::Hooks>>,
+    pub hooks: Option<Box<broca_records::record::Hooks>>,
     pub refused: Option<String>,
 }
 
 impl PreparedInput {
     /// Queued.request remains the caller's payload; only the final input belongs in hooks.
-    pub fn queued_hooks(&self) -> Option<Box<broca_wal::Hooks>> {
+    pub fn queued_hooks(&self) -> Option<Box<broca_records::record::Hooks>> {
         self.hooks.clone().map(|mut hooks| {
             if hooks.original.take().is_some() {
                 hooks.final_value = Some(serde_json::to_value(&self.input).expect("message JSON"));
@@ -35,7 +35,7 @@ pub(crate) type InputTransforms = (HookPlan, Arc<dyn broca_core::HookPlane>);
 /// is recorded about it. A plan whose transforms can't be read, or that has no plane to call
 /// them, is refused.
 pub(crate) fn input_transforms(
-    manifest: Option<&broca_wal::PlanManifest>,
+    manifest: Option<&broca_records::record::PlanManifest>,
     plane: Option<Arc<dyn broca_core::HookPlane>>,
 ) -> Result<Option<InputTransforms>, SendOutcome> {
     let Some(manifest) = manifest.filter(|manifest| broca_core::hooks::has_transforms(manifest))
@@ -136,9 +136,9 @@ pub(crate) fn refusal_error(provider: &str) -> broca_protocol::ProviderError {
 /// queued, and their final value is the input the run sends, so they never run again. `input`
 /// is the send's input as its caller sent it, which the queue kept, and becomes `original`.
 pub(crate) fn drained_hooks(
-    queued: Option<Box<broca_wal::Hooks>>,
+    queued: Option<Box<broca_records::record::Hooks>>,
     input: &[broca_protocol::Message],
-) -> Option<Box<broca_wal::Hooks>> {
+) -> Option<Box<broca_records::record::Hooks>> {
     queued.map(|mut hooks| {
         hooks.original = Some(serde_json::to_value(input).expect("message JSON"));
         hooks

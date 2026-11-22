@@ -136,7 +136,7 @@ async fn imported_side(
     steps: Vec<Vec<broca_protocol::NormalizedEvent>>,
     cipher: Cipher,
     view: Option<fn(&str) -> View>,
-) -> (Rendered, Arc<broca_wal::PlanManifest>) {
+) -> (Rendered, Arc<broca_records::record::PlanManifest>) {
     let compactor = Arc::new(super::super::controls::Compactor::default());
     let side = Rendered::with_compactor(true, steps, false, Some(compactor), cipher).await;
     let results_mid = import(&side).await;

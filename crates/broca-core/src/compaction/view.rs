@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use broca_protocol::{tags::part_key, ContentBlock, Message, Role};
-use broca_wal::{CompactionStrip, CompactionViewChoice, OpaqueJson};
+use broca_records::{record::CompactionStrip, record::CompactionViewChoice, record::OpaqueJson};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -602,7 +602,7 @@ pub fn account_label(account_ref: &str) -> String {
 /// all, as on the mock path; no `account_decision`, as on old records) or an unknown account
 /// (an `apikey` method, an unknown method token, or no vault account id) is unknown. A
 /// placeholder is never sent: unknown stays `None`.
-pub fn selection_account_label(selection: &broca_wal::AuthSelection) -> Option<String> {
+pub fn selection_account_label(selection: &broca_records::record::AuthSelection) -> Option<String> {
     let method = match selection.auth_method.as_deref() {
         Some(method) => method,
         None => selection.credential_id.split_once(':')?.0,

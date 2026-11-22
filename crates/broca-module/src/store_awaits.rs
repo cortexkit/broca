@@ -22,7 +22,7 @@ impl std::fmt::Debug for Labels {
 #[derive(Debug, Clone, Default)]
 pub struct RunWait {
     labels: Labels,
-    selection: Option<broca_wal::AuthSelection>,
+    selection: Option<broca_records::record::AuthSelection>,
     message: Option<cortexkit_role_llm_runner::awaits::AwaitMessage>,
     label: Option<String>,
     pause: Option<(PauseReason, Option<u64>, Option<u64>)>,

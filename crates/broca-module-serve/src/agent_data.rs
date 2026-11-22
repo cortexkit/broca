@@ -152,7 +152,7 @@ impl AgentDataService {
     }
 
     pub async fn reconcile_boot(&self) -> Result<(), ErrorBody> {
-        broca_wal::migration::rebuild_fence_index(&self.root)
+        broca_records::move_fence::rebuild_fence_index(&self.root)
             .map_err(|error| unavailable(format!("rebuild_fence_index: {error}")))?;
         self.cuts
             .reconcile_boot(&self.artifacts)
@@ -488,7 +488,7 @@ impl MoveDriver for Driver {
             None
         } else {
             let path = CutStore::new(&self.root).path(cut_id);
-            broca_wal::migration::read_json(&path).map_err(|error| {
+            broca_records::move_fence::read_json(&path).map_err(|error| {
                 unavailable(format!("cannot read cut {}: {error}", path.display()))
             })?
         };

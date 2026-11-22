@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use broca_core::tool_plane::CompatibleTool;
 use broca_protocol::request::Tool;
-use broca_wal::{FetchOutcome, PlanManifest};
+use broca_records::{record::FetchOutcome, record::PlanManifest};
 
 /// `manifest` and `offered` (the run's tools, in the order the model sees them) with each tool
 /// in `changes` given its current description and input schema, and its frozen pin replaced
@@ -69,7 +69,9 @@ pub fn take_compatible_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_wal::{DispatchSchemaPin, FrozenProviderDeclarations, ProviderFetch};
+    use broca_records::{
+        record::DispatchSchemaPin, record::FrozenProviderDeclarations, record::ProviderFetch,
+    };
     use serde_json::json;
 
     fn tool(name: &str, module: Option<&str>, description: &str) -> Tool {
@@ -94,7 +96,7 @@ mod tests {
     fn manifest() -> PlanManifest {
         PlanManifest {
             rich_ui: None,
-            plan: broca_wal::OpaqueJson::from_json_text(json!({}).to_string()).unwrap(),
+            plan: broca_records::record::OpaqueJson::from_json_text(json!({}).to_string()).unwrap(),
             plan_identity: "plan-1".into(),
             composition_digest: "composition".into(),
             tools: Arc::new(vec![

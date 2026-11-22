@@ -4,7 +4,7 @@ use broca_protocol::{
     request::{BudgetConfig, BudgetKind},
     RunId,
 };
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 
 use serde::{Deserialize, Serialize};
 

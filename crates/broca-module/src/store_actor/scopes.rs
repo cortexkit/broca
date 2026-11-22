@@ -109,7 +109,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     pub(super) async fn cancel_from(
         &mut self,
         run_id: &RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
         principal: Option<&BindPrincipal>,
         scope: &SendScope,
     ) -> CancelOutcome {
@@ -129,7 +129,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Ok(()) => return self.cancel(run_id, at).await,
                 Err(refusal) => refusal,
             };
-        let granted = at == broca_wal::record::RunCancelAt::Now
+        let granted = at == broca_records::record::RunCancelAt::Now
             && matches!(principal, Some(BindPrincipal::Reserved { module_id })
                 if crate::sender_admission::interrupt_granted(&ownership, module_id));
         if !granted {

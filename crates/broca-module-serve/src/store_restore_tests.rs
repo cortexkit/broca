@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
+use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::SessionAddr;
 use broca_session_store::codec::Id128;
 use broca_session_store::session::restore::{LogCut, RestoreError, Restored};
-use broca_wal::StorageClass;
 
 use super::Report;
 

@@ -16,8 +16,6 @@ pub struct State {
     latest: Option<ReceivedView>,
     applied: Option<ReceivedView>,
     marked_version: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) marker: Option<Box<broca_wal::WalRecord>>,
     #[serde(default)]
     step_id: Option<u64>,
     #[serde(default)]

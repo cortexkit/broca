@@ -138,7 +138,7 @@ async fn approve_subscription_is_admitted_with_its_declaration_frozen() {
         );
     }
     assert_eq!(manifest.plan.as_json_text(), raw.to_string());
-    let decoded: broca_wal::PlanManifest =
+    let decoded: broca_records::record::PlanManifest =
         serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
     assert_eq!(decoded, manifest);
 }
@@ -260,7 +260,7 @@ async fn catalog_result_ops_freeze_the_explicit_list_or_resolved_default() {
         .await
         .unwrap()
         .manifest;
-        let broca_wal::FetchOutcome::Answered {
+        let broca_records::record::FetchOutcome::Answered {
             result_ops: Some(permissions),
             ..
         } = &manifest.fetches[0].outcome
@@ -305,7 +305,9 @@ async fn reply_validation_vectors_freeze_valid_declarations() {
         .await
         .unwrap()
         .manifest;
-        let broca_wal::FetchOutcome::Answered { reply, .. } = &manifest.fetches[0].outcome else {
+        let broca_records::record::FetchOutcome::Answered { reply, .. } =
+            &manifest.fetches[0].outcome
+        else {
             panic!("answered fetch")
         };
         if case["reply"].is_null() {
@@ -321,7 +323,7 @@ async fn reply_validation_vectors_freeze_valid_declarations() {
                 case["name"]
             );
         }
-        let decoded: broca_wal::PlanManifest =
+        let decoded: broca_records::record::PlanManifest =
             serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
         assert_eq!(decoded, manifest);
     }

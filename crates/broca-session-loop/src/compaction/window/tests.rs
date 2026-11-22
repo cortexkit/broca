@@ -64,10 +64,10 @@ impl broca_core::CompactionPlane for Quiet {
     }
 }
 
-fn manifest() -> Arc<broca_wal::PlanManifest> {
-    Arc::new(broca_wal::PlanManifest {
+fn manifest() -> Arc<broca_records::record::PlanManifest> {
+    Arc::new(broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             json!({"compaction_item": {"provider": "compactor", "preset": "head", "params": {}}})
                 .to_string(),
         )

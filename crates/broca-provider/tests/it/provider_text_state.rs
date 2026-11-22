@@ -13,10 +13,8 @@ use broca_provider::{
     },
     wire::{FrozenRenderConfig, WireFamily},
 };
-use broca_wal::{
-    framing::{decode_next, encode, DecodeStep, PROVIDER_TEXT_STATE_FEATURE},
-    WalRecord,
-};
+use broca_records::record::WalRecord;
+use broca_wal::framing::{decode_next, encode, DecodeStep, PROVIDER_TEXT_STATE_FEATURE};
 use serde_json::{json, Value};
 
 fn decoded(

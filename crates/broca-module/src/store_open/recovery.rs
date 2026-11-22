@@ -143,7 +143,7 @@ pub(crate) fn sign_in_move_routed(
         .flatten()
         .and_then(|selection| selection.account_decision)
         .is_some_and(|decision| {
-            decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+            decision.path == broca_records::record::ACCOUNT_DECISION_ROUTED
                 && decision.admission_id.is_some()
                 && decision.decision_id.is_some()
         })

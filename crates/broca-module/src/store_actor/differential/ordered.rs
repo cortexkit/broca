@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use broca_protocol::content::ContentBlock;
 use broca_protocol::{BindPrincipal, Delivery, NormalizedEvent, RunId, SubmissionRequest};
+use broca_records::{record::OpaqueJson, record::PlanManifest};
 use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
-use broca_wal::{OpaqueJson, PlanManifest};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 

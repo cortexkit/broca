@@ -127,7 +127,7 @@ pub enum ForkCallRefusal {
 pub struct ForkReleaseJob {
     pub head: BindIdentity,
     /// The head's config the attempt was pinned to (its base's `config`).
-    pub config: broca_wal::RunConfig,
+    pub config: broca_records::record::RunConfig,
     pub admission_id: String,
     /// The attempt's run identity ([`ForkCallJob::run_id`]).
     pub run_id: String,

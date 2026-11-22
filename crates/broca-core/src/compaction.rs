@@ -17,9 +17,10 @@
 //! floor. Restoring an older copy of a session's WAL by hand is not detected.
 
 use broca_protocol::{ContentBlock, Message, Role, Usage};
-use broca_wal::{
-    CompactionMessageKind, CompactionRange, CompactionStabilityRank, CompactionStrip,
-    CompactionWait, CompactionWaitExit, OpaqueJson, WalRecord,
+use broca_records::{
+    record::CompactionMessageKind, record::CompactionRange, record::CompactionStabilityRank,
+    record::CompactionStrip, record::CompactionWait, record::CompactionWaitExit,
+    record::OpaqueJson, record::WalRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -28,7 +29,7 @@ use std::{
     sync::Arc,
 };
 
-pub use broca_wal::MAX_REPLACEMENT_BYTES;
+pub use broca_records::record::MAX_REPLACEMENT_BYTES;
 mod media;
 pub use media::CapturedMedia;
 mod stored;
@@ -180,7 +181,7 @@ pub struct CompactionState {
     /// The Setup answer's tag checkpoint, for a session the provider moved from standalone
     /// Magic Context: tag numbering is anchored at its cut message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tag_checkpoint: Option<broca_wal::SetupTagCheckpoint>,
+    pub tag_checkpoint: Option<broca_records::record::SetupTagCheckpoint>,
     /// The Setup answer's `ride_wait_ms` (compaction-provider 0.5.1 §4), frozen with the
     /// session: the deadline of every rewrite ride. Absent when the answer carried none, and
     /// the runner then uses its own short ride deadline.
@@ -191,7 +192,7 @@ pub struct CompactionState {
     pub view_features: Option<Vec<String>>,
     /// Retried before every model step until this exact published view applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view_due: Option<broca_wal::SetupViewDue>,
+    pub view_due: Option<broca_records::record::SetupViewDue>,
     /// The rewrite ride the current step waits for, once its wait is reported
     /// (`CompactionRideWait`): the step and the absolute deadline. Cleared when it resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,7 +318,7 @@ impl CompactionState {
                 ..
             } => {
                 self.provider.clone_from(provider);
-                if *disposition == broca_wal::CompactionDisposition::Wait {
+                if *disposition == broca_records::record::CompactionDisposition::Wait {
                     self.open_wait = wait.clone().map(|wait| OpenCompactionWait {
                         request_id: request_id.clone(),
                         wait,
@@ -352,7 +353,9 @@ impl CompactionState {
                     }) {
                         self.view_due = None;
                     }
-                    if let broca_wal::CompactionViewChoice::Companion { edit, strip } = choice {
+                    if let broca_records::record::CompactionViewChoice::Companion { edit, strip } =
+                        choice
+                    {
                         self.strips.push(*strip);
                         self.unannounced.push(
                             crate::compaction_provider::notice::Event::ViewCompanion {
@@ -477,7 +480,7 @@ impl CompactionHistory {
     }
 }
 
-pub fn has_compaction(manifest: &broca_wal::PlanManifest) -> bool {
+pub fn has_compaction(manifest: &broca_records::record::PlanManifest) -> bool {
     serde_json::from_str::<Value>(manifest.plan.as_json_text())
         .ok()
         .is_some_and(|plan| {
@@ -772,7 +775,9 @@ pub type CompactionItem = (
     Map<String, Value>,
 );
 
-pub fn item(manifest: &broca_wal::PlanManifest) -> Result<Option<CompactionItem>, String> {
+pub fn item(
+    manifest: &broca_records::record::PlanManifest,
+) -> Result<Option<CompactionItem>, String> {
     let plan: Value =
         serde_json::from_str(manifest.plan.as_json_text()).map_err(|e| e.to_string())?;
     let Some(item) = plan.get("compaction_item").filter(|item| !item.is_null()) else {

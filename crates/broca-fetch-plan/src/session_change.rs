@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use broca_wal::PlanManifest;
+use broca_records::record::PlanManifest;
 
 /// The rungs this runner supports for each surface are: Both surfaces
 /// apply at the next `RunStarted` that freezes the pending manifest: `immediately` at the next
@@ -201,7 +201,7 @@ mod tests {
         let plan_text = format!(r#"{{"id":"{plan_identity}"}}"#);
         PlanManifest {
             rich_ui: None,
-            plan: broca_wal::OpaqueJson::from_json_text(plan_text).unwrap(),
+            plan: broca_records::record::OpaqueJson::from_json_text(plan_text).unwrap(),
             plan_identity: plan_identity.into(),
             composition_digest: composition_digest.into(),
             fetches: Vec::new(),
@@ -218,7 +218,7 @@ mod tests {
     fn compaction_provider_preset_and_params_cannot_refresh() {
         let mut current = test_manifest("old", "c");
         let plan = serde_json::json!({"compaction_item":{"provider":"ck-mc","preset":"head","params":{"n":1}},"composition":{"generation":1}});
-        current.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        current.plan = broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap();
         for (field, replacement) in [
             ("provider", serde_json::json!("other")),
             ("preset", serde_json::json!("worker")),
@@ -247,9 +247,11 @@ mod tests {
         let with_item = serde_json::json!({"compaction_item": item, "composition": {}});
         let without = serde_json::json!({"compaction_item": null, "composition": {}});
         let mut compacted = test_manifest("old", "c");
-        compacted.plan = broca_wal::OpaqueJson::from_json_text(with_item.to_string()).unwrap();
+        compacted.plan =
+            broca_records::record::OpaqueJson::from_json_text(with_item.to_string()).unwrap();
         let mut plain = test_manifest("old", "c");
-        plain.plan = broca_wal::OpaqueJson::from_json_text(without.to_string()).unwrap();
+        plain.plan =
+            broca_records::record::OpaqueJson::from_json_text(without.to_string()).unwrap();
         let mut changed = with_item.clone();
         changed["compaction_item"]["preset"] = serde_json::json!("worker");
         for (latest, next, expected) in [
@@ -281,7 +283,7 @@ mod tests {
     fn compaction_composition_only_refresh_keeps_the_item() {
         let mut current = test_manifest("old", "c");
         let plan = serde_json::json!({"compaction_item":{"provider":"ck-mc","preset":"head","params":{"n":1}},"composition":{"generation":1}});
-        current.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        current.plan = broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap();
         let mut next = plan;
         next["composition"] = serde_json::json!({"generation":2,"other":"changed"});
         next["compaction_item"]["params"]["n"] = serde_json::json!(1.0);
@@ -292,7 +294,7 @@ mod tests {
     fn sender_only_refresh_never_requires_a_surface_rung() {
         let current = test_manifest("old", "c");
         let mut next = current.clone();
-        next.plan = broca_wal::OpaqueJson::from_json_text(
+        next.plan = broca_records::record::OpaqueJson::from_json_text(
             r#"{"senders":[{"module":"occipital","idle_start":true}]}"#,
         )
         .unwrap();

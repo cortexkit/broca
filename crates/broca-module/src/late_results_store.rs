@@ -59,8 +59,10 @@ pub(crate) fn retention_block_reason(
             .join(REGISTRATION_MARKER)
             .try_exists()
             .map_err(|e| e.to_string())?;
-        let floor = broca_wal::read_floor(&root.join(broca_wal::FEATURE_FLOOR_FILENAME))
-            .map_err(|e| e.to_string())?;
+        let floor = broca_records::floor::read_floor(
+            &root.join(broca_records::floor::FEATURE_FLOOR_FILENAME),
+        )
+        .map_err(|e| e.to_string())?;
         return Ok((prior_registration || floor.contains("provider-held/v1"))
             .then_some("provider_held_intake_unknown"));
     }

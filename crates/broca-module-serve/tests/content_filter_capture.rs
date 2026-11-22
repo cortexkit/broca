@@ -11,8 +11,8 @@ use broca_provider::{
     families::{anthropic_frozen_config, anthropic_renderer_version, AnthropicMessages},
     wire::WireFamily,
 };
+use broca_records::record::RefusalFallbackPhase;
 use broca_session_store::record::Record;
-use broca_wal::RefusalFallbackPhase;
 use delivery_rig::{result, Rig};
 use serde_json::{json, Value};
 

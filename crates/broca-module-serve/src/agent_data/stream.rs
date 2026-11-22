@@ -164,7 +164,7 @@ mod tests {
                 from_offset: offset,
                 end_offset: end as u64,
                 stream_end: self.bytes.len() as u64,
-                digest: broca_wal::migration::digest(&self.bytes),
+                digest: broca_records::move_fence::digest(&self.bytes),
             })
         }
     }
@@ -217,7 +217,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("{:?}", error.refusal));
         assert_eq!(incoming.bytes, framed(&[b"last"]));
         assert_eq!(incoming.end, door.bytes.len() as u64);
-        assert_eq!(incoming.digest, broca_wal::migration::digest(&door.bytes));
+        assert_eq!(
+            incoming.digest,
+            broca_records::move_fence::digest(&door.bytes)
+        );
     }
     #[tokio::test]
     async fn newest_budget_refusal_names_size_before_reading_or_allocating_the_payload() {

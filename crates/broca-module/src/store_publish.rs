@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
+use broca_records::move_fence;
 use broca_session_store::backend::{LocalBackend, SessionAddr, SessionBackend as _, Version};
-use broca_wal::migration;
 
 use crate::registry::store_move::MoveRefusal;
 
@@ -112,7 +112,7 @@ pub fn publish_data_at<E: From<MoveRefusal>>(
                     },
                 ),
             ] {
-                migration::sync_dir(&parent)
+                move_fence::sync_dir(&parent)
                     .map_err(io_failed("a data rename's parent couldn't be synced"))?;
                 step(boundary)?;
             }
@@ -154,15 +154,16 @@ fn install_entries<E: From<MoveRefusal>>(
         std::fs::rename(staged.join(&name), &to)
             .map_err(io_failed("the staged session couldn't be published"))?;
         if to.is_dir() {
-            migration::sync_dir(&to)
+            move_fence::sync_dir(&to)
         } else {
             broca_session_store::durable::sync_file(&to)
         }
         .map_err(io_failed("a published entry couldn't be synced"))?;
         renamed()?;
     }
-    migration::sync_dir(live).map_err(io_failed("the live session's folder couldn't be synced"))?;
-    migration::sync_dir(staged)
+    move_fence::sync_dir(live)
+        .map_err(io_failed("the live session's folder couldn't be synced"))?;
+    move_fence::sync_dir(staged)
         .map_err(io_failed("the staged session's folder couldn't be synced"))?;
     std::fs::remove_dir(staged)
         .map_err(io_failed("the emptied staged folder couldn't be removed"))?;
@@ -228,7 +229,7 @@ pub async fn publish_head_at<E: From<MoveRefusal>>(
             .into())
         }
     }
-    migration::sync_dir(&store.join("heads"))
+    move_fence::sync_dir(&store.join("heads"))
         .map_err(io_failed("the new storage's heads couldn't be synced"))?;
     let read = live
         .read_head(&addr)

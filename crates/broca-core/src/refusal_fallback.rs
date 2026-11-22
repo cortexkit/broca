@@ -12,7 +12,10 @@
 //! it.
 
 use broca_protocol::request::ModelHandle;
-use broca_wal::{RefusalFallbackPhase, RefusalFallbackSchedule, StepFallback, WalRecord};
+use broca_records::{
+    record::RefusalFallbackPhase, record::RefusalFallbackSchedule, record::StepFallback,
+    record::WalRecord,
+};
 
 /// Committed fallback responses in a round before the first doubling.
 pub const ROUND_STEPS: u32 = 10;
@@ -176,6 +179,34 @@ impl<'a> StepServing<'a> {
                 iterations: fallback.usage_iterations.as_deref(),
             }),
             WalRecord::ModelStepRefused {
+                usage,
+                served_model,
+                usage_iterations,
+                ..
+            } => Some(Self {
+                route_model: None,
+                served_model: served_model.as_deref(),
+                usage: *usage,
+                iterations: usage_iterations.as_deref(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// What a spend-fact builder's step record says about how it was served. `None` for a
+    /// record that carries no step usage.
+    pub fn of_event(event: &'a crate::billing::BillingEvent) -> Option<Self> {
+        use crate::billing::BillingEvent;
+        match event {
+            BillingEvent::StepFinished {
+                usage, fallback, ..
+            } => Some(Self {
+                route_model: fallback.route.as_ref().map(|route| &route.model),
+                served_model: fallback.served_model.as_deref(),
+                usage: *usage,
+                iterations: fallback.usage_iterations.as_deref(),
+            }),
+            BillingEvent::StepRefused {
                 usage,
                 served_model,
                 usage_iterations,

@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use broca_core::FileLeaseStore;
 use broca_protocol::{BindIdentity, PauseReason, RunFinishReason};
+use broca_records::session_storage::StorageClass;
 use broca_session_loop::queue::{Receipt, SteerReceipt};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::{Moved, Pause, QueuedSend, Record, RunEnd, RunStart};
 use broca_session_store::session::Session;
-use broca_wal::StorageClass;
 
 use super::store_policy;
 use crate::executor::RunExecutor;

@@ -1,5 +1,5 @@
 use broca_protocol::{ErrorClass, ModelAttempt, ProviderError, StepId};
-use broca_wal::{AccountLimitPause, AuthSelection};
+use broca_records::{record::AccountLimitPause, record::AuthSelection};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static STALE_RESETS: AtomicU64 = AtomicU64::new(0);

@@ -33,7 +33,7 @@ use broca_protocol::{
     provider::{NormalizedEvent, ProviderControl},
     BindIdentity, FinishReason, MessageId, Usage,
 };
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use subc_protocol::session::{
     HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -154,7 +154,10 @@ struct StoredRecord {
 async fn starts_in(
     runtime: &broca_module::store_open::StoreRuntime,
     session: &BindIdentity,
-) -> Vec<(broca_session_loop::run::Admission, broca_wal::RunConfig)> {
+) -> Vec<(
+    broca_session_loop::run::Admission,
+    broca_records::record::RunConfig,
+)> {
     let Some(class) = runtime.class_of(session).unwrap() else {
         return Vec::new();
     };
@@ -177,7 +180,10 @@ impl Sessions {
     async fn starts(
         &self,
         session: &BindIdentity,
-    ) -> Vec<(broca_session_loop::run::Admission, broca_wal::RunConfig)> {
+    ) -> Vec<(
+        broca_session_loop::run::Admission,
+        broca_records::record::RunConfig,
+    )> {
         starts_in(&self.0, session).await
     }
 
@@ -1137,7 +1143,7 @@ async fn separator_collision_bind_is_rejected_before_any_durable_state() {
     assert_eq!(error.code, "invalid_bind_identity");
     assert!(error.message.contains("U+001F"));
     assert!(
-        broca_wal::session_storage_class(&dir, &address)
+        broca_records::session_storage::session_storage_class(&dir, &address)
             .unwrap()
             .is_none(),
         "rejected bind must not create a session"
@@ -3743,7 +3749,7 @@ async fn project_observation_wire(import: bool) {
         }
         // The session is stored under the original triple's address, and nowhere else.
         assert!(
-            broca_wal::session_storage_class(&dir, &address)
+            broca_records::session_storage::session_storage_class(&dir, &address)
                 .unwrap()
                 .is_some(),
             "the original triple must address the session"
@@ -3761,7 +3767,7 @@ async fn project_observation_wire(import: bool) {
             .count();
         assert_eq!(episodes, index + 1);
         previous = records;
-        let heads: usize = broca_wal::StorageClass::ALL
+        let heads: usize = broca_records::session_storage::StorageClass::ALL
             .into_iter()
             .map(|class| {
                 std::fs::read_dir(class.store_root(&dir).join("heads"))
@@ -4024,7 +4030,7 @@ impl PrincipalRig {
     }
 
     /// The frozen config of each run the rig's session started, in the order they started.
-    async fn run_configs(&self) -> Vec<broca_wal::RunConfig> {
+    async fn run_configs(&self) -> Vec<broca_records::record::RunConfig> {
         starts_in(&self.runtime, &self.session)
             .await
             .into_iter()
@@ -4034,7 +4040,7 @@ impl PrincipalRig {
 
     /// Whether the session store holds the rig's session at all.
     fn exists(&self) -> bool {
-        broca_wal::session_storage_class(
+        broca_records::session_storage::session_storage_class(
             self.runtime.state_root(),
             &broca_core::session_addr(&self.session),
         )

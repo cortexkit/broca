@@ -110,7 +110,7 @@ impl subc_client_rs::ModuleHandler for DoorProvider {
                     };
                 }
                 let end = bytes.len().min(from.saturating_add(limit));
-                json!({"bytes":hex(&bytes[from..end]),"fromOffset":from,"endOffset":end,"streamEnd":bytes.len(),"digest":broca_wal::migration::digest(&bytes)})
+                json!({"bytes":hex(&bytes[from..end]),"fromOffset":from,"endOffset":end,"streamEnd":bytes.len(),"digest":broca_records::move_fence::digest(&bytes)})
             }
             other => panic!("unexpected door op {other}"),
         };

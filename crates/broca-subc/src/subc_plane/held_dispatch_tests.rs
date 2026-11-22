@@ -3,9 +3,9 @@ use broca_core::tool_plane::{
     DispatchKey, DispatchRegistration, LateResultRegistration, LateResultsIntake,
     ProviderHeldLifecycle, ProviderHeldRecorder, ProviderHeldReply,
 };
-use broca_wal::{
-    FetchOutcome, FrozenProviderDeclarations, FrozenResultFormat, OpaqueJson, PlanManifest,
-    ProviderFetch,
+use broca_records::{
+    record::FetchOutcome, record::FrozenProviderDeclarations, record::FrozenResultFormat,
+    record::OpaqueJson, record::PlanManifest, record::ProviderFetch,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -951,7 +951,9 @@ async fn negotiated_media_dispatch_captures_with_nullable_error_code() {
 /// The batch's frozen plan with the catalog schema pins a later build freezes at admission,
 /// and no other declaration.
 fn manifest_pinning(
-    schema_pins: Option<std::collections::BTreeMap<String, broca_wal::DispatchSchemaPin>>,
+    schema_pins: Option<
+        std::collections::BTreeMap<String, broca_records::record::DispatchSchemaPin>,
+    >,
 ) -> ToolManifest {
     let plan = PlanManifest {
         rich_ui: None,
@@ -996,7 +998,7 @@ fn manifest_pinning(
 /// without pins, which is every plan this build admits itself, leaves the pin unknown.
 #[tokio::test]
 async fn a_resumed_batch_dispatches_under_the_schema_pin_its_plan_recorded() {
-    let pin = broca_wal::DispatchSchemaPin {
+    let pin = broca_records::record::DispatchSchemaPin {
         schema_digest: "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335".into(),
         semantics: 7,
         major: None,

@@ -544,7 +544,7 @@ async fn app_message_session() -> Side {
     )
     .await;
     let mut manifest = compacting_manifest(true);
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
         json!({
             "compaction_item": {"provider": "ck-mc", "preset": "default"},
             "render_tags": true,

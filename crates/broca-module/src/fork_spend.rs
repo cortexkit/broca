@@ -10,11 +10,10 @@
 //! the fork is pinned to. Neither the fact nor the attempt's step event names the fork; its
 //! own session and run keep its spend apart.
 
-use broca_core::billing::{compute_segments_for_run, SpendSegment};
+use broca_core::billing::{compute_segments_for_run, BillingEvent, BillingRecord, SpendSegment};
 use broca_core::ChargeBasisResolver;
-use broca_protocol::content::{AssistantMessage, FinishReason};
-use broca_protocol::{BindIdentity, MessageId, RunFinishReason, RunId, StepId};
-use broca_wal::{FramedRecord, RunConfig, RunOrigin, StepFallback, StepRoute, WalRecord};
+use broca_protocol::{BindIdentity, RunFinishReason, RunId, StepId};
+use broca_records::{record::RunConfig, record::StepFallback, record::StepRoute};
 
 use crate::executor::ForkStepSpend;
 
@@ -66,77 +65,40 @@ impl AttemptSpend<'_> {
 
     /// The records of a one-step run that made this attempt's model call: its start, its step and
     /// its end.
-    pub fn records(&self) -> Vec<FramedRecord> {
-        let frame = |seq, record| FramedRecord {
-            seq,
-            fence: 0,
-            record,
-        };
-        let started = WalRecord::RunStarted {
-            message_marks: None,
-            compaction_plan_version: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: None,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
+    pub fn records(&self) -> Vec<BillingRecord> {
+        let started = BillingEvent::RunStarted {
             run_id: RunId(self.run_id.to_owned()),
             session: self.session.clone(),
-            ts_ms: Some(self.started_at_ms),
             config: Box::new(self.config.clone()),
-            input: Vec::new().into(),
-            origin: RunOrigin::Fresh,
-            submission_id: None,
+            ts_ms: Some(self.started_at_ms),
+            scope: None,
         };
-        let step = WalRecord::ModelStepFinished {
-            raw_finish_reason: None,
+        let step = BillingEvent::StepFinished {
+            step_id: StepId(1),
+            written_at_ms: Some(self.finished_at_ms),
+            usage: self.spend.usage,
+            retries_used: 0,
+            service_tier_used: self.spend.service_tier_used.clone(),
+            speed_used: None,
             fallback: Box::new(StepFallback {
                 route: self.route.cloned(),
                 ..StepFallback::default()
             }),
-            written_at_ms: Some(self.finished_at_ms),
-            tags: None,
-            hooks: None,
-            step_id: StepId(1),
-            // The fact is content-free: the reply itself is the fork's stored answer.
-            assistant_message: AssistantMessage {
-                message_id: MessageId(self.run_id.to_owned()),
-                content: Vec::new(),
-            }
-            .into(),
-            usage: self.spend.usage,
-            finish_reason: self
-                .spend
-                .finish_reason
-                .or((!self.failed).then_some(FinishReason::Stop)),
-            retries_used: 0,
-            service_tier_used: self.spend.service_tier_used.clone(),
-            speed_used: None,
         };
-        let finished = WalRecord::RunFinished {
-            interrupt_reason: None,
+        let finished = BillingEvent::RunFinished {
             reason: if self.failed {
                 RunFinishReason::Error
             } else {
                 RunFinishReason::Completed
             },
             ts_ms: Some(self.finished_at_ms),
-            usage: self.spend.usage,
-            error: None,
             retries_used: 0,
         };
-        vec![frame(1, started), frame(2, step), frame(3, finished)]
+        [started, step, finished]
+            .into_iter()
+            .zip(1..)
+            .map(|(event, seq)| BillingRecord { seq, event })
+            .collect()
     }
 }
 
@@ -144,9 +106,10 @@ impl AttemptSpend<'_> {
 mod tests {
     use super::*;
     use broca_core::ChargeBasis;
+    use broca_protocol::content::FinishReason;
     use broca_protocol::request::{GenerationConfig, ResponseFormat, ToolChoice};
     use broca_protocol::{ModelHandle, Usage};
-    use broca_wal::AuthSelection;
+    use broca_records::record::AuthSelection;
 
     fn head_config() -> RunConfig {
         RunConfig {

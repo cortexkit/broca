@@ -23,7 +23,7 @@
 //! writes nothing and renders exactly as before.
 
 use broca_protocol::{ModelHandle, StepId};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 
 /// The smallest output cap the loop lowers a request to when the request did not ask for less.
 /// Below this a reasoning model typically spends the whole reservation thinking and returns a

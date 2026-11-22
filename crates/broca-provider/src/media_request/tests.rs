@@ -5,7 +5,7 @@ use crate::{
 };
 use broca_core::media_store::{MediaBytes, MediaReadError};
 use broca_protocol::Role;
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -679,8 +679,11 @@ fn wal_view_drops_and_keep_text_edits_preserve_media_age_and_protection() {
     records.push(WalRecord::CompactionViewApplied {
         provider: "compact".into(),
         view_version: 1,
-        view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap()).unwrap(),
-        choice: broca_wal::CompactionViewChoice::Applied,
+        view: broca_records::record::OpaqueJson::from_json_text(
+            serde_json::to_string(&view).unwrap(),
+        )
+        .unwrap(),
+        choice: broca_records::record::CompactionViewChoice::Applied,
     });
     let mut profile = profile();
     let sb = STANDARD.encode(&fixture.bytes).len() as u64;
@@ -752,8 +755,11 @@ fn replacement_of_new_input_keeps_protection_when_an_older_input_shares_its_dige
     records.push(WalRecord::CompactionViewApplied {
         provider: "compact".into(),
         view_version: 1,
-        view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap()).unwrap(),
-        choice: broca_wal::CompactionViewChoice::Applied,
+        view: broca_records::record::OpaqueJson::from_json_text(
+            serde_json::to_string(&view).unwrap(),
+        )
+        .unwrap(),
+        choice: broca_records::record::CompactionViewChoice::Applied,
     });
     let mut profile = profile();
     let sb = STANDARD.encode(&fixture.bytes).len() as u64;

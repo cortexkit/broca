@@ -103,7 +103,10 @@ pub trait RunExecutor: Send + Sync + 'static {
         Ok(())
     }
     /// The email on a cached vault row, never a vault request on a read path.
-    fn cached_account_email(&self, _selection: &broca_wal::AuthSelection) -> Option<String> {
+    fn cached_account_email(
+        &self,
+        _selection: &broca_records::record::AuthSelection,
+    ) -> Option<String> {
         None
     }
     /// Quote current catalog media facts for enqueue and read-only fresh-send preflight.
@@ -193,7 +196,7 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// warming.
     fn warm_costs(
         &self,
-        _config: &broca_wal::RunConfig,
+        _config: &broca_records::record::RunConfig,
         _prefix_tokens: u64,
         _ttl_ms: u64,
     ) -> Result<broca_core::keep_warm::WarmCosts, String> {
@@ -204,7 +207,7 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// Drivers without usage pricing retain the pre-send estimate.
     fn responses_warm_cost(
         &self,
-        _config: &broca_wal::RunConfig,
+        _config: &broca_records::record::RunConfig,
         _usage: broca_protocol::Usage,
     ) -> Result<f64, String> {
         Err("pricing_unavailable".into())
@@ -213,9 +216,9 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// A failed warm consumes only provider-reported usage, not a cache-refresh estimate.
     fn failed_warm_cost(
         &self,
-        _config: &broca_wal::RunConfig,
-        _reservation: &broca_wal::record::AttemptReservation,
-        _envelope: &broca_wal::record::AttemptEnvelope,
+        _config: &broca_records::record::RunConfig,
+        _reservation: &broca_records::record::AttemptReservation,
+        _envelope: &broca_records::record::AttemptEnvelope,
         _ttl_ms: Option<u64>,
     ) -> Result<f64, String> {
         Err("reported warm usage pricing unavailable".into())
@@ -226,7 +229,7 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// for the rest of this tool wait.
     async fn warm_quota(
         &self,
-        _config: &broca_wal::RunConfig,
+        _config: &broca_records::record::RunConfig,
         _headers: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), String> {
         Ok(())
@@ -234,7 +237,7 @@ pub trait RunExecutor: Send + Sync + 'static {
 
     /// Override expiry-based timing with an interval after the last request was sent,
     /// for providers that do not document whether a cached read extends retention.
-    fn warm_after_send_ms(&self, _config: &broca_wal::RunConfig) -> Option<u64> {
+    fn warm_after_send_ms(&self, _config: &broca_records::record::RunConfig) -> Option<u64> {
         None
     }
 
@@ -473,7 +476,7 @@ impl WarmBase {
 pub struct WarmJob {
     pub session: BindIdentity,
     /// The config the request was sent with: the provider is built from it.
-    pub config: broca_wal::RunConfig,
+    pub config: broca_records::record::RunConfig,
     pub base: WarmBase,
     /// Present only on overhaul roots; the transport must obtain permission before each send.
     pub attempt_hook: Option<Arc<dyn broca_core::run::AttemptHook>>,

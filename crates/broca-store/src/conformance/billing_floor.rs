@@ -3,23 +3,20 @@
 use super::*;
 use broca_core::{emit_lineage_usage_exports, imported_run_ids};
 
-fn finish(seq: u64) -> FramedRecord {
+fn finish(seq: u64) -> BillingRecord {
     framed(
         seq,
-        WalRecord::RunFinished {
-            interrupt_reason: None,
+        BillingEvent::RunFinished {
             reason: RunFinishReason::Completed,
             ts_ms: Some(seq),
-            usage: Usage::default(),
-            error: None,
             retries_used: 0,
         },
     )
 }
 
-fn episode(seq: u64, run_id: &str, session: &BindIdentity) -> Vec<FramedRecord> {
+fn episode(seq: u64, run_id: &str, session: &BindIdentity) -> Vec<BillingRecord> {
     vec![
-        run_started(seq, run_id, session, "hello", ModelHandle::new("stub", "m")),
+        run_started(seq, run_id, session, ModelHandle::new("stub", "m")),
         finish(seq + 1),
     ]
 }
@@ -37,7 +34,6 @@ where
         0,
         "z-local-resumed",
         &session,
-        "hello",
         ModelHandle::new("stub", "m"),
     )];
     let mut incoming = local.clone();

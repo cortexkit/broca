@@ -57,7 +57,7 @@ impl ProjectionAdmission {
         // Repeat both barriers even for an existing marker: a concurrent creator
         // may not have made its directory entry durable before this append.
         file.sync_all()?;
-        broca_wal::migration::sync_dir(&root)?;
+        broca_records::move_fence::sync_dir(&root)?;
         Ok(Self { _lease: lease })
     }
 }
@@ -96,7 +96,7 @@ impl ProjectionRepair {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        broca_wal::migration::sync_dir(&self.root)?;
+        broca_records::move_fence::sync_dir(&self.root)?;
         Ok(true)
     }
 }

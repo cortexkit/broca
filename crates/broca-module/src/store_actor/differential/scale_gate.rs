@@ -77,9 +77,9 @@ where
 /// A head plan with one tool, as core sends with an imported head's first send.
 fn plan() -> crate::session_cmd::SendPlan {
     let plan = serde_json::json!({"senders": []});
-    let manifest = broca_wal::PlanManifest {
+    let manifest = broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: "scale-gate-plan".into(),
         composition_digest: "composition".into(),
         tools: Arc::new(vec![serde_json::from_value(serde_json::json!({
@@ -164,8 +164,8 @@ async fn scale_gate_imported_head() {
     // A head is kept in the class root its backup class names; find the one holding it.
     let root = [
         broca_wal::SESSION_STORAGE_DIR,
-        broca_wal::SESSION_STORAGE_DURABLE_DIR,
-        broca_wal::SESSION_STORAGE_EPHEMERAL_DIR,
+        broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
+        broca_records::session_storage::SESSION_STORAGE_EPHEMERAL_DIR,
     ]
     .into_iter()
     .map(|name| module.dir.join(name))

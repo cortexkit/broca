@@ -12,7 +12,7 @@ use broca_provider::media_profile::{freeze_media_profile, MediaProfileId};
 use broca_provider::registry::wire_family;
 use broca_provider::spec::{AuthKind, InputModalities, ModelSpec, ProviderSpec, WireFamilyId};
 use broca_provider::wire::FrozenRenderConfig;
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde_json::{json, Value};
 
 const FAMILIES: [WireFamilyId; 7] = [

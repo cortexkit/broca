@@ -115,7 +115,7 @@ impl Export {
 impl ExportIndex for Export {
     fn emit_run(
         &self,
-        records: &[broca_wal::FramedRecord],
+        records: &[broca_core::billing::BillingRecord],
         run_id: &RunId,
         resolver: &dyn broca_core::ChargeBasisResolver,
     ) -> Result<(), ExportError> {
@@ -124,7 +124,7 @@ impl ExportIndex for Export {
 
     fn emit_run_with_attempts(
         &self,
-        records: &[broca_wal::FramedRecord],
+        records: &[broca_core::billing::BillingRecord],
         run_id: &RunId,
         attempts: &[broca_core::billing::attempt::AttemptEvidence],
         resolver: &dyn broca_core::ChargeBasisResolver,

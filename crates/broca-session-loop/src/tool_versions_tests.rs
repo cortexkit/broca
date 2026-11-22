@@ -18,12 +18,15 @@ use broca_protocol::{
     BindIdentity, MessageId, NormalizedEvent, ProviderControl, RunId, StepId, SubmissionRequest,
     ToolCallId, Usage,
 };
+use broca_records::{
+    record::DispatchSchemaPin, record::FetchOutcome, record::FrozenProviderDeclarations,
+    record::PlanManifest,
+};
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
-use broca_wal::{DispatchSchemaPin, FetchOutcome, FrozenProviderDeclarations, PlanManifest};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -143,13 +146,13 @@ fn manifest() -> PlanManifest {
     let tools = Arc::new(vec![bash(FROZEN)]);
     PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             json!({"tool_items": [{"provider": "aft"}]}).to_string(),
         )
         .unwrap(),
         plan_identity: "plan-1".into(),
         composition_digest: "composition".into(),
-        fetches: vec![broca_wal::ProviderFetch {
+        fetches: vec![broca_records::record::ProviderFetch {
             provider: "aft".into(),
             outcome: FetchOutcome::Answered {
                 catalog_digest: "one".into(),

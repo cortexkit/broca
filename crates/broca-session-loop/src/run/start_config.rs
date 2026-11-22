@@ -114,7 +114,7 @@ pub fn run_config_members<E>(
 pub fn run_config_of_start(
     start: &broca_session_store::record::RunStart,
     parts: &dyn Parts,
-) -> Result<broca_wal::RunConfig, LoopError> {
+) -> Result<broca_records::record::RunConfig, LoopError> {
     let (config, _) = run_config_members(
         start,
         SetupParts::Config,
@@ -135,7 +135,7 @@ pub fn run_config_of_start(
 pub fn run_config_of_run(
     run: &broca_session_store::fold::operations::Run,
     parts: &dyn Parts,
-) -> Result<broca_wal::RunConfig, LoopError> {
+) -> Result<broca_records::record::RunConfig, LoopError> {
     let start = run.start.as_ref().ok_or(LoopError::Unsupported(
         "a run whose start isn't in the fold",
     ))?;
@@ -162,13 +162,13 @@ pub struct FrozenFacts {
     #[serde(default)]
     pub render_tags: bool,
     #[serde(default)]
-    pub computed_tags: Option<broca_wal::ComputedTagRules>,
+    pub computed_tags: Option<broca_records::record::ComputedTagRules>,
     #[serde(default)]
     pub frozen_render_config: Value,
     #[serde(default)]
     pub turn_directives_v1: Option<Vec<broca_protocol::request::DirectiveName>>,
     #[serde(default)]
-    pub auth_selection: Option<broca_wal::AuthSelection>,
+    pub auth_selection: Option<broca_records::record::AuthSelection>,
 }
 
 impl FrozenFacts {

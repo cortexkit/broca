@@ -33,7 +33,7 @@ async fn run_awaits_sign_in_names_only_the_frozen_account_label() {
     }
 }
 
-pub(super) fn selection() -> broca_wal::AuthSelection {
+pub(super) fn selection() -> broca_records::record::AuthSelection {
     serde_json::from_value(
         json!({"credential_id":"oauth:stub:synthetic", "account_ref":"synthetic-account"}),
     )

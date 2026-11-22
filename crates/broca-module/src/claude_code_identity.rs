@@ -177,33 +177,19 @@ pub fn first_durable_cc_version_suffix(
     })
 }
 
-/// Count human prompts from durable episode inputs, including imported history. Steered
-/// records belong to the already-running prompt and compaction messages are model views,
-/// so neither opens another human prompt. Tool results are not human prompts either.
-pub fn human_prompt_ordinal<'a>(
-    records: impl IntoIterator<Item = &'a broca_wal::WalRecord>,
-    admitted_input: &[Message],
-) -> u64 {
-    fn count(messages: &[Message]) -> u64 {
-        messages
-            .iter()
-            .filter(|message| {
-                message.role == broca_protocol::Role::User
-                    && message
-                        .content
-                        .iter()
-                        .any(|block| !matches!(block, broca_protocol::ContentBlock::ToolResult(_)))
-            })
-            .count() as u64
-    }
-    records
-        .into_iter()
-        .filter_map(|record| match record {
-            broca_wal::WalRecord::RunStarted { input, .. } => Some(count(input)),
-            _ => None,
+/// How many human prompts `input` holds: user messages carrying something other than tool
+/// results.
+pub fn human_prompts(input: &[Message]) -> u64 {
+    input
+        .iter()
+        .filter(|message| {
+            message.role == broca_protocol::Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|block| !matches!(block, broca_protocol::ContentBlock::ToolResult(_)))
         })
-        .sum::<u64>()
-        + count(admitted_input)
+        .count() as u64
 }
 
 /// The persona a fresh episode freezes. `account_id` is the vault's account id for the
@@ -605,31 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn durable_prompt_ordinal_includes_imports_but_not_steers_or_tool_results() {
+    fn human_prompts_count_user_messages_but_not_tool_results() {
         use broca_protocol::Role;
-        use serde_json::json;
-        let config = json!({
-            "model": {"provider_module_id": "anthropic", "model_id": "claude-sonnet-5-5"},
-            "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
-            "response_format": {"type": "text"}, "provider_options": null, "cache_tiers": null,
-            "context_epoch": 0, "renderer_version": 1, "frozen_render_config": null
-        });
-        let started = |input: Vec<Message>| -> broca_wal::WalRecord {
-            serde_json::from_value(json!({"type": "run_started", "run_id": "r",
-                "session": BindIdentity::new("/tmp/project", "test", "session"),
-                "config": config, "input": input}))
-            .unwrap()
-        };
-        let imported = started(vec![
-            text(Role::User, "imported first"),
-            text(Role::Assistant, "answer"),
-            text(Role::User, "imported second"),
-        ]);
-        let later = started(vec![text(Role::User, "new episode")]);
-        let steer: broca_wal::WalRecord = serde_json::from_value(
-            json!({"type": "steered", "input": [text(Role::User, "steer")] }),
-        )
-        .unwrap();
         let tool_result = Message::new(
             Role::User,
             vec![broca_protocol::ContentBlock::ToolResult(
@@ -642,11 +605,13 @@ mod tests {
                 },
             )],
         );
-        let records = [imported, later, steer, started(vec![tool_result])];
-        assert_eq!(
-            human_prompt_ordinal(&records, &[text(Role::User, "current prompt")]),
-            4
-        );
-        assert_eq!(human_prompt_ordinal(&records, &[]), 3);
+        let input = [
+            text(Role::User, "first"),
+            text(Role::Assistant, "answer"),
+            text(Role::User, "second"),
+            tool_result,
+        ];
+        assert_eq!(human_prompts(&input), 2);
+        assert_eq!(human_prompts(&[]), 0);
     }
 }

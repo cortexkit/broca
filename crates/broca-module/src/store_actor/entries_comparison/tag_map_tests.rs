@@ -18,9 +18,9 @@ const PROVIDER: &str = "ck-mc";
 const NOTER: &str = "aft";
 
 /// A plan naming [`PROVIDER`], rendering part numbers, and naming [`NOTER`] as a sender.
-fn noting_manifest() -> broca_wal::PlanManifest {
+fn noting_manifest() -> broca_records::record::PlanManifest {
     let mut manifest = compacting_manifest(true);
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
         json!({
             "compaction_item": {"provider": PROVIDER, "preset": "default"},
             "render_tags": true,

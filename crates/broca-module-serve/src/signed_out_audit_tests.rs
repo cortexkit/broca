@@ -483,7 +483,7 @@ async fn cancelling_an_open_time_sign_in_ask_ends_cancelled() {
     commands
         .send(LineageCmd::Cancel {
             run_id: broca_protocol::RunId("signed-out-run".into()),
-            at: broca_wal::record::RunCancelAt::Now,
+            at: broca_records::record::RunCancelAt::Now,
             reply,
         })
         .unwrap();

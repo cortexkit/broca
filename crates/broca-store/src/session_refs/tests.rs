@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub(super) fn stored_in(
     root: &std::path::Path,
     session: &BindIdentity,
-    class: broca_wal::StorageClass,
+    class: broca_records::session_storage::StorageClass,
 ) {
     use broca_session_store::{
         backend::{LocalBackend, SessionAddr},
@@ -42,12 +42,16 @@ pub(super) fn stored_in(
 
 /// As [`stored_in`], in the durable class.
 pub(super) fn stored(root: &std::path::Path, session: &BindIdentity) {
-    stored_in(root, session, broca_wal::StorageClass::Durable);
+    stored_in(
+        root,
+        session,
+        broca_records::session_storage::StorageClass::Durable,
+    );
 }
 
 /// The head file of `session`, stored by [`stored`].
 pub(super) fn head_path(root: &std::path::Path, session: &BindIdentity) -> std::path::PathBuf {
-    broca_wal::StorageClass::Durable
+    broca_records::session_storage::StorageClass::Durable
         .store_root(root)
         .join("heads")
         .join(session_addr(session))
@@ -75,7 +79,7 @@ fn absence_is_unknown_until_a_census_finishes() {
 
 #[test]
 fn store_lookup_finds_a_session_in_any_storage_class() {
-    for class in broca_wal::StorageClass::ALL {
+    for class in broca_records::session_storage::StorageClass::ALL {
         let root = broca_test_support::scratch_root()
             .join(format!("session-ref-{}-{class}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -470,7 +474,7 @@ fn census_resumes_coverage_without_rereading_covered_sessions() {
     // head with its key and refuses a damaged one; coverage is not authority over the session.
     for address in &covered {
         std::fs::write(
-            broca_wal::StorageClass::Durable
+            broca_records::session_storage::StorageClass::Durable
                 .store_root(&root)
                 .join("heads")
                 .join(address)
@@ -511,7 +515,7 @@ fn census_quarantines_a_head_that_names_another_address() {
     let store = SqliteStore::open(root.join("run-index.db")).unwrap();
     let session = BindIdentity::new("/census/project", "broca", "misplaced");
     stored(&root, &session);
-    let heads = broca_wal::StorageClass::Durable
+    let heads = broca_records::session_storage::StorageClass::Durable
         .store_root(&root)
         .join("heads");
     let elsewhere = "0123456789abcdef";
@@ -568,7 +572,7 @@ fn census_records_only_unrepresented_sessions() {
     assert!(counts.complete);
     assert_eq!(counts.addresses, 2);
     assert_eq!(counts.not_represented, 1);
-    let store_root = broca_wal::StorageClass::Durable.store_root(&root);
+    let store_root = broca_records::session_storage::StorageClass::Durable.store_root(&root);
     let backend = broca_session_store::backend::LocalBackend::new(&store_root);
     let heads: u64 = [&represented, &unindexed]
         .into_iter()
@@ -647,7 +651,11 @@ fn census_over_read_only_state_root_never_changes_sessions_or_manifest() {
     let session = BindIdentity::new("/readonly/project", "broca", "durable");
     stored(&root, &session);
     let retained = BindIdentity::new("/readonly/project", "broca", "retained");
-    stored_in(&root, &retained, broca_wal::StorageClass::Ephemeral);
+    stored_in(
+        &root,
+        &retained,
+        broca_records::session_storage::StorageClass::Ephemeral,
+    );
     std::fs::write(
         root.join("move-inventory.json"),
         b"cleanup must not run in a census",

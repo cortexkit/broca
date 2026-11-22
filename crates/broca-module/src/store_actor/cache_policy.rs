@@ -42,7 +42,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
     pub(super) fn run_cache(
         &self,
         sent: Option<&Cache>,
-        manifest: Option<&broca_wal::PlanManifest>,
+        manifest: Option<&broca_records::record::PlanManifest>,
     ) -> Result<RunCache, String> {
         let operations = self.session.operations();
         let session_plan = broca_session_loop::plan::sender_manifest(operations, &self.parts)?;
@@ -79,7 +79,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
 
 /// The `cache` member of a stored plan. Admission checked it when the plan arrived, so a plan
 /// whose `cache` no longer reads is a damaged record, refused rather than read as no policy.
-fn plan_cache(plan: &broca_wal::PlanManifest) -> Result<Option<Cache>, String> {
+fn plan_cache(plan: &broca_records::record::PlanManifest) -> Result<Option<Cache>, String> {
     let value: serde_json::Value = serde_json::from_str(plan.plan.as_json_text())
         .map_err(|error| format!("the run's plan: {error}"))?;
     let object = value.as_object().ok_or("the run's plan is not an object")?;

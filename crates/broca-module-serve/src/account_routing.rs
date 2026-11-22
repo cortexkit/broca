@@ -11,7 +11,7 @@
 //! for either. A listed credential missing either field is unmapped: it is never offered, is
 //! warned about once while it stays unmapped, and is counted in `health.check`. The answer,
 //! or the reason there was none, is frozen on the run's auth selection as an
-//! [`broca_wal::AccountDecision`], so a resume never asks again. What happens on each answer:
+//! [`broca_records::record::AccountDecision`], so a resume never asks again. What happens on each answer:
 //!
 //! * an account: the run reads and uses exactly that credential;
 //! * no usable answer (routing unreachable, no decision within [`ADMISSION_BUDGET`], or a pick
@@ -1212,7 +1212,7 @@ pub struct AccountHoldCap {
 /// Its outer `None` means unloaded; `Some(None)` proves no accepted send on that account.
 pub fn account_hold_cap(
     setting: broca_core::SameAccountWait,
-    previous: Option<&broca_wal::RunConfig>,
+    previous: Option<&broca_records::record::RunConfig>,
     now_ms: u64,
     accepted: impl FnOnce(&str) -> Option<Option<u64>>,
 ) -> AccountHoldCap {
@@ -1992,7 +1992,7 @@ where
         // reserve nothing.
         let mut result = decision(
             path,
-            if path == broca_wal::ACCOUNT_DECISION_ROUTED {
+            if path == broca_records::record::ACCOUNT_DECISION_ROUTED {
                 admission_id
             } else {
                 None
@@ -2001,11 +2001,11 @@ where
         );
         result.conversation_key = Some(conversation.to_owned());
         result.conversation_key_source = Some(if inputs.conversation_key.is_some() {
-            broca_wal::ConversationKeySource::Caller
+            broca_records::record::ConversationKeySource::Caller
         } else if inputs.inherited_conversation_key.is_some() {
-            broca_wal::ConversationKeySource::Inherited
+            broca_records::record::ConversationKeySource::Inherited
         } else {
-            broca_wal::ConversationKeySource::Session
+            broca_records::record::ConversationKeySource::Session
         });
         result
     };
@@ -2034,7 +2034,7 @@ where
     {
         client.counters.bump("pinned");
         return Ok(AccountChoice::Static(decision(
-            broca_wal::ACCOUNT_DECISION_PINNED,
+            broca_records::record::ACCOUNT_DECISION_PINNED,
             Some(admission),
             None,
         )));
@@ -2122,7 +2122,7 @@ where
                 credential_id,
                 method,
                 decision: decision(
-                    broca_wal::ACCOUNT_DECISION_ROUTED,
+                    broca_records::record::ACCOUNT_DECISION_ROUTED,
                     Some(admission),
                     decision_id,
                 ),
@@ -2161,7 +2161,7 @@ where
         AccountForOutcome::AuthRequired { decision_id } => {
             client.counters.bump("auth_required");
             Ok(AccountChoice::AuthRequired(decision(
-                broca_wal::ACCOUNT_DECISION_AUTH_REQUIRED,
+                broca_records::record::ACCOUNT_DECISION_AUTH_REQUIRED,
                 Some(admission),
                 decision_id,
             )))
@@ -2189,7 +2189,7 @@ where
                 "routing account selection is switched off; using the static credential"
             );
             Ok(AccountChoice::Static(decision(
-                broca_wal::ACCOUNT_DECISION_DISABLED,
+                broca_records::record::ACCOUNT_DECISION_DISABLED,
                 Some(admission),
                 decision_id,
             )))
@@ -2521,7 +2521,7 @@ pub struct RunReporter {
 }
 
 fn held_admission_id(decision: &AccountDecision) -> Option<&str> {
-    if decision.path == broca_wal::ACCOUNT_DECISION_ROUTED {
+    if decision.path == broca_records::record::ACCOUNT_DECISION_ROUTED {
         decision.admission_id.as_deref()
     } else {
         None
@@ -2807,7 +2807,7 @@ impl RunReporter {
         &self,
         lineage: Option<WalLineageId>,
         wal_seq: u64,
-        selection: &broca_wal::AuthSelection,
+        selection: &broca_records::record::AuthSelection,
     ) {
         let _ = self.tx.send(ReportEvent::Moved {
             lineage,
@@ -2911,7 +2911,7 @@ impl RunReporter {
         lineage: Option<WalLineageId>,
         wal_seq: u64,
         attempt: &ModelAttempt,
-        selection: Option<&broca_wal::AuthSelection>,
+        selection: Option<&broca_records::record::AuthSelection>,
     ) {
         let served = selection.map(|selection| ServedOn {
             credential_id: selection.credential_id.clone(),

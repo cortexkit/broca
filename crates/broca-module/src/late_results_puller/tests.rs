@@ -335,7 +335,8 @@ async fn session_store(root: &std::path::Path) -> Arc<crate::store_open::StoreRu
 /// Write one session's records to the store under `root`, as its run loop would have.
 async fn seed_root(root: &std::path::Path, bind: &BindIdentity, records: &[Record]) {
     use broca_session_store::backend::{LocalBackend, SessionAddr};
-    let backend = LocalBackend::new(broca_wal::StorageClass::Ordinary.store_root(root));
+    let backend =
+        LocalBackend::new(broca_records::session_storage::StorageClass::Ordinary.store_root(root));
     let address = SessionAddr(broca_core::session_addr(bind));
     let triple = crate::store_open::triple(bind);
     let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]);

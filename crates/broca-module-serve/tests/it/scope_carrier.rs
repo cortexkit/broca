@@ -510,9 +510,12 @@ impl Rig {
 
     /// Whether the session store holds the session at all.
     fn exists(&self) -> bool {
-        broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.session))
-            .unwrap()
-            .is_some()
+        broca_records::session_storage::session_storage_class(
+            &self.dir,
+            &broca_core::session_addr(&self.session),
+        )
+        .unwrap()
+        .is_some()
     }
 
     /// What each run the session started was admitted with, in the order the runs started.

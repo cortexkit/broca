@@ -432,7 +432,7 @@ fn view_shows(
 
 /// Whether the session's frozen plan names a compaction provider, whose views can leave parts
 /// out of a request.
-fn plan_compacts(manifest: Option<&broca_wal::PlanManifest>) -> bool {
+fn plan_compacts(manifest: Option<&broca_records::record::PlanManifest>) -> bool {
     manifest
         .and_then(|manifest| {
             serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
@@ -655,7 +655,7 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
 async fn derive_message<H: ServeHandler + ?Sized>(
     messages: &mut Messages<'_, H>,
     entry: &SessionReadMessage,
-    manifest: Option<&broca_wal::PlanManifest>,
+    manifest: Option<&broca_records::record::PlanManifest>,
 ) -> Result<MessageOutputRefs, ServeError> {
     let ordinal = entry.ordinal;
     let lineage = messages.lineage.clone();
@@ -815,7 +815,7 @@ pub async fn read<H: ServeHandler + ?Sized>(
 /// scanned.
 fn call_scans(
     entry: &SessionReadMessage,
-    manifest: Option<&broca_wal::PlanManifest>,
+    manifest: Option<&broca_records::record::PlanManifest>,
 ) -> Vec<CallScan> {
     let Some(manifest) = manifest else {
         return Vec::new();
@@ -831,7 +831,7 @@ fn call_scans(
             .fetches
             .iter()
             .find(|fetch| fetch.provider == provider)?;
-        let broca_wal::FetchOutcome::Answered {
+        let broca_records::record::FetchOutcome::Answered {
             reference_slots: Some(slots),
             ..
         } = &fetch.outcome

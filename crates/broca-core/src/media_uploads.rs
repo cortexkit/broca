@@ -104,7 +104,7 @@ struct Metadata {
 pub fn create_upload_directories(state_root: &Path) -> io::Result<()> {
     for child in ["objects", "refs"] {
         let path = state_root.join("media-uploads").join(child);
-        broca_wal::migration::durable_dir(state_root, &path).map_err(|error| {
+        broca_records::move_fence::durable_dir(state_root, &path).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("create media directory {}: {error}", path.display()),
@@ -117,7 +117,7 @@ pub fn create_upload_directories(state_root: &Path) -> io::Result<()> {
         .create(true)
         .open(state_root.join("media-uploads/uploads.lock"))?;
     lock.sync_all()?;
-    broca_wal::migration::sync_dir(&state_root.join("media-uploads"))?;
+    broca_records::move_fence::sync_dir(&state_root.join("media-uploads"))?;
     Ok(())
 }
 
@@ -222,7 +222,7 @@ impl Uploads {
     }
 
     fn save(&self, id: &str, meta: &Metadata) -> Result<(), UploadError> {
-        broca_wal::migration::atomic_json(
+        broca_records::move_fence::atomic_json(
             self.root.parent().unwrap(),
             &self.metadata_path(id),
             meta,
@@ -287,7 +287,7 @@ impl Uploads {
             .create_new(true)
             .open(self.data_path(&id))?;
         file.sync_all()?;
-        broca_wal::migration::sync_dir(&self.root.join("objects"))?;
+        broca_records::move_fence::sync_dir(&self.root.join("objects"))?;
         self.save(&id, &meta)?;
         Ok(wire::UploadBeginReply::new(id))
     }

@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use broca_core::FileLeaseStore;
 use broca_protocol::BindIdentity;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::Session;
-use broca_wal::StorageClass;
 
 use super::{triple, StoreRuntime, StoreSlot};
 use crate::executor::RunExecutor;
@@ -543,9 +543,9 @@ async fn a_new_session_is_placed_by_one_rule() {
     ];
     for (gen, (name, retention, class, expected)) in cases.into_iter().enumerate() {
         assert_eq!(
-            broca_wal::placement(
+            broca_records::session_storage::placement(
                 retention.is_some(),
-                broca_wal::selected_for_backup(class, &backup_classes)
+                broca_records::session_storage::selected_for_backup(class, &backup_classes)
             ),
             expected,
             "{name}"
@@ -589,7 +589,11 @@ async fn a_new_session_is_placed_by_one_rule() {
         Some(StorageClass::Ordinary)
     );
     assert_eq!(
-        broca_wal::session_storage_class(&root, &broca_core::session_addr(&held)).unwrap(),
+        broca_records::session_storage::session_storage_class(
+            &root,
+            &broca_core::session_addr(&held)
+        )
+        .unwrap(),
         Some(StorageClass::Durable)
     );
     // An import brings an agent head onto broca: it is durable without a label, even with no
@@ -631,7 +635,11 @@ async fn a_session_in_each_root_reopens_from_its_root() {
         assert_eq!(runtime.class_of(&session).unwrap(), Some(class));
         registry.actor_for(&session).await.unwrap();
         assert_eq!(
-            broca_wal::session_storage_class(&root, &broca_core::session_addr(&session)).unwrap(),
+            broca_records::session_storage::session_storage_class(
+                &root,
+                &broca_core::session_addr(&session)
+            )
+            .unwrap(),
             Some(class),
             "it opened from its own root"
         );
@@ -652,7 +660,10 @@ async fn a_head_in_two_roots_is_refused_by_name() {
     let heads: Vec<Vec<u8>> = [StorageClass::Durable, StorageClass::Ordinary]
         .into_iter()
         .map(|class| {
-            std::fs::read(broca_wal::session_storage_head(&root, class, &address)).unwrap()
+            std::fs::read(broca_records::session_storage::session_storage_head(
+                &root, class, &address,
+            ))
+            .unwrap()
         })
         .collect();
     let runtime = runtime(&root).await;
@@ -666,7 +677,7 @@ async fn a_head_in_two_roots_is_refused_by_name() {
     }
     let named = |error: String| {
         assert!(
-            error.contains(broca_wal::SESSION_IN_TWO_CLASSES),
+            error.contains(broca_records::session_storage::SESSION_IN_TWO_CLASSES),
             "not refused by name: {error}"
         );
     };
@@ -681,7 +692,10 @@ async fn a_head_in_two_roots_is_refused_by_name() {
         .zip(heads)
     {
         assert_eq!(
-            std::fs::read(broca_wal::session_storage_head(&root, class, &address)).unwrap(),
+            std::fs::read(broca_records::session_storage::session_storage_head(
+                &root, class, &address
+            ))
+            .unwrap(),
             head,
             "the {class} head is untouched"
         );

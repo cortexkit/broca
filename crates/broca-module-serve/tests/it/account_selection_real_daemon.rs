@@ -16,7 +16,9 @@ struct FramedRecord {
 }
 
 /// The auth selection a run's start froze.
-fn auth_of(start: &broca_session_store::record::RunStart) -> Option<broca_wal::AuthSelection> {
+fn auth_of(
+    start: &broca_session_store::record::RunStart,
+) -> Option<broca_records::record::AuthSelection> {
     serde_json::from_value(serde_json::to_value(&start.auth_selection).unwrap()).unwrap()
 }
 
@@ -1662,9 +1664,9 @@ impl Rig {
         .unwrap();
         let incarnation = broca_session_store::codec::hex(&session.head().incarnation.0);
         drop(session);
-        let head = broca_wal::session_storage_head(
+        let head = broca_records::session_storage::session_storage_head(
             &self.state_root,
-            broca_wal::StorageClass::Ordinary,
+            broca_records::session_storage::StorageClass::Ordinary,
             &broca_core::session_addr(identity),
         );
         assert!(
@@ -1810,9 +1812,12 @@ impl Rig {
             "runner",
             name,
         );
-        if broca_wal::session_storage_class(&self.state_root, &broca_core::session_addr(&identity))
-            .unwrap()
-            .is_none()
+        if broca_records::session_storage::session_storage_class(
+            &self.state_root,
+            &broca_core::session_addr(&identity),
+        )
+        .unwrap()
+        .is_none()
         {
             return Vec::new();
         }
@@ -3082,7 +3087,7 @@ async fn a_routed_run_killed_before_its_first_step_resumes_on_its_frozen_selecti
     );
     for frame in &frames {
         if let Record::AuthRefrozen(refrozen) = &frame.record {
-            let auth_selection: broca_wal::AuthSelection =
+            let auth_selection: broca_records::record::AuthSelection =
                 serde_json::from_value(serde_json::to_value(&refrozen.auth_selection).unwrap())
                     .unwrap();
             assert_eq!(auth_selection.credential_id, "work-claude");
@@ -3462,7 +3467,7 @@ async fn queued_conversation_key_survives_drain_and_crash_before_drain() {
                 .as_ref()
                 .unwrap()
                 .conversation_key_source,
-            Some(broca_wal::ConversationKeySource::Caller)
+            Some(broca_records::record::ConversationKeySource::Caller)
         );
     }
 }
@@ -3545,19 +3550,19 @@ async fn later_send_inherits_conversation_key_after_restart() {
             "first",
             Some("consult:inherit"),
             "consult:inherit",
-            broca_wal::ConversationKeySource::Caller,
+            broca_records::record::ConversationKeySource::Caller,
         ),
         (
             "second",
             None,
             "consult:inherit",
-            broca_wal::ConversationKeySource::Inherited,
+            broca_records::record::ConversationKeySource::Inherited,
         ),
         (
             "override",
             Some("consult:override"),
             "consult:override",
-            broca_wal::ConversationKeySource::Caller,
+            broca_records::record::ConversationKeySource::Caller,
         ),
     ] {
         // A durable terminal precedes the actor's idle transition; wait for admission readiness

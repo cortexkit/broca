@@ -147,7 +147,7 @@ async fn assert_keyed_by_bind(
 ) {
     let runtime = rig.registry().store_runtime().unwrap();
     assert!(
-        broca_wal::session_storage_class(
+        broca_records::session_storage::session_storage_class(
             rig.registry().store_runtime().unwrap().state_root(),
             &broca_core::session_addr(session)
         )
@@ -192,7 +192,7 @@ async fn assert_keyed_by_bind(
     };
     let moved = BindIdentity::new(elsewhere, session.harness.clone(), session.session.clone());
     assert!(
-        broca_wal::session_storage_class(
+        broca_records::session_storage::session_storage_class(
             rig.registry().store_runtime().unwrap().state_root(),
             &broca_core::session_addr(&moved)
         )
@@ -429,7 +429,7 @@ async fn ambiguous_and_incomplete_addresses_refuse_before_any_session_is_stored(
         assert_eq!(count(), before);
         for identity in [&first, &second] {
             assert!(
-                broca_wal::session_storage_class(
+                broca_records::session_storage::session_storage_class(
                     rig.registry().store_runtime().unwrap().state_root(),
                     &broca_core::session_addr(identity)
                 )
@@ -508,7 +508,7 @@ async fn inventory_wait_refusals_keep_the_precise_transient_code_and_reason() {
             &rig.session.harness,
             "new-after-repair",
         );
-        assert!(broca_wal::session_storage_class(
+        assert!(broca_records::session_storage::session_storage_class(
             rig.registry().store_runtime().unwrap().state_root(),
             &broca_core::session_addr(&identity)
         )

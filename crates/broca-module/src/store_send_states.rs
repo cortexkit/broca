@@ -235,7 +235,8 @@ impl Projector {
                         .reason
                         .clone()
                         .and_then(|reason| {
-                            serde_json::from_value::<broca_wal::record::SendEndReason>(reason).ok()
+                            serde_json::from_value::<broca_records::record::SendEndReason>(reason)
+                                .ok()
                         })
                         .map_or("not_delivered", |reason| reason.as_str());
                     self.notice(&sent, seq, reason);
@@ -456,11 +457,11 @@ mod tests {
     #[test]
     fn a_direct_start_and_each_way_a_queued_send_ends_have_notices() {
         // The reasons as the queue writes them (`store_actor::ordered`).
-        let superseded = serde_json::to_value(broca_wal::record::SendEndReason::Superseded {
+        let superseded = serde_json::to_value(broca_records::record::SendEndReason::Superseded {
             by: broca_protocol::SubmissionId("sub-9".into()),
         })
         .unwrap();
-        let expired = serde_json::to_value(broca_wal::record::SendEndReason::Expired).unwrap();
+        let expired = serde_json::to_value(broca_records::record::SendEndReason::Expired).unwrap();
         let ended = |submission: &str, reason: serde_json::Value| {
             Record::SendEnded(SendEnded {
                 submission_id: submission.into(),

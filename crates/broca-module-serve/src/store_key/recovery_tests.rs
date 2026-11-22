@@ -167,7 +167,7 @@ impl Rig {
         cancelled: bool,
     ) -> BindIdentity {
         let key = BindIdentity::new(self.root.join("project"), "recovery", name);
-        let root = broca_wal::StorageClass::Ordinary.store_root(&self.root);
+        let root = broca_records::session_storage::StorageClass::Ordinary.store_root(&self.root);
         let addr = SessionAddr(broca_core::session_addr(&key));
         broca_module::store_open::recovery::register_candidate(&root, &addr).unwrap();
         let mut session = Session::create(

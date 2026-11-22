@@ -68,11 +68,11 @@ fn assert_placed(
     subject: &BrocaSubject,
     live: &Live,
     session: &str,
-    placed: broca_wal::StorageClass,
+    placed: broca_records::session_storage::StorageClass,
 ) {
     let address = broca_core::session_addr(&subject.bind_identity(session));
     assert_eq!(
-        broca_wal::session_storage_class(&live.state_root, &address).unwrap(),
+        broca_records::session_storage::session_storage_class(&live.state_root, &address).unwrap(),
         Some(placed),
         "{session} is stored as {}",
         placed.name()
@@ -83,7 +83,7 @@ async fn assert_stored_head(
     subject: &BrocaSubject,
     live: &Live,
     session: &str,
-    class: broca_wal::StorageClass,
+    class: broca_records::session_storage::StorageClass,
     runs: u64,
 ) {
     use broca_session_store::{
@@ -95,11 +95,16 @@ async fn assert_stored_head(
     let identity = subject.bind_identity(session);
     let address = broca_core::session_addr(&identity);
     assert_eq!(
-        broca_wal::session_storage_class(&live.state_root, &address).unwrap(),
+        broca_records::session_storage::session_storage_class(&live.state_root, &address).unwrap(),
         Some(class),
         "the head keeps its backup class"
     );
-    assert!(broca_wal::session_storage_head(&live.state_root, class, &address).is_file());
+    assert!(broca_records::session_storage::session_storage_head(
+        &live.state_root,
+        class,
+        &address
+    )
+    .is_file());
     let stored = Session::view(
         LocalBackend::new(class.store_root(&live.state_root)),
         SessionAddr(address),
@@ -132,7 +137,7 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
     let mut subject = BrocaSubject::new(&scratch).await;
     let root = scratch.join("rig");
     let mut live = subject.start(&root).await.unwrap();
-    use broca_wal::StorageClass;
+    use broca_records::session_storage::StorageClass;
     for (session, class, retention, placed) in [
         ("durable-head", Some("head"), None, StorageClass::Durable),
         ("ordinary", None, None, StorageClass::Ordinary),
@@ -188,9 +193,9 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
         assert_placed(&subject, &live, session, placed);
         if class == Some("head") {
             let storage_class = if retention.is_some() {
-                broca_wal::StorageClass::Ephemeral
+                broca_records::session_storage::StorageClass::Ephemeral
             } else {
-                broca_wal::StorageClass::Durable
+                broca_records::session_storage::StorageClass::Durable
             };
             assert_stored_head(&subject, &live, session, storage_class, 1).await;
         } else {
@@ -263,7 +268,7 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
                 &subject,
                 &live,
                 session,
-                broca_wal::StorageClass::Durable,
+                broca_records::session_storage::StorageClass::Durable,
                 2,
             )
             .await;
@@ -285,7 +290,7 @@ async fn classed_sends_route_freeze_and_keep_placement_after_restart() {
                 &subject,
                 &live,
                 session,
-                broca_wal::StorageClass::Durable,
+                broca_records::session_storage::StorageClass::Durable,
                 2,
             )
             .await;

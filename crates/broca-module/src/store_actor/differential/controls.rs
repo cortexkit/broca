@@ -12,11 +12,11 @@ use broca_core::{HookPlane, HookUnavailable};
 use broca_protocol::content::ContentBlock;
 use broca_protocol::SubmissionRequest;
 use broca_protocol::{BindIdentity, Delivery, NormalizedEvent, RunId, SessionScope};
+use broca_records::{record::FrozenDeclaration, record::OpaqueJson, record::PlanManifest};
 use broca_session_loop::parts::MemoryParts;
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
-use broca_wal::{FrozenDeclaration, OpaqueJson, PlanManifest};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Notify};
 

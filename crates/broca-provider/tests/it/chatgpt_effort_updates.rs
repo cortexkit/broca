@@ -12,7 +12,7 @@ use broca_provider::{
     policy::ReasoningPolicy,
     wire::{FrozenRenderConfig, WireFamily},
 };
-use broca_wal::{RunConfig, RunOrigin, WalRecord};
+use broca_records::{record::RunConfig, record::RunOrigin, record::WalRecord};
 use serde_json::{json, Value};
 
 fn config(model: &str, effort: &str, admitted: bool) -> FrozenRenderConfig {

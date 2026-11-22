@@ -87,14 +87,14 @@ fn result(output: ToolOutput) -> Message {
     )
 }
 
-fn frozen_ride(id: &str) -> broca_wal::record::RideMetadata {
-    broca_wal::record::RideMetadata {
+fn frozen_ride(id: &str) -> broca_records::record::RideMetadata {
+    broca_records::record::RideMetadata {
         speaks_for: None,
         call_key: "frozen-carrier-key".into(),
         send_id: id.into(),
         sender: "ck-mc".into(),
         forms: vec!["tool_result".into()],
-        form: broca_wal::record::RideForm::Append,
+        form: broca_records::record::RideForm::Append,
     }
 }
 
@@ -532,29 +532,23 @@ fn compaction_v2_strip_newest_signed_thinking_keeps_final_tool() {
         "stripping never mutates the stored view"
     );
 
-    let stored = broca_wal::WalRecord::CompactionViewV2(broca_wal::CompactionViewV2 {
-        version: strip.version,
-        checksum: strip.checksum.to_string(),
-        edits: super::storage::encode(None, &strip.clone().into()),
-        built_through: strip.built_through.clone(),
-        new_signed: strip.new_signed.clone(),
-        applied_by: Some("ck-mc".into()),
-    });
-    let stored: broca_wal::WalRecord =
-        serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
-    let mut restored = super::state::State::default();
-    let session = broca_protocol::BindIdentity::new("/project", "test", "s");
-    super::fold::fold(&mut restored, &stored, &session).unwrap();
-    super::fold::fold(
-        &mut restored,
-        &broca_wal::WalRecord::CompactionViewAppliedV2 {
-            step_id: 1,
-            version: strip.version,
-            checksum: strip.checksum.to_string(),
-        },
-        &session,
+    let edits: Vec<broca_records::record::StoredViewEdit> = serde_json::from_slice(
+        &serde_json::to_vec(&super::storage::encode(None, &strip.clone().into())).unwrap(),
     )
     .unwrap();
+    let mut restored = super::state::State::default();
+    super::fold::restore_view(
+        &mut restored,
+        strip.version,
+        strip.checksum.to_string(),
+        &edits,
+        strip.built_through.clone(),
+        strip.new_signed.clone(),
+        Some("ck-mc".into()),
+    )
+    .unwrap();
+    super::fold::restore_applied(&mut restored, 1, strip.version, &strip.checksum.to_string())
+        .unwrap();
     let checkpoint = serde_json::to_vec(&restored).unwrap();
     let restored: super::state::State = serde_json::from_slice(&checkpoint).unwrap();
     let applied = restored.applied().unwrap();
@@ -1461,7 +1455,7 @@ async fn compaction_v2_failed_setup_retries_on_next_send_without_an_applied_view
 #[test]
 fn compaction_v2_storage_references_only_byte_identical_previous_edits() {
     use super::{received::ReceivedView, storage};
-    use broca_wal::StoredViewEdit;
+    use broca_records::record::StoredViewEdit;
     let raw = serde_json::value::RawValue::from_string(
         r#"{ "since":1, "op":"drop", "mid":"m12345678.0" }"#.into(),
     )
@@ -1507,7 +1501,7 @@ fn compaction_v2_storage_references_only_byte_identical_previous_edits() {
 #[test]
 fn compaction_v2_storage_bad_reference_and_checksum_refuse_by_name() {
     use super::{received::ReceivedView, storage};
-    use broca_wal::StoredViewEdit;
+    use broca_records::record::StoredViewEdit;
     let previous = ReceivedView::from(View::seal(1, vec![]));
     let error = storage::rebuild(
         Some(&previous),
@@ -1573,30 +1567,17 @@ fn compaction_v2_every_final_result_kind_is_a_delivery_carrier() {
 }
 
 #[test]
-fn compaction_v2_marker_identity_is_checked_in_log_and_checkpoint() {
-    use super::fold;
+fn compaction_v2_a_marker_naming_another_session_is_refused() {
     use broca_protocol::BindIdentity;
-    use broca_wal::WalRecord;
     let original = BindIdentity::new("/synthetic/marker", "runner", "original");
     let fork = BindIdentity::new("/synthetic/marker", "runner", "fork");
-    let marker = WalRecord::CompactionMarker {
-        harness: original.harness.clone(),
-        session: original.session.clone(),
-        view_version: 1,
-        first_kept_mid: "m12345678.1".into(),
-        first_kept_ordinal: 2,
-        checkpoint: 1,
-    };
     let mut state = state::State::default();
-    let error = fold::fold(&mut state, &marker, &fork).unwrap_err();
+    let error =
+        super::fold::restore_marker(&mut state, "runner", "original", 1, &fork).unwrap_err();
     assert!(error.contains("compaction marker session mismatch"));
     assert!(error.contains("runner/original"));
     assert!(error.contains("runner/fork"));
-    fold::fold(&mut state, &marker, &original).unwrap();
-    let decoded: state::State =
-        serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-    fold::validate_identity(&decoded, &original).unwrap();
-    assert!(fold::validate_identity(&decoded, &fork).is_err());
+    super::fold::restore_marker(&mut state, "runner", "original", 1, &original).unwrap();
 }
 
 #[test]
@@ -1644,7 +1625,7 @@ fn cache_expired_is_claimed_only_when_proven() {
 #[test]
 fn the_output_reserve_falls_back_to_the_models_output_cap() {
     use broca_protocol::request::ModelHandle;
-    use broca_wal::RunConfig;
+    use broca_records::record::RunConfig;
     let config = |max_output_tokens: Option<u64>| RunConfig {
         global_system: None,
         account_route: None,

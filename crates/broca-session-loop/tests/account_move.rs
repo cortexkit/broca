@@ -64,7 +64,7 @@ async fn session(backend: &MemoryBackend) -> Session<&MemoryBackend> {
 }
 
 /// The selection routing gave the run for `account`, under the decision `decision`.
-fn routed(account: &str, decision: &str) -> broca_wal::AuthSelection {
+fn routed(account: &str, decision: &str) -> broca_records::record::AuthSelection {
     serde_json::from_value(json!({
         "credential_id": format!("cred-{account}"),
         "account_ref": account,
@@ -394,7 +394,7 @@ struct Routing {
     answers: Mutex<VecDeque<Scripted>>,
     providers: Mutex<HashMap<String, Box<dyn Provider>>>,
     asked: Mutex<Vec<Asked>>,
-    adopted: Mutex<Vec<broca_wal::AuthSelection>>,
+    adopted: Mutex<Vec<broca_records::record::AuthSelection>>,
 }
 
 #[async_trait::async_trait]
@@ -417,7 +417,7 @@ impl AccountContinue<Box<dyn Provider>> for Routing {
             .pop_front()
             .expect("routing was asked more often than the test scripted");
         let offer = |account: &str,
-                     selection: broca_wal::AuthSelection,
+                     selection: broca_records::record::AuthSelection,
                      valid_until_ms: u64,
                      persona: bool| {
             let provider = self
@@ -479,7 +479,7 @@ impl AccountContinue<Box<dyn Provider>> for Routing {
         }
     }
 
-    fn adopted(&self, selection: &broca_wal::AuthSelection) {
+    fn adopted(&self, selection: &broca_records::record::AuthSelection) {
         self.adopted.lock().unwrap().push(selection.clone());
     }
 }
@@ -506,7 +506,7 @@ impl AccountReports for Reports {
         event_id: &str,
         seq: u64,
         attempt: &ModelAttempt,
-        selection: Option<&broca_wal::AuthSelection>,
+        selection: Option<&broca_records::record::AuthSelection>,
     ) {
         assert_eq!(
             selection.and_then(|selection| selection.account_ref.as_deref()),
@@ -516,7 +516,12 @@ impl AccountReports for Reports {
         self.attempt_recorded(event_id, seq, attempt);
     }
 
-    fn account_moved(&self, _event_id: &str, _seq: u64, selection: &broca_wal::AuthSelection) {
+    fn account_moved(
+        &self,
+        _event_id: &str,
+        _seq: u64,
+        selection: &broca_records::record::AuthSelection,
+    ) {
         self.0.lock().unwrap().push(format!(
             "report moved {}",
             selection.account_ref.as_deref().unwrap_or("?")
@@ -753,7 +758,7 @@ struct Case {
     /// Routing's answers, in turn.
     answers: Vec<Scripted>,
     /// The selection the run starts on; routing's decision for the first account by default.
-    selection: Option<broca_wal::AuthSelection>,
+    selection: Option<broca_records::record::AuthSelection>,
     /// Whether the session's executor can ask routing at all.
     can_ask: bool,
     /// A timed pause on the same account: the run consented, the boot cap and the time the
@@ -813,7 +818,7 @@ struct Ran {
     sent: Vec<Sent>,
     log: Vec<String>,
     asked: Vec<Asked>,
-    adopted: Vec<broca_wal::AuthSelection>,
+    adopted: Vec<broca_records::record::AuthSelection>,
     segments: Vec<broca_core::billing::SpendSegment>,
     operations: Operations,
 }
@@ -845,7 +850,7 @@ fn seams<'a>(
     now: &'a (dyn Fn() -> u64 + Sync),
     routing: Option<&'a Routing>,
     log: &Log,
-    selection: broca_wal::AuthSelection,
+    selection: broca_records::record::AuthSelection,
     wait: broca_core::SameAccountWait,
     stop: tokio_util::sync::CancellationToken,
 ) -> Seams<'a, Box<dyn Provider>, StubToolPlane> {
@@ -1000,7 +1005,7 @@ impl Ran {
         .parse()
     }
 
-    fn auth_refreezes(&self) -> Vec<broca_wal::AuthSelection> {
+    fn auth_refreezes(&self) -> Vec<broca_records::record::AuthSelection> {
         self.records
             .iter()
             .filter_map(|(_, record)| match record {
@@ -1805,11 +1810,11 @@ fn the_ride_after_a_move_compares_the_old_account_with_the_new_one() {
 const COMPACTED_LIMIT: u64 = 200_000;
 
 /// A plan that names a compaction provider, for a run with `tools`.
-fn compacted_manifest(tools: &[broca_protocol::Tool]) -> Arc<broca_wal::PlanManifest> {
+fn compacted_manifest(tools: &[broca_protocol::Tool]) -> Arc<broca_records::record::PlanManifest> {
     let tools = Arc::new(tools.to_vec());
-    Arc::new(broca_wal::PlanManifest {
+    Arc::new(broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             json!({
                 "tool_items": [{"provider": "provider"}],
                 "compaction_item": {"provider": "compactor", "preset": "head", "params": {}},
@@ -1821,9 +1826,9 @@ fn compacted_manifest(tools: &[broca_protocol::Tool]) -> Arc<broca_wal::PlanMani
         .unwrap(),
         plan_identity: "plan-compacted".into(),
         composition_digest: "composition-1".into(),
-        fetches: vec![broca_wal::ProviderFetch {
+        fetches: vec![broca_records::record::ProviderFetch {
             provider: "provider".into(),
-            outcome: broca_wal::FetchOutcome::Answered {
+            outcome: broca_records::record::FetchOutcome::Answered {
                 catalog_digest: "catalog-1".into(),
                 tools: Arc::clone(&tools),
                 text: None,

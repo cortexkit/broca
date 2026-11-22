@@ -17,6 +17,7 @@ broca-protocol = { path = "../broca-protocol" }
 # The image engine's aging state, which `media_index` saves with a session.
 broca-provider = { path = "../broca-provider", features = ["live"] }
 broca-session-store = { path = "../broca-session-store" }
+broca-records = { path = "../broca-records" }
 broca-wal = { path = "../broca-wal" }
 cortexkit-compaction-view.workspace = true
 cortexkit-role-compaction.workspace = true

@@ -278,7 +278,7 @@ async fn seed_rebuild_inventory(side: &Side, count: usize) -> serde_json::Value 
         );
         let address = broca_core::session_addr(&bind);
         let key = format!("{address}:11");
-        let class = broca_wal::StorageClass::ALL[index % 3];
+        let class = broca_records::session_storage::StorageClass::ALL[index % 3];
         let mut session = Session::create(
             LocalBackend::new(class.store_root(&side.dir)),
             SessionAddr(address),
@@ -388,7 +388,7 @@ async fn store_rebuild_unreadable_head_or_missing_runtime_keeps_scan_incomplete(
     assert_eq!(missing_runtime.unreadable.len(), 1);
     assert!(store.registrations().unwrap().is_empty());
     let runtime = side.registry.store_runtime().unwrap();
-    let head = broca_wal::session_storage_head(
+    let head = broca_records::session_storage::session_storage_head(
         &side.dir,
         runtime.class_of(&side.key).unwrap().unwrap(),
         &broca_core::session_addr(&side.key),

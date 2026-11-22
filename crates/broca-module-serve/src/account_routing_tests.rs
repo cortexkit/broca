@@ -357,7 +357,7 @@ fn path_of(choice: &AccountChoice) -> &str {
 #[test]
 fn account_for_hold_cap_params_preserve_legacy_members_and_bound_the_previous_account() {
     use broca_core::SameAccountWait::{Max, Minutes};
-    let previous = |frozen: Value| -> broca_wal::RunConfig {
+    let previous = |frozen: Value| -> broca_records::record::RunConfig {
         serde_json::from_value(json!({
             "model":{"provider_module_id":"anthropic","model_id":"previous-model"},
             "tools":[], "tool_choice":{"type":"auto"}, "generation":{},
@@ -542,7 +542,10 @@ async fn account_selection_disabled_keeps_the_static_credential() {
     else {
         panic!("selection off must retain the static credential")
     };
-    assert_eq!(decision.path, broca_wal::ACCOUNT_DECISION_DISABLED);
+    assert_eq!(
+        decision.path,
+        broca_records::record::ACCOUNT_DECISION_DISABLED
+    );
     assert_eq!(decision.admission_id, None);
     assert_eq!(decision.decision_id.as_deref(), Some("acd-disabled"));
     assert_eq!(routing.methods(), vec![ACCOUNT_FOR_OP]);
@@ -1288,7 +1291,9 @@ async fn a_routing_answer_names_the_credential_and_the_decision() {
             method: AuthMethod::Oauth,
             decision: AccountDecision {
                 conversation_key: Some(conversation_key(&session())),
-                conversation_key_source: Some(broca_wal::ConversationKeySource::Session),
+                conversation_key_source: Some(
+                    broca_records::record::ConversationKeySource::Session
+                ),
                 path: "routed".into(),
                 admission_id: Some("run-1".into()),
                 decision_id: Some("acd-7".into()),
@@ -1361,7 +1366,7 @@ async fn caller_affinity_changes_only_the_conversation_key_in_the_routing_body()
     .unwrap();
     assert_eq!(
         choice.decision().unwrap().conversation_key_source,
-        Some(broca_wal::ConversationKeySource::Caller)
+        Some(broca_records::record::ConversationKeySource::Caller)
     );
     let mut expected = legacy;
     expected["conversation_key"] = json!("consult:42:subject:phase");
@@ -1709,7 +1714,7 @@ async fn auth_required_admits_for_a_fresh_login() {
         choice,
         AccountChoice::AuthRequired(AccountDecision {
             conversation_key: Some(conversation_key(&session())),
-            conversation_key_source: Some(broca_wal::ConversationKeySource::Session),
+            conversation_key_source: Some(broca_records::record::ConversationKeySource::Session),
             path: "auth_required".into(),
             admission_id: None,
             decision_id: Some("acd-9".into()),
@@ -3563,8 +3568,8 @@ async fn an_antigravity_run_with_two_accounts_asks_routing_for_one() {
 
 /// A wall on `account`, as the run loop states it, for a run routed under `decision-a`.
 fn continue_wall<'a>(
-    selection: &'a broca_wal::AuthSelection,
-    config: &'a broca_wal::RunConfig,
+    selection: &'a broca_records::record::AuthSelection,
+    config: &'a broca_records::record::RunConfig,
     refused: &'a [String],
     reask: bool,
 ) -> broca_session_loop::account_move::Wall<'a> {
@@ -3589,7 +3594,7 @@ fn continue_wall<'a>(
     }
 }
 
-fn continue_selection() -> broca_wal::AuthSelection {
+fn continue_selection() -> broca_records::record::AuthSelection {
     serde_json::from_value(json!({
         "credential_id": "credential-a",
         "account_ref": "acct-a",
@@ -3604,7 +3609,7 @@ fn continue_selection() -> broca_wal::AuthSelection {
     .unwrap()
 }
 
-fn continue_config() -> broca_wal::RunConfig {
+fn continue_config() -> broca_records::record::RunConfig {
     serde_json::from_value(json!({
         "model": {"provider_module_id": "anthropic", "model_id": "m"},
         "tools": [],
@@ -4108,7 +4113,7 @@ async fn attempt_reports(
     }
     let lineage = lineage();
     broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
-    let selection = |account: Option<&str>| -> broca_wal::AuthSelection {
+    let selection = |account: Option<&str>| -> broca_records::record::AuthSelection {
         serde_json::from_value(json!({
             "credential_id": "vault-key",
             "account_ref": account,

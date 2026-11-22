@@ -393,7 +393,7 @@ async fn a_wall_offered(
         },
     }))
     .unwrap();
-    let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
+    let config: broca_records::record::RunConfig = serde_json::from_value(serde_json::json!({
         "model": req.model,
         "tools": [],
         "tool_choice": broca_protocol::request::ToolChoice::default(),
@@ -704,7 +704,7 @@ async fn admit_chatgpt_resume(
         model_id: "gpt-6.1".into(),
     };
     let frozen = broca_provider::families::openai_responses_chatgpt_frozen_config("gpt-6.1");
-    let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
+    let config: broca_records::record::RunConfig = serde_json::from_value(serde_json::json!({
         "model": req.model,
         "tools": [],
         "tool_choice": broca_protocol::request::ToolChoice::default(),
@@ -843,7 +843,7 @@ fn kept_the_recorded_account(selection: &broca_core::AuthSelection) {
     assert_eq!(selection.credential_id, "chatgpt:openai");
     assert_eq!(selection.account_ref.as_deref(), Some("chatgpt-a"));
     let decision = selection.account_decision.as_ref().unwrap();
-    assert_eq!(decision.path, broca_wal::ACCOUNT_DECISION_ROUTED);
+    assert_eq!(decision.path, broca_records::record::ACCOUNT_DECISION_ROUTED);
     assert_eq!(decision.admission_id.as_deref(), Some("chatgpt-run"));
     assert_eq!(decision.decision_id.as_deref(), Some("decision-a"));
 }
@@ -1185,7 +1185,7 @@ async fn a_fresh_run_after_chatgpt_a(label: &str, moved_here: bool) -> serde_jso
         model_id: "gpt-5.6-sol".into(),
     };
     let frozen = broca_provider::families::openai_responses_chatgpt_frozen_config("gpt-5.6-sol");
-    let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
+    let config: broca_records::record::RunConfig = serde_json::from_value(serde_json::json!({
         "model": req.model,
         "tools": [],
         "tool_choice": broca_protocol::request::ToolChoice::default(),

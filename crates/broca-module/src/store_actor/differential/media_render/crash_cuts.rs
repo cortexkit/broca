@@ -234,7 +234,7 @@ async fn module(
 
 /// The plan of the scenario's session: the compaction provider, and the `photo` tool its runs
 /// may call.
-fn plan() -> Arc<broca_wal::PlanManifest> {
+fn plan() -> Arc<broca_records::record::PlanManifest> {
     let mut plan = (*super::super::controls::compacting_plan()).clone();
     plan.tools = Arc::new(vec![serde_json::from_value(serde_json::json!({
         "name": "photo",
@@ -252,7 +252,7 @@ async fn send(
     side: &Side,
     run_id: &str,
     request: SubmissionRequest,
-    plan: Option<&Arc<broca_wal::PlanManifest>>,
+    plan: Option<&Arc<broca_records::record::PlanManifest>>,
 ) -> SendOutcome {
     let key = crate::actor::SendKey::Minted;
     side.registry

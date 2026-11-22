@@ -85,7 +85,7 @@ pub struct RunControl {
     /// resumes on the same method, while persisting the vault account labels billing with the
     /// account that handled each segment. `None` means no vault token (for example, the mock
     /// path) and cannot produce an auth refreeze because there is no resolved selection to write.
-    pub auth_selection: Option<broca_wal::AuthSelection>,
+    pub auth_selection: Option<broca_records::record::AuthSelection>,
     /// The model's context-window limit, resolved at admission from a caller override or the
     /// catalog. A fresh run freezes it onto `RunConfig.context_limit`; a resume ignores this
     /// and keeps the value already frozen in the WAL. `None` means neither source had one.
@@ -117,7 +117,7 @@ pub struct RunControl {
     /// repeats it so the episodes left after a WAL fold still carry it. A `RunStarted` carrying
     /// it is written as a gated frame that builds without `plan-manifest/v1` refuse to read.
     /// `None` for a session admitted without a plan, whose `RunStarted` any build reads.
-    pub manifest: Option<Arc<broca_wal::PlanManifest>>,
+    pub manifest: Option<Arc<broca_records::record::PlanManifest>>,
     /// Replace the provider-view system text only after a recorded refresh applies. A
     /// difference between legacy transcript text and manifest metadata is not a refresh.
     pub manifest_system_override: bool,
@@ -140,7 +140,7 @@ pub struct RunControl {
     pub hook_plane: Option<Arc<dyn crate::HookPlane>>,
     /// Input transforms computed by the lineage actor. A queue drain carries its recorded
     /// final input here; core only renders and records it, never calls pre_user.
-    pub input_hooks: Option<Box<broca_wal::Hooks>>,
+    pub input_hooks: Option<Box<broca_records::record::Hooks>>,
     /// An input hook or routing decision refused execution. Admission is durable before this
     /// terminal error is written; no model step or tool dispatch may follow it.
     pub pre_model_error: Option<ProviderError>,

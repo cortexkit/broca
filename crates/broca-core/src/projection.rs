@@ -276,11 +276,11 @@ pub fn tool_finished_event_at(
 /// The outcome name a call's end carries, from its recorded terminal and result. An interrupted
 /// call reads `cancelled` when its run was cancelled.
 pub fn tool_outcome(
-    outcome: broca_wal::DispatchOutcome,
+    outcome: broca_records::record::DispatchOutcome,
     result: &broca_protocol::ToolResult,
     cancelled: bool,
 ) -> &'static str {
-    use broca_wal::DispatchOutcome;
+    use broca_records::record::DispatchOutcome;
     match outcome {
         DispatchOutcome::Interrupted if cancelled => "cancelled",
         DispatchOutcome::Interrupted | DispatchOutcome::Unknown => "interrupted",
@@ -296,10 +296,10 @@ pub fn tool_outcome(
 }
 
 /// The outcome name of a call that was never dispatched, from why it wasn't.
-pub fn no_dispatch_outcome(reason: &broca_wal::NoDispatchReason) -> &'static str {
+pub fn no_dispatch_outcome(reason: &broca_records::record::NoDispatchReason) -> &'static str {
     match reason {
-        broca_wal::NoDispatchReason::Denied { .. }
-        | broca_wal::NoDispatchReason::PolicyBlocked { .. } => "denied",
+        broca_records::record::NoDispatchReason::Denied { .. }
+        | broca_records::record::NoDispatchReason::PolicyBlocked { .. } => "denied",
         _ => "error",
     }
 }
@@ -356,7 +356,11 @@ impl<P> InputUnit<'_, P> {
             Self::Result(owner, result) => tool_finished_event_at(
                 mid(owner),
                 &result.tool_call_id,
-                tool_outcome(broca_wal::DispatchOutcome::Completed, result, false),
+                tool_outcome(
+                    broca_records::record::DispatchOutcome::Completed,
+                    result,
+                    false,
+                ),
                 result,
                 None,
             ),
@@ -471,7 +475,10 @@ pub fn notice_delivered_event(
 /// dispatch, its stored facts and every read of it all encode through here, so a provider and a
 /// reader see the same pin. `None` when the pin cannot be encoded (an empty tool name, a digest
 /// that is not 64 lowercase hex, or a pin over the byte bound); the call then goes without one.
-pub fn schema_pin_text(tool_name: &str, pin: &broca_wal::DispatchSchemaPin) -> Option<String> {
+pub fn schema_pin_text(
+    tool_name: &str,
+    pin: &broca_records::record::DispatchSchemaPin,
+) -> Option<String> {
     use cortexkit_role_tool_provider::call::{SchemaPin, ToolMajorPin};
     match pin.major {
         Some(major) => ToolMajorPin::new(tool_name, &pin.schema_digest, major).encode(),
@@ -509,7 +516,7 @@ pub fn message_shape_finish_reason(
 #[cfg(test)]
 mod schema_pin_tests {
     use super::schema_pin_text;
-    use broca_wal::DispatchSchemaPin;
+    use broca_records::record::DispatchSchemaPin;
 
     const DIGEST: &str = "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335";
 

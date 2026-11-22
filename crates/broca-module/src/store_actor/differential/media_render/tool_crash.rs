@@ -49,7 +49,7 @@ fn wait_step(id: &str, hold: &str) -> Vec<NormalizedEvent> {
 }
 
 /// A plan naming the compaction provider, whose runs may call the `wait` tool.
-fn waiting_plan() -> Arc<broca_wal::PlanManifest> {
+fn waiting_plan() -> Arc<broca_records::record::PlanManifest> {
     let mut plan = (*compacting_plan()).clone();
     plan.tools = Arc::new(vec![serde_json::from_value(json!({
         "name": "wait",

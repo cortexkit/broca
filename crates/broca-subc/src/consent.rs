@@ -650,7 +650,7 @@ mod tests {
             deferred_at_ms: None,
             batch_id: broca_protocol::BatchId("b".into()),
             call_id: broca_protocol::ToolCallId("c".into()),
-            executor: broca_wal::DeferredExecutor::Broca,
+            executor: broca_records::record::DeferredExecutor::Broca,
             module: Some("files".into()),
             tool: "files.write".into(),
             schema_pin: None,
@@ -660,13 +660,13 @@ mod tests {
                 json!({"owner":{"kind":"reserved","module_id":"broca"},"ref":"s","scope_epoch":1}),
             )
             .unwrap(),
-            ask: broca_wal::DeferredAsk {
+            ask: broca_records::record::DeferredAsk {
                 prompt: input["prompt"].as_str().unwrap().into(),
                 options: vec![],
                 expires_at_ms: 60_001,
-                on_expiry: broca_wal::OnExpiry::Deny,
+                on_expiry: broca_records::record::OnExpiry::Deny,
                 material_damage: true,
-                late_execution: broca_wal::LateExecution::Execute,
+                late_execution: broca_records::record::LateExecution::Execute,
             },
         }
     }
@@ -952,7 +952,7 @@ mod tests {
             };
             match field {
                 "schema" => {
-                    *schema_pin = Some(broca_wal::DispatchSchemaPin {
+                    *schema_pin = Some(broca_records::record::DispatchSchemaPin {
                         schema_digest: "s".into(),
                         semantics: 1,
                         major: None,

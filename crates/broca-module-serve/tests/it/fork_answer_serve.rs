@@ -438,10 +438,10 @@ fn plan(identity: &str, callers: Value) -> SendPlan {
     }
 }
 
-fn manifest(identity: &str, plan: Value) -> broca_wal::PlanManifest {
-    broca_wal::PlanManifest {
+fn manifest(identity: &str, plan: Value) -> broca_records::record::PlanManifest {
+    broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: identity.into(),
         composition_digest: "composition".into(),
         tools: Arc::new(Vec::new()),

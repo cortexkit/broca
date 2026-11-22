@@ -35,6 +35,7 @@ use broca_protocol::request::{
 use broca_protocol::{
     DisplayEvent, FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage,
 };
+use broca_records::record::WalRecord;
 use broca_session_loop::shared::{ActorWriter, Request};
 use broca_session_loop::{
     resume, run, seal, AccountReports, Admission, MemoryParts, PendingMedia, Seams, Writer,
@@ -47,7 +48,6 @@ use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Session, SessionError};
-use broca_wal::WalRecord;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -862,7 +862,7 @@ impl ToolPlane for Spy {
         ctx: &BatchCtx,
         id: &ToolCallId,
         tool: &str,
-    ) -> Option<broca_wal::DispatchSchemaPin> {
+    ) -> Option<broca_records::record::DispatchSchemaPin> {
         self.inner.dispatch_schema_pin(ctx, id, tool)
     }
 
@@ -1122,8 +1122,9 @@ async fn pin_spend(session: &Session<&MemoryBackend>, parts: &MemoryParts) {
     }
     assert!(!runs.is_empty(), "the session started no run");
     for run_id in runs {
-        let rebuilt = broca_session_loop::billing::today_records(&records, &run_id, &bind(), parts)
-            .expect("the run's records rebuild");
+        let rebuilt =
+            broca_session_loop::billing::billing_records(&records, &run_id, &bind(), parts)
+                .expect("the run's records rebuild");
         let facts = timeless(broca_core::billing::compute_segments_for_run(
             &rebuilt,
             &RunId(run_id.clone()),
@@ -1465,7 +1466,7 @@ tokio::task_local! {
 
 #[derive(Clone)]
 struct AccountScript {
-    selection: broca_wal::AuthSelection,
+    selection: broca_records::record::AuthSelection,
     wait: broca_core::SameAccountWait,
     /// Whether a pause comparison waits for the account to reset before resuming.
     wait_for_reset: bool,
@@ -1475,11 +1476,11 @@ fn account() -> Option<AccountScript> {
     ACCOUNT.try_with(Clone::clone).ok().flatten()
 }
 
-fn account_selection() -> Option<broca_wal::AuthSelection> {
+fn account_selection() -> Option<broca_records::record::AuthSelection> {
     account().map(|script| script.selection)
 }
 
-fn routed(account: &str) -> broca_wal::AuthSelection {
+fn routed(account: &str) -> broca_records::record::AuthSelection {
     serde_json::from_value(json!({
         "credential_id": "oauth:anthropic",
         "account_ref": account,
@@ -2150,7 +2151,7 @@ struct Scenario {
     tools: Vec<Tool>,
     stop_when: Vec<StopCondition>,
     /// The session's plan manifest, for a scenario admitted with a fetch plan.
-    manifest: Option<Arc<broca_wal::PlanManifest>>,
+    manifest: Option<Arc<broca_records::record::PlanManifest>>,
     steps: Vec<Vec<NormalizedEvent>>,
 }
 
@@ -4494,7 +4495,7 @@ fn ordered_with(id: &str, order: Value, text: &str, supersedes: Option<&str>) ->
             Record::SendEnded(SendEnded {
                 submission_id: old.into(),
                 reason: Some(
-                    serde_json::to_value(broca_wal::record::SendEndReason::Superseded {
+                    serde_json::to_value(broca_records::record::SendEndReason::Superseded {
                         by: broca_protocol::SubmissionId(id.into()),
                     })
                     .unwrap(),
@@ -5328,13 +5329,16 @@ async fn compare_auth_pause(scenario: Scenario) {
 
 /// [`compare_auth_pause`], with routing giving the resumed run `account` instead of the one
 /// the run was admitted to.
-async fn compare_auth_pause_switching(scenario: Scenario, account: broca_wal::AuthSelection) {
+async fn compare_auth_pause_switching(
+    scenario: Scenario,
+    account: broca_records::record::AuthSelection,
+) {
     compare_auth_pause_switching_to(scenario, Some(account)).await;
 }
 
 async fn compare_auth_pause_switching_to(
     scenario: Scenario,
-    resume_account: Option<broca_wal::AuthSelection>,
+    resume_account: Option<broca_records::record::AuthSelection>,
 ) {
     for layout in LAYOUTS {
         LAYOUT
@@ -5351,7 +5355,7 @@ async fn compare_auth_pause_switching_to(
 
 async fn compare_auth_pause_in(
     scenario: Scenario,
-    resume_account: Option<broca_wal::AuthSelection>,
+    resume_account: Option<broca_records::record::AuthSelection>,
 ) {
     with_each_writer(|| {
         Box::pin(compare_auth_pause_in_once(
@@ -5364,7 +5368,7 @@ async fn compare_auth_pause_in(
 
 async fn compare_auth_pause_in_once(
     scenario: Scenario,
-    resume_account: Option<broca_wal::AuthSelection>,
+    resume_account: Option<broca_records::record::AuthSelection>,
 ) {
     // The new loop.
     let backend = MemoryBackend::default();
@@ -6391,19 +6395,19 @@ async fn every_cut_of_a_narrowed_call_behind_a_held_call_resumes_alike() {
 
 /// A plan manifest as a fetch plan freezes it: one tool provider that answered with `tools`,
 /// and a system text.
-fn planned_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
+fn planned_manifest(tools: &[Tool]) -> Arc<broca_records::record::PlanManifest> {
     let tools = Arc::new(tools.to_vec());
-    Arc::new(broca_wal::PlanManifest {
+    Arc::new(broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             json!({"tool_items": [{"provider": "provider"}]}).to_string(),
         )
         .unwrap(),
         plan_identity: "plan-1".into(),
         composition_digest: "composition-1".into(),
-        fetches: vec![broca_wal::ProviderFetch {
+        fetches: vec![broca_records::record::ProviderFetch {
             provider: "provider".into(),
-            outcome: broca_wal::FetchOutcome::Answered {
+            outcome: broca_records::record::FetchOutcome::Answered {
                 catalog_digest: "catalog-1".into(),
                 tools: Arc::clone(&tools),
                 text: None,
@@ -6458,7 +6462,7 @@ async fn assert_store_dispatch_preset(plan: Option<Value>, expected: Option<&str
     scenario.manifest = plan.map(|plan| {
         let mut manifest = planned_manifest(&scenario.tools);
         Arc::make_mut(&mut manifest).plan =
-            broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+            broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap();
         manifest
     });
     for layout in LAYOUTS {
@@ -6606,12 +6610,15 @@ fn harness_hooks_cancelling(cancel: CancellationToken) -> Arc<dyn broca_core::ho
 /// A planned manifest whose one hook provider subscribes to the pre-tool mutate phase (passing
 /// when unavailable) and validate phase (refusing when unavailable), and to post-tool hooks for
 /// `read` (passing when unavailable) and `post_down` (refusing when unavailable).
-fn hooked_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
+fn hooked_manifest(tools: &[Tool]) -> Arc<broca_records::record::PlanManifest> {
     hooked_manifest_with(tools, &["read"])
 }
 
 /// [`hooked_manifest`], with the passing post-tool hook subscribed for `post_tools`.
-fn hooked_manifest_with(tools: &[Tool], post_tools: &[&str]) -> Arc<broca_wal::PlanManifest> {
+fn hooked_manifest_with(
+    tools: &[Tool],
+    post_tools: &[&str],
+) -> Arc<broca_records::record::PlanManifest> {
     let subscriptions = json!([
         {"hook": "pre_tool", "phase": "mutate", "ops": [], "on_unavailable": "pass", "budget_ms": 500},
         {"hook": "pre_tool", "phase": "validate", "ops": [], "on_unavailable": "refuse", "budget_ms": 500},
@@ -6620,7 +6627,7 @@ fn hooked_manifest_with(tools: &[Tool], post_tools: &[&str]) -> Arc<broca_wal::P
         {"hook": "post_assistant", "ops": ["append", "prepend"], "on_unavailable": "pass", "budget_ms": 500},
     ]);
     let mut manifest = (*planned_manifest(tools)).clone();
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
         json!({
             "tool_items": [{"provider": "provider"}],
             "step_transform_items": [
@@ -6630,9 +6637,9 @@ fn hooked_manifest_with(tools: &[Tool], post_tools: &[&str]) -> Arc<broca_wal::P
         .to_string(),
     )
     .unwrap();
-    manifest.declarations = vec![broca_wal::FrozenDeclaration {
+    manifest.declarations = vec![broca_records::record::FrozenDeclaration {
         provider: "p0".into(),
-        answer: broca_wal::OpaqueJson::from_json_text(
+        answer: broca_records::record::OpaqueJson::from_json_text(
             json!({"subscriptions": subscriptions}).to_string(),
         )
         .unwrap(),
@@ -7003,9 +7010,9 @@ async fn compare_compacted_every_cut(scenario: Scenario, script: CompactionScrip
 
 /// A fetch plan's manifest that also names a compaction provider (`compactor`, preset `head`),
 /// with part numbers rendered into requests.
-fn compacted_manifest(tools: &[Tool]) -> Arc<broca_wal::PlanManifest> {
+fn compacted_manifest(tools: &[Tool]) -> Arc<broca_records::record::PlanManifest> {
     let mut manifest = planned_manifest(tools).as_ref().clone();
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
         json!({
             "tool_items": [{"provider": "provider"}],
             "compaction_item": {"provider": "compactor", "preset": "head", "params": {}},
@@ -7810,7 +7817,7 @@ async fn every_cut_of_a_run_ending_at_the_ceiling_resumes_alike() {
 fn tagged_scenario() -> Scenario {
     let tools = vec![tool("read", ExecutionMode::Parallel)];
     let mut manifest = planned_manifest(&tools).as_ref().clone();
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
         json!({"tool_items": [{"provider": "provider"}], "render_tags": true}).to_string(),
     )
     .unwrap();
@@ -9597,7 +9604,7 @@ const ENROLLED_SYSTEM: &str = "You compact.";
 struct EnrollRun {
     id: &'static str,
     input: Vec<Message>,
-    manifest: Option<Arc<broca_wal::PlanManifest>>,
+    manifest: Option<Arc<broca_records::record::PlanManifest>>,
     steps: Vec<Vec<NormalizedEvent>>,
     /// The context limit a run under a plan naming a compaction provider freezes, when not
     /// [`ENROLLED_LIMIT`].
@@ -9622,7 +9629,7 @@ fn enrollment_plane() -> Spy {
 }
 
 /// A plan naming a compaction provider, with its own system text.
-fn enrolling_manifest() -> Arc<broca_wal::PlanManifest> {
+fn enrolling_manifest() -> Arc<broca_records::record::PlanManifest> {
     let mut manifest = compacted_manifest(&enrollment_tools()).as_ref().clone();
     manifest.system_text = ENROLLED_SYSTEM.into();
     manifest.plan_identity = "plan-compacted".into();
@@ -9630,9 +9637,9 @@ fn enrolling_manifest() -> Arc<broca_wal::PlanManifest> {
 }
 
 /// A plan with no compaction provider that renders part numbers into the model's view.
-fn tagging_manifest() -> Arc<broca_wal::PlanManifest> {
+fn tagging_manifest() -> Arc<broca_records::record::PlanManifest> {
     let mut manifest = planned_manifest(&enrollment_tools()).as_ref().clone();
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
         json!({"tool_items": [{"provider": "provider"}], "render_tags": true}).to_string(),
     )
     .unwrap();
@@ -10907,7 +10914,8 @@ async fn the_enrolling_run_bills_as_the_same_run_without_compaction() {
                 let mut plain = run.manifest.as_deref().unwrap().clone();
                 let mut plan: Value = serde_json::from_str(plain.plan.as_json_text()).unwrap();
                 plan["compaction_item"] = Value::Null;
-                plain.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+                plain.plan =
+                    broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap();
                 run.manifest = Some(Arc::new(plain));
             }
             enroll_run(&mut session, &mut parts, &spy, &run)

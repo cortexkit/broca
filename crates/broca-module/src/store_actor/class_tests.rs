@@ -3,10 +3,10 @@ use super::tests::{
 };
 use super::*;
 use crate::actor::SendKey;
+use broca_records::session_storage::StorageClass;
 use broca_session_loop::parts::MemoryParts;
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::keys::Cipher;
-use broca_wal::StorageClass;
 use tokio::sync::Notify;
 
 type MemorySession = Session<&'static MemoryBackend>;

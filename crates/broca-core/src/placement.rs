@@ -1,7 +1,7 @@
 //! Message placement over durable records, independent of message content and storage.
 
 use broca_protocol::{caller::RunFinishReason, request::BudgetConfig, BatchId, RunId, ToolCallId};
-use broca_wal::{RunOrigin, SeedOriginKind, WalRecord};
+use broca_records::{record::RunOrigin, record::SeedOriginKind, record::WalRecord};
 
 use crate::{budget_kernel, BudgetReplayStateV1};
 

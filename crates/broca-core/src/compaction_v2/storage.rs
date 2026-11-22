@@ -1,7 +1,7 @@
 //! The log references edits only by byte equality against the latest accepted
 //! view, never by the provider's `since` claim or the last applied version.
 
-use broca_wal::record::StoredViewEdit;
+use broca_records::record::StoredViewEdit;
 use std::collections::HashMap;
 
 use super::received::ReceivedView;

@@ -257,7 +257,7 @@ async fn message_ids_use_served_facts_after_compaction_enrolment() {
         "composition": composition,
     });
     let mut initial = compacting_manifest(false);
-    initial.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+    initial.plan = broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap();
     initial.composition_digest = plan["composition_digest"].as_str().unwrap().into();
     initial.tools = Arc::new(Vec::new());
     initial.system_text.clear();
@@ -288,7 +288,7 @@ async fn message_ids_use_served_facts_after_compaction_enrolment() {
     )
     .unwrap());
     let mut refreshed = compacting_manifest(false);
-    refreshed.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+    refreshed.plan = broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap();
     refreshed.composition_digest = plan["composition_digest"].as_str().unwrap().into();
     refreshed.tools = Arc::new(Vec::new());
     refreshed.system_text.clear();

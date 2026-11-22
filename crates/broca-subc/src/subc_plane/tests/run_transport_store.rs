@@ -204,7 +204,7 @@ async fn send(
     registry: &LineageRegistry,
     bind: &BindIdentity,
     run: &str,
-    plan: Option<broca_wal::PlanManifest>,
+    plan: Option<broca_records::record::PlanManifest>,
 ) {
     let mut request: SubmissionRequest = serde_json::from_value(json!({
         "model":{"provider_module_id":"stub","model_id":"stub"},

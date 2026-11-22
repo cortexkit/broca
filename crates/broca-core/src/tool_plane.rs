@@ -19,7 +19,7 @@
 use async_trait::async_trait;
 use broca_protocol::{BindIdentity, RunId, SessionScope};
 use broca_protocol::{ToolCall, ToolCallId, ToolResult};
-pub use broca_wal::DispatchSchemaPin;
+pub use broca_records::record::DispatchSchemaPin;
 
 use crate::capability::ToolManifest;
 
@@ -478,7 +478,7 @@ impl ToolOpenGuard {
     }
 }
 
-pub use broca_wal::{FrozenProviderDeclarations, PlanManifest};
+pub use broca_records::{record::FrozenProviderDeclarations, record::PlanManifest};
 
 /// One tool's current definition, which a run at a prefix rebuild takes in place of the one
 /// its session froze ([`ToolPlane::compatible_tools`]).
@@ -501,8 +501,8 @@ pub trait ToolPlane: Send + Sync {
         &self,
         _bind: &BindIdentity,
         _scope: Option<&broca_protocol::SessionScope>,
-        _manifest: &broca_wal::PlanManifest,
-    ) -> std::collections::BTreeMap<String, broca_wal::FrozenProviderDeclarations> {
+        _manifest: &broca_records::record::PlanManifest,
+    ) -> std::collections::BTreeMap<String, broca_records::record::FrozenProviderDeclarations> {
         Default::default()
     }
 
@@ -512,7 +512,10 @@ pub trait ToolPlane: Send + Sync {
     /// Read from what [`Self::run_transport`] just read for the same run, so it asks no
     /// provider again. A tool whose provider could not be read, or that changed major, is not
     /// listed and keeps its frozen definition. Adapters without discovery list none.
-    async fn compatible_tools(&self, _manifest: &broca_wal::PlanManifest) -> Vec<CompatibleTool> {
+    async fn compatible_tools(
+        &self,
+        _manifest: &broca_records::record::PlanManifest,
+    ) -> Vec<CompatibleTool> {
         Vec::new()
     }
 
@@ -617,7 +620,7 @@ pub trait ToolPlane: Send + Sync {
         _ctx: &BatchCtx,
         _tool_call_id: &ToolCallId,
         _tool: &str,
-    ) -> Option<broca_wal::DispatchSchemaPin> {
+    ) -> Option<broca_records::record::DispatchSchemaPin> {
         None
     }
 
@@ -712,7 +715,7 @@ pub trait ElicitationPlane: Send + Sync {
         &self,
         _ctx: &BatchCtx,
         _call_key: &str,
-        _prepared: &broca_wal::WalRecord,
+        _prepared: &broca_records::record::WalRecord,
         _now_ms: u64,
     ) -> Result<ApprovalFiling, ApprovalRouteError> {
         Err(ApprovalRouteError {
@@ -794,4 +797,4 @@ pub trait ElicitationPlane: Send + Sync {
 }
 
 // Adapter crates can name the durable filing payload without an additional WAL dependency.
-pub use broca_wal::{LateExecution, WalRecord};
+pub use broca_records::{record::LateExecution, record::WalRecord};

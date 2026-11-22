@@ -19,9 +19,9 @@ use broca_core::tags::TagNumbering;
 use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::request::{EpisodeRenderInput, RenderHistory};
 use broca_protocol::tags::ComputedRules;
+use broca_records::record::ComputedTagRules;
 use broca_session_store::fold::conversation::{ChangeMark, Conversation};
 use broca_session_store::session::EnrollmentOverlay;
-use broca_wal::ComputedTagRules;
 
 use crate::run::LoopError;
 use crate::writer::Writer;

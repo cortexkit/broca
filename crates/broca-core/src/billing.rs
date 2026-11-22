@@ -10,13 +10,15 @@
 use broca_protocol::{
     caller::RunFinishReason, request::ModelHandle, BindIdentity, RunId, StepId, Usage,
 };
-use broca_wal::{FramedRecord, WalRecord};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod attempt;
 mod fact_session;
+pub mod input;
+
+pub use input::{BillingEvent, BillingRecord};
 
 /// When installing a session WAL received from another machine, select its
 /// `RunStarted` ids that are absent from this machine's current session WAL.
@@ -28,12 +30,12 @@ mod fact_session;
 /// This is set membership, not a sequence or timestamp floor. An unfinished local
 /// episode must stay billable if installation fails and the old WAL resumes.
 /// The caller supplies only the verified cut's records through its end offset.
-pub fn imported_run_ids(incoming: &[FramedRecord], local: &[FramedRecord]) -> Vec<RunId> {
-    fn started_ids(records: &[FramedRecord]) -> BTreeSet<String> {
+pub fn imported_run_ids(incoming: &[BillingRecord], local: &[BillingRecord]) -> Vec<RunId> {
+    fn started_ids(records: &[BillingRecord]) -> BTreeSet<String> {
         records
             .iter()
-            .filter_map(|frame| match &frame.record {
-                WalRecord::RunStarted { run_id, .. } => Some(run_id.0.clone()),
+            .filter_map(|frame| match &frame.event {
+                BillingEvent::RunStarted { run_id, .. } => Some(run_id.0.clone()),
                 _ => None,
             })
             .collect()
@@ -183,7 +185,7 @@ pub struct SpendSegment {
     /// credential selection, so this fact can be matched to the vault's own record of that
     /// request. Absent when the run made no vault request (OpenCode/mock) or predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vault_request: Option<broca_wal::VaultRequest>,
+    pub vault_request: Option<broca_records::record::VaultRequest>,
     /// How the run's provider account was chosen, as its selection froze it: the
     /// `AccountDecision::path` (`routed`, `disabled`, `unreachable`, `pinned`, `legacy_static`,
     /// ...). Absent when the run recorded none (no vault account to choose, or a run admitted
@@ -265,7 +267,7 @@ pub struct SpendSegment {
     /// warm facts, ordinary model-step facts and facts stored before this field existed;
     /// a failure can still carry provider-reported billable usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub warm_outcome: Option<broca_wal::record::BillingAttemptOutcome>,
+    pub warm_outcome: Option<broca_records::record::BillingAttemptOutcome>,
     /// `true` when the run's usage is also exported one fact per model attempt
     /// ([`attempt::AttemptFact`]), each share of which names its segment. A reader
     /// prices the attempts and records a segment marked this way without pricing it, so no usage
@@ -310,7 +312,7 @@ struct OpenRun {
     source_instance_id: String,
     run_id: RunId,
     session: BindIdentity,
-    config: broca_wal::RunConfig,
+    config: broca_records::record::RunConfig,
     scope: Option<broca_protocol::SessionScope>,
     segments: Vec<SpendSegment>,
     freeze_ts_ms: Option<u64>,
@@ -337,7 +339,7 @@ impl OpenRun {
         source_instance_id: &str,
         run_id: RunId,
         session: BindIdentity,
-        config: broca_wal::RunConfig,
+        config: broca_records::record::RunConfig,
         ts_ms: Option<u64>,
         scope: Option<broca_protocol::SessionScope>,
     ) -> Self {
@@ -368,16 +370,18 @@ impl OpenRun {
         &mut self,
         resolver: &R,
         seq: u64,
-        record: &WalRecord,
+        record: &BillingEvent,
         at_ms: Option<u64>,
         retries_used: u32,
         service_tier: Option<&str>,
     ) -> u32 {
         let episode_model = self.config.model.clone();
-        let entries = crate::refusal_fallback::usage_by_model(&episode_model, None, record);
+        let entries = crate::refusal_fallback::StepServing::of_event(record)
+            .map(|serving| serving.usage_by_model(&episode_model, None))
+            .unwrap_or_default();
         let iterations = match record {
-            WalRecord::ModelStepFinished { fallback, .. } => fallback.usage_iterations.as_deref(),
-            WalRecord::ModelStepRefused {
+            BillingEvent::StepFinished { fallback, .. } => fallback.usage_iterations.as_deref(),
+            BillingEvent::StepRefused {
                 usage_iterations, ..
             } => usage_iterations.as_deref(),
             _ => None,
@@ -404,8 +408,8 @@ impl OpenRun {
                 .and_then(serde_json::Value::as_str)
                 .or_else(|| last.then_some(service_tier).flatten());
             let (step_id, refused) = match record {
-                WalRecord::ModelStepFinished { step_id, .. } => (step_id.0, false),
-                WalRecord::ModelStepRefused { step_id, .. } => (step_id.0, true),
+                BillingEvent::StepFinished { step_id, .. } => (step_id.0, false),
+                BillingEvent::StepRefused { step_id, .. } => (step_id.0, true),
                 _ => (0, false),
             };
             let segment_ordinal = self.segments.len() as u64;
@@ -589,7 +593,7 @@ impl OpenRun {
 /// and freeze timestamps come only from fields present in the records. Records that
 /// lack those fields therefore produce `None` rather than using a rebuild-time clock.
 pub fn compute_segments<R: ChargeBasisResolver>(
-    records: &[FramedRecord],
+    records: &[BillingRecord],
     source_instance_id: &str,
     resolver: &R,
 ) -> Vec<SpendSegment> {
@@ -599,7 +603,7 @@ pub fn compute_segments<R: ChargeBasisResolver>(
 /// Compute billing-homogeneous segments for one target run without constructing
 /// segments for the other runs in the same lineage.
 pub fn compute_segments_for_run<R: ChargeBasisResolver>(
-    records: &[FramedRecord],
+    records: &[BillingRecord],
     run_id: &RunId,
     source_instance_id: &str,
     resolver: &R,
@@ -615,7 +619,7 @@ pub fn compute_segments_for_run<R: ChargeBasisResolver>(
 
 /// [`compute_segments_for_run`], with the step shares its segments counted.
 pub fn compute_run_billing<R: ChargeBasisResolver>(
-    records: &[FramedRecord],
+    records: &[BillingRecord],
     run_id: &RunId,
     source_instance_id: &str,
     resolver: &R,
@@ -632,7 +636,7 @@ pub fn compute_run_billing<R: ChargeBasisResolver>(
 }
 
 fn compute_segments_matching<R: ChargeBasisResolver>(
-    records: &[FramedRecord],
+    records: &[BillingRecord],
     target_run: Option<&RunId>,
     source_instance_id: &str,
     resolver: &R,
@@ -649,7 +653,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
         RunId,
         (
             BindIdentity,
-            broca_wal::RunConfig,
+            broca_records::record::RunConfig,
             Option<broca_protocol::SessionScope>,
         ),
     > = std::collections::HashMap::new();
@@ -660,8 +664,8 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
         std::collections::HashMap::new();
 
     for framed in records {
-        match &framed.record {
-            WalRecord::RunStarted {
+        match &framed.event {
+            BillingEvent::RunStarted {
                 run_id,
                 session,
                 config,
@@ -689,7 +693,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     ));
                 }
             }
-            WalRecord::RunConfigRefrozen {
+            BillingEvent::ConfigRefrozen {
                 renderer_version,
                 ts_ms,
                 frozen_render_config,
@@ -710,7 +714,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     current.segment_open = true;
                 }
             }
-            WalRecord::RunAuthRefrozen {
+            BillingEvent::AuthRefrozen {
                 ts_ms,
                 auth_selection,
             } => {
@@ -728,7 +732,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     current.segment_open = true;
                 }
             }
-            WalRecord::ModelStepFinished {
+            BillingEvent::StepFinished {
                 written_at_ms,
                 step_id,
                 retries_used,
@@ -744,7 +748,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     closed_retries_used = closed_retries_used.saturating_add(current.record_usage(
                         resolver,
                         framed.seq,
-                        &framed.record,
+                        &framed.event,
                         *written_at_ms,
                         *retries_used,
                         service_tier_used.as_deref(),
@@ -752,20 +756,20 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 }
             }
             // A refused call was billed: it joins the segment of the model that refused it.
-            WalRecord::ModelStepRefused { ts_ms, .. } => {
+            BillingEvent::StepRefused { ts_ms, .. } => {
                 if let Some(current) = open.as_mut() {
                     current.pause_candidate = None;
                     closed_retries_used = closed_retries_used.saturating_add(current.record_usage(
                         resolver,
                         framed.seq,
-                        &framed.record,
+                        &framed.event,
                         *ts_ms,
                         0,
                         None,
                     ));
                 }
             }
-            WalRecord::RunFinished {
+            BillingEvent::RunFinished {
                 reason,
                 ts_ms,
                 retries_used,
@@ -783,7 +787,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     output.extend(current.finish(resolver, shares));
                 }
             }
-            WalRecord::RunPaused { ts_ms, .. } => {
+            BillingEvent::RunPaused { ts_ms, .. } => {
                 if let Some(current) = open.as_mut() {
                     // A pause can be resumed under the same run id. Defer closing
                     // until the record stream ends so later steps are not stranded
@@ -792,7 +796,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     current.pause_candidate = Some(*ts_ms);
                 }
             }
-            WalRecord::CacheWarmed {
+            BillingEvent::Warmed {
                 run_id,
                 step_id,
                 usage,
@@ -841,7 +845,6 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -950,11 +953,11 @@ fn warm_segment<R: ChargeBasisResolver>(
     source_instance_id: &str,
     run_id: &RunId,
     session: &BindIdentity,
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
     usage: Usage,
     wal_seq: u64,
     sent_at_ms: u64,
-    outcome: Option<broca_wal::record::BillingAttemptOutcome>,
+    outcome: Option<broca_records::record::BillingAttemptOutcome>,
     resolver: &R,
 ) -> SpendSegment {
     let selection = config.auth_selection.as_ref();
@@ -1031,11 +1034,10 @@ fn append_len_prefixed(output: &mut Vec<u8>, value: &[u8]) {
 mod tests {
     use super::*;
     use broca_protocol::{
-        content::{AssistantMessage, ContentBlock, FinishReason, Message, Role},
-        request::{BudgetKind, GenerationConfig, ModelHandle, ResponseFormat, ToolChoice},
+        request::{GenerationConfig, ModelHandle, ResponseFormat, ToolChoice},
         StepId,
     };
-    use broca_wal::{AuthSelection, RunConfig, RunOrigin};
+    use broca_records::{record::AuthSelection, record::RunConfig};
     use serde_json::json;
 
     pub(super) fn resolver(provider: &str, method: &str) -> (ChargeBasis, u32) {
@@ -1086,73 +1088,34 @@ mod tests {
         }
     }
 
-    pub(super) fn frame(seq: u64, record: WalRecord) -> FramedRecord {
-        FramedRecord {
-            seq,
-            fence: 1,
-            record,
-        }
+    pub(super) fn frame(seq: u64, event: BillingEvent) -> BillingRecord {
+        BillingRecord { seq, event }
     }
 
-    pub(super) fn started(seq: u64, run_id: &str, ts_ms: Option<u64>) -> FramedRecord {
+    pub(super) fn started(seq: u64, run_id: &str, ts_ms: Option<u64>) -> BillingRecord {
         frame(
             seq,
-            WalRecord::RunStarted {
-                message_marks: None,
-                compaction_plan_version: None,
-                sent_by: None,
-                written_at_ms: None,
-                tags: None,
-                session_class: None,
-                retention: None,
-                hooks: None,
-                title: None,
-                on_restart: None,
-                keep_warm: None,
-                marker_order_version: None,
-                manifest: None,
-                scope: None,
-                send_id: None,
-                request_identity_digest: None,
-                project_id: None,
-                principal: None,
+            BillingEvent::RunStarted {
                 run_id: RunId(run_id.into()),
                 session: BindIdentity::new("/tmp/project", "runner", "session"),
-                ts_ms,
                 config: Box::new(config("anthropic", "claude", Some("apikey:anthropic:work"))),
-                input: vec![Message::new(
-                    Role::User,
-                    vec![ContentBlock::Text {
-                        text: "hello".into(),
-                    }],
-                )]
-                .into(),
-                origin: RunOrigin::Fresh,
-                submission_id: None,
+                ts_ms,
+                scope: None,
             },
         )
     }
 
-    pub(super) fn step(seq: u64, id: u64, usage: Usage, retries_used: u32) -> FramedRecord {
+    pub(super) fn step(seq: u64, id: u64, usage: Usage, retries_used: u32) -> BillingRecord {
         frame(
             seq,
-            WalRecord::ModelStepFinished {
-                raw_finish_reason: None,
-                fallback: Default::default(),
-                written_at_ms: None,
-                tags: None,
-                hooks: None,
+            BillingEvent::StepFinished {
                 step_id: StepId(id),
-                assistant_message: (AssistantMessage {
-                    message_id: broca_protocol::MessageId(format!("m{id}")),
-                    content: vec![ContentBlock::Text { text: "ok".into() }],
-                })
-                .into(),
+                written_at_ms: None,
                 usage,
-                finish_reason: Some(FinishReason::Stop),
                 retries_used,
                 service_tier_used: None,
                 speed_used: None,
+                fallback: Default::default(),
             },
         )
     }
@@ -1168,13 +1131,13 @@ mod tests {
     pub(super) fn synthetic_iteration_records(
         models: [&str; 2],
         retries: u32,
-    ) -> Vec<FramedRecord> {
+    ) -> Vec<BillingRecord> {
         let mut start = started(1, "synthetic-run", Some(100));
-        if let WalRecord::RunStarted {
+        if let BillingEvent::RunStarted {
             session,
             config: frozen,
             ..
-        } = &mut start.record
+        } = &mut start.event
         {
             *session = BindIdentity::new("/synthetic", "capture", "l3");
             **frozen = config(
@@ -1196,11 +1159,11 @@ mod tests {
             },
             retries,
         );
-        if let WalRecord::ModelStepFinished {
+        if let BillingEvent::StepFinished {
             fallback,
             written_at_ms,
             ..
-        } = &mut handoff.record
+        } = &mut handoff.event
         {
             *written_at_ms = Some(150);
             fallback.served_model = Some(models[1].into());
@@ -1209,8 +1172,8 @@ mod tests {
                 {"model":models[1], "input_tokens":2, "output_tokens":29287, "cache_read_input_tokens":20068, "cache_creation_input_tokens":4}
             ])).unwrap());
         }
-        let mut end = terminal(3, Some(200), Usage::default());
-        if let WalRecord::RunFinished { retries_used, .. } = &mut end.record {
+        let mut end = terminal(3, Some(200));
+        if let BillingEvent::RunFinished { retries_used, .. } = &mut end.event {
             *retries_used = retries;
         }
         vec![start, handoff, end]
@@ -1224,7 +1187,7 @@ mod tests {
             started(5, "a-imported", Some(1)),
             started(8, "b-imported", None),
             started(9, "a-imported", Some(1000)),
-            frame(10, WalRecord::TurnFinished { step_id: StepId(1) }),
+            frame(10, BillingEvent::RunPaused { ts_ms: None }),
         ];
         assert_eq!(
             imported_run_ids(&incoming, &local),
@@ -1235,47 +1198,6 @@ mod tests {
             imported_run_ids(&local, &[]),
             vec![RunId("z-local-unfinished".into())]
         );
-    }
-
-    #[test]
-    fn budget_caller_text_does_not_change_metering_fact_identity() {
-        let first = vec![
-            started(1, "budget", Some(100)),
-            step(2, 1, usage(3, 1), 0),
-            frame(
-                3,
-                WalRecord::BudgetFired {
-                    tags: None,
-                    run_id: RunId("budget".into()),
-                    kind: BudgetKind::Nudge,
-                    threshold: 1,
-                    ordinal: 2,
-                    caller_text: Some("first text".into()),
-                },
-            ),
-            frame(
-                4,
-                WalRecord::RunFinished {
-                    interrupt_reason: None,
-                    reason: RunFinishReason::Completed,
-                    ts_ms: Some(101),
-                    usage: usage(3, 1),
-                    error: None,
-                    retries_used: 0,
-                },
-            ),
-        ];
-        let mut second = first.clone();
-        let WalRecord::BudgetFired { caller_text, .. } = &mut second[2].record else {
-            unreachable!("fixture includes a budget firing");
-        };
-        *caller_text = Some("different replay-only text".into());
-        let first_segments =
-            compute_segments_for_run(&first, &RunId("budget".into()), "instance-a", &resolver);
-        let second_segments =
-            compute_segments_for_run(&second, &RunId("budget".into()), "instance-a", &resolver);
-        assert_eq!(first_segments, second_segments);
-        assert_eq!(first_segments[0].fact_id, second_segments[0].fact_id);
     }
 
     #[test]
@@ -1302,58 +1224,29 @@ mod tests {
         ts_ms: Option<u64>,
         credential_id: Option<&str>,
         account_ref: Option<&str>,
-    ) -> FramedRecord {
+    ) -> BillingRecord {
         let mut config = config("anthropic", "claude", credential_id);
         if let Some(selection) = config.auth_selection.as_mut() {
             selection.account_ref = account_ref.map(str::to_string);
         }
         frame(
             seq,
-            WalRecord::RunStarted {
-                message_marks: None,
-                compaction_plan_version: None,
-                sent_by: None,
-                written_at_ms: None,
-                tags: None,
-                session_class: None,
-                retention: None,
-                hooks: None,
-                title: None,
-                on_restart: None,
-                keep_warm: None,
-                marker_order_version: None,
-                manifest: None,
-                scope: None,
-                send_id: None,
-                request_identity_digest: None,
-                project_id: None,
-                principal: None,
+            BillingEvent::RunStarted {
                 run_id: RunId(run_id.into()),
                 session: BindIdentity::new("/tmp/project", "runner", "session"),
-                ts_ms,
                 config: Box::new(config),
-                input: vec![Message::new(
-                    Role::User,
-                    vec![ContentBlock::Text {
-                        text: "hello".into(),
-                    }],
-                )]
-                .into(),
-                origin: RunOrigin::Fresh,
-                submission_id: None,
+                ts_ms,
+                scope: None,
             },
         )
     }
 
-    pub(super) fn terminal(seq: u64, ts_ms: Option<u64>, usage: Usage) -> FramedRecord {
+    pub(super) fn terminal(seq: u64, ts_ms: Option<u64>) -> BillingRecord {
         frame(
             seq,
-            WalRecord::RunFinished {
-                interrupt_reason: None,
+            BillingEvent::RunFinished {
                 reason: RunFinishReason::Completed,
                 ts_ms,
-                usage,
-                error: None,
                 retries_used: 0,
             },
         )
@@ -1373,12 +1266,12 @@ mod tests {
                 Some("acct-uuid-1"),
             ),
             step(2, 1, usage(3, 1), 0),
-            terminal(3, Some(101), usage(3, 1)),
+            terminal(3, Some(101)),
         ];
         let without_account = vec![
             started_with_account(1, "acct", Some(100), Some("chatgpt:openai"), None),
             step(2, 1, usage(3, 1), 0),
-            terminal(3, Some(101), usage(3, 1)),
+            terminal(3, Some(101)),
         ];
         let with_segments = compute_segments_for_run(
             &with_account,
@@ -1402,11 +1295,11 @@ mod tests {
     }
 
     /// A model step whose provider response reported `tier` (or reported none).
-    fn tiered_step(seq: u64, id: u64, usage: Usage, tier: Option<&str>) -> FramedRecord {
+    fn tiered_step(seq: u64, id: u64, usage: Usage, tier: Option<&str>) -> BillingRecord {
         let mut framed = step(seq, id, usage, 0);
-        if let WalRecord::ModelStepFinished {
+        if let BillingEvent::StepFinished {
             service_tier_used, ..
-        } = &mut framed.record
+        } = &mut framed.event
         {
             *service_tier_used = tier.map(str::to_owned);
         }
@@ -1414,14 +1307,14 @@ mod tests {
     }
 
     /// Three steps at two reported tiers and one step that reported nothing, in one segment.
-    fn mixed_tier_run(tiers: [Option<&str>; 4]) -> Vec<FramedRecord> {
+    fn mixed_tier_run(tiers: [Option<&str>; 4]) -> Vec<BillingRecord> {
         vec![
             started(1, "run", Some(100)),
             tiered_step(2, 1, usage(10, 2), tiers[0]),
             tiered_step(3, 2, usage(20, 4), tiers[1]),
             tiered_step(4, 3, usage(7, 1), tiers[2]),
             tiered_step(5, 4, usage(100, 50), tiers[3]),
-            terminal(6, Some(200), usage(137, 57)),
+            terminal(6, Some(200)),
         ]
     }
 

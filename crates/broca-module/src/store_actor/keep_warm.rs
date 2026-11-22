@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 use broca_core::keep_warm_wait::{KeepWarmDriver, WarmTick, WarmTiming};
 use broca_core::{CacheClock, ShutdownSeal};
 use broca_protocol::{BindIdentity, RunId};
+use broca_records::record::RunConfig;
 use broca_session_loop::run::Admission;
 use broca_session_store::record::{Record, Warmed};
-use broca_wal::RunConfig;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::executor::{RunExecutor, WarmBase, WarmJob};
@@ -241,8 +241,8 @@ impl KeepWarmDriver<Admission> for StoreWarmer {
     fn failed_cost(
         &self,
         _admission: &Admission,
-        reservation: &broca_wal::record::AttemptReservation,
-        envelope: &broca_wal::record::AttemptEnvelope,
+        reservation: &broca_records::record::AttemptReservation,
+        envelope: &broca_records::record::AttemptEnvelope,
         ttl_ms: Option<u64>,
     ) -> Result<f64, String> {
         self.executor

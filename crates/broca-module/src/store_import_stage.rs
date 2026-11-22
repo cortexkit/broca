@@ -18,11 +18,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use broca_records::move_fence;
 use broca_session_store::backend::{LocalBackend, SessionAddr, SessionBackend, Version};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::{Session, SessionError};
-use broca_wal::migration;
 
 use crate::registry::store_move::MoveRefusal;
 use crate::store_publish::{publish_data_at, publish_head_at, PublicationDirs};
@@ -38,7 +38,7 @@ pub fn import_staging_root(state_root: &Path) -> PathBuf {
 pub fn clear_import_staging(state_root: &Path) -> std::io::Result<()> {
     let root = import_staging_root(state_root);
     match std::fs::remove_dir_all(&root) {
-        Ok(()) => migration::sync_dir(root.parent().expect("the staging root has a parent")),
+        Ok(()) => move_fence::sync_dir(root.parent().expect("the staging root has a parent")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }

@@ -1,4 +1,5 @@
 use super::*;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::{
     backend::{LocalBackend, SessionAddr},
     head::Residence,
@@ -7,7 +8,6 @@ use broca_session_store::{
         Session,
     },
 };
-use broca_wal::StorageClass;
 
 pub fn failure(error: moves::Error) -> ErrorBody {
     match error {
@@ -66,7 +66,7 @@ impl FileCutArtifacts {
             return Ok(());
         }
         if let Some(other) =
-            migration::cut_fence(&self.state_root, &plan.reference).map_err(unavailable)?
+            move_fence::cut_fence(&self.state_root, &plan.reference).map_err(unavailable)?
         {
             if other != cut {
                 return Err(foreign_owner(plan, cut, &other, op, state.step));
@@ -238,7 +238,7 @@ impl FileCutArtifacts {
             Op::Prepare => {
                 self.driver.cache_store_stream(cut, plan, op).await?;
                 let (_, version) = export.head(&addr, runtime.deployment()).map_err(failure)?;
-                migration::freeze(
+                move_fence::freeze(
                     &self.state_root,
                     &sidecar,
                     &Freeze {
@@ -272,7 +272,7 @@ impl FileCutArtifacts {
                 )
                 .await
                 .map_err(failure)?;
-                migration::release(&self.state_root, &sidecar, cut, &holder)
+                move_fence::release(&self.state_root, &sidecar, cut, &holder)
                     .map_err(unavailable)?
                     .map_err(unavailable)?;
             }
@@ -360,7 +360,7 @@ impl FileCutArtifacts {
                         &addr,
                     )
                     .map_err(failure)?;
-                migration::unlink(&sidecar.with_extension("moved")).map_err(unavailable)?;
+                move_fence::unlink(&sidecar.with_extension("moved")).map_err(unavailable)?;
             }
             _ => {}
         }

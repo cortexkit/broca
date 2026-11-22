@@ -8,14 +8,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use broca_core::billing::{BillingEvent, BillingRecord};
 use broca_core::{ChargeBasis, ExportCursor, ExportError, ExportIndex};
-use broca_protocol::{
-    caller::RunFinishReason,
-    content::{ContentBlock, Message, Role},
-    request::ModelHandle,
-    BindIdentity, RunId, Usage,
-};
-use broca_wal::{AuthSelection, FramedRecord, RunConfig, WalRecord};
+use broca_protocol::{caller::RunFinishReason, request::ModelHandle, BindIdentity, RunId};
+use broca_records::{record::AuthSelection, record::RunConfig};
 
 mod billing_floor;
 pub use billing_floor::billing_floor_preserves_local_and_new_runs;
@@ -36,12 +32,9 @@ where
     let mut records = base_records(&session);
     records.push(framed(
         1,
-        WalRecord::RunFinished {
-            interrupt_reason: None,
+        BillingEvent::RunFinished {
             reason: RunFinishReason::Completed,
             ts_ms: Some(2),
-            usage: Usage::default(),
-            error: None,
             retries_used: 0,
         },
     ));
@@ -107,42 +100,19 @@ pub(crate) fn session(label: &str) -> BindIdentity {
     )
 }
 
-fn framed(seq: u64, record: WalRecord) -> FramedRecord {
-    FramedRecord {
-        seq,
-        fence: 1,
-        record,
-    }
+fn framed(seq: u64, event: BillingEvent) -> BillingRecord {
+    BillingRecord { seq, event }
 }
 
 pub(crate) fn run_started(
     seq: u64,
     run_id: &str,
     session: &BindIdentity,
-    input: &str,
     model: ModelHandle,
-) -> FramedRecord {
+) -> BillingRecord {
     framed(
         seq,
-        WalRecord::RunStarted {
-            message_marks: None,
-            compaction_plan_version: None,
-            sent_by: None,
-            written_at_ms: None,
-            tags: None,
-            session_class: None,
-            retention: None,
-            hooks: None,
-            title: None,
-            on_restart: None,
-            keep_warm: None,
-            marker_order_version: None,
-            manifest: None,
-            scope: None,
-            send_id: None,
-            request_identity_digest: None,
-            project_id: None,
-            principal: None,
+        BillingEvent::RunStarted {
             ts_ms: None,
             run_id: RunId(run_id.into()),
             session: session.clone(),
@@ -175,18 +145,7 @@ pub(crate) fn run_started(
                 stop_when: Vec::new(),
                 context_management: None,
             }),
-            input: vec![Message {
-                turn_system: false,
-                cache_prefix_blocks: None,
-                origin: None,
-                ordinal: None,
-                tags: Default::default(),
-                role: Role::User,
-                content: vec![ContentBlock::Text { text: input.into() }],
-            }]
-            .into(),
-            origin: broca_wal::RunOrigin::Fresh,
-            submission_id: None,
+            scope: None,
         },
     )
 }
@@ -258,9 +217,9 @@ fn export_records_with_account(
     session: &BindIdentity,
     run_id: &RunId,
     account_ref: Option<&str>,
-) -> Vec<FramedRecord> {
-    let mut start = run_started(0, &run_id.0, session, "hi", ModelHandle::new("stub", "m"));
-    if let WalRecord::RunStarted { config, .. } = &mut start.record {
+) -> Vec<BillingRecord> {
+    let mut start = run_started(0, &run_id.0, session, ModelHandle::new("stub", "m"));
+    if let BillingEvent::RunStarted { config, .. } = &mut start.event {
         config.auth_selection = Some(AuthSelection {
             billing_vault_facts: None,
             auth_method: None,
@@ -275,24 +234,15 @@ fn export_records_with_account(
         start,
         framed(
             1,
-            WalRecord::RunFinished {
-                interrupt_reason: None,
+            BillingEvent::RunFinished {
                 reason: RunFinishReason::Completed,
                 ts_ms: Some(2),
-                usage: Usage::default(),
-                error: None,
                 retries_used: 0,
             },
         ),
     ]
 }
 
-pub(crate) fn base_records(session: &BindIdentity) -> Vec<FramedRecord> {
-    vec![run_started(
-        0,
-        "r",
-        session,
-        "hi",
-        ModelHandle::new("stub", "m"),
-    )]
+pub(crate) fn base_records(session: &BindIdentity) -> Vec<BillingRecord> {
+    vec![run_started(0, "r", session, ModelHandle::new("stub", "m"))]
 }

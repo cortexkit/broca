@@ -2,7 +2,7 @@
 //! the timer and provider future, so receiving the tool results stops that future's local IO.
 
 use broca_protocol::RunId;
-use broca_wal::RunConfig;
+use broca_records::record::RunConfig;
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -89,8 +89,8 @@ pub trait KeepWarmDriver<C: ?Sized + Sync = RunConfig>: Send + Sync {
     fn failed_cost(
         &self,
         _config: &C,
-        _reservation: &broca_wal::record::AttemptReservation,
-        _envelope: &broca_wal::record::AttemptEnvelope,
+        _reservation: &broca_records::record::AttemptReservation,
+        _envelope: &broca_records::record::AttemptEnvelope,
         _ttl_ms: Option<u64>,
     ) -> Result<f64, String> {
         Err("reported warm usage pricing unavailable".into())

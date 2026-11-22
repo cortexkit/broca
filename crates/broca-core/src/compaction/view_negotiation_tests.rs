@@ -12,7 +12,7 @@ fn negotiated_setup(view: Option<&CompactionView>) -> WalRecord {
         unreachable!()
     };
     *view_features = Some(vec!["truncate".into(), "tag_bytes_edits".into()]);
-    *view_due = view.map(|view| broca_wal::SetupViewDue {
+    *view_due = view.map(|view| broca_records::record::SetupViewDue {
         version: view.view_version,
         digest: view.digest.clone(),
     });
@@ -65,7 +65,10 @@ fn negotiated_replace_ranges_remain_final_and_never_inherit_part_tags() {
     state.fold(&WalRecord::CompactionViewApplied {
         provider: "provider".into(),
         view_version: 2,
-        view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap()).unwrap(),
+        view: broca_records::record::OpaqueJson::from_json_text(
+            serde_json::to_string(&view).unwrap(),
+        )
+        .unwrap(),
         choice: CompactionViewChoice::Applied,
     });
     let rendered = render(&CallOptions::new(prompt), &state, &[])

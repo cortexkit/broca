@@ -1198,11 +1198,11 @@ async fn an_empty_text_is_recorded_empty_and_an_absent_one_absent() {
     };
     assert!(matches!(
         outcome("aft"),
-        broca_wal::FetchOutcome::Answered { text: Some(text), .. } if text.is_empty()
+        broca_records::record::FetchOutcome::Answered { text: Some(text), .. } if text.is_empty()
     ));
     assert_eq!(
         outcome("notes-provider"),
-        broca_wal::FetchOutcome::Absent {
+        broca_records::record::FetchOutcome::Absent {
             reason: "timeout".into()
         }
     );
@@ -1315,7 +1315,7 @@ async fn texts_are_joined_exactly_as_fetched() {
     assert_eq!(manifest.system_text, expected);
     assert_eq!(manifest.system_digest, sha256_hex(expected.as_bytes()));
     for fetch in &manifest.fetches {
-        let broca_wal::FetchOutcome::Answered { text, .. } = &fetch.outcome else {
+        let broca_records::record::FetchOutcome::Answered { text, .. } = &fetch.outcome else {
             panic!("{} answered", fetch.provider);
         };
         assert_eq!(text.as_deref(), Some(text_of(&fetch.provider).as_str()));

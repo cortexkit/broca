@@ -223,12 +223,12 @@ impl LiveLoopExecutor {
     }
 }
 
-fn fork_is_routed(config: &broca_wal::RunConfig) -> bool {
+fn fork_is_routed(config: &broca_records::record::RunConfig) -> bool {
     config
         .auth_selection
         .as_ref()
         .and_then(|selection| selection.account_decision.as_ref())
-        .is_some_and(|decision| decision.path == broca_wal::ACCOUNT_DECISION_ROUTED)
+        .is_some_and(|decision| decision.path == broca_records::record::ACCOUNT_DECISION_ROUTED)
 }
 
 /// The fork's `route.account_for` admission. With `fork_of` (the router declares

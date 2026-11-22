@@ -6,7 +6,10 @@ use broca_protocol::{
     BindIdentity, RunId, ToolCallId,
 };
 use sha2::{Digest, Sha256};
-use {broca_wal::RunConfig, broca_wal::RunOrigin, broca_wal::SeedOriginKind};
+use {
+    broca_records::record::RunConfig, broca_records::record::RunOrigin,
+    broca_records::record::SeedOriginKind,
+};
 
 /// Imports stay comfortably below the 64 MiB transport/frame limit, leaving room for
 /// the operation envelope and WAL record metadata.
@@ -212,7 +215,7 @@ pub fn import_marker_config(request_digest: &str, tag_checkpoint: u64) -> RunCon
         account_limit_pause: false,
         turn_directives_v1: None,
         render_tags: false,
-        computed_tags: Some(broca_wal::ComputedTagRules {
+        computed_tags: Some(broca_records::record::ComputedTagRules {
             checkpoint: tag_checkpoint,
         }),
         model: ModelHandle::new("import", "import"),

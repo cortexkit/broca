@@ -1,6 +1,6 @@
 //! Check consent answers against frozen tool arguments and recover missing card ids
 //! without reopening calls already closed by crash recovery.
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde_json::{json, Value};
 
 /// The returned binding is opaque to Cingulate; broca alone checks all four frozen fields.

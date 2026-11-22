@@ -1,13 +1,13 @@
+use broca_core::billing::{BillingEvent, BillingRecord};
 use broca_protocol::BindIdentity;
 use broca_session_store::backend::{MemoryBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::Record;
 use broca_session_store::session::Session;
-use broca_wal::{FramedRecord, WalRecord};
 use futures::executor::block_on;
 
-use super::{run_records, today_records};
+use super::{billing_records, run_records};
 use crate::parts::MemoryParts;
 
 /// A stored history: its records and setup parts, as the converter that moved sessions from the
@@ -110,8 +110,8 @@ fn stored_cache_write_lifetimes_reach_the_shared_billing_builder() {
         let rebuilt = run_records(&session, "r1", &bind(), &parts).await.unwrap();
         let usage = rebuilt
             .iter()
-            .find_map(|framed| match &framed.record {
-                WalRecord::ModelStepFinished { usage, .. } => Some(usage),
+            .find_map(|framed| match &framed.event {
+                BillingEvent::StepFinished { usage, .. } => Some(usage),
                 _ => None,
             })
             .unwrap();
@@ -127,7 +127,7 @@ fn stored_cache_write_lifetimes_reach_the_shared_billing_builder() {
         );
         let mut without_splits = rebuilt.clone();
         for framed in &mut without_splits {
-            if let WalRecord::ModelStepFinished { usage, .. } = &mut framed.record {
+            if let BillingEvent::StepFinished { usage, .. } = &mut framed.event {
                 usage.cache_write_5m_tokens = None;
                 usage.cache_write_1h_tokens = None;
             }
@@ -166,18 +166,19 @@ fn stored_cache_write_lifetimes_reach_the_shared_billing_builder() {
     });
 }
 
-/// Each fed record's type, and the run it names when it names one.
-fn kinds(records: &[FramedRecord]) -> Vec<String> {
+/// Each fed record's kind, and the run it names when it names one.
+fn kinds(records: &[BillingRecord]) -> Vec<String> {
     records
         .iter()
-        .map(|framed| {
-            let value = serde_json::to_value(&framed.record).unwrap();
-            let run = value
-                .get("run_id")
-                .and_then(|run| run.as_str())
-                .map(|run| format!(" {run}"))
-                .unwrap_or_default();
-            format!("{}{run}", value["type"].as_str().unwrap())
+        .map(|record| match &record.event {
+            BillingEvent::RunStarted { run_id, .. } => format!("run_started {}", run_id.0),
+            BillingEvent::ConfigRefrozen { .. } => "config_refrozen".into(),
+            BillingEvent::AuthRefrozen { .. } => "auth_refrozen".into(),
+            BillingEvent::StepFinished { .. } => "step_finished".into(),
+            BillingEvent::StepRefused { .. } => "step_refused".into(),
+            BillingEvent::RunFinished { .. } => "run_finished".into(),
+            BillingEvent::RunPaused { .. } => "run_paused".into(),
+            BillingEvent::Warmed { run_id, .. } => format!("warmed {}", run_id.0),
         })
         .collect()
 }
@@ -197,10 +198,10 @@ fn an_ended_run_is_fed_its_own_records_and_its_later_warms() {
         fed("r1"),
         [
             "run_started r1",
-            "model_step_finished",
+            "step_finished",
             "run_finished",
-            "cache_warmed r1",
-            "cache_warmed r1",
+            "warmed r1",
+            "warmed r1",
         ]
     );
 }
@@ -212,9 +213,9 @@ fn a_paused_run_is_fed_through_its_end() {
         fed("r2"),
         [
             "run_started r2",
-            "model_step_finished",
-            "run_paused r2",
-            "model_step_finished",
+            "step_finished",
+            "run_paused",
+            "step_finished",
             "run_finished",
         ]
     );
@@ -224,10 +225,7 @@ fn a_paused_run_is_fed_through_its_end() {
 /// through the end of the records.
 #[test]
 fn a_later_run_is_fed_nothing_from_before_it() {
-    assert_eq!(
-        fed("r3"),
-        ["run_started r3", "model_step_finished", "run_paused r3"]
-    );
+    assert_eq!(fed("r3"), ["run_started r3", "step_finished", "run_paused"]);
 }
 
 /// If another run starts before a run ends, that run is fed the later start to close its last
@@ -245,13 +243,13 @@ fn an_unended_run_is_fed_the_start_that_closes_it() {
             .filter(|(_, record)| !matches!(record, Record::RunEnd(end) if end.run_id == "r1"))
             .collect();
         assert_eq!(
-            kinds(&today_records(&records, "r1", &bind(), &parts).unwrap()),
+            kinds(&billing_records(&records, "r1", &bind(), &parts).unwrap()),
             [
                 "run_started r1",
-                "model_step_finished",
-                "cache_warmed r1",
+                "step_finished",
+                "warmed r1",
                 "run_started r2",
-                "cache_warmed r1",
+                "warmed r1",
             ]
         );
     });

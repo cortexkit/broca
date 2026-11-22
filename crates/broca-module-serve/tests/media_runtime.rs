@@ -902,7 +902,7 @@ fn stored_snapshot(state_root: &Path) -> std::collections::BTreeMap<std::path::P
         }
     }
     let mut out = Default::default();
-    for class in broca_wal::StorageClass::ALL {
+    for class in broca_records::session_storage::StorageClass::ALL {
         visit(&class.store_root(state_root), &mut out);
     }
     out

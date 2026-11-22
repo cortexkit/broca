@@ -9,7 +9,7 @@ use broca_provider::wire::FrozenRenderConfig;
 pub struct ProviderCacheDeclarer;
 
 impl broca_module::CacheDeclarer for ProviderCacheDeclarer {
-    fn declare(&self, config: &broca_wal::RunConfig) -> Option<CacheDeclaration> {
+    fn declare(&self, config: &broca_records::record::RunConfig) -> Option<CacheDeclaration> {
         let frozen = frozen_render_config(config).ok()?;
         let declared = broca_provider::cache_warm::cache_declaration(
             &config.model.provider_module_id,
@@ -28,13 +28,17 @@ impl broca_module::CacheDeclarer for ProviderCacheDeclarer {
     }
 }
 
-fn frozen_render_config(config: &broca_wal::RunConfig) -> Result<FrozenRenderConfig, String> {
+fn frozen_render_config(
+    config: &broca_records::record::RunConfig,
+) -> Result<FrozenRenderConfig, String> {
     serde_json::from_value(config.frozen_render_config.clone())
         .map_err(|error| format!("the session's frozen render config is unreadable: {error}"))
 }
 
 /// The frozen render config of a session that can be warmed, or why it cannot.
-pub fn warmable_config(config: &broca_wal::RunConfig) -> Result<FrozenRenderConfig, WarmError> {
+pub fn warmable_config(
+    config: &broca_records::record::RunConfig,
+) -> Result<FrozenRenderConfig, WarmError> {
     let frozen = frozen_render_config(config).map_err(WarmError::Unsupported)?;
     broca_provider::cache_warm::cache_declaration(
         &config.model.provider_module_id,
@@ -50,7 +54,7 @@ pub fn warmable_config(config: &broca_wal::RunConfig) -> Result<FrozenRenderConf
 /// OpenAI guarantees thirty minutes of prompt retention for these Responses backends, but
 /// does not document whether a cached read restarts that clock. Schedule the next refresh
 /// twenty-five minutes after sending rather than relying on a read to extend retention.
-pub fn warm_after_send_ms(config: &broca_wal::RunConfig) -> Option<u64> {
+pub fn warm_after_send_ms(config: &broca_records::record::RunConfig) -> Option<u64> {
     use broca_catalog::live::WireFamilyId;
     let family = frozen_render_config(config).ok()?.family_id;
     matches!(
@@ -61,7 +65,7 @@ pub fn warm_after_send_ms(config: &broca_wal::RunConfig) -> Option<u64> {
 }
 
 pub fn automatic_warm_prices(
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
     prefix_tokens: u64,
     ttl_ms: u64,
 ) -> Result<broca_core::keep_warm::WarmCosts, String> {
@@ -81,7 +85,7 @@ pub fn automatic_warm_prices(
 }
 
 pub fn responses_warm_cost(
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
     usage: broca_protocol::Usage,
 ) -> Result<f64, String> {
     let (method, _) = frozen_credential(config).ok_or("pricing_unavailable: auth_method")?;
@@ -106,9 +110,9 @@ pub fn responses_warm_cost(
 /// Subscription cache writes count as fresh input, matching the subscription cache-bust quote;
 /// neither the five-minute nor one-hour metered write multiplier applies to those budget units.
 pub fn failed_warm_cost(
-    config: &broca_wal::RunConfig,
-    reservation: &broca_wal::record::AttemptReservation,
-    envelope: &broca_wal::record::AttemptEnvelope,
+    config: &broca_records::record::RunConfig,
+    reservation: &broca_records::record::AttemptReservation,
+    envelope: &broca_records::record::AttemptEnvelope,
     ttl_ms: Option<u64>,
 ) -> Result<f64, String> {
     if !broca_core::cache_warm::warm_budget_needs_pricing(envelope) {
@@ -121,9 +125,9 @@ pub fn failed_warm_cost(
 
 fn failed_warm_cost_with_catalog(
     catalog: &broca_catalog::runtime::CatalogSnapshot,
-    config: &broca_wal::RunConfig,
-    reservation: &broca_wal::record::AttemptReservation,
-    envelope: &broca_wal::record::AttemptEnvelope,
+    config: &broca_records::record::RunConfig,
+    reservation: &broca_records::record::AttemptReservation,
+    envelope: &broca_records::record::AttemptEnvelope,
     ttl_ms: Option<u64>,
 ) -> Result<f64, String> {
     if !broca_core::cache_warm::warm_budget_needs_pricing(envelope) {
@@ -151,7 +155,7 @@ fn failed_warm_cost_with_catalog(
 
 fn failed_cost_from_schedule(
     schedule: &broca_provider::spec::CostSchedule,
-    envelope: &broca_wal::record::AttemptEnvelope,
+    envelope: &broca_records::record::AttemptEnvelope,
     ttl_ms: Option<u64>,
     subscription: bool,
 ) -> Result<f64, String> {
@@ -160,7 +164,7 @@ fn failed_cost_from_schedule(
     }
     let Some(usage) = envelope
         .usage
-        .filter(|_| envelope.sent != broca_wal::record::AttemptSent::No)
+        .filter(|_| envelope.sent != broca_records::record::AttemptSent::No)
     else {
         return Ok(0.0);
     };
@@ -257,7 +261,7 @@ fn failed_cost_from_schedule(
 /// The method and provider of the run's frozen credential selection, read as the selection
 /// froze them (see [`crate::auth_routing::frozen_selection_credential`]).
 fn frozen_credential(
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
 ) -> Option<(crate::auth_routing::AuthMethod, String)> {
     config.auth_selection.as_ref().and_then(|selection| {
         crate::auth_routing::frozen_selection_credential(
@@ -274,7 +278,7 @@ fn frozen_credential(
 /// alias or the credential-id suffix.
 pub async fn automatic_warm_quota_for_config(
     client: &crate::account_routing::RoutingClient,
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
     headers: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), String> {
     let frozen = frozen_render_config(config).map_err(|_| "reading_missing")?;
@@ -299,7 +303,7 @@ pub async fn automatic_warm_quota_for_config(
 mod automatic_tests {
     use super::*;
 
-    fn reservation(model: &str) -> broca_wal::record::AttemptReservation {
+    fn reservation(model: &str) -> broca_records::record::AttemptReservation {
         serde_json::from_value(serde_json::json!({
             "run_id":"r", "step_id":1, "attempt":0, "send_index":1, "warm":true,
             "reserved_at_ms":100, "provider":"anthropic", "endpoint_host":"example.com", "model_sent":model,
@@ -308,7 +312,7 @@ mod automatic_tests {
         })).unwrap()
     }
 
-    fn metered_config() -> broca_wal::RunConfig {
+    fn metered_config() -> broca_records::record::RunConfig {
         let mut config = config();
         config.model = broca_protocol::request::ModelHandle::new("anthropic", "source");
         config.auth_selection.as_mut().unwrap().credential_id = "apikey:anthropic:test".into();
@@ -378,7 +382,7 @@ mod automatic_tests {
 
     #[test]
     fn failed_warm_adapter_uses_actual_model_and_one_hour_tariff() {
-        use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome};
+        use broca_records::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome};
         let catalog = pricing_catalog();
         let config = metered_config();
         let mut e = AttemptEnvelope {
@@ -466,7 +470,7 @@ mod automatic_tests {
 
     #[test]
     fn failed_warm_unknown_tariff_and_missing_fresh_counts_choose_higher_prices() {
-        use broca_wal::record::{AttemptEnvelope, AttemptSent};
+        use broca_records::record::{AttemptEnvelope, AttemptSent};
         let schedule = broca_provider::spec::CostSchedule {
             input: Some(10.0),
             cache_write: Some(30.0),
@@ -512,7 +516,7 @@ mod automatic_tests {
 
     #[test]
     fn failed_warm_prices_only_reported_usage_and_cache_write_splits() {
-        use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome};
+        use broca_records::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome};
         let rates = broca_provider::spec::CostSchedule {
             input: Some(10.0),
             output: Some(80.0),
@@ -604,12 +608,12 @@ mod automatic_tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    fn config() -> broca_wal::RunConfig {
-        let record: broca_wal::WalRecord = serde_json::from_str(include_str!(
+    fn config() -> broca_records::record::RunConfig {
+        let record: broca_records::record::WalRecord = serde_json::from_str(include_str!(
             "../../broca-wal/tests/golden/run_started.keep_warm.json"
         ))
         .unwrap();
-        let broca_wal::WalRecord::RunStarted { config, .. } = record else {
+        let broca_records::record::WalRecord::RunStarted { config, .. } = record else {
             unreachable!()
         };
         let mut config = *config;
@@ -617,7 +621,7 @@ mod automatic_tests {
             broca_provider::families::anthropic_frozen_config("claude-opus-4-8"),
         )
         .unwrap();
-        config.auth_selection = Some(broca_wal::AuthSelection {
+        config.auth_selection = Some(broca_records::record::AuthSelection {
             billing_vault_facts: None,
             auth_method: None,
             credential_id: "oauth:anthropic:credential-suffix-is-not-account".into(),

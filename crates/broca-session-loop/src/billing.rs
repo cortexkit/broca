@@ -3,9 +3,9 @@
 //! The usage export holds the facts computed by
 //! [`broca_core::billing::compute_segments_for_run`], and its readers read nothing else. That
 //! builder handles segments, refreezes, refusal-fallback routing and warms billed under the run
-//! whose request they re-sent, so runs stored here use the same rules rather than a second copy.
-//! The builder's input records are rebuilt by [`crate::today`] and handed to the same builder
-//! through the usage export writer. This code decides which records are handed over.
+//! whose request they re-sent. This code builds its input records
+//! ([`broca_core::billing::BillingRecord`]) from the session's records and decides which are
+//! handed over; the usage export writer hands them to the builder.
 //!
 //! For one run, the builder reads:
 //! - the run's start;
@@ -21,32 +21,30 @@
 //! config so that a warm is billed under the run it names, but a warm naming an earlier run
 //! yields that run's facts, never this one's.
 //!
-//! The rebuilt records carry the store's seqs. The builder reads a seq only as a warm fact's
+//! The builder's records carry the store's seqs. The builder reads a seq only as a warm fact's
 //! segment ordinal and in its fact id, and a store seq never repeats within a session, so warm
 //! fact ids stay unique.
 
 use broca_core::billing::attempt::AttemptEvidence;
-use broca_protocol::BindIdentity;
+use broca_core::billing::{BillingEvent, BillingRecord};
+use broca_protocol::{BindIdentity, RunId, StepId};
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::idindex::IdKind;
-use broca_session_store::record::{Assistant, Input, Placement, Record};
+use broca_session_store::record::{Assistant, Record, RunStart};
 use broca_session_store::session::Session;
-use broca_wal::FramedRecord;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::parts::Parts;
-use crate::today;
 
-/// The builder's input records for `run_id`, rebuilt from `records`: the session's records
-/// in seq order, both streams, from the run's first start or earlier. `session` is the
-/// session's identity: builder-format run starts repeat it, while the session store keeps it
-/// once.
-pub fn today_records(
+/// The builder's input records for `run_id`, built from `records`: the session's records in seq
+/// order, transcript and ledger records alike, from the run's first start or earlier. `session` is the session's
+/// identity, which the builder names each fact's session with.
+pub fn billing_records(
     records: &[(u64, Record)],
     run_id: &str,
     session: &BindIdentity,
     parts: &dyn Parts,
-) -> Result<Vec<FramedRecord>, String> {
+) -> Result<Vec<BillingRecord>, String> {
     let first = records
         .iter()
         .position(|(_, record)| matches!(record, Record::RunStart(start) if start.run_id == run_id))
@@ -57,37 +55,34 @@ pub fn today_records(
     let mut own = false;
     let mut ended = false;
     let mut assistant: Option<&Assistant> = None;
-    for (index, (seq, record)) in records.iter().enumerate().skip(first) {
-        let rebuilt = match record {
+    for (seq, record) in records.iter().skip(first) {
+        let event = match record {
             Record::RunStart(start) if start.run_id == run_id => {
                 own = true;
                 ended = false;
                 assistant = None;
-                // Its input entries follow it.
-                let inputs: Vec<&Input> = records[index + 1..]
-                    .iter()
-                    .map_while(|(_, record)| match record {
-                        Record::Input(input)
-                            if input.placement == Placement::RunInput
-                                && input.run_id == start.run_id =>
-                        {
-                            Some(input)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                Some(run_started(start, &inputs, session, parts)?)
+                Some(run_started(start, session, parts)?)
             }
             Record::RunStart(start) => {
                 let closes = own && !ended;
                 own = false;
                 if closes {
-                    Some(run_started(start, &[], session, parts)?)
+                    Some(run_started(start, session, parts)?)
                 } else {
                     None
                 }
             }
-            Record::Warmed(warmed) if warmed.run_id == run_id => Some(today::cache_warmed(warmed)?),
+            Record::Warmed(warmed) if warmed.run_id == run_id => Some(BillingEvent::Warmed {
+                run_id: RunId(warmed.run_id.clone()),
+                step_id: StepId(warmed.step_id),
+                usage: warmed.usage,
+                sent_at_ms: warmed.sent_at_ms,
+                envelope: members(warmed.billing.as_ref())?
+                    .remove("envelope")
+                    .map(|envelope| decode(envelope, "a warm's billing envelope"))
+                    .transpose()?,
+                trigger: warmed.trigger.clone(),
+            }),
             _ if !own => None,
             Record::Assistant(message) => {
                 assistant = Some(message);
@@ -105,45 +100,107 @@ pub fn today_records(
                             end.step_id
                         )
                     })?;
-                Some(today::model_step_finished(message, end)?)
+                Some(BillingEvent::StepFinished {
+                    step_id: StepId(end.step_id),
+                    written_at_ms: message.written_at_ms,
+                    usage: message.usage.ok_or_else(|| {
+                        format!(
+                            "the step {} of the run {run_id} records no usage",
+                            end.step_id
+                        )
+                    })?,
+                    retries_used: end.retries_used,
+                    service_tier_used: end.service_tier_used.clone(),
+                    speed_used: end.speed_used.clone(),
+                    fallback: Box::new(decode(
+                        Value::Object(members(end.fallback.as_ref())?),
+                        "a step's fallback",
+                    )?),
+                })
             }
-            Record::StepRefused(refused) => Some(today::model_step_refused(refused)),
-            Record::ConfigRefrozen(refrozen) => Some(today::run_config_refrozen(refrozen)),
-            Record::AuthRefrozen(refrozen) => Some(today::run_auth_refrozen(refrozen)),
-            Record::Pause(pause) => Some(today::run_paused(pause)),
+            Record::StepRefused(refused) => Some(BillingEvent::StepRefused {
+                step_id: StepId(refused.step_id),
+                ts_ms: refused.ts_ms,
+                usage: refused.usage,
+                served_model: refused.served_model.clone(),
+                usage_iterations: refused
+                    .usage_iterations
+                    .clone()
+                    .map(|iterations| decode(iterations, "a refused step's usage iterations"))
+                    .transpose()?,
+            }),
+            Record::ConfigRefrozen(refrozen) => Some(BillingEvent::ConfigRefrozen {
+                renderer_version: refrozen.renderer_version,
+                ts_ms: refrozen.ts_ms,
+                frozen_render_config: refrozen.render_config.clone(),
+            }),
+            Record::AuthRefrozen(refrozen) => Some(BillingEvent::AuthRefrozen {
+                ts_ms: refrozen.ts_ms,
+                auth_selection: decode(
+                    refrozen.auth_selection.clone(),
+                    "a refreeze's auth selection",
+                )?,
+            }),
+            Record::Pause(pause) => Some(BillingEvent::RunPaused { ts_ms: pause.ts_ms }),
             Record::RunEnd(end) => {
                 ended = true;
-                Some(today::run_finished(end))
+                // A run end that recorded no usage can't be billed: its facts would claim a
+                // total nobody measured.
+                end.usage
+                    .ok_or_else(|| format!("the end of the run {run_id} records no usage"))?;
+                Some(BillingEvent::RunFinished {
+                    reason: end.reason,
+                    ts_ms: end.ts_ms,
+                    retries_used: end.retries_used,
+                })
             }
             _ => None,
         };
-        if let Some(value) = rebuilt {
-            let kind = value["type"].as_str().unwrap_or("?").to_owned();
-            let record = serde_json::from_value(value).map_err(|error| {
-                format!("the rebuilt {kind} at seq {seq} doesn't read: {error}")
-            })?;
-            out.push(FramedRecord {
-                seq: *seq,
-                fence: 0,
-                record,
-            });
+        if let Some(event) = event {
+            out.push(BillingRecord { seq: *seq, event });
         }
     }
     Ok(out)
 }
 
-/// The `run_started` record for `start`, under the session's identity.
+/// The builder's record of `start`: the run's config as the serve executor reads it from the
+/// start and the setup parts it names, under the session's identity.
 fn run_started(
-    start: &broca_session_store::record::RunStart,
-    inputs: &[&Input],
+    start: &RunStart,
     session: &BindIdentity,
     parts: &dyn Parts,
-) -> Result<Value, String> {
-    let mut value = today::run_started(start, inputs, |part| crate::parts::value(parts, part))?;
-    if let Value::Object(object) = &mut value {
-        object.insert("session".into(), today::json(session));
+) -> Result<BillingEvent, String> {
+    let (config, _) = crate::run::run_config_members(
+        start,
+        crate::run::SetupParts::All,
+        |part| crate::parts::value(parts, part),
+        || "a carried payload is not an object".to_string(),
+    )?;
+    Ok(BillingEvent::RunStarted {
+        run_id: RunId(start.run_id.clone()),
+        session: session.clone(),
+        config: Box::new(decode(Value::Object(config), "a run's config")?),
+        ts_ms: start.ts_ms,
+        scope: start
+            .scope
+            .clone()
+            .map(|scope| decode(scope, "a run's scope"))
+            .transpose()?,
+    })
+}
+
+/// The members of a payload a record holds as JSON text; none when it holds none.
+fn members(payload: Option<&broca_protocol::json::Json>) -> Result<Map<String, Value>, String> {
+    match payload.map(broca_protocol::json::Json::parse) {
+        None => Ok(Map::new()),
+        Some(Value::Object(object)) => Ok(object),
+        Some(_) => Err("a carried payload is not an object".into()),
     }
-    Ok(value)
+}
+
+/// `value` read as `T`, naming `what` it is when it doesn't read.
+fn decode<T: serde::de::DeserializeOwned>(value: Value, what: &str) -> Result<T, String> {
+    serde_json::from_value(value).map_err(|error| format!("{what} doesn't read: {error}"))
 }
 
 /// The session's records the builder may read for `run_id`: every record of both streams from
@@ -173,9 +230,9 @@ pub async fn run_records<B: SessionBackend>(
     run_id: &str,
     bind: &BindIdentity,
     parts: &dyn Parts,
-) -> Result<Vec<FramedRecord>, String> {
+) -> Result<Vec<BillingRecord>, String> {
     let records = session_records(session, run_id).await?;
-    today_records(&records, run_id, bind, parts)
+    billing_records(&records, run_id, bind, parts)
 }
 
 /// What the usage export needs to bill `run_id`: the builder's input records and the run's model
@@ -186,10 +243,10 @@ pub async fn run_billing_inputs<B: SessionBackend>(
     run_id: &str,
     bind: &BindIdentity,
     parts: &dyn Parts,
-) -> Result<(Vec<FramedRecord>, Vec<AttemptEvidence>), String> {
+) -> Result<(Vec<BillingRecord>, Vec<AttemptEvidence>), String> {
     let records = session_records(session, run_id).await?;
     let attempts = attempt_evidence(&records, run_id);
-    Ok((today_records(&records, run_id, bind, parts)?, attempts))
+    Ok((billing_records(&records, run_id, bind, parts)?, attempts))
 }
 
 /// The attempt records of `run_id` among `records`, as the attempt facts read them.

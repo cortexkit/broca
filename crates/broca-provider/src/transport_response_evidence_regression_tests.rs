@@ -1,7 +1,7 @@
 fn regression_decode(
     name: &str,
     bytes: &[u8],
-) -> (broca_wal::record::AttemptEnvelope, Vec<NormalizedEvent>) {
+) -> (broca_records::record::AttemptEnvelope, Vec<NormalizedEvent>) {
     let (id, family) = evidence_family(name);
     let frozen = families::frozen_config_for_family(id, "claude-opus-5-5");
     let mut legacy = family.normalizer(&frozen, StepId(1));
@@ -19,7 +19,7 @@ fn regression_decode(
     }
     super::super::observe_response_finish(&Some(evidence.clone()), &events);
     let mut envelope = response_envelope(std::mem::take(&mut *evidence.lock().unwrap()), None);
-    envelope.outcome = broca_wal::record::BillingAttemptOutcome::ProviderError;
+    envelope.outcome = broca_records::record::BillingAttemptOutcome::ProviderError;
     (envelope, events)
 }
 
@@ -68,7 +68,7 @@ fn response_evidence_regression_missing_iterations_do_not_label_handoff_as_sourc
         serde_json::to_string(envelope.usage_by_model.as_ref().unwrap()).unwrap(),
         r#"[{"model_used":"claude-opus-5-5","usage":{}},{"model_used":"claude-opus-4-8","usage":{}}]"#
     );
-    serde_json::from_value::<broca_wal::record::AttemptEnvelope>(
+    serde_json::from_value::<broca_records::record::AttemptEnvelope>(
         serde_json::to_value(envelope).unwrap(),
     )
     .unwrap();

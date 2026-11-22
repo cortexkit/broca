@@ -316,7 +316,7 @@ fn walk(
                     .iter_mut()
                     .find(|call| call.call.tool_call_id == id && !call.terminal)
                 {
-                    use broca_wal::record::DispatchOutcome;
+                    use broca_records::record::DispatchOutcome;
                     if call.call.call_key.is_none() {
                         call.call.call_key = outcome.call_key.clone();
                     }

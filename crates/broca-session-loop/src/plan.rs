@@ -20,7 +20,7 @@ use crate::parts::Parts;
 pub fn sender_manifest(
     operations: &Operations,
     parts: &dyn Parts,
-) -> Result<Option<Arc<broca_wal::PlanManifest>>, String> {
+) -> Result<Option<Arc<broca_records::record::PlanManifest>>, String> {
     if let Some(accepted) = accepted(operations) {
         return stored(accepted, parts).map(Some);
     }
@@ -62,7 +62,7 @@ pub fn selection(operations: &Operations, parts: &dyn Parts) -> Result<Option<Pl
 /// The model selected by the `manifest`'s plan, as recorded by a refresh
 /// (`SessionRefresh::selection`), using `broca_core::head::manifest_selection` to read the
 /// plan's `model`.
-pub fn recorded_selection(manifest: &broca_wal::PlanManifest) -> Option<Value> {
+pub fn recorded_selection(manifest: &broca_records::record::PlanManifest) -> Option<Value> {
     broca_core::head::manifest_selection(manifest)
         .map(|selection| serde_json::to_value(selection).expect("a plan model encodes"))
 }
@@ -74,7 +74,7 @@ fn accepted(operations: &Operations) -> Option<&ManifestRef> {
 fn first_manifest(
     operations: &Operations,
     parts: &dyn Parts,
-) -> Result<Option<Arc<broca_wal::PlanManifest>>, String> {
+) -> Result<Option<Arc<broca_records::record::PlanManifest>>, String> {
     let Some(first) = operations.owner.first_start.as_ref() else {
         return Ok(None);
     };
@@ -85,7 +85,7 @@ fn first_manifest(
 fn stored(
     manifest: &ManifestRef,
     parts: &dyn Parts,
-) -> Result<Arc<broca_wal::PlanManifest>, String> {
+) -> Result<Arc<broca_records::record::PlanManifest>, String> {
     crate::run::stored_manifest(manifest, parts)
         .map_err(|error| format!("the accepted refresh's manifest: {error:?}"))
 }

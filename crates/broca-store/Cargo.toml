@@ -19,6 +19,7 @@ broca-protocol = { path = "../broca-protocol" }
 # The session-ref census reads the session store's heads for the identity each session was
 # created under.
 broca-session-store = { path = "../broca-session-store" }
+broca-records = { path = "../broca-records" }
 broca-wal = { path = "../broca-wal" }
 serde.workspace = true
 serde_json.workspace = true

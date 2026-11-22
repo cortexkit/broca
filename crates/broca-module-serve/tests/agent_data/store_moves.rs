@@ -1,10 +1,10 @@
 use super::*;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::{
     backend::{LocalBackend, SessionAddr},
     keys::{Cipher, DeploymentKey},
     session::Session,
 };
-use broca_wal::StorageClass;
 
 /// A rig whose new storage opens without its deployment key, as broca's does at boot before the
 /// vault answers, and the slot and setup that load the key later. With `open_late`, the storage
@@ -439,14 +439,16 @@ async fn store_busy_refuses_prepare_and_bad_verification_digests_refuse_before_s
 fn pending(rig: &Rig, op: &str, previous: contract::step::Step, params: Value) {
     use broca_module::cut_state::{CutState, CutStore, Intent};
     let path = CutStore::new(&rig.root).path(CUT);
-    let mut state: CutState = broca_wal::migration::read_json(&path).unwrap().unwrap();
+    let mut state: CutState = broca_records::move_fence::read_json(&path)
+        .unwrap()
+        .unwrap();
     state.step = previous;
     state.replies.remove(&format!("agent_data.{op}"));
     state.intent = Some(Intent {
         op: op.into(),
         request: params,
     });
-    broca_wal::migration::atomic_json(&rig.root, &path, &state).unwrap();
+    broca_records::move_fence::atomic_json(&rig.root, &path, &state).unwrap();
 }
 
 #[tokio::test]

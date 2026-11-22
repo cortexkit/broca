@@ -1,7 +1,7 @@
 //! Session-wide input accounting over durable model-step records, independent of episode budgets.
 
 use broca_protocol::{BudgetExhaustedDetail, Usage};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use cortexkit_role_llm_runner::{
     run::budget_exhausted_causes::{LIMIT_REACHED, USAGE_UNREPORTED},
     send::Budget,

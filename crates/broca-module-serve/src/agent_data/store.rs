@@ -62,7 +62,7 @@ impl Driver {
             return Ok(());
         }
         let parent = path.parent().unwrap();
-        broca_wal::migration::durable_dir(&self.root, parent).map_err(unavailable)?;
+        broca_records::move_fence::durable_dir(&self.root, parent).map_err(unavailable)?;
         let temp = path.with_extension(cut);
         let mut file = broca_owner_only::OpenOptions::new()
             .write(true)
@@ -105,7 +105,7 @@ impl Driver {
         file.sync_all().map_err(unavailable)?;
         drop(file);
         std::fs::rename(&temp, &path).map_err(unavailable)?;
-        broca_wal::migration::sync_dir(parent).map_err(unavailable)?;
+        broca_records::move_fence::sync_dir(parent).map_err(unavailable)?;
         Ok(())
     }
     pub(super) async fn incoming_store_plan(
@@ -236,7 +236,7 @@ impl Driver {
         }
         // A session kept with retention lives in the ephemeral class and is deleted when its
         // deadline passes; a move would keep a copy of it beyond that on another computer.
-        if op == Op::Prepare && class == broca_wal::StorageClass::Ephemeral {
+        if op == Op::Prepare && class == broca_records::session_storage::StorageClass::Ephemeral {
             return Err(refusal(
                 "not_exportable",
                 "retention session must not leave this computer",
@@ -249,14 +249,15 @@ impl Driver {
             .read_stored_head(&addr)
             .map_err(|e| unavailable(format!("{e:?}")))?
             .ok_or_else(|| unavailable("store head missing"))?;
-        let freeze: Option<broca_wal::migration::Freeze> = broca_wal::migration::read_json(
-            &self
-                .root
-                .join("session-store-moves/fences")
-                .join(&addr.0)
-                .with_extension("moving"),
-        )
-        .map_err(unavailable)?;
+        let freeze: Option<broca_records::move_fence::Freeze> =
+            broca_records::move_fence::read_json(
+                &self
+                    .root
+                    .join("session-store-moves/fences")
+                    .join(&addr.0)
+                    .with_extension("moving"),
+            )
+            .map_err(unavailable)?;
         let mut version = freeze
             .as_ref()
             .and_then(|freeze| freeze.store_head_version)

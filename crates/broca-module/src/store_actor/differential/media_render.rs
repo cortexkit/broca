@@ -1016,7 +1016,7 @@ async fn send_planned(
     side: &Rendered,
     run_id: &str,
     request: SubmissionRequest,
-    plan: &Arc<broca_wal::PlanManifest>,
+    plan: &Arc<broca_records::record::PlanManifest>,
 ) -> SendOutcome {
     let key = crate::actor::SendKey::Minted;
     side.side

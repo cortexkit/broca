@@ -21,7 +21,7 @@ pub use crate::seal::{crash_orphan_error, SealCause};
 pub use crate::tool_results::{not_dispatched_result, provider_held_close_result};
 pub use crate::tool_results::{NOT_DISPATCHED_TEXT, OUTCOME_UNKNOWN_TEXT};
 
-use broca_wal::WithdrawElicitation;
+use broca_records::record::WithdrawElicitation;
 
 /// How a sealing caller closes an unanswered Prepared call. Reader builds choose the ungated
 /// not-dispatched result; writer builds supply the question's durable filing identity.

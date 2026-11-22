@@ -42,7 +42,7 @@ pub type Deliveries = HashMap<(String, String), Vec<Delivered>>;
 /// with each part's delivered list and is recovered from the durable source frame.
 #[derive(Clone, Debug, Default)]
 pub struct RideEnvelopes(
-    HashMap<(String, String), Vec<Option<broca_wal::record::RideMetadata>>>,
+    HashMap<(String, String), Vec<Option<broca_records::record::RideMetadata>>>,
     /// Whether the render holds each ride out of its result, beside the tool message (see
     /// [`RideEnvelopes::after_results`]).
     bool,
@@ -67,13 +67,18 @@ impl RideEnvelopes {
         mid: &str,
         part: &str,
         index: usize,
-    ) -> Option<&broca_wal::record::RideMetadata> {
+    ) -> Option<&broca_records::record::RideMetadata> {
         self.0.get(&(mid.into(), part.into()))?.get(index)?.as_ref()
     }
 
     /// Adds the envelope of the next text delivered with the part `part` of message `mid`:
     /// `None` for text delivered without one. Calls follow the part's delivered order.
-    pub fn push(&mut self, mid: &str, part: &str, ride: Option<broca_wal::record::RideMetadata>) {
+    pub fn push(
+        &mut self,
+        mid: &str,
+        part: &str,
+        ride: Option<broca_records::record::RideMetadata>,
+    ) {
         self.0
             .entry((mid.into(), part.into()))
             .or_default()
@@ -90,7 +95,7 @@ impl RideEnvelopes {
         &self,
         mid: &str,
         part: &str,
-    ) -> Option<&Vec<Option<broca_wal::record::RideMetadata>>> {
+    ) -> Option<&Vec<Option<broca_records::record::RideMetadata>>> {
         self.0.get(&(mid.to_owned(), part.to_owned()))
     }
 }
@@ -99,7 +104,7 @@ impl RideEnvelopes {
 /// own record names it. Text without an envelope keeps what it has.
 pub fn attach_ride_envelope(
     delivered: &mut Delivered,
-    ride: Option<&broca_wal::record::RideMetadata>,
+    ride: Option<&broca_records::record::RideMetadata>,
 ) {
     if let Some(ride) = ride {
         delivered.sender.clone_from(&ride.sender);

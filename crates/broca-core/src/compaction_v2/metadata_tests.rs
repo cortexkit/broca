@@ -3,7 +3,8 @@ use std::sync::Arc;
 use broca_protocol::{
     ContentBlock, Message, Role, ToolCall, ToolCallId, ToolOutput, ToolResult, Usage,
 };
-use broca_wal::{FramedRecord, WalRecord};
+use broca_records::record::WalRecord;
+use broca_wal::FramedRecord;
 use cortexkit_role_compaction::part::{PartBody, ToolStatus};
 use serde_json::json;
 

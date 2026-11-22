@@ -195,7 +195,7 @@ async fn compressed_refusal_is_two_attempts() {
     assert_eq!(terminals[0].0, sends[0].0);
     assert_eq!(
         terminals[0].2,
-        broca_wal::record::BillingAttemptOutcome::CompressionRefused
+        broca_records::record::BillingAttemptOutcome::CompressionRefused
     );
     assert_eq!(terminals[0].1.http_status, Some(415));
     assert!(terminals[0].1.sent_at_ms.is_some());

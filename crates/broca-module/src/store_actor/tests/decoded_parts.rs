@@ -216,7 +216,7 @@ async fn tool_bytes_match_across_a_fresh_step_its_resume_and_the_next_run() {
 /// and the start of the session's latest run when the job began.
 struct Recording {
     inner: LoopExecutor,
-    manifests: std::sync::Mutex<Vec<Option<Arc<broca_wal::PlanManifest>>>>,
+    manifests: std::sync::Mutex<Vec<Option<Arc<broca_records::record::PlanManifest>>>>,
     latest: std::sync::Mutex<Vec<Option<broca_session_store::record::RunStart>>>,
 }
 
@@ -229,7 +229,7 @@ impl Recording {
         })
     }
 
-    fn manifests(&self) -> Vec<Option<Arc<broca_wal::PlanManifest>>> {
+    fn manifests(&self) -> Vec<Option<Arc<broca_records::record::PlanManifest>>> {
         self.manifests.lock().unwrap().clone()
     }
 }

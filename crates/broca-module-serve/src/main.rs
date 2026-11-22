@@ -1606,10 +1606,10 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
     // Storage folders are created here, not on their first write, because the backup
     // descriptor names them, and engram refuses a capture whose declared path is missing.
     for name in [
-        broca_wal::SESSION_STORAGE_DURABLE_DIR,
+        broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
         broca_wal::SESSION_STORAGE_DIR,
-        broca_wal::SESSION_STORAGE_EPHEMERAL_DIR,
-        broca_wal::SESSION_STORAGE_MOVES_DIR,
+        broca_records::session_storage::SESSION_STORAGE_EPHEMERAL_DIR,
+        broca_records::session_storage::SESSION_STORAGE_MOVES_DIR,
     ] {
         let path = state_root.join(name);
         match broca_owner_only::create_dir(&path) {
@@ -1650,7 +1650,7 @@ fn write_engram_catalog(state_root: &Path) -> std::io::Result<()> {
         Err(error) => return Err(error),
     }
 
-    broca_wal::migration::atomic_json_bytes(state_root, &path, EMBEDDED_ENGRAM_CATALOG)
+    broca_records::move_fence::atomic_json_bytes(state_root, &path, EMBEDDED_ENGRAM_CATALOG)
 }
 
 fn ensure_engram_catalog_owner_only(path: &Path) -> std::io::Result<()> {
@@ -1891,7 +1891,9 @@ mod state_directory_tests {
                 .collect();
             actual.sort();
             let expected: &[&str] = match relative_path {
-                broca_wal::SESSION_STORAGE_DURABLE_DIR => &["recovery-candidates"],
+                broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR => {
+                    &["recovery-candidates"]
+                }
                 _ => &[],
             };
             assert_eq!(
@@ -1919,15 +1921,24 @@ mod state_directory_tests {
                 .unwrap();
         let entries = catalog["entries"].as_array().unwrap();
         for (path, class) in [
-            (broca_wal::SESSION_STORAGE_DURABLE_DIR, "portable"),
+            (
+                broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
+                "portable",
+            ),
             (broca_wal::SESSION_STORAGE_DIR, "excluded"),
-            (broca_wal::SESSION_STORAGE_EPHEMERAL_DIR, "excluded"),
-            (broca_wal::SESSION_STORAGE_MOVES_DIR, "device-local"),
+            (
+                broca_records::session_storage::SESSION_STORAGE_EPHEMERAL_DIR,
+                "excluded",
+            ),
+            (
+                broca_records::session_storage::SESSION_STORAGE_MOVES_DIR,
+                "device-local",
+            ),
         ] {
             let folder = state_root.join(path);
             assert!(folder.is_dir(), "startup must create {}", folder.display());
             broca_owner_only::validate(&folder).unwrap();
-            if path == broca_wal::SESSION_STORAGE_MOVES_DIR {
+            if path == broca_records::session_storage::SESSION_STORAGE_MOVES_DIR {
                 assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "{path}");
             } else {
                 let children: Vec<_> = std::fs::read_dir(&folder)
@@ -1953,7 +1964,7 @@ mod state_directory_tests {
             }
         }
         // The placement rule's classes name exactly these roots.
-        for class in broca_wal::StorageClass::ALL {
+        for class in broca_records::session_storage::StorageClass::ALL {
             assert!(class.store_root(&state_root).is_dir(), "{class}");
         }
         let _ = std::fs::remove_dir_all(state_root);
@@ -1992,8 +2003,14 @@ mod state_directory_tests {
         let state_root = fresh_root("existing");
         std::fs::create_dir_all(&state_root).expect("create existing state root");
         let expected = [
-            (broca_wal::SESSION_STORAGE_DURABLE_DIR, 0o750),
-            (broca_wal::SESSION_STORAGE_MOVES_DIR, 0o755),
+            (
+                broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
+                0o750,
+            ),
+            (
+                broca_records::session_storage::SESSION_STORAGE_MOVES_DIR,
+                0o755,
+            ),
         ];
         for (name, mode) in expected {
             let path = state_root.join(name);
@@ -2020,7 +2037,7 @@ mod state_directory_tests {
     fn startup_directory_errors_name_the_path() {
         let state_root = fresh_root("blocked");
         std::fs::create_dir_all(&state_root).expect("create blocked state root");
-        let blocked = state_root.join(broca_wal::SESSION_STORAGE_DURABLE_DIR);
+        let blocked = state_root.join(broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR);
         std::fs::write(&blocked, "not a directory").expect("occupy durable directory path");
 
         let error =

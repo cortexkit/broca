@@ -511,7 +511,7 @@ async fn a_cancel_while_a_compacting_run_waits_for_its_media_ends_it_cancelled()
     commands
         .send(LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::Now,
+            at: broca_records::record::RunCancelAt::Now,
             reply,
         })
         .unwrap();

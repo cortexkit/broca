@@ -101,7 +101,7 @@ pub fn warm_spend<C: ?Sized + Sync>(
         .filter(|warm| warm.step_id == step_id)
         .map(|warm| {
             let billing = |key: &str| warm.billing.as_ref().and_then(|billing| billing.get(key));
-            let envelope: Option<broca_wal::record::AttemptEnvelope> = billing("envelope")
+            let envelope: Option<broca_records::record::AttemptEnvelope> = billing("envelope")
                 .and_then(|envelope| serde_json::from_value(envelope.clone()).ok());
             if warm.reached_cache {
                 return driver
@@ -110,7 +110,7 @@ pub fn warm_spend<C: ?Sized + Sync>(
             }
             match envelope {
                 Some(envelope) if broca_core::cache_warm::warm_budget_needs_pricing(&envelope) => {
-                    let reservation: Option<broca_wal::record::AttemptReservation> =
+                    let reservation: Option<broca_records::record::AttemptReservation> =
                         billing("reservation").and_then(|reservation| {
                             serde_json::from_value(reservation.clone()).ok()
                         });

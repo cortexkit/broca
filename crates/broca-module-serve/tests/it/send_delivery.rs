@@ -329,7 +329,7 @@ async fn joining_steer_same_settings_and_omissions_are_accepted() {
 #[tokio::test]
 async fn joining_steer_auth_pin_is_refused_unless_it_names_the_frozen_credential() {
     let mut rig = Rig::start("steer-auth-pin").await;
-    *rig.script.auth_selection.lock().unwrap() = Some(broca_wal::AuthSelection {
+    *rig.script.auth_selection.lock().unwrap() = Some(broca_records::record::AuthSelection {
         billing_vault_facts: None,
         auth_method: None,
         credential_id: "oauth:anthropic:work".into(),
@@ -552,7 +552,8 @@ async fn a_steer_into_a_paused_run_is_refused_and_writes_nothing() {
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
     let before = rig.records().await;
-    let floor = std::fs::read_to_string(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME)).ok();
+    let floor =
+        std::fs::read_to_string(rig.dir.join(broca_records::floor::FEATURE_FLOOR_FILENAME)).ok();
     let refused = rig.send("steer-1", "more", Some("steer")).await;
     assert_eq!(refused.header.ty, FrameType::Error);
     assert_golden(&refused, "run_paused.json", &run_1);
@@ -562,7 +563,7 @@ async fn a_steer_into_a_paused_run_is_refused_and_writes_nothing() {
         "a refused steer writes nothing"
     );
     assert_eq!(
-        std::fs::read_to_string(rig.dir.join(broca_wal::FEATURE_FLOOR_FILENAME)).ok(),
+        std::fs::read_to_string(rig.dir.join(broca_records::floor::FEATURE_FLOOR_FILENAME)).ok(),
         floor
     );
     rig.finish().await;

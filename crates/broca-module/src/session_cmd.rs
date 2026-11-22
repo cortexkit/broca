@@ -60,7 +60,7 @@ pub struct SendPlan {
     /// The manifest admission built from the plan's fetches. Present only when the session had
     /// no episode when the serve layer checked it; the actor freezes it only if the session
     /// still has none when the send is admitted.
-    pub manifest: Option<Arc<broca_wal::PlanManifest>>,
+    pub manifest: Option<Arc<broca_records::record::PlanManifest>>,
     /// The checked plan, present when the send left its model to the session. The serve layer
     /// cannot know that model, so the actor checks the plan's model-bearing items against the
     /// session's frozen model once it is resolved, refusing `plan_model_mismatch` there.
@@ -148,12 +148,12 @@ pub enum LineageCmd {
     /// Cancel a run by id. A boundary request preserves the in-flight step and tool batch.
     Cancel {
         run_id: RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
         reply: oneshot::Sender<CancelOutcome>,
     },
     CancelFrom {
         run_id: RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
         principal: Option<broca_protocol::BindPrincipal>,
         scope: broca_protocol::SendScope,
         reply: oneshot::Sender<CancelOutcome>,
@@ -161,7 +161,7 @@ pub enum LineageCmd {
     SenderPolicy {
         principal: Option<broca_protocol::BindPrincipal>,
         scope: broca_protocol::SendScope,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
         reply: oneshot::Sender<Result<Option<CancelAuthority>, crate::serve::ServeError>>,
     },
     /// Retract a still-pending queued submission (durable tombstone). Replies the outcome.
@@ -175,7 +175,7 @@ pub enum LineageCmd {
     SessionRefresh {
         generation: u64,
         policy: String,
-        manifest: Box<broca_wal::PlanManifest>,
+        manifest: Box<broca_records::record::PlanManifest>,
         /// The providers the refresh asked to read afresh (llm-runner `refetch`), empty when
         /// it named none; part of what an identical repeat repeats.
         refetch: Vec<String>,
@@ -404,7 +404,7 @@ pub enum SendOutcome {
     /// dedupe key, or expired.
     SendEnded {
         submission_id: broca_protocol::SubmissionId,
-        reason: broca_wal::record::SendEndReason,
+        reason: broca_records::record::SendEndReason,
     },
     /// An input hook refused a steer or queued send before any durable write or interrupt.
     PreUserUnavailable {

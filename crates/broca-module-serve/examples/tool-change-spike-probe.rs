@@ -412,7 +412,7 @@ impl broca_core::run::AttemptHook for OneSend {
         &self,
         _send: broca_core::run::PhysicalSend,
         _cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<broca_wal::record::AttemptId, broca_protocol::ProviderError> {
+    ) -> Result<broca_records::record::AttemptId, broca_protocol::ProviderError> {
         if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err(refusal());
         }
@@ -420,10 +420,10 @@ impl broca_core::run::AttemptHook for OneSend {
     }
     async fn finished(
         &self,
-        _id: broca_wal::record::AttemptId,
+        _id: broca_records::record::AttemptId,
         _attempt: broca_protocol::ModelAttempt,
-        _outcome: broca_wal::record::BillingAttemptOutcome,
-        _response: Option<broca_wal::record::AttemptEnvelope>,
+        _outcome: broca_records::record::BillingAttemptOutcome,
+        _response: Option<broca_records::record::AttemptEnvelope>,
     ) -> Result<(), broca_protocol::ProviderError> {
         Ok(())
     }

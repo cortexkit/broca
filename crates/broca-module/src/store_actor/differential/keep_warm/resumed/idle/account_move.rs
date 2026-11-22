@@ -8,7 +8,7 @@ cipher_tests!(
     recorded_request_without_refreezes_keeps_pinned_bytes,
 );
 
-fn selection(account: &str) -> broca_wal::AuthSelection {
+fn selection(account: &str) -> broca_records::record::AuthSelection {
     serde_json::from_value(json!({
         "credential_id": format!("cred-{account}"),
         "resolved_credential_id": format!("cred-{account}"),

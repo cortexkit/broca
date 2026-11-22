@@ -176,7 +176,7 @@ async fn tool_identity_contract_samples() {
     let mut rig = Rig::start("contract-tool-and-bus-samples").await;
     let digest =
         cortexkit_role_tool_provider::catalog::schema_digest(&json!({"type":"object"})).unwrap();
-    *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
+    *rig.script.schema_pin.lock().unwrap() = Some(broca_records::record::DispatchSchemaPin {
         schema_digest: digest.clone(),
         semantics: 7,
         major: None,
@@ -267,7 +267,7 @@ async fn tool_changed_contract_samples() {
     let mut rig = Rig::start("contract-tool-changed-samples").await;
     let digest =
         cortexkit_role_tool_provider::catalog::schema_digest(&json!({"type":"object"})).unwrap();
-    *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
+    *rig.script.schema_pin.lock().unwrap() = Some(broca_records::record::DispatchSchemaPin {
         schema_digest: digest.clone(),
         semantics: 1,
         major: Some(2),

@@ -1,6 +1,6 @@
 //! Billing identities are independent of log position and retry counters, including after restore.
 
-use broca_wal::record::AttemptId;
+use broca_records::record::AttemptId;
 
 /// Mint all 128 bits from the OS random source before building a reservation.
 /// Entropy failures propagate to the caller: there is no counter or timestamp fallback.
@@ -17,9 +17,9 @@ mod tests {
 
     use std::collections::BTreeSet;
     use {
-        broca_wal::record::AttemptCredential, broca_wal::record::AttemptReservation,
-        broca_wal::record::AttemptRun, broca_wal::record::AttemptSession,
-        broca_wal::record::WalRecord,
+        broca_records::record::AttemptCredential, broca_records::record::AttemptReservation,
+        broca_records::record::AttemptRun, broca_records::record::AttemptSession,
+        broca_records::record::WalRecord,
     };
 
     fn reservation() -> AttemptReservation {

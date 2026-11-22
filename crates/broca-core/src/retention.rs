@@ -1,6 +1,7 @@
 //! The first run, not the most recent send, fixes whether a lineage may persist content.
 
-use broca_wal::{FramedRecord, WalRecord};
+use broca_records::record::WalRecord;
+use broca_wal::FramedRecord;
 use serde::{Deserialize, Serialize};
 
 /// A checkpoint's proof of the policy frozen by the first `RunStarted`.

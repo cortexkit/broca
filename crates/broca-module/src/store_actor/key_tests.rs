@@ -329,7 +329,7 @@ async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
     assert_key_unavailable(send().await.expect_err("the head is refused"));
     let address = broca_core::session_addr(&head);
     assert_eq!(
-        broca_wal::session_storage_class(&module.dir, &address).unwrap(),
+        broca_records::session_storage::session_storage_class(&module.dir, &address).unwrap(),
         None
     );
     assert_eq!(module.registry.slot_state(&head), None);
@@ -338,8 +338,8 @@ async fn a_head_is_refused_transient_until_the_new_storage_can_create_it() {
     let outcome = send().await.expect("the head opens once the key loads");
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     assert_eq!(
-        broca_wal::session_storage_class(&module.dir, &address).unwrap(),
-        Some(broca_wal::StorageClass::Durable)
+        broca_records::session_storage::session_storage_class(&module.dir, &address).unwrap(),
+        Some(broca_records::session_storage::StorageClass::Durable)
     );
 }
 
@@ -371,16 +371,18 @@ async fn a_creating_send_is_refused_transient_until_the_new_storage_can_create_i
     assert_key_unavailable(send().await.expect_err("the sidekick is refused"));
     let address = broca_core::session_addr(&session);
     assert_eq!(
-        broca_wal::session_storage_class(&module.dir, &address).unwrap(),
+        broca_records::session_storage::session_storage_class(&module.dir, &address).unwrap(),
         None
     );
 
     module.load_key().await;
     let outcome = send().await.expect("the sidekick opens once the key loads");
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
-    assert!(broca_wal::session_storage_class(&module.dir, &address)
-        .unwrap()
-        .is_some());
+    assert!(
+        broca_records::session_storage::session_storage_class(&module.dir, &address)
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// A plan naming `readers` (the apps it lets read the session), as every worker plan core sends
@@ -404,9 +406,9 @@ async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
         "composition": composition,
         "readers": ["occipital"],
     });
-    let manifest = Arc::new(broca_wal::PlanManifest {
+    let manifest = Arc::new(broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: "plan-1".into(),
         composition_digest: plan["composition_digest"].as_str().unwrap().into(),
         fetches: vec![],
@@ -464,7 +466,7 @@ async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
     assert_key_unavailable(send().await.expect_err("the mason is refused"));
     let address = broca_core::session_addr(&session);
     assert_eq!(
-        broca_wal::session_storage_class(&module.dir, &address).unwrap(),
+        broca_records::session_storage::session_storage_class(&module.dir, &address).unwrap(),
         None
     );
 
@@ -475,9 +477,11 @@ async fn a_worker_plan_with_readers_is_refused_transient_until_the_key_loads() {
     );
     let outcome = send().await.expect("the mason opens once the key loads");
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
-    assert!(broca_wal::session_storage_class(&module.dir, &address)
-        .unwrap()
-        .is_some());
+    assert!(
+        broca_records::session_storage::session_storage_class(&module.dir, &address)
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// With new sessions plain, a send that creates a session creates it plain, before the key has

@@ -196,7 +196,7 @@ async fn a_pool_key_run_sends_the_variant_it_was_asked_for() {
 /// What one run on the gateway fixture sent the gateway and froze.
 struct GatewayRun {
     request: CapturedResumeRequest,
-    config: broca_wal::RunConfig,
+    config: broca_records::record::RunConfig,
     segments: Vec<broca_core::billing::SpendSegment>,
     gateway_root: String,
 }

@@ -37,7 +37,9 @@ pub async fn stored_records(state_root: &Path, identity: &BindIdentity) -> Vec<R
 /// [`stored_records`] with each record's log sequence number.
 pub async fn stored_log_records(state_root: &Path, identity: &BindIdentity) -> Vec<(u64, Record)> {
     let address = broca_core::session_addr(identity);
-    let Some(class) = broca_wal::session_storage_class(state_root, &address).unwrap() else {
+    let Some(class) =
+        broca_records::session_storage::session_storage_class(state_root, &address).unwrap()
+    else {
         return Vec::new();
     };
     let view = match Session::view(
@@ -66,9 +68,11 @@ pub async fn stored_log_records(state_root: &Path, identity: &BindIdentity) -> V
 pub async fn stored_run_configs(
     state_root: &Path,
     identity: &BindIdentity,
-) -> Vec<broca_wal::RunConfig> {
+) -> Vec<broca_records::record::RunConfig> {
     let address = broca_core::session_addr(identity);
-    let Some(class) = broca_wal::session_storage_class(state_root, &address).unwrap() else {
+    let Some(class) =
+        broca_records::session_storage::session_storage_class(state_root, &address).unwrap()
+    else {
         return Vec::new();
     };
     let backend = LocalBackend::new(class.store_root(state_root));
@@ -133,7 +137,7 @@ pub fn stored_files(state_root: &Path) -> std::collections::BTreeMap<std::path::
         }
     }
     let mut out = std::collections::BTreeMap::new();
-    for class in broca_wal::StorageClass::ALL {
+    for class in broca_records::session_storage::StorageClass::ALL {
         walk(&class.store_root(state_root), &mut out);
     }
     out
@@ -146,7 +150,9 @@ pub async fn stored_admissions(
     identity: &BindIdentity,
 ) -> Vec<broca_session_loop::run::Admission> {
     let address = broca_core::session_addr(identity);
-    let Some(class) = broca_wal::session_storage_class(state_root, &address).unwrap() else {
+    let Some(class) =
+        broca_records::session_storage::session_storage_class(state_root, &address).unwrap()
+    else {
         return Vec::new();
     };
     let backend = LocalBackend::new(class.store_root(state_root));

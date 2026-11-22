@@ -12,7 +12,11 @@ use crate::actor::{SendKey, SendOutcome, SendPlan};
 use crate::executor::RunKind;
 use crate::serve::ServeHandler;
 
-async fn send(module: &Module, run: &str, manifest: &Arc<broca_wal::PlanManifest>) -> SendOutcome {
+async fn send(
+    module: &Module,
+    run: &str,
+    manifest: &Arc<broca_records::record::PlanManifest>,
+) -> SendOutcome {
     let mut request = request("hello");
     request.tools = None;
     module
@@ -54,7 +58,10 @@ async fn a_planned_admitting_send_carries_its_cache_declaration_in_both_cipher_m
 struct DeclaredCache;
 
 impl crate::cache::CacheDeclarer for DeclaredCache {
-    fn declare(&self, _: &broca_wal::RunConfig) -> Option<crate::cache::CacheDeclaration> {
+    fn declare(
+        &self,
+        _: &broca_records::record::RunConfig,
+    ) -> Option<crate::cache::CacheDeclaration> {
         Some(crate::cache::CacheDeclaration {
             ttl_ms: Some(300_000),
             ttl_options_ms: vec![300_000, 3_600_000],

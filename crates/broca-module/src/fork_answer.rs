@@ -38,7 +38,7 @@ use broca_session_store::record::{Fork, ForkEvent, Record};
 use broca_session_store::session::{Session, SessionError};
 
 use crate::store_actor::recorded_warm::Through;
-use broca_wal::StorageClass;
+use broca_records::session_storage::StorageClass;
 use cortexkit_role_llm_runner::fork_answer::{
     ForkAskReply, ForkAskRequest, ForkEndReply, ForkEndRequest, ForkFinish, ForkPrepareReply,
 };
@@ -236,10 +236,10 @@ struct Base {
     /// The head's config when the base was sent: what a restart releases the fork's routing
     /// admissions under, when the base can no longer be rebuilt, and what the fork's spend is
     /// billed under.
-    config: broca_wal::RunConfig,
+    config: broca_records::record::RunConfig,
     /// The refusal-fallback route the base was sent on, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    route: Option<broca_wal::StepRoute>,
+    route: Option<broca_records::record::StepRoute>,
 }
 
 /// A fork's session, open under its lease while an operation uses it.
@@ -610,7 +610,7 @@ fn head_of(key: &BindIdentity, fork_id: &str) -> BindIdentity {
 /// The digest of `opts` rendered by the wire family `config` froze, as the store actor learns a
 /// warm's digest before the executor sends it.
 fn render_digest(
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
     opts: &broca_protocol::request::CallOptions,
 ) -> Result<String, String> {
     Ok(broca_core::render::request_digest_hex(&render(
@@ -620,7 +620,7 @@ fn render_digest(
 
 /// `opts` rendered by the wire family `config` froze.
 pub(crate) fn render(
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
     opts: &broca_protocol::request::CallOptions,
 ) -> Result<Vec<u8>, String> {
     // A provider with no render state of its own renders the shared canonical bytes, and froze
@@ -673,7 +673,7 @@ fn served(attempt: &broca_session_store::record::Attempt) -> bool {
 }
 
 /// The head's routing conversation key, as its frozen routing decision recorded it.
-fn head_conversation_key(config: &broca_wal::RunConfig) -> Option<&str> {
+fn head_conversation_key(config: &broca_records::record::RunConfig) -> Option<&str> {
     config
         .auth_selection
         .as_ref()?

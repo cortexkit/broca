@@ -1053,7 +1053,7 @@ impl Rig {
 
     /// Whether the session store holds `session`.
     fn exists(&self, session: &broca_protocol::BindIdentity) -> bool {
-        broca_wal::session_storage_class(
+        broca_records::session_storage::session_storage_class(
             &self.state_root,
             &broca_core::session_addr(&self.keyed(session)),
         )
@@ -2018,10 +2018,13 @@ async fn a_new_head_runs_two_turns_across_a_restart_in_the_new_storage() {
     let session = first.session("alfonso:head:agent_0123456789abcdef");
     // Where the head is kept: the session store's root holding its head file, if any.
     let kept = |rig: &Rig| {
-        broca_wal::session_storage_class(&rig.state_root, &broca_core::session_addr(&session))
-            .unwrap()
+        broca_records::session_storage::session_storage_class(
+            &rig.state_root,
+            &broca_core::session_addr(&session),
+        )
+        .unwrap()
     };
-    let in_the_new_storage = Some(broca_wal::StorageClass::Durable);
+    let in_the_new_storage = Some(broca_records::session_storage::StorageClass::Durable);
     let turn = |prompt: &str, send_id: &str, class: Option<&str>| {
         let mut params = serde_json::json!({
             "prompt": prompt,

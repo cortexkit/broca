@@ -3034,10 +3034,10 @@ async fn authorize_route_request<H: ServeHandler>(
             .await
     } else if method == OP_CANCEL {
         let at = match params.get("at") {
-            None => Some(broca_wal::record::RunCancelAt::Now),
+            None => Some(broca_records::record::RunCancelAt::Now),
             Some(at) => match at.as_str() {
-                Some("now") => Some(broca_wal::record::RunCancelAt::Now),
-                Some("step_boundary") => Some(broca_wal::record::RunCancelAt::StepBoundary),
+                Some("now") => Some(broca_records::record::RunCancelAt::Now),
+                Some("step_boundary") => Some(broca_records::record::RunCancelAt::StepBoundary),
                 _ => None,
             },
         };
@@ -4182,8 +4182,8 @@ where
                 }
             };
             let at = match params.at.as_deref() {
-                None | Some("now") => broca_wal::record::RunCancelAt::Now,
-                Some("step_boundary") => broca_wal::record::RunCancelAt::StepBoundary,
+                None | Some("now") => broca_records::record::RunCancelAt::Now,
+                Some("step_boundary") => broca_records::record::RunCancelAt::StepBoundary,
                 _ => {
                     return send_invalid_params(
                         writer,

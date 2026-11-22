@@ -120,7 +120,7 @@ impl SessionDoor for FakeDoor {
                     .lock()
                     .unwrap()
                     .clone()
-                    .unwrap_or_else(|| broca_wal::migration::digest(bytes))
+                    .unwrap_or_else(|| broca_records::move_fence::digest(bytes))
             },
         })
     }
@@ -245,7 +245,7 @@ impl Rig {
             }
         }
         let mut out = BTreeMap::new();
-        for class in broca_wal::StorageClass::ALL {
+        for class in broca_records::session_storage::StorageClass::ALL {
             walk(
                 &class.store_root(&self.root),
                 &broca_core::session_addr(session),
@@ -273,7 +273,9 @@ impl Rig {
             })
             .unwrap();
         let runtime = self.registry.store_runtime().unwrap();
-        let backend = LocalBackend::new(broca_wal::StorageClass::Durable.store_root(&self.root));
+        let backend = LocalBackend::new(
+            broca_records::session_storage::StorageClass::Durable.store_root(&self.root),
+        );
         let mut writer = Session::load(
             &backend,
             SessionAddr(broca_core::session_addr(session)),
@@ -362,7 +364,7 @@ async fn store_session(rig: &Rig, session: &BindIdentity, terminal: bool) {
         rig,
         session,
         seed_history(terminal),
-        broca_wal::StorageClass::Durable,
+        broca_records::session_storage::StorageClass::Durable,
     )
     .await;
 }
@@ -372,7 +374,7 @@ async fn store_session_with(
     rig: &Rig,
     session: &BindIdentity,
     seeded: Seed,
-    class: broca_wal::StorageClass,
+    class: broca_records::session_storage::StorageClass,
 ) {
     use broca_session_store::{
         backend::{LocalBackend, SessionAddr},
@@ -677,7 +679,7 @@ async fn retention_marker_never_reaches_the_door() {
         &rig,
         &session,
         seed_history(true),
-        broca_wal::StorageClass::Ephemeral,
+        broca_records::session_storage::StorageClass::Ephemeral,
     )
     .await;
     broca_core::SessionRefIndex::record_session(
@@ -832,7 +834,7 @@ async fn status_keeps_a_partial_prepare_intent_byte_identical_until_repeat() {
         replies: Default::default(),
     };
     let path = CutStore::new(&rig.root).path(CUT);
-    broca_wal::migration::atomic_json(&rig.root, &path, &state).unwrap();
+    broca_records::move_fence::atomic_json(&rig.root, &path, &state).unwrap();
     let before = std::fs::read(&path).unwrap();
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     assert_eq!(
@@ -884,7 +886,7 @@ async fn contract_request_vectors_pass_through_internal_serve() {
         }
     }
     // Invalid requests must be decoded before this deliberately unreadable store.
-    let junk = broca_wal::StorageClass::Durable
+    let junk = broca_records::session_storage::StorageClass::Durable
         .store_root(&rig.root)
         .join("heads/not-a-valid-address");
     std::fs::create_dir_all(&junk).unwrap();
@@ -918,8 +920,12 @@ async fn contract_step_vectors_pass_through_internal_serve() {
             sessions: Default::default(),
             replies: Default::default(),
         };
-        broca_wal::migration::atomic_json(&rig.root, &CutStore::new(&rig.root).path(CUT), &state)
-            .unwrap();
+        broca_records::move_fence::atomic_json(
+            &rig.root,
+            &CutStore::new(&rig.root).path(CUT),
+            &state,
+        )
+        .unwrap();
         let before = std::fs::read(CutStore::new(&rig.root).path(CUT)).unwrap();
         let mut params = json!({"refs":[],"cutId":CUT});
         if case["op"] == "describe" {
@@ -971,7 +977,7 @@ async fn contract_idempotency_vectors_replay_before_resolving_sessions() {
             },
         );
         if let Some(cut) = first["params"]["cutId"].as_str() {
-            broca_wal::migration::atomic_json(
+            broca_records::move_fence::atomic_json(
                 &rig.root,
                 &CutStore::new(&rig.root).path(cut),
                 &state,
@@ -1007,8 +1013,12 @@ async fn contract_ref_set_vectors_are_checked_before_artifacts() {
             sessions: Default::default(),
             replies: Default::default(),
         };
-        broca_wal::migration::atomic_json(&rig.root, &CutStore::new(&rig.root).path(CUT), &state)
-            .unwrap();
+        broca_records::move_fence::atomic_json(
+            &rig.root,
+            &CutStore::new(&rig.root).path(CUT),
+            &state,
+        )
+        .unwrap();
         let mut params = json!({"refs":case["refs"],"cutId":CUT});
         if case["op"] == "release" {
             params["holder"] = json!("receiver");
@@ -1154,7 +1164,13 @@ async fn a_session_with_a_held_call_is_busy_before_prepare() {
             sequential: false,
         }),
     ]);
-    store_session_with(&rig, &session, seeded, broca_wal::StorageClass::Durable).await;
+    store_session_with(
+        &rig,
+        &session,
+        seeded,
+        broca_records::session_storage::StorageClass::Durable,
+    )
+    .await;
     broca_core::SessionRefIndex::record_session(
         rig.index.as_ref(),
         &broca_core::session_addr(&session),
@@ -1205,7 +1221,7 @@ async fn source_tombstone_case(op: contract::Op) {
         sessions: recorded_sessions(std::slice::from_ref(&session)),
         replies: Default::default(),
     };
-    broca_wal::migration::atomic_json(&rig.root, &CutStore::new(&rig.root).path(CUT), &state)
+    broca_records::move_fence::atomic_json(&rig.root, &CutStore::new(&rig.root).path(CUT), &state)
         .unwrap();
     if op == contract::Op::Release {
         params["holder"] = json!("new-mac");
@@ -1259,10 +1275,12 @@ async fn contradictory_owner_case(op: contract::Op) {
     let authority = CutStore::new(&rig.root).path(CUT);
     // The session's freeze is then rewritten to name cut `BACK`, its pinned version kept.
     let sidecar = rig.fence(&session).with_extension("moving");
-    let mut freeze: broca_wal::migration::Freeze =
-        broca_wal::migration::read_json(&sidecar).unwrap().unwrap();
+    let mut freeze: broca_records::move_fence::Freeze =
+        broca_records::move_fence::read_json(&sidecar)
+            .unwrap()
+            .unwrap();
     freeze.cut_id = BACK.into();
-    broca_wal::migration::atomic_json(&rig.root, &sidecar, &freeze).unwrap();
+    broca_records::move_fence::atomic_json(&rig.root, &sidecar, &freeze).unwrap();
     let old_sidecar = std::fs::read(&sidecar).unwrap();
     let old_authority = std::fs::read(&authority).unwrap();
     if op == contract::Op::Release {
@@ -1428,7 +1446,7 @@ async fn retained_copy(rig: &Rig, session: &BindIdentity) {
         rig,
         session,
         seed_history(true),
-        broca_wal::StorageClass::Ephemeral,
+        broca_records::session_storage::StorageClass::Ephemeral,
     )
     .await;
     broca_core::SessionRefIndex::record_session(
@@ -1568,7 +1586,7 @@ async fn pending_import_abort_uses_only_owned_staging_and_never_the_door() {
             replies: Default::default(),
         };
         let authority = CutStore::new(&rig.root).path(CUT);
-        broca_wal::migration::atomic_json(&rig.root, &authority, &state).unwrap();
+        broca_records::move_fence::atomic_json(&rig.root, &authority, &state).unwrap();
         *rig.door.refusal.lock().unwrap() = Some("unavailable".into());
         let mut wire = Wire::new(&rig, entorhinal(), true).await;
         wire.call("abort", params.clone()).await.unwrap();
@@ -1605,7 +1623,7 @@ async fn boot_keeps_an_unreadable_cut_pending_and_status_read_only() {
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
-    broca_wal::migration::atomic_json(&rig.root, &authority, &state).unwrap();
+    broca_records::move_fence::atomic_json(&rig.root, &authority, &state).unwrap();
     let before = std::fs::read(&authority).unwrap();
     *rig.door.refusal.lock().unwrap() = Some("unavailable".into());
     rig.service.reconcile_boot().await.unwrap();
@@ -1665,7 +1683,13 @@ async fn closed_session_with_a_queued_send_is_busy_before_prepare() {
         named_speaker: None,
         kept_notice: None,
     }));
-    store_session_with(&rig, &session, seeded, broca_wal::StorageClass::Durable).await;
+    store_session_with(
+        &rig,
+        &session,
+        seeded,
+        broca_records::session_storage::StorageClass::Durable,
+    )
+    .await;
     broca_core::SessionRefIndex::record_session(
         rig.index.as_ref(),
         &broca_core::session_addr(&session),
@@ -1745,7 +1769,7 @@ async fn diverged_unheld_ref_does_not_read_the_door_or_complete_a_pending_import
         replies: Default::default(),
     };
     let authority = CutStore::new(&rig.root).path(CUT);
-    broca_wal::migration::atomic_json(&rig.root, &authority, &state).unwrap();
+    broca_records::move_fence::atomic_json(&rig.root, &authority, &state).unwrap();
     let before = std::fs::read(&authority).unwrap();
     assert_eq!(
         wire.call("diverged", params).await.unwrap(),
@@ -1890,7 +1914,7 @@ async fn refused_first_prepare_does_not_capture_refs_for_the_next_request() {
 
 /// Makes `session`'s stored head unreadable, as a damaged disk would.
 fn unreadable(rig: &Rig, session: &BindIdentity) {
-    let head = broca_wal::StorageClass::Durable
+    let head = broca_records::session_storage::StorageClass::Durable
         .store_root(&rig.root)
         .join("heads")
         .join(broca_core::session_addr(session))
@@ -1985,7 +2009,7 @@ async fn cut_without_required_addresses_is_named_unreadable_before_lookup() {
     let params = rig.params(CUT, std::slice::from_ref(&a));
     let path = CutStore::new(&rig.root).path(CUT);
     let state = json!({"step":"prepared","refs":params["refs"],"intent":null,"replies":{}});
-    broca_wal::migration::atomic_json(&rig.root, &path, &state).unwrap();
+    broca_records::move_fence::atomic_json(&rig.root, &path, &state).unwrap();
     let before = std::fs::read(&path).unwrap();
     let mut wire = Wire::new(&rig, entorhinal(), true).await;
     let error = assert_code(wire.call("status", params).await, "unavailable");

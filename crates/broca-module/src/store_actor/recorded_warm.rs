@@ -269,7 +269,7 @@ async fn rebuild<W: Writer>(
         })
         .map(broca_protocol::json::Json::parse)
         .and_then(|fallback| fallback.get("route").cloned())
-        .map(serde_json::from_value::<broca_wal::StepRoute>)
+        .map(serde_json::from_value::<broca_records::record::StepRoute>)
         .transpose()
         .map_err(|error| format!("the recorded step's route: {error}"))?;
     if let Some(route) = &route {

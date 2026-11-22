@@ -2,7 +2,7 @@
 // This non-shipping profiler directly prepares and removes its synthetic fixture.
 #![allow(clippy::disallowed_methods)]
 
-use broca_wal::migration::{atomic_json, check, rebuild_fence_index};
+use broca_records::move_fence::{atomic_json, check, rebuild_fence_index};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

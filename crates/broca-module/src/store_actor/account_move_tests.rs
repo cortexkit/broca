@@ -29,7 +29,7 @@ use crate::actor::SendOutcome;
 use crate::executor::{RunExecutor, StoreRunEnd, StoreRunError, StoreRunJob, StoreRunMode};
 
 /// The selection routing gave the run for `account`.
-fn routed(account: &str) -> broca_wal::AuthSelection {
+fn routed(account: &str) -> broca_records::record::AuthSelection {
     serde_json::from_value(json!({
         "credential_id": format!("cred-{account}"),
         "account_ref": account,
@@ -145,7 +145,7 @@ impl AccountContinue<Box<dyn Provider>> for OffersB {
         }))
     }
 
-    fn adopted(&self, _selection: &broca_wal::AuthSelection) {}
+    fn adopted(&self, _selection: &broca_records::record::AuthSelection) {}
 }
 
 /// Runs a fresh store run on A, with routing that moves it to B; seals a run the actor's

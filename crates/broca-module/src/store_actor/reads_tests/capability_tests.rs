@@ -79,9 +79,9 @@ async fn marked_session(catalog: Result<Vec<String>, ()>) -> (Module, Arc<Catalo
         Arc::new(e)
     })
     .await;
-    let manifest = broca_wal::PlanManifest {
+    let manifest = broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             json!({"compaction_item":{"provider":"magic","preset":"default"}}).to_string(),
         )
         .unwrap(),

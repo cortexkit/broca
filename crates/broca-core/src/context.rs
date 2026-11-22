@@ -9,7 +9,10 @@ use broca_protocol::{
     error::ProviderError,
     BindIdentity, RunId, Usage,
 };
-use broca_wal::{FramedRecord, WalRecord};
+#[cfg(test)]
+use broca_records::record::WalRecord;
+#[cfg(test)]
+use broca_wal::FramedRecord;
 
 /// The default `session.read` page size.
 pub const SESSION_READ_DEFAULT_LIMIT: u64 = 200;
@@ -251,7 +254,7 @@ pub trait ExportIndex: Send + Sync {
 
     fn emit_run(
         &self,
-        records: &[FramedRecord],
+        records: &[crate::billing::BillingRecord],
         run_id: &RunId,
         resolver: &dyn ChargeBasisResolver,
     ) -> Result<(), ExportError>;
@@ -262,7 +265,7 @@ pub trait ExportIndex: Send + Sync {
     /// writes the segments unmarked, as `emit_run` does.
     fn emit_run_with_attempts(
         &self,
-        records: &[FramedRecord],
+        records: &[crate::billing::BillingRecord],
         run_id: &RunId,
         _attempts: &[crate::billing::attempt::AttemptEvidence],
         resolver: &dyn ChargeBasisResolver,
@@ -288,15 +291,16 @@ pub trait ExportIndex: Send + Sync {
 /// This deliberately does not consult the missing-facts outbox or run index.
 pub fn emit_lineage_usage_exports(
     index: &dyn ExportIndex,
-    records: &[FramedRecord],
+    records: &[crate::billing::BillingRecord],
     resolver: &dyn ChargeBasisResolver,
 ) -> Result<usize, ExportError> {
+    use crate::billing::BillingEvent;
     let mut current = None;
     let mut emitted = std::collections::HashSet::new();
     for frame in records {
-        match &frame.record {
-            WalRecord::RunStarted { run_id, .. } => current = Some(run_id),
-            WalRecord::RunFinished { .. } => {
+        match &frame.event {
+            BillingEvent::RunStarted { run_id, .. } => current = Some(run_id),
+            BillingEvent::RunFinished { .. } => {
                 let Some(run_id) = current.take() else {
                     continue;
                 };
@@ -471,7 +475,10 @@ mod tests {
     use super::*;
     use crate::replay::replay;
 
-    use broca_wal::{AuthSelection, DispatchOutcome, FramedRecord, RunConfig, WalRecord};
+    use broca_records::{
+        record::AuthSelection, record::DispatchOutcome, record::RunConfig, record::WalRecord,
+    };
+    use broca_wal::FramedRecord;
     use {
         broca_protocol::caller::RunFinishReason, broca_protocol::content::AssistantMessage,
         broca_protocol::content::ContentBlock, broca_protocol::content::Role,
@@ -546,7 +553,7 @@ mod tests {
                     tags: Default::default(),
                 }]
                 .into(),
-                origin: broca_wal::RunOrigin::Fresh,
+                origin: broca_records::record::RunOrigin::Fresh,
                 submission_id: None,
             },
             WalRecord::ModelStepFinished {

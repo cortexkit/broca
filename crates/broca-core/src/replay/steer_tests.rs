@@ -9,7 +9,9 @@ use broca_protocol::{
     request::{ModelHandle, StopCondition},
     BatchId, BindIdentity, Delivery, MessageId, RunId, StepId, ToolCallId, Usage,
 };
-use broca_wal::{DispatchOutcome, RunConfig, RunOrigin, WalRecord};
+use broca_records::{
+    record::DispatchOutcome, record::RunConfig, record::RunOrigin, record::WalRecord,
+};
 
 use super::{replay, ReplayResolution};
 

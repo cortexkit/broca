@@ -57,7 +57,7 @@ fn stranger() -> BindPrincipal {
 pub(super) fn stored_mode(dir: &std::path::Path, key: &BindIdentity) -> Cipher {
     use broca_session_store::backend::{LocalBackend, SessionAddr};
     let address = broca_core::session_addr(key);
-    let class = broca_wal::session_storage_class(dir, &address)
+    let class = broca_records::session_storage::session_storage_class(dir, &address)
         .unwrap()
         .expect("the session is kept in the new storage");
     let (stored, _) = LocalBackend::new(class.store_root(dir))

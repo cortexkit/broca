@@ -317,7 +317,7 @@ async fn flow_and_run_routes_have_no_owner_authority_alike() {
                     &module.key,
                     Some(&core()),
                     &scope,
-                    Some(broca_wal::record::RunCancelAt::Now),
+                    Some(broca_records::record::RunCancelAt::Now),
                 )
                 .await,
                 ServeHandler::authorize_session_retract(
@@ -418,14 +418,14 @@ async fn a_planned_session_heads_alike() {
         "model": {"provider": "stub", "model": "m", "variant": "high"},
         "senders": [{"module": "occipital", "idle_start": true}],
     });
-    let manifest = broca_wal::PlanManifest {
+    let manifest = broca_records::record::PlanManifest {
         rich_ui: Some(
             serde_json::from_value(
                 serde_json::json!({"dialect": "1.0", "catalog_digest": "a".repeat(64)}),
             )
             .unwrap(),
         ),
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: "plan-1".into(),
         composition_digest: "composition".into(),
         tools: Arc::new(Vec::new()),

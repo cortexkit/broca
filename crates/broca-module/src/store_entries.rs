@@ -142,7 +142,10 @@ pub async fn compaction_runner(
             };
             // No root holds the session, so it names no parts: any root's parts serve it.
             serve_compaction::<broca_session_store::backend::LocalBackend>(
-                store.parts_for(broca_wal::StorageClass::Ordinary, store.new_sessions()),
+                store.parts_for(
+                    broca_records::session_storage::StorageClass::Ordinary,
+                    store.new_sessions(),
+                ),
                 None,
                 key,
                 caller.as_deref(),

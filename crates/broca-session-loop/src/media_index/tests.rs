@@ -10,10 +10,10 @@ use broca_protocol::media_event::MediaLimits;
 use broca_provider::media_profile::{select_media_profile, AgingThresholds, MediaQuirk};
 use broca_provider::media_request::MediaAging;
 use broca_provider::spec::{InputModalities, WireFamilyId};
+use broca_records::record::WalRecord;
 use broca_session_store::codec::{Id128, Message as _};
 use broca_session_store::record::MediaObject;
 use broca_session_store::session::StoredMediaIndex;
-use broca_wal::WalRecord;
 use serde_json::json;
 
 use super::{from_stored, to_stored};

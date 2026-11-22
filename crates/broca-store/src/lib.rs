@@ -447,7 +447,7 @@ impl broca_core::RunEventBodies for SqliteStore {
 mod tests {
     #[test]
     fn boot_selected_legacy_opens_do_not_read_the_marker_again() {
-        use broca_wal::fs_ops::{self, FsOps};
+        use broca_records::fs_ops::{self, FsOps};
         use std::{
             path::{Path, PathBuf},
             sync::{

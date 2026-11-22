@@ -974,7 +974,7 @@ async fn an_import_meets_the_scope_reservation_of_the_session_it_creates() {
 #[tokio::test]
 async fn an_imported_head_is_created_in_the_durable_root_and_reopens_from_it() {
     use broca_core::FileLeaseStore;
-    use broca_wal::StorageClass;
+    use broca_records::session_storage::StorageClass;
     const IDLE: std::time::Duration = std::time::Duration::from_millis(100);
     let source = Source::new("durable");
     let dir = source.dir.join("state");
@@ -1019,7 +1019,7 @@ async fn an_imported_head_is_created_in_the_durable_root_and_reopens_from_it() {
     assert!(written > 0);
     for class in StorageClass::ALL {
         assert_eq!(
-            broca_wal::session_storage_head(&dir, class, &address).is_file(),
+            broca_records::session_storage::session_storage_head(&dir, class, &address).is_file(),
             class == StorageClass::Durable,
             "the {class} root's head"
         );
@@ -1048,7 +1048,7 @@ async fn an_imported_head_is_created_in_the_durable_root_and_reopens_from_it() {
     );
     assert_eq!(retry, reply);
     assert_eq!(
-        broca_wal::session_storage_class(&dir, &address).unwrap(),
+        broca_records::session_storage::session_storage_class(&dir, &address).unwrap(),
         Some(StorageClass::Durable)
     );
     assert!(registry.stop_and_seal().await);
@@ -1175,10 +1175,10 @@ impl broca_core::CompactionPlane for Compactor {
 }
 
 /// A fetch plan's manifest naming a compaction provider, `compactor` with preset `head`.
-fn compacted_manifest() -> broca_wal::PlanManifest {
-    broca_wal::PlanManifest {
+fn compacted_manifest() -> broca_records::record::PlanManifest {
+    broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             serde_json::json!({
                 "compaction_item": {"provider": "compactor", "preset": "head", "params": {}},
                 "composition": {},

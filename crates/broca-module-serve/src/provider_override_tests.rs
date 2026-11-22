@@ -287,7 +287,7 @@ fn assert_resume_replays_the_admitted_cache_policy(
     let admitted_with = |cache: Option<CachePolicy>| {
         let mut frozen = broca_provider::families::anthropic_frozen_config("claude-opus-4-8");
         frozen.cache = cache;
-        let config: broca_wal::RunConfig = serde_json::from_value(serde_json::json!({
+        let config: broca_records::record::RunConfig = serde_json::from_value(serde_json::json!({
             "model": req.model,
             "tools": [],
             "tool_choice": broca_protocol::request::ToolChoice::default(),
@@ -638,7 +638,7 @@ fn run_started_with_user_text(
     session: &broca_protocol::BindIdentity,
     run_id: &str,
     text: &str,
-) -> broca_wal::WalRecord {
+) -> broca_records::record::WalRecord {
     serde_json::from_value(serde_json::json!({
         "type": "run_started", "run_id": run_id, "session": session,
         "config": {

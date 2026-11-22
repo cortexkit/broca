@@ -1,7 +1,7 @@
 //! Tool-hook subjects and synthetic tool results shared by dispatch and recovery.
 
 use broca_protocol::{StepId, ToolCall, ToolCallId, ToolOutput, ToolResult};
-use broca_wal::{DispatchOutcome, NoDispatchReason};
+use broca_records::{record::DispatchOutcome, record::NoDispatchReason};
 
 /// The `route_drained` result for a call a scope drain stopped before it was sent. The text
 /// leads with the name so the model, and anyone reading the transcript, sees why.
@@ -175,7 +175,11 @@ pub fn pre_tool_refusal(
 pub fn transformed_tool_result(
     original: &ToolResult,
     output: &crate::hooks::ChainOutput,
-) -> (ToolResult, Option<String>, Option<Box<broca_wal::Hooks>>) {
+) -> (
+    ToolResult,
+    Option<String>,
+    Option<Box<broca_records::record::Hooks>>,
+) {
     let mut result = original.clone();
     let mut reason = None;
     if let Some((provider, _, _)) = &output.refusal {
@@ -216,7 +220,7 @@ mod unavailable_result_tests {
     use super::no_dispatch_result;
     use broca_protocol::ToolCallId;
     use broca_protocol::ToolOutput;
-    use broca_wal::NoDispatchReason;
+    use broca_records::record::NoDispatchReason;
 
     /// A call refused because its module stayed down keeps the exact matchable message
     /// and carries the outage in sibling fields, so the model sees what was down and

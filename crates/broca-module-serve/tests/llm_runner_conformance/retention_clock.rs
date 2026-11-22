@@ -136,7 +136,8 @@ impl BrocaSubject {
             .ok_or_else(|| HarnessError::new("retention kill has no written session"))?;
         let key = self.bind_identity(&session);
         let addr = broca_session_store::backend::SessionAddr(broca_core::session_addr(&key));
-        let root = broca_wal::StorageClass::Ephemeral.store_root(&handle.state_root);
+        let root =
+            broca_records::session_storage::StorageClass::Ephemeral.store_root(&handle.state_root);
         let heads = root.join("heads").join(&addr.0);
         let head = heads.join("head");
         let triple = broca_session_store::head::SessionTriple {
@@ -193,7 +194,7 @@ pub(super) fn deletion_finished(
     state: &Path,
     key: &broca_protocol::BindIdentity,
 ) -> Result<bool, HarnessError> {
-    broca_wal::session_storage_class(state, &broca_core::session_addr(key))
+    broca_records::session_storage::session_storage_class(state, &broca_core::session_addr(key))
         .map(|class| class.is_none())
         .map_err(|error| HarnessError::new(error.to_string()))
 }

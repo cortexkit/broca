@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use broca_protocol::{BindPrincipal, ContentBlock, DeliveryMode, Message, Role as HostRole, Usage};
-use broca_wal::{FramedRecord, WalRecord};
+use broca_records::record::WalRecord;
+use broca_wal::FramedRecord;
 use cortexkit_role_compaction::{
     part::{Delivered, PartBody, ToolPart, ToolStatus},
     read::{NoticeOrigin, Role, SpeaksFor, StepUsage},
@@ -24,7 +25,10 @@ pub fn clean_replies(render_tags: bool, frozen_render_config: &serde_json::Value
         .is_some_and(|frozen| frozen.mode == broca_protocol::structured_output::Mode::FinalText)
 }
 
-fn renders_tag_numbers(render_tags: bool, manifest: Option<&broca_wal::PlanManifest>) -> bool {
+fn renders_tag_numbers(
+    render_tags: bool,
+    manifest: Option<&broca_records::record::PlanManifest>,
+) -> bool {
     render_tags
         || manifest.is_some_and(|manifest| {
             serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
@@ -39,8 +43,8 @@ fn renders_tag_numbers(render_tags: bool, manifest: Option<&broca_wal::PlanManif
 /// The caller-facing reply policy frozen by a compaction run. Its view shows tag numbers
 /// independently of the legacy render bit. This policy must not replace request-rendering rules.
 pub fn clean_replies_for_run(
-    config: &broca_wal::RunConfig,
-    manifest: Option<&broca_wal::PlanManifest>,
+    config: &broca_records::record::RunConfig,
+    manifest: Option<&broca_records::record::PlanManifest>,
 ) -> bool {
     clean_replies(
         renders_tag_numbers(config.render_tags, manifest),
@@ -361,13 +365,13 @@ impl Fold {
                 self.clean_replies = clean_replies_for_run(config, manifest.as_deref());
                 self.import_high = matches!(
                     origin,
-                    broca_wal::RunOrigin::SeededFrom {
-                        origin_kind: broca_wal::SeedOriginKind::Import,
+                    broca_records::record::RunOrigin::SeededFrom {
+                        origin_kind: broca_records::record::SeedOriginKind::Import,
                         ..
                     }
                 )
                 .then_some(self.high);
-                let notice_input = matches!(origin, broca_wal::RunOrigin::Fresh);
+                let notice_input = matches!(origin, broca_records::record::RunOrigin::Fresh);
                 let mut origin = submission_id
                     .as_ref()
                     .and_then(|id| self.origins.remove(&id.0))

@@ -9,7 +9,7 @@ use broca_protocol::{
     canonical_json_bytes, content::Message, request::SubmissionRequest, BindPrincipal, RunId,
     SessionScope, SubmissionId, Usage,
 };
-use broca_wal::RunConfig;
+use broca_records::record::RunConfig;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::PendingSubmission;
@@ -479,9 +479,9 @@ pub use crate::budget_kernel::{BudgetReplayStateV1, BUDGET_REPLAY_STATE_VERSION}
 pub struct LastEpisodeV1 {
     /// Timed pause evidence restored from a checkpoint; waking still requires validation against the WAL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
+    pub account_limit_pause: Option<Box<broca_records::record::AccountLimitPause>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cancel_at: Option<broca_wal::record::RunCancelAt>,
+    pub cancel_at: Option<broca_records::record::RunCancelAt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_restart: Option<broca_protocol::request::OnRestart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -554,7 +554,7 @@ pub struct SessionOwnershipV1 {
     /// identity; unchanged sessions omit this field and retain their original checkpoint bytes.
     /// Older summaries also omit it because their episodes shared the first manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_manifest: Option<Arc<broca_wal::PlanManifest>>,
+    pub latest_manifest: Option<Arc<broca_records::record::PlanManifest>>,
     /// Whether the WAL contains session-change facts. False is omitted so unrefreshed logs
     /// retain their old checkpoint bytes and admission need not probe for change records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -610,7 +610,7 @@ pub struct FirstEpisodeV1 {
     /// The plan manifest the episode froze, when the session was admitted with a fetch plan.
     /// Later episodes retain it until a session refresh applies a new manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<Arc<broca_wal::PlanManifest>>,
+    pub manifest: Option<Arc<broca_records::record::PlanManifest>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -621,7 +621,7 @@ pub struct SenderAdmissionV1 {
 
 /// The senders a session's frozen plan manifest grants, as admission reads them.
 pub fn manifest_senders(
-    manifest: &broca_wal::PlanManifest,
+    manifest: &broca_records::record::PlanManifest,
 ) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
     serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
         .ok()

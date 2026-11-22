@@ -2,9 +2,7 @@
 //!
 //! The record vocabulary (re-exported from `broca-records`; the session store's own record
 //! kinds are in `broca-session-store`), the frame codec and its must-understand feature names,
-//! the `state-format` marker check at startup, and size limits. It also keeps the move fences
-//! (see [`migration`]): small files under `agent-data/` that hold no session content and stop
-//! writes to a session while it moves to another computer.
+//! the `state-format` marker check at startup, and size limits.
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // Test fixtures intentionally use direct I/O to prepare and inspect crash images.
@@ -57,6 +55,5 @@ pub use state_format::{classify_state_root, StateRootError, WalConfig, WalFormat
 // `RunFinishReason`) and is re-exported here so existing `broca_wal::PauseReason` paths
 // keep resolving.
 pub use broca_protocol::PauseReason;
-pub mod migration;
 
 pub mod size_limit;

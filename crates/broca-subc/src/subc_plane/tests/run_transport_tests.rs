@@ -1,5 +1,7 @@
 use super::*;
-use broca_wal::{FetchOutcome, OpaqueJson, PlanManifest, ProviderFetch};
+use broca_records::{
+    record::FetchOutcome, record::OpaqueJson, record::PlanManifest, record::ProviderFetch,
+};
 use serde_json::json;
 
 pub(in crate::subc_plane) fn catalog(tagged: bool, pinned: bool) -> serde_json::Value {
@@ -148,7 +150,7 @@ async fn run_transport_successfully_withdrawn_promises_override_but_never_replac
     let facts = plane.run_transport(&bind, None, &plan).await;
     assert_eq!(
         facts[provider],
-        broca_wal::FrozenProviderDeclarations::default()
+        broca_records::record::FrozenProviderDeclarations::default()
     );
     let dispatch = ToolManifest::from_shared_tools(Arc::clone(&plan.tools))
         .with_plan_manifest(&plan)

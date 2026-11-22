@@ -1,7 +1,7 @@
 //! Completed-step usage, generation timing and normalized provider finish reasons.
 
 use broca_protocol::{RunId, Usage};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 
 /// A completed-step usage fold for one run id. The same durable records feed
 /// cold reconciliation and the live writer's small status projection.

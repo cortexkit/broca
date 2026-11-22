@@ -137,7 +137,10 @@ pub use scope_admission::{
 // Re-exported so resume/context APIs can name the authoritative request config + the
 // frozen auth-selection a caller threads into a fresh run's RunControl.
 pub use account_report::AccountReporter;
-pub use broca_wal::{AccountDecision, AuthSelection, RunConfig, VaultReadOp, VaultRequest};
+pub use broca_records::{
+    record::AccountDecision, record::AuthSelection, record::RunConfig, record::VaultReadOp,
+    record::VaultRequest,
+};
 // Re-exported so resume APIs can name the run id recovered for the last episode.
 pub use broca_protocol::RunId;
 pub use cache_warm::{

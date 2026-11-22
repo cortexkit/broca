@@ -22,7 +22,9 @@
 use std::collections::HashMap;
 
 use broca_protocol::{BindIdentity, RunId, Usage};
-use broca_wal::{FramedRecord, RunConfig, WalRecord};
+use broca_records::record::RunConfig;
+
+use super::input::{BillingEvent, BillingRecord};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -150,7 +152,7 @@ pub struct RunAttemptFacts {
 /// The export facts of `run_id`: its segments, as [`super::compute_segments_for_run`] builds
 /// them, and a fact per attempt in `attempts`, the run's attempt records in seq order.
 pub fn compute_attempt_facts<R: ChargeBasisResolver>(
-    records: &[FramedRecord],
+    records: &[BillingRecord],
     run_id: &RunId,
     attempts: &[AttemptEvidence],
     source_instance_id: &str,
@@ -260,7 +262,7 @@ struct RunContext {
 }
 
 impl RunContext {
-    fn read(records: &[FramedRecord], run_id: &RunId) -> Self {
+    fn read(records: &[BillingRecord], run_id: &RunId) -> Self {
         let mut context = RunContext {
             configs: Vec::new(),
             session: None,
@@ -271,8 +273,8 @@ impl RunContext {
         };
         let mut own = false;
         for framed in records {
-            match &framed.record {
-                WalRecord::RunStarted {
+            match &framed.event {
+                BillingEvent::RunStarted {
                     run_id: started,
                     session,
                     config,
@@ -287,7 +289,7 @@ impl RunContext {
                     }
                 }
                 _ if !own => {}
-                WalRecord::RunConfigRefrozen {
+                BillingEvent::ConfigRefrozen {
                     renderer_version,
                     frozen_render_config,
                     ..
@@ -299,17 +301,17 @@ impl RunContext {
                         context.configs.push((framed.seq, config));
                     }
                 }
-                WalRecord::RunAuthRefrozen { auth_selection, .. } => {
+                BillingEvent::AuthRefrozen { auth_selection, .. } => {
                     if let Some((_, config)) = context.configs.last() {
                         let mut config = config.clone();
                         config.auth_selection = Some(auth_selection.clone());
                         context.configs.push((framed.seq, config));
                     }
                 }
-                WalRecord::ModelStepRefused { step_id, .. } => {
+                BillingEvent::StepRefused { step_id, .. } => {
                     context.refused_at.insert(step_id.0, framed.seq);
                 }
-                WalRecord::ModelStepFinished {
+                BillingEvent::StepFinished {
                     step_id,
                     speed_used,
                     fallback,

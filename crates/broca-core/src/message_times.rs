@@ -1,7 +1,7 @@
 //! Envelope times follow the shared placement decisions, never message content or replay clocks.
 
 use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

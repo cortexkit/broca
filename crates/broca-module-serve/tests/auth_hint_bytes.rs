@@ -1,6 +1,6 @@
 use broca_module_serve::wire::SendParamsExt;
 use broca_protocol::{BindIdentity, RunId, SubmissionId};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde_json::json;
 
 fn pin_values() -> [(&'static str, Vec<u8>, &'static str); 4] {

@@ -9,7 +9,7 @@ use super::{
         setup::ModelRef,
     },
 };
-use broca_wal::{PlanManifest, RunConfig};
+use broca_records::{record::PlanManifest, record::RunConfig};
 use cortexkit_compaction_view::rules::Floor;
 
 /// What a send's compaction conditions and context read from its run's frozen configuration.
@@ -20,7 +20,7 @@ pub struct Frozen<'a> {
     pub frozen_render_config: &'a serde_json::Value,
     pub tools: &'a [broca_protocol::request::Tool],
     pub global_system: Option<&'a [broca_protocol::Message]>,
-    pub auth_selection: Option<&'a broca_wal::AuthSelection>,
+    pub auth_selection: Option<&'a broca_records::record::AuthSelection>,
     pub context_limit: Option<u64>,
     pub max_output_tokens: Option<u64>,
 }

@@ -43,7 +43,7 @@ impl Counts {
     pub fn configure(
         &mut self,
         frozen: &super::host::Frozen<'_>,
-        manifest: Option<&broca_wal::PlanManifest>,
+        manifest: Option<&broca_records::record::PlanManifest>,
     ) {
         let mut system = manifest
             .map(super::systems::from_manifest)

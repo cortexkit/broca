@@ -73,7 +73,7 @@ async fn a_steer_and_a_cancel_are_answered_while_the_media_fold_builds() {
     commands
         .send(LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::Now,
+            at: broca_records::record::RunCancelAt::Now,
             reply,
         })
         .unwrap();

@@ -3,10 +3,8 @@ use broca_provider::{
     families::AnthropicMessages,
     wire::{FrozenRenderConfig, WireFamily},
 };
-use broca_wal::{
-    framing::{decode_next, DecodeStep},
-    WalRecord,
-};
+use broca_records::record::WalRecord;
+use broca_wal::framing::{decode_next, DecodeStep};
 
 #[test]
 fn reader_only_replays_writer_log_with_identical_native_and_downgraded_bytes() {

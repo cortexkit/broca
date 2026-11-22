@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use broca_protocol::{error::ProviderError, AttemptOutcome, CallOptions, RunId, StepId, Usage};
-use broca_wal::RunConfig;
+use broca_records::record::RunConfig;
 
 /// A warm is refused, and nothing sent, when less than this much of the cache's estimated
 /// lifetime remains. The estimate is only that, so a warm at the very edge could arrive after the
@@ -204,8 +204,8 @@ pub struct WarmSent {
 
 /// Missing or reported-zero counts consume no warm budget and require no price lookup.
 /// Here `Usage.output_tokens` already includes reasoning tokens; do not add them again.
-pub fn warm_budget_needs_pricing(envelope: &broca_wal::record::AttemptEnvelope) -> bool {
-    envelope.sent != broca_wal::record::AttemptSent::No
+pub fn warm_budget_needs_pricing(envelope: &broca_records::record::AttemptEnvelope) -> bool {
+    envelope.sent != broca_records::record::AttemptSent::No
         && envelope.usage.is_some_and(|usage| {
             [
                 usage.input_tokens,
@@ -260,7 +260,7 @@ pub struct RecordedRequest {
     /// Set when the request went to the refusal-fallback model instead of the episode's: the
     /// warm must render it for that model (`opts.target_model` already names it), and its
     /// digest only matches when it does. `None` for a request to the episode's own model.
-    pub route: Option<broca_wal::StepRoute>,
+    pub route: Option<broca_records::record::StepRoute>,
 }
 
 #[cfg(test)]

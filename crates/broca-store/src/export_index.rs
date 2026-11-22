@@ -9,12 +9,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use broca_core::billing::BillingRecord;
 use broca_core::{
     compute_segments_for_run, ChargeBasisResolver, ExportCursor, ExportError, ExportFact,
     ExportIndex, ExportPage, SpendSegment,
 };
 use broca_protocol::RunId;
-use broca_wal::FramedRecord;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::SqliteStore;
@@ -308,7 +308,7 @@ impl ExportStore {
     /// unmarked, so the run is never priced twice.
     pub fn emit_export_run_with_attempts(
         &self,
-        records: &[FramedRecord],
+        records: &[BillingRecord],
         run_id: &RunId,
         attempts: &[broca_core::billing::attempt::AttemptEvidence],
         resolver: &dyn ChargeBasisResolver,
@@ -374,7 +374,7 @@ impl ExportStore {
     /// are interpreted by the same pure billing function used elsewhere.
     pub fn emit_export_run(
         &self,
-        records: &[FramedRecord],
+        records: &[BillingRecord],
         run_id: &RunId,
         resolver: &dyn ChargeBasisResolver,
     ) -> Result<(), ExportError> {
@@ -805,7 +805,7 @@ impl ExportIndex for SqliteStore {
 
     fn emit_run(
         &self,
-        records: &[FramedRecord],
+        records: &[BillingRecord],
         run_id: &RunId,
         resolver: &dyn ChargeBasisResolver,
     ) -> Result<(), ExportError> {
@@ -814,7 +814,7 @@ impl ExportIndex for SqliteStore {
 
     fn emit_run_with_attempts(
         &self,
-        records: &[FramedRecord],
+        records: &[BillingRecord],
         run_id: &RunId,
         attempts: &[broca_core::billing::attempt::AttemptEvidence],
         resolver: &dyn ChargeBasisResolver,
@@ -871,7 +871,7 @@ impl SqliteStore {
 
     pub fn emit_export_run(
         &self,
-        records: &[FramedRecord],
+        records: &[BillingRecord],
         run_id: &RunId,
         resolver: &dyn ChargeBasisResolver,
     ) -> Result<(), ExportError> {
@@ -880,7 +880,7 @@ impl SqliteStore {
 
     pub fn emit_export_run_with_attempts(
         &self,
-        records: &[FramedRecord],
+        records: &[BillingRecord],
         run_id: &RunId,
         attempts: &[broca_core::billing::attempt::AttemptEvidence],
         resolver: &dyn ChargeBasisResolver,
@@ -905,14 +905,14 @@ pub(crate) mod tests {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
+    use broca_core::billing::BillingEvent;
     use broca_core::ChargeBasis;
     use broca_protocol::{
         caller::RunFinishReason,
-        content::{ContentBlock, Message, Role},
         request::{GenerationConfig, ModelHandle, ResponseFormat, ToolChoice},
         BindIdentity, RunId, StepId, Usage,
     };
-    use broca_wal::{AuthSelection, RunConfig, RunOrigin, WalRecord};
+    use broca_records::{record::AuthSelection, record::RunConfig};
     use serde_json::Value;
 
     fn with_billing_floor_store(test: impl FnOnce(&dyn Fn() -> SqliteStore)) {
@@ -988,7 +988,7 @@ pub(crate) mod tests {
     fn records_with_attempts(
         run_id: &str,
     ) -> (
-        Vec<FramedRecord>,
+        Vec<BillingRecord>,
         Vec<broca_core::billing::attempt::AttemptEvidence>,
     ) {
         let mut frames = records(run_id, 2);
@@ -997,8 +997,8 @@ pub(crate) mod tests {
         }
         let attempts = frames
             .iter()
-            .filter_map(|framed| match &framed.record {
-                WalRecord::ModelStepFinished { step_id, .. } => {
+            .filter_map(|framed| match &framed.event {
+                BillingEvent::StepFinished { step_id, .. } => {
                     Some(broca_core::billing::attempt::AttemptEvidence {
                         seq: framed.seq - 1,
                         step_id: step_id.0,
@@ -1122,7 +1122,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn records(run_id: &str, segments: usize) -> Vec<FramedRecord> {
+    fn records(run_id: &str, segments: usize) -> Vec<BillingRecord> {
         records_with_usage_policy(
             run_id,
             segments,
@@ -1136,90 +1136,50 @@ pub(crate) mod tests {
         segments: usize,
         usage_policy: &str,
         session: BindIdentity,
-    ) -> Vec<FramedRecord> {
-        let mut records = vec![FramedRecord {
+    ) -> Vec<BillingRecord> {
+        let mut records = vec![BillingRecord {
             seq: 1,
-            fence: 1,
-            record: WalRecord::RunStarted {
-                message_marks: None,
-                compaction_plan_version: None,
-                sent_by: None,
-                written_at_ms: None,
-                tags: None,
-                session_class: None,
-                retention: None,
-                hooks: None,
-                title: None,
-                on_restart: None,
-                keep_warm: None,
-                marker_order_version: None,
-                manifest: None,
-                scope: None,
-                send_id: None,
-                request_identity_digest: None,
-                project_id: None,
-                principal: None,
+            event: BillingEvent::RunStarted {
                 run_id: RunId(run_id.into()),
                 session,
-                ts_ms: Some(100),
                 config: Box::new(config(usage_policy)),
-                input: vec![Message::new(
-                    Role::User,
-                    vec![ContentBlock::Text { text: "hi".into() }],
-                )]
-                .into(),
-                origin: RunOrigin::Fresh,
-                submission_id: None,
+                ts_ms: Some(100),
+                scope: None,
             },
         }];
         for ordinal in 0..segments {
             if ordinal > 0 {
-                records.push(FramedRecord {
+                records.push(BillingRecord {
                     seq: records.len() as u64 + 1,
-                    fence: 1,
-                    record: WalRecord::RunConfigRefrozen {
+                    event: BillingEvent::ConfigRefrozen {
                         renderer_version: ordinal as u32 + 1,
                         ts_ms: Some(100 + ordinal as u64),
                         frozen_render_config: config(usage_policy).frozen_render_config,
                     },
                 });
             }
-            records.push(FramedRecord {
+            records.push(BillingRecord {
                 seq: records.len() as u64 + 1,
-                fence: 1,
-                record: WalRecord::ModelStepFinished {
-                    raw_finish_reason: None,
-                    fallback: Default::default(),
-                    written_at_ms: None,
-                    tags: None,
-                    hooks: None,
+                event: BillingEvent::StepFinished {
                     step_id: StepId(ordinal as u64),
-                    assistant_message: (broca_protocol::content::AssistantMessage {
-                        message_id: broca_protocol::MessageId(format!("m{ordinal}")),
-                        content: vec![ContentBlock::Text { text: "ok".into() }],
-                    })
-                    .into(),
+                    written_at_ms: None,
                     usage: Usage {
                         input_tokens: Some(10 + ordinal as u64),
                         output_tokens: Some(2),
                         ..Usage::default()
                     },
-                    finish_reason: Some(broca_protocol::FinishReason::Stop),
                     retries_used: ordinal as u32,
                     service_tier_used: None,
                     speed_used: None,
+                    fallback: Default::default(),
                 },
             });
         }
-        records.push(FramedRecord {
+        records.push(BillingRecord {
             seq: records.len() as u64 + 1,
-            fence: 1,
-            record: WalRecord::RunFinished {
-                interrupt_reason: None,
+            event: BillingEvent::RunFinished {
                 reason: RunFinishReason::Completed,
                 ts_ms: Some(200),
-                usage: Usage::default(),
-                error: None,
                 retries_used: 0,
             },
         });
@@ -1245,7 +1205,7 @@ pub(crate) mod tests {
         let store = SqliteStore::open(root.join("store.db")).unwrap();
         let mut frames = records("witness", 1);
         for frame in &mut frames {
-            if let WalRecord::RunStarted { config, .. } = &mut frame.record {
+            if let BillingEvent::RunStarted { config, .. } = &mut frame.event {
                 let selection = config.auth_selection.as_mut().unwrap();
                 selection.credential_id = "apikey:kimi-code-plan-global".into();
                 selection.resolved_credential_id = Some("apikey:kimi-for-coding".into());
@@ -1288,7 +1248,7 @@ pub(crate) mod tests {
         };
         let mut frames = records("asked", 1);
         for frame in &mut frames {
-            if let WalRecord::RunStarted { config, .. } = &mut frame.record {
+            if let BillingEvent::RunStarted { config, .. } = &mut frame.event {
                 config.auth_selection.as_mut().unwrap().vault_request = Some(request.clone());
             }
         }
@@ -1438,7 +1398,7 @@ pub(crate) mod tests {
         // Old usage writers recorded every zero explicitly. Keep those measurements
         // in this historical-byte fixture; new unreported usage omits the keys.
         for frame in &mut historical_records {
-            if let WalRecord::ModelStepFinished { usage, .. } = &mut frame.record {
+            if let BillingEvent::StepFinished { usage, .. } = &mut frame.event {
                 usage.cached_input_tokens = Some(0);
                 usage.cache_write_tokens = Some(0);
                 usage.reasoning_tokens = Some(0);

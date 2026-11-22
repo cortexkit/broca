@@ -11,8 +11,8 @@ use std::time::Duration;
 use broca_core::scope_admission::OwnerMismatch;
 use broca_core::{FileLeaseStore, ScopeRefusal};
 use broca_protocol::{BindIdentity, BindPrincipal, NormalizedEvent, RunId, SendScope};
+use broca_records::session_storage::StorageClass;
 use broca_store::session_address::ScopeReservation;
-use broca_wal::StorageClass;
 use serde_json::json;
 
 use super::tests::{executor, request, text_step, Inventory};
@@ -130,7 +130,11 @@ impl Module {
 
     /// The class of the session store's root holding the session's head, if one does.
     fn store_class(&self) -> Option<StorageClass> {
-        broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key)).unwrap()
+        broca_records::session_storage::session_storage_class(
+            &self.dir,
+            &broca_core::session_addr(&self.key),
+        )
+        .unwrap()
     }
 
     /// Whether any of the session store's roots holds a head, a log or an object of the session.
@@ -147,7 +151,7 @@ impl Module {
     }
 
     fn floor(&self) -> String {
-        std::fs::read_to_string(self.dir.join(broca_wal::FEATURE_FLOOR_FILENAME))
+        std::fs::read_to_string(self.dir.join(broca_records::floor::FEATURE_FLOOR_FILENAME))
             .unwrap_or_default()
     }
 }

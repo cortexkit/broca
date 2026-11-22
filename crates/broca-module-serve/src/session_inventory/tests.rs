@@ -133,7 +133,7 @@ async fn failed_migration_refuses_new_pairs_and_can_be_retried() {
     // A session store whose session folder list can't be read fails the census. Its `heads`
     // folder is a file: listing it fails on every platform, while a missing path below a file
     // reads as an empty store on Windows.
-    let heads = broca_wal::StorageClass::Durable
+    let heads = broca_records::session_storage::StorageClass::Durable
         .store_root(&fixture.root)
         .join("heads");
     std::fs::create_dir_all(heads.parent().unwrap()).unwrap();

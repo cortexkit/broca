@@ -10,7 +10,10 @@ use broca_provider::{
     families::{anthropic_frozen_config, gemini_frozen_config, AnthropicMessages, Gemini},
     wire::WireFamily,
 };
-use broca_wal::{CompactionMessageKind, CompactionRange, RunConfig, RunOrigin, WalRecord};
+use broca_records::{
+    record::CompactionMessageKind, record::CompactionRange, record::RunConfig, record::RunOrigin,
+    record::WalRecord,
+};
 use serde_json::{json, Value};
 
 fn text(role: Role, value: &str) -> Message {
@@ -139,7 +142,7 @@ fn applied(version: u64, to: u64) -> WalRecord {
         compaction_id: "view".into(),
         version,
         range: CompactionRange { from: 0, to },
-        sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+        sha256: broca_records::record::compaction_replacement_sha256(&replacement).unwrap(),
         replacement: Arc::new(replacement),
         request_id: None,
         cursor: None,
@@ -384,7 +387,7 @@ fn carried_replacement_thinking_is_stripped_without_editing_the_replacement() {
     } = &mut record
     {
         *replacement = Arc::new(vec![text(Role::User, "summary"), thinking("older")]);
-        *sha256 = broca_wal::compaction_replacement_sha256(replacement).unwrap();
+        *sha256 = broca_records::record::compaction_replacement_sha256(replacement).unwrap();
     }
     let records = vec![start(seed()), record];
     let stored = serde_json::to_vec(&records).unwrap();

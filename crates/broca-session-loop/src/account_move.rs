@@ -43,7 +43,7 @@ pub struct Wall<'a> {
     pub run_id: &'a str,
     pub step_id: u64,
     /// The selection the refused attempt was sent under.
-    pub selection: &'a broca_wal::AuthSelection,
+    pub selection: &'a broca_records::record::AuthSelection,
     /// The decision routing's continue request names as the run's predecessor (see
     /// [`predecessor`]).
     pub predecessor: &'a str,
@@ -70,7 +70,7 @@ pub struct Wall<'a> {
     /// The run's frozen config as a resume would read it now (see
     /// [`crate::run::run_config_of_run`]): what the executor admits the new account's provider
     /// from.
-    pub run_config: &'a broca_wal::RunConfig,
+    pub run_config: &'a broca_records::record::RunConfig,
     /// The run is a head's turn (see `Admission::head_turn`).
     pub head_turn: bool,
     /// Set when routing is asked a second time at this wall because the account it offered
@@ -118,7 +118,7 @@ impl SignInOutcome {
 pub struct Move<P> {
     /// The selection the run renders and bills under from the move on, with the offer's
     /// decision id.
-    pub selection: broca_wal::AuthSelection,
+    pub selection: broca_records::record::AuthSelection,
     /// The account routing offered, which the selection names.
     pub account: String,
     /// When routing's reservation of the account ends.
@@ -137,7 +137,7 @@ pub trait AccountContinue<P>: Send + Sync {
     async fn ask(&self, wall: &Wall<'_>) -> Answer<P>;
     /// The move to `selection` is durable and the run sends on it from now on. Called once per
     /// move, after the records and before any request on the new account.
-    fn adopted(&self, selection: &broca_wal::AuthSelection);
+    fn adopted(&self, selection: &broca_records::record::AuthSelection);
     /// Whether this credential re-check may ask again for an already parked sign-in pause.
     fn recheck_sign_in(&self) -> bool {
         true
@@ -222,7 +222,7 @@ pub(crate) async fn at_wall<W: Writer, P, T>(
         return Ok(None);
     };
     let routed = selection.account_decision.as_ref().is_some_and(|decision| {
-        decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+        decision.path == broca_records::record::ACCOUNT_DECISION_ROUTED
             && decision.decision_id.is_some()
             && decision.admission_id.is_some()
     });
@@ -380,7 +380,7 @@ pub(crate) fn signed_out_selection<'a, P: broca_core::Provider, T>(
     admission: &'a Admission,
     error: &broca_protocol::ProviderError,
     step_id: u64,
-) -> Option<&'a broca_wal::AuthSelection> {
+) -> Option<&'a broca_records::record::AuthSelection> {
     if seams.account_continue.is_none() || error.class != broca_protocol::ErrorClass::Auth {
         return None;
     }
@@ -392,7 +392,7 @@ pub(crate) fn signed_out_selection<'a, P: broca_core::Provider, T>(
         .or(seams.auth_selection.as_ref())
         .filter(|selection| {
             selection.account_decision.as_ref().is_some_and(|decision| {
-                decision.path == broca_wal::ACCOUNT_DECISION_ROUTED
+                decision.path == broca_records::record::ACCOUNT_DECISION_ROUTED
                     && decision.decision_id.is_some()
                     && decision.admission_id.is_some()
             })
@@ -459,7 +459,7 @@ pub(crate) async fn record_move<W: Writer, P, T>(
 pub fn predecessor(
     start_selection: Option<&Value>,
     route_decision_id: Option<&str>,
-    selection: &broca_wal::AuthSelection,
+    selection: &broca_records::record::AuthSelection,
 ) -> Option<String> {
     let current = selection
         .account_decision
@@ -591,7 +591,7 @@ pub fn resume_can_record_account_change(run: &broca_session_store::fold::operati
 pub fn current_auth_selection(
     run: &broca_session_store::fold::operations::Run,
     parts: &dyn crate::parts::Parts,
-) -> Result<Option<broca_wal::AuthSelection>, LoopError> {
+) -> Result<Option<broca_records::record::AuthSelection>, LoopError> {
     if let Some(refrozen) = &run.refrozen_auth {
         return serde_json::from_value(refrozen.clone())
             .map(Some)
@@ -780,7 +780,7 @@ mod tests {
     }
 
     /// The selection a run's start froze, routed under account decision `decision`.
-    fn routed(decision: Option<&str>) -> broca_wal::AuthSelection {
+    fn routed(decision: Option<&str>) -> broca_records::record::AuthSelection {
         serde_json::from_value(json!({
             "credential_id": "c",
             "account_decision": {"path": "routed", "admission_id": "a", "decision_id": decision},

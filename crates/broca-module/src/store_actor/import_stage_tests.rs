@@ -8,11 +8,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use broca_core::FileLeaseStore;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::keys::Cipher;
 use broca_session_store::record::Placement;
 use broca_session_store::session::MAX_BATCH_RECORDS;
-use broca_wal::StorageClass;
 use serde_json::{json, Value};
 
 use super::*;

@@ -302,7 +302,7 @@ pub fn select_credential_id(
 /// never parsed. An older selection holds a broca key, which names both. `None` for a method
 /// token this build does not know or a key that does not parse.
 pub fn frozen_selection_credential(
-    selection: &broca_wal::AuthSelection,
+    selection: &broca_records::record::AuthSelection,
     run_provider: &str,
 ) -> Option<(AuthMethod, String)> {
     match &selection.auth_method {

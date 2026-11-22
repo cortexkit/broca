@@ -15,12 +15,12 @@
 //! finds it expired.
 
 use broca_protocol::{BindPrincipal, DeliveryMode, DeliveryOrder, SubmissionId, SubmissionRequest};
+use broca_records::record::SendEndReason;
 use broca_session_loop::queue;
 use broca_session_loop::writer::Writer;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::idindex::IdKind;
 use broca_session_store::record::{DeliveryOrdered, Record, SendEnded};
-use broca_wal::record::SendEndReason;
 use cortexkit_role_llm_runner::delivery_order as role;
 use cortexkit_role_llm_runner::errors;
 use tokio::sync::oneshot;

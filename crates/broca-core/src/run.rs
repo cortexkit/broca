@@ -545,22 +545,22 @@ pub trait AttemptHook: Send + Sync {
         &self,
         send: PhysicalSend,
         cancel: CancellationToken,
-    ) -> Result<broca_wal::record::AttemptId, ProviderError>;
+    ) -> Result<broca_records::record::AttemptId, ProviderError>;
 
     async fn finished(
         &self,
-        id: broca_wal::record::AttemptId,
+        id: broca_records::record::AttemptId,
         attempt: ModelAttempt,
-        outcome: broca_wal::record::BillingAttemptOutcome,
-        response: Option<broca_wal::record::AttemptEnvelope>,
+        outcome: broca_records::record::BillingAttemptOutcome,
+        response: Option<broca_records::record::AttemptEnvelope>,
     ) -> Result<(), ProviderError>;
 
     /// Warm usage is independent of model-step telemetry. A hook that cannot persist it must
     /// refuse settlement rather than silently discard the provider's billing evidence.
     async fn warm_finished(
         &self,
-        _id: broca_wal::record::AttemptId,
-        _envelope: broca_wal::record::AttemptEnvelope,
+        _id: broca_records::record::AttemptId,
+        _envelope: broca_records::record::AttemptEnvelope,
         _sent: Option<crate::WarmSent>,
         _warm_body_sha256: String,
     ) -> Result<(), ProviderError> {

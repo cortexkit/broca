@@ -33,7 +33,9 @@ use broca_protocol::{
 use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
 use broca_provider::policy::{CrossModelThinking, ReasoningPolicy};
 use broca_provider::wire::{FrozenRenderConfig, WireFamily};
-use broca_wal::{RunConfig, RunOrigin, SeedOriginKind, WalRecord};
+use broca_records::{
+    record::RunConfig, record::RunOrigin, record::SeedOriginKind, record::WalRecord,
+};
 use serde_json::Value;
 
 const PROVIDER: &str = "anthropic";

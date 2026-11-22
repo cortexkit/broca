@@ -8,7 +8,7 @@ use crate::compaction::{
 };
 use crate::compaction_provider::{lineage::MessageRef, notice::ViewReady, view::ViewRange};
 use broca_protocol::CallOptions;
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde_json::json;
 
 const LINEAGE: &str = "lineage-1";
@@ -89,7 +89,7 @@ fn indexed_render_keeps_interior_system_messages_and_episode_coordinates() {
     let mut state = after_setup();
     state.view = Some(AppliedView {
         view,
-        choice: broca_wal::CompactionViewChoice::Applied,
+        choice: broca_records::record::CompactionViewChoice::Applied,
     });
     let rendered = crate::compaction::model_options_indexed(&opts, &state, &[1]).unwrap();
     assert_eq!(rendered.prompt[0], prompt[1]);
@@ -131,7 +131,10 @@ fn a_recorded_view_that_does_not_assemble_is_an_error_not_a_fallback() {
     state.fold(&WalRecord::CompactionViewApplied {
         provider: "provider".into(),
         view_version: 2,
-        view: broca_wal::OpaqueJson::from_json_text(serde_json::to_string(&view).unwrap()).unwrap(),
+        view: broca_records::record::OpaqueJson::from_json_text(
+            serde_json::to_string(&view).unwrap(),
+        )
+        .unwrap(),
         choice: CompactionViewChoice::Applied,
     });
     let error = model_options(&CallOptions::new(prompt), &state).unwrap_err();
@@ -139,17 +142,17 @@ fn a_recorded_view_that_does_not_assemble_is_an_error_not_a_fallback() {
     assert!(matches!(error.problem, AssemblyProblem::Rejected(_)));
 }
 
-fn routed_selection(account_ref: &str) -> broca_wal::AuthSelection {
-    broca_wal::AuthSelection {
+fn routed_selection(account_ref: &str) -> broca_records::record::AuthSelection {
+    broca_records::record::AuthSelection {
         billing_vault_facts: None,
         credential_id: format!("vault-cred-{account_ref}"),
         account_ref: Some(account_ref.to_owned()),
         resolved_credential_id: Some(format!("vault-cred-{account_ref}")),
         vault_request: None,
-        account_decision: Some(broca_wal::AccountDecision {
+        account_decision: Some(broca_records::record::AccountDecision {
             conversation_key: None,
             conversation_key_source: None,
-            path: broca_wal::ACCOUNT_DECISION_ROUTED.to_owned(),
+            path: broca_records::record::ACCOUNT_DECISION_ROUTED.to_owned(),
             admission_id: Some("admission".into()),
             decision_id: Some("decision".into()),
             routed_ref: None,
@@ -158,17 +161,17 @@ fn routed_selection(account_ref: &str) -> broca_wal::AuthSelection {
     }
 }
 
-fn static_selection() -> broca_wal::AuthSelection {
-    broca_wal::AuthSelection {
+fn static_selection() -> broca_records::record::AuthSelection {
+    broca_records::record::AuthSelection {
         billing_vault_facts: None,
         credential_id: "oauth:anthropic".into(),
         account_ref: Some("static-acct".into()),
         resolved_credential_id: Some("vault-static".into()),
         vault_request: None,
-        account_decision: Some(broca_wal::AccountDecision {
+        account_decision: Some(broca_records::record::AccountDecision {
             conversation_key: None,
             conversation_key_source: None,
-            path: broca_wal::ACCOUNT_DECISION_SINGLE_CANDIDATE.to_owned(),
+            path: broca_records::record::ACCOUNT_DECISION_SINGLE_CANDIDATE.to_owned(),
             admission_id: Some("admission".into()),
             decision_id: None,
             routed_ref: None,

@@ -340,7 +340,7 @@ impl VaultAddressing {
     /// without one resolve their frozen key, never the current default method.
     pub fn vault_id_for_selection(
         &self,
-        selection: &broca_wal::AuthSelection,
+        selection: &broca_records::record::AuthSelection,
     ) -> Result<Option<String>, broca_core::RunError> {
         if let Some(id) = &selection.resolved_credential_id {
             return Ok(Some(id.clone()));
@@ -502,7 +502,7 @@ mod tests {
             addressing.vault_id_for(&key("apikey:openai")),
             Err(broca_core::RunError::CredentialsUnavailable)
         ));
-        let frozen: broca_wal::AuthSelection = serde_json::from_value(serde_json::json!({
+        let frozen: broca_records::record::AuthSelection = serde_json::from_value(serde_json::json!({
             "credential_id":"apikey:kimi-code-plan-global", "resolved_credential_id":"frozen-vault-id"
         })).unwrap();
         assert_eq!(
@@ -520,7 +520,7 @@ mod tests {
                 .as_deref(),
             Some("apikey:kimi-for-coding")
         );
-        let older: broca_wal::AuthSelection = serde_json::from_value(
+        let older: broca_records::record::AuthSelection = serde_json::from_value(
             serde_json::json!({"credential_id":"apikey:kimi-code-plan-global"}),
         )
         .unwrap();

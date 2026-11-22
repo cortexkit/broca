@@ -2,8 +2,8 @@
 //! record, without re-inserting facts for older runs.
 
 use super::*;
+use broca_core::billing::BillingRecord;
 use broca_core::{ExportError, ExportIndex};
-use broca_wal::FramedRecord;
 
 cipher_tests!(idle_open_recovery_never_reinserts_older_runs);
 
@@ -13,7 +13,7 @@ struct Inserts(Mutex<Vec<String>>);
 impl ExportIndex for Inserts {
     fn emit_run(
         &self,
-        _: &[FramedRecord],
+        _: &[BillingRecord],
         run: &RunId,
         _: &dyn broca_core::ChargeBasisResolver,
     ) -> Result<(), ExportError> {

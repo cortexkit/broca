@@ -8,7 +8,7 @@ pub(crate) fn response(
     session_class: Option<String>,
     started_at_ms: u64,
     storage: RunAdmissionStorage,
-    manifest: Option<&broca_wal::PlanManifest>,
+    manifest: Option<&broca_records::record::PlanManifest>,
     principal: Option<&broca_protocol::BindPrincipal>,
     scope: Option<&broca_protocol::SessionScope>,
 ) -> Result<RunAdmissionResponse, ServeError> {
@@ -17,7 +17,7 @@ pub(crate) fn response(
         .flat_map(|manifest| &manifest.fetches)
         .map(|fetch| {
             let declarations = match &fetch.outcome {
-                broca_wal::record::FetchOutcome::Answered {
+                broca_records::record::FetchOutcome::Answered {
                     declarations_frozen,
                     ..
                 } => declarations_frozen

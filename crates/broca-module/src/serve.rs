@@ -784,7 +784,9 @@ pub(crate) fn supported_rungs() -> cortexkit_role_llm_runner::baseline::Rungs {
 }
 
 /// The baseline of a session admitted with a fetch plan, read from its frozen manifest alone.
-pub(crate) fn planned_baseline(manifest: &broca_wal::PlanManifest) -> broca_wire::BaselineWire {
+pub(crate) fn planned_baseline(
+    manifest: &broca_records::record::PlanManifest,
+) -> broca_wire::BaselineWire {
     let facts = broca_fetch_plan::baseline_facts(manifest);
     let json =
         |value: serde_json::Result<serde_json::Value>| value.expect("a baseline item is JSON");
@@ -926,12 +928,12 @@ pub(crate) struct RunToolCallsPageContext<'a> {
 }
 
 pub(crate) fn run_tool_call_outcome(
-    outcome: broca_wal::record::DispatchOutcome,
+    outcome: broca_records::record::DispatchOutcome,
     has_intent: bool,
     reason: Option<&str>,
     is_error: bool,
 ) -> &'static str {
-    use broca_wal::record::DispatchOutcome;
+    use broca_records::record::DispatchOutcome;
     use cortexkit_role_llm_runner::tool_calls::outcomes;
 
     match outcome {
@@ -1390,7 +1392,7 @@ pub(crate) fn run_status_response_with_reader_policy(
                         .account_decision
                         .as_ref()
                         .filter(|decision| {
-                            decision.path == broca_wal::ACCOUNT_DECISION_AUTH_REQUIRED
+                            decision.path == broca_records::record::ACCOUNT_DECISION_AUTH_REQUIRED
                         })
                         .map(|_| "auth_required".to_owned()),
                     path: selection
@@ -1925,7 +1927,7 @@ pub trait ServeHandler: Send + Sync {
         session: &LineageKey,
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
-        _at: Option<broca_wal::record::RunCancelAt>,
+        _at: Option<broca_records::record::RunCancelAt>,
     ) -> Result<(), ServeError> {
         self.authorize_session_owner(session, principal, scope)
             .await
@@ -2115,7 +2117,7 @@ pub trait ServeHandler: Send + Sync {
     async fn frozen_manifest(
         &self,
         _session: &LineageKey,
-    ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, ServeError> {
+    ) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, ServeError> {
         Ok(None)
     }
 
@@ -2195,9 +2197,9 @@ pub trait ServeHandler: Send + Sync {
         &self,
         session: &LineageKey,
         run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
     ) -> Result<CancelResponse, ServeError> {
-        if at == broca_wal::record::RunCancelAt::Now {
+        if at == broca_records::record::RunCancelAt::Now {
             self.cancel(session, run_id).await
         } else {
             // Permanent: a serve implementation without the boundary runtime will not gain it
@@ -2215,7 +2217,7 @@ pub trait ServeHandler: Send + Sync {
         &self,
         session: &LineageKey,
         run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
     ) -> Result<CancelResponse, ServeError> {
@@ -2792,7 +2794,7 @@ impl ServeHandler for crate::LineageRegistry {
     async fn frozen_manifest(
         &self,
         session: &LineageKey,
-    ) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, ServeError> {
+    ) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, ServeError> {
         Ok(self
             .session_ownership_for_bind(session)
             .await
@@ -2832,7 +2834,7 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
-        at: Option<broca_wal::record::RunCancelAt>,
+        at: Option<broca_records::record::RunCancelAt>,
     ) -> Result<(), ServeError> {
         // Admission must not synchronize the writer: even a pending StepStarted would
         // otherwise become durable before an invalid cancellation point is rejected.
@@ -2844,7 +2846,7 @@ impl ServeHandler for crate::LineageRegistry {
             Err(ServeError::ScopeRefused(refusal)) => refusal,
             Err(error) => return Err(error),
         };
-        if at != Some(broca_wal::record::RunCancelAt::StepBoundary) {
+        if at != Some(broca_records::record::RunCancelAt::StepBoundary) {
             if let Some(broca_protocol::BindPrincipal::Reserved { module_id }) = principal {
                 if self.interrupt_cancel_granted(session, module_id).await? {
                     return Ok(());
@@ -4045,7 +4047,7 @@ impl ServeHandler for crate::LineageRegistry {
         session: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<CancelResponse, ServeError> {
-        self.cancel_at(session, run_id, broca_wal::record::RunCancelAt::Now)
+        self.cancel_at(session, run_id, broca_records::record::RunCancelAt::Now)
             .await
     }
 
@@ -4053,7 +4055,7 @@ impl ServeHandler for crate::LineageRegistry {
         &self,
         session: &LineageKey,
         run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
     ) -> Result<CancelResponse, ServeError> {
         use crate::actor::CancelOutcome;
         match self.route_cancel_at(session, run_id, at).await? {
@@ -4071,7 +4073,7 @@ impl ServeHandler for crate::LineageRegistry {
         &self,
         session: &LineageKey,
         run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
     ) -> Result<CancelResponse, ServeError> {
@@ -4294,14 +4296,14 @@ mod paused_auth_tests {
                     retries_used: 0,
                     error: None,
                     pause_reason: Some(reason),
-                    auth_selection: Some(broca_wal::AuthSelection {
+                    auth_selection: Some(broca_records::record::AuthSelection {
                         billing_vault_facts: None,
                         auth_method: None,
                         credential_id: "requested-key".into(),
                         resolved_credential_id: Some("resolved-key".into()),
                         account_ref: Some("7b66addd-0000-4000-8000-000000000001".into()),
                         vault_request: None,
-                        account_decision: Some(broca_wal::AccountDecision {
+                        account_decision: Some(broca_records::record::AccountDecision {
                             path: frozen.into(),
                             conversation_key: None,
                             conversation_key_source: None,

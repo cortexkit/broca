@@ -154,7 +154,7 @@ impl Provider for Limited {
     }
 }
 
-fn selection() -> broca_wal::AuthSelection {
+fn selection() -> broca_records::record::AuthSelection {
     serde_json::from_value(json!({"credential_id":"oauth:stub:work", "account_ref":"acct-a"}))
         .unwrap()
 }

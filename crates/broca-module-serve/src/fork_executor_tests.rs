@@ -64,7 +64,7 @@ fn fork_chosen(
 
 fn fork_job(root: &std::path::Path, url: &str) -> ForkCallJob {
     let req = drift_request(root);
-    let broca_wal::WalRecord::RunStarted { config, .. } =
+    let broca_records::record::WalRecord::RunStarted { config, .. } =
         run_started_with_user_text(&req.session, "head-run", "head")
     else {
         panic!()

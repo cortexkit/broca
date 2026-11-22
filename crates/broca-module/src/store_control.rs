@@ -473,7 +473,7 @@ impl StoreControl {
                             .detail
                             .as_ref()
                             .and_then(|detail| {
-                                serde_json::from_value::<broca_wal::NoDispatchReason>(
+                                serde_json::from_value::<broca_records::record::NoDispatchReason>(
                                     detail.clone().parse(),
                                 )
                                 .ok()
@@ -569,7 +569,7 @@ impl StoreControl {
             }
             Record::Retraction(retraction) => {
                 if let Some(failure) = &retraction.failure {
-                    let failure: broca_wal::QueuedAdmissionFailure =
+                    let failure: broca_records::record::QueuedAdmissionFailure =
                         serde_json::from_value(failure.clone())
                             .map_err(|e| format!("a queued send's admission failure: {e}"))?;
                     self.reset_run();
@@ -759,7 +759,10 @@ impl StoreControl {
                 .schema_pin
                 .as_ref()
                 .and_then(|pin| {
-                    serde_json::from_value::<broca_wal::DispatchSchemaPin>(pin.clone().parse()).ok()
+                    serde_json::from_value::<broca_records::record::DispatchSchemaPin>(
+                        pin.clone().parse(),
+                    )
+                    .ok()
                 })
                 .and_then(|pin| schema_pin_text(name, &pin)),
         };
@@ -1075,13 +1078,13 @@ fn calls_of(message: &Message) -> Vec<ToolCall> {
         .collect()
 }
 
-fn dispatch_outcome(outcome: CallOutcome) -> broca_wal::DispatchOutcome {
+fn dispatch_outcome(outcome: CallOutcome) -> broca_records::record::DispatchOutcome {
     match outcome {
         CallOutcome::Completed | CallOutcome::NotDispatched => {
-            broca_wal::DispatchOutcome::Completed
+            broca_records::record::DispatchOutcome::Completed
         }
-        CallOutcome::Unknown => broca_wal::DispatchOutcome::Unknown,
-        CallOutcome::Interrupted => broca_wal::DispatchOutcome::Interrupted,
-        CallOutcome::MaxSteps => broca_wal::DispatchOutcome::MaxSteps,
+        CallOutcome::Unknown => broca_records::record::DispatchOutcome::Unknown,
+        CallOutcome::Interrupted => broca_records::record::DispatchOutcome::Interrupted,
+        CallOutcome::MaxSteps => broca_records::record::DispatchOutcome::MaxSteps,
     }
 }

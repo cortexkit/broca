@@ -802,7 +802,7 @@ impl broca_core::run::AttemptHook for SingleSend {
         &self,
         _: broca_core::run::PhysicalSend,
         _: tokio_util::sync::CancellationToken,
-    ) -> std::result::Result<broca_wal::record::AttemptId, broca_protocol::ProviderError> {
+    ) -> std::result::Result<broca_records::record::AttemptId, broca_protocol::ProviderError> {
         let mut evidence = self.0.lock().unwrap();
         if evidence.permitted {
             return Err(hook_error("probe refuses a second physical send"));
@@ -810,15 +810,15 @@ impl broca_core::run::AttemptHook for SingleSend {
         let mut bytes = [0; 16];
         getrandom::fill(&mut bytes).map_err(|_| hook_error("probe receipt entropy unavailable"))?;
         evidence.permitted = true;
-        Ok(broca_wal::record::AttemptId::from_bytes(bytes))
+        Ok(broca_records::record::AttemptId::from_bytes(bytes))
     }
 
     async fn finished(
         &self,
-        _: broca_wal::record::AttemptId,
+        _: broca_records::record::AttemptId,
         attempt: broca_protocol::ModelAttempt,
-        _: broca_wal::record::BillingAttemptOutcome,
-        response: Option<broca_wal::record::AttemptEnvelope>,
+        _: broca_records::record::BillingAttemptOutcome,
+        response: Option<broca_records::record::AttemptEnvelope>,
     ) -> std::result::Result<(), broca_protocol::ProviderError> {
         let failed = attempt.outcome != broca_protocol::provider::AttemptOutcome::Complete;
         let mut evidence = self.0.lock().unwrap();

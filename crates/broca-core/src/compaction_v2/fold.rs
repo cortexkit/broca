@@ -1,70 +1,65 @@
-//! Durable v2 state is folded independently of the legacy replacement renderer.
+//! Rebuilding the compaction state from what the session stored: the views it accepted, the
+//! steps that applied them, and the markers its cuts wrote. The session store's own records
+//! name each of these; the host reads them in order and calls the function for each.
 
 use broca_protocol::BindIdentity;
-use broca_wal::WalRecord;
+use broca_records::record::StoredViewEdit;
 use cortexkit_role_compaction::view::AppliedView;
 
 use super::{state::State, storage};
 
-pub fn fold(state: &mut State, record: &WalRecord, session: &BindIdentity) -> Result<(), String> {
-    match record {
-        WalRecord::RunStarted { .. } => state.begin_run(),
-        WalRecord::StepStarted { step_id, .. } => state.start_step(step_id.0),
-        WalRecord::CompactionViewV2(view) => {
-            let received = storage::rebuild(
-                state.latest_received(),
-                view.version,
-                view.checksum.clone(),
-                &view.edits,
-                view.built_through.clone(),
-                view.new_signed.clone(),
-            )?;
-            state.restore_accepted(received)?;
-            state.restore_accepted_by(view.applied_by.clone());
-        }
-        WalRecord::CompactionViewAppliedV2 {
-            step_id,
-            version,
-            checksum,
-        } => {
-            state.restore_applied_at(*step_id, &AppliedView::new(*version, checksum))?;
-        }
-        WalRecord::CompactionMarker {
-            harness,
-            session: marker_session,
-            view_version,
-            ..
-        } => {
-            check_marker_identity(harness, marker_session, session)?;
-            state.restore_marker(*view_version);
-            state.marker = Some(Box::new(record.clone()));
-        }
-        _ => {}
-    }
+/// An accepted view, rebuilt from its stored edits against the view accepted before it, and
+/// the module that handed it over through `session.apply_view` (`None` for a view a run's step
+/// accepted).
+pub fn restore_view(
+    state: &mut State,
+    version: u64,
+    checksum: String,
+    edits: &[StoredViewEdit],
+    built_through: Option<String>,
+    new_signed: Option<String>,
+    applied_by: Option<String>,
+) -> Result<(), String> {
+    let received = storage::rebuild(
+        state.latest_received(),
+        version,
+        checksum,
+        edits,
+        built_through,
+        new_signed,
+    )?;
+    state.restore_accepted(received)?;
+    state.restore_accepted_by(applied_by);
     Ok(())
 }
 
-/// Check cached markers too: a checkpoint copied along with a fork must not
-/// authorize Setup or rendering under another session's address.
-pub fn validate_identity(state: &State, session: &BindIdentity) -> Result<(), String> {
-    match state.marker.as_deref() {
-        None => Ok(()),
-        Some(WalRecord::CompactionMarker {
-            harness,
-            session: marker_session,
-            ..
-        }) => check_marker_identity(harness, marker_session, session),
-        Some(_) => Err("compaction marker checkpoint contains a non-marker record".into()),
-    }
+/// A view a step applied: `version` and `checksum` name an accepted view.
+pub fn restore_applied(
+    state: &mut State,
+    step: u64,
+    version: u64,
+    checksum: &str,
+) -> Result<(), String> {
+    state.restore_applied_at(step, &AppliedView::new(version, checksum))
 }
 
-fn check_marker_identity(
+/// A marker a cut wrote, under view `view_version`. A marker names the session it was written
+/// for: one naming another session, as a log copied along with a fork does, must not authorize
+/// Setup or rendering under `session`'s address.
+pub fn restore_marker(
+    state: &mut State,
     harness: &str,
     marker_session: &str,
+    view_version: u64,
     session: &BindIdentity,
 ) -> Result<(), String> {
-    if harness == session.harness && marker_session == session.session {
-        return Ok(());
+    if harness != session.harness || marker_session != session.session {
+        return Err(format!(
+            "compaction marker session mismatch: marker names {harness}/{marker_session}, \
+             loaded as {}/{}",
+            session.harness, session.session
+        ));
     }
-    Err(format!("compaction marker session mismatch: marker names {harness}/{marker_session}, loaded as {}/{}", session.harness, session.session))
+    state.restore_marker(view_version);
+    Ok(())
 }

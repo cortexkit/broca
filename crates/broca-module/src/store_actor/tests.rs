@@ -192,7 +192,7 @@ impl broca_core::provider::Provider for Gated {
                         serde_json::from_value(serde_json::to_value(&attempt.outcome).unwrap())
                             .unwrap();
                     let complete = attempt.outcome == broca_protocol::AttemptOutcome::Complete;
-                    let envelope = broca_wal::record::AttemptEnvelope {
+                    let envelope = broca_records::record::AttemptEnvelope {
                         outcome,
                         sent_at_ms: attempt.sent_at_ms,
                         finished_at_ms: Some(attempt.ts_ms),
@@ -1217,7 +1217,7 @@ async fn a_boundary_cancel_is_durable_and_ends_the_run_at_its_boundary() {
     commands
         .send(LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::StepBoundary,
+            at: broca_records::record::RunCancelAt::StepBoundary,
             reply,
         })
         .unwrap();
@@ -1273,7 +1273,7 @@ async fn a_cancel_behind_a_send_lands_after_the_runs_start() {
     commands
         .send(LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::StepBoundary,
+            at: broca_records::record::RunCancelAt::StepBoundary,
             reply,
         })
         .unwrap();
@@ -1307,7 +1307,7 @@ async fn a_cancel_with_no_active_run_is_not_active() {
     commands
         .send(LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::Now,
+            at: broca_records::record::RunCancelAt::Now,
             reply,
         })
         .unwrap();
@@ -1873,7 +1873,7 @@ async fn a_running_run_with_a_cancel_pending_resumes_to_its_cancel_on_open() {
     commands
         .send(LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::StepBoundary,
+            at: broca_records::record::RunCancelAt::StepBoundary,
             reply,
         })
         .unwrap();
@@ -1987,10 +1987,13 @@ async fn a_send_left_queued_behind_an_ended_run_drains_on_open() {
 
 /// A fetch plan's manifest for these tests, with `plan` as the plan the caller sent: the tools
 /// `read` and `edit`, and a system text.
-pub(super) fn plan_manifest(identity: &str, plan: serde_json::Value) -> broca_wal::PlanManifest {
-    broca_wal::PlanManifest {
+pub(super) fn plan_manifest(
+    identity: &str,
+    plan: serde_json::Value,
+) -> broca_records::record::PlanManifest {
+    broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: identity.into(),
         composition_digest: "composition".into(),
         tools: Arc::new(
@@ -2022,7 +2025,7 @@ pub(super) async fn send_planned(
     run_id: &str,
     request: SubmissionRequest,
     identity: &str,
-    manifest: Option<broca_wal::PlanManifest>,
+    manifest: Option<broca_records::record::PlanManifest>,
 ) -> SendOutcome {
     let request = commands.caller.shape(run_id, &SendKey::Minted, request);
     let (reply, answer) = oneshot::channel();

@@ -5,6 +5,7 @@ pub mod features;
 pub mod floor;
 pub mod fs_ops;
 pub mod head_proof;
+pub mod move_fence;
 pub mod record;
 pub mod recovery;
 pub mod session_storage;

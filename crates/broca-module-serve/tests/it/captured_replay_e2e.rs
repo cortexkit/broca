@@ -902,7 +902,7 @@ async fn send_anthropic_turn(
     project_root: &Path,
     session: &str,
     variant: Option<&str>,
-) -> Result<broca_wal::RunConfig, String> {
+) -> Result<broca_records::record::RunConfig, String> {
     let identity = broca_protocol::BindIdentity::new(project_root, "variant-e2e", session);
     let conn = broca_subc::SubcConnection::connect(&daemon.connection_file)
         .await

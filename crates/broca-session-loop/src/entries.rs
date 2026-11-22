@@ -516,7 +516,7 @@ impl Tags {
     /// contract.
     pub fn for_session(
         contract: bool,
-        manifest: Option<&broca_wal::PlanManifest>,
+        manifest: Option<&broca_records::record::PlanManifest>,
         render_config: &serde_json::Value,
     ) -> Self {
         if contract {
@@ -534,7 +534,7 @@ impl Tags {
     /// or names a compaction item, and replies are cleaned when they render, except for a
     /// structured-output run's final text.
     pub fn for_run(
-        manifest: Option<&broca_wal::PlanManifest>,
+        manifest: Option<&broca_records::record::PlanManifest>,
         render_config: &serde_json::Value,
     ) -> Self {
         let render = manifest.is_some_and(|manifest| {
@@ -1234,7 +1234,7 @@ pub fn rich_ui(stamp: &broca_protocol::RichUiStamp) -> Option<RichUi> {
 /// as reads serve it: the encoded `tp1` or `tp2` pin for the tool `tool_name`
 /// ([`broca_core::projection::schema_pin_text`]).
 pub fn served_schema_pin(tool_name: &str, pin: &serde_json::Value) -> Option<String> {
-    let pin: broca_wal::DispatchSchemaPin = serde_json::from_value(pin.clone()).ok()?;
+    let pin: broca_records::record::DispatchSchemaPin = serde_json::from_value(pin.clone()).ok()?;
     broca_core::projection::schema_pin_text(tool_name, &pin)
 }
 
@@ -1999,15 +1999,15 @@ pub fn project(stored: &StoredEntry) -> Result<Entry, String> {
 
 /// The envelope in the `SendDelivered` record for a ride, or `None` for text delivered before
 /// envelopes existed.
-pub fn ride_metadata(delivered: &Delivered) -> Option<broca_wal::record::RideMetadata> {
+pub fn ride_metadata(delivered: &Delivered) -> Option<broca_records::record::RideMetadata> {
     let ride = delivered.ride.as_ref()?;
-    Some(broca_wal::record::RideMetadata {
+    Some(broca_records::record::RideMetadata {
         call_key: ride.call_key.clone(),
         send_id: delivered.send_id.clone().unwrap_or_default(),
         sender: ride.sender.clone(),
         forms: ride.forms.clone(),
         form: match ride.form {
-            RideForm::Append => broca_wal::record::RideForm::Append,
+            RideForm::Append => broca_records::record::RideForm::Append,
         },
         // The envelope keeps the agent the sending module spoke for.
         speaks_for: ride

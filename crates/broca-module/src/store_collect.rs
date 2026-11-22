@@ -20,11 +20,11 @@ use std::time::Duration;
 
 use broca_core::{LeaseError, LeaseStore};
 use broca_protocol::BindIdentity;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::{self, HeadError};
 use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::session::{self, SessionError};
-use broca_wal::StorageClass;
 use tokio_util::sync::CancellationToken;
 
 use crate::store_open::StoreSlot;

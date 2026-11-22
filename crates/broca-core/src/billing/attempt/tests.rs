@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use broca_protocol::{caller::RunFinishReason, request::ModelHandle, RunId, Usage};
-use broca_wal::{FramedRecord, WalRecord};
+use crate::billing::{BillingEvent, BillingRecord};
+use broca_protocol::{caller::RunFinishReason, request::ModelHandle, RunId, StepId, Usage};
 use serde_json::json;
 
 use super::{compute_attempt_facts, AttemptEvidence, AttemptFact};
@@ -56,18 +56,19 @@ fn segment_and_attempt_sums(
 
 /// A step tried twice, a step its model refused and its fallback answered, and a last try that
 /// got no answer before the run ended.
-fn refused_and_retried_run() -> (Vec<FramedRecord>, Vec<AttemptEvidence>) {
-    let refused: WalRecord = serde_json::from_value(json!({"type":"model_step_refused",
-        "step_id":2,"usage":{"input_tokens":30,"output_tokens":1},"discarded_blocks":1,
-        "ts_ms":150,"schedule":{"source":{"provider_module_id":"anthropic","model_id":"claude"},
-        "fallback":{"provider_module_id":"anthropic","model_id":"claude-fallback"},
-        "phase":{"kind":"fallback","remaining":10},"re_refusals":0}}))
-    .unwrap();
+fn refused_and_retried_run() -> (Vec<BillingRecord>, Vec<AttemptEvidence>) {
+    let refused = BillingEvent::StepRefused {
+        step_id: StepId(2),
+        ts_ms: Some(150),
+        usage: usage(30, 1),
+        served_model: None,
+        usage_iterations: None,
+    };
     let mut routed = step(80, 2, usage(20, 3), 0);
-    if let WalRecord::ModelStepFinished { fallback, .. } = &mut routed.record {
-        fallback.route = Some(broca_wal::StepRoute {
+    if let BillingEvent::StepFinished { fallback, .. } = &mut routed.event {
+        fallback.route = Some(broca_records::record::StepRoute {
             model: ModelHandle::new("anthropic", "claude-fallback"),
-            reason: broca_wal::StepRouteReason::Schedule,
+            reason: broca_records::record::StepRouteReason::Schedule,
         });
     }
     let records = vec![
@@ -77,12 +78,9 @@ fn refused_and_retried_run() -> (Vec<FramedRecord>, Vec<AttemptEvidence>) {
         routed,
         frame(
             100,
-            WalRecord::RunFinished {
-                interrupt_reason: None,
+            BillingEvent::RunFinished {
                 reason: RunFinishReason::Error,
                 ts_ms: Some(500),
-                usage: usage(60, 6),
-                error: None,
                 retries_used: 1,
             },
         ),
@@ -205,7 +203,7 @@ fn a_run_whose_usage_has_no_attempt_before_it_gets_no_attempt_facts() {
     let records = vec![
         started(10, "run", Some(100)),
         step(20, 1, usage(10, 2), 0),
-        terminal(30, Some(200), usage(10, 2)),
+        terminal(30, Some(200)),
     ];
     // The step's attempt was recorded after its end, so the usage has no attempt to go to.
     let attempts = vec![attempt(25, 1, 1, "complete", true)];
@@ -227,9 +225,9 @@ fn a_run_whose_usage_has_no_attempt_before_it_gets_no_attempt_facts() {
 
 /// A run on a pooled API key that resolved to one key of the pool, asking for the fast tier: one
 /// step served fast, one served at the standard tier, each with a cache write split by lifetime.
-fn pooled_fast_run() -> (Vec<FramedRecord>, Vec<AttemptEvidence>) {
+fn pooled_fast_run() -> (Vec<BillingRecord>, Vec<AttemptEvidence>) {
     let mut start = started(10, "pooled", Some(100));
-    if let WalRecord::RunStarted { config, .. } = &mut start.record {
+    if let BillingEvent::RunStarted { config, .. } = &mut start.event {
         config.frozen_render_config = json!({"service_tier": "fast"});
         let selection = config.auth_selection.as_mut().unwrap();
         selection.credential_id = "apikey:anthropic".into();
@@ -249,22 +247,17 @@ fn pooled_fast_run() -> (Vec<FramedRecord>, Vec<AttemptEvidence>) {
         (&mut fast, "priority", "fast"),
         (&mut standard, "standard", "standard"),
     ] {
-        if let WalRecord::ModelStepFinished {
+        if let BillingEvent::StepFinished {
             service_tier_used,
             speed_used,
             ..
-        } = &mut framed.record
+        } = &mut framed.event
         {
             *service_tier_used = Some(tier.into());
             *speed_used = Some(speed.into());
         }
     }
-    let records = vec![
-        start,
-        fast,
-        standard,
-        terminal(60, Some(300), usage(21, 700)),
-    ];
+    let records = vec![start, fast, standard, terminal(60, Some(300))];
     let mut attempts = vec![
         attempt(20, 1, 1, "complete", true),
         attempt(40, 2, 1, "complete", true),
@@ -278,16 +271,16 @@ fn pooled_fast_run() -> (Vec<FramedRecord>, Vec<AttemptEvidence>) {
 /// A ChatGPT-login run of two steps on `gpt-6.2-sol`. Before step 1's model ran, the provider
 /// removed two reasoning items whose earlier context had changed; step 2's response reported no
 /// change.
-fn reasoning_removed_run() -> (Vec<FramedRecord>, Vec<AttemptEvidence>) {
+fn reasoning_removed_run() -> (Vec<BillingRecord>, Vec<AttemptEvidence>) {
     let mut start = started(10, "reasoning", Some(100));
-    if let WalRecord::RunStarted { config, .. } = &mut start.record {
+    if let BillingEvent::RunStarted { config, .. } = &mut start.event {
         **config = crate::billing::tests::config("openai", "gpt-6.2-sol", Some("chatgpt:openai"));
     }
     let records = vec![
         start,
         step(20, 1, usage(40, 900), 0),
         step(40, 2, usage(30, 200), 0),
-        terminal(50, Some(300), usage(70, 1_100)),
+        terminal(50, Some(300)),
     ];
     let removed = |id: &str| broca_protocol::InputTransformation {
         kind: Some("reasoning".into()),
@@ -358,7 +351,7 @@ fn write_attempt_fact_samples_when_requested() {
     let unmatched = vec![
         started(10, "run", Some(100)),
         step(20, 1, usage(10, 2), 0),
-        terminal(30, Some(200), usage(10, 2)),
+        terminal(30, Some(200)),
     ];
     let cases = [
         (

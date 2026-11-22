@@ -40,7 +40,7 @@ async fn a_restarted_store_session_loads_hold_cap_evidence_before_admission() {
     assert_eq!(client.session_accepted_send_evidence(&bind, "acct-a"), AcceptedSendEvidence::NotLoaded);
     assert_eq!(client.session_last_accepted_at_ms(&bind, "acct-a"), None);
     let frozen = serde_json::json!({});
-    let config = broca_wal::RunConfig {
+    let config = broca_records::record::RunConfig {
         account_route: None, global_system: None, route_decision_id: None, served_provider: None, account_limit_pause: true,
         turn_directives_v1: None, render_tags: false, computed_tags: None,
         model: broca_protocol::request::ModelHandle { provider_module_id: "test".into(), model_id: "test".into() },

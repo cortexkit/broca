@@ -163,7 +163,7 @@ pub struct Script {
     /// Optional real tool transport for serve-path tests; ordinary scripts keep their fake plane.
     pub tool_plane: Mutex<Option<Arc<dyn broca_core::ToolPlane>>>,
     /// A synthetic tool's catalog schema and semantics pin; absent for legacy direct tools.
-    pub schema_pin: Mutex<Option<broca_wal::DispatchSchemaPin>>,
+    pub schema_pin: Mutex<Option<broca_records::record::DispatchSchemaPin>>,
     pub hold_stream: Mutex<bool>,
     pub stream_gate: Notify,
     /// Model steps, consumed in order across every run. An exhausted script answers text.
@@ -201,7 +201,7 @@ pub struct Script {
     pub compaction_wired: Mutex<bool>,
     /// When set, each run executes with this auth selection, so a fresh run freezes it into
     /// its `RunStarted` the way a run resolved through the vault does. Unset, runs freeze none.
-    pub auth_selection: Mutex<Option<broca_wal::AuthSelection>>,
+    pub auth_selection: Mutex<Option<broca_records::record::AuthSelection>>,
     /// What the rig's route reports about schema-constrained output, as a catalog row would.
     /// A run admitted with `structured_output` freezes the decision `decide` makes from this
     /// for an xAI OpenAI Chat route, the same decision a resolved provider freezes.
@@ -432,7 +432,7 @@ impl ToolPlane for ScriptedTools {
         ctx: &BatchCtx,
         id: &ToolCallId,
         tool: &str,
-    ) -> Option<broca_wal::DispatchSchemaPin> {
+    ) -> Option<broca_records::record::DispatchSchemaPin> {
         if let Some(real) = self.0.tool_plane.lock().unwrap().as_ref() {
             return real.dispatch_schema_pin(ctx, id, tool);
         }
@@ -1539,7 +1539,7 @@ impl Rig {
 
     /// The frozen config of each run the session started, in the order the runs started, read
     /// back from each run's start record and the setup parts it names.
-    pub async fn run_configs(&self) -> Vec<broca_wal::RunConfig> {
+    pub async fn run_configs(&self) -> Vec<broca_records::record::RunConfig> {
         self.run_configs_by_id()
             .await
             .into_iter()
@@ -1548,7 +1548,7 @@ impl Rig {
     }
 
     /// The frozen config of the run `run_id` started with.
-    pub async fn run_config_of(&self, run_id: &str) -> Option<broca_wal::RunConfig> {
+    pub async fn run_config_of(&self, run_id: &str) -> Option<broca_records::record::RunConfig> {
         self.run_configs_by_id()
             .await
             .into_iter()
@@ -1556,7 +1556,7 @@ impl Rig {
     }
 
     /// Each run's id and frozen config, in the order the runs started.
-    async fn run_configs_by_id(&self) -> Vec<(String, broca_wal::RunConfig)> {
+    async fn run_configs_by_id(&self) -> Vec<(String, broca_records::record::RunConfig)> {
         let runtime = self
             .registry
             .store_runtime()

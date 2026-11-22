@@ -862,7 +862,8 @@ async fn report_routed_terminal_error(
 ) -> Option<Option<ProviderError>> {
     let selection = selection.filter(|selection| {
         selection.account_decision.as_ref().is_some_and(|decision| {
-            decision.path == broca_wal::ACCOUNT_DECISION_ROUTED && decision.admission_id.is_some()
+            decision.path == broca_records::record::ACCOUNT_DECISION_ROUTED
+                && decision.admission_id.is_some()
         })
     })?;
     let summary = outcome.as_ref().ok()?;
@@ -903,7 +904,7 @@ fn wire_auth_status(err: &ProviderError) -> Option<u16> {
 
 struct PriorRunView {
     run_id: broca_protocol::RunId,
-    config: broca_wal::RunConfig,
+    config: broca_records::record::RunConfig,
     idle: bool,
     /// The run moved to another account at a quota wall: its config names the account it
     /// moved to. Only a run in the session store moves.
@@ -939,7 +940,7 @@ struct EpisodeHistory<'a> {
     /// The session's latest run, unless the job appends a new episode.
     prior_run: Option<PriorRunView>,
     /// The latest run's config, for an appended episode too.
-    last_config: Option<&'a broca_wal::RunConfig>,
+    last_config: Option<&'a broca_records::record::RunConfig>,
     /// The session's durable head: 0 when it holds nothing yet.
     head_seq: u64,
     /// Where a fresh Claude Code persona reads the session's earlier prompts from, when the
@@ -978,12 +979,8 @@ struct EpisodeAdmission {
 /// when the new input opens a prompt. A new user send opens one prompt, even if its input
 /// contains several messages.
 fn prompt_ordinal_after(req: &broca_core::RunRequest, count: u64) -> Result<u64, RunError> {
-    let admitted = u64::from(
-        broca_module_serve::claude_code_identity::human_prompt_ordinal(
-            std::iter::empty(),
-            &req.input,
-        ) > 0,
-    );
+    let admitted =
+        u64::from(broca_module_serve::claude_code_identity::human_prompts(&req.input) > 0);
     count
         .checked_add(admitted)
         .ok_or_else(|| RunError::Config("Claude Code prompt ordinal overflow".into()))
@@ -1107,7 +1104,7 @@ fn store_prior_config(
     run: &broca_session_store::fold::operations::Run,
     start: &broca_session_store::record::RunStart,
     parts: &dyn broca_session_loop::parts::Parts,
-) -> Result<broca_wal::RunConfig, broca_session_loop::LoopError> {
+) -> Result<broca_records::record::RunConfig, broca_session_loop::LoopError> {
     if run.finished.is_none() {
         broca_session_loop::run::run_config_of_run(run, parts)
     } else {
@@ -1517,7 +1514,7 @@ impl<'a> AccountMoves<'a> {
         wall: &broca_session_loop::account_move::Wall<'_>,
         offer: &cortexkit_role_routing::account_continue::ContinueOffer,
         decision: &broca_core::AccountDecision,
-    ) -> Result<broca_wal::RunConfig, String> {
+    ) -> Result<broca_records::record::RunConfig, String> {
         let mut config = wall.run_config.clone();
         config.auth_selection = Some(broca_core::AuthSelection {
             credential_id: offer.credential_id.clone(),
@@ -1757,16 +1754,16 @@ impl broca_session_loop::account_move::AccountContinue<Box<dyn broca_core::provi
 }
 
 fn frozen_render_config(
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
 ) -> Option<broca_catalog::live::FrozenRenderConfig> {
     serde_json::from_value(config.frozen_render_config.clone()).ok()
 }
 
-fn frozen_cache_policy(config: &broca_wal::RunConfig) -> Option<CachePolicy> {
+fn frozen_cache_policy(config: &broca_records::record::RunConfig) -> Option<CachePolicy> {
     frozen_render_config(config).and_then(|frozen| frozen.cache)
 }
 
-fn frozen_prompt_cache_key(config: &broca_wal::RunConfig) -> Option<String> {
+fn frozen_prompt_cache_key(config: &broca_records::record::RunConfig) -> Option<String> {
     frozen_render_config(config).and_then(|frozen| frozen.prompt_cache_key)
 }
 
@@ -1778,7 +1775,7 @@ fn frozen_prompt_cache_key(config: &broca_wal::RunConfig) -> Option<String> {
 fn inherited_cache(
     req: &broca_core::RunRequest,
     fresh_episode: bool,
-    last: Option<&broca_wal::RunConfig>,
+    last: Option<&broca_records::record::RunConfig>,
 ) -> Option<(Option<CachePolicy>, Option<String>)> {
     if !(req.inherit_frozen_cache && fresh_episode) {
         return None;
@@ -1849,7 +1846,7 @@ fn refreeze_persona(render_config: &mut serde_json::Value, persona: serde_json::
 }
 
 fn decode_recorded_render_config(
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
 ) -> Result<broca_provider::wire::FrozenRenderConfig, String> {
     serde_json::from_value(config.frozen_render_config.clone())
         .map_err(|error| format!("recorded provider render config cannot be decoded: {error}"))
@@ -4377,7 +4374,10 @@ impl RunExecutor for LiveLoopExecutor {
             .map(|_| ())
             .map_err(|error| format!("account_route: {error}"))
     }
-    fn cached_account_email(&self, selection: &broca_wal::AuthSelection) -> Option<String> {
+    fn cached_account_email(
+        &self,
+        selection: &broca_records::record::AuthSelection,
+    ) -> Option<String> {
         let vault = self.vault.as_ref()?;
         let id = vault.addressing.vault_id_for_selection(selection).ok()??;
         let (listing, _) = vault.listing.get()?;
@@ -4471,13 +4471,13 @@ impl RunExecutor for LiveLoopExecutor {
         Some(self.compaction_views.clone())
     }
 
-    fn warm_after_send_ms(&self, config: &broca_wal::RunConfig) -> Option<u64> {
+    fn warm_after_send_ms(&self, config: &broca_records::record::RunConfig) -> Option<u64> {
         broca_module_serve::cache_warm::warm_after_send_ms(config)
     }
 
     fn warm_costs(
         &self,
-        config: &broca_wal::RunConfig,
+        config: &broca_records::record::RunConfig,
         prefix_tokens: u64,
         ttl_ms: u64,
     ) -> Result<broca_core::keep_warm::WarmCosts, String> {
@@ -4486,7 +4486,7 @@ impl RunExecutor for LiveLoopExecutor {
 
     fn responses_warm_cost(
         &self,
-        config: &broca_wal::RunConfig,
+        config: &broca_records::record::RunConfig,
         usage: broca_protocol::Usage,
     ) -> Result<f64, String> {
         broca_module_serve::cache_warm::responses_warm_cost(config, usage)
@@ -4494,9 +4494,9 @@ impl RunExecutor for LiveLoopExecutor {
 
     fn failed_warm_cost(
         &self,
-        config: &broca_wal::RunConfig,
-        reservation: &broca_wal::record::AttemptReservation,
-        envelope: &broca_wal::record::AttemptEnvelope,
+        config: &broca_records::record::RunConfig,
+        reservation: &broca_records::record::AttemptReservation,
+        envelope: &broca_records::record::AttemptEnvelope,
         ttl_ms: Option<u64>,
     ) -> Result<f64, String> {
         broca_module_serve::cache_warm::failed_warm_cost(config, reservation, envelope, ttl_ms)
@@ -4504,7 +4504,7 @@ impl RunExecutor for LiveLoopExecutor {
 
     async fn warm_quota(
         &self,
-        config: &broca_wal::RunConfig,
+        config: &broca_records::record::RunConfig,
         headers: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), String> {
         let (method, _) = config

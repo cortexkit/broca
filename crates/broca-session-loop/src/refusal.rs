@@ -8,7 +8,7 @@ use broca_core::provider::Provider;
 use broca_core::refusal_fallback::{self, CommittedStep, StepRoute};
 use broca_protocol::content::{AssistantMessage, ContentBlock};
 use broca_protocol::request::ModelHandle;
-use broca_wal::{RefusalFallbackSchedule, StepRouteReason};
+use broca_records::{record::RefusalFallbackSchedule, record::StepRouteReason};
 
 use crate::run::LoopError;
 use crate::writer::Writer;
@@ -149,7 +149,7 @@ impl Route {
             )
         };
         Ok(Committed {
-            route: (self.route == StepRoute::Fallback).then(|| broca_wal::StepRoute {
+            route: (self.route == StepRoute::Fallback).then(|| broca_records::record::StepRoute {
                 model: fallback.clone(),
                 reason: self.reason,
             }),
@@ -163,7 +163,7 @@ impl Route {
 #[derive(Default)]
 pub(crate) struct Committed {
     /// The fallback model and why the step went there, on a fallback step.
-    pub route: Option<broca_wal::StepRoute>,
+    pub route: Option<broca_records::record::StepRoute>,
     /// The session's schedule after the step, while one exists.
     pub schedule: Option<RefusalFallbackSchedule>,
     pub after_tool_use: bool,

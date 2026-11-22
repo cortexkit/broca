@@ -10,10 +10,10 @@
 //! loaded from the vault. `session_storage.encryption` in `broca.jsonc` chooses the mode of the
 //! sessions created here.
 //!
-//! The session store is three complete stores, one per backup class (`broca_wal::StorageClass`):
+//! The session store is three complete stores, one per backup class (`broca_records::session_storage::StorageClass`):
 //! each root has its own heads, logs, objects and setup parts, and all share the deployment key.
 //! A session is created in the root its creating send's class places it in
-//! (`broca_wal::placement`), and from then on the root holding its head is where it is opened,
+//! (`broca_records::session_storage::placement`), and from then on the root holding its head is where it is opened,
 //! read and written. A head found in two roots is refused by name, never served from either.
 
 use std::collections::HashSet;
@@ -22,13 +22,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use broca_protocol::BindIdentity;
+use broca_records::session_storage::StorageClass;
 use broca_session_loop::durable::SetupParts;
 use broca_session_loop::parts::{DeploymentParts, SetupSource, SharedParts};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::session::{Position, Session, SessionError};
-use broca_wal::StorageClass;
 use tokio::sync::mpsc;
 
 use crate::executor::RunExecutor;
@@ -409,7 +409,7 @@ impl StoreRuntime {
                 .map_err(|error| open_error(SessionError::Head(error), false))?;
             Ok(Some(head))
         };
-        if broca_wal::migration::read_json::<broca_wal::migration::Moved>(
+        if broca_records::move_fence::read_json::<broca_records::move_fence::Moved>(
             &sidecar.with_extension("moved"),
         )
         .map_err(read)?
@@ -428,9 +428,9 @@ impl StoreRuntime {
             return Err(OpenError::SessionMoved { holder });
         }
         if write {
-            if let Some(freeze) = broca_wal::migration::read_json::<broca_wal::migration::Freeze>(
-                &sidecar.with_extension("moving"),
-            )
+            if let Some(freeze) = broca_records::move_fence::read_json::<
+                broca_records::move_fence::Freeze,
+            >(&sidecar.with_extension("moving"))
             .map_err(read)?
             {
                 return Err(OpenError::SessionMoving {
@@ -438,7 +438,7 @@ impl StoreRuntime {
                 });
             }
             if let Some(cut_id) =
-                broca_wal::migration::cut_fence(&self.state_root, &reference).map_err(read)?
+                broca_records::move_fence::cut_fence(&self.state_root, &reference).map_err(read)?
             {
                 return Err(OpenError::SessionMoving { cut_id });
             }
@@ -855,8 +855,10 @@ impl StoreRuntime {
             // session-store sessions by name don't know this one. So once a session lives here,
             // no build that would serve it from a WAL it doesn't have can be placed. The floor
             // is raised before the session's head exists.
-            broca_wal::raise_floor(
-                &self.state_root.join(broca_wal::FEATURE_FLOOR_FILENAME),
+            broca_records::floor::raise_floor(
+                &self
+                    .state_root
+                    .join(broca_records::floor::FEATURE_FLOOR_FILENAME),
                 &[broca_wal::SESSION_STORAGE_FEATURE],
             )
             .map_err(|error| {
@@ -1204,7 +1206,9 @@ pub fn key_unavailable(key_id: u16) -> OpenError {
 
 /// The refusal of a session whose head is in two of the session store's roots: damage, which an
 /// operator must look at, so it is permanent and never served from either root.
-fn session_in_two_classes(refusal: &broca_wal::SessionInTwoClasses) -> OpenError {
+fn session_in_two_classes(
+    refusal: &broca_records::session_storage::SessionInTwoClasses,
+) -> OpenError {
     OpenError::Classified {
         reason: refusal.to_string(),
         class: broca_protocol::ErrorClass::Permanent,
@@ -1220,13 +1224,19 @@ fn head_class(state_root: &Path, key: &BindIdentity) -> Result<Option<StorageCla
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     };
-    broca_wal::session_storage_class_by(state_root, &broca_core::session_addr(key), present)
-        .map_err(|error| match broca_wal::SessionInTwoClasses::of(&error) {
+    broca_records::session_storage::session_storage_class_by(
+        state_root,
+        &broca_core::session_addr(key),
+        present,
+    )
+    .map_err(
+        |error| match broca_records::session_storage::SessionInTwoClasses::of(&error) {
             Some(refusal) => session_in_two_classes(refusal),
             None => OpenError::Open(format!(
                 "the new storage's head of this session could not be checked: {error}"
             )),
-        })
+        },
+    )
 }
 
 /// How many times a read probes the session's position again after a writer moved its head

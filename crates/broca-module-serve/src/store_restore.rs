@@ -22,11 +22,11 @@ use broca_module::registry::LineageKey;
 use broca_module::store_open::StoreSlot;
 use broca_module::LineageRegistry;
 use broca_protocol::BindIdentity;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::codec::hex;
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::restore::{self, Finding, RestoreError, Restored};
-use broca_wal::StorageClass;
 use serde_json::{json, Value};
 
 /// What runs `session.restore_from_backup` for a daemon's new storage.
@@ -63,7 +63,10 @@ impl StoreRestore {
     ) -> Result<Vec<(StorageClass, SessionAddr)>, MoveRefusal> {
         if !all {
             let address = broca_core::session_addr(key);
-            return match broca_wal::session_storage_class(&self.state_root, &address) {
+            return match broca_records::session_storage::session_storage_class(
+                &self.state_root,
+                &address,
+            ) {
                 Ok(Some(class)) => Ok(vec![(class, SessionAddr(address))]),
                 Ok(None) => Err(MoveRefusal::new(
                     "not_in_new_storage",

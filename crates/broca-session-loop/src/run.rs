@@ -39,6 +39,7 @@ use broca_protocol::{
     BatchId, BindIdentity, FinishReason, GenerationConfig, RunId, StepId, ToolCallId, Usage,
 };
 use broca_protocol::{DeliveryMode, DeliveryOrder};
+use broca_records::record::{ComputedTagRules, FrozenProviderDeclarations, NoDispatchReason};
 use broca_session_store::codec::{Digest, Message as _};
 use broca_session_store::fold::operations::{CallState, Operations, Resolution};
 use broca_session_store::record::{
@@ -47,8 +48,6 @@ use broca_session_store::record::{
     SendEnded, SetupStub, StepEnd, StepStart, ToolHeld, ToolIntent, ToolOutcome, ToolReply,
 };
 use broca_session_store::session::SessionError;
-use broca_wal::ComputedTagRules;
-use broca_wal::NoDispatchReason;
 use futures::channel::oneshot;
 use futures::StreamExt as _;
 use serde_json::{json, Value};
@@ -116,10 +115,10 @@ pub struct Admission {
     pub written_at_ms: Option<u64>,
     /// The session's frozen plan manifest, for a session admitted with a fetch plan: the tools
     /// its providers answered with, its system text and the hooks it declares.
-    pub manifest: Option<std::sync::Arc<broca_wal::PlanManifest>>,
+    pub manifest: Option<std::sync::Arc<broca_records::record::PlanManifest>>,
     /// Transport-only differences from the plan, frozen on this run rather than in shared
     /// setup parts. A resume reads these without consulting the provider again.
-    pub transport: std::collections::BTreeMap<String, broca_wal::FrozenProviderDeclarations>,
+    pub transport: std::collections::BTreeMap<String, FrozenProviderDeclarations>,
     /// For a session on the current compaction contract, the system text every request renders
     /// above the conversation, which is never part of its transcript: the plan's system text for
     /// a planned run, otherwise the system messages the caller sent, or the previous run's when
@@ -144,7 +143,7 @@ pub struct Admission {
     /// off.
     pub keep_warm: Option<broca_protocol::request::KeepWarm>,
     /// The provider account the run was admitted to, frozen so a resume uses the same one.
-    pub auth_selection: Option<broca_wal::AuthSelection>,
+    pub auth_selection: Option<broca_records::record::AuthSelection>,
     /// Whether the run may pause on its own account when the provider says the account's limit
     /// is reached and resets soon, rather than end. Admission freezes this from the boot
     /// setting.
@@ -222,7 +221,7 @@ pub struct SendFacts {
     pub scope: Option<broca_protocol::SessionScope>,
     /// What the input hooks did to the run's input, as evidence: the input itself is already
     /// the hooks' final value.
-    pub hooks: Option<broca_wal::Hooks>,
+    pub hooks: Option<broca_records::record::Hooks>,
     /// The send's display marks, which the run's start records for its input.
     pub message_marks: Option<broca_protocol::MessageMarks>,
 }
@@ -275,7 +274,7 @@ pub struct Seams<'a, P, T> {
     pub max_same_account_wait: broca_core::SameAccountWait,
     /// The account routing gives the session now. A run paused on its account resumes only
     /// on the account it froze; `None` when the caller didn't route one.
-    pub auth_selection: Option<broca_wal::AuthSelection>,
+    pub auth_selection: Option<broca_records::record::AuthSelection>,
     /// Where the run publishes its in-flight model step while the provider call runs: the
     /// session's owner serves it as an active run's `step`. It is cleared when the step's call
     /// ends. Never a durability input.
@@ -303,7 +302,7 @@ impl<'a, P, T> Seams<'a, P, T> {
     fn moved_to<'b>(
         &'b self,
         provider: &'b P,
-        auth_selection: broca_wal::AuthSelection,
+        auth_selection: broca_records::record::AuthSelection,
     ) -> Seams<'b, P, T> {
         Seams {
             person_steers: self.person_steers.clone(),
@@ -364,14 +363,20 @@ pub trait AccountReports: Send + Sync {
         event_id: &str,
         seq: u64,
         attempt: &ModelAttempt,
-        _selection: Option<&broca_wal::AuthSelection>,
+        _selection: Option<&broca_records::record::AuthSelection>,
     ) {
         self.attempt_recorded(event_id, seq, attempt);
     }
     /// The run moved to the account `selection` names at a quota wall, and the record that
     /// says so, at `seq`, is durable. Reported once per move, before any attempt on that
     /// account. The default reports nothing.
-    fn account_moved(&self, _event_id: &str, _seq: u64, _selection: &broca_wal::AuthSelection) {}
+    fn account_moved(
+        &self,
+        _event_id: &str,
+        _seq: u64,
+        _selection: &broca_records::record::AuthSelection,
+    ) {
+    }
 }
 
 /// The id an account report names a record by: the session's id and the record's seq.
@@ -511,7 +516,7 @@ where
     // and the session's next run read them, so all of them render the same requests.
     let setup = store_setup(parts, &mut admission)?;
     let runner = broca_core::tags::rules_for(
-        Some(broca_wal::ComputedTagRules { checkpoint }),
+        Some(broca_records::record::ComputedTagRules { checkpoint }),
         frozen_render_tags(&admission),
         &admission.render_config,
     )
@@ -1376,7 +1381,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: Option<Value>) -> Result<Option
 /// provider's answer, the manifest's tools, its system text and its hook declarations. Returns
 /// what remains of the manifest, or `None` when nothing does.
 pub fn manifest_parts(
-    manifest: &broca_wal::PlanManifest,
+    manifest: &broca_records::record::PlanManifest,
     parts: &mut dyn Parts,
     setup: &mut Vec<broca_session_store::record::PartRef>,
 ) -> Result<Option<Value>, LoopError> {
@@ -1414,7 +1419,7 @@ pub fn manifest_parts(
 pub fn frozen_manifest(
     start: &broca_session_store::record::RunStart,
     parts: &dyn Parts,
-) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, LoopError> {
+) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, LoopError> {
     broca_session_store::fold::operations::ManifestRef::of_start(start)
         .map(|manifest| stored_manifest(&manifest, parts))
         .transpose()
@@ -1426,8 +1431,8 @@ pub fn frozen_manifest(
 pub fn stored_manifest(
     manifest: &broca_session_store::fold::operations::ManifestRef,
     parts: &dyn Parts,
-) -> Result<std::sync::Arc<broca_wal::PlanManifest>, LoopError> {
-    let rebuild = || -> Result<broca_wal::PlanManifest, String> {
+) -> Result<std::sync::Arc<broca_records::record::PlanManifest>, LoopError> {
+    let rebuild = || -> Result<broca_records::record::PlanManifest, String> {
         let mut members = match &manifest.rest {
             Some(Value::Object(rest)) => rest.clone(),
             _ => serde_json::Map::new(),
@@ -1460,7 +1465,7 @@ pub fn stored_manifest(
             }
         }
         members.insert("fetches".into(), Value::Array(fetches));
-        let mut rebuilt: broca_wal::PlanManifest =
+        let mut rebuilt: broca_records::record::PlanManifest =
             serde_json::from_value(Value::Object(members))
                 .map_err(|e| format!("the frozen manifest: {e}"))?;
         if let Some(tools) = tools {
@@ -1496,7 +1501,7 @@ fn manifest_key(manifest: &broca_session_store::fold::operations::ManifestRef) -
 /// manifest it references.
 fn manifest_system(
     reference: &broca_session_store::fold::operations::ManifestRef,
-    manifest: &broca_wal::PlanManifest,
+    manifest: &broca_records::record::PlanManifest,
     parts: &dyn Parts,
 ) -> Result<Arc<Vec<Message>>, LoopError> {
     let derive = || Ok(broca_core::compaction_v2::systems::from_manifest(manifest));
@@ -2453,7 +2458,7 @@ where
                                     Some(DeliveryMode::TurnSystem) => (
                                         "turn_system",
                                         Placement::DeliveredTurnSystem,
-                                        turn_system_input(send, &pending.submission_id, &run_id),
+                                        turn_system_input(send, &pending.submission_id),
                                     ),
                                     _ => continue,
                                 };
@@ -4127,7 +4132,7 @@ impl Served {
     /// The step end's `fallback` members: the facts the step records about the refusal fallback,
     /// in the `StepFallback` shape. `None` when there are none.
     fn members(&self, refusal: crate::refusal::Committed) -> Result<Option<Value>, LoopError> {
-        let fallback = broca_wal::StepFallback {
+        let fallback = broca_records::record::StepFallback {
             served_model: self.served_model.clone(),
             usage_iterations: self.usage_iterations.clone(),
             route: refusal.route,
@@ -4239,7 +4244,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     requested_ttl_ms: Option<u64>,
     account_limit_pause: bool,
     first_attempt: u32,
-    selection: Option<&broca_wal::AuthSelection>,
+    selection: Option<&broca_records::record::AuthSelection>,
     live_display: &mut bool,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
@@ -4468,7 +4473,7 @@ async fn record_attempt<W: Writer, P: Provider, T>(
     step_id: u64,
     mut attempt: broca_protocol::ModelAttempt,
     context: &AttemptContext,
-    selection: Option<&broca_wal::AuthSelection>,
+    selection: Option<&broca_records::record::AuthSelection>,
 ) -> Result<Option<Box<FailedAccountLimitAttempt>>, LoopError> {
     if let Some(warm) = &seams.keep_warm {
         warm.note_attempt(&attempt);
@@ -5122,7 +5127,7 @@ fn structured_of(
 pub(crate) fn run_selection<'a, P, T>(
     seams: &'a Seams<'_, P, T>,
     admission: &'a Admission,
-) -> Option<&'a broca_wal::AuthSelection> {
+) -> Option<&'a broca_records::record::AuthSelection> {
     seams
         .auth_selection
         .as_ref()
@@ -5147,7 +5152,7 @@ fn reserve_for<W: Writer>(
 /// The timed same-account pause the run's state holds, if it is paused on one.
 fn account_limit_of<W: Writer>(
     writer: &W,
-) -> Result<Option<broca_wal::AccountLimitPause>, LoopError> {
+) -> Result<Option<broca_records::record::AccountLimitPause>, LoopError> {
     run_state(writer)
         .account_limit_pause
         .clone()
@@ -5251,7 +5256,7 @@ fn account_limit_pause<P: Provider, T>(
     step_id: u64,
     limited: &FailedAccountLimitAttempt,
     error: &ProviderError,
-) -> Option<Box<broca_wal::AccountLimitPause>> {
+) -> Option<Box<broca_records::record::AccountLimitPause>> {
     let selection = run_selection(seams, admission);
     let last_accepted = limited
         .attempt
@@ -5726,22 +5731,16 @@ fn system_after_results<P: Provider>(provider: &P) -> bool {
     provider.turn_system_possible(Some(&Message::new(Role::Tool, Vec::new())), false)
 }
 
-/// The messages a `turn_system` delivery of `send` places: its text as turn-scoped system text,
-/// using `broca_core::delivery_order::system_delivered`.
-fn turn_system_input(send: &OrderedSend, submission_id: &str, run_id: &str) -> Vec<Message> {
-    let core = broca_core::delivery_order::OrderedSend {
+/// The messages a `turn_system` delivery of `send` places: its text as turn-scoped system text
+/// (`broca_core::delivery_order::system_messages`).
+fn turn_system_input(send: &OrderedSend, submission_id: &str) -> Vec<Message> {
+    broca_core::delivery_order::system_messages(&broca_core::delivery_order::OrderedSend {
         admitted_at_ms: send.written_at_ms,
         submission_id: broca_protocol::SubmissionId(submission_id.into()),
         order: send.order.clone(),
         principal: None,
         input: send.input.clone(),
-    };
-    match broca_core::delivery_order::system_delivered(&core, &RunId(run_id.into())) {
-        broca_wal::WalRecord::SendDelivered {
-            input: Some(input), ..
-        } => input.as_ref().clone(),
-        _ => unreachable!("a turn-scoped system delivery records the messages it places"),
-    }
+    })
 }
 
 /// The result a call gets when the run stopped before the call was dispatched.

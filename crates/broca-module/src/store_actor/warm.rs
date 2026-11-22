@@ -467,7 +467,7 @@ pub(crate) fn run_config(
     run: &broca_session_store::fold::operations::Run,
     start: &broca_session_store::record::RunStart,
     parts: &dyn broca_session_loop::parts::Parts,
-) -> Result<broca_wal::RunConfig, broca_session_loop::run::LoopError> {
+) -> Result<broca_records::record::RunConfig, broca_session_loop::run::LoopError> {
     let mut config = broca_session_loop::run::run_config_of_start(start, parts)?;
     // A refreeze before the run's first provider call renders and bills under what it froze.
     if let Some(refrozen) = &run.refrozen_render {

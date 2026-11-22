@@ -1,5 +1,5 @@
 use broca_protocol::{usage::GenerationUsage, StepId, Usage};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 
 #[derive(Debug, Clone)]
 pub(super) struct AttemptTiming {

@@ -183,7 +183,7 @@ pub struct StoreActor<B: SessionBackend> {
     retention_clock: Option<broca_core::clock::Clock>,
     /// The authoritative folder and the opener's backup selection rule. Without placement
     /// information an unlabelled session cannot safely adopt a class.
-    class_placement: Option<(broca_wal::StorageClass, Vec<String>)>,
+    class_placement: Option<(broca_records::session_storage::StorageClass, Vec<String>)>,
     /// Where an import stages the session it writes before publishing it over this one (see
     /// `store_import_stage`). Without it an import is refused.
     import_staging: Option<Arc<dyn crate::store_import_stage::ImportStaging<B>>>,
@@ -316,7 +316,7 @@ struct Start {
     scope: Option<broca_protocol::SessionScope>,
     /// The fetch plan's manifest the run starts under: the one the session's first run froze,
     /// or, for that first run, the one its send's plan fetched. Its start records it.
-    manifest: Option<Arc<broca_wal::PlanManifest>>,
+    manifest: Option<Arc<broca_records::record::PlanManifest>>,
     /// The session's label its start records: the one the session's first run froze, or, for
     /// that first run, the send's.
     session_class: Option<String>,
@@ -338,7 +338,7 @@ struct Prepared {
     /// the one its message keeps. `None` takes the time the run starts.
     at_ms: Option<u64>,
     /// What the input transforms did to the run's input, which its start records.
-    hooks: Option<Box<broca_wal::Hooks>>,
+    hooks: Option<Box<broca_records::record::Hooks>>,
     /// The error the run ends with before any model call, when a transform refused its input.
     pre_model_error: Option<broca_protocol::ProviderError>,
     /// The pending plan refresh the run applies by freezing its manifest, which its start's
@@ -354,7 +354,7 @@ struct Drained {
     /// When the queued send's message was accepted, which the message keeps.
     written_at_ms: Option<u64>,
     /// What the send's input transforms did when it was queued, as its record kept it.
-    hooks: Option<Box<broca_wal::Hooks>>,
+    hooks: Option<Box<broca_records::record::Hooks>>,
     /// Where the queued record stored the send's media, which the run's input points at.
     media: broca_session_loop::HeldInputMedia,
 }
@@ -543,7 +543,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// The session's latest run's frozen config, with the run's later refreezes folded in, or
     /// `None` before any run and when that run was seeded from an import, which froze nothing a
     /// caller chose.
-    fn latest_run_config(&self) -> Result<Option<broca_wal::RunConfig>, String> {
+    fn latest_run_config(&self) -> Result<Option<broca_records::record::RunConfig>, String> {
         let Some(run) = self.session.operations().run.as_ref() else {
             return Ok(None);
         };
@@ -2658,9 +2658,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     .class_placement
                     .as_ref()
                     .is_some_and(|(folder, backups)| {
-                        broca_wal::placement(
+                        broca_records::session_storage::placement(
                             first.is_some_and(|start| start.retention_secs.is_some()),
-                            broca_wal::selected_for_backup(Some(&label), backups),
+                            broca_records::session_storage::selected_for_backup(
+                                Some(&label),
+                                backups,
+                            ),
                         ) == *folder
                     })
                 {
@@ -2698,7 +2701,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// The fetch plan's manifest the session's first run froze, read back from the setup parts
     /// its start names; `None` for a session admitted without a plan, or with no run yet. Shared
     /// with every other holder of the same manifest.
-    fn frozen_manifest(&self) -> Result<Option<Arc<broca_wal::PlanManifest>>, String> {
+    fn frozen_manifest(&self) -> Result<Option<Arc<broca_records::record::PlanManifest>>, String> {
         let Some(first) = self.session.operations().owner.first_start.as_ref() else {
             return Ok(None);
         };
@@ -2919,7 +2922,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &mut self,
         input: Vec<broca_protocol::Message>,
         delivery: broca_protocol::Delivery,
-        manifest: Option<&broca_wal::PlanManifest>,
+        manifest: Option<&broca_records::record::PlanManifest>,
         scope: Option<&broca_protocol::SessionScope>,
         at_ms: Option<u64>,
         reply: &mut oneshot::Sender<SendOutcome>,
@@ -3620,7 +3623,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         run_id: &RunId,
         error: broca_core::RunError,
     ) -> Result<(), String> {
-        let failure = broca_wal::record::QueuedAdmissionFailure {
+        let failure = broca_records::record::QueuedAdmissionFailure {
             run_id: run_id.clone(),
             error: crate::serve::admission_refusal::queued_admission_error(error),
         };
@@ -3967,7 +3970,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &mut self,
         generation: u64,
         policy: String,
-        manifest: Box<broca_wal::PlanManifest>,
+        manifest: Box<broca_records::record::PlanManifest>,
         refetch: Vec<String>,
     ) -> crate::actor::SessionRefreshOutcome {
         use crate::actor::SessionRefreshOutcome;
@@ -4444,7 +4447,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     async fn cancel(
         &mut self,
         run_id: &RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
     ) -> CancelOutcome {
         if self.run.is_none() {
             let Some(run) = self.session.operations().run.as_ref().filter(|run| {
@@ -4457,8 +4460,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Err(error) => return CancelOutcome::Error(error),
             };
             let point = match at {
-                broca_wal::record::RunCancelAt::Now => CancelPoint::Now,
-                broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
+                broca_records::record::RunCancelAt::Now => CancelPoint::Now,
+                broca_records::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
             };
             if let Err(error) = self
                 .append_own(Record::CancelRequest(CancelRequest {
@@ -4480,8 +4483,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return CancelOutcome::Ack;
         }
         let point = match at {
-            broca_wal::record::RunCancelAt::Now => CancelPoint::Now,
-            broca_wal::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
+            broca_records::record::RunCancelAt::Now => CancelPoint::Now,
+            broca_records::record::RunCancelAt::StepBoundary => CancelPoint::StepBoundary,
         };
         // A stop the run already owes is acknowledged again without writing: one asked for now,
         // or one at the same point. Only a stop now after one at the step boundary moves it.

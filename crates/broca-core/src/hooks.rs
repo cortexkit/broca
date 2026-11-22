@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use broca_protocol::BindIdentity;
-use broca_wal::{HookOp, Hooks, PlanManifest};
+use broca_records::{record::HookOp, record::Hooks, record::PlanManifest};
 pub use cortexkit_role_step_transform_provider::{
     answer::HookAnswer,
     hook::{HookCall, Subject},
@@ -126,7 +126,7 @@ impl HookPlan {
         // Permissions come only from the catalog that owns the selected model tool.
         // An unused provider's same-named tool cannot widen another tool's permissions.
         for fetch in &manifest.fetches {
-            if let broca_wal::FetchOutcome::Answered {
+            if let broca_records::record::FetchOutcome::Answered {
                 result_ops: Some(permissions),
                 ..
             } = &fetch.outcome
@@ -260,7 +260,7 @@ pub struct ChainOutput {
     pub trace: Trace,
     pub refusal: Option<(String, String, bool)>,
     pub cancellation: Option<HookCancellation>,
-    pub ask: Option<broca_wal::DeferredAsk>,
+    pub ask: Option<broca_records::record::DeferredAsk>,
 }
 impl ChainOutput {
     fn fallback(&self, remaining: &[(&HookItem, &Subscription, &Declaration)]) -> Self {
@@ -538,16 +538,16 @@ mod permission_tests {
         let known = json!({"hook":"pre_user", "ops":["append"], "on_unavailable":"refuse", "budget_ms":500});
         let frozen = |planned: Value, declared: Value| {
             let mut manifest = manifest(json!({}));
-            manifest.plan = broca_wal::OpaqueJson::from_json_text(
+            manifest.plan = broca_records::record::OpaqueJson::from_json_text(
                 json!({"step_transform_items":[{
                     "provider":"transform", "subscriptions":[planned]
                 }]})
                 .to_string(),
             )
             .unwrap();
-            manifest.declarations = vec![broca_wal::FrozenDeclaration {
+            manifest.declarations = vec![broca_records::record::FrozenDeclaration {
                 provider: "transform".into(),
-                answer: broca_wal::OpaqueJson::from_json_text(
+                answer: broca_records::record::OpaqueJson::from_json_text(
                     json!({"subscriptions":[declared]}).to_string(),
                 )
                 .unwrap(),

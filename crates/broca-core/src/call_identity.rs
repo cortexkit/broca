@@ -1,6 +1,6 @@
 //! Per-occurrence durable call anchors, shared by reader and live projections.
 use broca_protocol::ToolCallId;
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 
 /// The calls of the current step, one slot per copy in the assistant message's order, each
 /// anchored by the records that answer it. A record matches the first fitting copy of its

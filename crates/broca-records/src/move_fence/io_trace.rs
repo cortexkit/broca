@@ -30,7 +30,7 @@ impl<'a> SyncFile<'a> {
         observe(self.event.clone())
     }
 }
-/// Only Unix syncs directories (see `migration::sync_dir`), so only Unix records the event.
+/// Only Unix syncs directories (see `move_fence::sync_dir`), so only Unix records the event.
 #[cfg(unix)]
 pub(crate) fn sync_dir(path: &std::path::Path) -> io::Result<()> {
     observe(Event::BeforeDirectorySync(path.to_owned()))?;

@@ -6643,9 +6643,10 @@ mod held_call_tests {
                 })
                 .collect();
             Ok(broca_fetch_plan::Admitted {
-                manifest: broca_wal::PlanManifest {
+                manifest: broca_records::record::PlanManifest {
                     rich_ui: None,
-                    plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                    plan: broca_records::record::OpaqueJson::from_json_text(plan.text.clone())
+                        .unwrap(),
                     plan_identity: plan.identity.clone(),
                     composition_digest: plan.composition_digest.clone(),
                     fetches: Vec::new(),

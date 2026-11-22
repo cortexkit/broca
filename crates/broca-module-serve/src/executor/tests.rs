@@ -67,7 +67,7 @@ fn an_inheriting_episode_takes_the_frozen_cache_policy_and_key() {
     frozen.cache = Some(policy.clone());
     frozen.prompt_cache_key = Some("frozen-key".into());
     let mut req = drift_request(std::path::Path::new("/inherit-cache"));
-    let config = broca_wal::RunConfig {
+    let config = broca_records::record::RunConfig {
         account_route: None,
         global_system: None,
         route_decision_id: None,
@@ -1323,11 +1323,12 @@ async fn terminal_backoff_reports_with_attempt_status(
         reports: Default::default(),
         supported: true,
     });
-    let decision: broca_wal::AccountDecision = serde_json::from_value(serde_json::json!({
-        "path": path,
-        "admission_id": "adm-transient",
-    }))
-    .unwrap();
+    let decision: broca_records::record::AccountDecision =
+        serde_json::from_value(serde_json::json!({
+            "path": path,
+            "admission_id": "adm-transient",
+        }))
+        .unwrap();
     // A run names its reports by its session and record position. Only an
     // account routing chose is reported to routing at all.
     let Some(reporter) = RunReporter::start_for_decision(

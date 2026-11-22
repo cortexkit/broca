@@ -604,7 +604,7 @@ async fn a_refused_resume_of_a_started_run_ends_it_before_the_next_run(temporary
         .route_cancel_at(
             &side.key,
             RunId("r1".into()),
-            broca_wal::record::RunCancelAt::StepBoundary,
+            broca_records::record::RunCancelAt::StepBoundary,
         )
         .await
         .expect("the cancel is routed");

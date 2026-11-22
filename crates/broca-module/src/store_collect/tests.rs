@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use broca_core::{FileLeaseStore, LeaseStore as _};
 use broca_protocol::BindIdentity;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::codec::{hex, Id128};
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::session::{Session, GRACE_MS};
-use broca_wal::StorageClass;
 use tokio_util::sync::CancellationToken;
 
 use super::{StoreCollectSweep, SweepPass};

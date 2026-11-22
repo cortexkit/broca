@@ -23,7 +23,7 @@ pub fn take_globals(input: &mut Vec<Message>) -> Vec<Message> {
     global
 }
 
-pub fn from_manifest(manifest: &broca_wal::PlanManifest) -> Vec<Message> {
+pub fn from_manifest(manifest: &broca_records::record::PlanManifest) -> Vec<Message> {
     if manifest.system_text.is_empty() {
         return Vec::new();
     }

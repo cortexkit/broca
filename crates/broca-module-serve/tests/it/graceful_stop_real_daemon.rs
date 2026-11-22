@@ -303,8 +303,11 @@ impl Rig {
             harness,
             session,
         );
-        broca_wal::session_storage_class(&self.state_root(), &broca_core::session_addr(&key))
-            .unwrap()?;
+        broca_records::session_storage::session_storage_class(
+            &self.state_root(),
+            &broca_core::session_addr(&key),
+        )
+        .unwrap()?;
         Some(super::stored_log::stored_records(&self.state_root(), &key).await)
     }
 

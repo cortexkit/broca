@@ -691,7 +691,9 @@ fn start_scope(records: &[Record]) -> Option<&serde_json::Value> {
 }
 
 /// The plan manifest a run froze at admission.
-fn manifest_of(admission: &broca_session_loop::run::Admission) -> &broca_wal::PlanManifest {
+fn manifest_of(
+    admission: &broca_session_loop::run::Admission,
+) -> &broca_records::record::PlanManifest {
     admission
         .manifest
         .as_deref()

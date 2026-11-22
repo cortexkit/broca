@@ -35,7 +35,7 @@ struct Continuation<'a> {
     recheck: bool,
 }
 
-fn selected(account: &str) -> broca_wal::AuthSelection {
+fn selected(account: &str) -> broca_records::record::AuthSelection {
     serde_json::from_value(serde_json::json!({"credential_id":format!("credential-{account}"),"account_ref":account,"auth_method":"oauth",
         "account_decision":{"path":"routed","admission_id":"r1","decision_id":format!("decision-{account}"),"conversation_key":"conversation"}})).unwrap()
 }
@@ -94,7 +94,7 @@ impl AccountContinue<Box<dyn Provider>> for Continuation<'_> {
             })),
         }
     }
-    fn adopted(&self, _: &broca_wal::AuthSelection) {}
+    fn adopted(&self, _: &broca_records::record::AuthSelection) {}
     fn recheck_sign_in(&self) -> bool {
         self.recheck
     }

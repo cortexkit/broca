@@ -20,7 +20,7 @@ pub async fn rebuild_store_from_sessions_with_progress(
     use broca_session_store::backend::LocalBackend;
     let inventory = || {
         let mut sessions = Vec::new();
-        for class in broca_wal::StorageClass::ALL {
+        for class in broca_records::session_storage::StorageClass::ALL {
             let backend = LocalBackend::new(class.store_root(state_root));
             for address in backend
                 .stored_sessions()

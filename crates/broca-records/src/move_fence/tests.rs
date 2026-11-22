@@ -297,7 +297,7 @@ fn real_process_kill_keeps_the_intent_and_tombstone_owned_after_restart() {
     use std::io::BufRead;
     let root = root("kill");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "migration::tests::crash_child", "--nocapture"])
+        .args(["--exact", "move_fence::tests::crash_child", "--nocapture"])
         .env("BROCA_MOVE_CRASH_ROOT", &root)
         .stdout(std::process::Stdio::piped())
         .spawn()

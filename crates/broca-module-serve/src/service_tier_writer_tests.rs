@@ -298,9 +298,9 @@ impl broca_fetch_plan::PlanAdmitter for HeadSelectionAdmitter {
         _: Option<&broca_protocol::SessionScope>,
     ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
         Ok(broca_fetch_plan::Admitted {
-            manifest: broca_wal::PlanManifest {
+            manifest: broca_records::record::PlanManifest {
                 rich_ui: None,
-                plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                plan: broca_records::record::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
                 plan_identity: plan.identity.clone(),
                 composition_digest: cortexkit_role_tool_provider::catalog::composition_digest(
                     &serde_json::json!({"providers":[],"step_transform_items":[]}),
@@ -817,7 +817,7 @@ fn service_tier_switch_off_pins_master_log_discovery_usage_and_request_bytes() {
         )
         .unwrap();
     assert!(req.request.service_tier_level.is_none());
-    let queued: broca_wal::WalRecord = serde_json::from_value(
+    let queued: broca_records::record::WalRecord = serde_json::from_value(
         serde_json::json!({"type":"queued","submission_id":"sub-off","request":req.request}),
     )
     .unwrap();
@@ -840,12 +840,12 @@ fn service_tier_switch_off_pins_master_log_discovery_usage_and_request_bytes() {
         "off-run",
         "hello",
     );
-    if let broca_wal::WalRecord::RunStarted { config, .. } = &mut started {
+    if let broca_records::record::WalRecord::RunStarted { config, .. } = &mut started {
         config.model = broca_protocol::ModelHandle::new("mock", "mock-model");
         config.frozen_render_config =
             serde_json::json!({"family_id":"openai_chat","service_tier":"priority"});
     }
-    let step: broca_wal::WalRecord = serde_json::from_value(serde_json::json!({"type":"model_step_finished","step_id":1,
+    let step: broca_records::record::WalRecord = serde_json::from_value(serde_json::json!({"type":"model_step_finished","step_id":1,
         "assistant_message":{"message_id":"off-assistant","content":[{"type":"text","text":"done"}]},
         "usage":{},"service_tier_used":"priority"})).unwrap();
     let mut projection = broca_core::RunUsageProjection::new(RunId("off-run".into()));
@@ -914,24 +914,24 @@ fn service_tier_billed_refusal_reports_and_anthropic_speed_vote_truthfully() {
         "tier-run",
         "hello",
     );
-    if let broca_wal::WalRecord::RunStarted { config, .. } = &mut started {
+    if let broca_records::record::WalRecord::RunStarted { config, .. } = &mut started {
         config.frozen_render_config =
             serde_json::json!({"family_id":"anthropic_messages","speed":"fast"});
     }
-    let attempt: broca_wal::WalRecord = serde_json::from_value(serde_json::json!({
+    let attempt: broca_records::record::WalRecord = serde_json::from_value(serde_json::json!({
         "type":"model_attempt_finished", "step_id":1, "attempt":0,
         "request_body_len":1,"request_body_sha256":"00","response_body_len":8,"response_body_sha256":"00",
         "outcome":"complete","ts_ms":1,
         "envelope":{"sent":true,"outcome":"complete","response_bytes":8,"service_tier_used":"priority","speed_used":"standard"}
     })).unwrap();
-    let refused: broca_wal::WalRecord = serde_json::from_value(serde_json::json!({
+    let refused: broca_records::record::WalRecord = serde_json::from_value(serde_json::json!({
         "type":"model_step_refused","step_id":1,"usage":{},"discarded_blocks":0,
         "schedule":{"source":{"provider_module_id":"anthropic","model_id":"claude-opus-4-8"},
             "fallback":{"provider_module_id":"anthropic","model_id":"test-fallback"},
             "phase":{"kind":"fallback","remaining":20},"re_refusals":1}
     }))
     .unwrap();
-    let completed: broca_wal::WalRecord = serde_json::from_value(serde_json::json!({
+    let completed: broca_records::record::WalRecord = serde_json::from_value(serde_json::json!({
         "type":"model_step_finished","step_id":1,"assistant_message":{"message_id":"answer","content":[]},
         "usage":{},"service_tier_used":"priority","speed_used":"fast"
     })).unwrap();

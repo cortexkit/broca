@@ -113,7 +113,7 @@ pub(crate) async fn build<B: SessionBackend>(
     Ok(reply)
 }
 
-fn system_items(manifest: &broca_wal::PlanManifest) -> Option<Vec<PlanViewSystemItem>> {
+fn system_items(manifest: &broca_records::record::PlanManifest) -> Option<Vec<PlanViewSystemItem>> {
     let checked = || -> Option<Vec<PlanViewSystemItem>> {
         if manifest.join_version != broca_fetch_plan::admit::JOIN_VERSION {
             return None;
@@ -140,7 +140,9 @@ fn system_items(manifest: &broca_wal::PlanManifest) -> Option<Vec<PlanViewSystem
                             return None;
                         }
                         match &fetch.outcome {
-                            broca_wal::FetchOutcome::Answered { text, .. } => text.as_deref(),
+                            broca_records::record::FetchOutcome::Answered { text, .. } => {
+                                text.as_deref()
+                            }
                             _ => None,
                         }
                     })

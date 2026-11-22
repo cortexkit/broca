@@ -400,7 +400,7 @@ async fn older_build_reads_the_captured_outage_output() {
     assert_eq!(message, "tool plane unavailable");
     // The same build reads the current `Unavailable` reason the batch path writes: the
     // new attribution fields decode away, the stable message survives.
-    let reason_json = serde_json::to_value(broca_wal::NoDispatchReason::Unavailable {
+    let reason_json = serde_json::to_value(broca_records::record::NoDispatchReason::Unavailable {
         detail: broca_protocol::TOOL_PLANE_UNAVAILABLE_MESSAGE.into(),
         module: Some("aft".into()),
         code: Some(OUTAGE_CODE.into()),

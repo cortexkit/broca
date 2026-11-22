@@ -4,7 +4,7 @@
 use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::request::SubmissionRequest;
 use broca_protocol::SessionScope;
-use broca_wal::PlanManifest;
+use broca_records::record::PlanManifest;
 
 /// Whether a send that names tools is refused because the session's creating send froze them.
 /// A retry under a recorded key is never refused here:
@@ -120,7 +120,7 @@ mod tests {
 
     use broca_protocol::content::{ContentBlock, Message, Role};
     use broca_protocol::request::{SubmissionRequest, Tool};
-    use broca_wal::{OpaqueJson, PlanManifest};
+    use broca_records::{record::OpaqueJson, record::PlanManifest};
     use serde_json::json;
 
     use super::{freeze_manifest, plan_compaction_version, require_confining_scope};

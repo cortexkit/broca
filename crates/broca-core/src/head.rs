@@ -1,7 +1,7 @@
 //! Small, replayable head facts, committed with the projection's exact WAL watermark.
 
 use broca_protocol::RunId;
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use cortexkit_role_llm_runner::{read::HeadModel, usage::SessionUsage};
 use serde::{Deserialize, Serialize};
 
@@ -75,7 +75,7 @@ impl HeadProjection {}
 /// The plan's senders as `session.head` reads them: each sender's grants without its templates,
 /// which only admission reads.
 pub fn head_senders(
-    manifest: &broca_wal::PlanManifest,
+    manifest: &broca_records::record::PlanManifest,
 ) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
     let mut senders = crate::admission::manifest_senders(manifest);
     for sender in &mut senders {
@@ -135,7 +135,7 @@ pub fn head_sender(
 
 /// Only admission interprets untrusted plan choices. Replay reads an already admitted manifest.
 pub fn manifest_selection(
-    manifest: &broca_wal::PlanManifest,
+    manifest: &broca_records::record::PlanManifest,
 ) -> Option<cortexkit_role_llm_runner::head_selection::PlanModel> {
     let plan: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text()).ok()?;
     serde_json::from_value(plan.get("model")?.clone()).ok()

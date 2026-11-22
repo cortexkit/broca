@@ -533,7 +533,7 @@ pub enum CutLockMode {
 type ToolRouteHealth = dyn Fn(&[LineageKey]) -> serde_json::Value + Send + Sync;
 
 /// What creates a session in the session store, which decides the class of root it is created in
-/// (`broca_wal::placement`).
+/// (`broca_records::session_storage::placement`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreCreation {
     /// A send: its session is durable when its `session_class` is one of `backup_classes`.
@@ -797,7 +797,7 @@ impl LineageRegistry {
         key: &LineageKey,
         run_id: broca_protocol::RunId,
     ) -> Result<crate::actor::CancelOutcome, OpenError> {
-        self.route_cancel_at(key, run_id, broca_wal::record::RunCancelAt::Now)
+        self.route_cancel_at(key, run_id, broca_records::record::RunCancelAt::Now)
             .await
     }
 
@@ -1304,7 +1304,7 @@ impl LineageRegistry {
     /// it.
     pub fn cache_declaration(
         &self,
-        config: &broca_wal::RunConfig,
+        config: &broca_records::record::RunConfig,
     ) -> Option<crate::cache::CacheDeclaration> {
         self.inner.cache.declare(config)
     }
@@ -1499,7 +1499,7 @@ impl LineageRegistry {
         key: &LineageKey,
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
     ) -> Result<Option<crate::actor::CancelAuthority>, crate::serve::ServeError> {
         self.check_authorization_expired(key).await?;
         match self.check_move(key, true) {
@@ -1543,7 +1543,7 @@ impl LineageRegistry {
         key: &LineageKey,
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::SendScope,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
     ) -> Result<crate::actor::CancelAuthority, crate::serve::ServeError> {
         use crate::{actor::CancelAuthority, serve::ServeError};
         if let Some(authority) = self
@@ -1559,7 +1559,7 @@ impl LineageRegistry {
                 Err(refusal) => refusal,
             };
         if let (
-            broca_wal::record::RunCancelAt::Now,
+            broca_records::record::RunCancelAt::Now,
             Some(broca_protocol::BindPrincipal::Reserved { module_id }),
         ) = (at, principal)
         {
@@ -2114,7 +2114,7 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
         run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
     ) -> Result<crate::actor::CancelOutcome, OpenError> {
         self.route_cancel_inner(key, run_id, at, None).await
     }
@@ -2123,7 +2123,7 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
         run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
         principal: Option<broca_protocol::BindPrincipal>,
         scope: broca_protocol::SendScope,
     ) -> Result<crate::actor::CancelOutcome, OpenError> {
@@ -2135,7 +2135,7 @@ impl LineageRegistry {
         &self,
         key: &LineageKey,
         run_id: broca_protocol::RunId,
-        at: broca_wal::record::RunCancelAt,
+        at: broca_records::record::RunCancelAt,
         caller: Option<(
             Option<broca_protocol::BindPrincipal>,
             broca_protocol::SendScope,
@@ -2333,7 +2333,7 @@ impl LineageRegistry {
         key: &LineageKey,
         generation: u64,
         policy: String,
-        manifest: Box<broca_wal::PlanManifest>,
+        manifest: Box<broca_records::record::PlanManifest>,
         refetch: Vec<String>,
     ) -> Result<crate::actor::SessionRefreshOutcome, OpenError> {
         use crate::actor::{LineageCmd, SessionRefreshOutcome};
@@ -2890,7 +2890,7 @@ impl RegistryHandle {
     /// What `config` declares about its prompt cache; `None` without an installed declarer.
     pub(crate) fn cache_declaration(
         &self,
-        config: &broca_wal::RunConfig,
+        config: &broca_records::record::RunConfig,
     ) -> Option<crate::cache::CacheDeclaration> {
         self.inner.cache.declare(config)
     }

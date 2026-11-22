@@ -3,7 +3,8 @@ use std::sync::Mutex;
 
 use broca_core::{media_request::SessionMedia, media_store::MediaBytes};
 use broca_protocol::{CallOptions, ErrorClass, ProviderError};
-use broca_wal::{FramedRecord, WalRecord};
+use broca_records::record::WalRecord;
+use broca_wal::FramedRecord;
 
 use super::{prepare, AgingEvent, MediaAging};
 use crate::{media_profile::MediaProfile, wire::FrozenRenderConfig};

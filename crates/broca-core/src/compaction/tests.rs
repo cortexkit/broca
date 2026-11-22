@@ -15,7 +15,7 @@ pub(super) fn setup_record(ceiling: Option<&str>) -> WalRecord {
         compaction_id: "c".into(),
         version: 1,
         range: CompactionRange { from: 0, to: 0 },
-        sha256: broca_wal::compaction_replacement_sha256(&replacement).unwrap(),
+        sha256: broca_records::record::compaction_replacement_sha256(&replacement).unwrap(),
         replacement: Arc::new(replacement),
         request_id: None,
         cursor: None,

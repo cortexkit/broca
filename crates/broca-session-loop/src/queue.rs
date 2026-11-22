@@ -36,7 +36,7 @@ pub struct Receipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<Box<broca_wal::Hooks>>,
+    pub hooks: Option<Box<broca_records::record::Hooks>>,
 }
 
 /// Where a queued send sits in time and how it asked to be delivered.
@@ -150,7 +150,7 @@ pub struct SteerReceipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<broca_protocol::Delivery>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<Box<broca_wal::Hooks>>,
+    pub hooks: Option<Box<broca_records::record::Hooks>>,
 }
 
 /// The record of a steer into a running run: its messages, accepted at `written_at_ms`, with the

@@ -15,7 +15,7 @@ use broca_provider::{
     spec::WireFamilyId,
     wire::{FrozenRenderConfig, WireFamily},
 };
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde_json::{json, Value};
 
 use crate::renderer_version_reproduction::openai_chat_v4_call_options;

@@ -97,10 +97,10 @@ async fn normalize_evidence_stream(
     (trace, events)
 }
 
-fn take_evidence_envelope(trace: &mut AttemptTrace) -> broca_wal::record::AttemptEnvelope {
+fn take_evidence_envelope(trace: &mut AttemptTrace) -> broca_records::record::AttemptEnvelope {
     let raw = std::mem::take(&mut *trace.response_evidence.as_ref().unwrap().lock().unwrap());
     let mut envelope = response_envelope(raw, trace.vendor_request_id.take());
-    envelope.outcome = broca_wal::record::BillingAttemptOutcome::Complete;
+    envelope.outcome = broca_records::record::BillingAttemptOutcome::Complete;
     envelope
 }
 
@@ -148,7 +148,7 @@ async fn synthetic_response_evidence_family_usage_goldens_preserve_legacy_events
             envelope.reasoning_included_in_output,
             vector["normalized"].get("reasoning_tokens").map(|_| true)
         );
-        serde_json::from_value::<broca_wal::record::AttemptEnvelope>(
+        serde_json::from_value::<broca_records::record::AttemptEnvelope>(
             serde_json::to_value(&envelope).unwrap(),
         )
         .unwrap();
@@ -312,7 +312,7 @@ async fn synthetic_anthropic_response_evidence_merges_ttl_split_and_unknown_keys
     assert_eq!(raw["new_detail"], json!({"a":false,"b":["kept"]}));
     assert_eq!(raw["cache_creation"], start["cache_creation"]);
     assert_eq!(envelope.reasoning_included_in_output, Some(true));
-    serde_json::from_value::<broca_wal::record::AttemptEnvelope>(
+    serde_json::from_value::<broca_records::record::AttemptEnvelope>(
         serde_json::to_value(envelope).unwrap(),
     )
     .unwrap();
@@ -341,7 +341,7 @@ async fn synthetic_anthropic_response_evidence_coalesces_models_without_top_leve
     assert_eq!(models[0].cache_write_1h_tokens, Some(3));
     assert_eq!(models[1].usage.reasoning_tokens, Some(2));
     assert_eq!(envelope.usage_raw.as_ref(), Some(&raw));
-    serde_json::from_value::<broca_wal::record::AttemptEnvelope>(
+    serde_json::from_value::<broca_records::record::AttemptEnvelope>(
         serde_json::to_value(envelope).unwrap(),
     )
     .unwrap();

@@ -442,7 +442,7 @@ mod tests {
         let body = crate::registry::wire_family(frozen.family_id)
             .unwrap()
             .render(&frozen, &opts);
-        let config = broca_wal::RunConfig {
+        let config = broca_records::record::RunConfig {
             account_route: None,
             global_system: None,
             route_decision_id: None,

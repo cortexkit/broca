@@ -51,7 +51,9 @@ pub fn check_plan(plan: &Map<String, Value>, supported: bool) -> Result<(), Serv
     })
 }
 
-fn plan(manifest: Option<&broca_wal::PlanManifest>) -> Result<Map<String, Value>, ServeError> {
+fn plan(
+    manifest: Option<&broca_records::record::PlanManifest>,
+) -> Result<Map<String, Value>, ServeError> {
     manifest.map_or_else(
         || Ok(Map::new()),
         |manifest| {

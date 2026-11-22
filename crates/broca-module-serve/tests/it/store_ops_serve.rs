@@ -260,9 +260,9 @@ fn compacting_plan() -> SendPlan {
     let plan = json!({"compaction_item": {"provider": PROVIDER, "preset": "default"}});
     SendPlan {
         identity: "plan-1".into(),
-        manifest: Some(Arc::new(broca_wal::PlanManifest {
+        manifest: Some(Arc::new(broca_records::record::PlanManifest {
             rich_ui: None,
-            plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+            plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
             plan_identity: "plan-1".into(),
             composition_digest: "composition".into(),
             tools: Arc::new(Vec::new()),
@@ -543,9 +543,12 @@ impl Rig {
 
     fn assert_store_only(&self) {
         assert!(
-            broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key))
-                .unwrap()
-                .is_some(),
+            broca_records::session_storage::session_storage_class(
+                &self.dir,
+                &broca_core::session_addr(&self.key)
+            )
+            .unwrap()
+            .is_some(),
             "the session's head is in the new storage"
         );
     }
@@ -950,7 +953,7 @@ fn inspection_plan(label: &str) -> SendPlan {
     let composition_digest =
         cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap();
     manifest.composition_digest = composition_digest.clone();
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
         json!({
         "compaction_item":{"provider":PROVIDER,"preset":"default","params":{}},
         "system_text_items":[{"provider":"synthetic-persona","params":{}}],

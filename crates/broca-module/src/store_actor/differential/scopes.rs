@@ -11,7 +11,7 @@ use broca_protocol::{
     BindPrincipal, BindScope, Delivery, DeliveryOrder, NormalizedEvent, RunId, SendScope,
     SessionScope, SubmissionRequest,
 };
-use broca_wal::record::RunCancelAt;
+use broca_records::record::RunCancelAt;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
@@ -469,9 +469,9 @@ async fn an_ordered_send_starting_its_run_records_its_scope_alike() {
 /// A plan whose senders grant `occipital` the right to interrupt, giving the session one tool.
 fn granting_plan() -> SendPlan {
     let plan = json!({"senders": [{"module": "occipital", "interrupt": true}]});
-    let manifest = broca_wal::PlanManifest {
+    let manifest = broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: "plan-1".into(),
         composition_digest: "composition".into(),
         tools: Arc::new(vec![serde_json::from_value(json!({

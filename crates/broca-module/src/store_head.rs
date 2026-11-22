@@ -444,7 +444,7 @@ pub(crate) fn head_failed(error: StoreHeadError) -> crate::serve::ServeError {
 fn frozen_manifest(
     start: &RunStart,
     parts: &dyn Parts,
-) -> Result<Option<std::sync::Arc<broca_wal::PlanManifest>>, StoreHeadError> {
+) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, StoreHeadError> {
     broca_session_loop::run::frozen_manifest(start, parts)
         .map_err(|error| StoreHeadError::Setup(format!("run {}: {error:?}", start.run_id)))
 }

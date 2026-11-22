@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use broca_fetch_plan::session_change::{self, PendingState};
-use broca_wal::PlanManifest;
+use broca_records::record::PlanManifest;
 
 use crate::serve::SessionChangeError;
 
@@ -418,7 +418,7 @@ pub(crate) fn with_newer_stamp(
     current: Option<Arc<PlanManifest>>,
     pending: Option<&PendingState>,
 ) -> Option<Arc<PlanManifest>> {
-    use broca_wal::FetchOutcome;
+    use broca_records::record::FetchOutcome;
     let (Some(effective), Some(pending)) = (current.as_ref(), pending) else {
         return current;
     };
@@ -611,9 +611,10 @@ mod tests {
     fn a_refresh_changing_the_compaction_item_or_an_unsupported_rung_is_refused() {
         let facts = facts();
         let mut compacting = manifest("plan-3", &["a"], "text");
-        compacting.plan =
-            broca_wal::OpaqueJson::from_json_text(r#"{"compaction_item":{"provider":"p"}}"#)
-                .unwrap();
+        compacting.plan = broca_records::record::OpaqueJson::from_json_text(
+            r#"{"compaction_item":{"provider":"p"}}"#,
+        )
+        .unwrap();
         assert!(matches!(
             accept_refresh(&facts, 3, "immediately", &compacting, &[], false),
             RefreshAcceptance::Refused(SessionChangeError::InvalidParams { field, .. })
@@ -851,7 +852,8 @@ mod tests {
         let mut plan: serde_json::Value =
             serde_json::from_str(manifest.plan.as_json_text()).unwrap();
         plan["compaction_item"] = item.unwrap_or(serde_json::Value::Null);
-        manifest.plan = broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap();
+        manifest.plan =
+            broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap();
         manifest
     }
 

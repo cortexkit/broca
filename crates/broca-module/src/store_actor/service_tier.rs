@@ -18,7 +18,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     pub(super) fn admit_service_tier(
         &self,
         request: &mut SubmissionRequest,
-        manifest: Option<&broca_wal::PlanManifest>,
+        manifest: Option<&broca_records::record::PlanManifest>,
     ) -> Result<(), SendOutcome> {
         use cortexkit_role_llm_runner::{head_selection, service_tier::ServiceTier};
         let operations = self.session.operations();

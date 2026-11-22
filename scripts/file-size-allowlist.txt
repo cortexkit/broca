@@ -1,8 +1,8 @@
 # Hand-written Rust files over the 5,000-line limit, as `<lines> <path> <reason>`: the size
 # each had when the limit began, which it may not grow past. scripts/check-file-sizes.sh reads
 # this file. Lower or drop an entry when its file shrinks.
-13590 crates/broca-provider/src/transport.rs provider HTTP and socket transport; split retry, socket and stream
+13586 crates/broca-provider/src/transport.rs provider HTTP and socket transport; split retry, socket and stream
 10718 crates/broca-module-serve/src/serve.rs every route's handler; split by operation family
-    6554 crates/broca-session-loop/src/run.rs the run loop; split into model step, tool batch and between-step work (compaction views, messages sent into a running run)
+    6553 crates/broca-session-loop/src/run.rs the run loop; split into model step, tool batch and between-step work (compaction views, messages sent into a running run)
 6220 crates/broca-wire/src/lib.rs wire types of every op; split by op family
 6073 crates/broca-catalog/src/runtime.rs catalog resolution; split poller, cache and resolution

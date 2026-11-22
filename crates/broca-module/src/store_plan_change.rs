@@ -216,7 +216,7 @@ pub struct BaselineFacts {
         Option<broca_protocol::BindPrincipal>,
     ),
     /// The first run's frozen config, whose prompt-cache declaration the reply carries.
-    pub first_config: broca_wal::RunConfig,
+    pub first_config: broca_records::record::RunConfig,
     /// The reply's baseline, without its cache declaration.
     pub baseline: broca_wire::BaselineWire,
 }
@@ -302,7 +302,7 @@ async fn latest<B: SessionBackend>(
 fn stored(
     manifest: &ManifestRef,
     parts: &dyn Parts,
-) -> Result<Arc<broca_wal::PlanManifest>, String> {
+) -> Result<Arc<broca_records::record::PlanManifest>, String> {
     broca_session_loop::run::stored_manifest(manifest, parts)
         .map_err(|error| format!("a plan manifest the session froze: {error:?}"))
 }

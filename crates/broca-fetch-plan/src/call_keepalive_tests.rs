@@ -6,8 +6,8 @@ mod call_keepalive {
         let historical =
             include_str!("../../broca-wal/tests/fixtures/plan_manifest_pre_declarations.json")
                 .trim_end();
-        let record: broca_wal::WalRecord = serde_json::from_str(historical).unwrap();
-        let broca_wal::WalRecord::RunStarted {
+        let record: broca_records::record::WalRecord = serde_json::from_str(historical).unwrap();
+        let broca_records::record::WalRecord::RunStarted {
             manifest: Some(ref manifest),
             ..
         } = record

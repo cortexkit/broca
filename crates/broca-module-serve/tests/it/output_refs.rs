@@ -955,7 +955,7 @@ async fn an_opted_in_call_scans_only_its_declared_slots() {
         .manifest
         .as_ref()
         .expect("the plan froze a manifest");
-    let broca_wal::FetchOutcome::Answered {
+    let broca_records::record::FetchOutcome::Answered {
         reference_slots: Some(slots),
         ..
     } = &manifest.fetches[0].outcome

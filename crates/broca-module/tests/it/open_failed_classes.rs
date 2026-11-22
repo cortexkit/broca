@@ -79,7 +79,7 @@ async fn default_refusals_carry_their_retry_class() {
                     .cancel_at(
                         &session,
                         run(),
-                        broca_wal::record::RunCancelAt::StepBoundary,
+                        broca_records::record::RunCancelAt::StepBoundary,
                     )
                     .await,
             ),

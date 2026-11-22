@@ -49,7 +49,7 @@ pub struct ToolManifest {
         HashMap<String, HashMap<String, cortexkit_role_tool_provider::catalog::Reply>>,
     /// Per-tool result formats and session capabilities frozen for this run. A resume uses
     /// the run's recorded override, or its plan when the run recorded none.
-    provider_declarations: HashMap<String, broca_wal::FrozenProviderDeclarations>,
+    provider_declarations: HashMap<String, broca_records::record::FrozenProviderDeclarations>,
     /// The providers whose catalog the plan fetch answered at admission. Each was fetched over
     /// a route declaring `tool-provider: v1`, so its dispatch route declares the same role.
     fetched_providers: HashSet<String>,
@@ -91,7 +91,7 @@ impl ToolManifest {
     /// Use only the plan frozen in the WAL manifest, not a later send or configuration.
     pub fn with_plan_manifest(
         mut self,
-        manifest: &broca_wal::PlanManifest,
+        manifest: &broca_records::record::PlanManifest,
     ) -> Result<Self, serde_json::Error> {
         let plan: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text())?;
         self.compaction_provider = plan["compaction_item"]["provider"]
@@ -114,10 +114,13 @@ impl ToolManifest {
             }
         }
         for fetch in &manifest.fetches {
-            if matches!(fetch.outcome, broca_wal::FetchOutcome::Answered { .. }) {
+            if matches!(
+                fetch.outcome,
+                broca_records::record::FetchOutcome::Answered { .. }
+            ) {
                 self.fetched_providers.insert(fetch.provider.clone());
             }
-            if let broca_wal::FetchOutcome::Answered {
+            if let broca_records::record::FetchOutcome::Answered {
                 declarations_frozen: Some(declarations),
                 ..
             } = &fetch.outcome
@@ -129,7 +132,7 @@ impl ToolManifest {
             }
         }
         for fetch in &manifest.fetches {
-            if let broca_wal::FetchOutcome::Answered {
+            if let broca_records::record::FetchOutcome::Answered {
                 reply: Some(replies),
                 ..
             } = &fetch.outcome
@@ -152,7 +155,10 @@ impl ToolManifest {
     /// Apply a run's recorded transport facts without changing schema pins or request inputs.
     pub fn with_run_transport(
         mut self,
-        transport: &std::collections::BTreeMap<String, broca_wal::FrozenProviderDeclarations>,
+        transport: &std::collections::BTreeMap<
+            String,
+            broca_records::record::FrozenProviderDeclarations,
+        >,
     ) -> Self {
         for (provider, facts) in transport {
             if !self.fetched_providers.contains(provider) {
@@ -175,7 +181,7 @@ impl ToolManifest {
     pub fn provider_declarations(
         &self,
         provider: &str,
-    ) -> Option<&broca_wal::FrozenProviderDeclarations> {
+    ) -> Option<&broca_records::record::FrozenProviderDeclarations> {
         self.provider_declarations.get(provider)
     }
 
@@ -253,7 +259,7 @@ impl ToolManifest {
 
 /// Runtime deadline arithmetic uses the role's types; durable bytes use the WAL's types.
 fn reply_from_frozen(
-    saved: &broca_wal::FrozenReply,
+    saved: &broca_records::record::FrozenReply,
 ) -> cortexkit_role_tool_provider::catalog::Reply {
     let reply = cortexkit_role_tool_provider::catalog::Reply::new(saved.max_ms);
     match &saved.hold_argument {
@@ -295,7 +301,7 @@ mod tests {
     #[test]
     fn frozen_reply_is_scoped_to_selected_owner_and_tool() {
         let selected = json!({"name":"read", "description":"", "input_schema":{}, "module":"selected", "execution_mode":"parallel"});
-        let frozen: broca_wal::PlanManifest = serde_json::from_value(json!({
+        let frozen: broca_records::record::PlanManifest = serde_json::from_value(json!({
             "plan":"{}", "plan_identity":"", "composition_digest":"", "fetches":[
                 {"provider":"selected", "catalog_digest":"", "tools":[selected], "reply":{"read":{"max_ms":180000}, "unselected":{"max_ms":900000}}},
                 {"provider":"other", "catalog_digest":"", "tools":[], "reply":{"read":{"max_ms":900000}}}

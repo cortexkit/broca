@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_protocol::request::{ExecutionMode, Tool};
-use broca_wal::{
-    FetchOutcome, FrozenDeclaration, FrozenProviderDeclarations, FrozenResultFormat, OpaqueJson,
-    PlanManifest, ProviderFetch,
+use broca_records::{
+    record::FetchOutcome, record::FrozenDeclaration, record::FrozenProviderDeclarations,
+    record::FrozenResultFormat, record::OpaqueJson, record::PlanManifest, record::ProviderFetch,
 };
 use cortexkit_role_llm_runner::baseline::{AbsentItem, BaselineItem};
 use cortexkit_role_step_transform_provider::subscription::{
@@ -875,7 +875,7 @@ fn decode_answer(value: Value, text_asked: bool) -> Result<Fetched, FetchMiss> {
 /// recomputing schema identities locally, just as they do for an admitted session.
 pub struct ToolCatalog {
     pub tools: Vec<Tool>,
-    pub schema_pins: BTreeMap<String, broca_wal::DispatchSchemaPin>,
+    pub schema_pins: BTreeMap<String, broca_records::record::DispatchSchemaPin>,
 }
 
 /// Decode standalone tool discovery with the same validation and mappings as plan admission.
@@ -954,7 +954,7 @@ fn frozen_reference_slots(
     plan: &Plan,
     provider: &str,
     fetched: &Fetched,
-) -> Option<BTreeMap<String, Vec<broca_wal::FrozenReferenceSlot>>> {
+) -> Option<BTreeMap<String, Vec<broca_records::record::FrozenReferenceSlot>>> {
     plan.tool_items
         .iter()
         .find(|item| item.provider == provider)
@@ -969,7 +969,7 @@ fn frozen_reference_slots(
                 tool.name.clone(),
                 tool.reference_slots
                     .iter()
-                    .map(|slot| broca_wal::FrozenReferenceSlot {
+                    .map(|slot| broca_records::record::FrozenReferenceSlot {
                         name: slot.name.clone(),
                         kind: slot.kind.clone(),
                     })
@@ -994,17 +994,18 @@ fn session_tool(provider: &str, tool: &cortexkit_role_tool_provider::catalog::Ca
 }
 
 /// Copy validated catalog fields into the WAL's independently owned storage shape.
-fn freeze_reply(reply: &cortexkit_role_tool_provider::catalog::Reply) -> broca_wal::FrozenReply {
-    broca_wal::FrozenReply {
+fn freeze_reply(
+    reply: &cortexkit_role_tool_provider::catalog::Reply,
+) -> broca_records::record::FrozenReply {
+    broca_records::record::FrozenReply {
         max_ms: reply.max_ms,
-        hold_argument: reply
-            .hold_argument
-            .as_ref()
-            .map(|hold| broca_wal::FrozenHoldArgument {
+        hold_argument: reply.hold_argument.as_ref().map(|hold| {
+            broca_records::record::FrozenHoldArgument {
                 name: hold.name.clone(),
                 default_ms: hold.default_ms,
                 grace_ms: hold.grace_ms,
-            }),
+            }
+        }),
     }
 }
 
@@ -1057,7 +1058,7 @@ fn frozen_provider_declarations(
                 .map(|tool| {
                     (
                         tool.name.clone(),
-                        broca_wal::DispatchSchemaPin {
+                        broca_records::record::DispatchSchemaPin {
                             schema_digest: tool.schema_digest.clone(),
                             semantics: tool.semantics,
                             major: tool.version.map(|version| version.major),
@@ -2221,7 +2222,7 @@ mod tests {
             serde_json::to_value(pin).unwrap(),
             json!({"schema_digest": digest, "semantics": 7, "major": 3})
         );
-        let round_trip: broca_wal::DispatchSchemaPin =
+        let round_trip: broca_records::record::DispatchSchemaPin =
             serde_json::from_value(serde_json::to_value(pin).unwrap()).unwrap();
         assert_eq!(&round_trip, pin);
     }
@@ -2287,7 +2288,8 @@ mod tests {
                 assert_eq!(admitted.manifest.system_text, text);
                 fetcher.answer["system_text"]["text"] = json!("later catalog text");
                 let stored = serde_json::to_vec(&admitted.manifest).unwrap();
-                let restored: broca_wal::PlanManifest = serde_json::from_slice(&stored).unwrap();
+                let restored: broca_records::record::PlanManifest =
+                    serde_json::from_slice(&stored).unwrap();
                 assert_eq!(restored.system_text, text);
                 assert_eq!(requests.len(), 1);
             }

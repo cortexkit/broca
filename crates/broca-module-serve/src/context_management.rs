@@ -84,7 +84,7 @@ pub enum PriorContextManagement<'a> {
 impl<'a> PriorContextManagement<'a> {
     /// Classify the last episode's frozen config. An import seed is not an admission: the
     /// session's first harness episode after it is the one that binds.
-    pub fn from_last_config(config: Option<&'a broca_wal::RunConfig>) -> Self {
+    pub fn from_last_config(config: Option<&'a broca_records::record::RunConfig>) -> Self {
         match config {
             None => Self::FirstAdmission,
             Some(config) if is_import_seed(config) => Self::FirstAdmission,
@@ -99,7 +99,7 @@ impl<'a> PriorContextManagement<'a> {
 /// Whether `config` is the placeholder `session.import` writes for an imported history: model
 /// `import/import` with a string `import_request_digest` option, the same test broca-core's
 /// loop applies. Such a seed never ran a provider, so it chose no context management.
-fn is_import_seed(config: &broca_wal::RunConfig) -> bool {
+fn is_import_seed(config: &broca_records::record::RunConfig) -> bool {
     config.model.provider_module_id == "import"
         && config.model.model_id == "import"
         && config
@@ -218,7 +218,7 @@ impl ContextManagementConfig {
         &self,
         fresh_episode: bool,
         requested: Option<&ContextManagement>,
-        last_config: Option<&broca_wal::RunConfig>,
+        last_config: Option<&broca_records::record::RunConfig>,
         project_root: &str,
     ) -> Result<ContextManagement, RunError> {
         if fresh_episode {
@@ -532,8 +532,10 @@ mod tests {
         assert_eq!(config, ContextManagementConfig::default());
     }
 
-    fn episode_config(context_management: Option<ContextManagement>) -> broca_wal::RunConfig {
-        broca_wal::RunConfig {
+    fn episode_config(
+        context_management: Option<ContextManagement>,
+    ) -> broca_records::record::RunConfig {
+        broca_records::record::RunConfig {
             account_route: None,
             global_system: None,
             route_decision_id: None,
@@ -609,7 +611,7 @@ mod tests {
 
     #[test]
     fn an_import_seed_is_not_a_binding_admission() {
-        let mut config = broca_wal::RunConfig {
+        let mut config = broca_records::record::RunConfig {
             account_route: None,
             global_system: None,
             route_decision_id: None,

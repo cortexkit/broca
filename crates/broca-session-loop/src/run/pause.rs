@@ -200,7 +200,7 @@ pub(super) async fn pause<W: Writer, P, T>(
     run_id: &str,
     reason: PauseReason,
     error: Option<ProviderError>,
-    account_limit: Option<Box<broca_wal::AccountLimitPause>>,
+    account_limit: Option<Box<broca_records::record::AccountLimitPause>>,
     held: Option<&BatchCtx>,
 ) -> Result<Finished, LoopError> {
     let error = error

@@ -48,6 +48,7 @@ use broca_protocol::{
     AttemptOutcome, CallOptions, CredentialRefresh, GenerationConfig, ModelAttempt,
     NormalizedEvent, ProviderControl, StepId, ToolChoice,
 };
+use broca_records::record::{AttemptEnvelope, AttemptId, BillingAttemptOutcome};
 use bytes::Bytes;
 use futures::StreamExt;
 use rand::Rng;
@@ -553,7 +554,7 @@ struct AttemptTrace {
     response_evidence: Option<crate::normalize::SharedResponseEvidence>,
     vendor_request_id: Option<String>,
     auth_refreshed: bool,
-    attempt_id: Option<broca_wal::record::AttemptId>,
+    attempt_id: Option<AttemptId>,
     attempt_ordinal: u32,
     send_index: u32,
     attempt_cancel: Option<CancellationToken>,
@@ -651,7 +652,7 @@ impl AttemptTrace {
         &mut self,
         digest: &RequestDigest,
         outcome: AttemptOutcome,
-        billing_outcome: Option<broca_wal::record::BillingAttemptOutcome>,
+        billing_outcome: Option<BillingAttemptOutcome>,
     ) -> Result<(), ProviderError> {
         if let (Some(hook), Some(id)) = (&self.attempt_hook, self.attempt_id.take()) {
             let billing_outcome = billing_outcome.unwrap_or_else(|| {
@@ -1890,7 +1891,7 @@ async fn send_warm_journaled(
 ) -> Result<broca_core::WarmSent, broca_core::WarmFailure> {
     let classification = family.into();
     let family = classification.family;
-    use broca_wal::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome as Outcome};
+    use broca_records::record::{AttemptEnvelope, AttemptSent, BillingAttemptOutcome as Outcome};
     let warm_body_sha256 = lower_hex(&Sha256::digest(&request.body));
     let anthropic_api_host = request_gzip::is_anthropic_api_host(&request.url);
     let identity = Bytes::from(request.body);
@@ -2114,7 +2115,7 @@ async fn send_warm_journaled(
 fn warm_billing_usage(
     body: &[u8],
     family: crate::spec::WireFamilyId,
-    envelope: &mut broca_wal::record::AttemptEnvelope,
+    envelope: &mut AttemptEnvelope,
 ) {
     let value = serde_json::from_slice::<Value>(body).ok().or_else(|| {
         std::str::from_utf8(body)
@@ -2161,7 +2162,7 @@ fn warm_billing_usage(
                 .and_then(Value::as_str)
                 .map(crate::families::openai_responses::map_response_status)
         });
-    *envelope = broca_wal::record::AttemptEnvelope {
+    *envelope = AttemptEnvelope {
         sent: envelope.sent,
         sent_at_ms: envelope.sent_at_ms,
         finished_at_ms: envelope.finished_at_ms,
@@ -2176,7 +2177,7 @@ fn warm_billing_usage(
 async fn read_warm_body(
     response: reqwest::Response,
     failed: &impl Fn(String) -> broca_core::WarmFailure,
-    envelope: &mut broca_wal::record::AttemptEnvelope,
+    envelope: &mut AttemptEnvelope,
     observer: Option<&dyn crate::quota::QuotaObserver>,
 ) -> Result<Vec<u8>, broca_core::WarmFailure> {
     let mut quota_sse = crate::quota::SseTap::new(observer);
@@ -2184,13 +2185,13 @@ async fn read_warm_body(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            envelope.outcome = broca_wal::record::BillingAttemptOutcome::ChunkError;
+            envelope.outcome = BillingAttemptOutcome::ChunkError;
             failed(format!("warm answer unreadable: {error}"))
         })?;
         envelope.response_bytes += chunk.len() as u64;
         let received_at = quota_sse.as_ref().map(|_| now_millis());
         if body.len() + chunk.len() > MAX_WARM_RESPONSE_BYTES {
-            envelope.outcome = broca_wal::record::BillingAttemptOutcome::ByteLimit;
+            envelope.outcome = BillingAttemptOutcome::ByteLimit;
             return Err(failed("warm answer exceeded its size limit".into()));
         }
         body.extend_from_slice(&chunk);
@@ -4244,7 +4245,7 @@ async fn drive_http_attempt(
                     .settle_send(
                         &RequestDigest::of(&request.body),
                         AttemptOutcome::HttpError,
-                        Some(broca_wal::record::BillingAttemptOutcome::CompressionRefused),
+                        Some(BillingAttemptOutcome::CompressionRefused),
                     )
                     .await
                     .map_err(|error| {
@@ -4598,8 +4599,8 @@ fn observe_response_finish(
 fn response_envelope(
     evidence: crate::normalize::ResponseEvidence,
     vendor_request_id: Option<String>,
-) -> broca_wal::record::AttemptEnvelope {
-    use broca_wal::record::{AttemptEnvelope, AttemptModelUsage};
+) -> AttemptEnvelope {
+    use broca_records::record::{AttemptEnvelope, AttemptModelUsage};
     fn model_row<'a>(
         models: &'a mut Vec<AttemptModelUsage>,
         model: &str,
@@ -6532,6 +6533,7 @@ mod classifier_captures;
 
 #[cfg(test)]
 mod tests {
+    use broca_records::record::{AttemptEnvelope, AttemptId, BillingAttemptOutcome};
     use std::{
         path::PathBuf,
         sync::{
@@ -7227,15 +7229,9 @@ mod tests {
 
     pub(super) struct TestAttemptHook {
         pub(super) order: Arc<Mutex<Vec<&'static str>>>,
-        pub(super) sends: Mutex<Vec<(broca_wal::record::AttemptId, broca_core::run::PhysicalSend)>>,
-        pub(super) finished: Mutex<
-            Vec<(
-                broca_wal::record::AttemptId,
-                ModelAttempt,
-                broca_wal::record::BillingAttemptOutcome,
-            )>,
-        >,
-        pub(super) responses: Mutex<Vec<Option<broca_wal::record::AttemptEnvelope>>>,
+        pub(super) sends: Mutex<Vec<(AttemptId, broca_core::run::PhysicalSend)>>,
+        pub(super) finished: Mutex<Vec<(AttemptId, ModelAttempt, BillingAttemptOutcome)>>,
+        pub(super) responses: Mutex<Vec<Option<AttemptEnvelope>>>,
         pub(super) deny: bool,
     }
 
@@ -7257,7 +7253,7 @@ mod tests {
             &self,
             send: broca_core::run::PhysicalSend,
             _cancel: CancellationToken,
-        ) -> Result<broca_wal::record::AttemptId, ProviderError> {
+        ) -> Result<AttemptId, ProviderError> {
             assert!(
                 send.warm.is_none(),
                 "model-step sends must not carry warm policy"
@@ -7275,10 +7271,10 @@ mod tests {
         }
         async fn finished(
             &self,
-            id: broca_wal::record::AttemptId,
+            id: AttemptId,
             attempt: ModelAttempt,
-            outcome: broca_wal::record::BillingAttemptOutcome,
-            response: Option<broca_wal::record::AttemptEnvelope>,
+            outcome: BillingAttemptOutcome,
+            response: Option<AttemptEnvelope>,
         ) -> Result<(), ProviderError> {
             self.responses.lock().unwrap().push(response);
             self.finished.lock().unwrap().push((id, attempt, outcome));
@@ -7546,15 +7542,15 @@ mod tests {
             &self,
             send: broca_core::run::PhysicalSend,
             cancel: CancellationToken,
-        ) -> Result<broca_wal::record::AttemptId, ProviderError> {
+        ) -> Result<AttemptId, ProviderError> {
             broca_core::run::AttemptHook::before_send(&self.inner, send, cancel).await
         }
         async fn finished(
             &self,
-            id: broca_wal::record::AttemptId,
+            id: AttemptId,
             attempt: ModelAttempt,
-            outcome: broca_wal::record::BillingAttemptOutcome,
-            response: Option<broca_wal::record::AttemptEnvelope>,
+            outcome: BillingAttemptOutcome,
+            response: Option<AttemptEnvelope>,
         ) -> Result<(), ProviderError> {
             self.waits.lock().unwrap().push(Duration::from_secs(239));
             broca_core::run::AttemptHook::finished(&self.inner, id, attempt, outcome, response)

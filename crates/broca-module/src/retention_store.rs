@@ -21,12 +21,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use broca_protocol::BindIdentity;
+use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::{self, SessionTriple};
 use broca_session_store::keys::Cipher;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Position, Session, SessionError};
-use broca_wal::StorageClass;
 
 use super::{policy_of, PolicyEvent, RetentionService};
 use crate::store_open::StoreRuntime;
@@ -304,7 +304,7 @@ impl RetentionService {
         let Ok(_lease) = self.lease(&key) else {
             return Ok(());
         };
-        broca_wal::migration::unlink(
+        broca_records::move_fence::unlink(
             &runtime
                 .state_root()
                 .join("session-store-moves/streams")
@@ -448,7 +448,7 @@ impl RetentionService {
     ) -> Result<bool, String> {
         let state_root = runtime.state_root();
         // A head in two roots is damage, which is never resolved by deleting one of them.
-        if broca_wal::session_storage_class(state_root, &addr.0)
+        if broca_records::session_storage::session_storage_class(state_root, &addr.0)
             .map_err(|error| error.to_string())?
             != Some(StorageClass::Ephemeral)
         {
@@ -526,8 +526,9 @@ impl RetentionService {
     ) -> Result<OperatorDeletion, String> {
         let state_root = runtime.state_root();
         let addr = SessionAddr(broca_core::session_addr(key));
-        let Some(class) = broca_wal::session_storage_class(state_root, &addr.0)
-            .map_err(|error| error.to_string())?
+        let Some(class) =
+            broca_records::session_storage::session_storage_class(state_root, &addr.0)
+                .map_err(|error| error.to_string())?
         else {
             return Ok(OperatorDeletion::Absent);
         };
@@ -611,13 +612,16 @@ impl RetentionService {
         let next_notice_seq = records
             .iter()
             .filter_map(|(_, record)| match record {
-                Record::Compaction(record) => {
-                    serde_json::from_value::<broca_wal::WalRecord>(record.body.clone().parse()).ok()
-                }
+                Record::Compaction(record) => serde_json::from_value::<
+                    broca_records::record::WalRecord,
+                >(record.body.clone().parse())
+                .ok(),
                 _ => None,
             })
             .filter_map(|record| match record {
-                broca_wal::WalRecord::CompactionNotice { seq, .. } => seq.checked_add(1),
+                broca_records::record::WalRecord::CompactionNotice { seq, .. } => {
+                    seq.checked_add(1)
+                }
                 _ => None,
             })
             .max()
@@ -648,8 +652,10 @@ impl RetentionService {
         .map_err(described)?;
         // The cached move stream copies the session's content, so it goes before the session: a
         // crash between the two leaves the session to be deleted again, never the copy behind.
-        broca_wal::migration::unlink(&state_root.join("session-store-moves/streams").join(&addr.0))
-            .map_err(|error| error.to_string())?;
+        broca_records::move_fence::unlink(
+            &state_root.join("session-store-moves/streams").join(&addr.0),
+        )
+        .map_err(|error| error.to_string())?;
         Session::delete(backend, addr, version)
             .await
             .map_err(described)?;

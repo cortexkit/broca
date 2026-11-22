@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use broca_wal::migration;
+use broca_records::move_fence;
 
 #[derive(Default)]
 pub struct PublicationDirs {
@@ -102,7 +102,7 @@ impl PublicationDirs {
         self.stores.remove(&key);
         let shared: Vec<_> = folders.iter().map(|folder| store.join(folder)).collect();
         for path in &shared {
-            migration::durable_dir(&root, path)?;
+            move_fence::durable_dir(&root, path)?;
         }
         let store = store.canonicalize()?;
         let key = (root.clone(), store.clone());

@@ -34,6 +34,7 @@ use std::{
 };
 
 use crate::placement::{AppendKind, HoldKind, Placement, PlacementAction};
+use broca_protocol::PauseReason;
 use broca_protocol::{
     caller::RunFinishReason,
     content::{AssistantMessage, ContentBlock, Message, Role, ToolResult},
@@ -41,10 +42,11 @@ use broca_protocol::{
     request::BudgetConfig,
     BatchId, FinishReason, RunId, StepId, ToolCallId, Usage,
 };
-use broca_wal::{
-    DeferredDecision, DispatchOutcome, FramedRecord, LateDecision, LateExecution, NoDispatchReason,
-    PauseReason, RunConfig, WalLineageId, WalRecord, WithdrawElicitation,
+use broca_records::{
+    record::DeferredDecision, record::DispatchOutcome, record::LateDecision, record::LateExecution,
+    record::NoDispatchReason, record::RunConfig, record::WalRecord, record::WithdrawElicitation,
 };
+use broca_wal::{FramedRecord, WalLineageId};
 /// WAL-derived identity of the run that produced one transcript message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunAttribution {
@@ -120,7 +122,7 @@ pub struct ReplayState {
     /// cannot establish this value and leaves it unknown.
     pub mode3: Option<bool>,
     /// Timed recovery evidence from the current pause, never inferred from an error code.
-    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
+    pub account_limit_pause: Option<Box<broca_records::record::AccountLimitPause>>,
     /// Session-scoped recovery tombstones survive episode boundaries.
     pub recovered_calls: Vec<broca_records::recovery::RecoveryRun>,
     /// Next absolute transcript ordinal, including messages not held in the prompt.
@@ -130,7 +132,7 @@ pub struct ReplayState {
     /// numbering is anchored by host markers, never a Setup answer.
     pub tags_await_setup: bool,
     pub input_budget: crate::input_budget::InputTokenBudget,
-    pub cancel_at: Option<broca_wal::record::RunCancelAt>,
+    pub cancel_at: Option<broca_records::record::RunCancelAt>,
     /// Run metadata beside the prompt, never part of model input or WAL message bytes.
     pub message_runs: Vec<Option<RunAttribution>>,
     /// Last transcript position produced by each run whose RunFinished is durable. Positions
@@ -145,7 +147,7 @@ pub struct ReplayState {
     /// tombstones recorded. Replay alone cannot know it; admission sets it from the WAL store.
     pub compaction_notice_floor: u64,
     /// The first episode's WAL-frozen plan, restored by admission for tool dispatch.
-    pub manifest: Option<std::sync::Arc<broca_wal::PlanManifest>>,
+    pub manifest: Option<std::sync::Arc<broca_records::record::PlanManifest>>,
     pub keep_warm: Option<broca_protocol::request::KeepWarm>,
     pub on_restart: Option<broca_protocol::request::OnRestart>,
     /// Every committed tool turn in the replayed transcript, as `(index in prompt of its
@@ -229,7 +231,7 @@ pub struct ReplayState {
     /// or `model_step_finished` recorded, cleared when an episode is admitted with another model
     /// or a day after the schedule last changed. `None` when no refusal armed one. A replay
     /// that starts from a materialized prefix seeds this state before folding its tail.
-    pub refusal_fallback: Option<broca_wal::RefusalFallbackSchedule>,
+    pub refusal_fallback: Option<broca_records::record::RefusalFallbackSchedule>,
     /// The last episode's steps a `model_step_refused` re-sent to the fallback model.
     pub refused_steps: std::collections::BTreeSet<StepId>,
 }
@@ -495,7 +497,7 @@ fn deferred_effect_identity(
 pub struct LateApprovalView {
     pub call_key: String,
     pub approval: Arc<WalRecord>,
-    pub outcome: Option<broca_wal::LateOutcome>,
+    pub outcome: Option<broca_records::record::LateOutcome>,
     pub result: Option<Arc<ToolResult>>,
 }
 
@@ -1140,7 +1142,7 @@ struct Episode {
     /// This episode's non-terminal pause (auth-required), if any. Carries the record's
     /// own run_id so the resolution is self-contained.
     paused: Option<(RunId, PauseReason, Option<ProviderError>)>,
-    account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
+    account_limit_pause: Option<Box<broca_records::record::AccountLimitPause>>,
     /// The trailing tool-turn (assistant w/ tool calls) + its batch, held until the
     /// batch completes (then committed to the prompt).
     open_assistant: Option<Arc<AssistantMessage>>,
@@ -1504,7 +1506,8 @@ fn replay_seeded_with_compaction<'a>(
                 // episode.
                 ep = Episode::default();
                 seeded_nudge_indices.clear();
-                ep.seeded_from = matches!(origin, broca_wal::RunOrigin::SeededFrom { .. });
+                ep.seeded_from =
+                    matches!(origin, broca_records::record::RunOrigin::SeededFrom { .. });
                 // Import/fork inputs describe historical messages, not messages produced by the
                 // synthetic seed run. A missing or empty producer id is never invented.
                 ep.attributable = !ep.seeded_from && !rid.0.is_empty();
@@ -1536,7 +1539,7 @@ fn replay_seeded_with_compaction<'a>(
                 });
                 // A seeded run (an import's) never sends a request, so its tools carry no
                 // reasoning and can't invalidate any.
-                if !matches!(origin, broca_wal::RunOrigin::SeededFrom { .. }) {
+                if !matches!(origin, broca_records::record::RunOrigin::SeededFrom { .. }) {
                     signed_floor.observe_run(
                         extent_before,
                         crate::signed_floor::tool_set_digest(
@@ -1968,7 +1971,7 @@ fn replay_seeded_with_compaction<'a>(
             } => {
                 if run_id.as_ref() == Some(cancelled_run)
                     && ep.finished.is_none()
-                    && cancel_at != Some(broca_wal::record::RunCancelAt::Now)
+                    && cancel_at != Some(broca_records::record::RunCancelAt::Now)
                 {
                     cancel_at = Some(*at);
                 }
@@ -2416,7 +2419,7 @@ fn replay_seeded_with_compaction<'a>(
             .number_new(&mut prompt)
             .map_err(ReplayError::TagNumbering)?;
         if let WalRecord::CompactionMessage {
-            kind: broca_wal::CompactionMessageKind::Setup,
+            kind: broca_records::record::CompactionMessageKind::Setup,
             tag_checkpoint: Some(checkpoint),
             ..
         } = rec
@@ -2627,7 +2630,7 @@ fn replay_seeded_with_compaction<'a>(
 pub struct ReconciledRunState {
     /// Last completed model step's normalized native reason; display only.
     pub finish: Option<cortexkit_role_llm_runner::finish::Finish>,
-    pub account_limit_pause: Option<Box<broca_wal::record::AccountLimitPause>>,
+    pub account_limit_pause: Option<Box<broca_records::record::AccountLimitPause>>,
     pub budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
     pub context_ceiling: Option<broca_protocol::ContextCeilingDetail>,
     pub ceiling_deadline_ms: Option<u64>,
@@ -2661,7 +2664,7 @@ pub struct ReconciledRunState {
     /// Why the run is paused, taken from its `RunPaused`. Set only when `state` is `Paused`.
     pub pause_reason: Option<PauseReason>,
     /// Authentication selection from this run's durable start, never from current routing.
-    pub auth_selection: Option<broca_wal::AuthSelection>,
+    pub auth_selection: Option<broca_records::record::AuthSelection>,
     /// The caller's title recorded for this run: its `RunStarted`'s, or, for a queued send that
     /// never started, its `Queued` record's. `None` when the send carried none.
     pub title: Option<String>,
@@ -2751,7 +2754,8 @@ pub fn reconcile_run_state<'a>(
                 budget_detail = None;
                 context_ceiling = None;
                 pending_steer_ids.clear();
-                active_zero_step_seed = matches!(origin, broca_wal::RunOrigin::SeededFrom { .. });
+                active_zero_step_seed =
+                    matches!(origin, broca_records::record::RunOrigin::SeededFrom { .. });
                 has_completed_step = false;
                 total_usage = Usage::default();
                 total_retries_used = 0;
@@ -3331,7 +3335,7 @@ mod steer_tests;
 #[cfg(test)]
 pub(crate) mod deferred_tests {
     use super::*;
-    use broca_wal::{DeferredAsk, DeferredExecutor, OnExpiry};
+    use broca_records::{record::DeferredAsk, record::DeferredExecutor, record::OnExpiry};
 
     pub(crate) fn prepared(id: &str, batch: &str) -> WalRecord {
         WalRecord::ToolCallDeferred {

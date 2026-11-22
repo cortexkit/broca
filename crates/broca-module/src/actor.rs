@@ -113,7 +113,7 @@ pub(crate) fn check_structured_output(
 /// (`store_actor::cache_policy`).
 pub(crate) fn inherit_frozen_parameters(
     request: &mut SubmissionRequest,
-    frozen: &broca_wal::RunConfig,
+    frozen: &broca_records::record::RunConfig,
 ) {
     use broca_protocol::request::InheritedParam;
     for param in request.inherit_frozen.clone() {
@@ -148,11 +148,11 @@ pub(crate) struct SteerFrozen<'a> {
     pub joining_temperature: Option<Option<f64>>,
     pub stop_when: &'a [broca_protocol::request::StopCondition],
     pub directives: Option<&'a [broca_protocol::request::DirectiveName]>,
-    pub auth_selection: Option<&'a broca_wal::AuthSelection>,
+    pub auth_selection: Option<&'a broca_records::record::AuthSelection>,
 }
 
-impl<'a> From<&'a broca_wal::RunConfig> for SteerFrozen<'a> {
-    fn from(config: &'a broca_wal::RunConfig) -> Self {
+impl<'a> From<&'a broca_records::record::RunConfig> for SteerFrozen<'a> {
+    fn from(config: &'a broca_records::record::RunConfig) -> Self {
         Self {
             model: &config.model,
             variant: config.variant.as_deref(),
@@ -235,7 +235,7 @@ pub(crate) fn steer_settings_conflict(
 /// older than the field) cannot confirm any pin, so every pin is refused rather than ignored.
 fn steer_auth_pin_matches(
     pin: &broca_protocol::request::AuthRequest,
-    frozen: Option<&broca_wal::AuthSelection>,
+    frozen: Option<&broca_records::record::AuthSelection>,
 ) -> bool {
     let Some(selection) = frozen else {
         return false;

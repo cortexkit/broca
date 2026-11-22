@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use broca_protocol::tags::{MessageTags, PartTags};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde::{Deserialize, Serialize};
 
 /// What a lineage's records say about tags, as folded from its WAL.
@@ -104,7 +104,7 @@ fn starts_computed_run(record: &WalRecord) -> bool {
 /// tags and is not a `final_text` structured-output run, whose final text is its output and is
 /// never cleaned.
 pub fn computed_rules(
-    config: &broca_wal::RunConfig,
+    config: &broca_records::record::RunConfig,
 ) -> Option<broca_protocol::tags::ComputedRules> {
     rules_for(
         config.computed_tags,
@@ -116,7 +116,7 @@ pub fn computed_rules(
 /// [`computed_rules`] from a run's frozen members: its computed tag rules, whether it renders
 /// tags, and its provider's frozen render config (which holds a structured-output run's mode).
 pub fn rules_for(
-    computed_tags: Option<broca_wal::ComputedTagRules>,
+    computed_tags: Option<broca_records::record::ComputedTagRules>,
     render_tags: bool,
     frozen_render_config: &serde_json::Value,
 ) -> Option<broca_protocol::tags::ComputedRules> {
@@ -137,7 +137,7 @@ fn structured_final_text(frozen_render_config: &serde_json::Value) -> bool {
 
 /// Whether a session's frozen plan asks its runs to show runner tags to the model: the plan's
 /// `render_tags` member is `true`. Absent or `false` means off.
-pub fn plan_renders_tags(manifest: &broca_wal::PlanManifest) -> bool {
+pub fn plan_renders_tags(manifest: &broca_records::record::PlanManifest) -> bool {
     serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
         .ok()
         .and_then(|plan| plan.get("render_tags").and_then(serde_json::Value::as_bool))
@@ -201,7 +201,7 @@ impl TagNumbering {
     pub fn for_run(
         prior: &[broca_protocol::Message],
         rules: Option<broca_protocol::tags::ComputedRules>,
-        computed_tags: Option<broca_wal::ComputedTagRules>,
+        computed_tags: Option<broca_records::record::ComputedTagRules>,
     ) -> Self {
         let mut numbering = Self::new(TagSeed::from_prefix(prior), prior.len());
         numbering.rules = rules;
@@ -212,7 +212,7 @@ impl TagNumbering {
     }
 
     /// A run starts: from here on messages are numbered by its rules, after its checkpoint.
-    pub fn start_run(&mut self, config: &broca_wal::RunConfig) {
+    pub fn start_run(&mut self, config: &broca_records::record::RunConfig) {
         self.rules = computed_rules(config);
         if let Some(rules) = config.computed_tags {
             self.high = self.high.max(rules.checkpoint);
@@ -279,7 +279,7 @@ impl TagNumbering {
         ordinal_base: u64,
         markers: &[broca_protocol::tags::v1::Marker],
         session: &str,
-        checkpoint: &broca_wal::SetupTagCheckpoint,
+        checkpoint: &broca_records::record::SetupTagCheckpoint,
     ) -> Result<bool, broca_protocol::tags::NumberingOverflow> {
         let numbered = self.numbered.min(prompt.len());
         let index_of = |cut: &str| {
@@ -464,7 +464,7 @@ mod tests {
         let mut numbering = TagNumbering::new(TagSeed::default(), 0);
         numbering.rules = Some(RENDER);
         numbering.number_new(&mut prompt).unwrap();
-        let checkpoint = broca_wal::SetupTagCheckpoint {
+        let checkpoint = broca_records::record::SetupTagCheckpoint {
             tag_checkpoint: 500,
             cut: "m0".into(),
         };
@@ -489,7 +489,7 @@ mod tests {
     /// except a `final_text` structured-output run, whose final text is its output.
     #[test]
     fn only_a_tag_rendering_run_that_is_not_final_text_output_cleans() {
-        let computed = Some(broca_wal::ComputedTagRules { checkpoint: 0 });
+        let computed = Some(broca_records::record::ComputedTagRules { checkpoint: 0 });
         let plain = serde_json::json!({"render_config": "stateless"});
         let final_text = serde_json::json!({
             "render_config": "stateless",

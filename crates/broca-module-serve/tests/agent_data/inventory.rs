@@ -266,7 +266,7 @@ async fn prepare_survives_closed_route(connection_close: bool) {
     )
     .await;
     let frozen = std::fs::read(&path).unwrap();
-    let freeze: broca_wal::migration::Freeze = serde_json::from_slice(&frozen).unwrap();
+    let freeze: broca_records::move_fence::Freeze = serde_json::from_slice(&frozen).unwrap();
     assert_eq!(freeze.cut_id, CUT);
     let mut retry = Wire::new(&rig, entorhinal(), true).await;
     let reply = tokio::time::timeout(

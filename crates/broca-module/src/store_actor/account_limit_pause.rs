@@ -58,13 +58,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }) else {
             return Ok(None);
         };
-        let pause: broca_wal::AccountLimitPause = serde_json::from_value(
+        let pause: broca_records::record::AccountLimitPause = serde_json::from_value(
             run.account_limit_pause
                 .clone()
                 .ok_or("account-limit pause has no recovery evidence")?,
         )
         .map_err(|error| format!("account-limit pause recovery evidence: {error}"))?;
-        let selection: Option<broca_wal::AuthSelection> = match &run.refrozen_auth {
+        let selection: Option<broca_records::record::AuthSelection> = match &run.refrozen_auth {
             Some(selection) => {
                 Some(serde_json::from_value(selection.clone()).map_err(|error| {
                     format!("account-limit pause credential selection: {error}")

@@ -755,12 +755,14 @@ fn seed_start(
     let json = |value: serde_json::Result<serde_json::Value>| {
         value.map_err(|error| ImportRefusal::new("import_source_unmapped", error.to_string()))
     };
-    let origin = json(serde_json::to_value(broca_wal::RunOrigin::SeededFrom {
-        origin_kind: broca_wal::SeedOriginKind::Import,
-        source_ref: at.params.origin.source_ref.clone(),
-        origin_device_pseudonym: None,
-        base_seq: None,
-    }))?;
+    let origin = json(serde_json::to_value(
+        broca_records::record::RunOrigin::SeededFrom {
+            origin_kind: broca_records::record::SeedOriginKind::Import,
+            source_ref: at.params.origin.source_ref.clone(),
+            origin_device_pseudonym: None,
+            base_seq: None,
+        },
+    ))?;
     let config = serde_json::json!({
         "account_limit_pause": false,
         "render_tags": false,

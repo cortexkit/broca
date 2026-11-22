@@ -130,12 +130,12 @@ impl CutStore {
     }
     fn load(&self, cut_id: &str) -> Result<CutState, ErrorBody> {
         let path = self.path(cut_id);
-        broca_wal::migration::read_json(&path)
+        broca_records::move_fence::read_json(&path)
             .map(|s| s.unwrap_or_default())
             .map_err(|error| unavailable(format!("cannot read cut {}: {error}", path.display())))
     }
     fn save(&self, cut_id: &str, state: &CutState) -> Result<(), ErrorBody> {
-        broca_wal::migration::atomic_json(&self.root, &self.path(cut_id), state)
+        broca_records::move_fence::atomic_json(&self.root, &self.path(cut_id), state)
             .map_err(unavailable)
     }
     async fn lock(

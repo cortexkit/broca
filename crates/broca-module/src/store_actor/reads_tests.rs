@@ -374,7 +374,7 @@ async fn admitted_owner_operation_is_durable_after_pending_records() {
     commands
         .send(LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::Now,
+            at: broca_records::record::RunCancelAt::Now,
             reply,
         })
         .unwrap();
@@ -586,7 +586,7 @@ impl Module {
             labels: Default::default(),
             token_counts: None,
             parts: runtime.parts_for(
-                broca_wal::StorageClass::Ordinary,
+                broca_records::session_storage::StorageClass::Ordinary,
                 broca_session_store::keys::Cipher::XChaCha20Poly1305,
             ),
             held: slot.is_some(),
@@ -1436,7 +1436,7 @@ async fn the_served_history_version_is_the_stored_one_past_the_exposure_epoch() 
         .unwrap();
     let runtime = m.runtime();
     let parts = runtime.parts_for(
-        broca_wal::StorageClass::Ordinary,
+        broca_records::session_storage::StorageClass::Ordinary,
         broca_session_store::keys::Cipher::XChaCha20Poly1305,
     );
     let page = |version: Option<u64>| {
@@ -1560,7 +1560,7 @@ async fn in_memory_reads_refuse_only_where_they_did_before() {
     m.in_step("r1", 2).await;
     m.gate.notify_one();
     m.in_step("r2", 1).await;
-    let manifest: broca_wal::PlanManifest = serde_json::from_value(serde_json::json!({
+    let manifest: broca_records::record::PlanManifest = serde_json::from_value(serde_json::json!({
         "plan": "{}", "plan_identity": "refreshed-plan", "composition_digest": "composition",
         "tools": [], "system_text": "", "system_digest": "system",
         "join_version": 1, "role_versions": {}, "declarations": [], "fetches": []

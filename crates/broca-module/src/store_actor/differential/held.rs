@@ -172,7 +172,7 @@ impl ToolPlane for HoldingTools {
 }
 
 struct HeldExecutor {
-    auth_selection: std::sync::Mutex<Option<broca_wal::AuthSelection>>,
+    auth_selection: std::sync::Mutex<Option<broca_records::record::AuthSelection>>,
     provider: Gated,
     tools: Arc<HoldingTools>,
     slots: Arc<HeldSlots>,
@@ -201,7 +201,10 @@ impl HeldExecutor {
 
 #[async_trait]
 impl RunExecutor for HeldExecutor {
-    fn cached_account_email(&self, selection: &broca_wal::AuthSelection) -> Option<String> {
+    fn cached_account_email(
+        &self,
+        selection: &broca_records::record::AuthSelection,
+    ) -> Option<String> {
         (selection.credential_id == "oauth:stub").then(|| "  default@example.invalid  ".into())
     }
     fn provider_held_lifecycle(
@@ -787,8 +790,8 @@ async fn boot_sweep_seals_store_orphans_without_a_run_index(cipher: Cipher) {
 
 #[tokio::test]
 async fn startup_read_is_served_while_background_recovery_is_pending() {
+    use broca_records::session_storage::StorageClass;
     use broca_session_store::backend::{LocalBackend, SessionAddr};
-    use broca_wal::StorageClass;
 
     let dir = scratch_dir();
     let key = BindIdentity::new(dir.join("project"), "startup-recovery", "orphan");
@@ -898,9 +901,9 @@ async fn startup_read_is_served_while_background_recovery_is_pending() {
 /// load their logs, at either inventory size.
 #[tokio::test]
 async fn startup_recovery_work_ignores_idle_store_sessions() {
+    use broca_records::session_storage::StorageClass;
     use broca_session_store::backend::{MemoryBackend, SessionAddr};
     use broca_session_store::record::{Record, RunStart};
-    use broca_wal::StorageClass;
 
     let mut work = Vec::new();
     for size in [64, 3000] {

@@ -44,7 +44,7 @@ impl CacheDeclaration {
 /// no warm is supported.
 pub trait CacheDeclarer: Send + Sync {
     /// `None` when the config cannot be read as any family's.
-    fn declare(&self, config: &broca_wal::RunConfig) -> Option<CacheDeclaration>;
+    fn declare(&self, config: &broca_records::record::RunConfig) -> Option<CacheDeclaration>;
 }
 
 /// Target capacity for cache facts. Shared clocks may exceed this target because
@@ -115,7 +115,10 @@ impl CacheTable {
         self.declarer.get().is_some()
     }
 
-    pub(crate) fn declare(&self, config: &broca_wal::RunConfig) -> Option<CacheDeclaration> {
+    pub(crate) fn declare(
+        &self,
+        config: &broca_records::record::RunConfig,
+    ) -> Option<CacheDeclaration> {
         self.declarer.get()?.declare(config)
     }
 

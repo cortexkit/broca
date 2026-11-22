@@ -138,10 +138,10 @@ impl broca_fetch_plan::PlanAdmitter for EmptyAdmitter {
     }
 }
 
-fn manifest(plan: &broca_fetch_plan::Plan) -> broca_wal::PlanManifest {
-    broca_wal::PlanManifest {
+fn manifest(plan: &broca_fetch_plan::Plan) -> broca_records::record::PlanManifest {
+    broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
         plan_identity: plan.identity.clone(),
         composition_digest: plan.composition_digest.clone(),
         fetches: vec![],
@@ -723,11 +723,12 @@ async fn app_readers_malformed_admission_writes_nothing() {
         assert_eq!(body["code"], "invalid_params");
         assert_eq!(body["detail"]["field"], "plan.readers");
         assert!(rig.registry.slot_state(&rig.key).is_none());
-        assert!(
-            broca_wal::session_storage_class(&rig.dir, &broca_core::session_addr(&rig.key))
-                .unwrap()
-                .is_none()
-        );
+        assert!(broca_records::session_storage::session_storage_class(
+            &rig.dir,
+            &broca_core::session_addr(&rig.key)
+        )
+        .unwrap()
+        .is_none());
         sample("plan-readers-invalid-refusal.json", &refused.body);
     }
     let valid = readers_plan(Some(json!([])), false);
@@ -758,7 +759,7 @@ fn app_readers_plan_parts_preserve_absent_bytes_and_present_lists() {
         )
         .unwrap(),
     );
-    stored.plan = broca_wal::OpaqueJson::from_json_text("{\"tool_items\":[]}").unwrap();
+    stored.plan = broca_records::record::OpaqueJson::from_json_text("{\"tool_items\":[]}").unwrap();
     let mut parts = MemoryParts::default();
     let mut setup = vec![];
     broca_session_loop::run::manifest_parts(&stored, &mut parts, &mut setup).unwrap();
@@ -768,7 +769,8 @@ fn app_readers_plan_parts_preserve_absent_bytes_and_present_lists() {
         .unwrap();
     assert_eq!(parts.parts[&reference.digest], br#""{\"tool_items\":[]}""#);
     stored.plan =
-        broca_wal::OpaqueJson::from_json_text("{\"tool_items\":[],\"readers\":[]}").unwrap();
+        broca_records::record::OpaqueJson::from_json_text("{\"tool_items\":[],\"readers\":[]}")
+            .unwrap();
     let mut setup = vec![];
     let rest = broca_session_loop::run::manifest_parts(&stored, &mut parts, &mut setup).unwrap();
     let rebuilt = broca_session_loop::run::stored_manifest(

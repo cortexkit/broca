@@ -11,7 +11,7 @@ use broca_protocol::content::{Message, Role};
 use broca_protocol::request::{
     BudgetConfig, GenerationConfig, ModelHandle, ResponseFormat, StopCondition, Tool, ToolChoice,
 };
-use broca_wal::{PlanManifest, RunConfig};
+use broca_records::{record::PlanManifest, record::RunConfig};
 
 use crate::provider::Provider;
 use crate::run::{RunError, RunRequest};

@@ -5,7 +5,7 @@ const MANIFEST: &str = r#"{"plan":"{}","plan_identity":"plan","composition_diges
 
 #[test]
 fn stored_manifest_before_yield_tools_keeps_provider_answer_bytes() {
-    let manifest: broca_wal::PlanManifest = serde_json::from_str(MANIFEST).unwrap();
+    let manifest: broca_records::record::PlanManifest = serde_json::from_str(MANIFEST).unwrap();
     let mut parts = MemoryParts::default();
     let mut setup = Vec::new();
     let rest = broca_session_loop::run::manifest_parts(&manifest, &mut parts, &mut setup).unwrap();
@@ -39,14 +39,14 @@ fn stored_manifest_before_yield_tools_keeps_provider_answer_bytes() {
 fn yield_tools_survives_stored_manifest_parts_round_trip() {
     let mut value: serde_json::Value = serde_json::from_str(MANIFEST).unwrap();
     value["fetches"][0]["declarations_frozen"]["yield_tools"] = serde_json::json!(["work"]);
-    let manifest: broca_wal::PlanManifest = serde_json::from_value(value).unwrap();
+    let manifest: broca_records::record::PlanManifest = serde_json::from_value(value).unwrap();
     let mut parts = MemoryParts::default();
     let mut setup = Vec::new();
     let rest = broca_session_loop::run::manifest_parts(&manifest, &mut parts, &mut setup).unwrap();
     let reference = broca_session_store::fold::operations::ManifestRef { parts: setup, rest };
     let restored = broca_session_loop::run::stored_manifest(&reference, &parts).unwrap();
     assert_eq!(*restored, manifest);
-    let broca_wal::FetchOutcome::Answered {
+    let broca_records::record::FetchOutcome::Answered {
         declarations_frozen: Some(declarations),
         ..
     } = &restored.fetches[0].outcome

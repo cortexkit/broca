@@ -28,7 +28,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     pub(crate) fn with_class_placement(
         mut self,
-        class: broca_wal::StorageClass,
+        class: broca_records::session_storage::StorageClass,
         backup_classes: Vec<String>,
     ) -> Self {
         self.class_placement = Some((class, backup_classes));

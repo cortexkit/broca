@@ -147,9 +147,12 @@ impl Side {
     }
 
     fn in_store(&self) -> bool {
-        broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key))
-            .unwrap()
-            .is_some()
+        broca_records::session_storage::session_storage_class(
+            &self.dir,
+            &broca_core::session_addr(&self.key),
+        )
+        .unwrap()
+        .is_some()
     }
 
     async fn run_status(&self, run_id: &str) -> Value {
@@ -191,7 +194,7 @@ fn reply<T: serde::Serialize>(reply: Result<T, crate::serve::ServeError>) -> Val
 
 async fn admission_case(store: bool, scoped: bool) {
     let side = side(vec![text_step("answer", "done")], None).await;
-    let manifest: broca_wal::PlanManifest = serde_json::from_value(json!({
+    let manifest: broca_records::record::PlanManifest = serde_json::from_value(json!({
         "plan": "{}", "plan_identity": "admission-plan", "composition_digest": "composition",
         "tools": [], "system_text": "private system text", "system_digest": "system",
         "join_version": 1, "role_versions": {}, "declarations": [],
@@ -922,7 +925,7 @@ mod open_recovery {
         commands
             .send(LineageCmd::Cancel {
                 run_id: broca_protocol::RunId("r1".into()),
-                at: broca_wal::record::RunCancelAt::StepBoundary,
+                at: broca_records::record::RunCancelAt::StepBoundary,
                 reply,
             })
             .unwrap();

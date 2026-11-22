@@ -253,8 +253,8 @@ async fn an_open_retained_session_expires_at_its_deadline(cipher: Cipher) {
 }
 
 async fn recreated_retained_sessions_carry_numbering_floors_alike(cipher: Cipher) {
+    use broca_records::session_storage::StorageClass;
     use broca_session_store::backend::SessionAddr;
-    use broca_wal::StorageClass;
     let new = retained(cipher, Duration::from_millis(1), None).await;
     new.send("r1", Some(SECONDS)).await.unwrap();
     new.module.closed().await;
@@ -357,7 +357,7 @@ async fn expiry_reads_before_the_key_load_never_become_absent(cipher: Cipher) {
 }
 
 async fn computed_numbering_resets_after_retention_alike(cipher: Cipher) {
-    use broca_wal::StorageClass;
+    use broca_records::session_storage::StorageClass;
     let new = retained(cipher, Duration::from_millis(1), None).await;
     let plan = || {
         let mut manifest =

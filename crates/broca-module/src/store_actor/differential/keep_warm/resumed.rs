@@ -34,8 +34,8 @@ mod idle;
 #[derive(Default)]
 struct Warming {
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
-    warm_configs: Mutex<Vec<broca_wal::RunConfig>>,
-    quota_configs: Mutex<Vec<broca_wal::RunConfig>>,
+    warm_configs: Mutex<Vec<broca_records::record::RunConfig>>,
+    quota_configs: Mutex<Vec<broca_records::record::RunConfig>>,
     clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     no_cache: bool,
     fail: bool,
@@ -105,7 +105,7 @@ impl RunExecutor for Warming {
     }
     fn warm_costs(
         &self,
-        _: &broca_wal::RunConfig,
+        _: &broca_records::record::RunConfig,
         _: u64,
         _: u64,
     ) -> Result<broca_core::keep_warm::WarmCosts, String> {
@@ -141,7 +141,7 @@ impl RunExecutor for Warming {
 
     async fn warm_quota(
         &self,
-        config: &broca_wal::RunConfig,
+        config: &broca_records::record::RunConfig,
         _: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), String> {
         self.quota_configs.lock().unwrap().push(config.clone());

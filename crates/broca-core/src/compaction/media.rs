@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use broca_protocol::{ContentBlock, MediaMarkerReason, MediaRef, Message};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde::{Deserialize, Serialize};
 
 /// Exact, metadata-only captures, indexed by digest. Repeated uses of a capture take one entry.

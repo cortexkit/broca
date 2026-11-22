@@ -18,7 +18,7 @@ use crate::actor::{LineageCmd, SendOutcome, SessionRefreshOutcome};
 use crate::store_plan_view::Error;
 use crate::store_reads::{StoreReadOutcome, StoreReadReply, StoreReadRequest};
 
-fn manifest(label: &str, extras: bool) -> broca_wal::PlanManifest {
+fn manifest(label: &str, extras: bool) -> broca_records::record::PlanManifest {
     let first = format!("{label}: You are π.");
     let second = "工具 café";
     let tool = |provider: &str, name: &str| {
@@ -60,9 +60,9 @@ fn manifest(label: &str, extras: bool) -> broca_wal::PlanManifest {
     let composition = json!({"providers":providers, "step_transform_items":[]});
     let composition_digest =
         cortexkit_role_tool_provider::catalog::composition_digest(&composition).unwrap();
-    broca_wal::PlanManifest {
+    broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(
+        plan: broca_records::record::OpaqueJson::from_json_text(
             json!({
             "tool_items":[{"provider":"beta", "params":{}},{"provider":"alpha", "params":{}}],
             "system_text_items":items, "step_transform_items":[],
@@ -171,7 +171,7 @@ async fn view(commands: &Harness) -> Result<PlanViewResponse, Error> {
     }
 }
 
-async fn send(commands: &Commands, id: &str, first: Option<broca_wal::PlanManifest>) {
+async fn send(commands: &Commands, id: &str, first: Option<broca_records::record::PlanManifest>) {
     let identity = first
         .as_ref()
         .map_or("", |manifest| manifest.plan_identity.as_str())
@@ -195,7 +195,7 @@ async fn refresh(
     commands: &Commands,
     generation: u64,
     policy: &str,
-    manifest: broca_wal::PlanManifest,
+    manifest: broca_records::record::PlanManifest,
 ) {
     let (reply, answer) = oneshot::channel();
     commands
@@ -284,7 +284,7 @@ async fn plan_view_fresh_and_empty_optional_items_match_model_bytes() {
         let text = fetched
             .iter()
             .find_map(|fetch| match &fetch.outcome {
-                broca_wal::FetchOutcome::Answered { text, .. }
+                broca_records::record::FetchOutcome::Answered { text, .. }
                     if fetch.provider == item.provider =>
                 {
                     text.as_deref()

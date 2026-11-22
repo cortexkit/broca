@@ -11,7 +11,7 @@ use broca_protocol::{
     media_event::{MediaEvent, MediaMessage},
     ContentBlock, MediaRef, Message, StepId, ToolCallId, ToolOutput, ToolOutputPart,
 };
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde::{Deserialize, Serialize};
 
 use crate::media_store::{MediaBytes, MediaReadError};

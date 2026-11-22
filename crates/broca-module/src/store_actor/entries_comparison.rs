@@ -444,9 +444,12 @@ impl Side {
     }
 
     fn holds(&self) -> bool {
-        broca_wal::session_storage_class(&self.dir, &broca_core::session_addr(&self.key))
-            .unwrap()
-            .is_some()
+        broca_records::session_storage::session_storage_class(
+            &self.dir,
+            &broca_core::session_addr(&self.key),
+        )
+        .unwrap()
+        .is_some()
     }
 
     /// Asserts the session's latest run is `run_id` and completed.
@@ -814,14 +817,14 @@ async fn cancelled_and_queued_runs_read_as_the_same_history() {
 
 /// A plan naming the compaction provider `ck-mc`, and, when `renders`, asking its runs to show
 /// part numbers to the model (the plan's `render_tags`).
-fn compacting_manifest(renders: bool) -> broca_wal::PlanManifest {
+fn compacting_manifest(renders: bool) -> broca_records::record::PlanManifest {
     let mut plan = json!({"compaction_item": {"provider": "ck-mc", "preset": "default"}});
     if renders {
         plan["render_tags"] = json!(true);
     }
-    broca_wal::PlanManifest {
+    broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: "plan-1".into(),
         composition_digest: "composition".into(),
         tools: Arc::new(vec![serde_json::from_value(json!({
@@ -839,7 +842,10 @@ fn compacting_manifest(renders: bool) -> broca_wal::PlanManifest {
     }
 }
 
-fn planned(identity: &str, manifest: Option<broca_wal::PlanManifest>) -> crate::actor::SendPlan {
+fn planned(
+    identity: &str,
+    manifest: Option<broca_records::record::PlanManifest>,
+) -> crate::actor::SendPlan {
     crate::actor::SendPlan {
         identity: identity.into(),
         // Only a send creating the session carries the manifest its plan fetched; a later send
@@ -1076,7 +1082,10 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
     let all = crate::store_entries::all_entries(&session).await.unwrap();
     assert!(all.len() >= 6, "{} entries", all.len());
     let runtime = store.registry.store_runtime().unwrap();
-    let parts = runtime.parts_for(broca_wal::StorageClass::Ordinary, session.head().cipher());
+    let parts = runtime.parts_for(
+        broca_records::session_storage::StorageClass::Ordinary,
+        session.head().cipher(),
+    );
     let admission = broca_session_loop::run::admission_of_start(
         session
             .operations
@@ -2272,9 +2281,9 @@ fn core_head_plan(params: &Value) -> crate::actor::SendPlan {
     )
     .expect("broca's plan reader takes core's plan");
     let subscriptions = plan["step_transform_items"][0]["subscriptions"].clone();
-    let manifest = broca_wal::PlanManifest {
+    let manifest = broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: parsed.identity.clone(),
         composition_digest: parsed.composition_digest.clone(),
         tools: Arc::new(vec![serde_json::from_value(json!({
@@ -2288,9 +2297,9 @@ fn core_head_plan(params: &Value) -> crate::actor::SendPlan {
         join_version: 1,
         role_versions: Default::default(),
         fetches: vec![],
-        declarations: vec![broca_wal::FrozenDeclaration {
+        declarations: vec![broca_records::record::FrozenDeclaration {
             provider: "magic-context".into(),
-            answer: broca_wal::OpaqueJson::from_json_text(
+            answer: broca_records::record::OpaqueJson::from_json_text(
                 json!({ "subscriptions": subscriptions }).to_string(),
             )
             .unwrap(),
@@ -2337,7 +2346,7 @@ async fn send_keyed(
 #[tokio::test]
 async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
-    use broca_wal::StorageClass;
+    use broca_records::session_storage::StorageClass;
     let first = core_head_send("first-send.json");
     let second = core_head_send("second-send.json");
     let first_id = first["send_id"].as_str().unwrap().to_owned();
@@ -2387,7 +2396,8 @@ async fn cores_creating_send_starts_a_head_in_the_new_storage_as_today() {
     broca_test_support::pin!("alike", replies[0]);
     let address = |side: &Side| broca_core::session_addr(&side.key);
     assert_eq!(
-        broca_wal::session_storage_class(&store.dir, &address(&store)).unwrap(),
+        broca_records::session_storage::session_storage_class(&store.dir, &address(&store))
+            .unwrap(),
         Some(StorageClass::Durable)
     );
     let current = || async {
@@ -2770,7 +2780,7 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
     use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
     let template = pointer();
     let mut manifest = compacting_manifest(true);
-    manifest.plan = broca_wal::OpaqueJson::from_json_text(
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
         json!({
             "compaction_item": {"provider": "ck-mc", "preset": "default"},
             "render_tags": true,

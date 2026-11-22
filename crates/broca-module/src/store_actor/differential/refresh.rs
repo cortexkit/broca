@@ -55,7 +55,7 @@ fn plan(text: &str, tools: &[&str], pinned: Option<Value>, chooses: Option<Value
 }
 
 /// The manifest an admitter fetches for `plan`, under the plan identity `identity`.
-fn manifest(plan: &Value, identity: &str) -> broca_wal::PlanManifest {
+fn manifest(plan: &Value, identity: &str) -> broca_records::record::PlanManifest {
     let tools = plan["composition"]["providers"][0]["tools"]
         .as_array()
         .unwrap()
@@ -72,9 +72,9 @@ fn manifest(plan: &Value, identity: &str) -> broca_wal::PlanManifest {
         .as_str()
         .unwrap()
         .to_owned();
-    broca_wal::PlanManifest {
+    broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(plan.to_string()).unwrap(),
         plan_identity: identity.into(),
         composition_digest: plan["composition_digest"].as_str().unwrap().into(),
         fetches: vec![],
@@ -103,7 +103,7 @@ enum Step {
     Refresh {
         generation: u64,
         policy: &'static str,
-        manifest: broca_wal::PlanManifest,
+        manifest: broca_records::record::PlanManifest,
     },
     Policy {
         generation: u64,
@@ -128,7 +128,7 @@ fn send(run_id: &'static str, plan: &'static str) -> Step {
 /// answered with, and the session's baseline after each step.
 async fn drive(
     module: &Module,
-    first: &broca_wal::PlanManifest,
+    first: &broca_records::record::PlanManifest,
     steps: &[Step],
 ) -> (Vec<String>, Vec<String>) {
     let mut answers = Vec::new();
@@ -272,7 +272,7 @@ async fn store_runs(module: &Module) -> (Vec<(String, Option<String>, String)>, 
 /// each refresh a run applied. Returns the module, its answers and its runs, for the scenario to
 /// check what they say.
 async fn compare(
-    first: &broca_wal::PlanManifest,
+    first: &broca_records::record::PlanManifest,
     steps: &[Step],
 ) -> (Module, Vec<String>, Vec<(String, Option<String>, String)>) {
     let (store, _) = both(
@@ -288,7 +288,7 @@ async fn compare(
 /// [`compare`], with the module's sessions in mode `cipher`.
 async fn compare_in(
     cipher: broca_session_store::keys::Cipher,
-    first: &broca_wal::PlanManifest,
+    first: &broca_records::record::PlanManifest,
     steps: &[Step],
 ) -> (Module, Vec<String>, Vec<(String, Option<String>, String)>) {
     let store = super::head::both_in(
@@ -304,7 +304,7 @@ async fn compare_in(
 /// [`compare`] on the module `store`.
 async fn compared(
     store: Module,
-    first: &broca_wal::PlanManifest,
+    first: &broca_records::record::PlanManifest,
     steps: &[Step],
 ) -> (Module, Vec<String>, Vec<(String, Option<String>, String)>) {
     let (store_answers, store_baselines) = drive(&store, first, steps).await;
@@ -316,11 +316,11 @@ async fn compared(
     (store, store_answers, runs)
 }
 
-pub(super) fn first_plan() -> broca_wal::PlanManifest {
+pub(super) fn first_plan() -> broca_records::record::PlanManifest {
     manifest(&plan("you are a worker", &["read"], None, None), "plan-1")
 }
 
-fn second_plan() -> broca_wal::PlanManifest {
+fn second_plan() -> broca_records::record::PlanManifest {
     manifest(
         &plan("you are a reviewer", &["read", "write"], None, None),
         "plan-2",
@@ -642,7 +642,7 @@ async fn a_refresh_changes_the_inherited_model_and_the_senders_alike() {
                 &module.key,
                 Some(&occipital()),
                 &SendScope::default(),
-                broca_wal::record::RunCancelAt::Now,
+                broca_records::record::RunCancelAt::Now,
             )
             .await;
         assert!(
@@ -708,7 +708,7 @@ async fn a_refreshed_sender_policy_refuses_a_module_it_doesnt_name_alike(
 
 /// [`manifest`], with its provider's system text answer stamped `digit` repeated (a Rich UI
 /// catalog digest).
-fn stamped(plan: &Value, identity: &str, digit: char) -> broca_wal::PlanManifest {
+fn stamped(plan: &Value, identity: &str, digit: char) -> broca_records::record::PlanManifest {
     let mut manifest = manifest(plan, identity);
     manifest.fetches = serde_json::from_value(json!([{
         "provider": "fixture", "catalog_digest": "d", "tools": [],

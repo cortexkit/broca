@@ -264,11 +264,14 @@ impl<L: LeaseStore + 'static> DefaultOpener<L> {
         let class = creating.map(|creation| {
             let durable = match creation {
                 StoreCreation::Send | StoreCreation::Head => {
-                    broca_wal::selected_for_backup(session_class.as_deref(), &self.backup_classes)
+                    broca_records::session_storage::selected_for_backup(
+                        session_class.as_deref(),
+                        &self.backup_classes,
+                    )
                 }
                 StoreCreation::Import => true,
             };
-            broca_wal::placement(retention.is_some(), durable)
+            broca_records::session_storage::placement(retention.is_some(), durable)
         });
         store
             .open_actor(

@@ -9,7 +9,7 @@ description = "Fetch-plan admission: checks a session's first-send plan, fetches
 
 [dependencies]
 broca-protocol = { path = "../broca-protocol" }
-broca-wal = { path = "../broca-wal" }
+broca-records = { path = "../broca-records" }
 # The tool-provider and step-transform-provider role crates own the catalog and declaration
 # wire types and the subscription admission rules; broca uses them rather than copies. Path deps
 # for the same reason as every other commons crate here (see broca-module-serve's manifest).

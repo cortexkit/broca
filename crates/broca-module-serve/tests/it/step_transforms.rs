@@ -72,9 +72,9 @@ async fn controlled_hook_deadlines() {
         (31000, 30001, 30000, 0),
     ] {
         let sub = subscription("pre_user", None, "refuse", budget);
-        let frozen = broca_wal::PlanManifest {
+        let frozen = broca_records::record::PlanManifest {
             rich_ui: None,
-            plan: broca_wal::OpaqueJson::from_json_text(
+            plan: broca_records::record::OpaqueJson::from_json_text(
                 plan(std::slice::from_ref(&sub), false).to_string(),
             )
             .unwrap(),
@@ -86,9 +86,9 @@ async fn controlled_hook_deadlines() {
             join_version: 1,
             role_versions: Default::default(),
             fetches: vec![],
-            declarations: vec![broca_wal::FrozenDeclaration {
+            declarations: vec![broca_records::record::FrozenDeclaration {
                 provider: MODULE.into(),
-                answer: broca_wal::OpaqueJson::from_json_text(
+                answer: broca_records::record::OpaqueJson::from_json_text(
                     json!({"subscriptions":[sub]}).to_string(),
                 )
                 .unwrap(),

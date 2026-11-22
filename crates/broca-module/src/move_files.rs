@@ -6,7 +6,7 @@ use crate::{
 };
 use broca_core::{FileLeaseStore, LeaseHandle, LeaseStore};
 use broca_protocol::BindIdentity;
-use broca_wal::migration::{self, Freeze, Moved};
+use broca_records::move_fence::{self, Freeze, Moved};
 use broca_wire::agent_data::{errors::ErrorBody, refs::Refs, request::Request, Op};
 use serde_json::Value;
 use std::{
@@ -252,11 +252,13 @@ impl FileCutArtifacts {
     ) -> Result<(), ErrorBody> {
         let live = self.move_sidecar(plan);
         if let Some(moved) =
-            migration::read_json::<Moved>(&live.with_extension("moved")).map_err(unavailable)?
+            move_fence::read_json::<Moved>(&live.with_extension("moved")).map_err(unavailable)?
         {
             return Err(moved_source(plan, &moved.holder, &moved.cut_id, op));
         }
-        match migration::read_json::<Freeze>(&live.with_extension("moving")).map_err(unavailable)? {
+        match move_fence::read_json::<Freeze>(&live.with_extension("moving"))
+            .map_err(unavailable)?
+        {
             Some(freeze) if freeze.cut_id != cut_id => {
                 Err(foreign_owner(plan, cut_id, &freeze.cut_id, op, step))
             }
@@ -363,9 +365,9 @@ impl CutArtifacts for FileCutArtifacts {
         let mut observations = Vec::new();
         for plan in &plans {
             let live = self.move_sidecar(plan);
-            let moving = migration::read_json::<Freeze>(&live.with_extension("moving"))
+            let moving = move_fence::read_json::<Freeze>(&live.with_extension("moving"))
                 .map_err(unavailable)?;
-            let moved = migration::read_json::<Moved>(&live.with_extension("moved"))
+            let moved = move_fence::read_json::<Moved>(&live.with_extension("moved"))
                 .map_err(unavailable)?;
             let mut observation = MoveObservation {
                 reference: plan.reference.clone(),
@@ -374,7 +376,7 @@ impl CutArtifacts for FileCutArtifacts {
                     .iter()
                     .find(|(key, _)| key == &plan.session)
                     .and_then(|(_, reason)| reason.clone()),
-                moving_cut: migration::cut_fence(&self.state_root, &plan.reference)
+                moving_cut: move_fence::cut_fence(&self.state_root, &plan.reference)
                     .map_err(unavailable)?
                     .or_else(|| moving.map(|f| f.cut_id)),
                 moved_holder: moved.map(|m| m.holder),
@@ -567,7 +569,7 @@ impl CutArtifacts for FileCutArtifacts {
         let locked = self.locked(&cut_id)?;
         for plan in &locked.plans {
             self.store_apply(&cut_id, plan, Op::Abort, request).await?;
-            migration::unlink(
+            move_fence::unlink(
                 &self
                     .state_root
                     .join("session-store-moves/streams")
@@ -579,7 +581,7 @@ impl CutArtifacts for FileCutArtifacts {
             if staged.exists() {
                 std::fs::remove_dir_all(&staged).map_err(unavailable)?;
             }
-            migration::abort_freeze(&self.move_sidecar(plan), &cut_id).map_err(unavailable)?;
+            move_fence::abort_freeze(&self.move_sidecar(plan), &cut_id).map_err(unavailable)?;
         }
         Ok(())
     }

@@ -53,7 +53,7 @@ fn reloading() -> Result<serde_json::Value, ConnError> {
 
 #[test]
 fn legacy_unavailable_replays_with_identical_result_bytes() {
-    let reason: broca_wal::NoDispatchReason =
+    let reason: broca_records::record::NoDispatchReason =
         serde_json::from_str(r#"{"kind":"unavailable","detail":"tool plane unavailable"}"#)
             .unwrap();
     assert_eq!(

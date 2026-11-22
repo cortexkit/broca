@@ -329,12 +329,14 @@ impl Daemon {
 }
 
 /// A fully frozen fixture for crash/resume: no admission path is available after the cut.
-pub fn frozen(state: &State) -> Arc<broca_wal::PlanManifest> {
+pub fn frozen(state: &State) -> Arc<broca_records::record::PlanManifest> {
     let tool: broca_protocol::Tool = serde_json::from_value(json!({"name":"work","description":"does work","input_schema":state.schema.lock().unwrap().clone(),"module":MODULE,"execution_mode":"sequential"})).unwrap();
-    Arc::new(broca_wal::PlanManifest {
+    Arc::new(broca_records::record::PlanManifest {
         rich_ui: None,
-        plan: broca_wal::OpaqueJson::from_json_text(plan(&state.subscriptions, false).to_string())
-            .unwrap(),
+        plan: broca_records::record::OpaqueJson::from_json_text(
+            plan(&state.subscriptions, false).to_string(),
+        )
+        .unwrap(),
         plan_identity: "frozen".into(),
         composition_digest: "frozen".into(),
         tools: vec![tool.clone()].into(),
@@ -342,9 +344,9 @@ pub fn frozen(state: &State) -> Arc<broca_wal::PlanManifest> {
         system_digest: String::new(),
         join_version: 1,
         role_versions: Default::default(),
-        fetches: vec![broca_wal::ProviderFetch {
+        fetches: vec![broca_records::record::ProviderFetch {
             provider: MODULE.into(),
-            outcome: broca_wal::FetchOutcome::Answered {
+            outcome: broca_records::record::FetchOutcome::Answered {
                 reply: None,
                 reference_slots: None,
                 catalog_digest: "catalog".into(),
@@ -361,9 +363,9 @@ pub fn frozen(state: &State) -> Arc<broca_wal::PlanManifest> {
                 ),
             },
         }],
-        declarations: vec![broca_wal::FrozenDeclaration {
+        declarations: vec![broca_records::record::FrozenDeclaration {
             provider: MODULE.into(),
-            answer: broca_wal::OpaqueJson::from_json_text(
+            answer: broca_records::record::OpaqueJson::from_json_text(
                 json!({"subscriptions":state.subscriptions}).to_string(),
             )
             .unwrap(),

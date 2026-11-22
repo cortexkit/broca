@@ -133,9 +133,9 @@ impl broca_fetch_plan::PlanAdmitter for DisplaySenderPlan {
         _scope: Option<&broca_protocol::SessionScope>,
     ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
         Ok(broca_fetch_plan::Admitted {
-            manifest: broca_wal::PlanManifest {
+            manifest: broca_records::record::PlanManifest {
                 rich_ui: None,
-                plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                plan: broca_records::record::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
                 plan_identity: plan.identity.clone(),
                 composition_digest: plan.composition_digest.clone(),
                 fetches: vec![],
@@ -487,7 +487,7 @@ async fn finish_reason_uses_only_the_last_native_step_and_survives_restart() {
 async fn display_facts_opt_in_preserves_default_and_matches_stored_times() {
     // Only the resume cursor's incarnation and source-frame digest extend the historical pin.
     let mut rig = Rig::start("read-display-facts").await;
-    *rig.script.schema_pin.lock().unwrap() = Some(broca_wal::DispatchSchemaPin {
+    *rig.script.schema_pin.lock().unwrap() = Some(broca_records::record::DispatchSchemaPin {
         schema_digest: "a".repeat(64),
         semantics: 7,
         major: None,
@@ -3064,9 +3064,10 @@ async fn upload_plan_named_sender_has_standing_on_the_frozen_session() {
             _scope: Option<&broca_protocol::SessionScope>,
         ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
             Ok(broca_fetch_plan::Admitted {
-                manifest: broca_wal::PlanManifest {
+                manifest: broca_records::record::PlanManifest {
                     rich_ui: None,
-                    plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                    plan: broca_records::record::OpaqueJson::from_json_text(plan.text.clone())
+                        .unwrap(),
                     plan_identity: plan.identity.clone(),
                     composition_digest: plan.composition_digest.clone(),
                     fetches: vec![],

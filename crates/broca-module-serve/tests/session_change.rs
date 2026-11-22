@@ -41,9 +41,9 @@ impl broca_fetch_plan::PlanAdmitter for Admitter {
                 })
             });
         Ok(broca_fetch_plan::Admitted {
-            manifest: broca_wal::PlanManifest {
+            manifest: broca_records::record::PlanManifest {
                 rich_ui: None,
-                plan: broca_wal::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
+                plan: broca_records::record::OpaqueJson::from_json_text(plan.text.clone()).unwrap(),
                 plan_identity: plan.identity.clone(),
                 composition_digest: cortexkit_role_tool_provider::catalog::composition_digest(
                     &composition,
@@ -54,9 +54,9 @@ impl broca_fetch_plan::PlanAdmitter for Admitter {
                     .unwrap()
                     .iter()
                     .filter(|item| item["optional"] == true)
-                    .map(|item| broca_wal::ProviderFetch {
+                    .map(|item| broca_records::record::ProviderFetch {
                         provider: item["provider"].as_str().unwrap().into(),
-                        outcome: broca_wal::FetchOutcome::Absent {
+                        outcome: broca_records::record::FetchOutcome::Absent {
                             reason: "timeout".into(),
                         },
                     })

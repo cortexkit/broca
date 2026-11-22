@@ -31,7 +31,7 @@ impl Artifacts {
         }
     }
     fn staged(&self, reference: &str) -> PathBuf {
-        broca_wal::migration::staging_path(&self.root.join("wal"), CUT, reference).unwrap()
+        broca_records::move_fence::staging_path(&self.root.join("wal"), CUT, reference).unwrap()
     }
     fn path(&self, reference: &str) -> PathBuf {
         self.root.join(format!("wal/{reference}.wal"))
@@ -66,10 +66,10 @@ impl CutArtifacts for Artifacts {
         for name in Self::ref_names(state) {
             match op {
                 Op::Prepare => {
-                    broca_wal::migration::freeze(
+                    broca_records::move_fence::freeze(
                         &self.root,
                         &self.path(&name),
-                        &broca_wal::migration::Freeze {
+                        &broca_records::move_fence::Freeze {
                             store_head_version: None,
                             cut_id: CUT.into(),
                             end_offset: 0,
@@ -80,23 +80,28 @@ impl CutArtifacts for Artifacts {
                     .map_err(unavailable)?;
                 }
                 Op::Release => {
-                    broca_wal::migration::release(&self.root, &self.path(&name), CUT, "remote")
-                        .map_err(unavailable)?
-                        .map_err(unavailable)?;
+                    broca_records::move_fence::release(
+                        &self.root,
+                        &self.path(&name),
+                        CUT,
+                        "remote",
+                    )
+                    .map_err(unavailable)?
+                    .map_err(unavailable)?;
                 }
                 Op::Abort => {
-                    broca_wal::migration::abort_freeze(&self.path(&name), CUT)
+                    broca_records::move_fence::abort_freeze(&self.path(&name), CUT)
                         .map_err(unavailable)?;
-                    broca_wal::migration::unlink(&self.staged(&name)).map_err(unavailable)?;
+                    broca_records::move_fence::unlink(&self.staged(&name)).map_err(unavailable)?;
                 }
                 Op::Export => {}
                 Op::Import => {
                     let bytes = format!("cut:{name}");
-                    broca_wal::migration::stage(
+                    broca_records::move_fence::stage(
                         &self.root,
                         &self.staged(&name),
                         bytes.as_bytes(),
-                        &broca_wal::migration::digest(bytes.as_bytes()),
+                        &broca_records::move_fence::digest(bytes.as_bytes()),
                     )
                     .map_err(unavailable)?;
                 }
@@ -112,7 +117,7 @@ impl CutArtifacts for Artifacts {
                     {
                         return Err(unavailable("installed digest mismatch"));
                     }
-                    broca_wal::migration::sync_dir(self.path(&name).parent().unwrap())
+                    broca_records::move_fence::sync_dir(self.path(&name).parent().unwrap())
                         .map_err(unavailable)?;
                 }
                 Op::Describe | Op::Busy | Op::Diverged | Op::Status => {}
@@ -128,8 +133,8 @@ impl CutArtifacts for Artifacts {
     }
     async fn rollback(&self, _request: &Request, state: &CutState) -> Result<(), ErrorBody> {
         for name in Self::ref_names(state) {
-            broca_wal::migration::abort_freeze(&self.path(&name), CUT).map_err(unavailable)?;
-            broca_wal::migration::unlink(&self.staged(&name)).map_err(unavailable)?;
+            broca_records::move_fence::abort_freeze(&self.path(&name), CUT).map_err(unavailable)?;
+            broca_records::move_fence::unlink(&self.staged(&name)).map_err(unavailable)?;
         }
         Ok(())
     }
@@ -152,10 +157,10 @@ impl CutArtifacts for Artifacts {
                     let expected = format!("cut:{name}");
                     match std::fs::read(self.staged(&name)) {
                         Ok(bytes)
-                            if broca_wal::migration::digest(&bytes)
-                                == broca_wal::migration::digest(expected.as_bytes()) => {}
+                            if broca_records::move_fence::digest(&bytes)
+                                == broca_records::move_fence::digest(expected.as_bytes()) => {}
                         Ok(_) => {
-                            broca_wal::migration::unlink(&self.staged(&name))
+                            broca_records::move_fence::unlink(&self.staged(&name))
                                 .map_err(unavailable)?;
                             return Ok(None);
                         }
@@ -189,10 +194,10 @@ async fn status_keeps_prepare_intent_byte_identical_and_repeat_rolls_forward_all
         ..CutState::default()
     };
     store.save(CUT, &state).unwrap();
-    broca_wal::migration::freeze(
+    broca_records::move_fence::freeze(
         &root,
         &artifacts.path("a"),
-        &broca_wal::migration::Freeze {
+        &broca_records::move_fence::Freeze {
             store_head_version: None,
             cut_id: CUT.into(),
             end_offset: 0,
@@ -336,7 +341,7 @@ async fn multi_ref_release_failure_retains_intent_fence_and_boot_completes_every
         .unwrap();
     assert_eq!(std::fs::read(store.path(CUT)).unwrap(), before);
     assert_eq!(
-        broca_wal::migration::cut_fence(&root, "b").unwrap(),
+        broca_records::move_fence::cut_fence(&root, "b").unwrap(),
         Some(CUT.into())
     );
     artifacts.fail_after.store(usize::MAX, Ordering::SeqCst);
@@ -382,11 +387,11 @@ async fn pending_import_verifies_the_entire_ref_set_before_recording_completion(
         ..CutState::default()
     };
     store.save(CUT, &state).unwrap();
-    broca_wal::migration::stage(
+    broca_records::move_fence::stage(
         &root,
         &artifacts.staged("a"),
         b"cut:a",
-        &broca_wal::migration::digest(b"cut:a"),
+        &broca_records::move_fence::digest(b"cut:a"),
     )
     .unwrap();
     store.reconcile_boot(&artifacts).await.unwrap();
@@ -396,11 +401,11 @@ async fn pending_import_verifies_the_entire_ref_set_before_recording_completion(
         .unwrap()
         .replies
         .contains_key(Op::Import.method()));
-    broca_wal::migration::stage(
+    broca_records::move_fence::stage(
         &root,
         &artifacts.staged("b"),
         b"invalid",
-        &broca_wal::migration::digest(b"invalid"),
+        &broca_records::move_fence::digest(b"invalid"),
     )
     .unwrap();
     store.reconcile_boot(&artifacts).await.unwrap();
@@ -434,12 +439,13 @@ async fn abort_intent_after_staging_unlink_is_not_mistaken_for_activation() {
         .await
         .unwrap();
     for name in ["a", "b"] {
-        broca_wal::migration::durable_dir(&root, artifacts.path(name).parent().unwrap()).unwrap();
+        broca_records::move_fence::durable_dir(&root, artifacts.path(name).parent().unwrap())
+            .unwrap();
         std::fs::write(artifacts.path(name), format!("cut:{name}")).unwrap();
-        broca_wal::migration::atomic_json(
+        broca_records::move_fence::atomic_json(
             &root,
             &artifacts.path(name).with_extension("moved"),
-            &broca_wal::migration::Moved {
+            &broca_records::move_fence::Moved {
                 cut_id: "old-cut".into(),
                 holder: "remote".into(),
                 lineage_id: name.into(),
@@ -453,7 +459,7 @@ async fn abort_intent_after_staging_unlink_is_not_mistaken_for_activation() {
         request: params(),
     });
     store.save(CUT, &state).unwrap();
-    broca_wal::migration::unlink(&artifacts.staged("a")).unwrap();
+    broca_records::move_fence::unlink(&artifacts.staged("a")).unwrap();
     store.reconcile_boot(&artifacts).await.unwrap();
     let state = store.load(CUT).unwrap();
     assert!(state.replies.contains_key(Op::Abort.method()));
@@ -470,7 +476,7 @@ async fn activate_failure_fences_the_first_installed_ref_and_refuses_abort() {
     let root = root("activate");
     let store = CutStore::new(&root);
     let artifacts = Artifacts::new(root.clone());
-    broca_wal::migration::durable_dir(&root, &root.join("wal")).unwrap();
+    broca_records::move_fence::durable_dir(&root, &root.join("wal")).unwrap();
     store
         .execute(
             contract::ADMITTED_CALLER,
@@ -499,7 +505,7 @@ async fn activate_failure_fences_the_first_installed_ref_and_refuses_abort() {
     );
     let before = std::fs::read(store.path(CUT)).unwrap();
     assert_eq!(
-        broca_wal::migration::cut_fence(&root, "a").unwrap(),
+        broca_records::move_fence::cut_fence(&root, "a").unwrap(),
         Some(CUT.into())
     );
     assert_eq!(std::fs::read(artifacts.path("a")).unwrap(), b"cut:a");
@@ -536,7 +542,10 @@ async fn activate_failure_fences_the_first_installed_ref_and_refuses_abort() {
         .unwrap();
     assert!(store.load(CUT).unwrap().intent.is_none());
     assert_eq!(std::fs::read(artifacts.path("b")).unwrap(), b"cut:b");
-    assert_eq!(broca_wal::migration::cut_fence(&root, "a").unwrap(), None);
+    assert_eq!(
+        broca_records::move_fence::cut_fence(&root, "a").unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -667,7 +676,7 @@ async fn mapless_cut_is_unreadable_before_any_artifact_resolution() {
     let store = CutStore::new(&root);
     let artifacts = Artifacts::new(root.clone());
     let state = json!({"step":"prepared","refs":params()["refs"],"intent":null,"replies":{}});
-    broca_wal::migration::atomic_json(&root, &store.path(CUT), &state).unwrap();
+    broca_records::move_fence::atomic_json(&root, &store.path(CUT), &state).unwrap();
     let error = store
         .execute(
             "reserved:entorhinal",
@@ -741,7 +750,7 @@ async fn a_damaged_cut_file_does_not_stop_boot_reconciliation() {
         "the damaged cut is left untouched"
     );
     assert!(
-        broca_wal::migration::cut_fence(&root, "b").is_err(),
+        broca_records::move_fence::cut_fence(&root, "b").is_err(),
         "the move fence still fails closed on the damaged cut"
     );
 }

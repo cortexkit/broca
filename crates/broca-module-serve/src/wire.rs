@@ -876,7 +876,7 @@ mod tests {
             },
         });
         let fresh = AnthropicMessages.shape(&frozen, &CallOptions::new(submission.input.clone()));
-        let queued = broca_wal::WalRecord::Queued {
+        let queued = broca_records::record::WalRecord::Queued {
             message_marks: None,
             sent_by: None,
             written_at_ms: None,
@@ -894,7 +894,8 @@ mod tests {
             principal: None,
         };
         let durable_bytes = serde_json::to_vec(&queued).unwrap();
-        let replayed: broca_wal::WalRecord = serde_json::from_slice(&durable_bytes).unwrap();
+        let replayed: broca_records::record::WalRecord =
+            serde_json::from_slice(&durable_bytes).unwrap();
         let drained = broca_core::pending_submissions(&[replayed])
             .pop()
             .expect("queued request survives replay");

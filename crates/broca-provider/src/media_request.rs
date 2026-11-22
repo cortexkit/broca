@@ -94,7 +94,7 @@ impl MediaAging {
     pub fn replay_wal(
         profile: &MediaProfile,
         session: &mut SessionMedia,
-        records: &[broca_wal::WalRecord],
+        records: &[broca_records::record::WalRecord],
     ) -> Result<Self, String> {
         let mut state = Self::default();
         let mut step_open = false;
@@ -102,9 +102,9 @@ impl MediaAging {
         for record in records {
             state.fold_wal_record(&mut active, session, record)?;
             match record {
-                broca_wal::WalRecord::RunStarted { .. } => step_open = false,
-                broca_wal::WalRecord::StepStarted { .. } => step_open = true,
-                broca_wal::WalRecord::ModelStepFinished { .. } => step_open = false,
+                broca_records::record::WalRecord::RunStarted { .. } => step_open = false,
+                broca_records::record::WalRecord::StepStarted { .. } => step_open = true,
+                broca_records::record::WalRecord::ModelStepFinished { .. } => step_open = false,
                 _ => {}
             }
         }
@@ -234,12 +234,14 @@ impl MediaAging {
         &mut self,
         active: &mut MediaProfile,
         session: &mut SessionMedia,
-        record: &broca_wal::WalRecord,
+        record: &broca_records::record::WalRecord,
     ) -> Result<(), String> {
         session.fold(record)?;
         let frozen = match record {
-            broca_wal::WalRecord::RunStarted { config, .. } => Some(&config.frozen_render_config),
-            broca_wal::WalRecord::RunConfigRefrozen {
+            broca_records::record::WalRecord::RunStarted { config, .. } => {
+                Some(&config.frozen_render_config)
+            }
+            broca_records::record::WalRecord::RunConfigRefrozen {
                 frozen_render_config,
                 ..
             } => Some(frozen_render_config),
@@ -262,10 +264,10 @@ impl MediaAging {
             self.fold_changes(active, session.take_changes());
         }
         match record {
-            broca_wal::WalRecord::ModelAttemptFinished { .. } => {
+            broca_records::record::WalRecord::ModelAttemptFinished { .. } => {
                 self.apply(active, AgingEvent::Boundary)
             }
-            broca_wal::WalRecord::ModelStepFinished { .. } => {
+            broca_records::record::WalRecord::ModelStepFinished { .. } => {
                 self.apply(active, AgingEvent::Boundary);
             }
             _ => {}

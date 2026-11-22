@@ -153,7 +153,7 @@ struct RenderedEntry {
     parts: Vec<PlanPart>,
     original: Message,
     next: Option<Message>,
-    rides: Vec<Option<Vec<Option<broca_wal::record::RideMetadata>>>>,
+    rides: Vec<Option<Vec<Option<broca_records::record::RideMetadata>>>>,
     message: Message,
     results: Vec<(usize, ContentBlock)>,
     held: Vec<(usize, String)>,
@@ -184,7 +184,7 @@ fn entry_inputs<'a>(
     position: usize,
 ) -> (
     Option<&'a Message>,
-    Vec<Option<&'a Vec<Option<broca_wal::record::RideMetadata>>>>,
+    Vec<Option<&'a Vec<Option<broca_records::record::RideMetadata>>>>,
 ) {
     let next = stored
         .get(position + 1)
@@ -885,7 +885,7 @@ fn render_result(
 fn append_delivery(
     output: &mut ToolOutput,
     delivery: &cortexkit_role_compaction::part::Delivered,
-    envelope: Option<&broca_wal::record::RideMetadata>,
+    envelope: Option<&broca_records::record::RideMetadata>,
     held: Option<&mut Vec<String>>,
 ) {
     let Some(text) = &delivery.text else {
@@ -896,7 +896,7 @@ fn append_delivery(
         return;
     }
     match envelope.map(|envelope| envelope.form) {
-        Some(broca_wal::record::RideForm::Append) => {
+        Some(broca_records::record::RideForm::Append) => {
             let envelope = envelope.unwrap();
             let ride = cortexkit_role_llm_runner::rides::Ride::new(
                 &envelope.send_id,

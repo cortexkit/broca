@@ -29,7 +29,7 @@
 use std::collections::HashSet;
 
 use broca_protocol::{SubmissionId, SubmissionRequest};
-use broca_wal::WalRecord;
+use broca_records::record::WalRecord;
 use serde::{Deserialize, Serialize};
 
 /// One pending submission: its id + the caller's full request, ready to consume into a run
@@ -48,7 +48,7 @@ pub struct PendingSubmission {
     /// Durable pre_user output. The caller request stays unchanged for keyed retries;
     /// the drain uses hooks.final as the rendered input without running hooks again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<Box<broca_wal::Hooks>>,
+    pub hooks: Option<Box<broca_records::record::Hooks>>,
     /// Routing affinity retained until this submission admits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_key: Option<String>,
@@ -221,7 +221,7 @@ mod tests {
         request::{GenerationConfig, ModelHandle, ToolChoice},
         BindIdentity, RunId,
     };
-    use broca_wal::{RunConfig, RunOrigin};
+    use broca_records::{record::RunConfig, record::RunOrigin};
 
     fn msg(text: &str) -> Message {
         Message {

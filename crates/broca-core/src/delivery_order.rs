@@ -18,8 +18,7 @@ use broca_protocol::{
     content::{ContentBlock, Message, Role, ToolOutput, ToolResult},
     BindPrincipal, DeliveryMode, DeliveryOrder, RunId, SubmissionId, ToolCallId,
 };
-use broca_wal::{record::SendEndReason, WalRecord};
-use std::sync::Arc;
+use broca_records::record::SendEndReason;
 
 /// What a request boundary offers, for choosing a send's mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +155,11 @@ pub fn append_to_result(result: &mut ToolResult, text: &str) {
 
 /// New ride envelopes preserve the native content list; legacy deliveries keep their
 /// original renderer because a resumed model request must not acquire different bytes.
-pub fn append_ride(result: &mut ToolResult, ride: &broca_wal::record::RideMetadata, text: &str) {
+pub fn append_ride(
+    result: &mut ToolResult,
+    ride: &broca_records::record::RideMetadata,
+    text: &str,
+) {
     let rides = [cortexkit_role_llm_runner::rides::Ride::new(
         &ride.send_id,
         &ride.sender,
@@ -207,7 +210,7 @@ pub(crate) fn append_ride_output(
 pub fn apply_ride_to_prompt(
     prompt: &mut [Message],
     call: &ToolCallId,
-    ride: &broca_wal::record::RideMetadata,
+    ride: &broca_records::record::RideMetadata,
     text: &str,
 ) -> bool {
     if let Some(message) = prompt
@@ -269,25 +272,16 @@ impl OrderedSend {
     }
 }
 
-/// Freeze a rendered template at its conversation position. Admission chooses whether
-/// system authority is possible; replay uses the stored message without re-rendering slots.
-pub fn system_delivered(send: &OrderedSend, run_id: &RunId) -> WalRecord {
+/// The messages a `turn_system` delivery of `send` places: its input as turn-scoped system
+/// text. Admission chooses whether system authority is possible; the delivery's record keeps
+/// these messages, so a later render uses them without rendering the send again.
+pub fn system_messages(send: &OrderedSend) -> Vec<Message> {
     let mut input = send.input.clone();
     for message in &mut input {
         message.role = Role::System;
         message.turn_system = true;
     }
-    WalRecord::SendDelivered {
-        ride: None,
-        written_at_ms: send.admitted_at_ms,
-        tags: None,
-        submission_id: send.submission_id.clone(),
-        run_id: run_id.clone(),
-        mode: DeliveryMode::TurnSystem,
-        input: Some(Arc::new(input)),
-        tool_call_id: None,
-        appended_text: None,
-    }
+    input
 }
 
 /// What became of the queued send whose submission is `sub-<run_id>`, read from the WAL alone.
@@ -557,7 +551,7 @@ mod ride_v2_tests {
     }
 
     #[test]
-    fn rides_v2_framed_resume_preserves_old_and_new_multipart_rules() {
+    fn rides_v2_keep_old_and_new_multipart_rules() {
         let source = serde_json::json!([{"image":"opaque"},{"text":"caption"}]);
         let mut old = ToolResult {
             tool_call_id: ToolCallId("call".into()),
@@ -585,22 +579,11 @@ mod ride_v2_tests {
                 serde_json::json!([{"text":"caption"},{"image":"opaque"},{"text":"\n\nnote"}]),
             ),
         ] {
-            let record: WalRecord = serde_json::from_value(serde_json::json!({"type":"send_delivered","submission_id":"submission","run_id":"run","mode":"tool_result","tool_call_id":"call","appended_text":"\n\nnote","ride":{"call_key":"log:7","send_id":"send","sender":"sender","forms":["tool_result"],"form":"append"}})).unwrap();
-            let bytes = broca_wal::framing::encode(8, 1, &record).unwrap();
-            let broca_wal::framing::DecodeStep::Record { framed, .. } =
-                broca_wal::framing::decode_next(&bytes)
-            else {
-                panic!("ride frame refused")
-            };
-            let WalRecord::SendDelivered {
-                ride: Some(ride),
-                appended_text: Some(text),
-                tool_call_id: Some(call),
-                ..
-            } = framed.record
-            else {
-                panic!("ride envelope lost")
-            };
+            let ride: broca_records::record::RideMetadata = serde_json::from_value(
+                serde_json::json!({"call_key":"log:7","send_id":"send","sender":"sender","forms":["tool_result"],"form":"append"}),
+            )
+            .unwrap();
+            let (call, text) = (ToolCallId("call".into()), "\n\nnote");
             let mut prompt = vec![Message::new(
                 Role::Tool,
                 vec![ContentBlock::ToolResult(ToolResult {
@@ -611,7 +594,7 @@ mod ride_v2_tests {
                     is_error: false,
                 })],
             )];
-            assert!(apply_ride_to_prompt(&mut prompt, &call, &ride, &text));
+            assert!(apply_ride_to_prompt(&mut prompt, &call, &ride, text));
             let ContentBlock::ToolResult(result) = &prompt[0].content[0] else {
                 unreachable!()
             };
