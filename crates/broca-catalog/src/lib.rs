@@ -36,7 +36,9 @@ pub use runtime::{
     FusiformCatalogResponse, ModelBatchRow, FUSIFORM_FACT_PREFIXES,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::BTreeSet;
 
 use broca_provider::policy::{Quirks, TokenLimitField, UsagePolicy};
 use broca_provider::spec::{
@@ -183,8 +185,10 @@ pub struct Catalog {
     /// Suppressed identities retained only to seed the test fixture cache after rows are removed.
     #[cfg(any(test, feature = "test-support"))]
     overlay_removed_models: BTreeMap<String, BTreeSet<String>>,
-    /// Explicit upstream withdrawals retained from fusiform's `include_retired` response. These
-    /// are not serveable rows, but keeping the identity distinguishes a withdrawal from a typo.
+    /// Explicit upstream withdrawals retained from fusiform's `include_retired` response, only to
+    /// seed the test fixture cache: a withdrawn identity there reads as withdrawn, not as a typo.
+    /// The serving catalog keeps its own copy from the response.
+    #[cfg(any(test, feature = "test-support"))]
     withdrawn_models: BTreeSet<(String, String)>,
     metadata: Option<Metadata>,
 }
@@ -383,6 +387,7 @@ impl Catalog {
             overlay_added,
             #[cfg(any(test, feature = "test-support"))]
             overlay_removed_models,
+            #[cfg(any(test, feature = "test-support"))]
             withdrawn_models: BTreeSet::new(),
             metadata: None,
         })
