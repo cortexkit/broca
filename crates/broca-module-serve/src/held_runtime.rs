@@ -395,11 +395,33 @@ impl HeldRuntime {
             _ = stopping.cancelled() => return,
             opened = registry.open_registered_sessions(sessions, RECOVERY_CONCURRENCY) => opened,
         };
+        // This recovery runs before the deployment key has loaded (it takes a few seconds after a
+        // start), so an encrypted session is refused here. That refusal is expected and not a
+        // loss: the store slot remembers every session refused for want of the key, and the key
+        // loader opens them all once it loads. Only the other failures are warnings. A key that
+        // loads between the refusal and this check makes one expected refusal read as a
+        // warning; the key loader still opens that session.
+        let runtime = registry.store_runtime();
+        let waits_for_key = |session: &BindIdentity| {
+            runtime.as_ref().is_some_and(|runtime| {
+                runtime.holds(session).unwrap_or(false)
+                    && !runtime.readable_now(session).unwrap_or(true)
+            })
+        };
+        let (after_key, failed): (Vec<_>, Vec<_>) = failed
+            .into_iter()
+            .partition(|(session, _)| waits_for_key(session));
         for (session, error) in &failed {
             tracing::warn!(target: "late_results", session = %session.session, "late-results recovery could not open a registered session: {error}");
         }
-        if opened > 0 || !failed.is_empty() {
-            tracing::info!(target: "late_results", opened, failed = failed.len(), "late-results recovery opened registered sessions");
+        if opened > 0 || !failed.is_empty() || !after_key.is_empty() {
+            tracing::info!(
+                target: "late_results",
+                opened,
+                failed = failed.len(),
+                after_key = after_key.len(),
+                "late-results recovery opened registered sessions; the encrypted ones open once the deployment key loads"
+            );
         }
         self.recover_feeds(modules.into_iter().collect(), stopping.clone())
             .await;
