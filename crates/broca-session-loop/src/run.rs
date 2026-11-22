@@ -411,14 +411,11 @@ pub enum LoopError {
     Refused(broca_core::RunError),
 }
 
-impl From<SessionError> for LoopError {
-    fn from(error: SessionError) -> Self {
-        LoopError::Session(error)
-    }
-}
+mod entry;
+pub use entry::run;
 
-/// Runs `admission` to its end on the session behind `writer`.
-pub async fn run<W, P, T>(
+/// The body of [`run`], which boxes it.
+async fn run_loop<W, P, T>(
     writer: &mut W,
     parts: &mut dyn Parts,
     admission: Admission,
