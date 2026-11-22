@@ -413,6 +413,9 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::TURN_DIRECTIVES,
         "plans",
         cortexkit_role_llm_runner::capabilities::SYSTEM_TEXT_DEFAULT,
+        // A system-text item's facts are checked at admission and sent unchanged to a
+        // provider that declares it reads them.
+        cortexkit_role_llm_runner::capabilities::PLAN_FACTS,
         "fetch-plan-optional-tools/v1",
         SEND_TOOL_REPLY_BOUND_CAPABILITY,
         "session_class",
@@ -1472,7 +1475,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "9bcc622a24822829385ebad14ece47e1a514bd475ae0b1e49069fadf69b4ed91",
+            "daedb2cc632f140b25d28d24ed045d8c143da847b1f9f02a602bec0165026801",
         );
     }
 
@@ -1669,7 +1672,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "b5c9faf32e38a9f07fe123a4d31db747b0889ed140d528cc53f27f5bb02ff481";
+        "62ab0df923174b0adbbb605ccc640c446713fb61213e332060049358f41a9546";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

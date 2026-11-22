@@ -40,6 +40,12 @@ pub struct Item {
     /// their declared reference slots scanned. Only a runner serving the group accepts the
     /// member at all ([`OutputRefsSupport`]); absent means false.
     pub output_refs: bool,
+    /// On a system-text item, the rendering facts its composer froze with the plan
+    /// (llm-runner `plan_facts`): the model, the harness and its declared host facts, the
+    /// served tools and the senders that may start a turn. The fetch sends them unchanged,
+    /// and only to a provider whose manifest declares `system-text-facts/v1`. Never read on
+    /// other items.
+    pub facts: Option<cortexkit_role_tool_provider::SystemTextFacts>,
 }
 
 /// A step-transform item: an [`Item`] and the hook subscriptions frozen into the plan.
@@ -264,7 +270,29 @@ fn item(value: &Value, at: &str, may_be_optional: bool) -> Result<Item, Refusal>
         params,
         optional,
         output_refs: object.get("output_refs") == Some(&Value::Bool(true)),
+        facts: None,
     })
+}
+
+/// Read each system-text item's `facts` (llm-runner `plan_facts`) into `items`, refusing a
+/// malformed one by its field before anything is fetched or written. The facts decode
+/// strictly: a list out of byte order, a duplicate or an unknown member is refused, never
+/// repaired, so the provider receives exactly the composer's canonical bytes.
+fn read_system_text_facts(plan: &Map<String, Value>, items: &mut [Item]) -> Result<(), Refusal> {
+    let values = plan
+        .get("system_text_items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for (index, (value, item)) in values.zip(items.iter_mut()).enumerate() {
+        if let Some(facts) = value.get("facts") {
+            item.facts =
+                Some(serde_json::from_value(facts.clone()).map_err(|_| {
+                    Refusal::invalid(format!("plan.system_text_items[{index}].facts"))
+                })?);
+        }
+    }
+    Ok(())
 }
 
 /// New compaction sessions need an explicit provider preset. Keep this separate
@@ -438,7 +466,8 @@ pub fn parse_plan_with(
     check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;
-    let system_text_items = items(object, "system_text_items", true)?;
+    let mut system_text_items = items(object, "system_text_items", true)?;
+    read_system_text_facts(object, &mut system_text_items)?;
     if let Some((index, _)) = system_text_items.iter().enumerate().find(|(_, item)| {
         item.optional && broca_protocol::same_module(&item.provider, PERSONA_PROVIDER)
     }) {

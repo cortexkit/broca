@@ -376,6 +376,16 @@ impl Fetcher for SubcPlanFetcher {
                 })
             }))
     }
+    async fn system_text_facts_supported(&self, provider: &str) -> Result<bool, FetchError> {
+        let entries = self.catalog_snapshot().await?;
+        Ok(crate::provider_catalog::find_module(&entries, provider)
+            .and_then(|entry| entry.capabilities.as_ref())
+            .is_some_and(|caps| {
+                caps.provides.iter().any(|capability| {
+                    capability == cortexkit_role_tool_provider::SYSTEM_TEXT_FACTS_V1
+                })
+            }))
+    }
     async fn catalog(&self, provider: &str, request: &CatalogRequest) -> Result<Value, FetchError> {
         let arguments =
             serde_json::to_value(request).map_err(|error| FetchError::Lost(error.to_string()))?;

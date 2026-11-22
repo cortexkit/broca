@@ -1379,6 +1379,7 @@ impl subc_client_rs::ModuleHandler for DefaultTextProvider {
         #[derive(serde::Deserialize)]
         struct Arguments {
             system_text: Option<Box<serde_json::value::RawValue>>,
+            facts: Option<Box<serde_json::value::RawValue>>,
         }
         let envelope: Envelope = serde_json::from_slice(&body).unwrap();
         let arguments: Arguments = serde_json::from_str(envelope.arguments.get()).unwrap();
@@ -1389,6 +1390,9 @@ impl subc_client_rs::ModuleHandler for DefaultTextProvider {
             if let Some(item) = arguments.system_text {
                 seen.provider_items.push(item.get().as_bytes().to_vec());
             }
+            // One entry per fetch, as it arrived: the system-text facts cases compare bytes.
+            seen.provider_facts
+                .push(arguments.facts.map(|facts| facts.get().as_bytes().to_vec()));
         }
         let request: Value = serde_json::from_slice(&body).unwrap();
         let composition = &request["arguments"]["composition"];

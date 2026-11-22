@@ -194,6 +194,7 @@ fn checking(id: &str) -> Arc<broca_fetch_plan::Plan> {
                 .unwrap(),
             optional: false,
             output_refs: false,
+            facts: None,
         }],
         compaction_item: None,
         step_items: Vec::new(),

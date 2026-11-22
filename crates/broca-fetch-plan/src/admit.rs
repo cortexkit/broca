@@ -422,6 +422,12 @@ pub trait Fetcher: Send + Sync {
     async fn system_text_default_supported(&self, _provider: &str) -> Result<bool, FetchError> {
         Ok(false)
     }
+    /// Whether the provider's daemon catalog entry declares `system-text-facts/v1`, so its
+    /// fetch may carry the plan's system-text facts. A provider that doesn't is never sent
+    /// them: an older one may refuse the unknown member.
+    async fn system_text_facts_supported(&self, _provider: &str) -> Result<bool, FetchError> {
+        Ok(false)
+    }
     /// One `tool.catalog` call to `provider`.
     async fn catalog(&self, provider: &str, request: &CatalogRequest) -> Result<Value, FetchError>;
     /// One `transform.declare` call to `provider`.
@@ -789,6 +795,10 @@ async fn catalog_with_optional_keepalive(
 #[cfg(test)]
 #[path = "yield_discovery_tests.rs"]
 mod yield_discovery_tests;
+
+#[cfg(test)]
+#[path = "system_text_facts_tests.rs"]
+mod system_text_facts_tests;
 
 /// A provider's decoded catalog answer.
 #[derive(Debug, Clone)]
@@ -1190,9 +1200,22 @@ struct CatalogFetch<'a> {
     provider: &'a str,
     tool_item: Option<&'a Item>,
     text_item: Option<&'a Item>,
+    /// The provider declares `system-text-facts/v1`, so the text item's facts, when it has
+    /// any, go with the fetch. Asked only of a provider whose text item has facts.
+    facts_supported: bool,
 }
 
 impl CatalogFetch<'_> {
+    /// The catalog request for this fetch against `plan`, carrying the text item's facts
+    /// unchanged where the provider declared it reads them.
+    fn request(&self, plan: &Plan, tool_item: Option<&Item>) -> CatalogRequest {
+        let mut request = catalog_request(plan, tool_item, self.text_item);
+        if self.facts_supported {
+            request.facts = self.text_item.and_then(|item| item.facts.clone());
+        }
+        request
+    }
+
     /// An optional tool's absence also removes any text from that provider. The persona's
     /// provider is never optional: its text is required, whatever its tool item says.
     fn optional(&self) -> bool {
@@ -1262,11 +1285,29 @@ pub async fn admit(
                     .system_text_items
                     .iter()
                     .find(|t| t.provider == item.provider),
+                facts_supported: false,
             });
         }
     }
+    for fetch in &mut catalog_fetches {
+        if fetch.text_item.is_none_or(|item| item.facts.is_none()) {
+            continue;
+        }
+        let provider = fetch.provider;
+        fetch.facts_supported =
+            within_deadline(deadline, || fetcher.system_text_facts_supported(provider))
+                .await
+                .map_err(|error| {
+                    let missed = FetchMiss::from_error(error);
+                    Refusal::FetchUnavailable {
+                        provider: provider.to_owned(),
+                        unanswered: missed.unanswered.clone(),
+                        provider_detail: missed.provider_detail("catalog.list"),
+                    }
+                })?;
+    }
     let catalogs = futures::future::join_all(catalog_fetches.iter().map(|fetch| {
-        let request = catalog_request(plan, fetch.tool_item, fetch.text_item);
+        let request = fetch.request(plan, fetch.tool_item);
         let fetch_deadline = if fetch.optional_tools() {
             deadline.min(started + OPTIONAL_TOOL_BUDGET)
         } else {
@@ -1388,11 +1429,11 @@ pub async fn admit(
             admitted_plan.composed.remove(*provider);
         }
         let texts = futures::future::join_all(catalog_fetches.iter().filter_map(|fetch| {
-            let text_item = fetch.text_item?;
+            fetch.text_item?;
             if absent_tools.contains(fetch.provider) {
                 return None;
             }
-            let request = catalog_request(&admitted_plan, None, Some(text_item));
+            let request = fetch.request(&admitted_plan, None);
             Some(async move {
                 let outcome =
                     within_deadline(deadline, || fetcher.catalog(fetch.provider, &request))
@@ -1787,6 +1828,7 @@ mod tests {
             params: serde_json::Map::new(),
             optional,
             output_refs: false,
+            facts: None,
         }
     }
 
@@ -1805,6 +1847,7 @@ mod tests {
                 provider,
                 tool_item: Some(&tool),
                 text_item: Some(&text),
+                facts_supported: false,
             };
             assert_eq!(fetch.optional(), optional, "{provider}");
             assert_eq!(fetch.optional_tools(), optional, "{provider}");
@@ -2003,6 +2046,7 @@ mod tests {
                     params: serde_json::Map::new(),
                     optional: false,
                     output_refs: false,
+                    facts: None,
                 },
                 subscriptions: Vec::new(),
             }],

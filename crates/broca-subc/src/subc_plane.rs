@@ -1109,6 +1109,7 @@ impl SubcToolPlane {
                     params: Default::default(),
                     optional: false,
                     output_refs: false,
+                    facts: None,
                 });
         self
     }
