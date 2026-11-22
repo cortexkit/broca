@@ -732,9 +732,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let step_events = Arc::new(broca_module_serve::step_events::StepEvents::start_on_bus(
         bus_connector.clone(),
     ));
-    // Account observations also go on the bus as route facts (routing 0.7.36 §8.1).
+    // Account observations also go on the bus as route facts (routing 0.7.36 §8.1). A run's end
+    // also stores its `run_finished` fact in the outbox, and routing's answer settles it there.
     if let Some(routing) = &classifier_router {
         routing.client.set_route_facts(bus_connector.clone());
+        if let Some(events) = &store_run_events {
+            routing.client.set_route_fact_outbox(events.clone());
+        }
     }
     let mut opener_builder =
         broca_module::DefaultOpener::new(lease_store, executor, Arc::clone(&store_slot))

@@ -1349,6 +1349,8 @@ pub struct RoutingClient {
     config: AccountSelectionConfig,
     /// Where observations are also published as route facts, once the bus link is set up.
     route_facts: std::sync::OnceLock<Arc<dyn crate::route_facts::RouteFactPublisher>>,
+    /// Where a run's end stored its `run_finished` route fact, settled once routing has it.
+    route_fact_outbox: std::sync::OnceLock<Arc<dyn crate::route_facts::RouteFactOutbox>>,
 }
 
 /// An answered refusal is distinct from an unavailable route. Classifier admission must
@@ -1477,12 +1479,34 @@ impl RoutingClient {
             counters: Arc::new(Counters::default()),
             config,
             route_facts: std::sync::OnceLock::new(),
+            route_fact_outbox: std::sync::OnceLock::new(),
         }
     }
 
     /// Also publish each observation as a route fact through `publisher` (see `route_facts`).
     pub fn set_route_facts(&self, publisher: Arc<dyn crate::route_facts::RouteFactPublisher>) {
         let _ = self.route_facts.set(publisher);
+    }
+
+    /// Settle in `outbox` the stored copy of each `run_finished` report routing receives.
+    pub fn set_route_fact_outbox(&self, outbox: Arc<dyn crate::route_facts::RouteFactOutbox>) {
+        let _ = self.route_fact_outbox.set(outbox);
+    }
+
+    /// Routing has `params`: when it is a run's end, its stored copy is not sent again.
+    async fn delivered(&self, params: &Value) {
+        let (Some(outbox), Some(fact_id)) = (
+            self.route_fact_outbox.get(),
+            params
+                .get("event_id")
+                .and_then(Value::as_str)
+                .filter(|_| params["kind"] == "run_finished"),
+        ) else {
+            return;
+        };
+        let outbox = Arc::clone(outbox);
+        let fact_id = fact_id.to_owned();
+        let _ = tokio::task::spawn_blocking(move || outbox.settle(&fact_id)).await;
     }
 
     pub fn counters(&self) -> Arc<Counters> {
@@ -1707,11 +1731,15 @@ impl RoutingClient {
                 == Ok(crate::routing_capabilities::CapabilitySupport::Declared);
         if streamed && self.publish_route_fact(ACCOUNT_OBSERVE_OP, &params).await {
             self.counters.bump("observe_sent");
+            self.delivered(&params).await;
             return;
         }
-        self.observe_directly(&params, deadline).await;
+        let answered = self.observe_directly(&params, deadline).await;
         if !streamed {
             self.publish_route_fact(ACCOUNT_OBSERVE_OP, &params).await;
+        }
+        if answered {
+            self.delivered(&params).await;
         }
     }
 
@@ -1742,19 +1770,23 @@ impl RoutingClient {
         }
     }
 
-    /// Send one observation as the direct `route.account_observe` call.
-    async fn observe_directly(&self, params: &Value, deadline: tokio::time::Instant) {
+    /// Send one observation as the direct `route.account_observe` call, and say whether routing
+    /// answered it (took it, or refused it by name). A report it refused is not worth resending.
+    async fn observe_directly(&self, params: &Value, deadline: tokio::time::Instant) -> bool {
         let body =
             match serde_json::to_vec(&json!({ "method": ACCOUNT_OBSERVE_OP, "params": params })) {
                 Ok(body) => body,
                 Err(_) => {
                     self.counters.bump("observe_failed");
-                    return;
+                    return false;
                 }
             };
         let kind = params["kind"].as_str().unwrap_or("?").to_string();
         match tokio::time::timeout_at(deadline, self.transport.request(body)).await {
-            Ok(Ok(Ok(_))) => self.counters.bump("observe_sent"),
+            Ok(Ok(Ok(_))) => {
+                self.counters.bump("observe_sent");
+                true
+            }
             Ok(Ok(Err(error)))
                 if serde_json::from_slice::<ErrorBodyView>(&error)
                     .is_ok_and(|error| error.code == SELECTION_DISABLED) =>
@@ -1762,7 +1794,8 @@ impl RoutingClient {
                 // Expected while routing's account selection is switched off: it refuses every
                 // account operation, yet still records the report for the decisions it computes
                 // without acting on them.
-                self.counters.bump("observe_disabled")
+                self.counters.bump("observe_disabled");
+                true
             }
             Ok(Ok(Err(error))) => {
                 self.counters.bump("observe_failed");
@@ -1771,10 +1804,12 @@ impl RoutingClient {
                     "routing refused a {kind} account report: {}",
                     String::from_utf8_lossy(&error)
                 );
+                true
             }
             Ok(Err(cause)) => {
                 self.counters.bump("observe_failed");
                 tracing::warn!(target: "accounts", "a {kind} account report was not delivered: {cause}");
+                false
             }
             Err(_) => {
                 self.counters.bump("observe_failed");
@@ -1783,6 +1818,7 @@ impl RoutingClient {
                     "a {kind} account report got no reply within {} s",
                     OBSERVE_BUDGET.as_secs()
                 );
+                false
             }
         }
     }

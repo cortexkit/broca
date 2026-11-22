@@ -124,6 +124,7 @@ opens it (`CREATE TABLE IF NOT EXISTS`).
 | `agent_data_session_ref`, `agent_data_session_ref_v2`, `agent_data_session_ref_v2_rule`, `agent_data_census*` | The session-ref index: which stored session each agent-data ref names, so an agent move finds sessions without reading every head, and the census that fills it from the session store. No session content. |
 | `session_scope_reservation` | One row per address a scoped bind reserved, with its owner and scope ref. |
 | `bus_event_outbox`, `send_state_outbox` | Bus publications waiting to be sent, recorded once the records they describe are durable. |
+| `route_fact_outbox` | The `run_finished` report each run routing admitted owes routing, stored with the run's end. Settled when the run's own report reaches routing; otherwise published as a `route_fact.v1` event after two minutes. |
 | `export_facts`, `export_meta`, `export_imported_runs` | The usage export (below). |
 
 None of these holds a session's records. Where a table is derived from them, the records win.

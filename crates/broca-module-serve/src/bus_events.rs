@@ -156,10 +156,16 @@ pub struct StoreRunEvents {
     /// Send state notices (see [`broca_module::store_send_states`]) that wait for the account,
     /// oldest first, each batch with the module each notice is for.
     waiting_sends: Mutex<VecDeque<Vec<(String, SendStateNotice)>>>,
+    /// Route facts the ends of routed runs owe routing (see [`broca_module::store_run_events`])
+    /// that wait for the account, oldest batch first.
+    waiting_facts: Mutex<VecDeque<RouteFacts>>,
     /// Each session's epoch and the seq of its last durable record, which a `run.progress`
     /// beat carries as its `seq`.
     positions: Mutex<HashMap<BindIdentity, (String, u64)>>,
 }
+
+/// Route facts, each its event id and its event body.
+type RouteFacts = Vec<(String, Vec<u8>)>;
 
 struct WaitingEvents {
     session: BindIdentity,
@@ -177,6 +183,7 @@ impl StoreRunEvents {
             store,
             waiting: Mutex::default(),
             waiting_sends: Mutex::default(),
+            waiting_facts: Mutex::default(),
             positions: Mutex::default(),
         })
     }
@@ -221,7 +228,20 @@ impl StoreRunEvents {
                 }
             }
         }
-        waiting.is_empty() && sends.is_empty()
+        let mut facts = self.waiting_facts.lock().unwrap();
+        while let Some(batch) = facts.front() {
+            match self.store.record_route_facts(batch, now_ms) {
+                Ok(true) => {
+                    facts.pop_front();
+                }
+                Ok(false) => break,
+                Err(error) => {
+                    tracing::warn!(target: "bus", %error, "could not record waiting route facts; retrying on the next pass");
+                    break;
+                }
+            }
+        }
+        waiting.is_empty() && sends.is_empty() && facts.is_empty()
     }
 
     /// The session's epoch and last durable seq, while its writer has told one.
@@ -266,7 +286,59 @@ impl broca_module::store_send_states::SendStateSink for StoreRunEvents {
     }
 }
 
+impl crate::route_facts::RouteFactOutbox for StoreRunEvents {
+    fn settle(&self, fact_id: &str) {
+        if let Err(error) = self.store.settle_route_fact(fact_id, now_ms()) {
+            tracing::warn!(target: "bus", %error, fact_id, "could not settle a stored route fact; the drain will publish it, and routing applies it once");
+        }
+    }
+}
+
 impl broca_module::store_run_events::RunEventSink for StoreRunEvents {
+    fn routed_ends(
+        &self,
+        _session: &BindIdentity,
+        ends: Vec<broca_module::store_run_events::RoutedRunEnd>,
+    ) {
+        let facts: RouteFacts = ends
+            .into_iter()
+            .filter_map(|end| {
+                let params = crate::account_routing::run_finished_body(
+                    &end.event_id,
+                    &end.admission_id,
+                    &end.run_id,
+                    end.reason,
+                    None,
+                );
+                match crate::route_facts::fact_body(crate::account_routing::ACCOUNT_OBSERVE_OP, &params) {
+                    Ok(body) => Some((end.event_id, body)),
+                    Err(error) => {
+                        tracing::warn!(target: "bus", %error, run_id = end.run_id, "a routed run's end report can't be stored as a route fact");
+                        None
+                    }
+                }
+            })
+            .collect();
+        if facts.is_empty() {
+            return;
+        }
+        let mut waiting = self.waiting_facts.lock().unwrap();
+        if waiting.is_empty() {
+            match self.store.record_route_facts(&facts, now_ms()) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(target: "bus", %error, "could not record route facts; they wait for the publisher's next pass");
+                }
+            }
+        }
+        if waiting.len() >= STORE_EVENTS_WAITING_CAP {
+            waiting.pop_front();
+            tracing::warn!(target: "bus", "too many route fact batches wait for the bus; dropping the oldest");
+        }
+        waiting.push_back(facts);
+    }
+
     fn durable(
         &self,
         session: &BindIdentity,

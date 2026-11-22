@@ -36,6 +36,25 @@ pub const STALE_BACKLOG_MS: u64 = 2 * 60 * 1000;
 /// The event name of the marker that stands in for skipped stale events of one session.
 pub const SKIPPED_EVENT: &str = "run.skipped";
 
+/// The event name and version of a route fact (routing 0.7.36 §8.1): one account observation
+/// broca reports to routing, `{op, params}`, published under the fact's own `event_id`.
+pub const ROUTE_FACT_EVENT: &str = "route_fact";
+pub const ROUTE_FACT_VERSION: u32 = 1;
+/// The largest route fact body the bus carries.
+pub const MAX_ROUTE_FACT_BYTES: usize = 4096;
+/// The bus header carrying a route fact body's digest, as `cortexkit-bus-client`'s
+/// `publish_event` writes it.
+const CONTENT_DIGEST_HEADER: &str = "Ck-Content-Digest";
+
+/// How long a stored route fact waits for the run's own report to deliver it before the drain
+/// publishes it instead. The report is sent the moment the run's end is durable, and settles the
+/// stored copy when routing has it; a copy left unsettled this long means the report never got
+/// through (the process stopped, or routing and the bus were both away) or was never sent (the
+/// run ended while paused, outside the task that reports). Routing applies a fact once by its
+/// event id, so a copy published after a slow report is harmless; the wait only saves routing
+/// a duplicate in the ordinary case.
+pub const ROUTE_FACT_GRACE_MS: u64 = 2 * 60 * 1000;
+
 /// What one stale-backlog pass replaced with markers.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SkipSummary {
@@ -127,15 +146,26 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             at_ms INTEGER NOT NULL, published_ms INTEGER
          );
          CREATE INDEX IF NOT EXISTS send_state_unpublished
-            ON send_state_outbox(at_ms) WHERE published_ms IS NULL;",
+            ON send_state_outbox(at_ms) WHERE published_ms IS NULL;
+         -- Route facts a run's end owes routing (`event.broca.route_fact.v1`), one row per fact,
+         -- keyed by the fact's event id. Settled when the run's own report reaches routing;
+         -- published by the drain, after run events and send states, once unsettled for
+         -- ROUTE_FACT_GRACE_MS.
+         CREATE TABLE IF NOT EXISTS route_fact_outbox (
+            fact_id TEXT PRIMARY KEY, subject TEXT NOT NULL, body BLOB NOT NULL,
+            at_ms INTEGER NOT NULL, published_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS route_fact_unpublished
+            ON route_fact_outbox(at_ms) WHERE published_ms IS NULL;",
     )
 }
 
 #[derive(Debug, Clone)]
 pub struct Publication {
-    /// The bus message id: the event's claim-check key for a run event,
-    /// `<session_ref>:advanced:<seq>` for a compaction advance notice, and
-    /// `<session_ref>:<send_id>:<seq>` for a send state notice.
+    /// The bus message id: for a run event, the key `run.event.get` fetches its body by,
+    /// `<session_ref>:advanced:<seq>` for a compaction advance notice,
+    /// `<session_ref>:<send_id>:<seq>` for a send state notice, and the fact's event id for a
+    /// route fact.
     pub event_key: String,
     pub subject: String,
     pub headers: Headers,
@@ -143,8 +173,8 @@ pub struct Publication {
     /// The bus digest when it is not the body's: a compaction advance notice carries no body,
     /// and its digest is the notice digest over its headers.
     pub digest: Option<ContentDigest>,
-    /// Whether the body travels as the message's payload. A send state notice does: it is
-    /// small, and its subscriber reads it straight off the message. The others carry an empty
+    /// Whether the body travels as the message's payload. A send state notice and a route fact
+    /// do: they are small, and their subscribers read them straight off the message. The others carry an empty
     /// payload and a digest: a run event's body is fetched with `run.event.get`, and a compaction
     /// advance notice has no body (its digest covers its headers).
     pub inline: bool,
@@ -155,6 +185,44 @@ impl Publication {
         self.digest
             .unwrap_or_else(|| ContentDigest::of_bytes(&self.body))
     }
+}
+
+/// A route fact's event body, `{op, params}`, refused over [`MAX_ROUTE_FACT_BYTES`].
+pub fn route_fact_body(op: &str, params: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let body = serde_json::to_vec(&serde_json::json!({"op": op, "params": params}))
+        .map_err(|error| error.to_string())?;
+    if body.len() > MAX_ROUTE_FACT_BYTES {
+        return Err(format!(
+            "a route fact of {} bytes is over the {MAX_ROUTE_FACT_BYTES}-byte event limit",
+            body.len()
+        ));
+    }
+    Ok(body)
+}
+
+/// The publication of route fact `body` on `account`'s event stream: broca's `route_fact.v1`
+/// subject, the fact id as message id, and the body inline with its digest header.
+pub fn route_fact_publication(
+    account: &AccountNames,
+    fact_id: &str,
+    body: Vec<u8>,
+) -> Result<Publication, String> {
+    let subject = account
+        .event_subject("broca", ROUTE_FACT_EVENT, ROUTE_FACT_VERSION)
+        .map_err(|error| error.to_string())?;
+    let mut publication = Publication {
+        event_key: fact_id.to_owned(),
+        subject,
+        headers: Default::default(),
+        body,
+        digest: None,
+        inline: true,
+    };
+    publication.headers.insert(
+        CONTENT_DIGEST_HEADER.into(),
+        publication.digest().to_string(),
+    );
+    Ok(publication)
 }
 
 #[async_trait]
@@ -212,6 +280,19 @@ pub trait RunEventStore: Send + Sync {
         changes: &[(String, SendStateNotice)],
         now_ms: u64,
     ) -> Result<bool, StoreError>;
+    /// Stores route facts, each its event id and [`route_fact_body`], for the drain to publish
+    /// unless settled first (see [`ROUTE_FACT_GRACE_MS`]). Storing one twice adds nothing.
+    /// `false`, storing nothing, until [`Self::enable_bus_events`] has named the bus account.
+    fn record_route_facts(
+        &self,
+        facts: &[(String, Vec<u8>)],
+        now_ms: u64,
+    ) -> Result<bool, StoreError>;
+    /// Routing has the fact `fact_id` (its report got a reply, or its bus publish an
+    /// acknowledgement): the stored copy, if any, is not published.
+    fn settle_route_fact(&self, fact_id: &str, now_ms: u64) -> Result<(), StoreError>;
+    /// The oldest stored route fact left unsettled for [`ROUTE_FACT_GRACE_MS`] at `now_ms`.
+    fn pending_route_fact(&self, now_ms: u64) -> Result<Option<Publication>, StoreError>;
 }
 
 /// Drain orchestration belongs to the publisher, not the object-safe storage port.
@@ -220,8 +301,12 @@ pub async fn drain_bus_event<S: RunEventStore + ?Sized>(
     publisher: &dyn BusPublisher,
     now_ms: u64,
 ) -> Result<DrainResult, StoreError> {
-    let Some(event) = store.pending_bus_event()? else {
-        return Ok(DrainResult::Empty);
+    let event = match store.pending_bus_event()? {
+        Some(event) => event,
+        None => match store.pending_route_fact(now_ms)? {
+            Some(fact) => fact,
+            None => return Ok(DrainResult::Empty),
+        },
     };
     match publisher.publish(&event).await {
         Ok(receipt) => {
@@ -297,6 +382,19 @@ impl RunEventStore for SqliteStore {
     ) -> Result<bool, StoreError> {
         self.event_store().record_send_states(changes, now_ms)
     }
+    fn record_route_facts(
+        &self,
+        facts: &[(String, Vec<u8>)],
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        self.event_store().record_route_facts(facts, now_ms)
+    }
+    fn settle_route_fact(&self, fact_id: &str, now_ms: u64) -> Result<(), StoreError> {
+        self.event_store().settle_route_fact(fact_id, now_ms)
+    }
+    fn pending_route_fact(&self, now_ms: u64) -> Result<Option<Publication>, StoreError> {
+        self.event_store().pending_route_fact(now_ms)
+    }
 }
 
 impl SqliteStore {
@@ -357,21 +455,7 @@ impl SqliteStore {
         publisher: &dyn BusPublisher,
         now_ms: u64,
     ) -> Result<DrainResult, StoreError> {
-        let Some(event) = self.pending_bus_event()? else {
-            return Ok(DrainResult::Empty);
-        };
-        match publisher.publish(&event).await {
-            Ok(receipt) => {
-                self.acknowledge_bus_event(&event, receipt, now_ms)?;
-                Ok(DrainResult::Published)
-            }
-            Err(_) => {
-                self.bus_metrics()
-                    .bus_publish_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(DrainResult::Retry)
-            }
-        }
+        drain_bus_event(self, publisher, now_ms).await
     }
 }
 
@@ -576,6 +660,62 @@ impl EventStore<'_> {
             tracing::warn!(target: "bus", refused, "refusing send state notices over the size limit or for a sender that is no module id");
         }
         Ok(true)
+    }
+
+    /// See [`RunEventStore::record_route_facts`].
+    pub fn record_route_facts(
+        &self,
+        facts: &[(String, Vec<u8>)],
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
+            return Ok(false);
+        };
+        let subject = account
+            .event_subject("broca", ROUTE_FACT_EVENT, ROUTE_FACT_VERSION)
+            .map_err(|error| StoreError::BusEvent(error.to_string()))?;
+        self.write(true, |tx| {
+            for (fact_id, body) in facts {
+                tx.execute(
+                    "INSERT OR IGNORE INTO route_fact_outbox(fact_id,subject,body,at_ms) VALUES(?1,?2,?3,?4)",
+                    params![fact_id, subject, body, now_ms],
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    /// See [`RunEventStore::settle_route_fact`].
+    pub fn settle_route_fact(&self, fact_id: &str, now_ms: u64) -> Result<(), StoreError> {
+        self.write(false, |conn| {
+            conn.execute(
+                "UPDATE route_fact_outbox SET published_ms=?2 WHERE fact_id=?1 AND published_ms IS NULL",
+                params![fact_id, now_ms],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// See [`RunEventStore::pending_route_fact`].
+    pub fn pending_route_fact(&self, now_ms: u64) -> Result<Option<Publication>, StoreError> {
+        let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let row: Option<(String, Vec<u8>)> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT fact_id,body FROM route_fact_outbox INDEXED BY route_fact_unpublished WHERE published_ms IS NULL AND at_ms<=?1 ORDER BY at_ms, rowid LIMIT 1",
+                [now_ms.saturating_sub(ROUTE_FACT_GRACE_MS)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(fact_id, body)| {
+            route_fact_publication(&account, &fact_id, body).map_err(StoreError::BusEvent)
+        })
+        .transpose()
     }
 
     /// The oldest send state notice not yet published.
@@ -794,11 +934,15 @@ impl EventStore<'_> {
             "UPDATE bus_event_outbox SET published_ms=?2 WHERE event_key=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
         )? as u64;
-        // A send state notice keeps no gauge: it is counted only as published.
+        // Send state notices and route facts keep no gauge: they are counted only as published.
         let sends_updated = conn.execute(
             "UPDATE send_state_outbox SET published_ms=?2 WHERE message_id=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
-        )? as u64;
+        )? as u64
+            + conn.execute(
+                "UPDATE route_fact_outbox SET published_ms=?2 WHERE fact_id=?1 AND published_ms IS NULL",
+                params![event.event_key, now_ms],
+            )? as u64;
         Ok((lifecycle, lifecycle_updated, sends_updated))
         }, |_| ())?;
         let updated = lifecycle_updated + sends_updated;
@@ -826,8 +970,16 @@ impl EventStore<'_> {
         if sends_dropped > 0 {
             tracing::warn!(target: "bus", dropped = sends_dropped, "dropping send state notices older than 24 hours without a publish acknowledgement");
         }
+        let facts_dropped: u64 = conn.query_row(
+            "SELECT count(*) FROM route_fact_outbox INDEXED BY route_fact_unpublished WHERE published_ms IS NULL AND at_ms<?1",
+            [cutoff], |r| r.get(0),
+        )?;
+        if facts_dropped > 0 {
+            tracing::warn!(target: "bus", dropped = facts_dropped, "dropping route facts older than 24 hours that neither a report nor the bus delivered");
+        }
         let deleted = conn.execute("DELETE FROM bus_event_outbox WHERE at_ms<?1", [cutoff])?
-            + conn.execute("DELETE FROM send_state_outbox WHERE at_ms<?1", [cutoff])?;
+            + conn.execute("DELETE FROM send_state_outbox WHERE at_ms<?1", [cutoff])?
+            + conn.execute("DELETE FROM route_fact_outbox WHERE at_ms<?1", [cutoff])?;
         Ok((deleted, dropped))
         }, |_| ())?;
         if dropped > 0 {
@@ -1560,5 +1712,84 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    /// Keeps every publication it is handed.
+    #[derive(Default)]
+    struct Kept(Mutex<Vec<Publication>>);
+    #[async_trait]
+    impl BusPublisher for Kept {
+        async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
+            let mut seen = self.0.lock().unwrap();
+            seen.push(event.clone());
+            Ok(PublishReceipt::new(seen.len() as u64, false))
+        }
+    }
+
+    /// A stored route fact waits for its report for [`ROUTE_FACT_GRACE_MS`]. Unsettled after
+    /// that, the drain publishes it after the run events: on broca's route fact subject, under
+    /// its event id, inline with its digest header, and once. A fact its report settled is
+    /// never published, and storing a fact twice stores it once.
+    #[tokio::test]
+    async fn a_route_fact_is_published_only_when_its_report_did_not_settle_it() {
+        let store = enabled();
+        let body = |id: &str| {
+            route_fact_body(
+                "route.account_observe",
+                &serde_json::json!({"event_id": id, "kind": "run_finished"}),
+            )
+            .unwrap()
+        };
+        let facts = [
+            ("s:9".to_string(), body("s:9")),
+            ("s:12".to_string(), body("s:12")),
+        ];
+        assert!(store.record_route_facts(&facts, NOW).unwrap());
+        assert!(store.record_route_facts(&facts[..1], NOW).unwrap());
+        store.settle_route_fact("s:12", NOW + 1).unwrap();
+        assert!(store
+            .record_run_events(&session(), "epoch", &mut [started_at(1, "r1", NOW)], NOW)
+            .unwrap());
+
+        let bus = Kept::default();
+        let due = NOW + ROUTE_FACT_GRACE_MS;
+        while store.drain_bus_event(&bus, due - 1).await.unwrap() == DrainResult::Published {}
+        assert_eq!(
+            bus.0.lock().unwrap().len(),
+            1,
+            "inside the grace only the run event goes"
+        );
+        while store.drain_bus_event(&bus, due).await.unwrap() == DrainResult::Published {}
+        while store.drain_bus_event(&bus, due + MINUTE).await.unwrap() == DrainResult::Published {}
+        let published = std::mem::take(&mut *bus.0.lock().unwrap());
+        let facts: Vec<_> = published
+            .iter()
+            .filter(|publication| publication.subject.ends_with(".route_fact.v1"))
+            .collect();
+        assert_eq!(facts.len(), 1, "{published:?}");
+        let fact = facts[0];
+        assert_eq!(fact.event_key, "s:9");
+        assert_eq!(fact.body, body("s:9"));
+        assert!(fact.inline);
+        assert_eq!(
+            fact.headers.get("Ck-Content-Digest"),
+            Some(&fact.digest().to_string())
+        );
+        assert_eq!(
+            fact.subject,
+            AccountNames::derive("box_test")
+                .unwrap()
+                .event_subject("broca", ROUTE_FACT_EVENT, ROUTE_FACT_VERSION)
+                .unwrap()
+        );
+    }
+
+    /// Nothing is stored before the bus account is known, since a fact's subject names it.
+    #[test]
+    fn route_facts_wait_for_the_bus_account() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(!store
+            .record_route_facts(&[("s:1".into(), b"{}".to_vec())], NOW)
+            .unwrap());
     }
 }

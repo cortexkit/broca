@@ -291,3 +291,182 @@ async fn write_run_event_samples() {
         "started, steer_consumed and ended, then started and paused"
     );
 }
+
+/// The selection a fresh run freezes in the tests below: routing chose its account and admitted
+/// it as `adm-1`.
+fn routed() -> broca_wal::AuthSelection {
+    serde_json::from_value(serde_json::json!({
+        "credential_id": "credential-a", "account_ref": "a", "auth_method": "oauth",
+        "account_decision": {"path": "routed", "admission_id": "adm-1", "decision_id": "decision-a"}
+    }))
+    .unwrap()
+}
+
+/// Collects the ends of routed runs a session hands its sink.
+#[derive(Default)]
+struct Ends(Mutex<Vec<crate::store_run_events::RoutedRunEnd>>);
+
+impl RunEventSink for Ends {
+    fn durable(&self, _: &BindIdentity, _: &str, _: u64, _: Vec<RunEvent>) {}
+
+    fn routed_ends(
+        &self,
+        session: &BindIdentity,
+        ends: Vec<crate::store_run_events::RoutedRunEnd>,
+    ) {
+        assert_eq!(session, &bind());
+        self.0.lock().unwrap().extend(ends);
+    }
+}
+
+/// The end `session`'s last run hands its sink: the session id and the end record's seq name it.
+async fn expected_end(
+    session: &Session<&'static MemoryBackend>,
+    reason: RunFinishReason,
+) -> crate::store_run_events::RoutedRunEnd {
+    let records = session.open_log_records().await.unwrap();
+    let end_seq = records
+        .iter()
+        .rev()
+        .find(|(_, record)| matches!(record, broca_session_store::record::Record::RunEnd(_)))
+        .map(|(seq, _)| *seq)
+        .expect("the run ended");
+    let session_id: String = session
+        .head()
+        .session_id
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    crate::store_run_events::RoutedRunEnd {
+        event_id: format!("{session_id}:{end_seq}"),
+        admission_id: "adm-1".into(),
+        run_id: "r1".into(),
+        reason,
+    }
+}
+
+/// A run routing admitted hands its end once the end is durable, so the `run_finished` report
+/// routing is owed is stored with it. A run whose account routing didn't choose hands none.
+#[tokio::test]
+async fn a_routed_run_hands_its_end_and_another_run_none() {
+    for routed_run in [true, false] {
+        let sink = Arc::new(Ends::default());
+        let mut executor = executor(vec![text_step("a1", "hello")], None);
+        executor.auth_selection = routed_run.then(routed);
+        let (commands, served) = actor(executor, Arc::clone(&sink) as Arc<dyn RunEventSink>).await;
+        assert!(matches!(
+            send(&commands, "r1", "first").await,
+            SendOutcome::Active { .. }
+        ));
+        idle(&commands).await;
+        drop(commands);
+        let session = served.await.unwrap();
+        let ends = std::mem::take(&mut *sink.0.lock().unwrap());
+        if routed_run {
+            assert_eq!(
+                ends,
+                [expected_end(&session, RunFinishReason::Completed).await]
+            );
+        } else {
+            assert!(ends.is_empty(), "{ends:?}");
+        }
+    }
+}
+
+/// A routed run cancelled while paused ends outside any run task, so no reporter is left to
+/// tell routing; its end is still handed over, for the stored report.
+#[tokio::test]
+async fn a_routed_run_cancelled_while_paused_hands_its_end() {
+    let sink = Arc::new(Ends::default());
+    let mut executor = executor(vec![auth_failure()], None);
+    executor.auth_selection = Some(routed());
+    let (commands, served) = actor(executor, Arc::clone(&sink) as Arc<dyn RunEventSink>).await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    assert!(
+        sink.0.lock().unwrap().is_empty(),
+        "a paused run hasn't ended"
+    );
+    let (reply, cancelled) = tokio::sync::oneshot::channel();
+    commands
+        .send(crate::actor::LineageCmd::Cancel {
+            run_id: RunId("r1".into()),
+            at: broca_wal::record::RunCancelAt::StepBoundary,
+            reply,
+        })
+        .unwrap();
+    cancelled.await.unwrap();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let ends = std::mem::take(&mut *sink.0.lock().unwrap());
+    assert_eq!(
+        ends,
+        [expected_end(&session, RunFinishReason::Cancelled).await]
+    );
+}
+
+/// A routed run paused when the module stopped, and cancelled by the next one, hands its end
+/// too: the reopened session's projector takes the open run's admission from the run the
+/// session folded, since it never saw the run start.
+#[tokio::test]
+async fn a_routed_run_paused_across_a_restart_hands_its_end() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let mut paused_by = executor(vec![auth_failure(), auth_failure()], None);
+    paused_by.auth_selection = Some(routed());
+    let executor = Arc::new(paused_by);
+    let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts.clone()))
+        .with_readers(Arc::new(move || backend));
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let served = tokio::spawn(actor.serve(receiver));
+    let commands = Commands::over(commands, backend);
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    drop(served.await.unwrap());
+
+    let sink = Arc::new(Ends::default());
+    let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    let actor = StoreActor::new(bind(), session, executor, Box::new(parts))
+        .with_readers(Arc::new(move || backend))
+        .with_run_events(Arc::clone(&sink) as Arc<dyn RunEventSink>);
+    let (commands, receiver) = mpsc::unbounded_channel();
+    let served = tokio::spawn(actor.serve(receiver));
+    let commands = Commands::over(commands, backend);
+    let (reply, cancelled) = tokio::sync::oneshot::channel();
+    commands
+        .send(crate::actor::LineageCmd::Cancel {
+            run_id: RunId("r1".into()),
+            at: broca_wal::record::RunCancelAt::StepBoundary,
+            reply,
+        })
+        .unwrap();
+    cancelled.await.unwrap();
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let ends = std::mem::take(&mut *sink.0.lock().unwrap());
+    assert_eq!(
+        ends,
+        [expected_end(&session, RunFinishReason::Cancelled).await]
+    );
+}

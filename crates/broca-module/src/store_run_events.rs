@@ -17,11 +17,17 @@
 //! The projector runs on the session's writer as an append observer, beside the subscribe
 //! stream's. It hands each durable batch's events to a [`RunEventSink`], which records them in
 //! the outbox the publisher drains (see `broca_module_serve::bus_events`).
+//!
+//! The same projection names the end of each run routing admitted ([`RoutedRunEnd`]), so the
+//! `run_finished` report routing is owed is stored with the end itself. The run's own reporter
+//! still sends it at once; the stored copy is what reaches routing when that report can't: the
+//! process stopped before routing answered (a daemon cut takes routing and the bus down
+//! together), or the run ended while paused, where no reporting task runs.
 
 use std::sync::Arc;
 
 use broca_protocol::run_events::{RunEvent, RunEventDetail, StructuredOutputStatus};
-use broca_protocol::BindIdentity;
+use broca_protocol::{BindIdentity, RunFinishReason};
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::record::Record;
 use broca_session_store::session::{Appended, Session};
@@ -32,6 +38,31 @@ pub trait RunEventSink: Send + Sync {
     /// of the last record that barrier made durable. Called on the session's writer, with the
     /// session's appends held, so it returns quickly and never waits on the bus.
     fn durable(&self, session: &BindIdentity, epoch: &str, through: u64, events: Vec<RunEvent>);
+
+    /// The ends of runs routing admitted that the same barrier made durable, called on the
+    /// writer like [`Self::durable`]. A sink with no routing to report to ignores them.
+    fn routed_ends(&self, _session: &BindIdentity, _ends: Vec<RoutedRunEnd>) {}
+}
+
+/// The durable end of a run routing admitted: what its `run_finished` report names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedRunEnd {
+    /// The report's event id: the session id and the end record's seq, `<session id>:<seq>`,
+    /// as the run's own reporter names the same report.
+    pub event_id: String,
+    pub admission_id: String,
+    pub run_id: String,
+    pub reason: RunFinishReason,
+}
+
+/// The admission routing granted the run started with `selection` (its run start's auth
+/// selection), when routing chose its account. Other decision paths hold no admission.
+fn routed_admission(selection: Option<&serde_json::Value>) -> Option<String> {
+    let decision = selection?.get("account_decision")?;
+    if decision.get("path")?.as_str()? != broca_records::record::ACCOUNT_DECISION_ROUTED {
+        return None;
+    }
+    decision.get("admission_id")?.as_str().map(str::to_owned)
 }
 
 /// Projects `session`'s appends into run events for `sink`, from its next append on.
@@ -46,6 +77,22 @@ pub fn observe<B: SessionBackend>(
         sink,
         wall_now_ms,
     );
+    projector.session_id = hex(&session.head().session_id.0);
+    // A run open when the session opens (paused, or resumed after a restart) started before
+    // this projector saw anything, so its admission comes from the open run the session rebuilt
+    // from its records when it loaded.
+    if let Some(run) = session
+        .operations
+        .run
+        .as_ref()
+        .filter(|run| run.finished.is_none())
+    {
+        projector.admission = run
+            .start
+            .as_ref()
+            .and_then(|start| routed_admission(start.auth_selection.as_ref()))
+            .map(|admission| (run.run_id.clone(), admission));
+    }
     session.add_append_observer(Box::new(move |appended| projector.appended(appended)));
 }
 
@@ -89,6 +136,12 @@ struct Projector {
     run: Option<(String, bool)>,
     steers: PendingSteers,
     structured: Option<StructuredOutputStatus>,
+    /// The session's id, which names a routed run's end report (see [`RoutedRunEnd`]).
+    session_id: String,
+    /// The open run and the admission routing granted it, when routing chose its account.
+    admission: Option<(String, String)>,
+    /// Ends of routed runs appended without a barrier, released with the events.
+    unsynced_ends: Vec<RoutedRunEnd>,
 }
 
 impl Projector {
@@ -109,6 +162,9 @@ impl Projector {
             run: None,
             steers: PendingSteers::default(),
             structured: None,
+            session_id: String::new(),
+            admission: None,
+            unsynced_ends: Vec::new(),
         }
     }
 
@@ -133,6 +189,8 @@ impl Projector {
             // with them, and the run state they built is no longer known.
             Appended::Replaced => {
                 self.unsynced.clear();
+                self.unsynced_ends.clear();
+                self.admission = None;
                 self.run = None;
                 self.steers = PendingSteers::default();
                 self.structured = None;
@@ -144,6 +202,10 @@ impl Projector {
         let events = std::mem::take(&mut self.unsynced);
         self.sink
             .durable(&self.session, &self.epoch, self.last, events);
+        if !self.unsynced_ends.is_empty() {
+            let ends = std::mem::take(&mut self.unsynced_ends);
+            self.sink.routed_ends(&self.session, ends);
+        }
     }
 
     fn project(&mut self, seq: u64, record: &Record) {
@@ -151,6 +213,8 @@ impl Projector {
             Record::RunStart(start) => {
                 let seeded = start.seeded == Some(true);
                 self.run = Some((start.run_id.clone(), seeded));
+                self.admission = routed_admission(start.auth_selection.as_ref())
+                    .map(|admission| (start.run_id.clone(), admission));
                 self.steers = PendingSteers::default();
                 self.structured = None;
                 Some((
@@ -211,6 +275,18 @@ impl Projector {
                 },
             )),
             Record::RunEnd(end) => {
+                if let Some((_, admission_id)) = self
+                    .admission
+                    .take()
+                    .filter(|(run_id, _)| *run_id == end.run_id)
+                {
+                    self.unsynced_ends.push(RoutedRunEnd {
+                        event_id: format!("{}:{seq}", self.session_id),
+                        admission_id,
+                        run_id: end.run_id.clone(),
+                        reason: end.reason,
+                    });
+                }
                 let error_class = end.error.as_ref().and_then(|error| {
                     serde_json::from_value::<broca_protocol::ProviderError>(error.parse())
                         .map(|error| error.class.shared_class())

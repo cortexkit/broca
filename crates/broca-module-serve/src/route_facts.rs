@@ -7,17 +7,11 @@
 //! bus that is down never loses a fact. Routing applies a fact that arrives both ways once.
 
 use async_trait::async_trait;
-use broca_store::bus_events::{BusPublisher, Publication};
-use serde_json::{json, Value};
-
-/// The event name and version of a route fact.
-pub const ROUTE_FACT_EVENT: &str = "route_fact";
-pub const ROUTE_FACT_VERSION: u32 = 1;
-/// The largest event body the bus carries. A larger fact goes only as the direct call.
-pub const MAX_ROUTE_FACT_BYTES: usize = 4096;
-/// The bus header carrying the body's digest, as `cortexkit-bus-client`'s `publish_event`
-/// writes it.
-const CONTENT_DIGEST_HEADER: &str = "Ck-Content-Digest";
+use broca_store::bus_events::BusPublisher;
+pub use broca_store::bus_events::{
+    route_fact_body as fact_body, MAX_ROUTE_FACT_BYTES, ROUTE_FACT_EVENT, ROUTE_FACT_VERSION,
+};
+use serde_json::Value;
 
 /// Publishes route facts on the bus.
 #[async_trait]
@@ -32,17 +26,10 @@ pub trait RouteFactPublisher: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// A route fact's event body, refused over [`MAX_ROUTE_FACT_BYTES`].
-pub fn fact_body(op: &str, params: &Value) -> Result<Vec<u8>, String> {
-    let body = serde_json::to_vec(&json!({"op": op, "params": params}))
-        .map_err(|error| error.to_string())?;
-    if body.len() > MAX_ROUTE_FACT_BYTES {
-        return Err(format!(
-            "a route fact of {} bytes is over the {MAX_ROUTE_FACT_BYTES}-byte event limit",
-            body.len()
-        ));
-    }
-    Ok(body)
+/// Where routing reports that a run's end stored (see `broca_module::store_run_events`) are
+/// settled once the run's own report reaches routing, so the stored copy is not sent again.
+pub trait RouteFactOutbox: Send + Sync {
+    fn settle(&self, fact_id: &str);
 }
 
 /// The publication of one route fact on `account`'s event stream: broca's `route_fact.v1`
@@ -52,24 +39,8 @@ pub fn publication(
     op: &str,
     params: &Value,
     fact_id: &str,
-) -> Result<Publication, String> {
-    let body = fact_body(op, params)?;
-    let subject = account
-        .event_subject("broca", ROUTE_FACT_EVENT, ROUTE_FACT_VERSION)
-        .map_err(|error| error.to_string())?;
-    let mut publication = Publication {
-        event_key: fact_id.to_owned(),
-        subject,
-        headers: Default::default(),
-        body,
-        digest: None,
-        inline: true,
-    };
-    publication.headers.insert(
-        CONTENT_DIGEST_HEADER.into(),
-        publication.digest().to_string(),
-    );
-    Ok(publication)
+) -> Result<broca_store::bus_events::Publication, String> {
+    broca_store::bus_events::route_fact_publication(account, fact_id, fact_body(op, params)?)
 }
 
 /// Publish one route fact through `publisher`, the account's shared bus link.
@@ -87,6 +58,7 @@ pub async fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_fact_is_its_op_and_params_on_broca_route_fact_subject() {
@@ -108,7 +80,7 @@ mod tests {
             json!({"op": "route.account_observe", "params": params})
         );
         assert_eq!(
-            publication.headers.get(CONTENT_DIGEST_HEADER),
+            publication.headers.get("Ck-Content-Digest"),
             Some(&publication.digest().to_string())
         );
     }
@@ -119,10 +91,12 @@ mod tests {
     use crate::routing_capabilities::CapabilitySupport;
     use std::sync::{Arc, Mutex};
 
-    /// Routing that answers every request and describes `route_fact_stream` as `stream`.
+    /// Routing that describes `route_fact_stream` as `stream` and answers every request, or
+    /// none when `away` (the call fails as a daemon cut makes it fail).
     struct Routing {
         stream: CapabilitySupport,
         requests: Mutex<Vec<Value>>,
+        away: bool,
     }
 
     #[async_trait]
@@ -138,6 +112,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(serde_json::from_slice(&body).unwrap());
+            if self.away {
+                return Err("routing is away".into());
+            }
             Ok(Ok(br#"{"result":{}}"#.to_vec()))
         }
     }
@@ -174,10 +151,22 @@ mod tests {
         stream: CapabilitySupport,
         acks: Option<bool>,
     ) -> (Vec<Value>, Vec<(String, Value, String)>) {
+        let (requests, published, _) = observe_settling(stream, acks, false).await;
+        (requests, published)
+    }
+
+    /// [`observe`] with routing `away` or not, also returning the stored facts it settled.
+    async fn observe_settling(
+        stream: CapabilitySupport,
+        acks: Option<bool>,
+        away: bool,
+    ) -> (Vec<Value>, Vec<(String, Value, String)>, Vec<String>) {
         let routing = Arc::new(Routing {
             stream,
             requests: Mutex::default(),
+            away,
         });
+        let outbox = Arc::new(Settled::default());
         let client = RoutingClient::new(routing.clone(), AccountSelectionConfig::default());
         let bus = acks.map(|acks| {
             Arc::new(Bus {
@@ -188,10 +177,49 @@ mod tests {
         if let Some(bus) = &bus {
             client.set_route_facts(bus.clone());
         }
+        client.set_route_fact_outbox(outbox.clone());
         client.observe(observation()).await;
         let requests = routing.requests.lock().unwrap().clone();
         let published = bus.map_or_else(Vec::new, |bus| bus.published.lock().unwrap().clone());
-        (requests, published)
+        let settled = outbox.0.lock().unwrap().clone();
+        (requests, published, settled)
+    }
+
+    /// The stored facts settled, in order.
+    #[derive(Default)]
+    struct Settled(Mutex<Vec<String>>);
+
+    impl RouteFactOutbox for Settled {
+        fn settle(&self, fact_id: &str) {
+            self.0.lock().unwrap().push(fact_id.into());
+        }
+    }
+
+    /// A run's end report settles its stored copy once routing has it, by an acknowledged
+    /// publish or an answered call. When neither reached routing (it and the bus were away, as
+    /// at a daemon cut), the stored copy stays, for the outbox to deliver.
+    #[tokio::test]
+    async fn a_delivered_end_report_settles_its_stored_copy_and_an_undelivered_one_keeps_it() {
+        let settled = |requests_reached: bool| {
+            if requests_reached {
+                vec!["adm1:run_finished".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let (_, _, by_publish) =
+            observe_settling(CapabilitySupport::Declared, Some(true), true).await;
+        assert_eq!(
+            by_publish,
+            settled(true),
+            "an acknowledged publish delivers it"
+        );
+        let (_, _, by_call) = observe_settling(CapabilitySupport::NotDeclared, None, false).await;
+        assert_eq!(by_call, settled(true), "an answered call delivers it");
+        let (requests, published, kept) =
+            observe_settling(CapabilitySupport::Declared, Some(false), true).await;
+        assert_eq!((requests.len(), published.len()), (1, 1));
+        assert_eq!(kept, settled(false), "neither reached routing");
     }
 
     fn observation() -> Value {

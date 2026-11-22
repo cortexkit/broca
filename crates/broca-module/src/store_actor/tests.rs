@@ -304,6 +304,9 @@ pub(super) struct LoopExecutor {
     /// Whether each run the actor started was at a prefix rebuild or applied a pending change
     /// (`RunControl::rebuild_point`), in order.
     pub(super) rebuild_points: Arc<std::sync::Mutex<Vec<bool>>>,
+    /// The credential selection each fresh run freezes, as the module's executor freezes the
+    /// account routing chose; `None` freezes none.
+    pub(super) auth_selection: Option<broca_wal::AuthSelection>,
 }
 
 /// Waits for the media the actor sends a run, without rendering any.
@@ -431,6 +434,7 @@ pub(super) fn executor(
         waits_for_media: false,
         person_steers: Default::default(),
         rebuild_points: Default::default(),
+        auth_selection: None,
     }
 }
 
@@ -480,6 +484,7 @@ impl RunExecutor for LoopExecutor {
                 .lock()
                 .unwrap()
                 .push(control.rebuild_point);
+            control.auth_selection = self.auth_selection.clone().or(control.auth_selection);
         }
         if let (Some((reached, release)), Some(_)) = (&self.drain_gate, &req.submission_id) {
             reached.notify_one();
