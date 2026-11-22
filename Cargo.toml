@@ -50,7 +50,7 @@ exclude = ["crates/broca-session-store/fuzz"]
 # checkouts are used only to build integration-test rig binaries.
 
 [workspace.package]
-version = "0.4.93"
+version = "0.4.94"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
