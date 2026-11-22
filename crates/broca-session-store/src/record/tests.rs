@@ -385,6 +385,35 @@ fn a_fork_fact_keeps_its_kind_number_and_bytes() {
 }
 
 #[test]
+fn a_retention_fact_keeps_its_kind_number_and_bytes() {
+    // A session's frozen policy and its release decide when it is deleted, and later builds read
+    // them back, so the kind number and encoding are pinned: the event as its declared number,
+    // the policy as compact JSON.
+    let record = Record::Retention(Retention {
+        event: RetentionEvent::Set,
+        at_ms: 300,
+        policy: Some(serde_json::json!({"keep": "none"})),
+    });
+    assert_eq!(record.kind(), 108);
+    assert_eq!(record.stream(), Stream::Ledger);
+    assert_eq!(record.activity_ms(), None);
+    let body = record.encode_body();
+    assert_eq!(
+        crate::codec::hex(&body),
+        concat!("1001", "20ac02", "320f7b226b656570223a226e6f6e65227d")
+    );
+    assert_eq!(Record::decode(108, &body).unwrap(), record);
+    let released = Record::Retention(Retention {
+        event: RetentionEvent::Released,
+        at_ms: 300,
+        policy: None,
+    });
+    let body = released.encode_body();
+    assert_eq!(crate::codec::hex(&body), "100220ac02");
+    assert_eq!(Record::decode(108, &body).unwrap(), released);
+}
+
+#[test]
 fn every_kind_round_trips_under_its_own_number_and_stream() {
     let records = one_of_each();
     let mut kinds: Vec<u32> = records.iter().map(Record::kind).collect();

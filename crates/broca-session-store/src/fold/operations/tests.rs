@@ -202,6 +202,62 @@ fn session_class_adoption_is_first_label_only_and_checkpoint_compatible() {
 }
 
 #[test]
+fn a_sessions_first_policy_and_release_stand_and_survive_a_checkpoint() {
+    use crate::codec::Message as _;
+    use crate::record::{Retention, RetentionEvent};
+    let fact = |event, at_ms, keep: Option<&str>| {
+        Record::Retention(Retention {
+            event,
+            at_ms,
+            policy: keep.map(|keep| serde_json::json!({"keep": keep})),
+        })
+    };
+    let operations = fold(&[
+        start(),
+        fact(RetentionEvent::Set, 10, Some("none")),
+        fact(RetentionEvent::Released, 20, None),
+        fact(RetentionEvent::Set, 30, Some("forever")),
+        fact(RetentionEvent::Released, 40, None),
+    ])
+    .unwrap();
+    assert_eq!(
+        operations.retention_policy,
+        Some(serde_json::json!({"keep": "none"}))
+    );
+    assert_eq!(operations.released_at_ms, Some(20));
+    // A reader that skipped either would keep, delete or serve the session by the wrong policy,
+    // so both carry the must-understand bit.
+    let numbers: Vec<u32> = crate::codec::Fields::new(&operations.encode(), "Operations")
+        .map(Result::unwrap)
+        .filter(|field| field.must)
+        .map(|field| field.number)
+        .collect();
+    assert!(
+        numbers.contains(&33) && numbers.contains(&34),
+        "{numbers:?}"
+    );
+    let checkpoint = crate::checkpoint::Checkpoint {
+        covers_through: 5,
+        next_seq: 6,
+        conversation: crate::fold::conversation::Conversation::new(false),
+        operational: operations,
+        transcript_base: None,
+        ledger_base: None,
+        activity_ms: None,
+        media: None,
+    };
+    let decoded = crate::checkpoint::Checkpoint::decode(&checkpoint.encode()).unwrap();
+    assert_eq!(
+        decoded.operational.retention_policy,
+        Some(serde_json::json!({"keep": "none"}))
+    );
+    assert_eq!(decoded.operational.released_at_ms, Some(20));
+    let plain = fold(&[start()]).unwrap();
+    assert_eq!(plain.retention_policy, None);
+    assert_eq!(plain.released_at_ms, None);
+}
+
+#[test]
 fn a_call_with_an_intent_and_no_outcome_interrupts_the_run() {
     let records = [
         start(),

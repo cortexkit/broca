@@ -1257,6 +1257,34 @@ message! {
     }
 }
 
+values! {
+    /// What a [`Retention`] record says happened to the session's retention (llm-runner
+    /// `session_retention`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum RetentionEvent {
+        /// A starter's policy froze: the first send carrying one, which writes this in its own
+        /// batch. A session has at most one.
+        1 Set,
+        /// The session's owner released it: it is deleted once no run is active or paused, no
+        /// send is queued and no spend is owed. Written and synced before the release is answered.
+        2 Released,
+    }
+}
+
+message! {
+    /// One fact of a session's retention: its policy froze, or its owner released it. Neither is
+    /// activity: a policy rides the send that carries it, and release doesn't move the clocks a
+    /// policy counts from.
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct Retention {
+        1 req event: RetentionEvent,
+        /// Wall-clock time of the fact, in milliseconds since the Unix epoch.
+        2 req at_ms: u64,
+        /// On `Set`: the policy as admission decoded it (llm-runner `RetentionPolicy` JSON).
+        3 opt policy: serde_json::Value,
+    }
+}
+
 message! {
     /// A session that ran outside the current compaction contract moved onto it: the run whose
     /// start shares this record's batch is its first run on the contract. The messages already
@@ -1999,6 +2027,7 @@ records! {
         105 CompactionEnrolled,
         106 Moved,
         107 Fork,
+        108 Retention,
     }
 }
 

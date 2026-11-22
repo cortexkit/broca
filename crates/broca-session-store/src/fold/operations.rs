@@ -979,6 +979,22 @@ state! {
             reset: "never",
             bound: Bound::Fixed,
         },
+        /// The policy the session's starter froze (llm-runner `session_retention`), as admission
+        /// decoded it, from the session's one `Retention` `Set` record. Absent while the session
+        /// keeps the policy the runner assigns it. Must be understood: a reader that skipped it
+        /// would keep or delete the session by the wrong policy.
+        33 opt pub [must] retention_policy: serde_json::Value => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
+        /// When the session's owner released it, from its `Retention` `Released` record. Must be
+        /// understood: a reader that skipped it would serve sends to a released session.
+        34 opt pub [must] released_at_ms: u64 => {
+            owner: "admission",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -1925,6 +1941,18 @@ impl Operations {
         }
         match record {
             Record::Moved(moved) => self.source_lineage.clone_from(&moved.source_lineage),
+            // Admission writes at most one of each; were a second written, the first stands, as
+            // it was the one in force when the second was.
+            Record::Retention(fact) => match fact.event {
+                crate::record::RetentionEvent::Set => {
+                    if self.retention_policy.is_none() {
+                        self.retention_policy.clone_from(&fact.policy);
+                    }
+                }
+                crate::record::RetentionEvent::Released => {
+                    self.released_at_ms.get_or_insert(fact.at_ms);
+                }
+            },
             Record::View(view) => {
                 self.view_accepted = Some(ViewSlot {
                     version: view.version,
