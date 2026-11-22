@@ -408,7 +408,7 @@ fn only_cfg_test_module_files_are_excluded_from_source_scans() {
     for test_file in [
         "crates/broca-core/src/media_validation/tests.rs",
         "crates/broca-core/src/media_provenance_tests.rs",
-        "crates/broca-core/src/compaction/ceiling_tests.rs",
+        "crates/broca-core/src/compaction_v2/statement_seq_tests.rs",
         "crates/broca-module/src/fork_answer_tests.rs",
         "crates/broca-module/src/phase_metrics_tests.rs",
     ] {

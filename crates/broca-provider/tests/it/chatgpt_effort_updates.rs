@@ -173,7 +173,7 @@ fn pre_change_session_and_new_append_keep_legacy_bytes() {
     assert_eq!(old, br#"{"include":["reasoning.encrypted_content"],"input":[{"content":"episode-xhigh","role":"user","type":"message"},{"content":"episode-high","role":"user","type":"message"}],"model":"gpt-6.1-sol","reasoning":{"effort":"high","summary":"auto"},"store":false,"stream":true}"#);
     // A run started before the admission choice existed stores a config without it.
     for row in &mut rows {
-        assert_eq!(row.frozen_config["chatgpt_effort_updates"], false);
+        assert!(row.frozen_config.get("chatgpt_effort_updates").is_none());
         row.frozen_config
             .as_object_mut()
             .unwrap()
