@@ -26,15 +26,15 @@ mod keeper_connection;
 pub mod legacy_inventory;
 pub(crate) use export_index::ExportStore;
 pub(crate) use keeper_connection::KeeperOpenError;
-mod fold_identities;
 pub mod grants;
 pub mod late_results_store;
 pub mod session_address;
 pub mod session_inventory;
+mod state_marker;
 pub use session_inventory::SessionInventory;
 pub mod session_refs;
 pub mod system_one;
-pub use fold_identities::{require_legacy_operator_root, LegacyOnlyOperator};
+pub use state_marker::{refuse_marked_state_root, MarkedStateRoot, STATE_FORMAT_MARKER};
 
 /// Reserve a logical session's storage address and verify its history through
 /// the format-selected inventory.
@@ -97,7 +97,7 @@ pub enum StoreError {
     AttributionStale,
     InconsistentSnapshot(&'static str),
     BusEvent(String),
-    LegacyOnly(LegacyOnlyOperator),
+    MarkedStateRoot(MarkedStateRoot),
 }
 
 impl std::fmt::Display for StoreError {
@@ -115,7 +115,7 @@ impl std::fmt::Display for StoreError {
                 std::fmt::Display::fmt(&broca_core::StorePageReadError::AttributionStale, f)
             }
             StoreError::BusEvent(e) => write!(f, "run event: {e}"),
-            StoreError::LegacyOnly(e) => write!(f, "{e}"),
+            StoreError::MarkedStateRoot(e) => write!(f, "{e}"),
             StoreError::InconsistentSnapshot(message) => {
                 write!(f, "inconsistent snapshot: {message}")
             }
@@ -163,7 +163,6 @@ impl From<broca_core::ReplayError> for StoreError {
 /// only for the short snapshot and commit phases.
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
-    wal_config: broca_wal::WalConfig,
     bus_events: bus_events::State,
     export: ExportStore,
 }
@@ -299,19 +298,14 @@ std::thread_local! {
 }
 
 impl SqliteStore {
-    /// Open an existing projection for inspection without creating a database or running migrations.
-    /// Read-only SQLite connections still read committed WAL frames not yet checkpointed into the database.
+    /// Open an existing store for inspection without creating a database or running migrations.
+    /// A read-only SQLite connection still reads committed frames of SQLite's own write-ahead log
+    /// that are not yet checkpointed into the database.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
-        require_legacy_operator_root(path.parent().unwrap_or(Path::new(".")), "SqliteStore")
-            .map_err(StoreError::LegacyOnly)?;
+        refuse_marked_state_root(path.parent().unwrap_or(Path::new(".")))
+            .map_err(StoreError::MarkedStateRoot)?;
         Self::open_read_only_decided(path)
-    }
-
-    pub fn open_boot_legacy_read_only(
-        root: broca_wal::state_format::LegacyStateRoot<'_>,
-    ) -> Result<Self, StoreError> {
-        Self::open_read_only_decided(&root.root().join("run-index.db"))
     }
 
     fn open_read_only_decided(path: &Path) -> Result<Self, StoreError> {
@@ -325,7 +319,6 @@ impl SqliteStore {
         let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
             conn: Arc::clone(&conn),
-            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: bus_events::State::default(),
             export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
@@ -333,28 +326,21 @@ impl SqliteStore {
 
     /// Open (creating + migrating) a store at `path`.
     ///
-    /// On Unix the file is restricted to its owner after creation. This database holds the
-    /// materialized transcript -- the same prompts, tool arguments and tool results as the
-    /// WAL -- and sqlite creates it through the umask, so a default install lands it 0644.
-    /// The WAL writer seals its own files at creation; sqlite gives no mode hook, so the
-    /// chmod happens here, immediately after open, before any row is written.
+    /// Refused in a state root marked with another format (see [`refuse_marked_state_root`]).
+    ///
+    /// On Unix the file is restricted to its owner after creation. This database holds
+    /// session refs, usage facts and outbound events, and sqlite creates it through the umask,
+    /// so a default install lands it 0644. sqlite gives no mode hook, so the chmod happens here,
+    /// immediately after open, before any row is written.
     ///
     /// Sidecars are covered too: WAL-mode sqlite creates `-wal` and `-shm` beside the
     /// database, and the `-wal` holds committed frames not yet checkpointed into the main
-    /// file. Sealing only the database would leave recent transcript content readable in a
-    /// file nobody thinks to look at.
+    /// file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
-        require_legacy_operator_root(path.parent().unwrap_or(Path::new(".")), "SqliteStore")
-            .map_err(StoreError::LegacyOnly)?;
+        refuse_marked_state_root(path.parent().unwrap_or(Path::new(".")))
+            .map_err(StoreError::MarkedStateRoot)?;
         Self::open_decided(path)
-    }
-
-    /// Boot has already classified this exact root; operator opens remain guarded.
-    pub fn open_boot_legacy(
-        root: broca_wal::state_format::LegacyStateRoot<'_>,
-    ) -> Result<Self, StoreError> {
-        Self::open_decided(&root.root().join("run-index.db"))
     }
 
     fn open_decided(path: &Path) -> Result<Self, StoreError> {
@@ -370,7 +356,6 @@ impl SqliteStore {
         let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
             conn: Arc::clone(&conn),
-            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
@@ -383,17 +368,9 @@ impl SqliteStore {
         let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
             conn: Arc::clone(&conn),
-            wal_config: broca_wal::WalConfig::LEGACY,
             bus_events: crate::bus_events::State::default(),
             export: ExportStore::from_shared(conn, (source_instance_id, source_epoch, high_water)),
         })
-    }
-
-    /// Supply the root format decided by the caller before sharing this connection.
-    /// Unconfigured stores retain legacy SQL and never probe the root for recovery.
-    pub fn with_wal_config(mut self, config: broca_wal::WalConfig) -> Self {
-        self.wal_config = config;
-        self
     }
 
     fn init(conn: &Connection) -> Result<(String, u64, u64), StoreError> {
@@ -446,99 +423,15 @@ impl broca_core::RunEventBodies for SqliteStore {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn boot_selected_legacy_opens_do_not_read_the_marker_again() {
-        use broca_records::fs_ops::{self, FsOps};
-        use std::{
-            path::{Path, PathBuf},
-            sync::{
-                atomic::{AtomicUsize, Ordering},
-                Arc,
-            },
-        };
-        struct CountMarker {
-            marker: PathBuf,
-            reads: Arc<AtomicUsize>,
-        }
-        impl FsOps for CountMarker {
-            fn open(
-                &self,
-                path: &Path,
-                options: &fs_ops::OpenOptions,
-            ) -> std::io::Result<Box<dyn fs_ops::FileOps>> {
-                if path == self.marker {
-                    self.reads.fetch_add(1, Ordering::Relaxed);
-                    return Err(std::io::Error::other("marker unavailable after boot"));
-                }
-                fs_ops::RealFs.open(path, options)
-            }
-            fn metadata(&self, p: &Path) -> std::io::Result<std::fs::Metadata> {
-                fs_ops::RealFs.metadata(p)
-            }
-            fn create_dir_all(&self, p: &Path) -> std::io::Result<()> {
-                fs_ops::RealFs.create_dir_all(p)
-            }
-            fn rename(&self, a: &Path, b: &Path) -> std::io::Result<()> {
-                fs_ops::RealFs.rename(a, b)
-            }
-            fn remove_file(&self, p: &Path) -> std::io::Result<()> {
-                fs_ops::RealFs.remove_file(p)
-            }
-            fn sync_dir(&self, p: &Path) -> std::io::Result<()> {
-                fs_ops::RealFs.sync_dir(p)
-            }
-            fn create_dir(&self, p: &Path) -> std::io::Result<()> {
-                fs_ops::RealFs.create_dir(p)
-            }
-            fn hard_link(&self, a: &Path, b: &Path) -> std::io::Result<()> {
-                fs_ops::RealFs.hard_link(a, b)
-            }
-            fn canonicalize(&self, p: &Path) -> std::io::Result<PathBuf> {
-                fs_ops::RealFs.canonicalize(p)
-            }
-            fn read_dir(&self, p: &Path) -> std::io::Result<fs_ops::ReadDir> {
-                fs_ops::RealFs.read_dir(p)
-            }
-            fn validate_if_exists(&self, p: &Path) -> std::io::Result<()> {
-                fs_ops::RealFs.validate_if_exists(p)
-            }
-        }
+    fn a_marked_state_root_refuses_the_store_without_touching_files() {
         let root = broca_test_support::scratch_root()
-            .join(format!("boot-open-marker-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("run-index.db");
-        drop(super::SqliteStore::open(&path).unwrap());
-        let decision = broca_wal::state_format::decide_state_root(&root).unwrap();
-        let reads = Arc::new(AtomicUsize::new(0));
-        fs_ops::with_fs_ops(
-            Arc::new(CountMarker {
-                marker: root.join("state-format"),
-                reads: reads.clone(),
-            }),
-            || {
-                drop(super::SqliteStore::open_boot_legacy(decision.legacy().unwrap()).unwrap());
-                drop(
-                    super::SqliteStore::open_boot_legacy_read_only(decision.legacy().unwrap())
-                        .unwrap(),
-                );
-                assert_eq!(reads.load(Ordering::Relaxed), 0);
-                assert!(super::SqliteStore::open(&path).is_err());
-                assert!(super::SqliteStore::open_read_only(&path).is_err());
-                assert_eq!(reads.load(Ordering::Relaxed), 2);
-            },
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn legacy_store_refuses_overhaul_destinations_without_touching_files() {
-        let root = broca_test_support::scratch_root()
-            .join(format!("legacy-store-overhaul-{}", std::process::id()));
+            .join(format!("marked-state-root-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("state-format"), "broca-state/2").unwrap();
         let path = root.join("run-index.db");
         assert!(matches!(
             super::SqliteStore::open(&path),
-            Err(super::StoreError::LegacyOnly(_))
+            Err(super::StoreError::MarkedStateRoot(_))
         ));
         assert!(!path.exists());
         let files = ["run-index.db", "run-index.db-wal", "run-index.db-shm"];
@@ -547,11 +440,11 @@ mod tests {
         }
         assert!(matches!(
             super::SqliteStore::open(&path),
-            Err(super::StoreError::LegacyOnly(_))
+            Err(super::StoreError::MarkedStateRoot(_))
         ));
         assert!(matches!(
             super::SqliteStore::open_read_only(&path),
-            Err(super::StoreError::LegacyOnly(_))
+            Err(super::StoreError::MarkedStateRoot(_))
         ));
         for name in files {
             assert_eq!(

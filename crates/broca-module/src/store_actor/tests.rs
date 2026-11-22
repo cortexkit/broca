@@ -306,7 +306,7 @@ pub(super) struct LoopExecutor {
     pub(super) rebuild_points: Arc<std::sync::Mutex<Vec<bool>>>,
     /// The credential selection each fresh run freezes, as the module's executor freezes the
     /// account routing chose; `None` freezes none.
-    pub(super) auth_selection: Option<broca_wal::AuthSelection>,
+    pub(super) auth_selection: Option<broca_records::record::AuthSelection>,
 }
 
 /// Waits for the media the actor sends a run, without rendering any.

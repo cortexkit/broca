@@ -184,7 +184,7 @@ impl Side {
     /// Whether the session is kept in the session store, in mode `cipher`.
     fn stored_in(&self, cipher: Cipher) -> bool {
         use broca_session_store::backend::{LocalBackend, SessionAddr};
-        let stored = LocalBackend::new(self.dir.join(broca_wal::SESSION_STORAGE_DIR))
+        let stored = LocalBackend::new(self.dir.join(broca_records::features::SESSION_STORAGE_DIR))
             .read_stored_head(&SessionAddr(broca_core::session_addr(&self.key)))
             .unwrap();
         stored.is_some_and(|(head, _)| {

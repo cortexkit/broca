@@ -8,7 +8,7 @@ export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 export CARGO_TERM_COLOR=always CI=true
 lane="${1:-}"
 case "$lane" in
-  fast|linux-small|linux-operator|linux|linux-lint|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos) ;;
+  fast|linux-small|linux-operator|linux|linux-lint|linux-portable|linux-unit|linux-integration-[1234]|linux-production|linux-msrv|linux-deploy|windows|macos) ;;
   *) echo "prepush: unknown lane $lane" >&2; exit 2 ;;
 esac
 platform="${lane%%-*}"
@@ -384,29 +384,25 @@ case "$lane" in
     ;;
   macos)
     step 'store contention' nice -n 10 cargo test --locked -p broca-store-contention-tests --lib
-    step 'WAL reader' nice -n 10 cargo test --locked -p broca-wal-reader
-    step 'v4 framing' nice -n 10 cargo test --locked -p broca-wal --lib framing::tests::v4
     step 'clean worktree' clean
     ;;
   linux|linux-*|windows)
     : "${CARGO_TARGET_DIR:?motor must supply its persistent target cache}"
     case "$lane" in
       linux-production|linux-unit) export CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 ;;
-      linux-wal|linux-small) export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 ;;
+      linux-small) export CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 ;;
       *) export CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=4 ;;
     esac
-    portable=0 unit=0 integration=0 production=0 msrv=0 wal=0 deployment=0 lint=0
+    portable=0 unit=0 integration=0 production=0 msrv=0 deployment=0 lint=0
     case "$lane" in
-      linux) portable=1 unit=1 integration=1 production=1 msrv=1 wal=1 deployment=1 ;;
+      linux) portable=1 unit=1 integration=1 production=1 msrv=1 deployment=1 ;;
       linux-portable) portable=1 ;;
       linux-unit) unit=1 ;;
       linux-integration-*) integration=1 ;;
       linux-production) production=1 ;;
       linux-msrv) msrv=1 ;;
-      linux-wal) wal=1 ;;
       linux-deploy) deployment=1 ;;
-      linux-small) wal=1 ;;
-      windows) lint=1 unit=1 integration=1 wal=1 ;;
+      windows) lint=1 unit=1 integration=1 ;;
     esac
     if [[ "$platform" == windows ]]; then
       export CARGO_NET_OFFLINE=true
@@ -504,10 +500,6 @@ case "$lane" in
             --output "$root/.cortexkit/internal-docs/investigations/prepush-portable-coverage-linux-unit.json"
         fi
       fi
-    fi
-    if [[ $wal == 1 ]]; then
-      step 'WAL reader' cargo test --locked -p broca-wal-reader
-      step 'v4 framing' cargo test --locked -p broca-wal --lib framing::tests::v4
     fi
     if [[ $production == 1 ]]; then
       step 'production clippy' cargo clippy --locked -p broca-core -p broca-module -p broca-module-serve --all-targets -- -D warnings

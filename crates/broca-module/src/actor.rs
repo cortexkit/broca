@@ -326,10 +326,6 @@ pub(crate) fn admission_refusal_outcome(error: RunError) -> SendOutcome {
             credential,
             candidate_ids,
         },
-        RunError::SessionTooLarge { max_bytes } => SendOutcome::SessionTooLarge { max_bytes },
-        RunError::RetainedSessionTooLarge { max_bytes } => {
-            SendOutcome::RetainedSessionTooLarge { max_bytes }
-        }
         error => SendOutcome::ClassifiedError {
             class: error.admission_error_class(),
             reason: error.to_string(),

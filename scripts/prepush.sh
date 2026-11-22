@@ -11,7 +11,7 @@ if [[ $# -gt 0 ]]; then
   if [[ $# == 2 && $1 == --lane ]]; then
     exec bash scripts/lib/prepush-lane.sh "$2"
   fi
-  echo 'usage: bash scripts/prepush.sh [--lane fast|linux-small|linux-operator|linux|linux-lint|linux-portable|linux-unit|linux-integration-{1,2,3,4}|linux-production|linux-msrv|linux-wal|linux-deploy|windows|macos]' >&2
+  echo 'usage: bash scripts/prepush.sh [--lane fast|linux-small|linux-operator|linux|linux-lint|linux-portable|linux-unit|linux-integration-{1,2,3,4}|linux-production|linux-msrv|linux-deploy|windows|macos]' >&2
   exit 2
 fi
 command -v ck >/dev/null || {

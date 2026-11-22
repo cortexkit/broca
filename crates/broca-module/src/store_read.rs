@@ -311,13 +311,8 @@ async fn read_page_with_facts<B: SessionBackend>(
         messages,
         next_from_ordinal,
         head: None,
-        lineage_id: None,
         lineage_state: lineage_state(session),
         prompt_len,
-        deferred_calls: None,
-        late_approvals: Vec::new(),
-        withdrawals_owed: false,
-        tags_await_setup: false,
     };
     Ok(StorePage {
         page,
@@ -767,7 +762,6 @@ fn empty_page() -> SessionReadPage {
         messages: Vec::new(),
         next_from_ordinal: None,
         head: None,
-        lineage_id: None,
         lineage_state: SessionReadLineageState {
             last_run_id: None,
             state: SessionReadStateKind::Idle,
@@ -776,10 +770,6 @@ fn empty_page() -> SessionReadPage {
             usage: None,
         },
         prompt_len: 0,
-        deferred_calls: None,
-        late_approvals: Vec::new(),
-        withdrawals_owed: false,
-        tags_await_setup: false,
     }
 }
 

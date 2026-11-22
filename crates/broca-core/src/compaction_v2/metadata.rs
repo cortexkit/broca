@@ -5,8 +5,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use broca_protocol::{BindPrincipal, ContentBlock, Message, Role as HostRole, Usage};
-use broca_records::record::WalRecord;
-use broca_wal::FramedRecord;
 use cortexkit_role_compaction::{
     part::{Delivered, PartBody, ToolPart, ToolStatus},
     read::{NoticeOrigin, Role, SpeaksFor, StepUsage},
@@ -237,31 +235,3 @@ fn numbered_flags_of(role: HostRole, kinds: impl IntoIterator<Item = NumberingKi
 }
 
 impl Fold {}
-
-pub fn source_frames<'a>(
-    metadata: &Metadata,
-    records: &'a [FramedRecord],
-) -> Result<&'a [FramedRecord], String> {
-    let start = records
-        .binary_search_by_key(&metadata.source_seq, |frame| frame.seq)
-        .map_err(|_| {
-            format!(
-                "compaction message source {} is missing",
-                metadata.source_seq
-            )
-        })?;
-    if matches!(records[start].record, WalRecord::ModelStepFinished { .. }) {
-        let end = records[start + 1..]
-            .iter()
-            .position(|frame| {
-                matches!(
-                    frame.record,
-                    WalRecord::ModelStepFinished { .. } | WalRecord::RunStarted { .. }
-                )
-            })
-            .map_or(records.len(), |offset| start + 1 + offset);
-        Ok(&records[start..end])
-    } else {
-        Ok(&records[start..start + 1])
-    }
-}

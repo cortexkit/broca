@@ -345,7 +345,7 @@ async fn view(
     cipher: Cipher,
 ) -> broca_session_store::session::SessionView<LocalBackend> {
     Session::view(
-        LocalBackend::new(dir.join(broca_wal::SESSION_STORAGE_DIR)),
+        LocalBackend::new(dir.join(broca_records::features::SESSION_STORAGE_DIR)),
         addr(key),
         &triple(key),
         &deployment(cipher),
@@ -364,7 +364,7 @@ async fn boundaries(
     key: &BindIdentity,
     cipher: Cipher,
 ) -> (PathBuf, Vec<(u64, String)>) {
-    let root = dir.join(broca_wal::SESSION_STORAGE_DIR);
+    let root = dir.join(broca_records::features::SESSION_STORAGE_DIR);
     let addr = addr(key);
     let backend = LocalBackend::new(&root);
     let (stored, _) = backend.read_stored_head(&addr).unwrap().unwrap();
@@ -404,7 +404,7 @@ async fn boundaries(
             cuts.push((offset as u64, what));
         }
     }
-    let file = Path::new(broca_wal::SESSION_STORAGE_DIR)
+    let file = Path::new(broca_records::features::SESSION_STORAGE_DIR)
         .join("logs")
         .join(&addr.0)
         .join(broca_session_store::codec::hex(&log.0));
@@ -434,7 +434,7 @@ fn index_objects(dir: &Path, key: &BindIdentity) -> Vec<(PathBuf, Vec<u8>)> {
     }
     let mut out = Vec::new();
     let objects = dir
-        .join(broca_wal::SESSION_STORAGE_DIR)
+        .join(broca_records::features::SESSION_STORAGE_DIR)
         .join("objects")
         .join(addr(key).0);
     walk(dir, &objects, &mut out);

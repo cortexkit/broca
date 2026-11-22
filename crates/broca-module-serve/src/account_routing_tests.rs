@@ -2303,12 +2303,11 @@ fn report_key_limit(client: Arc<RoutingClient>, decision: &AccountDecision) -> b
         "run-1".into(),
         None,
         Arc::new(AtomicU64::new(3)),
-        None,
+        Some(next_session_id()),
     ) else {
         return false;
     };
-    let lineage = lineage();
-    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    broca_core::AccountReporter::run_started(reporter.as_ref(), 1);
     let observed = attempt(
         Some(429),
         AttemptAccountObservation {
@@ -2322,8 +2321,8 @@ fn report_key_limit(client: Arc<RoutingClient>, decision: &AccountDecision) -> b
             ..Default::default()
         },
     );
-    broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), Some(lineage), 2, &observed);
-    reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+    broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), 2, &observed);
+    reporter.finish(3, RunFinishReason::Error);
     true
 }
 
@@ -2395,7 +2394,7 @@ async fn static_key_limits_send_nothing_but_routed_limits_name_the_issued_admiss
 }
 
 #[tokio::test]
-async fn legacy_unheld_admissions_never_start_reporters_or_report_sealed_runs() {
+async fn legacy_unheld_admissions_never_start_reporters() {
     for path in [
         "pinned",
         "single_candidate",
@@ -2416,24 +2415,6 @@ async fn legacy_unheld_admissions_never_start_reporters_or_report_sealed_runs() 
             routed_ref: None,
         };
         let started = report_key_limit(Arc::clone(&client), &decision);
-        report_sealed(
-            Arc::clone(&client),
-            &broca_module::SealedRun {
-                session: session(),
-                run_id: broca_protocol::RunId("run-1".into()),
-                auth_selection: Some(broca_core::AuthSelection {
-                    billing_vault_facts: None,
-                    auth_method: Some("apikey".into()),
-                    credential_id: "key-b".into(),
-                    account_ref: None,
-                    resolved_credential_id: None,
-                    vault_request: None,
-                    account_decision: Some(decision),
-                }),
-                lineage: Some(lineage()),
-                terminal_seq: 4,
-            },
-        );
         drop(client);
         wait_for_reporter_release(&routing).await;
         let reports = routing.observed();
@@ -2633,13 +2614,6 @@ fn headers_pass_through_unknown_names_and_odd_values_verbatim() {
     assert_eq!(body["headers"], json!(odd));
 }
 
-#[test]
-fn event_id_is_the_lineage_and_wal_sequence_joined_by_a_colon() {
-    let lineage = lineage();
-    assert_eq!(event_id(Some(lineage), 7), Some(format!("{lineage}:7")));
-    assert_eq!(event_id(None, 7), None);
-}
-
 // ---- the reporter ---------------------------------------------------------------------------
 
 async fn settle(routing: &FakeRouting, expected: usize) {
@@ -2653,12 +2627,10 @@ async fn settle(routing: &FakeRouting, expected: usize) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// A lineage id no other fixture in this process shares.
-fn lineage() -> WalLineageId {
+/// A session id no other fixture in this process shares, which names the reports' records.
+fn next_session_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::Relaxed).to_be_bytes());
-    WalLineageId::from_bytes(bytes)
+    format!("session-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 #[tokio::test]
@@ -2672,18 +2644,19 @@ async fn run_finished_is_sent_once_for_every_terminal_reason() {
         let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
         let client = Arc::new(client(&routing));
         let durable = Arc::new(AtomicU64::new(100));
+        let session_id = next_session_id();
         let reporter = RunReporter::start(
             Arc::clone(&client),
             "run-1".into(),
             "run-1".into(),
             None,
             durable,
+            session_id.clone(),
         );
-        let lineage = lineage();
-        broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
-        reporter.finish(Some(lineage), 9, reason);
+        broca_core::AccountReporter::run_started(reporter.as_ref(), 1);
+        reporter.finish(9, reason);
         // A second finish for the same run is never sent: the report task has ended.
-        reporter.finish(Some(lineage), 10, reason);
+        reporter.finish(10, reason);
         settle(&routing, 2).await;
         let observed = routing.observed();
         let kinds: Vec<_> = observed.iter().map(|body| body["kind"].clone()).collect();
@@ -2692,7 +2665,7 @@ async fn run_finished_is_sent_once_for_every_terminal_reason() {
             vec![json!("admission_started"), json!("run_finished")],
             "{reason:?}"
         );
-        assert_eq!(observed[1]["event_id"], format!("{lineage}:9"));
+        assert_eq!(observed[1]["event_id"], format!("{session_id}:9"));
         assert_eq!(
             observed[1]["terminal_reason"],
             serde_json::to_value(reason).unwrap()
@@ -2709,28 +2682,24 @@ async fn terminal_transient_backoff_is_gated_and_precedes_release() {
             ..FakeRouting::default()
         });
         let client = Arc::new(client(&routing));
+        let session_id = next_session_id();
         let reporter = RunReporter::start(
             client,
             "adm-key".into(),
             "run-key".into(),
             None,
             Arc::new(AtomicU64::new(10)),
+            session_id.clone(),
         );
-        let lineage = lineage();
         let observed = attempt(Some(429), AttemptAccountObservation::default());
-        broca_core::AccountReporter::attempt_recorded(
-            reporter.as_ref(),
-            Some(lineage),
-            2,
-            &observed,
-        );
+        broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), 2, &observed);
         let error = serde_json::from_value(
             json!({"class":"transient","message":"slow down","status":429,
             "retry_after_secs":1.125,"provider_code":"rate_limited"}),
         )
         .unwrap();
-        reporter.terminal_transient(Some(lineage), 3, &error);
-        reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+        reporter.terminal_transient(3, &error);
+        reporter.finish(3, RunFinishReason::Error);
         broca_test_support::wait_until("API-key release report", || async {
             let observed = routing.observed();
             if observed
@@ -2748,7 +2717,7 @@ async fn terminal_transient_backoff_is_gated_and_precedes_release() {
         if supported {
             assert_eq!(
                 reports[1],
-                json!({"event_id":format!("{lineage}:3:backoff"),"kind":"transient_backoff",
+                json!({"event_id":format!("{session_id}:3:backoff"),"kind":"transient_backoff",
                 "caller":{"runner":"broca"},"admission_id":"adm-key","retry_at_ms":NOW + 1125})
             );
             assert_ne!(reports[1]["event_id"], reports[2]["event_id"]);
@@ -2768,30 +2737,26 @@ async fn terminal_transient_backoff_uses_receipt_time_not_settlement_time() {
             backoff: true,
             ..FakeRouting::default()
         });
+        let session_id = next_session_id();
         let reporter = RunReporter::start(
             Arc::new(client(&routing)),
             "adm-receipt".into(),
             "run-receipt".into(),
             None,
             Arc::new(AtomicU64::new(4)),
+            session_id.clone(),
         );
-        let lineage = lineage();
         let mut observed = attempt(Some(503), AttemptAccountObservation::default());
         observed.account_observation.failure_received_at_ms = receipt;
         observed.ts_ms = 19_000;
-        broca_core::AccountReporter::attempt_recorded(
-            reporter.as_ref(),
-            Some(lineage),
-            2,
-            &observed,
-        );
+        broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), 2, &observed);
         let error = serde_json::from_value(json!({
             "class":"transient", "message":"unavailable", "status":503,
             "retry_after_secs":retry_seconds,
         }))
         .unwrap();
-        reporter.terminal_transient(Some(lineage), 4, &error);
-        reporter.finish(Some(lineage), 4, RunFinishReason::Error);
+        reporter.terminal_transient(4, &error);
+        reporter.finish(4, RunFinishReason::Error);
         drop(reporter);
         broca_test_support::wait_until("receipt reports drained", || async {
             if Arc::strong_count(&routing) == 1 {
@@ -2834,38 +2799,29 @@ async fn terminal_transient_backoff_requires_a_failed_final_attempt_outcome() {
             backoff: true,
             ..FakeRouting::default()
         });
+        let session_id = next_session_id();
         let reporter = RunReporter::start(
             Arc::new(client(&routing)),
             "adm-final-attempt".into(),
             "run-final-attempt".into(),
             None,
             Arc::new(AtomicU64::new(4)),
+            session_id.clone(),
         );
-        let lineage = lineage();
         let mut observed = attempt(Some(503), AttemptAccountObservation::default());
         observed.ts_ms = 1_000;
         observed.account_observation.failure_received_at_ms = Some(1_000);
-        broca_core::AccountReporter::attempt_recorded(
-            reporter.as_ref(),
-            Some(lineage),
-            2,
-            &observed,
-        );
+        broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), 2, &observed);
         // The recorded outcome, not the status, decides whether the final attempt failed.
         observed.http_status = status;
         observed.outcome = outcome.clone();
         observed.ts_ms = 42_000;
         observed.account_observation.failure_received_at_ms = Some(42_000);
-        broca_core::AccountReporter::attempt_recorded(
-            reporter.as_ref(),
-            Some(lineage),
-            3,
-            &observed,
-        );
+        broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), 3, &observed);
         let error =
             serde_json::from_value(json!({"class":"transient","message":"failed"})).unwrap();
-        reporter.terminal_transient(Some(lineage), 4, &error);
-        reporter.finish(Some(lineage), 4, RunFinishReason::Error);
+        reporter.terminal_transient(4, &error);
+        reporter.finish(4, RunFinishReason::Error);
         let reports = broca_test_support::wait_until("final attempt release report", || async {
             let reports = routing.observed();
             if reports
@@ -2902,17 +2858,17 @@ async fn terminal_transient_backoff_excludes_account_limits_and_invalid_delays()
             backoff: true,
             ..FakeRouting::default()
         });
+        let session_id = next_session_id();
         let reporter = RunReporter::start(
             Arc::new(client(&routing)),
             "adm-key".into(),
             "run-key".into(),
             None,
             Arc::new(AtomicU64::new(10)),
+            session_id.clone(),
         );
-        let lineage = lineage();
         broca_core::AccountReporter::attempt_recorded(
             reporter.as_ref(),
-            Some(lineage),
             2,
             &attempt(Some(429), AttemptAccountObservation::default()),
         );
@@ -2921,8 +2877,8 @@ async fn terminal_transient_backoff_excludes_account_limits_and_invalid_delays()
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        reporter.terminal_transient(Some(lineage), 3, &serde_json::from_value(error).unwrap());
-        reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+        reporter.terminal_transient(3, &serde_json::from_value(error).unwrap());
+        reporter.finish(3, RunFinishReason::Error);
         let reports = broca_test_support::wait_until("untimed API-key release report", || async {
             let observed = routing.observed();
             if observed
@@ -2949,15 +2905,16 @@ async fn terminal_credential_reports(
         credential_refused: true,
         ..FakeRouting::default()
     });
+    let session_id = next_session_id();
     let reporter = RunReporter::start(
         Arc::new(client(&routing)),
         "adm-refused".into(),
         "run-refused".into(),
         None,
         Arc::new(AtomicU64::new(10)),
+        session_id.clone(),
     );
-    let lineage = lineage();
-    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    broca_core::AccountReporter::run_started(reporter.as_ref(), 1);
     let observation = AttemptAccountObservation {
         failure_received_at_ms: None,
         limit: error
@@ -2973,13 +2930,12 @@ async fn terminal_credential_reports(
     };
     broca_core::AccountReporter::attempt_recorded(
         reporter.as_ref(),
-        Some(lineage),
         2,
         &attempt(error.status, observation),
     );
-    reporter.terminal_credential_refused(Some(lineage), 3, &error, Some(method), credential_id);
-    reporter.terminal_transient(Some(lineage), 3, &error);
-    reporter.finish(Some(lineage), 3, RunFinishReason::Error);
+    reporter.terminal_credential_refused(3, &error, Some(method), credential_id);
+    reporter.terminal_transient(3, &error);
+    reporter.finish(3, RunFinishReason::Error);
     broca_test_support::wait_until("credential refusal release report", || async {
         let reports = routing.observed();
         if reports
@@ -3208,14 +3164,15 @@ async fn an_attempt_is_reported_only_once_its_record_is_durable_and_in_order() {
     let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
     let client = Arc::new(client(&routing));
     let durable = Arc::new(AtomicU64::new(2));
+    let session_id = next_session_id();
     let reporter = RunReporter::start(
         Arc::clone(&client),
         "run-1".into(),
         "run-1".into(),
         Some("vault-view-1".into()),
         Arc::clone(&durable),
+        session_id.clone(),
     );
-    let lineage = lineage();
     let first = attempt(
         Some(200),
         AttemptAccountObservation {
@@ -3225,21 +3182,21 @@ async fn an_attempt_is_reported_only_once_its_record_is_durable_and_in_order() {
         },
     );
     let second = attempt(Some(200), AttemptAccountObservation::default());
-    broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), Some(lineage), 3, &first);
-    broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), Some(lineage), 5, &second);
+    broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), 3, &first);
+    broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), 5, &second);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         routing.observed().is_empty(),
         "record 3 is not durable yet, so nothing is reported"
     );
     durable.store(5, Ordering::Release);
-    reporter.finish(Some(lineage), 6, RunFinishReason::Completed);
+    reporter.finish(6, RunFinishReason::Completed);
     settle(&routing, 3).await;
     let observed = routing.observed();
     assert_eq!(observed.len(), 3);
-    assert_eq!(observed[0]["event_id"], format!("{lineage}:3"));
+    assert_eq!(observed[0]["event_id"], format!("{session_id}:3"));
     assert_eq!(observed[0]["view_digest"], "vault-view-1");
-    assert_eq!(observed[1]["event_id"], format!("{lineage}:5"));
+    assert_eq!(observed[1]["event_id"], format!("{session_id}:5"));
     assert_eq!(observed[1].get("headers"), None);
     // run_finished carries the latest reading seen, even when the last attempt had none.
     assert_eq!(
@@ -3254,86 +3211,26 @@ async fn an_attempt_is_reported_only_once_its_record_is_durable_and_in_order() {
 async fn a_hung_routing_never_holds_the_reporting_run() {
     let routing = FakeRouting::hung();
     let client = Arc::new(client(&routing));
+    let session_id = next_session_id();
     let reporter = RunReporter::start(
         Arc::clone(&client),
         "run-1".into(),
         "run-1".into(),
         None,
         Arc::new(AtomicU64::new(100)),
+        session_id.clone(),
     );
-    let lineage = lineage();
     let started = tokio::time::Instant::now();
-    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    broca_core::AccountReporter::run_started(reporter.as_ref(), 1);
     broca_core::AccountReporter::attempt_recorded(
         reporter.as_ref(),
-        Some(lineage),
         2,
         &attempt(Some(200), AttemptAccountObservation::default()),
     );
-    reporter.finish(Some(lineage), 3, RunFinishReason::Completed);
+    reporter.finish(3, RunFinishReason::Completed);
     assert!(
         started.elapsed() < Duration::from_millis(50),
         "the hooks queue and return"
-    );
-}
-
-#[tokio::test]
-async fn a_sealed_run_reports_its_interrupted_terminal_once() {
-    let routing = FakeRouting::refusing(SELECTION_DISABLED, json!({}));
-    let client = Arc::new(client(&routing));
-    let lineage = lineage();
-    let selection = |decision: Option<AccountDecision>| broca_core::AuthSelection {
-        billing_vault_facts: None,
-        auth_method: None,
-        credential_id: "oauth:anthropic".into(),
-        account_ref: None,
-        resolved_credential_id: None,
-        vault_request: None,
-        account_decision: decision,
-    };
-    let sealed = |auth_selection| broca_module::SealedRun {
-        session: session(),
-        run_id: broca_protocol::RunId("run-1".into()),
-        auth_selection,
-        lineage: Some(lineage),
-        terminal_seq: 12,
-    };
-    report_sealed(
-        Arc::clone(&client),
-        &sealed(Some(selection(Some(AccountDecision {
-            conversation_key: None,
-            conversation_key_source: None,
-            path: "routed".into(),
-            admission_id: Some("run-1".into()),
-            decision_id: None,
-            routed_ref: None,
-        })))),
-    );
-    // No admission id (the break-glass path), or no selection at all: nothing is reported.
-    report_sealed(
-        Arc::clone(&client),
-        &sealed(Some(selection(Some(AccountDecision {
-            conversation_key: None,
-            conversation_key_source: None,
-            path: "legacy_static".into(),
-            admission_id: None,
-            decision_id: None,
-            routed_ref: None,
-        })))),
-    );
-    report_sealed(Arc::clone(&client), &sealed(None));
-    settle(&routing, 1).await;
-    let observed = routing.observed();
-    assert_eq!(observed.len(), 1);
-    assert_eq!(
-        observed[0],
-        run_finished_body(
-            &format!("{lineage}:12"),
-            "run-1",
-            "run-1",
-            RunFinishReason::Interrupted,
-            None
-        )
     );
 }
 
@@ -3829,32 +3726,31 @@ async fn a_continue_request_is_sent_only_to_a_router_that_serves_continuation() 
 async fn a_move_is_reported_once_in_order_under_the_original_admission() {
     let routing = Arc::new(FakeRouting::default());
     let client = Arc::new(client(&routing));
+    let session_id = next_session_id();
     let reporter = RunReporter::start(
         Arc::clone(&client),
         "adm-move".into(),
         "run-move".into(),
         None,
         Arc::new(AtomicU64::new(100)),
+        session_id.clone(),
     );
-    let lineage = lineage();
-    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    broca_core::AccountReporter::run_started(reporter.as_ref(), 1);
     broca_core::AccountReporter::attempt_recorded(
         reporter.as_ref(),
-        Some(lineage),
         5,
         &attempt(Some(429), AttemptAccountObservation::default()),
     );
     let mut moved = continue_selection();
     moved.credential_id = "credential-b".into();
     moved.account_ref = Some("acct-b".into());
-    reporter.moved(Some(lineage), 6, &moved);
+    reporter.moved(6, &moved);
     broca_core::AccountReporter::attempt_recorded(
         reporter.as_ref(),
-        Some(lineage),
         7,
         &attempt(Some(200), AttemptAccountObservation::default()),
     );
-    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    reporter.finish(9, RunFinishReason::Completed);
     settle(&routing, 5).await;
     let observed = routing.observed();
     let kinds: Vec<_> = observed.iter().map(|body| body["kind"].clone()).collect();
@@ -3871,7 +3767,7 @@ async fn a_move_is_reported_once_in_order_under_the_original_admission() {
     assert_eq!(
         observed[2],
         json!({
-            "event_id": format!("{lineage}:6"),
+            "event_id": format!("{session_id}:6"),
             "caller": {"runner": "broca"},
             "kind": "admission_started",
             "admission_id": "adm-move",
@@ -3892,14 +3788,15 @@ async fn a_move_is_reported_once_in_order_under_the_original_admission() {
 async fn attempt_observations_name_the_account_each_attempt_was_sent_on() {
     let routing = Arc::new(FakeRouting::default());
     let client = Arc::new(client(&routing));
+    let session_id = next_session_id();
     let reporter = RunReporter::start(
         Arc::clone(&client),
         "adm-move".into(),
         "run-move".into(),
         None,
         Arc::new(AtomicU64::new(100)),
+        session_id.clone(),
     );
-    let lineage = lineage();
     let mut on_a = continue_selection();
     on_a.credential_id = "credential-a".into();
     on_a.account_ref = Some("acct-a".into());
@@ -3914,20 +3811,19 @@ async fn attempt_observations_name_the_account_each_attempt_was_sent_on() {
         ..Default::default()
     };
     reporter.attempt_recorded_on(
-        Some(lineage),
         4,
         &attempt(Some(200), AttemptAccountObservation::default()),
         Some(&on_a),
     );
-    reporter.attempt_recorded_on(Some(lineage), 5, &attempt(Some(429), wall), Some(&on_a));
+    reporter.attempt_recorded_on(5, &attempt(Some(429), wall), Some(&on_a));
     // The move's own report is not queued here: the attempts alone must name B.
     let mut on_b = continue_selection();
     on_b.credential_id = "credential-b".into();
     on_b.account_ref = Some("acct-b".into());
     let mut served_b = attempt(Some(200), AttemptAccountObservation::default());
     served_b.served_account_ref = Some("acct-b".into());
-    reporter.attempt_recorded_on(Some(lineage), 7, &served_b, Some(&on_b));
-    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    reporter.attempt_recorded_on(7, &served_b, Some(&on_b));
+    reporter.finish(9, RunFinishReason::Completed);
     settle(&routing, 4).await;
     let observed = routing.observed();
     let named: Vec<_> = observed
@@ -3974,14 +3870,15 @@ async fn attempt_observations_name_the_account_each_attempt_was_sent_on() {
 async fn a_move_drops_what_the_old_account_saw_from_later_reports() {
     let routing = Arc::new(FakeRouting::default());
     let client = Arc::new(client(&routing));
+    let session_id = next_session_id();
     let reporter = RunReporter::start(
         Arc::clone(&client),
         "adm-move".into(),
         "run-move".into(),
         Some("listing-of-a".into()),
         Arc::new(AtomicU64::new(100)),
+        session_id.clone(),
     );
-    let lineage = lineage();
     let mut on_a = continue_selection();
     on_a.credential_id = "credential-a".into();
     on_a.account_ref = Some("acct-a".into());
@@ -3992,23 +3889,17 @@ async fn a_move_drops_what_the_old_account_saw_from_later_reports() {
         )]),
         ..Default::default()
     };
-    reporter.attempt_recorded_on(
-        Some(lineage),
-        4,
-        &attempt(Some(200), exhausted),
-        Some(&on_a),
-    );
+    reporter.attempt_recorded_on(4, &attempt(Some(200), exhausted), Some(&on_a));
     let mut on_b = continue_selection();
     on_b.credential_id = "credential-b".into();
     on_b.account_ref = Some("acct-b".into());
-    reporter.moved(Some(lineage), 6, &on_b);
+    reporter.moved(6, &on_b);
     reporter.attempt_recorded_on(
-        Some(lineage),
         7,
         &attempt(Some(200), AttemptAccountObservation::default()),
         Some(&on_b),
     );
-    reporter.finish(Some(lineage), 9, RunFinishReason::Completed);
+    reporter.finish(9, RunFinishReason::Completed);
     settle(&routing, 4).await;
     let observed = routing.observed();
     assert_eq!(observed[0]["view_digest"], "listing-of-a");
@@ -4101,18 +3992,19 @@ async fn attempt_reports(
         declared,
         ..FakeRouting::default()
     });
+    let session_id = next_session_id();
     let reporter = RunReporter::start(
         Arc::new(client(&routing)),
         "adm-served".into(),
         "run-served".into(),
         None,
         Arc::new(AtomicU64::new(10)),
+        session_id.clone(),
     );
     if let Some(account) = admitted {
         reporter.admitted_on(account.into(), "vault-key".into());
     }
-    let lineage = lineage();
-    broca_core::AccountReporter::run_started(reporter.as_ref(), Some(lineage), 1);
+    broca_core::AccountReporter::run_started(reporter.as_ref(), 1);
     let selection = |account: Option<&str>| -> broca_records::record::AuthSelection {
         serde_json::from_value(json!({
             "credential_id": "vault-key",
@@ -4123,11 +4015,11 @@ async fn attempt_reports(
     };
     let mut seq = 2;
     if let Some(account) = moved_to {
-        reporter.moved(Some(lineage), seq, &selection(Some(account)));
+        reporter.moved(seq, &selection(Some(account)));
         seq += 1;
     }
-    reporter.attempt_recorded_on(Some(lineage), seq, &recorded, Some(&selection(account_ref)));
-    reporter.finish(Some(lineage), seq + 1, RunFinishReason::Completed);
+    reporter.attempt_recorded_on(seq, &recorded, Some(&selection(account_ref)));
+    reporter.finish(seq + 1, RunFinishReason::Completed);
     broca_test_support::wait_until("the run's reports", || async {
         let reports = routing.observed();
         if reports

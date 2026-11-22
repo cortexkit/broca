@@ -553,7 +553,7 @@ async fn a_session_with_no_recorded_time_is_refused_by_name() {
     };
     let mut session = broca_session_store::session::Session::create(
         broca_session_store::backend::LocalBackend::new(
-            store.dir.join(broca_wal::SESSION_STORAGE_DIR),
+            store.dir.join(broca_records::features::SESSION_STORAGE_DIR),
         ),
         broca_session_store::backend::SessionAddr(broca_core::session_addr(&store.key)),
         triple,

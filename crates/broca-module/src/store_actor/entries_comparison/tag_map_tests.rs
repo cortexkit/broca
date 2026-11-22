@@ -312,7 +312,7 @@ pub(super) async fn closed(side: &Side) {
 /// The session's writer, loaded as no actor holds it.
 pub(super) async fn writer(side: &Side) -> Session<LocalBackend> {
     Session::load(
-        LocalBackend::new(side.dir.join(broca_wal::SESSION_STORAGE_DIR)),
+        LocalBackend::new(side.dir.join(broca_records::features::SESSION_STORAGE_DIR)),
         SessionAddr(broca_core::session_addr(&side.key)),
         &SessionTriple {
             project_root: side.key.project_root.display().to_string(),

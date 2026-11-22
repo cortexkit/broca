@@ -33,7 +33,6 @@ use broca_protocol::{
     provider::{NormalizedEvent, ProviderControl},
     BindIdentity, FinishReason, MessageId, Usage,
 };
-use broca_records::record::WalRecord;
 use subc_protocol::session::{
     HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
 };
@@ -4719,13 +4718,10 @@ async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_ser
     let second_run = second["result"]["run_id"].as_str().unwrap().to_string();
     wait_for_completed_run(&mut creader, &mut cwriter, 7, &second_run, 200).await;
 
-    let pinned: WalRecord = serde_json::from_str(include_str!(
-        "../../../broca-wal/tests/golden/run_started.tool_reply.json"
-    ))
-    .unwrap();
-    let WalRecord::RunStarted { config: pinned, .. } = pinned else {
-        unreachable!()
-    };
+    let pinned: serde_json::Value =
+        serde_json::from_str(include_str!("../golden/run_started.tool_reply.json")).unwrap();
+    let pinned: broca_records::record::RunConfig =
+        serde_json::from_value(pinned["config"].clone()).unwrap();
     let pinned_entry = serde_json::to_string(&pinned.tools[0]).unwrap();
     let starts = Sessions(runtime.clone()).starts(&session).await;
     assert_eq!(starts.len(), 2);

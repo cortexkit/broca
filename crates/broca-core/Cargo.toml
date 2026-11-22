@@ -8,7 +8,7 @@ repository.workspace = true
 description = "broca core: the agentic loop and its seams (provider, tool-plane, lease, approval). Provider- and transport-agnostic — no subc dependency; the subc tool plane is a separate adapter crate."
 
 [features]
-test-clock = ["broca-wal/fs-override"]
+test-clock = ["broca-records/fs-override"]
 test-attachments = ["broca-protocol/test-attachments"]
 
 [dependencies]
@@ -17,7 +17,6 @@ broca-owner-only.workspace = true
 broca-diagnostics = { path = "../broca-diagnostics" }
 broca-protocol = { path = "../broca-protocol" }
 broca-records = { path = "../broca-records" }
-broca-wal = { path = "../broca-wal" }
 cortexkit-role-compaction-provider = { workspace = true }
 cortexkit-role-compaction.workspace = true
 cortexkit-tokens.workspace = true
@@ -49,7 +48,6 @@ broca-owner-only = { workspace = true, features = ["test-support"] }
 broca-test-support = { path = "../broca-test-support" }
 # Tests of the paths that copy WAL bytes need a gated frame this build can read; see
 # `broca_wal::framing::TEST_KNOWN_FEATURE`.
-broca-wal = { path = "../broca-wal", features = ["test-known-feature"] }
 # The M9 resume-execution harness implements a step-keyed recording Provider.
 async-trait.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

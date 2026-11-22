@@ -294,7 +294,7 @@ async fn write_run_event_samples() {
 
 /// The selection a fresh run freezes in the tests below: routing chose its account and admitted
 /// it as `adm-1`.
-fn routed() -> broca_wal::AuthSelection {
+fn routed() -> broca_records::record::AuthSelection {
     serde_json::from_value(serde_json::json!({
         "credential_id": "credential-a", "account_ref": "a", "auth_method": "oauth",
         "account_decision": {"path": "routed", "admission_id": "adm-1", "decision_id": "decision-a"}
@@ -395,7 +395,7 @@ async fn a_routed_run_cancelled_while_paused_hands_its_end() {
     commands
         .send(crate::actor::LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::StepBoundary,
+            at: broca_records::record::RunCancelAt::StepBoundary,
             reply,
         })
         .unwrap();
@@ -456,7 +456,7 @@ async fn a_routed_run_paused_across_a_restart_hands_its_end() {
     commands
         .send(crate::actor::LineageCmd::Cancel {
             run_id: RunId("r1".into()),
-            at: broca_wal::record::RunCancelAt::StepBoundary,
+            at: broca_records::record::RunCancelAt::StepBoundary,
             reply,
         })
         .unwrap();

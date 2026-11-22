@@ -2,38 +2,24 @@
 
 use std::path::Path;
 
-/// A marker is never permission to reinterpret an unsupported root as the current format.
-pub(crate) fn prepare(
-    root: &Path,
-) -> Result<broca_wal::state_format::StateRootDecision<'_>, String> {
-    let marker = root.join("state-format");
+/// Refuse a state root holding a `state-format` marker: it names a format this build doesn't
+/// run (the removed `broca-state/2` staging format, or another), and a marker is never
+/// permission to read the root as this build's format. The message quotes the marker.
+pub(crate) fn prepare(root: &Path) -> Result<(), String> {
+    let marker = root.join(broca_store::STATE_FORMAT_MARKER);
     match std::fs::read(&marker) {
-        Ok(bytes) => {
-            return Err(format!(
-                "refusing to serve: the state root {} is marked state-format = {:?}, a state \
-                 format this build does not run. Start with a fresh state root.",
-                root.display(),
-                String::from_utf8_lossy(&bytes[..bytes.len().min(64)])
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "refusing to serve: cannot read the state-format marker {}: {error}",
-                marker.display()
-            ));
-        }
+        Ok(bytes) => Err(format!(
+            "refusing to serve: the state root {} is marked state-format = {:?}, a state \
+             format this build does not run. Start with a fresh state root.",
+            root.display(),
+            String::from_utf8_lossy(&bytes[..bytes.len().min(64)])
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "refusing to serve: cannot read the state-format marker {}: {error}",
+            marker.display()
+        )),
     }
-    let decision = broca_wal::state_format::decide_state_root(root)
-        .map_err(|error| format!("refusing to serve: {error}. Start with a fresh state root."))?;
-    if decision.config().is_overhaul() {
-        return Err(format!(
-            "refusing to serve: the state root {} is marked broca-state/2, a removed staging \
-             format. Start with a fresh state root.",
-            root.display()
-        ));
-    }
-    Ok(decision)
 }
 
 #[cfg(test)]
@@ -77,11 +63,11 @@ mod tests {
         let root = broca_test_support::scratch_root()
             .join(format!("unmarked-state-format-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        assert!(prepare(&root).unwrap().legacy().is_some());
+        prepare(&root).unwrap();
         assert!(!root.exists());
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("run-index.db"), b"legacy index").unwrap();
-        assert!(prepare(&root).unwrap().legacy().is_some());
+        prepare(&root).unwrap();
         std::fs::write(root.join("state-format"), b"unknown-format").unwrap();
         let error = prepare(&root).err().unwrap();
         assert!(error.contains("unknown-format"), "{error}");

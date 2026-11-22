@@ -120,14 +120,6 @@ pub fn admission_refusal(error: &ServeError) -> Option<AdmissionRefusal> {
             "tool_alias_invalid",
             Some(json!({"tool": refusal.tool, "class": "permanent"})),
         ),
-        ServeError::SessionTooLarge { max_bytes } => (
-            "session_too_large",
-            Some(json!({"class": "permanent", "max_bytes": max_bytes})),
-        ),
-        ServeError::RetainedSessionTooLarge { max_bytes } => (
-            "retained_session_too_large",
-            Some(json!({"class": "permanent", "max_bytes": max_bytes})),
-        ),
         ServeError::DeliveryRefused { code, .. } => (*code, Some(json!({"field": "delivery"}))),
         ServeError::NotServedOnNewStorage { feature } => (
             crate::store_entries::NOT_SERVED_ON_NEW_STORAGE,
@@ -219,10 +211,6 @@ pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
         RunError::ToolAliasInvalid(refusal) => ServeError::ToolAliasInvalid(refusal),
         RunError::AccountSelectionRefused(refusal) => ServeError::AccountSelectionRefused(refusal),
         RunError::RoutingUnavailable(unavailable) => ServeError::RoutingUnavailable(unavailable),
-        RunError::SessionTooLarge { max_bytes } => ServeError::SessionTooLarge { max_bytes },
-        RunError::RetainedSessionTooLarge { max_bytes } => {
-            ServeError::RetainedSessionTooLarge { max_bytes }
-        }
         RunError::SendIdReuse { differing } => ServeError::SendIdReuse {
             differing: differing.into(),
         },

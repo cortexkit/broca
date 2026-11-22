@@ -348,12 +348,6 @@ pub enum SendOutcome {
     /// The send was refused because the module is stopping; it did nothing (see
     /// [`crate::serve::ServeError::ModuleStopping`]).
     ModuleStopping(crate::serve::StoppingAt),
-    RetainedSessionTooLarge {
-        max_bytes: u64,
-    },
-    SessionTooLarge {
-        max_bytes: u64,
-    },
     /// Admission failed before any durable write because a dependency is temporarily unavailable.
     Transient(String),
     /// The routing module refused to choose a provider account; nothing was written.
@@ -483,12 +477,6 @@ pub enum RetractOutcome {
     NotPending,
     /// The actor is closing — re-route through the registry (re-open).
     Reopen,
-    SessionTooLarge {
-        max_bytes: u64,
-    },
-    RetainedSessionTooLarge {
-        max_bytes: u64,
-    },
     /// Writing the retract tombstone failed durably.
     Error(String),
 }

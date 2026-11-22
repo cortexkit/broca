@@ -5527,8 +5527,6 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::SessionHeld(_) => "session_held".into(),
         ServeError::Open(_, _) => "open_failed".into(),
         ServeError::ReplyTooLarge(_) => broca_wire::REPLY_TOO_LARGE.into(),
-        ServeError::RetainedSessionTooLarge { .. } => "retained_session_too_large".into(),
-        ServeError::SessionTooLarge { .. } => "session_too_large".into(),
         ServeError::SendRetracted { .. } => "send_retracted".into(),
         ServeError::SendEnded { .. } => "send_ended".into(),
         ServeError::DeliveryRefused { code, .. } => (*code).into(),
@@ -5795,8 +5793,6 @@ async fn send_serve_error(
         ServeError::Upload(_)
         | ServeError::CredentialsUnavailable
         | ServeError::CredentialAmbiguous { .. }
-        | ServeError::SessionTooLarge { .. }
-        | ServeError::RetainedSessionTooLarge { .. }
         | ServeError::Open(_, _)
         | ServeError::VariantUnsupported(_)
         | ServeError::ToolAliasInvalid(_)
@@ -7824,32 +7820,6 @@ mod tests {
         let frame = rx.recv().await.unwrap();
         assert_eq!(frame.header.ty, FrameType::Error);
         assert_eq!(frame.body.as_slice(), br#"{"code":"tool_alias_invalid","message":"tool_alias_invalid: tool \"bash\": alias collides","detail":{"class":"permanent","tool":"bash"}}"#);
-    }
-
-    #[tokio::test]
-    async fn retained_session_size_error_body_is_the_pinned_golden() {
-        assert_eq!(
-            broca_core::RunError::RetainedSessionTooLarge { max_bytes: 4096 }
-                .admission_error_class(),
-            broca_protocol::ErrorClass::Permanent
-        );
-        let (tx, mut rx) = broca_diagnostics::channel(1, Arc::default());
-        send_serve_error(
-            &tx,
-            PROTOCOL_VERSION,
-            7,
-            3,
-            11,
-            &ServeError::RetainedSessionTooLarge { max_bytes: 4096 },
-        )
-        .await
-        .unwrap();
-        let frame = rx.recv().await.unwrap();
-        assert_eq!(frame.header.ty, FrameType::Error);
-        assert_eq!(
-            std::str::from_utf8(&frame.body).unwrap(),
-            include_str!("../tests/golden/retained_session_too_large.json").trim_end()
-        );
     }
 
     #[tokio::test]

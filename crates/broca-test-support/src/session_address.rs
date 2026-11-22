@@ -3,7 +3,6 @@ use std::path::Path;
 use broca_core::SessionRefIndex;
 use broca_protocol::BindIdentity;
 use broca_store::SessionAddressResolver;
-use broca_wal::state_format::decide_state_root;
 
 /// Read an already-admitted rig session's identity from the production inventory.
 /// The format-selected read-only opener neither migrates schemas nor reserves new addresses,
@@ -46,10 +45,8 @@ fn with_inventory<T>(
     operation: impl FnOnce(&dyn SessionAddressResolver, &dyn SessionRefIndex) -> Result<T, String>,
 ) -> Result<T, String> {
     std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
-    let decision = decide_state_root(root).map_err(|error| error.to_string())?;
-    let legacy = decision.legacy().ok_or("unsupported state root")?;
-    let store =
-        broca_store::SqliteStore::open_boot_legacy(legacy).map_err(|error| error.to_string())?;
+    let store = broca_store::SqliteStore::open(root.join("run-index.db"))
+        .map_err(|error| error.to_string())?;
     operation(&store, &store)
 }
 

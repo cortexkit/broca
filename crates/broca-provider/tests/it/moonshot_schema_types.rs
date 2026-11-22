@@ -4,7 +4,6 @@
 //! `moonshot_schema_types` and the OpenAI Chat render adds the missing types. Every other
 //! route, and a Kimi run frozen before the flag existed, renders exactly the bytes it did.
 
-use broca_protocol::request::ModelHandle;
 use broca_protocol::{request::Tool, CallOptions};
 use broca_provider::{
     families::{
@@ -15,7 +14,6 @@ use broca_provider::{
     spec::WireFamilyId,
     wire::{FrozenRenderConfig, WireFamily},
 };
-use broca_records::record::WalRecord;
 use serde_json::{json, Value};
 
 use crate::renderer_version_reproduction::openai_chat_v4_call_options;
@@ -155,20 +153,9 @@ fn a_kimi_run_started_bytes_record_v6_and_the_flag() {
     frozen.reasoning_echo = Some(ReasoningEchoPolicy::KIMI);
     frozen.moonshot_schema_types = true;
     frozen.renderer_version = openai_chat_renderer_version(frozen.moonshot_schema_types);
-    let started: WalRecord = serde_json::from_value(json!({
-        "type": "run_started", "run_id": "kimi",
-        "session": {"project_root": "/kimi", "harness": "test", "session": "kimi"},
-        "config": {
-            "model": ModelHandle::new("kimi-code-plan-global", "k3.1-pro"),
-            "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
-            "response_format": {"type": "text"}, "context_epoch": 0,
-            "renderer_version": frozen.renderer_version, "frozen_render_config": frozen
-        },
-        "input": [], "origin": {"kind": "fresh"}
-    }))
-    .unwrap();
+    // A run start stores the frozen render config as a JSON value, whose keys serialize sorted.
     assert_eq!(
-        serde_json::to_string(&started).unwrap(),
-        r#"{"type":"run_started","run_id":"kimi","session":{"project_root":"/kimi","harness":"test","session":"kimi"},"config":{"model":{"provider_module_id":"kimi-code-plan-global","model_id":"k3.1-pro"},"tools":[],"tool_choice":{"type":"auto"},"generation":{},"response_format":{"type":"text"},"context_epoch":0,"renderer_version":6,"frozen_render_config":{"base_url":"https://api.kimi.ai/coding/v1","family_id":"openai_chat","max_output_tokens":2048,"moonshot_schema_types":true,"reasoning":{"mode":"none"},"reasoning_echo":{"format":"reasoning_content","turns":"every_assistant"},"renderer_version":6,"system_prompt":{"mode":"system_message"},"token_limit_field":"max_tokens","tool_id":"passthrough","usage":"open_ai_usage","wire_model_id":"k3.1-pro"}},"input":[],"origin":{"kind":"fresh"}}"#
+        serde_json::to_value(&frozen).unwrap().to_string(),
+        r#"{"base_url":"https://api.kimi.ai/coding/v1","family_id":"openai_chat","max_output_tokens":2048,"moonshot_schema_types":true,"reasoning":{"mode":"none"},"reasoning_echo":{"format":"reasoning_content","turns":"every_assistant"},"renderer_version":6,"system_prompt":{"mode":"system_message"},"token_limit_field":"max_tokens","tool_id":"passthrough","usage":"open_ai_usage","wire_model_id":"k3.1-pro"}"#
     );
 }

@@ -52,17 +52,6 @@ def check(root):
     require(len(goldens) >= minimum, f'run.status golden inventory: {len(goldens)} < {minimum}')
     print(f'PASS wire golden lists: {len(uses)} hashes, {len(goldens)} run.status files (minimum {minimum})')
 
-    wal = crates / 'broca-wal'
-    framing = (wal / 'src/framing.rs').read_text()
-    test = framing.split('fn a_manifest_run_started_is_a_gated_frame_requiring_plan_manifest_v1_and_round_trips()', 1)[1].split('#[test]', 1)[0]
-    tool_count = int(capture(r'assert_eq!\(manifest.tools.len\(\), (\d+)\)', test))
-    fetch_count = int(capture(r'assert_eq!\(tools.len\(\), (\d+)\)', test))
-    providers = json.loads('[' + capture(r'assert_eq!\(providers, \[(.*?)\]\)', test) + ']')
-    manifest = json.loads((wal / 'tests/fixtures/plan_manifest_run_started.json').read_text())['manifest']
-    require(len(manifest['tools']) == tool_count, 'WAL manifest fixture tool count changed')
-    require(len(manifest['fetches'][0]['tools']) == fetch_count, 'WAL manifest first fetch tool count changed')
-    require([f['provider'] for f in manifest['fetches']] == providers, 'WAL manifest provider list changed')
-    print(f'PASS manifest counts: {tool_count} tools, {len(providers)} providers, {fetch_count} first-fetch tools')
 
 
 if __name__ == '__main__':

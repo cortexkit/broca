@@ -21,8 +21,7 @@
 //!   path a credential the vault reports as needing re-login takes;
 //! * any other refusal: the send is refused with routing's code and detail. Account limits use
 //!   `account_limit_exhausted`; other codes use `account_selection_refused`, classified by
-//!   [`classify_refusal`]. An account refusal writes no run records; the session's lineage
-//!   record may still be initialized.
+//!   [`classify_refusal`]. An account refusal writes no run records.
 //!
 //! An API key's vault listing need not carry a login account id. Only active, readable API keys
 //! for the credential provider (or legacy rows with no provider ids) can satisfy the answer.
@@ -53,7 +52,6 @@ use std::time::Duration;
 use broca_core::{AccountDecision, AccountSelectionRefusal, RoutingUnavailable};
 use broca_protocol::{AttemptOutcome, BindIdentity, ErrorClass, ModelAttempt, RunFinishReason};
 use broca_subc::vault::{ScopedCredential, ScopedList};
-use broca_wal::WalLineageId;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -2292,12 +2290,6 @@ fn record_diagnostic_refusal(provider: &str, code: &str) {
 // Reports
 // ------------------------------------------------------------------------------------------
 
-/// A report's `event_id`: the WAL record it reports, as its log's lineage id and sequence
-/// number. `None` for a log with no lineage id, which cannot name its records stably.
-pub fn event_id(lineage: Option<WalLineageId>, wal_seq: u64) -> Option<String> {
-    lineage.map(|lineage| format!("{lineage}:{wal_seq}"))
-}
-
 fn report(kind: &str, event_id: &str, admission_id: &str) -> Map<String, Value> {
     let mut body = Map::new();
     body.insert("event_id".into(), json!(event_id));
@@ -2511,7 +2503,6 @@ pub fn scoped_not_found_body(
 
 enum ReportEvent {
     Started {
-        lineage: Option<WalLineageId>,
         wal_seq: u64,
     },
     /// The account and credential routing admitted the run on, from its `route.account_for`
@@ -2521,29 +2512,24 @@ enum ReportEvent {
         credential_id: String,
     },
     Attempt {
-        lineage: Option<WalLineageId>,
         wal_seq: u64,
         attempt: Box<ModelAttempt>,
         served: Option<ServedOn>,
     },
     Finished {
-        lineage: Option<WalLineageId>,
         wal_seq: u64,
         reason: RunFinishReason,
     },
     Backoff {
-        lineage: Option<WalLineageId>,
         wal_seq: u64,
         retry_after_secs: f64,
     },
     CredentialRefused {
-        lineage: Option<WalLineageId>,
         wal_seq: u64,
         credential_id: Option<String>,
         provider_code: Option<String>,
     },
     Moved {
-        lineage: Option<WalLineageId>,
         wal_seq: u64,
         credential_id: String,
         account: Option<String>,
@@ -2567,7 +2553,8 @@ fn held_admission_id(decision: &AccountDecision) -> Option<&str> {
 impl RunReporter {
     /// Report only an allocation routing granted to this runner. Older static decisions can
     /// contain fabricated admission ids; their presence must not enable live or recovery reports.
-    /// Session-store runs pass their session id to name reports without a WAL lineage.
+    /// Reports name records by the run's session id (`session_id`) and each record's sequence
+    /// number.
     pub fn start_for_decision(
         client: Arc<RoutingClient>,
         decision: &AccountDecision,
@@ -2587,15 +2574,17 @@ impl RunReporter {
         ))
     }
 
-    /// Start reporting run `run_id`, known to routing as `admission_id`. `durable_head` is the
-    /// run's WAL writer's durable-sequence gauge. `view_digest` is the listing digest the
-    /// run's credential was chosen from, when this process chose it.
+    /// Start reporting run `run_id`, known to routing as `admission_id`, whose records reports
+    /// name by `session_id`. `durable_head` is the sequence of the session's last durable
+    /// record. `view_digest` is the listing digest the run's credential was chosen from, when
+    /// this process chose it.
     pub fn start(
         client: Arc<RoutingClient>,
         admission_id: String,
         run_id: String,
         view_digest: Option<String>,
         durable_head: Arc<AtomicU64>,
+        session_id: String,
     ) -> Arc<Self> {
         Self::start_named(
             client,
@@ -2603,7 +2592,7 @@ impl RunReporter {
             run_id,
             view_digest,
             durable_head,
-            None,
+            Some(session_id),
         )
     }
 
@@ -2636,9 +2625,9 @@ impl RunReporter {
                             account: Some(account_id),
                         })
                     }
-                    ReportEvent::Started { lineage, wal_seq } => {
+                    ReportEvent::Started { wal_seq } => {
                         let Some(id) =
-                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                            event_id_or_count(&client, store_session.as_deref(), wal_seq)
                         else {
                             continue;
                         };
@@ -2647,7 +2636,6 @@ impl RunReporter {
                             .await;
                     }
                     ReportEvent::Backoff {
-                        lineage,
                         wal_seq,
                         retry_after_secs,
                     } => {
@@ -2662,7 +2650,7 @@ impl RunReporter {
                             continue;
                         };
                         if let Some(id) =
-                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                            event_id_or_count(&client, store_session.as_deref(), wal_seq)
                         {
                             let mut body = report(
                                 "transient_backoff",
@@ -2674,13 +2662,12 @@ impl RunReporter {
                         }
                     }
                     ReportEvent::CredentialRefused {
-                        lineage,
                         wal_seq,
                         credential_id,
                         provider_code,
                     } => {
                         if let Some(id) =
-                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                            event_id_or_count(&client, store_session.as_deref(), wal_seq)
                         {
                             client
                                 .observe(credential_refused_body(
@@ -2693,7 +2680,6 @@ impl RunReporter {
                         }
                     }
                     ReportEvent::Attempt {
-                        lineage,
                         wal_seq,
                         attempt,
                         served,
@@ -2713,7 +2699,7 @@ impl RunReporter {
                             continue;
                         }
                         let Some(id) =
-                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                            event_id_or_count(&client, store_session.as_deref(), wal_seq)
                         else {
                             continue;
                         };
@@ -2772,7 +2758,6 @@ impl RunReporter {
                         client.observe(body).await;
                     }
                     ReportEvent::Moved {
-                        lineage,
                         wal_seq,
                         credential_id,
                         account,
@@ -2788,7 +2773,7 @@ impl RunReporter {
                             account: account.clone(),
                         });
                         if let Some(id) =
-                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                            event_id_or_count(&client, store_session.as_deref(), wal_seq)
                         {
                             client
                                 .observe(admission_moved_body(
@@ -2801,13 +2786,9 @@ impl RunReporter {
                                 .await;
                         }
                     }
-                    ReportEvent::Finished {
-                        lineage,
-                        wal_seq,
-                        reason,
-                    } => {
+                    ReportEvent::Finished { wal_seq, reason } => {
                         if let Some(id) =
-                            event_id_or_count(&client, lineage, store_session.as_deref(), wal_seq)
+                            event_id_or_count(&client, store_session.as_deref(), wal_seq)
                         {
                             client
                                 .observe(run_finished_body(
@@ -2828,25 +2809,15 @@ impl RunReporter {
     }
 
     /// The run's terminal, at `wal_seq`, is durable. Sent after every report already queued.
-    pub fn finish(&self, lineage: Option<WalLineageId>, wal_seq: u64, reason: RunFinishReason) {
-        let _ = self.tx.send(ReportEvent::Finished {
-            lineage,
-            wal_seq,
-            reason,
-        });
+    pub fn finish(&self, wal_seq: u64, reason: RunFinishReason) {
+        let _ = self.tx.send(ReportEvent::Finished { wal_seq, reason });
     }
 
     /// The run moved, at a quota wall, to the account routing offered; the record naming it, at
     /// `wal_seq`, is durable. Queued once, behind the refused attempt's report and ahead of any
     /// attempt on the new account, and sent once: routing counts it as the offer being used.
-    pub fn moved(
-        &self,
-        lineage: Option<WalLineageId>,
-        wal_seq: u64,
-        selection: &broca_records::record::AuthSelection,
-    ) {
+    pub fn moved(&self, wal_seq: u64, selection: &broca_records::record::AuthSelection) {
         let _ = self.tx.send(ReportEvent::Moved {
-            lineage,
             wal_seq,
             credential_id: selection.credential_id.clone(),
             account: selection.account_ref.clone(),
@@ -2857,17 +2828,11 @@ impl RunReporter {
     /// have their own reports; other transients use the structured retry delay or five seconds.
     /// Exhausted transport failures use their shared transient classification.
     /// The executor calls this only for an error finish on a run admitted by routing.
-    pub fn terminal_transient(
-        &self,
-        lineage: Option<WalLineageId>,
-        wal_seq: u64,
-        error: &broca_protocol::ProviderError,
-    ) {
+    pub fn terminal_transient(&self, wal_seq: u64, error: &broca_protocol::ProviderError) {
         if error.class.shared_class() == ErrorClass::Transient
             && !error.is_account_limit_exhausted()
         {
             let _ = self.tx.send(ReportEvent::Backoff {
-                lineage,
                 wal_seq,
                 retry_after_secs: error.retry_after_secs.unwrap_or(5.0),
             });
@@ -2879,7 +2844,6 @@ impl RunReporter {
     /// The executor calls this only for a routed admission's error terminal or API-key auth pause.
     pub fn terminal_credential_refused(
         &self,
-        lineage: Option<WalLineageId>,
         wal_seq: u64,
         error: &broca_protocol::ProviderError,
         auth_method: Option<&str>,
@@ -2898,7 +2862,6 @@ impl RunReporter {
             && matches!(error.status, Some(401 | 403)));
         if refused {
             let _ = self.tx.send(ReportEvent::CredentialRefused {
-                lineage,
                 wal_seq,
                 credential_id: credential_id
                     .or(error.credential_id.as_deref())
@@ -2910,18 +2873,12 @@ impl RunReporter {
 }
 
 impl broca_core::AccountReporter for RunReporter {
-    fn run_started(&self, lineage: Option<WalLineageId>, wal_seq: u64) {
-        let _ = self.tx.send(ReportEvent::Started { lineage, wal_seq });
+    fn run_started(&self, wal_seq: u64) {
+        let _ = self.tx.send(ReportEvent::Started { wal_seq });
     }
 
-    fn attempt_recorded(
-        &self,
-        lineage: Option<WalLineageId>,
-        wal_seq: u64,
-        attempt: &ModelAttempt,
-    ) {
+    fn attempt_recorded(&self, wal_seq: u64, attempt: &ModelAttempt) {
         let _ = self.tx.send(ReportEvent::Attempt {
-            lineage,
             wal_seq,
             attempt: Box::new(attempt.clone()),
             served: None,
@@ -2944,7 +2901,6 @@ impl RunReporter {
     /// record names, else the selection's.
     pub fn attempt_recorded_on(
         &self,
-        lineage: Option<WalLineageId>,
         wal_seq: u64,
         attempt: &ModelAttempt,
         selection: Option<&broca_records::record::AuthSelection>,
@@ -2957,7 +2913,6 @@ impl RunReporter {
                 .or_else(|| selection.account_ref.clone()),
         });
         let _ = self.tx.send(ReportEvent::Attempt {
-            lineage,
             wal_seq,
             attempt: Box::new(attempt.clone()),
             served,
@@ -2965,19 +2920,20 @@ impl RunReporter {
     }
 }
 
+/// A report's `event_id`: the record it reports, as its session's id and the record's sequence
+/// number in that session's log. `None` for a run with no session id to name it by, counted as
+/// a failed observation.
 fn event_id_or_count(
     client: &RoutingClient,
-    lineage: Option<WalLineageId>,
     store_session: Option<&str>,
-    wal_seq: u64,
+    seq: u64,
 ) -> Option<String> {
-    let id = event_id(lineage, wal_seq)
-        .or_else(|| store_session.map(|session| format!("{session}:{wal_seq}")));
+    let id = store_session.map(|session| format!("{session}:{seq}"));
     if id.is_none() {
         client.counters.bump("observe_failed");
         tracing::warn!(
             target: "accounts",
-            "WAL record {wal_seq} has no lineage id to name it by; its account report is dropped"
+            "record {seq} has no session id to name it by; its account report is dropped"
         );
     }
     id
@@ -2994,30 +2950,6 @@ async fn wait_durable(durable_head: &AtomicU64, wal_seq: u64) -> bool {
         tokio::time::sleep(DURABILITY_POLL).await;
     }
     true
-}
-
-/// Report the `Interrupted` terminal the module wrote for a run it sealed (a shutdown, or a
-/// run a crash left in flight). Does nothing for a run with no admission id.
-pub fn report_sealed(client: Arc<RoutingClient>, sealed: &broca_module::SealedRun) {
-    let Some(admission_id) = sealed
-        .auth_selection
-        .as_ref()
-        .and_then(|selection| selection.account_decision.as_ref())
-        .and_then(held_admission_id)
-    else {
-        return;
-    };
-    let Some(id) = event_id_or_count(&client, sealed.lineage, None, sealed.terminal_seq) else {
-        return;
-    };
-    let body = run_finished_body(
-        &id,
-        admission_id,
-        &sealed.run_id.0,
-        RunFinishReason::Interrupted,
-        None,
-    );
-    tokio::spawn(async move { client.observe(body).await });
 }
 
 /// The vault did not serve the credential routing chose: tell routing (which excludes that

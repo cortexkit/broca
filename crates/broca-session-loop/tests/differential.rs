@@ -35,7 +35,6 @@ use broca_protocol::request::{
 use broca_protocol::{
     DisplayEvent, FinishReason, GenerationConfig, MessageId, RunId, StepId, ToolCallId, Usage,
 };
-use broca_records::record::WalRecord;
 use broca_session_loop::shared::{ActorWriter, Request};
 use broca_session_loop::{
     resume, run, seal, AccountReports, Admission, MemoryParts, PendingMedia, Seams, Writer,
@@ -4545,8 +4544,8 @@ fn ordered_with(id: &str, order: Value, text: &str, supersedes: Option<&str>) ->
 /// Where a scripted provider sends what the session actor does while a step is answered.
 #[async_trait]
 trait SteerSink: Send + Sync {
-    /// Writes a `steered` record as the actor would.
-    async fn steer(&self, record: WalRecord);
+    /// Writes a steer record as the actor would.
+    async fn steer(&self, steer: Steered);
     /// Records the caller's cancel at the run's next step boundary, as the actor would.
     async fn cancel_at_boundary(&self);
     /// Cancels the run now, as the actor does for an interrupting send: no record, only the
@@ -4568,15 +4567,23 @@ struct NewSink {
 
 #[async_trait]
 impl SteerSink for NewSink {
-    async fn steer(&self, record: WalRecord) {
-        let mut value = serde_json::to_value(&record).unwrap();
-        let object = value.as_object_mut().unwrap();
-        object.remove("type");
-        let input = serde_json::from_value(object.remove("input").unwrap()).unwrap();
-        let written_at_ms = object.remove("written_at_ms").and_then(|v| v.as_u64());
-        let tags_v1 = object.remove("tags");
-        let message_marks = object.remove("message_marks");
-        let receipt = (!object.is_empty()).then(|| value.clone());
+    async fn steer(&self, steer: Steered) {
+        // The receipt keeps the send's own facts, as the actor stores them beside the input.
+        let mut receipt = serde_json::json!({
+            "ts_ms": HARNESS_TIME_MS,
+            "send_id": steer.send_id,
+            "delivery": broca_protocol::Delivery::Steer,
+        });
+        if let Some(sent_by) = &steer.sent_by {
+            receipt["sent_by"] = serde_json::to_value(sent_by).unwrap();
+        }
+        let input = steer.messages;
+        let written_at_ms = Some(HARNESS_TIME_MS);
+        let tags_v1 = None;
+        let message_marks = steer
+            .message_marks
+            .map(|marks| serde_json::to_value(marks).unwrap());
+        let receipt = Some(receipt);
         self.injected
             .lock()
             .unwrap()
@@ -4707,19 +4714,20 @@ impl Provider for SteeringProvider {
     }
 }
 
-fn steered(call: usize, index: usize, messages: Vec<Message>) -> WalRecord {
-    WalRecord::Steered {
+/// A message the caller steers into the running run: its input, the send that carried it,
+/// and, in a marked scenario, the owner who sent it and its marks.
+struct Steered {
+    sent_by: Option<broca_protocol::BindPrincipal>,
+    send_id: String,
+    messages: Vec<Message>,
+    message_marks: Option<broca_protocol::MessageMarks>,
+}
+
+fn steered(call: usize, index: usize, messages: Vec<Message>) -> Steered {
+    Steered {
         sent_by: RECORDED_MARKS.try_with(|_| owner()).ok(),
-        written_at_ms: Some(HARNESS_TIME_MS),
-        retention: None,
-        ts_ms: Some(HARNESS_TIME_MS),
-        send_id: Some(format!("steer-{call}-{index}")),
-        request_identity_digest: None,
-        delivery: Some(broca_protocol::Delivery::Steer),
-        title: None,
-        input: Arc::new(messages),
-        hooks: None,
-        tags: None,
+        send_id: format!("steer-{call}-{index}"),
+        messages,
         message_marks: RECORDED_MARKS
             .try_with(|(marks, _)| marks.clone())
             .ok()

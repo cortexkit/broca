@@ -609,14 +609,11 @@ mod automatic_tests {
     use std::sync::{Arc, Mutex};
 
     fn config() -> broca_records::record::RunConfig {
-        let record: broca_records::record::WalRecord = serde_json::from_str(include_str!(
-            "../../broca-wal/tests/golden/run_started.keep_warm.json"
-        ))
-        .unwrap();
-        let broca_records::record::WalRecord::RunStarted { config, .. } = record else {
-            unreachable!()
-        };
-        let mut config = *config;
+        let record: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/golden/run_started.keep_warm.json"))
+                .unwrap();
+        let mut config: broca_records::record::RunConfig =
+            serde_json::from_value(record["config"].clone()).unwrap();
         config.frozen_render_config = serde_json::to_value(
             broca_provider::families::anthropic_frozen_config("claude-opus-4-8"),
         )

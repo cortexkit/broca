@@ -13,54 +13,13 @@ pub fn mint_attempt_id() -> Result<AttemptId, getrandom::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broca_protocol::{RunId, StepId};
 
     use std::collections::BTreeSet;
-    use {
-        broca_records::record::AttemptCredential, broca_records::record::AttemptReservation,
-        broca_records::record::AttemptRun, broca_records::record::AttemptSession,
-        broca_records::record::WalRecord,
-    };
-
-    fn reservation() -> AttemptReservation {
-        AttemptReservation {
-            run_id: RunId("repeated-send-id".into()),
-            step_id: StepId(1),
-            attempt: 0,
-            send_index: 1,
-            warm: false,
-            reserved_at_ms: 42,
-            provider: "provider".into(),
-            endpoint_host: "example.com".into(),
-            model_sent: "model".into(),
-            credential: AttemptCredential {
-                credential_ref: None,
-                account_ref: None,
-                auth_selection: None,
-                auth_method: None,
-                provider_ids: None,
-                plan_tier: None,
-                plan_tier_source: None,
-            },
-            session: serde_json::from_value::<AttemptSession>(serde_json::json!({
-                "project_root":"/project", "harness":"runner", "session":"s", "session_ref":"ref"
-            }))
-            .unwrap(),
-            run: AttemptRun::default(),
-            request_body_bytes: 10,
-            compressed: false,
-            input_tokens_estimate: None,
-        }
-    }
 
     #[test]
     fn attempt_ids_do_not_repeat_across_restore_and_send_id_retry() {
-        let reservation = reservation();
         let original_id = mint_attempt_id().unwrap();
-        let mut branch = vec![WalRecord::AttemptReserved {
-            attempt_id: original_id.clone(),
-            reservation: Box::new(reservation.clone()),
-        }];
+        let mut branch = vec![original_id.clone()];
         let mut ids = BTreeSet::from([original_id]);
         // Each branch reuses the same run, step, retry ordinal and timestamp. Restoring the
         // earlier prefix must not roll the random identity source back along with the log.
@@ -77,10 +36,7 @@ mod tests {
                     ids.insert(id.clone()),
                     "duplicate reservation across a restored branch"
                 );
-                branch.push(WalRecord::AttemptReserved {
-                    attempt_id: id,
-                    reservation: Box::new(reservation.clone()),
-                });
+                branch.push(id);
             }
             let snapshot = serde_json::to_vec(&restored_prefix).unwrap();
             branch = serde_json::from_slice(&snapshot).unwrap();

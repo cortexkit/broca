@@ -11,7 +11,6 @@ broca-catalog|reasoning_routes|broca-catalog/live|crates/broca-catalog/tests/rea
 broca-catalog|service_tier|broca-catalog/live|crates/broca-catalog/tests/service_tier.rs|an_absent_tier_renders_no_tier_bytes_on_any_family|Checks service-tier rendering from local catalog fixtures.
 broca-provider|warm_allocation|broca-provider/live,broca-provider/test-harness|crates/broca-provider/tests/warm_allocation.rs|legacy_warm_allocations_match_base_path|Pins legacy warm parsing and allocation work against the original path.
 broca-module-serve|media_runtime|broca-module-serve/test-clock|crates/broca-module-serve/tests/media_runtime.rs|shipping_runtime_media_on|Pins runtime media on/off behavior through serve without native daemons or provider access.
-broca-records|wal_compatibility|broca-records/test-io-trace|crates/broca-records/src/record/pinned_bytes_tests.rs|compaction_view_before_metadata_keeps_exact_bytes|Keeps the extracted record byte pins and floor durability checks in the commit gate.
 # Runs the session loop's record pins when its package changes: a new field on any record the
 # loop writes changes them, and only this target notices.
 broca-session-loop|differential|-|crates/broca-session-loop/tests/differential.rs|pre_tool_hooks_mutate_deny_and_refuse_when_unavailable|Pins every record the new run loop writes; a record field added without re-recording fails here.

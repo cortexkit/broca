@@ -18,7 +18,6 @@ broca-protocol = { path = "../broca-protocol" }
 broca-provider = { path = "../broca-provider", features = ["live"] }
 broca-session-store = { path = "../broca-session-store" }
 broca-records = { path = "../broca-records" }
-broca-wal = { path = "../broca-wal" }
 cortexkit-compaction-view.workspace = true
 cortexkit-role-compaction.workspace = true
 cortexkit-role-step-transform-provider.workspace = true

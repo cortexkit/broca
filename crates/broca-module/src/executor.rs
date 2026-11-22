@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use broca_core::{OutputEvent, RunControl, RunError, RunId, RunRequest};
+use broca_core::{OutputEvent, RunControl, RunError, RunRequest};
 use broca_protocol::BindIdentity;
 use tokio::sync::mpsc;
 
@@ -177,12 +177,6 @@ pub trait RunExecutor: Send + Sync + 'static {
     /// Discard idle and borrowed connections after the module's shutdown grace period.
     fn retire_all_transports(&self) {}
 
-    /// Called after the actor has durably written an `Interrupted` terminal for a run it
-    /// sealed: one stopped by the module's shutdown, or one a crash left in flight. The run
-    /// loop did not write that terminal, so an executor that reports each run's end hears of
-    /// it only here. Must not block: the shutdown seal runs under a deadline. Default no-op.
-    fn on_run_sealed(&self, _sealed: SealedRun) {}
-
     /// Quote the next cache-refresh request and one uncached request from the in-memory model
     /// catalog, current at decision time. The frozen provider/model selects the rate row;
     /// the frozen account method selects subscription or metered pricing. Missing rates refuse
@@ -332,19 +326,6 @@ pub enum StoreRunError {
     Admission(RunError),
     /// The loop stopped; see [`broca_session_loop::run::LoopError`].
     Loop(broca_session_loop::run::LoopError),
-}
-
-/// A run the actor sealed `Interrupted`, as [`RunExecutor::on_run_sealed`] receives it.
-#[derive(Debug, Clone)]
-pub struct SealedRun {
-    pub session: BindIdentity,
-    pub run_id: RunId,
-    /// The sealed episode's frozen auth selection, as its `RunStarted` recorded it.
-    pub auth_selection: Option<broca_core::AuthSelection>,
-    /// The lineage of the WAL the terminal was written to.
-    pub lineage: Option<broca_wal::WalLineageId>,
-    /// The WAL sequence number of the durable `RunFinished` record.
-    pub terminal_seq: u64,
 }
 
 /// Send one warm of `base` through `provider`, which holds the session's frozen config and a

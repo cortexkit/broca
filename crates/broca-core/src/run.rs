@@ -257,14 +257,6 @@ pub enum RunError {
     /// A WAL write/barrier failed — FATAL: the run is aborted rather than continue
     /// without durability guarantees. The lease is released on return.
     Wal(String),
-    /// An expiring session's byte budget refused an append. The accepted records stay
-    /// writable so the run can commit a bounded permanent-error terminal.
-    RetainedSessionTooLarge {
-        max_bytes: u64,
-    },
-    SessionTooLarge {
-        max_bytes: u64,
-    },
     /// The run task PANICKED (unwound) before producing a terminal — synthesized by a
     /// drop-guard on the run-driving task so a panic still reports a terminal to the
     /// coordinator (otherwise the coordinator would wait forever for a result that never
@@ -425,8 +417,6 @@ impl RunError {
             | Self::SystemPromptChanged
             | Self::ContextManagementChanged { .. }
             | Self::ContextManagementUnavailable { .. }
-            | Self::RetainedSessionTooLarge { .. }
-            | Self::SessionTooLarge { .. }
             | Self::TagNumbering(_) => ErrorClass::Permanent,
             Self::LeaseHeld(_)
             | Self::CredentialsUnavailable
@@ -447,8 +437,6 @@ impl std::fmt::Display for RunError {
             RunError::CredentialsUnavailable => write!(f, "the vault credential listing has not loaded yet"),
             RunError::CredentialAmbiguous { credential, candidate_ids } => write!(f, "credential {credential} is ambiguous: {}", candidate_ids.join(", ")),
             RunError::Lease(s) => write!(f, "lease error: {s}"),
-            RunError::RetainedSessionTooLarge { max_bytes } => write!(f, "{}", broca_wal::size_limit::error(*max_bytes).message),
-            RunError::SessionTooLarge { max_bytes } => write!(f, "{}", broca_wal::size_limit::scoped_error(*max_bytes, broca_wal::size_limit::SizeScope::Session).message),
             RunError::Wal(s) => write!(f, "wal failure: {s}"),
             RunError::Panicked => write!(f, "run task panicked before producing a terminal"),
             RunError::TagNumbering(overflow) => write!(f, "{overflow}"),

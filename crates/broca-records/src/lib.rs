@@ -9,6 +9,7 @@ pub mod move_fence;
 pub mod record;
 pub mod recovery;
 pub mod session_storage;
+pub mod vault_facts;
 
 pub use floor::{raise_floor, read_floor, FEATURE_FLOOR_FILENAME};
 pub use record::*;

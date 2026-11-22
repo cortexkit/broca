@@ -61,8 +61,6 @@ class FastRustInvariants(unittest.TestCase):
             'Cargo.lock',
             'crates/broca-replay/tests/bench_envelope_is_representative.rs',
             'crates/broca-wire/src/role.rs', 'crates/broca-wire/src/lib.rs',
-            'crates/broca-wal/src/framing.rs',
-            'crates/broca-wal/tests/fixtures/plan_manifest_run_started.json',
         )
         for name in paths:
             destination = self.root / name
@@ -91,14 +89,6 @@ class FastRustInvariants(unittest.TestCase):
         for path in (self.root / 'crates/broca-wire/tests/golden').glob('run_status.*'):
             path.unlink()
         with self.assertRaisesRegex(ValueError, 'run.status golden inventory'):
-            self.module.check(self.root)
-
-    def test_manifest_count_drift_fails(self):
-        fixture = self.root / 'crates/broca-wal/tests/fixtures/plan_manifest_run_started.json'
-        record = json.loads(fixture.read_text())
-        record['manifest']['tools'].pop()
-        fixture.write_text(json.dumps(record))
-        with self.assertRaisesRegex(ValueError, 'manifest fixture tool count'):
             self.module.check(self.root)
 
 
@@ -470,10 +460,7 @@ python3() {
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         order = (self.root / 'order').read_text().splitlines()
-        for command in ('cargo fetch --locked jobs=2',
-                        'cargo test --locked -p broca-wal-reader jobs=2',
-                        'cargo test --locked -p broca-wal --lib framing::tests::v4 jobs=2',
-                        'operator'):
+        for command in ('cargo fetch --locked jobs=2', 'operator'):
             self.assertIn(command, order)
         self.assertNotIn('fixtures', order)
         self.assertNotIn('deploy', order)
@@ -1018,8 +1005,7 @@ class WorkflowGraph(unittest.TestCase):
         self.assertEqual(self.workflow('ci.yml')['permissions']['actions'], 'read')
         self.assertEqual(set(jobs['test']['needs']),
                          {'lint', 'scripts', 'unit', 'production-features', 'store-contention-macos',
-                          'integration-build', 'fixtures', 'integration', 'linux-deploy',
-                          'wal-reader'})
+                          'integration-build', 'fixtures', 'integration', 'linux-deploy'})
 
     def test_master_and_nightly_runs_are_never_cancelled_by_each_other(self):
         """A master push cancelled the nightly run on master, or a later push cancelled an

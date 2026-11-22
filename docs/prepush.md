@@ -19,8 +19,7 @@ reservations in Motor's admission queue or waiting for a whole-wave barrier.
 An UNKNOWN job keeps its reservation because it may still be running. If those
 reservations prevent any remaining job from fitting, the remaining jobs are
 reported NOT-RUN rather than exceeding the budget or waiting indefinitely.
-The small lane runs only the unchanged operator suite and WAL checks. An operator
-failure is recorded but does not suppress WAL. Full-workspace MSRV checking and
+The small lane runs only the unchanged operator suite. Full-workspace MSRV checking and
 the deployment release build are independent eight-CPU jobs. Fixture compilation
 stays with its consumers: unit, production, each integration job, Windows and
 deployment. It no longer occupies the small job.
@@ -306,7 +305,7 @@ On a warm dependency cache a broken fmt, lock or static pin fails before any
 workspace test compilation; cold downloads and the complete operator suites are
 not promised to finish in seconds. `check-fast-rust-invariants.py` reads Rust's
 existing reviewed protocol-pair table, named golden SHA pins and inventory
-minimum, and WAL manifest fixture count assertions (no second expected list).
+minimum (no second expected list).
 Runtime Rust manifest builders/codec goldens and the
 full portable-selection inventory require compiled test binaries and are not
 misrepresented as static checks: they run in the heavy lanes, described below.
@@ -331,7 +330,7 @@ another job, dispatch the machine-side lanes from AFT instead. Do **not** put
       and `--lane linux-deploy` with `runon: "linux,8c,net"`;
     - `--lane linux-unit` and `--lane linux-production`
       with `runon: "linux,4c,net"`;
-    - `--lane linux-small` with `runon: "linux,2c,net"` (operator/WAL);
+    - `--lane linux-small` with `runon: "linux,2c,net"` (operator suite);
    - `--lane windows` with `runon: "windows"`, after supplying the prepared input
      inside that worktree's non-ignored `prepush-inputs/`.
    - `bash scripts/prepush.sh --lane macos` with `runon: "macos"` (uses `nice -n 10`).
@@ -340,8 +339,8 @@ another job, dispatch the machine-side lanes from AFT instead. Do **not** put
    jobs only as slots are released. Wait for **every** job, retain all exit statuses and print complete
    failure logs. A missing/refused/timed-out lane is a failure, not coverage.
 
-The individual `linux-operator` and `linux-wal` lanes remain available for
-diagnostics but are not separately dispatched.
+The individual `linux-operator` lane remains available for diagnostics but is
+not separately dispatched.
 `--lane linux` remains an explicitly sequential diagnostic aggregate; it is not
 dispatched by the gate. It runs the same steps
 but cannot demonstrate the parallel wall-time budget. Direct AFT dispatch does
@@ -368,8 +367,6 @@ failure; Windows-target clippy on Linux is **not** native Windows coverage.
 | `lint` (Ubuntu, Windows) | `linux-lint` / Windows native clippy | `cargo fmt --all -- --check`; `cargo clippy --locked --workspace --all-targets` with the four features from `rust-test-gate.sh`, `-- -D warnings`. Linux preflight additionally cross-clippies `x86_64-pc-windows-gnu`. |
 | `scripts` (Ubuntu) | `fast` guards then the required `linux-small` job | Train preconditions and locked fetch remain before native jobs. `linux-small` runs unchanged `bash scripts/script-suites.sh`; same shared inventory and self-tests. |
 | `store-contention-macos` | `bash scripts/prepush.sh --lane macos` | `nice -n 10 cargo test --locked -p broca-store-contention-tests --lib`. Native macOS; not substituted by Linux/Windows unit results. |
-| `wal-reader` (Ubuntu, Windows) | WAL steps in `linux-small` / windows | `cargo test --locked -p broca-wal-reader`; `cargo test --locked -p broca-wal --lib framing::tests::v4`, including golden v4 codec and open-reader unlink semantics. |
-| `wal-reader` (macOS) | `bash scripts/prepush.sh --lane macos` | Same two commands under `nice -n 10`, on native macOS, alongside store contention. |
 | `integration-build` / Archive (Ubuntu, Windows) | Archive step in each `linux-integration-K` and windows | `bash scripts/ci-integration.sh build ARCHIVE`: independent libtest/nextest nonzero inventory equality, then archive with CI's four features. Linux also runs `python3 scripts/test-portable-test-selection.py` against built inventory. |
 | `integration` (Ubuntu shards 1–4/4; Windows shards 1–4/4) | `linux-integration-1` through `-4` / four Windows replays | `bash scripts/ci-integration.sh run ARCHIVE K/4`; unchanged full CI filter, hash partitioning, sentinel, profile, pinned NATS, aimock and required fixtures. Linux partitions are parallel, Windows sequential. No portable-only filter on Windows. |
 | `unit` / Lib/bin/doc (Ubuntu, Windows) | `linux-unit` / CI lib/bin/doc step in windows | Path-dependency checker + tests; `cargo test --locked --workspace --lib --bins --no-fail-fast` with the four features; independent doctest count and full doctests if positive. Includes store contention; no portable unit exclusions. |

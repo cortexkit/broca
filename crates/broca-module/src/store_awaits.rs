@@ -1,5 +1,5 @@
 //! Reader-facing waits for `broca_session_store` sessions. Every surface folds the same run
-//! records here; legacy `broca_wal` sessions deliberately keep their existing bodies.
+//! records here.
 
 use std::collections::BTreeMap;
 

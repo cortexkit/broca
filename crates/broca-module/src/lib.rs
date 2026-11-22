@@ -79,7 +79,7 @@ pub mod store_tool_calls;
 mod uploads;
 
 pub use cache::{CacheDeclaration, CacheDeclarer};
-pub use executor::{RunExecutor, RunKind, SealedRun, WarmError, WarmJob};
+pub use executor::{RunExecutor, RunKind, WarmError, WarmJob};
 pub use fanout::Delivery;
 pub use opener::DefaultOpener;
 pub use registry::{LineageKey, LineageRegistry};

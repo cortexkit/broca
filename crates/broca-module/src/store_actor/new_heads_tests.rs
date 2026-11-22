@@ -225,7 +225,9 @@ async fn a_head_starts_in_the_durable_root_of_the_new_storage_and_reopens_from_i
     assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
     module.closed().await;
     assert_eq!(module.store_class(), Some(StorageClass::Durable));
-    assert!(module.floor().contains(broca_wal::SESSION_STORAGE_FEATURE));
+    assert!(module
+        .floor()
+        .contains(broca_records::floor::SESSION_STORAGE_FEATURE));
     let mut later = request("second");
     later.tools = None;
     let second = send(&module, "r2", later, Some(HEAD_SESSION_CLASS), None, None)

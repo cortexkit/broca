@@ -91,7 +91,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         LaunchArgs::WalKnownFeatures => {
             // scripts/place-release.sh compares these sorted names with the features in
             // existing WALs to avoid installing a build that cannot read them.
-            let mut names = broca_wal::KNOWN_FEATURES.to_vec();
+            let mut names = broca_records::floor::KNOWN_FEATURES.to_vec();
             names.sort_unstable();
             for name in names {
                 println!("{name}");
@@ -215,8 +215,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map(str::to_owned);
     let stop_signal = shutdown_signal()?;
     // Refuse unsupported markers before the stall log or any durable store is opened.
-    let wal_decision = state_format::prepare(&state_root).map_err(ServeIoError)?;
-    let wal_config = wal_decision.config();
+    state_format::prepare(&state_root).map_err(ServeIoError)?;
     let _stall_watchdog = broca_module_serve::stall::start(&state_root)?;
     // An optional provider base_url override (the mock/openai-compatible path; e.g. aimock).
     // When unset, the run's model id is resolved through the catalog.
@@ -382,11 +381,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
     plane.set_scope_describer(scope_describer.clone());
     let index = Arc::new(
-        broca_store::SqliteStore::open_boot_legacy(
-            wal_decision.legacy().expect("legacy boot decision"),
-        )
-        .map_err(|error| ServeIoError(format!("open run index: {error}")))?
-        .with_wal_config(wal_config),
+        broca_store::SqliteStore::open(state_root.join("run-index.db"))
+            .map_err(|error| ServeIoError(format!("open run index: {error}")))?,
     );
     let run_index = Some(index);
     // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
@@ -1607,7 +1603,7 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
     // descriptor names them, and engram refuses a capture whose declared path is missing.
     for name in [
         broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
-        broca_wal::SESSION_STORAGE_DIR,
+        broca_records::features::SESSION_STORAGE_DIR,
         broca_records::session_storage::SESSION_STORAGE_EPHEMERAL_DIR,
         broca_records::session_storage::SESSION_STORAGE_MOVES_DIR,
     ] {
@@ -1925,7 +1921,7 @@ mod state_directory_tests {
                 broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
                 "portable",
             ),
-            (broca_wal::SESSION_STORAGE_DIR, "excluded"),
+            (broca_records::features::SESSION_STORAGE_DIR, "excluded"),
             (
                 broca_records::session_storage::SESSION_STORAGE_EPHEMERAL_DIR,
                 "excluded",

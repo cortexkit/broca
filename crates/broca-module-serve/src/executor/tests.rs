@@ -1317,8 +1317,6 @@ async fn terminal_backoff_reports_with_attempt_status(
     attempt_status: Option<u16>,
 ) -> Vec<serde_json::Value> {
     use broca_module_serve::account_routing::{RoutingClient, RunReporter};
-    // A run reports its attempts by record position alone.
-    let lineage: Option<broca_wal::WalLineageId> = None;
     let routing = Arc::new(TerminalRouting {
         reports: Default::default(),
         supported: true,
@@ -1355,7 +1353,7 @@ async fn terminal_backoff_reports_with_attempt_status(
         }))
         .unwrap();
         attempt.account_observation.failure_received_at_ms = Some(receipt);
-        broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), lineage, seq, &attempt);
+        broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), seq, &attempt);
     }
     let selection: broca_core::AuthSelection = serde_json::from_value(serde_json::json!({
         "auth_method":method,"credential_id":"vault-key",
@@ -1367,12 +1365,12 @@ async fn terminal_backoff_reports_with_attempt_status(
         Some(&selection),
         &outcome,
         async { Some(error) },
-        (lineage, 4),
+        4,
     )
     .await;
     if let Ok(summary) = outcome {
         if summary.paused.is_none() {
-            reporter.finish(lineage, 4, summary.reason);
+            reporter.finish(4, summary.reason);
         }
     }
     drop(reporter);

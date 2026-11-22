@@ -10,9 +10,8 @@ publish = false
 
 [dependencies]
 broca-owner-only = { path = "../broca-owner-only" }
-# Content types and renderer inputs only. This crate must never depend on broca-wal,
-# broca-store or broca-core: the new format is built standalone, and a converter crate is
-# the only place that reads both.
+# Content types and renderer inputs only. This crate must never depend on broca-store or
+# broca-core: the session store is built standalone.
 broca-protocol = { path = "../broca-protocol" }
 serde.workspace = true
 serde_json.workspace = true

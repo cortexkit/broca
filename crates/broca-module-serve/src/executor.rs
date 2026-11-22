@@ -825,7 +825,7 @@ async fn post_run_wire_auth_status(
 ) -> Option<u16> {
     // A provider 401/403 reaches the loop only as an AuthRequired pause or a wire-error
     // terminal. Completed, limited, interrupted, and infrastructure-error outcomes cannot
-    // carry a rejected-credential status, so do not replay their entire lineage WAL.
+    // carry a rejected-credential status, so do not read their terminal error.
     if !should_check_wire_auth(outcome) {
         return None;
     }
@@ -858,7 +858,7 @@ async fn report_routed_terminal_error(
     selection: Option<&broca_core::AuthSelection>,
     outcome: &Result<RunSummary, RunError>,
     terminal_error: impl std::future::Future<Output = Option<ProviderError>>,
-    terminal: (Option<broca_wal::WalLineageId>, u64),
+    terminal_seq: u64,
 ) -> Option<Option<ProviderError>> {
     let selection = selection.filter(|selection| {
         selection.account_decision.as_ref().is_some_and(|decision| {
@@ -875,14 +875,13 @@ async fn report_routed_terminal_error(
     let error = terminal_error.await;
     if let Some(error) = &error {
         reporter.terminal_credential_refused(
-            terminal.0,
-            terminal.1,
+            terminal_seq,
             error,
             selection.auth_method.as_deref(),
             Some(&selection.credential_id),
         );
         if finished_error {
-            reporter.terminal_transient(terminal.0, terminal.1, error);
+            reporter.terminal_transient(terminal_seq, error);
         }
     }
     Some(error)
@@ -1315,13 +1314,13 @@ struct StoreAccountReports {
 impl broca_session_loop::AccountReports for StoreAccountReports {
     fn run_started(&self, _event_id: &str, seq: u64) {
         if let Some(reporter) = &self.routing {
-            broca_core::AccountReporter::run_started(&**reporter, None, seq);
+            broca_core::AccountReporter::run_started(&**reporter, seq);
         }
     }
 
     fn attempt_recorded(&self, _event_id: &str, seq: u64, attempt: &broca_protocol::ModelAttempt) {
         if let Some(reporter) = &self.routing {
-            broca_core::AccountReporter::attempt_recorded(&**reporter, None, seq, attempt);
+            broca_core::AccountReporter::attempt_recorded(&**reporter, seq, attempt);
         }
     }
 
@@ -1334,13 +1333,13 @@ impl broca_session_loop::AccountReports for StoreAccountReports {
     ) {
         self.sent.lock().unwrap().attempted(selection, attempt);
         if let Some(reporter) = &self.routing {
-            reporter.attempt_recorded_on(None, seq, attempt, selection);
+            reporter.attempt_recorded_on(seq, attempt, selection);
         }
     }
 
     fn account_moved(&self, _event_id: &str, seq: u64, selection: &broca_core::AuthSelection) {
         if let Some(reporter) = &self.routing {
-            reporter.moved(None, seq, selection);
+            reporter.moved(seq, selection);
         }
     }
 }
@@ -2953,7 +2952,7 @@ impl LiveLoopExecutor {
     /// to routing, and its frozen context limit. Returns the reporter too, for the run's
     /// end. `durable_head` is the seq of the session's last durable record: the reporter
     /// names only records at or below it. `store_session` is a run in the session store's
-    /// session id, which its event ids are named by in place of a WAL lineage.
+    /// session id, which its event ids are named by.
     #[allow(clippy::too_many_arguments)]
     fn episode_control(
         &self,
@@ -3050,7 +3049,6 @@ impl LiveLoopExecutor {
         used_credential: Option<(broca_core::AuthSelection, u64)>,
         in_run_refresh: Option<&InRunRefresh>,
         terminal_error: impl Fn() -> F,
-        lineage: Option<broca_wal::WalLineageId>,
         durable_head: &std::sync::atomic::AtomicU64,
         session: &BindIdentity,
     ) where
@@ -3064,7 +3062,7 @@ impl LiveLoopExecutor {
                 report_selection.as_ref(),
                 summary,
                 terminal_error(),
-                (lineage, durable_head.load(Ordering::Acquire)),
+                durable_head.load(Ordering::Acquire),
             )
             .await
         } else {
@@ -3072,11 +3070,7 @@ impl LiveLoopExecutor {
         };
         if let (Some(reporter), Ok(finished)) = (&account_reporter, summary) {
             if finished.paused.is_none() {
-                reporter.finish(
-                    lineage,
-                    durable_head.load(Ordering::Acquire),
-                    finished.reason,
-                );
+                reporter.finish(durable_head.load(Ordering::Acquire), finished.reason);
             }
         }
 
@@ -3207,7 +3201,7 @@ impl LiveLoopExecutor {
                 .await
                 .map_err(StoreRunError::Loop)?;
             if let Some(reporter) = reporter.filter(|_| sealed.paused.is_none()) {
-                reporter.finish(None, durable_head.load(Ordering::Acquire), sealed.reason);
+                reporter.finish(durable_head.load(Ordering::Acquire), sealed.reason);
             }
             return Ok(sealed);
         }
@@ -3479,7 +3473,6 @@ impl LiveLoopExecutor {
             used_credential,
             in_run_refresh,
             || store_terminal_error(reader, execution_start_seq),
-            None,
             &durable_head,
             &req.session,
         )
@@ -4608,12 +4601,6 @@ impl RunExecutor for LiveLoopExecutor {
             )
             .await;
         broca_module::executor::StoreRunEnd { parts, result }
-    }
-
-    fn on_run_sealed(&self, sealed: broca_module::SealedRun) {
-        if let Some(routing) = self.routing.as_ref() {
-            broca_module_serve::account_routing::report_sealed(Arc::clone(routing), &sealed);
-        }
     }
 
     async fn on_session_close(&self, session: &BindIdentity) {

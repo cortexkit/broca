@@ -21,7 +21,6 @@ TOKIO_FREE_MEMBERS = {
     "broca-memory-relief",
     "broca-records",
     "broca-session-store",
-    "broca-wal-reader",
 }
 
 
@@ -93,7 +92,7 @@ class DependencyGraphProof(unittest.TestCase):
     def test_non_live_normal_graphs_exclude_live_transport(self):
         # These packages must not acquire the provider's optional networking stack
         # through feature unification or a workspace-hack dependency.
-        for package in ["broca-protocol", "broca-wal", "broca-provider", "broca-catalog"]:
+        for package in ["broca-protocol", "broca-records", "broca-provider", "broca-catalog"]:
             with self.subTest(package=package):
                 output = tree("-p", package, "-e", "normal,build", "--target", "all")
                 self.assertRegex(output, r"\A" + re.escape(package) + r" v\d")

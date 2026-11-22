@@ -14,13 +14,11 @@ fs-override = []
 [dependencies]
 broca-owner-only.workspace = true
 broca-protocol = { path = "../broca-protocol" }
-broca-wal-reader = { path = "../broca-wal-reader", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
 broca-owner-only = { workspace = true, features = ["test-support"] }
-broca-wal = { path = "../broca-wal", features = ["test-io-trace"] }
 broca-test-support = { path = "../broca-test-support" }
 serde_jcs = "0.2"

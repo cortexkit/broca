@@ -129,7 +129,7 @@ pub const RESTART_PAUSE_FEATURE: &str = "restart-pause/v1";
 /// seal the run Interrupted while the provider still owes its result, and `PauseReason` is a
 /// closed enum that has no other value to read `tool_held` as.
 ///
-/// Listed in `broca_wal::framing::KNOWN_FEATURES`: replay classes a held call as open rather
+/// Listed in `broca_records::floor::KNOWN_FEATURES`: replay classes a held call as open rather
 /// than indeterminate, and the runtime resumes the run when its late result arrives. The
 /// daemon installs that runtime and declares `held-reply/v1` on dispatch routes in every build.
 pub const PROVIDER_HELD_FEATURE: &str = "provider-held/v1";

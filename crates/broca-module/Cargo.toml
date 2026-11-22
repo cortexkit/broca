@@ -18,7 +18,6 @@ broca-core = { path = "../broca-core" }
 # same build happens to enable the feature.
 broca-provider = { path = "../broca-provider", features = ["live"] }
 broca-records = { path = "../broca-records" }
-broca-wal = { path = "../broca-wal" }
 # Owner-only files for the Claude Code persona's identity (`claude_code_identity`).
 broca-owner-only.workspace = true
 broca-store = { path = "../broca-store" }
@@ -63,7 +62,7 @@ cortexkit-role-llm-runner = { workspace = true, features = ["test-vectors"] }
 # llm-runner 0.7.48's tags.json vectors pin recorded v1 tool-result numbering and rendering.
 cortexkit-role-llm-runner-v1 = { workspace = true, features = ["test-vectors"] }
 cortexkit-bus-trait.workspace = true
-broca-wal = { path = "../broca-wal", features = ["test-io-trace"] }
+broca-records = { path = "../broca-records", features = ["test-io-trace"] }
 broca-store = { path = "../broca-store", features = ["test-conformance"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
 broca-test-support = { path = "../broca-test-support" }

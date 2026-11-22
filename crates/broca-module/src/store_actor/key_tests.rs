@@ -64,7 +64,7 @@ async fn module_with(name: &str, billing: Option<StoreBilling>, new_sessions: Ci
     let held = BindIdentity::new(dir.join("project"), "store-actor", "held");
     let absent = BindIdentity::new(dir.join("project"), "store-actor", "absent");
     Session::create(
-        LocalBackend::new(dir.join(broca_wal::SESSION_STORAGE_DIR)),
+        LocalBackend::new(dir.join(broca_records::features::SESSION_STORAGE_DIR)),
         SessionAddr(broca_core::session_addr(&held)),
         triple(&held),
         &DeploymentKey::new(1, &KEY),
@@ -189,7 +189,7 @@ impl Module {
         let session = BindIdentity::new(self.dir.join("project"), "store-actor", name);
         let deployment = DeploymentKey::new(1, &KEY).creating(cipher);
         Session::create(
-            LocalBackend::new(self.dir.join(broca_wal::SESSION_STORAGE_DIR)),
+            LocalBackend::new(self.dir.join(broca_records::features::SESSION_STORAGE_DIR)),
             SessionAddr(broca_core::session_addr(&session)),
             triple(&session),
             &deployment,
@@ -205,10 +205,11 @@ impl Module {
 
     /// The mode the stored head of `session` names.
     fn stored_mode(&self, session: &BindIdentity) -> Cipher {
-        let (stored, _) = LocalBackend::new(self.dir.join(broca_wal::SESSION_STORAGE_DIR))
-            .read_stored_head(&SessionAddr(broca_core::session_addr(session)))
-            .unwrap()
-            .unwrap();
+        let (stored, _) =
+            LocalBackend::new(self.dir.join(broca_records::features::SESSION_STORAGE_DIR))
+                .read_stored_head(&SessionAddr(broca_core::session_addr(session)))
+                .unwrap()
+                .unwrap();
         broca_session_store::head::stored_cipher(&stored).unwrap()
     }
 
@@ -217,7 +218,8 @@ impl Module {
     async fn flip_mode(&self, session: &BindIdentity, cipher: Option<Cipher>) {
         use broca_session_store::backend::SessionBackend;
         use broca_session_store::codec::Message;
-        let backend = LocalBackend::new(self.dir.join(broca_wal::SESSION_STORAGE_DIR));
+        let backend =
+            LocalBackend::new(self.dir.join(broca_records::features::SESSION_STORAGE_DIR));
         let addr = SessionAddr(broca_core::session_addr(session));
         let (stored, version) = backend.read_stored_head(&addr).unwrap().unwrap();
         // The head's body follows its 40-byte tag or check.

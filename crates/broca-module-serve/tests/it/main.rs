@@ -7,8 +7,6 @@
 //! the suite slow to build and slow to start.
 //!
 //! Some files keep binaries of their own, because sharing a process would change what they check:
-//! - `manifest_older_build` and `steer_older_build` make this process forget a WAL feature
-//!   (`broca_wal::forget_feature_for_test`), which every other WAL writer in the process would see.
 //! - `launch_nonce` needs the launch-nonce accessor's process-wide cache fresh, and re-runs its own
 //!   binary by exact test name.
 //! - `operation_counters` asserts exact values of process-wide operation counters, which any other

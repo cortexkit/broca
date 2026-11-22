@@ -38,14 +38,10 @@ fn account_route_body_uses_frozen_names_after_reload_and_readmission() {
     assert_eq!(admitted["provider"], "routing-provider");
     assert_eq!(admitted["model"], "routing-model");
     assert_eq!(admitted["affinity_model"], "routing-model");
-    let mut record: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/auth-hints/run-started.json")).unwrap();
-    record["config"]["account_route"] = serde_json::to_value(&route).unwrap();
-    let broca_records::record::WalRecord::RunStarted { config, .. } =
-        serde_json::from_value(record).unwrap()
-    else {
-        panic!("run fixture")
-    };
+    let mut config: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/auth-hints/run-config.json")).unwrap();
+    config["account_route"] = serde_json::to_value(&route).unwrap();
+    let config: broca_records::record::RunConfig = serde_json::from_value(config).unwrap();
     request.account_route = config.account_route.as_ref();
     request.provider = "changed-render-provider";
     request.model = "changed-render-model";

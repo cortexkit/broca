@@ -633,21 +633,12 @@ async fn stand_in_plane(root: &std::path::Path) -> (Arc<SubcToolPlane>, tokio::t
     (Arc::new(SubcToolPlane::new(connection, "unused")), server)
 }
 
-/// A `RunStarted` record for `session` whose input is one user message of `text`.
-fn run_started_with_user_text(
-    session: &broca_protocol::BindIdentity,
-    run_id: &str,
-    text: &str,
-) -> broca_records::record::WalRecord {
+/// A run's frozen config with no tools, for an Anthropic model.
+fn plain_run_config() -> broca_records::record::RunConfig {
     serde_json::from_value(serde_json::json!({
-        "type": "run_started", "run_id": run_id, "session": session,
-        "config": {
-            "model": {"provider_module_id": "anthropic", "model_id": "claude-opus-4-8"},
-            "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
-            "response_format": {"type": "text"}, "context_epoch": 0, "renderer_version": 2
-        },
-        "input": [{"role": "user", "content": [{"type": "text", "text": text}]}],
-        "origin": {"kind": "fresh"}
+        "model": {"provider_module_id": "anthropic", "model_id": "claude-opus-4-8"},
+        "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
+        "response_format": {"type": "text"}, "context_epoch": 0, "renderer_version": 2
     }))
     .unwrap()
 }

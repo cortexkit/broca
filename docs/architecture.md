@@ -95,11 +95,10 @@ supervisor can respawn it.
 |---|---|
 | `broca-protocol` | Canonical request, event, usage and error types; no I/O. |
 | `broca-wire` | Client-facing JSON contracts for the management surface. |
-| `broca-records` | Record types shared across crates, storage classes and their roots. |
+| `broca-records` | Record types shared across crates, storage classes and their roots, the `state-format` marker and move fences. |
 | `broca-session-store` | Heads, logs, objects and setup parts; the record codec; sealed history; moves. |
 | `broca-session-loop` | The run loop: render, stream, dispatch tools, resume. |
 | `broca-core` | Admission, queued sends and steers (sends that join a running run at its next step), compaction, hooks, budgets, media, billing facts and leases. |
-| `broca-wal`, `broca-wal-reader` | What live code still uses from the old log format: frame codec, feature names, the `state-format` marker and move fences. |
 | `broca-module` | Session actors, registry, serve handlers and subscriber fan-out. |
 | `broca-module-serve` | `ck-broca`, daemon serve loop, configuration, routing, health and `broca-session`. |
 | `broca-subc` | Daemon connection, route-open retry, tool/transform routing and vault client. |

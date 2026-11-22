@@ -634,10 +634,7 @@ pub fn session_read_response(
     };
     SessionReadResponse {
         history_version: 0,
-        incarnation: page
-            .lineage_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "unwritten".into()),
+        incarnation: "unwritten".into(),
         next_late_after: None,
         messages: page
             .messages
@@ -677,7 +674,7 @@ pub fn session_read_response(
             .collect(),
         next_from_ordinal: page.next_from_ordinal.map(|position| position + 1),
         head: page.head.map(CursorWire::from),
-        lineage_id: page.lineage_id.map(|lineage_id| lineage_id.to_string()),
+        lineage_id: None,
         lineage_state: SessionReadLineageState {
             last_run_id: page.lineage_state.last_run_id.map(|run_id| run_id.0),
             state: page.lineage_state.state.as_str().to_string(),
@@ -1551,12 +1548,6 @@ pub enum ServeError {
     ModuleStopping(StoppingAt),
     /// A whole message or model-view atomic group would exceed one encoded subc frame.
     ReplyTooLarge(ReplyTooLargeDetail),
-    RetainedSessionTooLarge {
-        max_bytes: u64,
-    },
-    SessionTooLarge {
-        max_bytes: u64,
-    },
     /// The queued submission named by a deterministic send identity was durably retracted.
     SendRetracted {
         submission_id: String,
@@ -1708,8 +1699,6 @@ impl std::fmt::Display for ServeError {
             ServeError::VariantUnsupported(e) => write!(f, "open failed: run resolution failed: {e}"),
             ServeError::ToolAliasInvalid(e) => write!(f, "{e}"),
             ServeError::ServiceTierInvalid { message, .. } => f.write_str(message),
-            ServeError::SessionTooLarge { max_bytes } => write!(f, "session log cannot exceed {max_bytes} bytes"),
-            ServeError::RetainedSessionTooLarge { max_bytes } => write!(f, "retained session log cannot exceed {max_bytes} bytes"),
             ServeError::Open(s, _) => write!(f, "open failed: {s}"),
             ServeError::ReplyTooLarge(_) => {
                 f.write_str("the session.read reply exceeds the transport frame limit")
@@ -3145,12 +3134,6 @@ impl ServeHandler for crate::LineageRegistry {
             SendOutcome::NotServedOnNewStorage { feature } => {
                 Err(ServeError::NotServedOnNewStorage { feature })
             }
-            SendOutcome::SessionTooLarge { max_bytes } => {
-                Err(ServeError::SessionTooLarge { max_bytes })
-            }
-            SendOutcome::RetainedSessionTooLarge { max_bytes } => {
-                Err(ServeError::RetainedSessionTooLarge { max_bytes })
-            }
             SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
             SendOutcome::CredentialsUnavailable => Err(ServeError::CredentialsUnavailable),
             SendOutcome::CredentialAmbiguous {
@@ -3519,12 +3502,6 @@ impl ServeHandler for crate::LineageRegistry {
         match self.route_retract(session, submission_id).await? {
             RetractOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
             RetractOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
-            RetractOutcome::SessionTooLarge { max_bytes } => {
-                Err(ServeError::SessionTooLarge { max_bytes })
-            }
-            RetractOutcome::RetainedSessionTooLarge { max_bytes } => {
-                Err(ServeError::RetainedSessionTooLarge { max_bytes })
-            }
             RetractOutcome::Retracted => Ok(RetractResponse::Retracted),
             RetractOutcome::AlreadyStarted => Ok(RetractResponse::AlreadyStarted),
             RetractOutcome::NotPending => Ok(RetractResponse::NotPending),

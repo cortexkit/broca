@@ -112,7 +112,7 @@ fn media_objects(store: &Side) -> usize {
             })
             .unwrap_or(0)
     }
-    count(&store.dir.join(broca_wal::SESSION_STORAGE_DIR))
+    count(&store.dir.join(broca_records::features::SESSION_STORAGE_DIR))
 }
 
 /// The store side, restarted on its state root: its image reads back byte-equal, whole and by

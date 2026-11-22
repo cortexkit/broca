@@ -102,7 +102,6 @@ class QuickcheckGuards(unittest.TestCase):
             ("broca-module-serve", "it", "wal_known_features_prints_the_sorted_table_and_nothing_else"),
             ("broca-module-serve", "launch_nonce", "no_shipped_code_reads_a_launch_nonce_variable_directly"),
             ("broca-module-serve", "it", "every_broca_spawn_site_pins_its_state_root"),
-            ("broca-wal", "it", "no_production_path_writes_deferred_call_records"),
             ("python", "scripts/test-portable-test-selection.py", "test_exact_rig_test_exclusion_keeps_guard_test_selected"),
         }
         available = {(entry[0], entry[1], entry[5]) for entry in cls.entries}

@@ -20,7 +20,6 @@ broca-protocol = { path = "../broca-protocol" }
 # created under.
 broca-session-store = { path = "../broca-session-store" }
 broca-records = { path = "../broca-records" }
-broca-wal = { path = "../broca-wal" }
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
@@ -42,6 +41,6 @@ broca-owner-only = { workspace = true, features = ["test-support"] }
 broca-test-support = { path = "../broca-test-support" }
 # Tests of the paths that copy WAL bytes need a gated frame this build can read; see
 # `broca_wal::framing::TEST_KNOWN_FEATURE`.
-broca-wal = { path = "../broca-wal", features = ["test-known-feature", "fs-override"] }
+broca-records = { path = "../broca-records", features = ["fs-override"] }
 async-trait.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

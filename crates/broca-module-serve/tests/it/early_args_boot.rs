@@ -88,7 +88,7 @@ fn fast_probes_remain_side_effect_free() {
         assert!(output.status.success(), "{output:?}");
         let stdout = String::from_utf8(output.stdout).unwrap();
         if flag == "--wal-known-features" {
-            let mut names = broca_wal::KNOWN_FEATURES.to_vec();
+            let mut names = broca_records::floor::KNOWN_FEATURES.to_vec();
             names.sort_unstable();
             let expected: String = names.iter().map(|name| format!("{name}\n")).collect();
             assert_eq!(stdout, expected);

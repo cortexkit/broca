@@ -64,12 +64,7 @@ fn fork_chosen(
 
 fn fork_job(root: &std::path::Path, url: &str) -> ForkCallJob {
     let req = drift_request(root);
-    let broca_records::record::WalRecord::RunStarted { config, .. } =
-        run_started_with_user_text(&req.session, "head-run", "head")
-    else {
-        panic!()
-    };
-    let mut config = *config;
+    let mut config = plain_run_config();
     let mut frozen = broca_provider::families::anthropic_frozen_config("claude-test");
     frozen.base_url = Some(url.into());
     config.model = broca_protocol::ModelHandle::new("anthropic", "claude-test");

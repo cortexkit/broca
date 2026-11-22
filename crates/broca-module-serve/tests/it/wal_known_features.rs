@@ -22,7 +22,7 @@ fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
     .unwrap();
     assert!(output.status.success(), "{output:?}");
 
-    let mut expected = broca_wal::KNOWN_FEATURES.to_vec();
+    let mut expected = broca_records::floor::KNOWN_FEATURES.to_vec();
     expected.sort_unstable();
     let expected: String = expected.iter().map(|name| format!("{name}\n")).collect();
     assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);

@@ -859,7 +859,7 @@ impl StoreRuntime {
                 &self
                     .state_root
                     .join(broca_records::floor::FEATURE_FLOOR_FILENAME),
-                &[broca_wal::SESSION_STORAGE_FEATURE],
+                &[broca_records::floor::SESSION_STORAGE_FEATURE],
             )
             .map_err(|error| {
                 OpenError::Open(format!("the feature floor could not be raised: {error}"))

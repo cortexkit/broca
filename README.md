@@ -11,8 +11,9 @@ effect.
 | Crate | Role |
 |---|---|
 | `broca-protocol`, `broca-wire` | Canonical types and client-facing JSON contracts. |
-| `broca-wal` | WAL records, framing, storage, archives and verification. |
-| `broca-core` | Run loop, replay, checkpoints, import, billing and leases. |
+| `broca-records`, `broca-session-store` | Shared record types; the session store: heads, logs, objects, and the older history kept behind a compaction view. |
+| `broca-session-loop` | The run loop: render, stream, dispatch tools, resume. |
+| `broca-core` | Admission, queued sends and steers, compaction, hooks, budgets, media, billing facts and leases. |
 | `broca-module` | Session actors, registry, handlers and subscribers. |
 | `broca-module-serve` | `ck-broca` module binary and `broca-session` CLI. |
 | `broca-subc` | Daemon connection, tool/transform routing and vault client. |

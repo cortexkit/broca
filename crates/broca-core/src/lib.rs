@@ -28,7 +28,6 @@ pub mod delivery_order;
 pub mod display_facts;
 pub mod fresh_start;
 pub mod head;
-pub use head::is_mode3_log;
 pub mod held_calls;
 pub mod hooks;
 pub mod import;
@@ -117,11 +116,7 @@ pub use provider::{Provider, StubProvider};
 pub use queue::PendingSubmission;
 pub use render::CANONICAL_RENDERER_VERSION;
 pub use render::{canonical_request_bytes, request_digest, request_digest_hex};
-pub use replay::{
-    DeferredCallObligations, DeferredCallProjection, OpenToolBatch, OwedWithdrawal, PendingTurn,
-    PreparedCall, ProjectedDeferredCall, ReplayResolution, ReplayState,
-};
-pub use replay::{LateApprovalView, OpenCallState, ReconciledRunState, ReplayError};
+pub use replay::{OpenCallState, ReconciledRunState, ReplayError};
 pub use resume::DeferredCloseKind;
 
 pub use scope_admission::{

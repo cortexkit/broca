@@ -329,7 +329,6 @@ dependencies = [
  "broca-protocol",
  "broca-records",
  "broca-test-support",
- "broca-wal",
  "cortexkit-compaction-view",
  "cortexkit-lease",
  "cortexkit-role-compaction",
@@ -408,7 +407,6 @@ dependencies = [
  "broca-session-store",
  "broca-store",
  "broca-test-support",
- "broca-wal",
  "broca-wire",
  "ck-session-import",
  "cortexkit-bus-trait",
@@ -453,7 +451,6 @@ dependencies = [
  "broca-store",
  "broca-subc",
  "broca-test-support",
- "broca-wal",
  "broca-wire",
  "chrono",
  "ck-session-import",
@@ -547,8 +544,6 @@ dependencies = [
  "broca-session-loop",
  "broca-session-store",
  "broca-test-support",
- "broca-wal",
- "broca-wal-reader",
  "bytes",
  "chrono",
  "cortexkit-anthropic-policy",
@@ -581,8 +576,6 @@ dependencies = [
  "broca-owner-only",
  "broca-protocol",
  "broca-test-support",
- "broca-wal",
- "broca-wal-reader",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -612,7 +605,6 @@ dependencies = [
  "broca-records",
  "broca-session-store",
  "broca-test-support",
- "broca-wal",
  "cortexkit-compaction-view",
  "cortexkit-role-compaction",
  "cortexkit-role-llm-runner 0.9.0",
@@ -661,7 +653,6 @@ dependencies = [
  "broca-records",
  "broca-session-store",
  "broca-test-support",
- "broca-wal",
  "cortexkit-bus-naming",
  "cortexkit-bus-trait",
  "getrandom 0.3.4",
@@ -729,7 +720,6 @@ dependencies = [
  "broca-owner-only",
  "broca-protocol",
  "broca-store",
- "broca-wal",
  "cortexkit-test-support",
  "libproc",
  "nix",
@@ -737,33 +727,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "broca-wal"
-version = "0.4.99"
-dependencies = [
- "broca-owner-only",
- "broca-protocol",
- "broca-records",
- "broca-test-support",
- "broca-wal-reader",
- "getrandom 0.3.4",
- "serde",
- "serde_jcs",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "broca-wal-reader"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

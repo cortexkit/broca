@@ -10,10 +10,6 @@ broca-module-serve|launch_nonce|no_shipped_code_reads_a_launch_nonce_variable_di
 broca-module-serve|it|state_root_isolation::every_broca_spawn_site_pins_its_state_root|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/state_root_isolation.rs|every_broca_spawn_site_pins_its_state_root|Boots a child through each test command builder and checks it writes only beneath the selected state root.
 # Ensures only the shared state-root resolver reads the state-root environment variable.
 broca-module-serve|it|state_root_isolation::only_the_shared_resolver_names_the_state_root|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/state_root_isolation.rs|only_the_shared_resolver_names_the_state_root|Checks production environment reads remain behind the shared state-root resolver.
-# Keeps production deferred-call record construction inside approved writer paths.
-broca-wal|it|compaction_source::|-|crates/broca-wal/tests/it/compaction_source.rs|no_production_path_writes_deferred_call_records|Scans production source for unauthorized deferred-call WAL writers.
-# Ensures retention writes stay in the core and actor implementation.
-broca-wal|it|retention_source::|-|crates/broca-wal/tests/it/retention_source.rs|retention_writes_are_limited_to_the_session_actor|Inventories production retention writers across crate sources.
 # Pins the embedded served-payload fixture's wire shape.
 broca-catalog|it|fusiform_wire_fixture::|broca-catalog/live|crates/broca-catalog/tests/it/fusiform_wire_fixture.rs|the_served_shape_carries_the_facts_broca_consumes|Checks local catalog payload fixture data without network access.
 # Checks row endpoints and refusal of withheld routing facts.

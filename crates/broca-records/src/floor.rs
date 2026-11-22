@@ -26,6 +26,81 @@ use std::sync::{Mutex, RwLock};
 /// The floor's file name, in broca's state root (next to the `wal/` directory).
 pub const FEATURE_FLOOR_FILENAME: &str = "wal-feature-floor";
 
+/// Not a record feature: it names the session store (`broca-session-store`), which keeps each
+/// session under [`crate::features::SESSION_STORAGE_DIR`]. The store raises the floor with
+/// this name before it writes its first session in a state root, so placement then refuses every
+/// build that doesn't know it: one that would serve those sessions from logs it doesn't have.
+pub const SESSION_STORAGE_FEATURE: &str = "session-storage/v1";
+
+/// Every feature name this build knows, which `ck-broca --wal-known-features` prints for release
+/// placement to check against the floor. The floor still names features the old log format
+/// recorded; a build serves no such log, and lists their names so the floor written before the
+/// session store doesn't refuse it.
+pub const KNOWN_FEATURES: &[&str] = &[
+    "account-limit-pause/v1",
+    "agent-run-scopes/v1",
+    "archive-index/v2",
+    "auth-selection-method/v1",
+    "bill-attempts/v1",
+    "bill-vault-facts/v1",
+    "chatgpt-codex-wire/v1",
+    "client-message-id/v1",
+    "compaction-ride-wait/v1",
+    "compaction-v2/v1",
+    "compaction-view-meta/v1",
+    "compaction-view-negotiation/v1",
+    "compaction-view/v1",
+    "compaction-wait/v1",
+    "compaction/v1",
+    "context-ceiling/v1",
+    "deferred-call/v1",
+    "delivery-order/v1",
+    "dispatch-module/v1",
+    "flow-scopes/v1",
+    "frame-stamps/v1",
+    "google-rpc-error-details/v1",
+    "input-token-cap/v1",
+    "interrupt-reason/v1",
+    "media-content/v1",
+    "message-marks/v1",
+    "message-times/v1",
+    "openrouter-reasoning/v1",
+    "output-reservation/v1",
+    "plan-manifest/v1",
+    "plan-reference-slots/v1",
+    "provider-declarations/v1",
+    "provider-fallback-block/v1",
+    "provider-held/v1",
+    "provider-text-state/v1",
+    "refusal-fallback/v1",
+    "restart-pause/v1",
+    "retention/v1",
+    "rides-v2/v1",
+    "run-cancel-at/v1",
+    "runner-tags/v1",
+    "runner-tags/v2",
+    "scope/v1",
+    "service-tier-queue/v1",
+    "session-change/v1",
+    "session-class/v1",
+    "session-storage/v1",
+    "speaks-for-name/v1",
+    "steer-queue/v1",
+    "step-transforms/v1",
+    "structured-output-downgrade/v1",
+    "structured-output-paragraph/v1",
+    "structured-output/v1",
+    "tool-name-aliases/v1",
+    "tool-reply/v1",
+    "tool-schema-pins/v1",
+    "tool-times/v1",
+    "turn-directives/v1",
+    "turn-system/v1",
+    "visibility-late/v1",
+    "wal-recovery/v1",
+    "writer-id/v1",
+];
+
 /// Serializes raises within this process, so two sessions writing their first gated frames at
 /// once cannot each read the old floor and have one rename drop the other's name.
 static RAISE_LOCK: Mutex<()> = Mutex::new(());

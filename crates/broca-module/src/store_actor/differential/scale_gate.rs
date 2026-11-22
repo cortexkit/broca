@@ -163,7 +163,7 @@ async fn scale_gate_imported_head() {
     let addr = broca_session_store::backend::SessionAddr(broca_core::session_addr(&module.key));
     // A head is kept in the class root its backup class names; find the one holding it.
     let root = [
-        broca_wal::SESSION_STORAGE_DIR,
+        broca_records::features::SESSION_STORAGE_DIR,
         broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
         broca_records::session_storage::SESSION_STORAGE_EPHEMERAL_DIR,
     ]

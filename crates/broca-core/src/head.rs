@@ -1,30 +1,12 @@
 //! Small, replayable head facts, committed with the projection's exact WAL watermark.
 
 use broca_protocol::RunId;
-use broca_records::record::WalRecord;
 use cortexkit_role_llm_runner::{read::HeadModel, usage::SessionUsage};
 use serde::{Deserialize, Serialize};
 
-/// A log uses mode-3 semantics exactly when its first RunStarted has a plan version.
-/// Later runs cannot change that choice. HeadProjection caches this predicate, with None
-/// meaning unknown rather than legacy.
-pub fn is_mode3_log<'a>(records: impl IntoIterator<Item = &'a WalRecord>) -> bool {
-    records
-        .into_iter()
-        .find_map(|record| match record {
-            WalRecord::RunStarted {
-                compaction_plan_version,
-                ..
-            } => Some(compaction_plan_version.is_some()),
-            _ => None,
-        })
-        .unwrap_or(false)
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeadProjection {
-    /// Set once from the first RunStarted. None is unknown, never evidence of a legacy log;
-    /// callers must obtain the shared is_mode3_log predicate's answer before choosing semantics.
+    /// Set once from the first RunStarted. None is unknown, never evidence of a legacy log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode3: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

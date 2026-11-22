@@ -4,23 +4,21 @@ mod call_keepalive {
     #[test]
     fn pre_declaration_manifest_golden_keeps_its_bytes_and_no_keepalive_promise() {
         let historical =
-            include_str!("../../broca-wal/tests/fixtures/plan_manifest_pre_declarations.json")
+            include_str!("../../broca-records/tests/fixtures/plan_manifest_pre_declarations.json")
                 .trim_end();
-        let record: broca_records::record::WalRecord = serde_json::from_str(historical).unwrap();
-        let broca_records::record::WalRecord::RunStarted {
-            manifest: Some(ref manifest),
-            ..
-        } = record
-        else {
-            panic!("the historical fixture contains its frozen manifest");
-        };
+        let record: Value = serde_json::from_str(historical).unwrap();
+        let stored = record
+            .get("manifest")
+            .expect("the historical fixture contains its frozen manifest");
+        let manifest: broca_records::record::PlanManifest =
+            serde_json::from_value(stored.clone()).unwrap();
         assert!(!manifest.fetches.is_empty());
         for fetch in &manifest.fetches {
-            assert!(frozen_provider_declarations_of(manifest, &fetch.provider)
+            assert!(frozen_provider_declarations_of(&manifest, &fetch.provider)
                 .and_then(|d| d.call_keepalive)
                 .is_none());
         }
-        assert_eq!(serde_json::to_string(&record).unwrap(), historical);
+        assert_eq!(&serde_json::to_value(&manifest).unwrap(), stored);
     }
 
     struct DeclaringFetcher {

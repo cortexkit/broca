@@ -26,7 +26,7 @@ test-loopback-credentials = []
 bench = ["dep:broca-replay", "dep:subc-protocol", "dep:subc-transport"]
 # The live Anthropic provider (LiveAnthropicProvider): a real HTTP/SSE front for
 # Provider::step. OFF by default so the pure normalize path stays reqwest-free.
-live = ["dep:reqwest", "dep:broca-core", "dep:broca-wal", "dep:broca-records", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:tokio-tungstenite", "dep:tungstenite", "dep:flate2", "tokio/rt"]
+live = ["dep:reqwest", "dep:broca-core", "dep:broca-records", "dep:futures", "dep:async-trait", "dep:httpdate", "dep:chrono", "dep:rand", "dep:tokio-util", "dep:tokio-tungstenite", "dep:tungstenite", "dep:flate2", "tokio/rt"]
 
 [dependencies]
 broca-owner-only.workspace = true
@@ -45,7 +45,6 @@ broca-replay = { path = "../broca-replay", optional = true }
 # broca-core for the Provider trait the live provider implements (feature `live`).
 broca-core = { path = "../broca-core", optional = true }
 broca-records = { path = "../broca-records", optional = true }
-broca-wal = { path = "../broca-wal", optional = true }
 # Only the bench-replay producer speaks the subc wire; the library codec paths are
 # transport-free so MITM consumers can depend on this crate with zero subc stacks.
 subc-protocol = { workspace = true, optional = true }
@@ -91,7 +90,6 @@ broca-session-loop = { path = "../broca-session-loop" }
 broca-session-store = { path = "../broca-session-store" }
 tokio-util.workspace = true
 proptest = { version = "1.11", default-features = false, features = ["std"] }
-broca-wal-reader = { path = "../broca-wal-reader" }
 broca-module-serve = { path = "../broca-module-serve" }
 # The session-loop test rig projects a run's records into control units with serve's projection.
 broca-module = { path = "../broca-module" }
@@ -103,7 +101,6 @@ broca-owner-only = { workspace = true, features = ["test-support"] }
 # Test scratch paths live under one owned, self-reclaiming root; see that crate.
 broca-test-support = { path = "../broca-test-support" }
 # The #1b frozen-config-resume gate drives the real loop + truncates the WAL.
-broca-wal = { path = "../broca-wal" }
 # The family e2e harness drives the session loop against a mock LLM server (aimock) over the live
 # transport, with broca-core's deterministic StubToolPlane. The transport reset test freezes the
 # clock to prove relative resets use the injected value.
