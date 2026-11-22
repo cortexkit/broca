@@ -27,10 +27,10 @@ PASS tag_read_unknown_call
 N/A tag_read_unknown_tag: adapter cannot seed a tag assigned after a call
 PASS tag_read_non_owner
 N/A tag_read_undeclared: the subject declares every one of tag_read, so none is left to refuse
-N/A notice_keep_owner_served: notice_keep is not declared
-N/A notice_keep_requires_notice: notice_keep is not declared
-N/A notice_keep_owner_only: notice_keep is not declared
-N/A notice_keep_false_absent: notice_keep is not declared
-N/A notice_keep_tool_result_refused: notice_keep is not declared
-PASS notice_keep_undeclared
+PASS notice_keep_owner_served
+PASS notice_keep_requires_notice
+PASS notice_keep_owner_only
+PASS notice_keep_false_absent
+PASS notice_keep_tool_result_refused
+N/A notice_keep_undeclared: the subject declares every one of notice_keep, so none is left to refuse
 PASS message_marks_retry_changed

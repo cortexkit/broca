@@ -259,8 +259,10 @@ fn history_display_kit_session(session: &str) -> bool {
         .any(|prefix| session.strip_prefix(*prefix).is_some_and(counter))
 }
 
+/// A session the kit's message-mark and kept-notice cases open, which need the owner stamp under
+/// a plain scope: an owner check compares the sender with the scope's owner.
 fn message_marks_kit_session(session: &str) -> bool {
-    ["cf-message-marks-", "cf-marks-retry-"]
+    ["cf-message-marks-", "cf-marks-retry-", "cf-notice-keep-"]
         .iter()
         .any(|prefix| {
             session.strip_prefix(*prefix).is_some_and(|counter| {
@@ -3191,6 +3193,9 @@ impl LlmRunnerSubject for BrocaSubject {
             // role.describe declares cache_policy. Its cases drive ordinary sends with a
             // session's cache in its creating send or its plan.
             Capability::CachePolicy,
+            // role.describe declares notice_keep. Its cases send marked notices from the owner
+            // and a stranger stamp on ordinary routes.
+            Capability::NoticeKeep,
         ]
         .into_iter()
         .collect();
@@ -7144,7 +7149,7 @@ async fn message_marks_fixture_scope_and_plan_are_limited_to_exact_kit_sessions(
     let root = broca_test_support::scratch_root().join("subject-message-marks-plan");
     let subject = BrocaSubject::new(&root).await;
     let owner = subject.owner_stamp();
-    for session in ["cf-message-marks-1", "cf-marks-retry-2"] {
+    for session in ["cf-message-marks-1", "cf-marks-retry-2", "cf-notice-keep-3"] {
         let stamp = message_marks_route_stamp(session, &owner);
         assert_eq!(stamp, scope_fixture_stamps(PLAIN_SCOPE_REF).1);
         let first = subject.send_fields(session, true);
