@@ -24,7 +24,7 @@ use super::tests::{executor, request, send_exactly, text_step};
 use super::StoreActor;
 use crate::actor::{LineageCmd, SendKey, SendOutcome};
 use crate::store_import::{
-    ImportCommand, ImportRoots, InstallViewCommand, StoreCommand, StoreOutcome,
+    ApplyViewCommand, ImportCommand, ImportRoots, InstallViewCommand, StoreCommand, StoreOutcome,
 };
 
 #[path = "import_inline_tests.rs"]
@@ -198,12 +198,20 @@ impl Drop for Source {
 type Served = tokio::task::JoinHandle<Session<&'static MemoryBackend>>;
 
 fn serve(session: Session<&'static MemoryBackend>) -> (mpsc::UnboundedSender<LineageCmd>, Served) {
+    serve_with(session, MemoryParts::default())
+}
+
+/// [`serve`], over the setup parts `parts` holds: those of the runs the session already had.
+fn serve_with(
+    session: Session<&'static MemoryBackend>,
+    parts: MemoryParts,
+) -> (mpsc::UnboundedSender<LineageCmd>, Served) {
     let backend = *session.backend();
     let actor = StoreActor::new(
         bind(),
         session,
         Arc::new(executor(Vec::new(), None)),
-        Box::new(SharedParts::new(Box::new(MemoryParts::default()))),
+        Box::new(SharedParts::new(Box::new(parts))),
     )
     .with_import_staging(Arc::new(
         crate::store_import_stage::MemoryImportStaging::new(backend, deployment()),
@@ -1315,6 +1323,10 @@ impl Writer for Unsealed<'_> {
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
         Writer::entry_at(&*self.0, ordinal).await
     }
+
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        Writer::moved_through(&*self.0).await
+    }
 }
 
 /// A model step answering `text` in two text parts, `Reply to <text>` and `More on <text>`.
@@ -1973,6 +1985,169 @@ async fn an_imported_sessions_view_applies_after_a_seal_through_the_import() {
     let operations = Writer::operations(&sealed);
     assert_eq!(operations.view_applied.as_ref().unwrap().view.version, 2);
     assert_eq!(operations.view_accepted.as_ref().unwrap().version, 2);
+}
+
+/// The installed view's cut is the move's (the compaction contract's MV7): a later view with no
+/// cut, or cutting through an earlier entry, is refused `cut_before_move` naming the move's
+/// entry and the view in force stays; one cutting there or later applies.
+#[tokio::test]
+async fn a_view_cutting_before_the_moves_cut_is_refused() {
+    let cut = |version, through: &str| {
+        view_of(
+            version,
+            vec![(
+                version,
+                EditOp::Cut {
+                    through: through.into(),
+                },
+            )],
+        )
+    };
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of("move-cut", exchanges(), None);
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    assert!(matches!(
+        ask(&commands, install_view(&cut(1, "msg_a2"))).await,
+        StoreOutcome::ViewInstalled(_)
+    ));
+    drop(commands);
+    let mut session = served.await.unwrap();
+    assert_eq!(
+        Writer::operations(&session).move_cut.as_deref(),
+        Some("msg_a2")
+    );
+    let mut parts = MemoryParts::default();
+    let compactor = Compactor::default();
+    run_once(
+        &mut session,
+        &mut parts,
+        &compactor,
+        ("r1", "m"),
+        "Question 5.",
+    )
+    .await;
+    let refusals = |compactor: &Compactor| {
+        compactor
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, params)| {
+                method == "compaction.notice"
+                    && params
+                        .to_string()
+                        .contains("\"code\":\"cut_before_move\",\"moved_through\":\"msg_a2\"")
+            })
+            .count()
+    };
+    assert_eq!(refusals(&compactor), 0);
+    // A provider handing over the earlier cut through `session.apply_view` is refused too, and
+    // the move's view stays.
+    let (commands, served) = serve_with(
+        session,
+        MemoryParts {
+            parts: parts.parts.clone(),
+        },
+    );
+    let outcome = ask(
+        &commands,
+        StoreCommand::ApplyView(Box::new(ApplyViewCommand {
+            view: serde_json::value::to_raw_value(&cut(2, "msg_a1")).unwrap(),
+            caller: Some("compactor".into()),
+        })),
+    )
+    .await;
+    let StoreOutcome::ViewApplied(answer) = outcome else {
+        panic!("apply_view answers: {outcome:?}")
+    };
+    let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(
+        answer["refusal"],
+        serde_json::json!({"code": "cut_before_move", "moved_through": "msg_a2"}),
+        "{answer}"
+    );
+    if let Some(dir) = std::env::var_os("BROCA_MV7_SAMPLES_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = serde_json::to_vec_pretty(&answer).unwrap();
+        std::fs::write(dir.join("apply-view-cut-before-move.json"), body).unwrap();
+    }
+    drop(commands);
+    let mut session = served.await.unwrap();
+    assert!(
+        Writer::operations(&session)
+            .view_accepted
+            .as_ref()
+            .unwrap()
+            .version
+            == 1
+    );
+    // Each run changes the model, so the provider is asked for a view at its start.
+    for (run, model, earlier) in [
+        ("r2", "m2", cut(2, "msg_a1")),
+        ("r3", "m3", view_of(2, Vec::new())),
+    ] {
+        compactor.answer_next_ride(earlier);
+        run_once(
+            &mut session,
+            &mut parts,
+            &compactor,
+            (run, model),
+            "Question 6.",
+        )
+        .await;
+        assert_eq!(
+            Writer::operations(&session)
+                .view_applied
+                .as_ref()
+                .unwrap()
+                .view
+                .version,
+            1,
+            "{run}: the move's view stays in force"
+        );
+    }
+    // `msg_a1` is in the history the move's cut sealed, so the refusal is about the move, not
+    // an unknown message.
+    assert_eq!(refusals(&compactor), 2, "both views are refused by name");
+    // Reader samples: each notice that told the provider of a refusal, as broca sent it.
+    if let Some(dir) = std::env::var_os("BROCA_MV7_SAMPLES_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = compactor.calls.lock().unwrap();
+        let notices = calls.iter().filter(|(method, params)| {
+            method == "compaction.notice" && params.to_string().contains("cut_before_move")
+        });
+        for (index, (_, params)) in notices.enumerate() {
+            let body = serde_json::to_vec_pretty(params).unwrap();
+            std::fs::write(
+                dir.join(format!("notice-cut-before-move-{index}.json")),
+                body,
+            )
+            .unwrap();
+        }
+    }
+    compactor.answer_next_ride(cut(2, "msg_u3"));
+    run_once(
+        &mut session,
+        &mut parts,
+        &compactor,
+        ("r4", "m4"),
+        "Question 7.",
+    )
+    .await;
+    assert_eq!(
+        Writer::operations(&session)
+            .view_applied
+            .as_ref()
+            .unwrap()
+            .view
+            .version,
+        2,
+        "a cut after the move's applies"
+    );
+    assert_eq!(refusals(&compactor), 2);
 }
 
 /// An installed view must fit the imported history: one naming a message the import never had,

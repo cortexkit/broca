@@ -232,6 +232,10 @@ impl Writer for Counting<'_, '_> {
         Writer::entry_at(&*self.session, ordinal).await
     }
 
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        Writer::moved_through(&*self.session).await
+    }
+
     async fn entries_by_mid(
         &self,
         mids: &[String],

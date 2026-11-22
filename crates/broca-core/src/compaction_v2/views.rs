@@ -31,6 +31,46 @@ pub fn check(
     check_boundary(entries, next, provider_rules, floor)
 }
 
+/// The entry a moved-in session's move cut through: the one its compaction provider's first view
+/// of the moved head cuts through, by the id the provider names it with and its ordinal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovedThrough {
+    pub mid: String,
+    pub ordinal: u64,
+}
+
+/// The entry `view`'s cut goes through, if it has a cut.
+pub fn cut_through(view: &View) -> Option<&str> {
+    view.edits.iter().find_map(|edit| match &edit.op {
+        EditOp::Cut { through } => Some(through.as_str()),
+        _ => None,
+    })
+}
+
+/// On a moved-in session, every view must cut through the entry the move cut through, or a later
+/// one (the compaction contract's MV7): the parts before it were numbered under the source host's
+/// rules, so no view may show them. A view with no cut, or cutting through an earlier entry,
+/// refuses `cut_before_move`. `through_ordinal` is the ordinal of the entry the cut goes through,
+/// which the history before the window holds too (the move's cut sealed it); `None` when the
+/// session holds no such entry, which the view's own check refuses by name.
+pub fn check_moved(
+    view: &View,
+    moved: Option<&MovedThrough>,
+    through_ordinal: Option<u64>,
+) -> Result<(), ViewRefusal> {
+    let Some(moved) = moved else {
+        return Ok(());
+    };
+    let refused = || ViewRefusal::CutBeforeMove {
+        moved_through: moved.mid.clone(),
+    };
+    let through = cut_through(view).ok_or_else(refused)?;
+    match through_ordinal {
+        Some(ordinal) if through != moved.mid && ordinal < moved.ordinal => Err(refused()),
+        _ => Ok(()),
+    }
+}
+
 /// Recheck against the current transcript: a running tool or a newly signed reply
 /// may have appeared after acceptance. A refusal must leave the old view applied.
 ///

@@ -101,6 +101,9 @@ pub enum Request {
         ordinal: u64,
         reply: Reply<Option<StoredEntry>>,
     },
+    MovedThrough {
+        reply: Reply<Option<(String, u64)>>,
+    },
     EntriesByMid {
         mids: Vec<String>,
         reply: Reply<Vec<StoredEntry>>,
@@ -503,6 +506,10 @@ impl Writer for ActorWriter {
         self.ask(|reply| Request::EntryAt { ordinal, reply }).await
     }
 
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        self.ask(|reply| Request::MovedThrough { reply }).await
+    }
+
     async fn entries_by_mid(&self, mids: &[String]) -> Result<Vec<StoredEntry>, SessionError> {
         self.ask(|reply| Request::EntriesByMid {
             mids: mids.to_vec(),
@@ -635,6 +642,9 @@ impl RunLink {
             }
             Request::EntryAt { ordinal, reply } => {
                 let _ = reply.send(session.entry_at(ordinal).await);
+            }
+            Request::MovedThrough { reply } => {
+                let _ = reply.send(session.moved_through().await);
             }
             Request::EntriesByMid { mids, reply } => {
                 let _ = reply.send(session.entries_by_mid(&mids).await);

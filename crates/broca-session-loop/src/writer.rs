@@ -161,6 +161,10 @@ pub trait Writer {
         ordinal: u64,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError>;
 
+    /// For a session moved in by an import, the id and ordinal of the entry the move's first view
+    /// cuts through (`Session::moved_through`); `None` for any other session.
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError>;
+
     /// The entries whose message ids `mids` lists, in ordinal order, each once; an id no entry
     /// has is left out. A session reads named entries close to each other in one pass.
     async fn entries_by_mid(
@@ -363,6 +367,10 @@ impl<B: SessionBackend> Writer for Session<B> {
         mid: &str,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
         Session::entry_by_mid(self, mid).await
+    }
+
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        Session::moved_through(self).await
     }
 
     async fn entry_at(

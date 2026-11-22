@@ -234,6 +234,10 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
         self.writer.entry_at(ordinal).await
     }
 
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        self.writer.moved_through().await
+    }
+
     async fn entries_by_mid(
         &self,
         mids: &[String],

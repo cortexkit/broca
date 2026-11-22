@@ -66,6 +66,14 @@ impl<B: SessionBackend> Journal for ActorJournal<'_, B> {
     async fn marker(&self, _: &ProviderView, _: &str, _: u64, _: u64) -> Result<(), String> {
         Err("a cut's marker is written by a run's step, never by session.apply_view".into())
     }
+
+    async fn entry_ordinal(&self, mid: &str) -> Result<Option<u64>, String> {
+        let session = self.session.lock().await;
+        broca_session_loop::writer::Writer::entry_by_mid(&**session, mid)
+            .await
+            .map(|entry| entry.map(|entry| entry.ordinal))
+            .map_err(|error| format!("the history could not be read: {error:?}"))
+    }
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
@@ -99,14 +107,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let compaction = std::sync::Arc::clone(&self.compaction_session);
         if !compaction.is_initialized() {
             // No run of this actor read the state from the session yet; read it as a run would.
-            let restored = match self.session.open_log_records().await {
-                Ok(records) => broca_session_loop::compaction::restore(
-                    &records,
-                    &self.key,
-                    &self.session.operations,
-                ),
-                Err(error) => Err(format!("{error:?}")),
-            };
+            let restored = broca_session_loop::compaction::restore_live(&self.session, &self.key)
+                .await
+                .map_err(|error| format!("{error:?}"));
             match restored {
                 Ok(state) => compaction.restore(state).await,
                 Err(error) => return Some(internal(error)),

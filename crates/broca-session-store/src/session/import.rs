@@ -337,6 +337,20 @@ impl<B: SessionBackend> Session<B> {
             .ok()
             .map(|at| map.ids[at].ordinal))
     }
+
+    /// On a session an import moved in, the entry the move's first view cuts through
+    /// (`Operations::move_cut`), as its id and ordinal: no later view may cut before it (the
+    /// compaction contract's MV7). `None` on any other session, and when the session no longer
+    /// holds that entry.
+    pub async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        let Some(mid) = self.operations.move_cut.clone() else {
+            return Ok(None);
+        };
+        Ok(self
+            .entry_by_mid(&mid)
+            .await?
+            .map(|entry| (mid, entry.ordinal)))
+    }
 }
 
 #[cfg(test)]

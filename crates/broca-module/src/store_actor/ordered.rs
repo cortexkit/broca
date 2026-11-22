@@ -352,13 +352,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if crate::store_entries::frozen_provider(&self.parts, &self.session)?.is_none() {
             return v2::shown::next_request(&Default::default(), &entries, &conditions);
         }
+        // Restored as a run would, since a state installed here is the one the session's later
+        // views are accepted and applied against.
         let restored = || async {
-            let records = self
-                .session
-                .open_log_records()
+            broca_session_loop::compaction::restore_live(&self.session, &self.key)
                 .await
-                .map_err(|error| format!("{error:?}"))?;
-            broca_session_loop::compaction::restore(&records, &self.key, &self.session.operations)
+                .map_err(|error| format!("{error:?}"))
         };
         let compaction = std::sync::Arc::clone(&self.compaction_session);
         if !compaction.is_initialized() {

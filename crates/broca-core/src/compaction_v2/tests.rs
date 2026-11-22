@@ -341,6 +341,48 @@ fn compaction_v2_view_checks_use_full_original_text_and_deliveries() {
     ));
 }
 
+/// On a moved-in session, a view must cut through the move's entry or a later one; any view is
+/// fine on a session nothing moved in, and a cut through an entry the session doesn't hold is
+/// left to the view's own checks.
+#[test]
+fn compaction_v2_a_moved_session_refuses_views_cutting_before_the_move() {
+    let moved = views::MovedThrough {
+        mid: "m-moved".into(),
+        ordinal: 4,
+    };
+    let cut = |through: &str| {
+        View::seal(
+            2,
+            vec![Edit::new(
+                2,
+                EditOp::Cut {
+                    through: through.into(),
+                },
+            )],
+        )
+    };
+    let refused = Err(ViewRefusal::CutBeforeMove {
+        moved_through: moved.mid.clone(),
+    });
+    let earlier = cut("m-earlier");
+    assert_eq!(views::check_moved(&earlier, Some(&moved), Some(3)), refused);
+    let no_cut = View::seal(2, Vec::new());
+    assert_eq!(views::check_moved(&no_cut, Some(&moved), None), refused);
+    assert_eq!(
+        views::check_moved(&cut("m-moved"), Some(&moved), Some(4)),
+        Ok(())
+    );
+    assert_eq!(
+        views::check_moved(&cut("m-later"), Some(&moved), Some(9)),
+        Ok(())
+    );
+    assert_eq!(
+        views::check_moved(&cut("unknown"), Some(&moved), None),
+        Ok(())
+    );
+    assert_eq!(views::check_moved(&earlier, None, Some(3)), Ok(()));
+}
+
 /// A view's inserted image is accepted when its bytes are the PNG its media type names, however
 /// the session stated it takes images (a provider repeats an image it inserted before), and
 /// refused `unsupported_edit` when they aren't: no request could render it.
@@ -973,6 +1015,9 @@ impl state::Journal for MemoryJournal {
             view.version
         ));
         Ok(())
+    }
+    async fn entry_ordinal(&self, _: &str) -> Result<Option<u64>, String> {
+        Ok(None)
     }
 }
 

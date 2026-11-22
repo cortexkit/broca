@@ -6349,9 +6349,7 @@ async fn compaction_ctx<W: Writer, P, T>(
         preset.ok_or_else(|| LoopError::Parts("a compaction preset must be a string".into()))?;
     let session = seams.compaction_session.clone().unwrap_or_default();
     if !session.is_initialized() {
-        let records = writer.open_log_records().await?;
-        let state = crate::compaction::restore(&records, &seams.bind, writer.operations())
-            .map_err(LoopError::Parts)?;
+        let state = crate::compaction::restore_live(writer, &seams.bind).await?;
         session.restore(state).await;
     }
     session.claim_serving_start();

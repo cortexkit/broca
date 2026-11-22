@@ -2527,6 +2527,10 @@ impl Writer for Recording<'_, '_> {
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
         Writer::entry_at(&*self.session, ordinal).await
     }
+
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        Writer::moved_through(&*self.session).await
+    }
     fn media(&self) -> Option<Arc<dyn MediaCapture>> {
         Some(Arc::clone(&self.media) as Arc<dyn MediaCapture>)
     }

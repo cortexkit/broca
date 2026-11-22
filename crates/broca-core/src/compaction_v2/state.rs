@@ -26,6 +26,11 @@ pub struct State {
     latest_applied_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     applied_by: Option<String>,
+    /// For a moved-in session, the entry its move cut through, which no view may cut before
+    /// ([`views::check_moved`]). The host sets it from the session's import when it restores the
+    /// state; it is never stored with it.
+    #[serde(skip)]
+    moved: Option<views::MovedThrough>,
 }
 
 /// Each method returns only after its record has crossed the durability barrier.
@@ -54,9 +59,37 @@ pub trait Journal {
         first_kept_ordinal: u64,
         checkpoint: u64,
     ) -> Result<(), String>;
+    /// The ordinal of the session's entry `mid`, wherever its history holds it, sealed or in
+    /// the window; `None` when it holds none. The move check ([`views::check_moved`]) asks it for
+    /// a cut through an entry outside the window.
+    async fn entry_ordinal(&self, mid: &str) -> Result<Option<u64>, String>;
 }
 
 impl State {
+    /// The move check ([`views::check_moved`]) of `view` against `entries`, the window it is
+    /// checked over. A cut through an entry the window doesn't hold is resolved through the
+    /// journal, since the history the move's cut sealed holds the entries the check is about.
+    /// It runs before the view's own checks, so a cut into that history is refused as cutting
+    /// before the move rather than as naming a message outside the window.
+    async fn check_moved(
+        &self,
+        journal: &impl Journal,
+        entries: &[Entry],
+        view: &View,
+    ) -> Result<Result<(), ViewRefusal>, String> {
+        let Some(moved) = self.moved.as_ref() else {
+            return Ok(Ok(()));
+        };
+        let through = match views::cut_through(view) {
+            None => None,
+            Some(through) => match entries.iter().find(|entry| entry.mid == through) {
+                Some(entry) => Some(entry.ordinal),
+                None => journal.entry_ordinal(through).await?,
+            },
+        };
+        Ok(views::check_moved(view, Some(moved), through))
+    }
+
     pub fn latest(&self) -> Option<&View> {
         self.latest.as_ref().map(ReceivedView::view)
     }
@@ -155,6 +188,11 @@ impl State {
         Ok(())
     }
 
+    /// Sets the entry the session's move cut through, for a moved-in session.
+    pub fn set_moved(&mut self, moved: Option<views::MovedThrough>) {
+        self.moved = moved;
+    }
+
     pub fn restore_applied(&mut self, identity: &AppliedView) -> Result<(), String> {
         let applied_by = if self
             .latest()
@@ -195,7 +233,11 @@ impl State {
         let received = received.into();
         received.check_size()?;
         let view = received.view();
-        if let Err(refusal) = views::check(entries, self.latest(), view, rules, floor) {
+        if let Err(refusal) = self
+            .check_moved(journal, entries, view)
+            .await?
+            .and_then(|()| views::check(entries, self.latest(), view, rules, floor))
+        {
             return Ok(Err(refusal));
         }
         journal.accepted(self.latest.as_ref(), &received).await?;
@@ -221,8 +263,12 @@ impl State {
             .as_ref()
             .is_some_and(|applied| applied.view().applied() == view.applied());
         if !already_applied {
-            if let Err(refusal) =
-                views::check_boundary(boundary.entries, view, boundary.rules, boundary.floor)
+            if let Err(refusal) = self
+                .check_moved(journal, boundary.entries, view)
+                .await?
+                .and_then(|()| {
+                    views::check_boundary(boundary.entries, view, boundary.rules, boundary.floor)
+                })
             {
                 journal.view_refused(
                     &super::diagnostics::Publication::from_view(view),

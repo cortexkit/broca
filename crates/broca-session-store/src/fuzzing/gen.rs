@@ -1319,7 +1319,8 @@ mod operations {
         run_going,
         ordered_next_starts_run,
         ordered_next_waits_for_run,
-        ordered_next_expires_at_ms
+        ordered_next_expires_at_ms,
+        move_cut
     });
     crate::fuzzing::gen::fields!(Enrollment {
         through_ordinal,

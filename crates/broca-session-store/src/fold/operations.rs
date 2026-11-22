@@ -970,6 +970,15 @@ state! {
             reset: "queued_send",
             bound: Bound::Fixed,
         },
+        /// On a session an import moved in, the id of the entry the move's first view (version
+        /// 1, the view its compaction provider took the moved head in with) cuts through: no
+        /// later view may cut before it (the compaction contract's MV7). Absent on other
+        /// sessions, and on imports whose first view had no cut or was recorded before this was.
+        32 opt pub move_cut: String => {
+            owner: "import",
+            reset: "never",
+            bound: Bound::Fixed,
+        },
     }
 }
 
@@ -1575,6 +1584,19 @@ fn receipt_module(principal: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+/// The entry a stored view's cut goes through. A view's edits are stored as its provider sent
+/// them, a cut as `{"kind": "full", "edit": {"op": "cut", "through": <mid>, ..}}`, except an edit
+/// repeated from the previous view, which is stored as that edit's index; a first view repeats
+/// none.
+fn cut_through(edits: &serde_json::Value) -> Option<String> {
+    edits.as_array()?.iter().find_map(|stored| {
+        let edit = stored.get("edit")?;
+        (edit.get("op")?.as_str()? == "cut")
+            .then(|| edit.get("through")?.as_str().map(str::to_owned))
+            .flatten()
+    })
+}
+
 impl Operations {
     /// A queued send joins the queue; a run that consumes it, a retraction, an ended send or a
     /// delivery into a running run removes it.
@@ -1908,6 +1930,9 @@ impl Operations {
                     version: view.version,
                     checksum: view.checksum.clone(),
                 });
+                if view.version == 1 && self.imported_ids.is_some() && self.move_cut.is_none() {
+                    self.move_cut = cut_through(&view.edits.parse());
+                }
             }
             Record::RecoveryCut(cut) => {
                 if let Some(ordinal) = cut.ordinal {

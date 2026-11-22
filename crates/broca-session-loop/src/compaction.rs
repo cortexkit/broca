@@ -169,6 +169,22 @@ pub fn restore(
     Ok(state)
 }
 
+/// [`restore`] from `writer`'s open log, for a session about to accept or apply views: on a
+/// session moved in by an import, the state also learns the entry the move cut through, so it
+/// refuses a view cutting before it (`views::check_moved`). Rebuilding a past request uses
+/// [`restore`] alone, since the views it replays were already accepted.
+pub async fn restore_live<W: Writer>(writer: &W, bind: &BindIdentity) -> Result<State, LoopError> {
+    let records = writer.open_log_records().await?;
+    let mut state = restore(&records, bind, writer.operations()).map_err(LoopError::Parts)?;
+    state.set_moved(
+        writer
+            .moved_through()
+            .await?
+            .map(|(mid, ordinal)| v2::views::MovedThrough { mid, ordinal }),
+    );
+    Ok(state)
+}
+
 /// The compaction journal appends an accepted view, an applied view and a marker durably before
 /// each call returns. The marker names the session it was written for.
 pub struct StoreJournal<'w, W> {
@@ -290,6 +306,16 @@ impl<W: Writer> Journal for StoreJournal<'_, W> {
             session: Some(self.bind.session.clone()),
         }))
         .await
+    }
+
+    async fn entry_ordinal(&self, mid: &str) -> Result<Option<u64>, String> {
+        self.writer
+            .lock()
+            .await
+            .entry_by_mid(mid)
+            .await
+            .map(|entry| entry.map(|entry| entry.ordinal))
+            .map_err(|error| format!("{error:?}"))
     }
 }
 

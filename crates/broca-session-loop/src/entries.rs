@@ -464,6 +464,10 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.entry_at(ordinal).await
     }
 
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        self.inner.moved_through().await
+    }
+
     async fn entries_by_mid(
         &self,
         mids: &[String],

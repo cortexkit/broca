@@ -1016,6 +1016,10 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
         broca_session_loop::Writer::entry_at(&*self.session, ordinal).await
     }
 
+    async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
+        broca_session_loop::Writer::moved_through(&*self.session).await
+    }
+
     async fn entries_by_mid(
         &self,
         mids: &[String],
