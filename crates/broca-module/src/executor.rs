@@ -117,13 +117,6 @@ pub trait RunExecutor: Send + Sync + 'static {
     ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, RunError> {
         Ok(None)
     }
-    /// The scoped question adapter shared by approval waits and withdrawals after a run ends.
-    /// Without it, calls waiting for approval close with ordinary not-dispatched results;
-    /// no approval-feature WAL records or question operations are written by the actor.
-    fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
-        None
-    }
-
     /// Where a provider-held call waits for its late result (see `crate::held_slots`). Without
     /// it a run that resumes on a held call stays paused, because nothing can deliver to it.
     fn provider_held_lifecycle(

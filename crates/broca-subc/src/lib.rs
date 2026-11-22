@@ -52,7 +52,7 @@ pub use connection::{
 };
 pub use consent::{
     AnswersPage, ConsentClient, ConsentError, ConsentRecord, ConsentState, FilingReply,
-    ScopedConsentPlane, WithdrawalReply,
+    WithdrawalReply,
 };
 pub use flow_providers::{
     ApprovedFlowProviders, FlowPolicy, FlowProvidersClient, FlowProvidersError,

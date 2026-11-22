@@ -23,7 +23,6 @@ pub mod capability;
 pub mod clock;
 pub mod compaction;
 pub mod compaction_v2;
-pub mod consent;
 pub mod context;
 pub mod creation_times;
 pub mod delivery_order;

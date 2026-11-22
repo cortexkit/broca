@@ -121,9 +121,6 @@ impl<L: LeaseStore + 'static> LineageOpener for DefaultOpener<L> {
     {
         self.executor.media_profile(request).await
     }
-    fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
-        self.executor.elicitation_plane()
-    }
     fn hook_plane_available(&self) -> bool {
         self.executor.hook_plane().is_some()
     }

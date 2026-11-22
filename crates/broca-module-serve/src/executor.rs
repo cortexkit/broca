@@ -2176,7 +2176,6 @@ pub struct LiveLoopExecutor {
     hooks: Option<Arc<broca_subc::SubcHookPlane>>,
     compaction_plane: Option<Arc<broca_subc::SubcCompactionPlane>>,
     compaction_views: Arc<broca_core::ViewReadyInbox>,
-    elicitation_plane: Option<Arc<broca_subc::consent::ScopedConsentPlane>>,
     /// Where provider-held calls wait for their late results; see `held_runtime`.
     provider_held_lifecycle: Option<Arc<broca_module::held_slots::HeldSlots>>,
     /// One process-long HTTP client. Every per-run provider gets a cheap clone so sequential
@@ -2229,7 +2228,6 @@ impl LiveLoopExecutor {
             hooks: None,
             compaction_plane: None,
             compaction_views: Arc::default(),
-            elicitation_plane: None,
             provider_held_lifecycle: None,
             provider_client: build_provider_http_client(),
             clock: broca_core::clock::Clock::default(),
@@ -2285,14 +2283,6 @@ impl LiveLoopExecutor {
         compaction: Arc<broca_subc::SubcCompactionPlane>,
     ) -> Self {
         self.compaction_plane = Some(compaction);
-        self
-    }
-
-    pub fn with_elicitation_plane(
-        mut self,
-        elicitation: Arc<broca_subc::consent::ScopedConsentPlane>,
-    ) -> Self {
-        self.elicitation_plane = Some(elicitation);
         self
     }
 
@@ -4440,11 +4430,6 @@ impl RunExecutor for LiveLoopExecutor {
                 &model,
             ),
         )))
-    }
-    fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
-        self.elicitation_plane
-            .as_ref()
-            .map(|plane| plane.clone() as Arc<dyn broca_core::tool_plane::ElicitationPlane>)
     }
 
     fn provider_held_lifecycle(

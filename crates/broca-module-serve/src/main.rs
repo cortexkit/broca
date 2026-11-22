@@ -449,10 +449,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut executor_impl = executor_impl
     .with_provider_held_lifecycle(held_runtime.slots.clone())
     .with_hook_plane(Arc::new(broca_subc::SubcHookPlane::new(plan_conn.clone())))
-    .with_elicitation_plane(Arc::new(broca_subc::consent::ScopedConsentPlane::new(
-        plan_conn.clone(),
-        broca_subc::RouteOpenRetry::default_patience(),
-    )))
     .with_provider_overrides(provider_overrides)
     .with_claude_code_install_id(
         match broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root) {

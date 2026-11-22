@@ -336,9 +336,6 @@ pub trait LineageOpener: Send + Sync {
     fn serves_from_store(&self, key: &LineageKey) -> Result<bool, OpenError> {
         Ok(self.store_holding(key)?.is_some())
     }
-    fn elicitation_plane(&self) -> Option<Arc<dyn broca_core::tool_plane::ElicitationPlane>> {
-        None
-    }
     /// Read-only admission capability. Hookless test openers inherit the fail-closed default;
     /// an opener with a hook executor must report it without acquiring a lease or opening a WAL.
     fn hook_plane_available(&self) -> bool {

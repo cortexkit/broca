@@ -147,9 +147,6 @@ pub struct RunControl {
     /// Optional driver that refreshes the provider's prompt cache during tool waits. The
     /// loop uses it only when this episode's keep_warm policy is auto.
     pub keep_warm: Option<Arc<dyn crate::keep_warm_wait::KeepWarmDriver>>,
-    /// Files and reads human approval questions under the run's frozen session scope.
-    /// The daemon's executor installs the transport; without it, a held call is refused.
-    pub elicitation_plane: Option<Arc<dyn crate::tool_plane::ElicitationPlane>>,
     /// The connection to the session's compaction provider, over its daemon route, as the hook
     /// plane is to its step-transform provider.
     pub compaction_plane: Option<Arc<dyn crate::compaction::CompactionPlane>>,
@@ -202,7 +199,6 @@ impl Default for RunControl {
             rebuild_point: false,
             account_reporter: None,
             keep_warm: None,
-            elicitation_plane: None,
             hook_plane: None,
             input_hooks: None,
             pre_model_error: None,
