@@ -612,18 +612,13 @@ impl RetentionService {
         let next_notice_seq = records
             .iter()
             .filter_map(|(_, record)| match record {
-                Record::Compaction(record) => serde_json::from_value::<
-                    broca_records::record::WalRecord,
-                >(record.body.clone().parse())
-                .ok(),
-                _ => None,
-            })
-            .filter_map(|record| match record {
-                broca_records::record::WalRecord::CompactionNotice { seq, .. } => {
-                    seq.checked_add(1)
+                Record::Compaction(record) => {
+                    serde_json::from_value::<StoredNotice>(record.body.clone().parse()).ok()
                 }
                 _ => None,
             })
+            .filter(|notice| notice.kind == "compaction_notice")
+            .filter_map(|notice| notice.seq?.checked_add(1))
             .max()
             .unwrap_or(1);
         broca_session_store::expired::write(
@@ -675,6 +670,17 @@ impl RetentionService {
         crate::diagnostics::retention_deleted(key);
         Ok(())
     }
+}
+
+/// The part of a stored compaction record that numbers notices: records written by the earlier
+/// compaction protocol keep its advance notices as `{"type": "compaction_notice", "seq": N, ...}`,
+/// and a session deleted with them records the next free number in its expiry marker
+/// (`broca_session_store::expired::Marker`), so a session recreated at the address numbers on.
+#[derive(serde::Deserialize)]
+struct StoredNotice {
+    #[serde(rename = "type")]
+    kind: String,
+    seq: Option<u64>,
 }
 
 #[cfg(test)]
