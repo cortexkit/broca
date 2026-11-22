@@ -573,6 +573,7 @@ pub fn apply_display_facts(
             if let Some(marks) = &facts.message_marks {
                 entry.speaks_for = marks.speaks_for.clone();
                 entry.notice = marks.notice;
+                entry.keep = marks.keep;
             }
             entry.sender = facts.sender.clone();
             entry.send_id = facts.send_id.clone().filter(|_| entry.sender.is_some());
@@ -645,6 +646,7 @@ pub fn session_read_response(
                 send_id: None,
                 speaks_for: None,
                 notice: false,
+                keep: false,
                 sender: None,
                 notices: Vec::new(),
                 created_at: None,

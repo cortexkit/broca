@@ -702,6 +702,7 @@ mod tests {
                 send_id: None,
                 speaks_for: None,
                 notice: false,
+                keep: false,
                 sender: None,
                 notices: Vec::new(),
                 created_at: None,

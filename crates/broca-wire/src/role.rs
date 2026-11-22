@@ -482,6 +482,22 @@ pub fn broca_role_describe_with_writers(
             cortexkit_role_llm_runner::capabilities::NOTICE_WITH_SPEAKS_FOR.into(),
         );
     }
+    if broca_core::scope_admission::NOTICE_KEEP {
+        // Admission reads the same constant: the session's scope owner may keep a notice that
+        // carries the person's own words, and reads serve the mark. It follows the other
+        // message-mark groups.
+        let at = capabilities
+            .iter()
+            .rposition(|name| {
+                name == cortexkit_role_llm_runner::capabilities::NOTICE_WITH_SPEAKS_FOR
+                    || name == cortexkit_role_llm_runner::capabilities::MESSAGE_MARKS
+            })
+            .unwrap();
+        capabilities.insert(
+            at + 1,
+            cortexkit_role_llm_runner::capabilities::NOTICE_KEEP.into(),
+        );
+    }
     if hook_writer {
         capabilities.push(cortexkit_role_llm_runner::capabilities::ORDERED_HOOK_PHASES.into());
     }
@@ -1294,7 +1310,8 @@ mod pinned_reply_bytes {
     #[test]
     fn adopted_runner_groups_leave_other_optional_groups_undeclared() {
         use cortexkit_role_llm_runner::capabilities::{
-            ADMISSION_REPORTS, MEDIA_REFS, MESSAGE_MARKS, NOTICE_WITH_SPEAKS_FOR, SEND_IDS,
+            ADMISSION_REPORTS, MEDIA_REFS, MESSAGE_MARKS, NOTICE_KEEP, NOTICE_WITH_SPEAKS_FOR,
+            SEND_IDS,
         };
         for writer in [false, true] {
             let actual = broca_role_describe_with_writers("test", writer, writer, writer);
@@ -1303,6 +1320,7 @@ mod pinned_reply_bytes {
             for group in [
                 MESSAGE_MARKS,
                 NOTICE_WITH_SPEAKS_FOR,
+                NOTICE_KEEP,
                 MEDIA_REFS,
                 ADMISSION_REPORTS,
                 SEND_IDS,
@@ -1454,7 +1472,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "39526e1e2367baa9f51710b7c6b30144eefc2b2d72ea45fa1f96b1c0b91ede78",
+            "9bcc622a24822829385ebad14ece47e1a514bd475ae0b1e49069fadf69b4ed91",
         );
     }
 
@@ -1651,7 +1669,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "1a43475b5649f775c9648ef22652ab47cec48e4017134647fef4bb83f93eff3a";
+        "b5c9faf32e38a9f07fe123a4d31db747b0889ed140d528cc53f27f5bb02ff481";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -141,25 +141,52 @@ pub fn decide_owner_access(
 /// and send admission both read this, so admission accepts exactly what describe declares.
 pub const NOTICE_WITH_SPEAKS_FOR: bool = true;
 
-/// Validate display attribution against the frozen owner before any session write.
+/// Whether broca declares llm-runner's `notice_keep` group: the session's scope owner may mark
+/// a notice `keep`, so a compaction provider never drops it automatically. `role.describe` and
+/// send admission both read this.
+pub const NOTICE_KEEP: bool = true;
+
+/// Validate display attribution against the frozen owner before any session write. `delivery`
+/// is the send's ordered delivery list, when it has one: a kept notice may not ride a tool
+/// result.
 pub fn admit_message_marks(
     params: &serde_json::Map<String, serde_json::Value>,
     ownership: &SessionOwnershipV1,
     principal: Option<&BindPrincipal>,
     send: &SendScope,
+    delivery: Option<&[broca_protocol::DeliveryMode]>,
 ) -> Result<Option<broca_protocol::MessageMarks>, &'static str> {
-    admit_message_marks_declaring(params, ownership, principal, send, NOTICE_WITH_SPEAKS_FOR)
+    admit_message_marks_declaring(
+        params,
+        ownership,
+        principal,
+        send,
+        delivery,
+        Declared {
+            notice_with_speaks_for: NOTICE_WITH_SPEAKS_FOR,
+            notice_keep: NOTICE_KEEP,
+        },
+    )
 }
 
-/// [`admit_message_marks`] for a runner that declares `notice_with_speaks_for` or not. Without
-/// it, a notice combined with a speaker refuses naming `notice`, and a speaker's name refuses
-/// naming `speaks_for.name`.
+/// The optional message-mark groups a runner declares, which decide what marks it admits.
+#[derive(Clone, Copy, Debug)]
+pub struct Declared {
+    /// Without `notice_with_speaks_for`, a notice combined with a speaker refuses naming
+    /// `notice`, and a speaker's name refuses naming `speaks_for.name`.
+    pub notice_with_speaks_for: bool,
+    /// Without `notice_keep`, any `keep` refuses naming `keep`, even false.
+    pub notice_keep: bool,
+}
+
+/// [`admit_message_marks`] for a runner that declares the groups `declared` names.
 pub fn admit_message_marks_declaring(
     params: &serde_json::Map<String, serde_json::Value>,
     ownership: &SessionOwnershipV1,
     principal: Option<&BindPrincipal>,
     send: &SendScope,
-    notice_with_speaks_for: bool,
+    delivery: Option<&[broca_protocol::DeliveryMode]>,
+    declared: Declared,
 ) -> Result<Option<broca_protocol::MessageMarks>, &'static str> {
     let automated = matches!(send, SendScope::Stamped(bind)
         if bind.scope.flow_id.is_some() || bind.scope.run_id.is_some());
@@ -174,13 +201,19 @@ pub fn admit_message_marks_declaring(
     let sender = principal
         .map(BindPrincipal::canonical_owner_string)
         .unwrap_or_default();
-    let marks = cortexkit_role_llm_runner::message_marks::check_with_notice_speaks_for(
+    let mut marks = cortexkit_role_llm_runner::message_marks::check_with_notice_speaks_for(
         params,
         true,
-        notice_with_speaks_for,
+        declared.notice_with_speaks_for,
         owner.as_deref(),
         &sender,
     )?;
+    // The contract's own check decides `keep`; it reads the mark members and the delivery
+    // list from a send request, so the send's are carried in one.
+    let mut send_request = cortexkit_role_llm_runner::send::SendRequest::new("", "");
+    send_request.runner_params = params.clone();
+    send_request.delivery_order = delivery.map(<[_]>::to_vec);
+    marks.keep = send_request.check_notice_keep(declared.notice_keep, owner.as_deref(), &sender)?;
     Ok((marks.speaks_for.is_some() || marks.notice).then_some(marks))
 }
 
@@ -983,7 +1016,11 @@ mod tests {
                 &session,
                 Some(&core()),
                 &send,
-                declared,
+                None,
+                Declared {
+                    notice_with_speaks_for: declared,
+                    notice_keep: true,
+                },
             )
             .map(|marks| serde_json::to_value(marks).unwrap())
         };
@@ -1011,9 +1048,86 @@ mod tests {
         );
         // Broca declares the group, so the admission it serves takes combined and named marks.
         assert_eq!(
-            admit_message_marks(both.as_object().unwrap(), &session, Some(&core()), &send)
-                .map(|marks| serde_json::to_value(marks).unwrap()),
+            admit_message_marks(
+                both.as_object().unwrap(),
+                &session,
+                Some(&core()),
+                &send,
+                None
+            )
+            .map(|marks| serde_json::to_value(marks).unwrap()),
             Ok(both.clone())
+        );
+    }
+
+    /// `keep` marks only a notice, only from the session's scope owner, and never one that may
+    /// ride a tool result; false is the same as absent.
+    #[test]
+    fn notice_keep_admits_the_owners_own_notice_only() {
+        let frozen = scope(core(), 3);
+        let session = history(&[(Some(core()), Some(frozen.clone()))]);
+        let send = stamped(frozen);
+        let admit = |marks: serde_json::Value,
+                     sender: BindPrincipal,
+                     delivery: Option<&[broca_protocol::DeliveryMode]>,
+                     notice_keep: bool| {
+            admit_message_marks_declaring(
+                marks.as_object().unwrap(),
+                &session,
+                Some(&sender),
+                &send,
+                delivery,
+                Declared {
+                    notice_with_speaks_for: true,
+                    notice_keep,
+                },
+            )
+            .map(|marks| serde_json::to_value(marks).unwrap())
+        };
+        let kept = serde_json::json!({"notice": true, "keep": true});
+        assert_eq!(admit(kept.clone(), core(), None, true), Ok(kept.clone()));
+        assert_eq!(
+            admit(
+                serde_json::json!({"notice": true, "keep": false}),
+                core(),
+                None,
+                true
+            ),
+            Ok(serde_json::json!({"notice": true})),
+            "a false keep is not stored"
+        );
+        assert_eq!(
+            admit(serde_json::json!({"keep": true}), core(), None, true),
+            Err("keep"),
+            "only a notice is kept"
+        );
+        assert_eq!(
+            admit(kept.clone(), other(), None, true),
+            Err("keep"),
+            "only the scope owner keeps a notice"
+        );
+        assert_eq!(
+            admit(
+                kept.clone(),
+                core(),
+                Some(&[
+                    broca_protocol::DeliveryMode::Steer,
+                    broca_protocol::DeliveryMode::ToolResult
+                ]),
+                true
+            ),
+            Err("delivery"),
+            "a kept notice needs its own entry, not a ride on a tool result"
+        );
+        assert_eq!(
+            admit(
+                serde_json::json!({"notice": true, "keep": false}),
+                core(),
+                None,
+                false
+            ),
+            Err("keep"),
+            "without the group any keep refuses"
         );
     }
 

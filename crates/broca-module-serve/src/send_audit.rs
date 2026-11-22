@@ -16,7 +16,7 @@ use serde_json::Value;
 
 /// Keys handled apart from `SendParams`: `seed_from` is refused unless null, the fetch plan
 /// is admitted separately, and display marks are checked against the daemon-attested route.
-const PRE_DECODE_SEND_KEYS: &[&str] = &["seed_from", "plan", "speaks_for", "notice"];
+const PRE_DECODE_SEND_KEYS: &[&str] = &["seed_from", "plan", "speaks_for", "notice", "keep"];
 const SEND_NOTICE_CACHE_ENTRIES: usize = 4096;
 
 /// One thing worth a single warning. Equality is the dedupe key, so every field is part of it.

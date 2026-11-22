@@ -1978,6 +1978,7 @@ impl LineageRegistry {
                 &ownership,
                 request.principal.as_ref(),
                 &request.scope,
+                order.as_ref().map(|order| order.modes.as_slice()),
             ) {
                 return Ok(SendOutcome::StructuredOutputInvalid {
                     field: field.into(),

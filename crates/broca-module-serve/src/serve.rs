@@ -3660,7 +3660,7 @@ where
                 Err(error) => unreachable!("send parameter validation returned {error}"),
             };
             send_req.request.project_id = bind.project_id.clone();
-            send_req.request.message_marks = ["speaks_for", "notice"]
+            send_req.request.message_marks = ["speaks_for", "notice", "keep"]
                 .into_iter()
                 .filter_map(|field| {
                     req.params
@@ -5707,29 +5707,8 @@ pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -
 }
 
 #[cfg(test)]
-#[test]
-fn the_store_gate_serves_inline_import_output_references_and_run_event_bodies() {
-    for method in [
-        OP_IMPORT,
-        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS,
-        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ,
-    ] {
-        assert!(served_on_new_storage(
-            method,
-            &serde_json::json!({"messages":[]})
-        ));
-    }
-    assert!(served_on_new_storage(
-        OP_IMPORT,
-        &serde_json::json!({"source":{}})
-    ));
-    // Basal fetches each run event's body before it trusts the event; refusing it made every
-    // program model call wait for its scheduled check instead.
-    assert!(served_on_new_storage(
-        "run.event.get",
-        &serde_json::json!({})
-    ));
-}
+#[path = "serve_store_gate_tests.rs"]
+mod store_gate_tests;
 
 /// Routes a command only the session store serves, and sends its answer: the reply, or its
 /// refusal under the refusal's own code.
@@ -7572,6 +7551,7 @@ mod tests {
                     send_id: None,
                     speaks_for: None,
                     notice: false,
+                    keep: false,
                     sender: None,
                     notices: Vec::new(),
                     created_at: None,
@@ -7602,6 +7582,7 @@ mod tests {
                     send_id: None,
                     speaks_for: None,
                     notice: false,
+                    keep: false,
                     sender: None,
                     notices: Vec::new(),
                     created_at: None,

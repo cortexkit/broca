@@ -1254,6 +1254,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         &ownership,
                         request.principal.as_ref(),
                         &request.scope,
+                        order.as_ref().map(|order| order.modes.as_slice()),
                     ) {
                         Ok(marks) => marks,
                         Err(field) => {
@@ -4561,6 +4562,11 @@ fn retry_of_queued(
         != message_marks.is_some_and(|marks| marks.notice)
     {
         return reuse("notice");
+    }
+    if kept.as_ref().is_some_and(|marks| marks.keep)
+        != message_marks.is_some_and(|marks| marks.keep)
+    {
+        return reuse("keep");
     }
     if queue::receipt_field(existing, "conversation_key")
         .as_ref()

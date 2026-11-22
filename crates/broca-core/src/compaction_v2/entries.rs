@@ -153,6 +153,8 @@ pub fn recorded_notice_origin(
     }
     let mut notice = NoticeOrigin::new(sender?);
     notice.template = template.map(str::to_owned);
+    // The owner marked it as the person's own words: the provider never drops it on its own.
+    notice.keep = marks.is_some_and(|marks| marks.keep);
     Some(notice)
 }
 
@@ -441,5 +443,34 @@ pub(super) fn tool_output(
                 .collect();
             (ToolStatus::Completed, text, OutputFormat::Text, attachments)
         }
+    }
+}
+
+#[cfg(test)]
+mod notice_origin_tests {
+    use serde_json::json;
+
+    use super::recorded_notice_origin;
+
+    fn origin(marks: serde_json::Value) -> serde_json::Value {
+        let marks: broca_protocol::MessageMarks = serde_json::from_value(marks).unwrap();
+        serde_json::to_value(recorded_notice_origin(Some("core"), None, Some(&marks)).unwrap())
+            .unwrap()
+    }
+
+    /// A kept notice tells the compaction provider so through its origin's `keep`, which its
+    /// entry digest covers. A notice that isn't kept, or is sent `keep: false`, carries no `keep`
+    /// member, so it serializes, and digests, exactly as before kept notices.
+    #[test]
+    fn a_kept_notice_carries_keep_and_an_unkept_one_is_unchanged() {
+        assert_eq!(
+            origin(json!({"notice": true, "keep": true})),
+            json!({"sender": "core", "keep": true})
+        );
+        assert_eq!(origin(json!({"notice": true})), json!({"sender": "core"}));
+        assert_eq!(
+            origin(json!({"notice": true, "keep": false})),
+            json!({"sender": "core"})
+        );
     }
 }

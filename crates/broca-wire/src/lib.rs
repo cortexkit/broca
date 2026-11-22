@@ -296,10 +296,9 @@ pub struct SendParams {
 pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
     // Undeclared notice permissions must not fall through the permissive send decoder:
     // silently dropping even a false member would accept a request broca cannot honour.
-    for field in ["keep", "yield"] {
-        if params.get(field).is_some() {
-            return Err(field.into());
-        }
+    // `keep` is declared: it is checked with the send's other marks, against the session's owner.
+    if params.get("yield").is_some() {
+        return Err("yield".into());
     }
     if let Some(index) = params
         .pointer("/plan/senders")
@@ -341,38 +340,8 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod temperature_tests {
-    use super::check_run_parameters;
-    use serde_json::json;
-
-    #[test]
-    fn temperature_invalid_values_name_the_exact_wire_path() {
-        for value in [
-            json!(-0.1),
-            json!(2.1),
-            json!(null),
-            json!("0.1"),
-            json!(false),
-            json!([]),
-            json!({}),
-        ] {
-            assert_eq!(
-                check_run_parameters(&json!({"generation": {"temperature": value}})),
-                Err("generation.temperature".into())
-            );
-        }
-        assert_eq!(
-            check_run_parameters(&json!({"generation": []})),
-            Err("generation".into())
-        );
-        for value in [0.0, 0.25, 2.0] {
-            assert!(check_run_parameters(
-                &json!({"generation": {"temperature": value, "max_output_tokens": 42}})
-            )
-            .is_ok());
-        }
-    }
-}
+#[path = "temperature_tests.rs"]
+mod temperature_tests;
 
 fn deserialize_account_route<'de, D>(
     deserializer: D,
@@ -1320,6 +1289,10 @@ pub struct SessionReadMessage {
     pub speaks_for: Option<broca_protocol::SpeaksFor>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notice: bool,
+    /// The scope owner marked the notice as carrying the person's own words (llm-runner
+    /// `notice_keep`). Served only where `notice` is, and only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1402,6 +1375,8 @@ impl Serialize for SessionReadMessage {
             speaks_for: &'a Option<broca_protocol::SpeaksFor>,
             #[serde(skip_serializing_if = "std::ops::Not::not")]
             notice: bool,
+            #[serde(skip_serializing_if = "std::ops::Not::not")]
+            keep: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             sender: &'a Option<String>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
@@ -1446,6 +1421,7 @@ impl Serialize for SessionReadMessage {
             send_id: &self.send_id,
             speaks_for: &self.speaks_for,
             notice: self.notice,
+            keep: self.keep,
             sender: &self.sender,
             notices: &self.notices,
             written_at: self.written_at,

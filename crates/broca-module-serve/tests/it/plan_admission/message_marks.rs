@@ -443,8 +443,6 @@ async fn assert_undeclared_notice_member(wanted: &str) {
     let (mut rig, admitter) = scoped_plan_rig(&format!("undeclared-{wanted}"), false).await;
     let plan = vector("plans/broca-head-no-compaction.json");
     for (field, extra, plan) in [
-        ("keep", json!({"keep":false}), plan.clone()),
-        ("keep", json!({"keep":true,"notice":true}), plan.clone()),
         ("yield", json!({"yield":false}), plan.clone()),
         ("yield", json!({"yield":true}), plan.clone()),
         ("plan.senders[0].yields", json!({}), {
@@ -479,9 +477,133 @@ async fn assert_undeclared_notice_member(wanted: &str) {
     rig.finish().await;
 }
 
+/// The scope owner's kept notice is served with `keep` wherever its marks are, and is kept
+/// through a reopen; the stored body, default reads and `history_version` don't change.
 #[tokio::test]
-async fn undeclared_keep_refuses_before_any_write() {
-    assert_undeclared_notice_member("keep").await;
+async fn a_kept_notice_is_served_kept_and_survives_reopen() {
+    let (mut rig, _) = scoped_plan_rig("message-marks-keep", false).await;
+    rig.script.push(&[Step::Text("answer")]);
+    let sent = send_plan(
+        &mut rig,
+        8,
+        "kept-words",
+        "the person's words",
+        Some(&vector("plans/broca-head-no-compaction.json")),
+        json!({"notice":true,"keep":true}),
+    )
+    .await;
+    sample("keep-send.json", &sent);
+    assert_eq!(
+        sent.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&sent.body)
+    );
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let default = rig
+        .request(8, json!({"method":"session.read","params":{}}))
+        .await;
+    sample("keep-default-read.json", &default);
+    let default = result(&default);
+    for entry in default["messages"].as_array().unwrap() {
+        assert!(entry.get("keep").is_none(), "{entry}");
+        assert!(entry.get("notice").is_none(), "{entry}");
+    }
+    let read = read_kept(&mut rig).await;
+    sample("keep-read.json", &read);
+    let read = result(&read);
+    assert_eq!(
+        read["messages"][0]["message"],
+        default["messages"][0]["message"]
+    );
+    assert_eq!(read["history_version"], default["history_version"]);
+    for form in ["raw", "display"] {
+        let history = rig
+            .request(
+                8,
+                json!({"method":"session.history","params":{"form":form}}),
+            )
+            .await;
+        sample(&format!("keep-history-{form}.json"), &history);
+        let history = result(&history);
+        let entry = &history["messages"][0];
+        let marked = if form == "display" {
+            &entry["row"]
+        } else {
+            entry
+        };
+        assert_eq!(marked["notice"], true, "{form}: {history}");
+        assert_eq!(marked["keep"], true, "{form}: {history}");
+    }
+    assert!(rig.registry().stop_and_seal().await);
+    let mut rig = rig.restart().await;
+    rig.bind_with_scope(8, Some(scope_owner()), Some(scope_stamp(false)))
+        .await;
+    read_kept(&mut rig).await;
+    rig.finish().await;
+}
+
+/// An `include_display_facts` read whose first message is the kept notice, checked as served
+/// with both marks.
+async fn read_kept(rig: &mut Rig) -> subc_protocol::Frame {
+    let read = rig
+        .request(
+            8,
+            json!({"method":"session.read","params":{"include_display_facts":true}}),
+        )
+        .await;
+    let body = result(&read);
+    let entry = &body["messages"][0];
+    assert_eq!(entry["notice"], true, "{entry}");
+    assert_eq!(entry["keep"], true, "{entry}");
+    read
+}
+
+/// `keep` marks only a notice, and never one that may ride a tool result; each refusal writes
+/// nothing.
+#[tokio::test]
+async fn keep_without_a_notice_or_on_a_tool_result_ride_refuses_before_any_write() {
+    let (mut rig, _) = scoped_plan_rig("message-marks-keep-refused", false).await;
+    let plan = vector("plans/broca-head-no-compaction.json");
+    for (field, extra) in [
+        ("keep", json!({"keep":true})),
+        (
+            "delivery",
+            json!({"keep":true,"notice":true,"delivery":["steer","tool_result"]}),
+        ),
+    ] {
+        let before = rig.records().await;
+        let reply = send_plan(&mut rig, 8, "kept", "words", Some(&plan), extra).await;
+        let error = error_body(&reply);
+        assert_eq!(error["code"], "invalid_params", "{error}");
+        assert_eq!(error["detail"]["field"], field, "{error}");
+        sample(&format!("keep-refused-{field}.json"), &reply);
+        assert_eq!(rig.records().await, before);
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn keep_retry_without_keep_refuses_keep_without_writing() {
+    let (mut rig, plan, _) =
+        retry_fixture("keep-retry-diff", json!({"notice":true,"keep":true}), false).await;
+    let before = rig.records().await;
+    let reply = send_plan(
+        &mut rig,
+        8,
+        "marked-key",
+        "same words",
+        Some(&plan),
+        json!({"notice":true}),
+    )
+    .await;
+    let error = error_body(&reply);
+    assert_eq!(error["code"], "send_id_reuse", "{error}");
+    assert_eq!(error["detail"]["field"], "keep", "{error}");
+    assert_eq!(rig.records().await, before);
+    sample("keep-reuse.json", &reply);
+    rig.finish().await;
 }
 
 #[tokio::test]
@@ -668,6 +790,20 @@ async fn non_owner_and_automated_routes_cannot_carry_agent_words_without_writes(
         let error = error_body(&reply);
         assert_eq!(error["code"], "invalid_params", "{error}");
         assert_eq!(error["detail"]["field"], "speaks_for", "{error}");
+        assert_eq!(rig.records().await, before);
+        // Nor can such a route keep a notice: only the scope owner marks the person's words.
+        let reply = send_plan(
+            &mut rig,
+            channel,
+            "refused-keep",
+            "refuse",
+            None,
+            json!({"notice":true,"keep":true}),
+        )
+        .await;
+        let error = error_body(&reply);
+        assert_eq!(error["code"], "invalid_params", "{error}");
+        assert_eq!(error["detail"]["field"], "keep", "{error}");
         assert_eq!(rig.records().await, before);
     }
     rig.finish().await;

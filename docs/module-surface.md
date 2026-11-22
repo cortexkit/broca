@@ -1926,6 +1926,19 @@ the writer. Every stored speaker with a name has a must-understand `named_speake
 beside it. After named speakers have been written, rolling back requires
 a build with that reader; older builds refuse such a record rather than drop the name.
 
+**Kept notices.** Broca declares `notice_keep`. The session's scope owner may add `keep: true`
+to a notice it sends, to say the notice carries the person's own words. `keep` without
+`notice: true`, `keep` from any other sender, and `keep` on a send whose delivery order lets it
+ride a tool result each refuse `invalid_params` naming the field, before any write; `keep:
+false` is the same as absent. The mark is stored with the other marks and served the same
+way: opted-in reads, raw history and display rows carry `keep: true`, and the notice's
+compaction entries carry `notice.keep: true`, which tells the compaction provider never to drop
+it on its own. An unkept notice serializes as before, so its entry digest doesn't change. A
+`send_id` retry with a different `keep` refuses `send_id_reuse` naming `keep`. Every stored
+kept notice has a must-understand `kept_notice` field beside its marks; its reader shipped one
+release before the writer, and older builds refuse such a record rather than serve the notice
+unkept.
+
 **Compaction entry attribution.** A marked send's user entries carry `speaks_for`
 (`agent_id` and, when sent, `name`) in `session.entries` pages and `compaction.notice`
 entries. This applies only when the session's compaction provider lists

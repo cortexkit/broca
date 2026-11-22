@@ -174,6 +174,7 @@ pub fn send_field_of(differing: &str) -> Option<&'static str> {
     Some(match differing {
         "speaks_for" => "speaks_for",
         "notice" => "notice",
+        "keep" => "keep",
         "input" => "prompt",
         "policy_allowed" | "tools" => "tools",
         "delivery" => "delivery",

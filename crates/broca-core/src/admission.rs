@@ -404,6 +404,17 @@ pub fn send_identity_difference_with_conversation_key(
             "notice",
         ),
         (
+            stored
+                .message_marks
+                .as_ref()
+                .is_some_and(|marks| marks.keep)
+                != requested
+                    .message_marks
+                    .as_ref()
+                    .is_some_and(|marks| marks.keep),
+            "keep",
+        ),
+        (
             stored.route_decision_id != requested.route_decision_id,
             "route_decision_id",
         ),

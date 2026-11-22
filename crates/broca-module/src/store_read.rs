@@ -1020,6 +1020,9 @@ pub struct DisplayFacts {
     pub speaks_for: Option<serde_json::Value>,
     /// The send's positive notice mark.
     pub notice: bool,
+    /// The scope owner marked the notice as carrying the person's own words (llm-runner
+    /// `notice_keep`).
+    pub keep: bool,
     /// One per tool call the message made, in call order.
     pub calls: Vec<CallDisplay>,
     /// Text delivered with the message's tool calls, in the order it was delivered.
@@ -1105,6 +1108,7 @@ pub fn display_facts(entry: &StoredEntry) -> DisplayFacts {
         sender: facts.and_then(|facts| facts.sender.as_deref().map(str::to_owned)),
         speaks_for: marks.and_then(|marks| marks.get("speaks_for").cloned()),
         notice: marks.and_then(|marks| marks.get("notice")) == Some(&serde_json::Value::Bool(true)),
+        keep: marks.and_then(|marks| marks.get("keep")) == Some(&serde_json::Value::Bool(true)),
         calls,
         notices,
         tool_times: entry
@@ -1220,6 +1224,7 @@ impl DisplayFacts {
         let mut marks = broca_protocol::MessageMarks::default();
         marks.speaks_for = speaks_for;
         marks.notice = self.notice;
+        marks.keep = self.keep;
         Some(marks)
     }
 }
