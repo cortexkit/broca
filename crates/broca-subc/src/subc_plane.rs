@@ -3519,7 +3519,7 @@ impl SubcToolPlane {
         //    the model. Re-opening waits out the drain with the tool-dispatch patience; a
         //    second `module_reloading` on the one re-send is reported as the module being
         //    unavailable, still never sent (see `finish_dispatch`);
-        //  - provider route_not_bound / route_reclaimed refusals share the stale-route retry;
+        //  - stale_route_epoch and provider route_not_bound / route_reclaimed share that retry;
         //    outcome_unknown_root_reclaimed instead interrupts and evicts without a retry;
         //  - any other typed Error frame (Rejected) is a DEFINITE negative response — a
         //    graceful is_error result, terminal, never re-dispatched;

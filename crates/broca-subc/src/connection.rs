@@ -4734,10 +4734,14 @@ pub(crate) enum ToolRouteRefusal {
 
 pub(crate) fn classify_tool_route_refusal(rejection: &RejectedMessage) -> ToolRouteRefusal {
     // Retrying provider route_not_bound and route_reclaimed refusals is safe only because
-    // the provider guarantees they happen before dispatch. An in-flight reclaimed call
-    // may have applied side effects and must never be re-sent; unfamiliar codes stay errors.
+    // the provider guarantees they happen before dispatch. The daemon guarantees the same for
+    // unknown_channel and stale_route_epoch: the module never saw the request. An in-flight
+    // reclaimed call may have applied side effects and must never be re-sent; unfamiliar codes
+    // stay errors.
     match rejection.code() {
-        "unknown_channel" | "route_not_bound" | "route_reclaimed" => ToolRouteRefusal::Reopen,
+        "unknown_channel" | "stale_route_epoch" | "route_not_bound" | "route_reclaimed" => {
+            ToolRouteRefusal::Reopen
+        }
         "outcome_unknown_root_reclaimed" => ToolRouteRefusal::OutcomeUnknown,
         _ => ToolRouteRefusal::Other,
     }

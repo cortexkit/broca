@@ -992,6 +992,29 @@ fn unknown_channel_rejection_uses_the_structured_code() {
     ));
 }
 
+/// The refusals the daemon or the provider sends before a call reaches the tool re-open the
+/// route and send the call again; one that may come after the call ran never does.
+#[test]
+fn only_refusals_before_dispatch_reopen_a_tool_route() {
+    let decode = |code: &str| {
+        let body = serde_json::to_vec(&subc_protocol::ErrorBody::new(code, "refused")).unwrap();
+        classify_tool_route_refusal(&decode_error_body(&body))
+    };
+    for code in [
+        "unknown_channel",
+        "stale_route_epoch",
+        "route_not_bound",
+        "route_reclaimed",
+    ] {
+        assert_eq!(decode(code), ToolRouteRefusal::Reopen, "{code}");
+    }
+    assert_eq!(
+        decode("outcome_unknown_root_reclaimed"),
+        ToolRouteRefusal::OutcomeUnknown
+    );
+    assert_eq!(decode("module_warming"), ToolRouteRefusal::Other);
+}
+
 use subc_transport::{
     authenticate_server,
     connection_file::{ConnectionInfo, Endpoint, SCHEMA_VERSION},
