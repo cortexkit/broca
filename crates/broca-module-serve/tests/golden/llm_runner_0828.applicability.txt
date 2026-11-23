@@ -34,3 +34,8 @@ PASS notice_keep_false_absent
 PASS notice_keep_tool_result_refused
 N/A notice_keep_undeclared: the subject declares every one of notice_keep, so none is left to refuse
 PASS message_marks_retry_changed
+PASS signed_tool_edit_strips
+PASS signed_tool_reorder_keeps
+N/A signed_tool_deferred_addition_strips: adapter supplies no prefix-bound signed-tool-change fixture
+N/A signed_tool_note_keeps: adapter supplies no prefix-bound signed-tool-change fixture
+N/A signed_tool_resume_identical: adapter supplies no prefix-bound signed-tool-change fixture

@@ -17,11 +17,18 @@ pub(super) fn catalog_row() -> Value {
         "wire.api":{"value":"https://conformance.invalid/v1","from":"fixture"}})
 }
 
-pub(super) fn stream(id: &str, turn: &ScriptedTurn) -> String {
-    stream_for_model(id, MODEL, turn)
+pub(super) fn stream_for_model(id: &str, model: &str, turn: &ScriptedTurn) -> String {
+    stream_signed(id, model, turn, None)
 }
 
-pub(super) fn stream_for_model(id: &str, model: &str, turn: &ScriptedTurn) -> String {
+/// [`stream_for_model`], with each reasoning block signed by `signature` when one is given, as
+/// Anthropic signs thinking with a `signature_delta` before the block stops.
+pub(super) fn stream_signed(
+    id: &str,
+    model: &str,
+    turn: &ScriptedTurn,
+    signature: Option<&str>,
+) -> String {
     let mut body = String::new();
     let mut event = |value: Value| {
         body.push_str(&format!(
@@ -62,8 +69,15 @@ pub(super) fn stream_for_model(id: &str, model: &str, turn: &ScriptedTurn) -> St
                 )
             }
         };
+        let signed = matches!(part, ScriptedPart::Reasoning(_))
+            .then_some(signature)
+            .flatten();
         event(json!({"type":"content_block_start","index":index,"content_block":block}));
         event(json!({"type":"content_block_delta","index":index,"delta":delta}));
+        if let Some(signature) = signed {
+            event(json!({"type":"content_block_delta","index":index,
+                "delta":{"type":"signature_delta","signature":signature}}));
+        }
         event(json!({"type":"content_block_stop","index":index}));
     }
     event(

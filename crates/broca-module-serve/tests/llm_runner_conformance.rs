@@ -358,6 +358,8 @@ mod session_class;
 #[allow(dead_code)]
 #[path = "it/session_client.rs"]
 mod session_client;
+#[path = "llm_runner_conformance/signed_floor.rs"]
+mod signed_floor;
 #[path = "llm_runner_conformance/step_events.rs"]
 mod step_events;
 
@@ -459,6 +461,9 @@ struct Shared {
     catalog_requests: Mutex<HashMap<String, Vec<Value>>>,
     flow_scope_sessions: Mutex<BTreeSet<String>>,
     output_refs_sessions: Mutex<BTreeSet<String>>,
+    /// For each session whose model signs its reasoning, the signature the Messages stand-in
+    /// signs it with (see `signed_floor`).
+    signed_reasoning: Mutex<HashMap<String, String>>,
     model_id_marker_sessions: Mutex<BTreeSet<String>>,
     model_holds: Mutex<HashMap<String, Arc<HoldGate>>>,
     stream_holds: Mutex<HashMap<String, usize>>,
@@ -1086,10 +1091,16 @@ async fn serve_model_request(
     }
     let media_fixture = model.ends_with(MEDIA_FIXTURE_MODEL);
     if model.ends_with(output_refs::MODEL) || native_messages || media_fixture {
+        let signature = shared
+            .signed_reasoning
+            .lock()
+            .unwrap()
+            .get(&session)
+            .cloned();
         let body = if native_messages || media_fixture {
             output_refs::stream_for_model(&id, model, &turn)
         } else {
-            output_refs::stream(&id, &turn)
+            output_refs::stream_signed(&id, output_refs::MODEL, &turn, signature.as_deref())
         };
         let headers = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
         stream.write_all(headers.as_bytes()).await?;
@@ -1200,7 +1211,8 @@ impl ToolProvider {
             .entry(session.clone())
             .or_default()
             .push(request.clone());
-        let mut answer = catalog::catalog(request);
+        let mut answer =
+            signed_floor::catalog(request).unwrap_or_else(|| catalog::catalog(request));
         held_late_results::declare_in_catalog(&self.shared, &session, &mut answer);
         answer
     }
@@ -3068,6 +3080,17 @@ impl LlmRunnerSubject for BrocaSubject {
     }
     fn supports_model_failure_fixture(&self) -> bool {
         true
+    }
+
+    async fn signed_tool_change_observation(
+        &self,
+        session: &str,
+        change: cortexkit_role_llm_runner_conformance::SignedToolChange,
+    ) -> Result<
+        Option<cortexkit_role_llm_runner_conformance::SignedToolChangeObservation>,
+        HarnessError,
+    > {
+        signed_floor::observe(self, session, change).await
     }
     fn runner_id(&self) -> &str {
         "broca"
@@ -4976,7 +4999,7 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 109);
+    assert_eq!(cases.len(), 114);
     check_0821_cases(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [
