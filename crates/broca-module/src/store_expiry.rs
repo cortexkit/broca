@@ -26,17 +26,21 @@ impl StoreRuntime {
         run: Option<&str>,
         now_ms: u64,
     ) -> Result<Option<u64>, OpenError> {
-        self.expiry_with_view(key, run, now_ms)
+        self.expiry_with_view(key, run, now_ms, false)
             .await
             .map(|(deadline, _)| deadline)
     }
 
     /// The expiry decision and its loaded view, for the rest of a stored read to reuse.
+    /// `actor_open` says the session's actor is open: its retention timer then decides the
+    /// session's deadline and deletes the session when it comes (`store_actor::expiry`), so only
+    /// the expiry markers of an earlier session at the address are read here.
     pub(crate) async fn expiry_with_view(
         &self,
         key: &BindIdentity,
         run: Option<&str>,
         now_ms: u64,
+        actor_open: bool,
     ) -> Result<(Option<u64>, Option<crate::store_read::StoredLocalView>), OpenError> {
         let markers = self.expiry_markers(key)?;
         if now_ms == 0 && markers.is_empty() {
@@ -56,13 +60,15 @@ impl StoreRuntime {
             }
         }
         // Only a session with a retention policy expires, and such a session is created in the
-        // ephemeral root. One kept in any other root can't expire, so its view isn't loaded:
-        // every operation runs this check, and loading the whole view here cost each read or
-        // send of a running session a full read of its log, which its actor then answered
-        // anyway.
-        if self
-            .class_of(key)?
-            .is_some_and(|class| class != StorageClass::Ephemeral)
+        // ephemeral root. One kept in any other root can't expire, and an open session's actor
+        // decides its own expiry, so neither view is loaded: every operation runs this check,
+        // and loading the whole view here cost each read, subscribe or send of a running
+        // session a full read of its log, which its actor then answered anyway. A running
+        // session's log moves on between two operations, so each load was a new one.
+        if actor_open
+            || self
+                .class_of(key)?
+                .is_some_and(|class| class != StorageClass::Ephemeral)
         {
             return Ok((None, None));
         }

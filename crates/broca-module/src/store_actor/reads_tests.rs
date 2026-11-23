@@ -534,6 +534,34 @@ impl Module {
             .expect("the session opens")
     }
 
+    /// Sends `request`, already shaped as the module's caller sends it. Kept apart from
+    /// [`Self::send`], whose future `submission_admission_future_stays_small` measures.
+    async fn submit(
+        &self,
+        run_id: &str,
+        request: broca_protocol::SubmissionRequest,
+    ) -> SendOutcome {
+        self.registry
+            .route_submission_with_order(
+                &self.key,
+                RunId(run_id.into()),
+                request,
+                RunKind::FreshOrResume,
+                SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("the session opens")
+    }
+
     /// Sends `text` as the module's caller sends it, under `key`.
     async fn send_keyed(&self, run_id: &str, text: &str, key: SendKey) -> SendOutcome {
         self.registry
@@ -1684,6 +1712,20 @@ const BEFORE_STORED: &[&str] = &[
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn operations_on_a_busy_session_read_none_of_its_log() {
+    busy_session_operations_read_none_of_its_log(false).await;
+}
+
+/// The same for a session whose first send carried a storage policy, which keeps it in the root
+/// of sessions that expire: while its actor is open, that actor decides its expiry, so no
+/// operation's expiry check loads the session either.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn operations_on_a_busy_expiring_session_read_none_of_its_log() {
+    busy_session_operations_read_none_of_its_log(true).await;
+}
+
+#[cfg(feature = "test-clock")]
+async fn busy_session_operations_read_none_of_its_log(policy: bool) {
     use crate::serve::{ServeHandler, SessionReadRequest};
     let m = module_with_retention(vec![
         text_step("a1", "one"),
@@ -1697,7 +1739,26 @@ async fn operations_on_a_busy_session_read_none_of_its_log() {
         // Counted from before the run, so the status polls that wait for its end count too:
         // each lands on a position the log has just moved past.
         runtime.log_reads.store(0, Ordering::Relaxed);
-        active(m.send(run, &format!("message {n}")).await);
+        let text = format!("message {n}");
+        if policy && n == 0 {
+            let mut request = m.caller.shape(run, &SendKey::Minted, request(&text));
+            request.retention_policy = Some(
+                cortexkit_role_llm_runner::session_retention::RetentionPolicy::new(
+                    cortexkit_role_llm_runner::session_retention::Keep::days(30),
+                    0,
+                    false,
+                    false,
+                ),
+            );
+            active(m.submit(run, request).await);
+            assert_eq!(
+                runtime.class_of(&m.key).unwrap(),
+                Some(broca_records::session_storage::StorageClass::Ephemeral),
+                "a session with a storage policy is kept in the root of expiring sessions"
+            );
+        } else {
+            active(m.send(run, &text).await);
+        }
         m.gate.notify_one();
         m.ended(run, "completed").await;
         assert!(

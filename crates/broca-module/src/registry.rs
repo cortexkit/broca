@@ -3199,7 +3199,10 @@ impl LineageRegistry {
             .retention
             .get()
             .map_or(0, |service| service.clock.now_ms());
-        let (expired_at_ms, view) = runtime.expiry_with_view(key, run, now_ms).await?;
+        let actor_open = self.open_handle(key).is_some();
+        let (expired_at_ms, view) = runtime
+            .expiry_with_view(key, run, now_ms, actor_open)
+            .await?;
         if let Some(expired_at_ms) = expired_at_ms {
             return Err(OpenError::Expired { expired_at_ms });
         }
