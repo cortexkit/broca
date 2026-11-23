@@ -547,6 +547,49 @@ async fn a_restarted_pass_reads_no_session_the_kept_deadlines_already_decide() {
     assert!(rig.holds(&key));
 }
 
+/// A pass decides a session whose head file hasn't changed since the last pass from its kept
+/// deadline, without opening the head: the sweep runs every five minutes over every session in
+/// the ephemeral root. Once that deadline has passed, the session is read and deleted as before.
+#[tokio::test]
+async fn a_later_pass_reads_no_head_that_has_not_changed() {
+    let rig = Rig::new("unchanged-heads", Duration::from_secs(600)).await;
+    let key = rig.key("idle");
+    rig.seed(
+        &key,
+        &[
+            store_start("r1", Some(SECONDS), STARTED_MS),
+            store_end("r1", ENDED_MS),
+            store_billed("r1"),
+        ],
+        false,
+    )
+    .await;
+    assert!(rig
+        .service
+        .sweep_store(&rig.runtime, DEADLINE_MS - 1)
+        .await
+        .is_empty());
+
+    let before = broca_session_store::backend::head_file_reads();
+    assert!(rig
+        .service
+        .sweep_store(&rig.runtime, DEADLINE_MS - 1)
+        .await
+        .is_empty());
+    assert_eq!(
+        broca_session_store::backend::head_file_reads(),
+        before,
+        "the second pass read a head that hadn't changed"
+    );
+
+    assert_eq!(
+        rig.service.sweep_store(&rig.runtime, DEADLINE_MS).await,
+        vec![key.clone()],
+        "a kept deadline that has passed still deletes the session"
+    );
+    assert!(!rig.holds(&key));
+}
+
 /// A fork's session in the ephemeral root, which holds only its fork's records, is kept until
 /// its retention time past the fork's idle time after its newest record, and then deleted by the
 /// same sweep, with no deletion deferred for want of a reading.

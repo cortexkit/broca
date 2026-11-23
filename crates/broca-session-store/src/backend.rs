@@ -916,6 +916,17 @@ impl LocalBackend {
         read_head_at(&self.head_dir(s).join("head"))
     }
 
+    /// The stamp of `s`'s head file, read from its metadata without opening it, or `None` when
+    /// it has no head. Two equal stamps mean the head wasn't written in between: every head write
+    /// renames a new file into place ([`write_head_file`]).
+    pub fn head_stamp(&self, s: &SessionAddr) -> Result<Option<HeadStamp>, BackendError> {
+        match std::fs::metadata(self.head_dir(s).join("head")) {
+            Ok(metadata) => Ok(Some(HeadStamp::of(&metadata))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// The head versions kept for `s` (see [`HEAD_VERSION_KEEP_MS`]), oldest first.
     pub fn head_versions(&self, s: &SessionAddr) -> Result<Vec<Version>, BackendError> {
         Ok(kept_versions(&self.head_dir(s).join(VERSIONS_DIR))?)
@@ -1107,11 +1118,47 @@ impl LocalBackend {
     }
 }
 
+/// What a head file's metadata says of it (see [`LocalBackend::head_stamp`]): a replaced file has
+/// another inode on Unix and, on every platform, the modification time of its own write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    inode: u64,
+}
+
+impl HeadStamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(metadata);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            inode,
+        }
+    }
+}
+
+thread_local! {
+    static HEAD_FILE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many head files this thread has opened and read. A test bounds with it what a pass over
+/// many sessions reads.
+pub fn head_file_reads() -> u64 {
+    HEAD_FILE_READS.with(std::cell::Cell::get)
+}
+
 /// A head file's version and bytes, or `None` when there is no such file.
 fn read_head_at(path: &Path) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
     let mut bytes = Vec::new();
     match File::open(path) {
-        Ok(mut file) => file.read_to_end(&mut bytes)?,
+        Ok(mut file) => {
+            HEAD_FILE_READS.with(|reads| reads.set(reads.get() + 1));
+            file.read_to_end(&mut bytes)?
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };

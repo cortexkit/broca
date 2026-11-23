@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 use broca_protocol::BindIdentity;
 use broca_records::session_storage::StorageClass;
-use broca_session_store::backend::{LocalBackend, SessionAddr};
+use broca_session_store::backend::{HeadStamp, LocalBackend, SessionAddr};
 use broca_session_store::head::{self, SessionTriple};
 use broca_session_store::keys::Cipher;
 use broca_session_store::record::Record;
@@ -43,6 +43,12 @@ pub(super) struct StoreRetention {
     /// address. A pass reads a session's records again only once the session has changed. Kept
     /// on disk too ([`kept`]), so a restart's first pass doesn't read every session again.
     deadlines: Mutex<HashMap<String, (Position, Option<u64>)>>,
+    /// The stamp each session's head file had when its deadline in `deadlines` was last confirmed,
+    /// by address. A pass that finds the same stamp again knows the head didn't move, so it
+    /// decides the session from its kept deadline without reading the head: tens of thousands
+    /// of small head reads every pass otherwise cost more disk reads than anything else broca
+    /// does while idle. Kept in memory only: a restart's first pass reads every head once.
+    stamps: Mutex<HashMap<String, HeadStamp>>,
     /// Whether `deadlines` was filled from the kept file, which the first pass does.
     loaded: std::sync::atomic::AtomicBool,
     /// Whether `deadlines` changed since it was last kept.
@@ -234,6 +240,11 @@ impl RetentionService {
             if deadlines.len() != before {
                 self.store.changed.store(true, Ordering::Relaxed);
             }
+            self.store
+                .stamps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|address, _| listed.contains(address.as_str()));
         }
         for addr in cut_short {
             if let Err(error) = self.finish_store_deletion(runtime, &backend, &addr) {
@@ -327,6 +338,14 @@ impl RetentionService {
         addr: &SessionAddr,
         now_ms: u64,
     ) -> Result<Option<BindIdentity>, String> {
+        // Taken before anything is read, so a write after this point gives a later pass another
+        // stamp and the session is read again then.
+        let Some(stamp) = backend.head_stamp(addr).map_err(described)? else {
+            return Ok(None);
+        };
+        if self.unchanged_and_unexpired(addr, &stamp, now_ms) {
+            return Ok(None);
+        }
         let Some((stored, _)) = backend.read_stored_head(addr).map_err(described)? else {
             return Ok(None);
         };
@@ -346,10 +365,23 @@ impl RetentionService {
             return Err("the session's head names a session filed under another address".into());
         }
         // Decided first without the lease, so a session that hasn't expired costs no lease.
-        let Some(deadline) = self
+        let deadline = self
             .store_deadline(runtime, backend, addr, &triple, true)
-            .await?
-        else {
+            .await?;
+        if self
+            .store
+            .deadlines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&addr.0)
+        {
+            self.store
+                .stamps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr.0.clone(), stamp);
+        }
+        let Some(deadline) = deadline else {
             return Ok(None);
         };
         if deadline > now_ms {
@@ -371,6 +403,29 @@ impl RetentionService {
         drop(deleting);
         drop(lease);
         Ok(deleted?.then_some(key))
+    }
+
+    /// Whether the session at `addr` is decided as kept without reading it: its head file still
+    /// has the stamp it had when its deadline was confirmed, and that deadline is none or later
+    /// than `now_ms`. A session whose kept deadline has passed is always read, so its deletion
+    /// is decided from its records as they are now.
+    fn unchanged_and_unexpired(&self, addr: &SessionAddr, stamp: &HeadStamp, now_ms: u64) -> bool {
+        if self
+            .store
+            .stamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&addr.0)
+            != Some(stamp)
+        {
+            return false;
+        }
+        self.store
+            .deadlines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&addr.0)
+            .is_some_and(|(_, deadline)| deadline.is_none_or(|deadline| deadline > now_ms))
     }
 
     /// The deadline of the session at `addr`, from its records at its stored position: the cached
