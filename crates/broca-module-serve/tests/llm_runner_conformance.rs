@@ -3321,9 +3321,9 @@ impl LlmRunnerSubject for BrocaSubject {
         if self.service_tier_enabled {
             capabilities.insert(Capability::ServiceTier);
         }
-        // role.describe declares the group from the same switch.
+        // role.describe declares both groups from the same switch.
         if broca_protocol::FORK_ANSWER_SERVED {
-            capabilities.insert(Capability::ForkAnswer);
+            capabilities.extend([Capability::ForkAnswer, Capability::ForkEffort]);
         }
         // Admission and role.describe read the same switch for combined and named marks.
         if broca_core::scope_admission::NOTICE_WITH_SPEAKS_FOR {
