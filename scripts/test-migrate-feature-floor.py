@@ -95,15 +95,25 @@ class MigrateFeatureFloor(unittest.TestCase):
     def test_old_folders_go_only_when_empty(self):
         for name in ("wal", "wal-durable", "media", "conversion-staging"):
             (self.root / name).mkdir()
+        # The old media store's shape: empty subfolders and an empty lock file are not data,
+        # while a lock file with content, or any other file, keeps the folder.
+        (self.root / "media-ephemeral" / "objects").mkdir(parents=True)
+        (self.root / "media-ephemeral" / "refs").mkdir()
+        (self.root / "media-ephemeral" / "store.lock").write_bytes(b"")
+        (self.root / "media-durable" / "refs").mkdir(parents=True)
+        (self.root / "media-durable" / "store.lock").write_bytes(b"1")
         (self.root / "conversion-ledger.db").write_bytes(b"")
         (self.root / "media" / "kept.bin").write_bytes(b"x")
         (self.root / "session-store").mkdir()
         (self.root / "caps.db").write_bytes(b"caps")
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        for name in ("wal", "wal-durable", "conversion-staging", "conversion-ledger.db"):
+        for name in (
+            "wal", "wal-durable", "conversion-staging", "conversion-ledger.db", "media-ephemeral"
+        ):
             self.assertFalse((self.root / name).exists(), name)
         self.assertTrue((self.root / "media" / "kept.bin").exists())
+        self.assertTrue((self.root / "media-durable" / "store.lock").exists())
         self.assertIn("not empty", result.stdout)
         self.assertTrue((self.root / "session-store").exists())
         self.assertFalse((self.root / "caps.db").exists())

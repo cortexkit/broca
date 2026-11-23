@@ -17,7 +17,8 @@ What it does, under the floor's lock file (the one a running ck-broca takes to r
   never named it), and removes `wal-feature-floor` and its lock file;
 - removes the folders the old log format kept its sessions and media in, and the staging
   folders and ledger of the one-time conversion that moved those sessions into the session store,
-  each only when it is empty; one that holds anything is named and kept;
+  each only when it holds nothing but empty folders and empty `store.lock` files; one that holds
+  anything else is named and kept;
 - moves `caps.db` (the spend caps of a removed feature) and its SQLite side files into the
   backup folder outside the state root.
 
@@ -77,7 +78,7 @@ def write_private(path: pathlib.Path, data: bytes) -> None:
 
 
 # What the old log format and its one-time conversion to the session store left in a state root.
-# Nothing reads or creates them any more; each is removed only when empty.
+# Nothing reads or creates them any more; each is removed only when it holds no data.
 OLD_FOLDERS = (
     "wal", "wal-archive", "wal-archive-durable", "wal-durable", "wal-ephemeral",
     "media", "media-durable", "media-ephemeral", "conversion-recovery", "conversion-staging",
@@ -85,6 +86,34 @@ OLD_FOLDERS = (
 OLD_FILES = ("conversion-ledger.db",)
 # Spend caps were removed; their database is kept as a backup rather than deleted.
 CAPS_FILES = ("caps.db", "caps.db-shm", "caps.db-wal")
+
+
+# The old media store left each of its folders holding empty subfolders and an empty lock file
+# (`store.lock`, which only ever carried an advisory lock). Neither is data.
+EMPTY_LOCK = "store.lock"
+
+
+def holds_no_data(path: pathlib.Path) -> bool:
+    """Whether a folder holds nothing but empty folders and empty lock files."""
+    for entry in path.iterdir():
+        if entry.is_symlink():
+            return False
+        if entry.is_dir():
+            if not holds_no_data(entry):
+                return False
+        elif entry.name != EMPTY_LOCK or entry.stat().st_size:
+            return False
+    return True
+
+
+def remove_tree(path: pathlib.Path) -> None:
+    """Removes a folder `holds_no_data` accepted, deepest entries first."""
+    for entry in path.iterdir():
+        if entry.is_dir():
+            remove_tree(entry)
+        else:
+            entry.unlink()
+    path.rmdir()
 
 
 def remove_old_folders(root: pathlib.Path, dry: bool) -> None:
@@ -103,12 +132,12 @@ def remove_old_folders(root: pathlib.Path, dry: bool) -> None:
         path = root / name
         if not path.is_dir():
             continue
-        if any(path.iterdir()):
+        if not holds_no_data(path):
             print(f"kept    {path}: not empty")
             continue
         print(f"removed {path}")
         if not dry:
-            path.rmdir()
+            remove_tree(path)
     for name in OLD_FILES:
         path = root / name
         if not path.is_file():
