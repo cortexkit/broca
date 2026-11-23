@@ -765,7 +765,32 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
             .expect("routing declaration is an object")
             .clone(),
     )]))
+    .provider_declarations(Some(provider_declarations()))
     .build()
+}
+
+/// What broca asks of other modules by declaration, which the daemon hands each provider when a
+/// first-party module opens a route to it. The vault (claustrum) grants a first-party module the
+/// credential categories its entry lists in place of a hand grant: broca reads model logins and
+/// keys (`llm-provider`), and reads and lists company gateway keys (`llm-gateway`), each listed
+/// key being an account it offers routing. broca's storage key is a single vault record, which a
+/// declaration doesn't cover, so it stays a hand grant (see `store_key`).
+fn provider_declarations() -> subc_protocol::provider_declarations::ProviderDeclarations {
+    let claustrum = serde_json::json!({
+        "v": 1,
+        "grants": [
+            {"category": "llm-provider", "operation": "read"},
+            {"category": "llm-gateway", "operation": "read"},
+            {"category": "llm-gateway", "operation": "list"},
+        ],
+    });
+    BTreeMap::from([(
+        "claustrum".to_string(),
+        claustrum
+            .as_object()
+            .expect("the vault declaration is an object")
+            .clone(),
+    )])
 }
 
 #[cfg(test)]
@@ -983,6 +1008,7 @@ mod provenance_tests {
                 "module_id",
                 "module_version",
                 "protocol_ver",
+                "provider_declarations",
                 "provides",
                 "role_declarations",
                 "self_signals",
@@ -1055,6 +1081,32 @@ mod provenance_tests {
         ]);
         assert!(
             subc_protocol::manifest::validate_hello_event_declarations(&hello(&dotted)).is_err()
+        );
+    }
+
+    /// broca's vault grants travel as a declaration the vault reads: exactly the categories
+    /// broca's hand grants gave it. A malformed declaration makes the daemon refuse HELLO, so
+    /// it is checked with the daemon's own validator; the control shows that validator refuses
+    /// one, so the pass can't come from a validator that accepts everything.
+    #[test]
+    fn the_vault_grants_are_declared_in_a_form_the_daemon_accepts() {
+        let encoded = serde_json::to_value(manifest("broca")).expect("manifest serialises");
+        assert_eq!(
+            encoded["provider_declarations"],
+            serde_json::json!({"claustrum": {"v": 1, "grants": [
+                {"category": "llm-provider", "operation": "read"},
+                {"category": "llm-gateway", "operation": "read"},
+                {"category": "llm-gateway", "operation": "list"},
+            ]}})
+        );
+        let hello = |manifest: &serde_json::Value| serde_json::json!({ "manifest": manifest });
+        subc_protocol::manifest::validate_hello_provider_declarations(&hello(&encoded))
+            .expect("the daemon would refuse this HELLO");
+        let mut malformed = encoded.clone();
+        malformed["provider_declarations"]["claustrum"] = serde_json::json!("grants");
+        assert!(
+            subc_protocol::manifest::validate_hello_provider_declarations(&hello(&malformed))
+                .is_err()
         );
     }
 
