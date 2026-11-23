@@ -1,6 +1,7 @@
 //! `ck-broca --wal-known-features` is read by placement tooling to decide whether a staged
-//! build can read every WAL feature already written on the machine. Its output is that
-//! contract: the known-name table, sorted, one name per line, nothing else, exit 0.
+//! build can read every storage format already written on the machine (the feature floor,
+//! `broca_records::floor`). Its output is that contract: the known-name table, sorted, one name
+//! per line, nothing else, exit 0.
 
 #[test]
 fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
@@ -28,25 +29,8 @@ fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
     assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
     // Also compare with a literal list: deriving both the probe output and the expectation
     // from `KNOWN_FEATURES` alone would let an unintended table change pass unnoticed. The
-    // expected list covers the features this build can read, including step transforms,
-    // the compaction records (the removed synchronous client's, read only, and asynchronous
-    // views and notices), deferred-call records, step-boundary cancellation and
-    // first-send session classes, hard input-token caps, Google RPC quota diagnostics,
-    // provider text state, OpenRouter reasoning, runner tags, client message ids,
-    // structured-output state including durable compiler-refusal downgrades and the frozen
-    // paragraph break before schema instructions, reply
-    // deadlines on tools declared directly on a send, durable tool observation times, and
-    // provider declarations frozen into a plan manifest, calls a tool provider holds past
-    // its reply, catalog reference slots a plan froze for output references, and Anthropic's
-    // server-side and client-side content-filter fallback, credential selections frozen
-    // with their auth method, a step's output cap lowered to fit its context limit, and the
-    // stamped version 4 frame header, writer lifecycle, late-visibility proofs and
-    // durable RecoveryCut records and per-ride rendering envelopes.
-    // It also lists the newer session storage, which this build refuses by name rather than serves.
-    assert_eq!(
-        expected,
-        "account-limit-pause/v1\nagent-run-scopes/v1\narchive-index/v2\nauth-selection-method/v1\nbill-attempts/v1\nbill-vault-facts/v1\nchatgpt-codex-wire/v1\nclient-message-id/v1\ncompaction-ride-wait/v1\ncompaction-v2/v1\ncompaction-view-meta/v1\ncompaction-view-negotiation/v1\ncompaction-view/v1\ncompaction-wait/v1\ncompaction/v1\ncontext-ceiling/v1\ndeferred-call/v1\ndelivery-order/v1\ndispatch-module/v1\nflow-scopes/v1\nframe-stamps/v1\ngoogle-rpc-error-details/v1\ninput-token-cap/v1\ninterrupt-reason/v1\nmedia-content/v1\nmessage-marks/v1\nmessage-times/v1\nopenrouter-reasoning/v1\noutput-reservation/v1\nplan-manifest/v1\nplan-reference-slots/v1\nprovider-declarations/v1\nprovider-fallback-block/v1\nprovider-held/v1\nprovider-text-state/v1\nrefusal-fallback/v1\nrestart-pause/v1\nretention/v1\nrides-v2/v1\nrun-cancel-at/v1\nrunner-tags/v1\nrunner-tags/v2\nscope/v1\nservice-tier-queue/v1\nsession-change/v1\nsession-class/v1\nsession-storage/v1\nspeaks-for-name/v1\nsteer-queue/v1\nstep-transforms/v1\nstructured-output-downgrade/v1\nstructured-output-paragraph/v1\nstructured-output/v1\ntool-name-aliases/v1\ntool-reply/v1\ntool-schema-pins/v1\ntool-times/v1\nturn-directives/v1\nturn-system/v1\nvisibility-late/v1\nwal-recovery/v1\nwriter-id/v1\n"
-    );
+    // session store is the one storage format this build reads.
+    assert_eq!(expected, "session-storage/v1\n");
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     assert!(
         !data_home.exists(),

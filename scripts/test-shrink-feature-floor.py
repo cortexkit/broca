@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Checks for scripts/shrink-feature-floor.py, the one-time rewrite of a state root's floor."""
+
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import unittest
+
+SCRIPT = pathlib.Path(__file__).resolve().parent / "shrink-feature-floor.py"
+
+
+class ShrinkFeatureFloor(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name) / "broca"
+        self.root.mkdir()
+        self.floor = self.root / "wal-feature-floor"
+        self.marker = self.root / "late-results-registered"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_script(self, *args):
+        env = dict(os.environ, BROCA_STATE_ROOT=str(self.root))
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args], env=env, capture_output=True, text=True
+        )
+
+    def backups(self):
+        folder = self.root.parent / "broca-migrations"
+        return sorted(folder.iterdir()) if folder.exists() else []
+
+    def test_an_old_floor_keeps_only_the_session_store_and_marks_held_intake(self):
+        old = "provider-held/v1\nscope/v1\nsession-storage/v1\n"
+        self.floor.write_text(old)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.floor.read_text(), "session-storage/v1\n")
+        # The old log once held a provider-held call, so the marker now carries that evidence.
+        self.assertTrue(self.marker.exists())
+        [backup] = self.backups()
+        self.assertEqual(backup.read_text(), old)
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+
+    def test_an_existing_marker_is_left_alone(self):
+        self.floor.write_text("scope/v1\nsession-storage/v1\n")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.floor.read_text(), "session-storage/v1\n")
+        self.assertFalse(self.marker.exists(), "no provider-held evidence, so no marker")
+
+    def test_an_unknown_name_refuses_and_changes_nothing(self):
+        text = "scope/v1\nsession-storage/v2\n"
+        self.floor.write_text(text)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("session-storage/v2", result.stdout)
+        self.assertEqual(self.floor.read_text(), text)
+        self.assertEqual(self.backups(), [])
+
+    def test_a_dry_run_changes_nothing(self):
+        text = "provider-held/v1\nsession-storage/v1\n"
+        self.floor.write_text(text)
+        result = self.run_script("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.floor.read_text(), text)
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(self.backups(), [])
+
+    def test_no_floor_is_nothing_to_do(self):
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.floor.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

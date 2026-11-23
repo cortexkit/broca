@@ -11,8 +11,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::features::SESSION_STORAGE_DIR;
 use crate::fs_ops as fs;
+
+/// The folder of a state root that holds the session store's ordinary sessions, the ones
+/// backups leave out. The durable and ephemeral classes have their own folders
+/// ([`StorageClass`]). Before the session store had classes it kept every session here.
+pub const SESSION_STORAGE_DIR: &str = "session-store";
 
 /// The folder of a state root holding the session store's durable sessions, the one class of the
 /// three that backups capture.

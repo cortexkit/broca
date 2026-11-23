@@ -475,7 +475,7 @@ impl Side {
             }
         }
         let dir = scratch_dir();
-        for folder in ["wal", broca_records::features::SESSION_STORAGE_DIR, "setup"] {
+        for folder in ["wal", broca_records::SESSION_STORAGE_DIR, "setup"] {
             copy(&self.dir.join(folder), &dir.join(folder));
         }
         Self::at(

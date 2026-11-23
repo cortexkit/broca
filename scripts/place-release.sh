@@ -62,7 +62,7 @@
 #   runtime-flag        the copy's code signature carries the hardened-runtime flag
 #   get-task-allow      the copy's entitlements let a debugger attach
 #   smoke-run           the copy fails to start: `--version` must exit 0 and name a version
-#   wal-feature-floor   the copy cannot read feature names this machine's WALs already use
+#   wal-feature-floor   the copy cannot read a storage format this machine's sessions already use
 
 set -euo pipefail
 
@@ -601,9 +601,9 @@ if [ "$smoke_rc" -ne 0 ] || ! [[ $SMOKE_LINE =~ $smoke_re ]]; then
     "An exit status above 128 is a signal: macOS kills a binary whose signature does not validate."
 fi
 
-# wal-feature-floor: the floor lists the WAL feature names already written on this machine, and a
-# build whose reader does not know one of them would refuse those WALs. Placing it would roll the
-# machine back to a reader that cannot read its own data. See scripts/wal-floor.sh.
+# wal-feature-floor: the floor lists the storage formats this machine's sessions are already
+# written in, and a build that does not know one of them cannot serve those sessions. Placing it
+# would roll the machine back to a reader that cannot read its own data. See scripts/wal-floor.sh.
 WAL_FLOOR_FILE="$(broca_wal_floor_path)"
 if ! FLOOR_NAMES="$(broca_wal_floor_names "$WAL_FLOOR_FILE")"; then
   echo "place-release: REFUSING -- placement gate check 'wal-feature-floor' cannot read the floor." >&2
@@ -629,18 +629,18 @@ if [ "$known_rc" -eq 0 ]; then
   if [ -n "$missing" ]; then
     gate_refuse wal-feature-floor "$TMP" \
       "the floor at $WAL_FLOOR_FILE lists feature(s) this build does not know: $missing" \
-      "WALs on this machine were written with them, and this build would refuse to read them."
+      "sessions on this machine were written with them, and this build cannot read them."
   fi
   FLOOR_VERDICT="covered by the copy's --wal-known-features"
 elif [ -n "$FLOOR_NAMES" ]; then
   # A build older than the flag cannot say what it knows. With a non-empty floor, that is a build
-  # that predates every gated feature, so it cannot read what the floor lists.
+  # that predates every storage format the floor can name, so it cannot read what the floor lists.
   gate_refuse wal-feature-floor "$TMP" \
-    "'--wal-known-features' exited $known_rc, so this build cannot report which WAL features it" \
-    "reads, and the floor at $WAL_FLOOR_FILE is not empty."
+    "'--wal-known-features' exited $known_rc, so this build cannot report which storage formats" \
+    "it reads, and the floor at $WAL_FLOOR_FILE is not empty."
 else
-  # No floor, or an empty one: no WAL frame on this machine names a feature, so any build can read
-  # every WAL here and an older one is as placeable as it always was.
+  # No floor, or an empty one: nothing on this machine is written in a format the floor guards,
+  # so an older build is as placeable as it always was.
   FLOOR_VERDICT="empty, not checked (the copy predates --wal-known-features)"
 fi
 

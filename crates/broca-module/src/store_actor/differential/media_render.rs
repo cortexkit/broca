@@ -910,10 +910,7 @@ async fn an_input_photo_and_a_tool_image_render_offline_as_sent(cipher: Cipher) 
 
     // The session store's: the session as its run holds it now, and its own media objects.
     use broca_session_store::backend::{LocalBackend, SessionAddr};
-    let root = store
-        .side
-        .dir
-        .join(broca_records::features::SESSION_STORAGE_DIR);
+    let root = store.side.dir.join(broca_records::SESSION_STORAGE_DIR);
     let deployment = broca_session_store::keys::DeploymentKey::new(1, &[7; 32]).creating(cipher);
     let key = &store.side.key;
     let view = broca_session_store::session::Session::view(

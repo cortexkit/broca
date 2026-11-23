@@ -1224,7 +1224,7 @@ impl Module {
 
     async fn load(&self) -> Session<broca_session_store::backend::LocalBackend> {
         let backend = broca_session_store::backend::LocalBackend::new(
-            self.dir.join(broca_records::features::SESSION_STORAGE_DIR),
+            self.dir.join(broca_records::SESSION_STORAGE_DIR),
         );
         let triple = broca_session_store::head::SessionTriple {
             project_root: self.key.project_root.display().to_string(),
@@ -1244,7 +1244,7 @@ impl Module {
     /// The text of every message the store session holds, read once its actor is gone.
     async fn store_texts(&self) -> Vec<String> {
         let backend = broca_session_store::backend::LocalBackend::new(
-            self.dir.join(broca_records::features::SESSION_STORAGE_DIR),
+            self.dir.join(broca_records::SESSION_STORAGE_DIR),
         );
         let triple = broca_session_store::head::SessionTriple {
             project_root: self.key.project_root.display().to_string(),

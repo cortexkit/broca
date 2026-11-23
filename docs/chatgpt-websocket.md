@@ -196,8 +196,7 @@ so request dumps and prefix/cache identity are unchanged. `websocket_request` se
 records the length and SHA-256 of the exact UTF-8 request payload before compression.
 Codex-profile frames additionally record continuation, suffix item count (zero on full input),
 connection generation, previous-ID presence, confirmed physical send count and full-input
-reason. These nested fields, and run starts/refreezes carrying the profile, require
-`chatgpt-codex-wire/v1`; the feature floor is published before the gated frame.
+reason.
 
 `full_input_reason` is absent on continuations. Broca emits the following closed
 vocabulary on full-input Codex frames; readers decode it as an **open string** so

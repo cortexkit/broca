@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Shared reader for the WAL feature floor, used by stage-release (to print it on the release
-# card) and place-release (to refuse a build that cannot read it).
+# Shared reader for the feature floor, used by stage-release (to print it on the release card)
+# and place-release (to refuse a build that cannot read it).
 #
-# WHAT THE FLOOR IS. A WAL frame can name features its reader must understand. A build that does
-# not know one of those names refuses the whole WAL rather than misreading it. The floor file
-# lists every feature name that frames on THIS machine have already been written with, so a
-# build whose known-feature table does not cover the floor would refuse data that exists here:
-# placing it is a rollback into unreadable WALs. place-release asks the candidate build for its
-# table (`ck-broca --wal-known-features`) and refuses unless it covers the floor.
+# WHAT THE FLOOR IS. The floor file lists the storage formats this machine's sessions are already
+# written in (crates/broca-records/src/floor.rs; today only the session store's
+# `session-storage/v1`). A build whose known-feature table does not cover the floor could not
+# serve sessions that exist here: placing it is a rollback onto unreadable data. place-release
+# asks the candidate build for its table (`ck-broca --wal-known-features`) and refuses unless it
+# covers the floor. The file and the flag keep the names they had when the floor listed the old
+# log format's frame features.
 #
-# These scripts only READ the floor. Writer releases raise it, before their first frame that
-# needs a new name; it only ever grows.
+# These scripts only READ the floor. The session store raises it before it writes its first
+# session in a state root; it only ever grows.
 #
 # Format: one feature name per line, sorted. Blank lines and surrounding whitespace are ignored.
 # Anything else on a line is a name, so a stray line makes placement refuse rather than pass.

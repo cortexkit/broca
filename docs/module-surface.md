@@ -1574,9 +1574,10 @@ fallback only for absent classes. The served bytes are pinned by `open_failed_pe
 and `open_transient.json` under `crates/broca-wire/tests/golden/`.
 
 A log holding a record kind or a must-understand field this build does not know was written by
-a newer broca. Release placement refuses such a downgrade before it happens: the state root's
-feature floor lists what its logs need, and a build that does not know every entry is not
-placed.
+a newer broca. Release placement does not see record kinds: the state root's feature floor
+names only the storage format, so it refuses a build older than the session store and nothing
+finer. A new record kind or must-understand field therefore ships in a reader release before
+any build writes it, so the build one release back reads every log a rollback meets.
 
 When the session is already open, `session.subscribe` attaches and then replays its records in the
 stream; a record it cannot read there ends the stream with `subscribe_replay_failed`.

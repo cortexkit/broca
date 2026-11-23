@@ -36,8 +36,9 @@ fn sync_marker(root: &Path, name: &str) -> Result<(), String> {
     broca_session_store::durable::sync_dir(root).map_err(|error| error.to_string())
 }
 
-/// Missing projections are harmless only on roots with no evidence of prior held intake.
-/// An existing but unreadable projection cannot prove that a lineage is unregistered.
+/// A missing late-results.db is harmless only on a root that has never registered a held call:
+/// one without the registration marker, which is written before a root's first registration. An
+/// existing but unreadable database cannot prove that a lineage is unregistered.
 pub(crate) fn retention_block_reason(
     root: &Path,
     lineage: &str,
@@ -59,12 +60,7 @@ pub(crate) fn retention_block_reason(
             .join(REGISTRATION_MARKER)
             .try_exists()
             .map_err(|e| e.to_string())?;
-        let floor = broca_records::floor::read_floor(
-            &root.join(broca_records::floor::FEATURE_FLOOR_FILENAME),
-        )
-        .map_err(|e| e.to_string())?;
-        return Ok((prior_registration || floor.contains("provider-held/v1"))
-            .then_some("provider_held_intake_unknown"));
+        return Ok(prior_registration.then_some("provider_held_intake_unknown"));
     }
     let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;

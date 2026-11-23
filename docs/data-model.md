@@ -41,7 +41,7 @@ paths rather than begin an empty history (`crates/broca-module-serve/src/state_r
   request-dumps/            request bodies written by the operator's request dump
   logs/                     daily log files
   state-format              format marker, when present; naming the removed broca-state/2 refuses startup
-  wal-feature-floor         record features this root's sessions may need; placement checks it
+  wal-feature-floor         storage formats this root's sessions use; placement checks it
   broca.lock                held by the one ck-broca serving this root   (below)
 ```
 

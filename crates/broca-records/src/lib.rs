@@ -1,7 +1,6 @@
 //! Durable record vocabulary and storage primitives shared by session backends.
 
 pub mod directory_sync;
-pub mod features;
 pub mod floor;
 pub mod fs_ops;
 pub mod head_proof;

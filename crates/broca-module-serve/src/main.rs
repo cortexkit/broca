@@ -1603,7 +1603,7 @@ fn create_state_directories(state_root: &std::path::Path) -> Result<(), ServeIoE
     // descriptor names them, and engram refuses a capture whose declared path is missing.
     for name in [
         broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
-        broca_records::features::SESSION_STORAGE_DIR,
+        broca_records::SESSION_STORAGE_DIR,
         broca_records::session_storage::SESSION_STORAGE_EPHEMERAL_DIR,
         broca_records::session_storage::SESSION_STORAGE_MOVES_DIR,
     ] {
@@ -1921,7 +1921,7 @@ mod state_directory_tests {
                 broca_records::session_storage::SESSION_STORAGE_DURABLE_DIR,
                 "portable",
             ),
-            (broca_records::features::SESSION_STORAGE_DIR, "excluded"),
+            (broca_records::SESSION_STORAGE_DIR, "excluded"),
             (
                 broca_records::session_storage::SESSION_STORAGE_EPHEMERAL_DIR,
                 "excluded",

@@ -496,7 +496,7 @@ impl Module {
     }
 
     fn backend(&self) -> LocalBackend {
-        LocalBackend::new(self.dir.join(broca_records::features::SESSION_STORAGE_DIR))
+        LocalBackend::new(self.dir.join(broca_records::SESSION_STORAGE_DIR))
     }
 
     fn addr(&self) -> SessionAddr {
@@ -1267,7 +1267,7 @@ async fn a_session_created_again_is_read_fresh() {
     for folder in ["heads", "logs", "objects"] {
         let _ = std::fs::remove_dir_all(
             m.dir
-                .join(broca_records::features::SESSION_STORAGE_DIR)
+                .join(broca_records::SESSION_STORAGE_DIR)
                 .join(folder)
                 .join(&m.addr().0),
         );

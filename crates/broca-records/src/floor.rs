@@ -1,16 +1,16 @@
-//! The WAL feature floor: the set of feature names that frames on this machine have already
-//! been written with.
+//! The feature floor: the storage formats this machine's state root already holds sessions in.
 //!
-//! A build that does not know one of those names refuses every WAL holding such a frame, so
-//! placing it would roll the machine back into data it cannot read. `scripts/place-release.sh`
+//! A build that does not know one of those names cannot serve the sessions written in it, so
+//! placing it would roll the machine back onto data it cannot read. `scripts/place-release.sh`
 //! reads this file and refuses a staged build whose known-name table
 //! (`ck-broca --wal-known-features`) does not cover it; `scripts/wal-floor.sh` describes the
-//! same format from the reading side.
+//! same format from the reading side. The file and the flag keep the names they had when the
+//! floor listed the old log format's frame features.
 //!
-//! The writer raises the floor BEFORE the first frame that needs a name the floor lacks: a
-//! crash between the two then leaves a floor that names a feature no frame uses yet, which only
-//! makes placement stricter than it has to be. The other order could leave a gated frame on
-//! disk that placement does not know about, and a rollback onto a build that cannot read it.
+//! The session store raises the floor BEFORE it writes its first session in a state root: a
+//! crash between the two then leaves a floor that names a format nothing uses yet, which only
+//! makes placement stricter than it has to be. The other order could leave sessions on disk
+//! that placement does not know about, and a rollback onto a build that cannot read them.
 //!
 //! Format: one feature name per line, sorted, ending with a newline. Blank lines and
 //! surrounding whitespace are ignored when reading. The file only ever grows, and is replaced
@@ -23,92 +23,27 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
-/// The floor's file name, in broca's state root (next to the `wal/` directory).
+/// The floor's file name, in broca's state root.
 pub const FEATURE_FLOOR_FILENAME: &str = "wal-feature-floor";
 
-/// Not a record feature: it names the session store (`broca-session-store`), which keeps each
-/// session under [`crate::features::SESSION_STORAGE_DIR`]. The store raises the floor with
-/// this name before it writes its first session in a state root, so placement then refuses every
-/// build that doesn't know it: one that would serve those sessions from logs it doesn't have.
+/// The session store's format (`broca-session-store`), whose sessions live under the state
+/// root's [`crate::SESSION_STORAGE_DIR`] and its sibling class folders. The store raises the
+/// floor with this name before it writes its first session in a state root, so placement then
+/// refuses every build that predates the session store.
 pub const SESSION_STORAGE_FEATURE: &str = "session-storage/v1";
 
 /// Every feature name this build knows, which `ck-broca --wal-known-features` prints for release
-/// placement to check against the floor. The floor still names features the old log format
-/// recorded; a build serves no such log, and lists their names so the floor written before the
-/// session store doesn't refuse it.
-pub const KNOWN_FEATURES: &[&str] = &[
-    "account-limit-pause/v1",
-    "agent-run-scopes/v1",
-    "archive-index/v2",
-    "auth-selection-method/v1",
-    "bill-attempts/v1",
-    "bill-vault-facts/v1",
-    "chatgpt-codex-wire/v1",
-    "client-message-id/v1",
-    "compaction-ride-wait/v1",
-    "compaction-v2/v1",
-    "compaction-view-meta/v1",
-    "compaction-view-negotiation/v1",
-    "compaction-view/v1",
-    "compaction-wait/v1",
-    "compaction/v1",
-    "context-ceiling/v1",
-    "deferred-call/v1",
-    "delivery-order/v1",
-    "dispatch-module/v1",
-    "flow-scopes/v1",
-    "frame-stamps/v1",
-    "google-rpc-error-details/v1",
-    "input-token-cap/v1",
-    "interrupt-reason/v1",
-    "media-content/v1",
-    "message-marks/v1",
-    "message-times/v1",
-    "openrouter-reasoning/v1",
-    "output-reservation/v1",
-    "plan-manifest/v1",
-    "plan-reference-slots/v1",
-    "provider-declarations/v1",
-    "provider-fallback-block/v1",
-    "provider-held/v1",
-    "provider-text-state/v1",
-    "refusal-fallback/v1",
-    "restart-pause/v1",
-    "retention/v1",
-    "rides-v2/v1",
-    "run-cancel-at/v1",
-    "runner-tags/v1",
-    "runner-tags/v2",
-    "scope/v1",
-    "service-tier-queue/v1",
-    "session-change/v1",
-    "session-class/v1",
-    "session-storage/v1",
-    "speaks-for-name/v1",
-    "steer-queue/v1",
-    "step-transforms/v1",
-    "structured-output-downgrade/v1",
-    "structured-output-paragraph/v1",
-    "structured-output/v1",
-    "tool-name-aliases/v1",
-    "tool-reply/v1",
-    "tool-schema-pins/v1",
-    "tool-times/v1",
-    "turn-directives/v1",
-    "turn-system/v1",
-    "visibility-late/v1",
-    "wal-recovery/v1",
-    "writer-id/v1",
-];
+/// placement to check against the floor.
+pub const KNOWN_FEATURES: &[&str] = &[SESSION_STORAGE_FEATURE];
 
-/// Serializes raises within this process, so two sessions writing their first gated frames at
-/// once cannot each read the old floor and have one rename drop the other's name.
+/// Serializes raises within this process, so two raises at once cannot each read the old floor
+/// and have one rename drop the other's name.
 static RAISE_LOCK: Mutex<()> = Mutex::new(());
 
 // A floor only grows: deleting it or removing names while writers are alive is unsupported.
 // Placement/rollback only reads it, so a successful durability proof remains valid for this
 // process. Key by absolute path to keep distinct state roots (and relative working directories)
-// separate without opening or canonicalizing a file on the append hot path.
+// separate without opening or canonicalizing a file on the session-open path.
 static DURABLE_FLOORS: RwLock<BTreeMap<PathBuf, BTreeSet<String>>> = RwLock::new(BTreeMap::new());
 
 fn memo_covers(path: &Path, names: &[&str]) -> bool {
@@ -126,7 +61,7 @@ fn remember_durable_floor(path: PathBuf, floor: BTreeSet<String>) {
         .insert(path, floor);
 }
 
-/// The names in the floor at `path`. A missing file is an empty floor: nothing gated has been
+/// The names in the floor at `path`. A missing file is an empty floor: no session has been
 /// written here yet. A file that exists but cannot be read is an error, never an empty floor.
 pub fn read_floor(path: &Path) -> std::io::Result<BTreeSet<String>> {
     match fs_ops::read_to_string(path) {
@@ -145,7 +80,7 @@ pub fn read_floor(path: &Path) -> std::io::Result<BTreeSet<String>> {
 ///
 /// Names already proved durable by this process return without filesystem I/O. A cold call
 /// syncs even an already-covered floor; new names are written to a temporary file, synced,
-/// renamed over the floor and directory-synced before the caller writes the gated frame.
+/// renamed over the floor and directory-synced before the caller writes what needs them.
 pub fn raise_floor(path: &Path, names: &[&str]) -> std::io::Result<()> {
     let memo_path = std::path::absolute(path)?;
     if memo_covers(&memo_path, names) {

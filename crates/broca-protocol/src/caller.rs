@@ -402,15 +402,11 @@ pub enum PauseReason {
     /// the intended design is that broca resumes the same run itself when the provider
     /// publishes the call's late result. The reason is informational; which calls the run
     /// waits on is reported separately.
-    ///
-    /// In the WAL this value is must-understand (feature `provider-held/v1`): a build without
-    /// that feature refuses the frame instead of misreading the pause. No production path
-    /// writes it yet, and this build's WAL reader does not list the feature.
     ToolHeld,
 }
 
 impl PauseReason {
-    /// The spelling the WAL and the control stream use.
+    /// The spelling the session store and the control stream use.
     pub fn as_str(self) -> &'static str {
         match self {
             PauseReason::AuthRequired => "auth_required",

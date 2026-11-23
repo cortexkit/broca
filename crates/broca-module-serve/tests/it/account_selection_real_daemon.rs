@@ -1649,8 +1649,7 @@ impl Rig {
     ) -> String {
         let session = broca_session_store::session::Session::create(
             broca_session_store::backend::LocalBackend::new(
-                self.state_root
-                    .join(broca_records::features::SESSION_STORAGE_DIR),
+                self.state_root.join(broca_records::SESSION_STORAGE_DIR),
             ),
             broca_session_store::backend::SessionAddr(broca_core::session_addr(identity)),
             broca_session_store::head::SessionTriple {
@@ -3233,8 +3232,7 @@ async fn store_and_wal_freeze_the_same_auth_selection_for_conversation_keys() {
             let mut selection = if on_store {
                 let session = broca_session_store::session::Session::view(
                     broca_session_store::backend::LocalBackend::new(
-                        rig.state_root
-                            .join(broca_records::features::SESSION_STORAGE_DIR),
+                        rig.state_root.join(broca_records::SESSION_STORAGE_DIR),
                     ),
                     broca_session_store::backend::SessionAddr(broca_core::session_addr(&identity)),
                     &broca_session_store::head::SessionTriple {

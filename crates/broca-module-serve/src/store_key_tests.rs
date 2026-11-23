@@ -48,7 +48,7 @@ async fn key_rig(name: &str) -> KeyRig {
     std::fs::create_dir_all(&root).unwrap();
     let held = BindIdentity::new(root.join("project"), "runner", "held");
     broca_session_store::session::Session::create(
-        broca_session_store::backend::LocalBackend::new(root.join(broca_records::features::SESSION_STORAGE_DIR)),
+        broca_session_store::backend::LocalBackend::new(root.join(broca_records::SESSION_STORAGE_DIR)),
         broca_session_store::backend::SessionAddr(broca_core::session_addr(&held)),
         broca_session_store::head::SessionTriple {
             project_root: held.project_root.display().to_string(),
