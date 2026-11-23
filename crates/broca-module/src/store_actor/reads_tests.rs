@@ -535,7 +535,9 @@ impl Module {
     }
 
     /// Sends `request`, already shaped as the module's caller sends it. Kept apart from
-    /// [`Self::send`], whose future `submission_admission_future_stays_small` measures.
+    /// [`Self::send`], whose future `submission_admission_future_stays_small` measures. Only the
+    /// retention-clock tests send a shaped request.
+    #[cfg(feature = "test-clock")]
     async fn submit(
         &self,
         run_id: &str,
