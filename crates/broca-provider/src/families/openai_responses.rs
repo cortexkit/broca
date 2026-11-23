@@ -300,11 +300,26 @@ fn render_prepared_body<'a>(
     let instructions = instructions_from_policy(&opts.prompt, frozen.system_prompt.clone());
     let developer_message = frozen.system_prompt == SystemPromptPolicy::DeveloperMessage;
     let mut provenance = provenance;
+    // A fork's ask that lowers its effort sends it as an update before its question, the
+    // prompt's last message, so only its answer uses it (see `effort_change::answer_effort`).
+    let answer_update = opts
+        .render_episodes
+        .answer_effort
+        .as_ref()
+        .filter(|_| super::openai_responses_chatgpt::takes_effort_updates(frozen))
+        .map(|effort| super::openai_responses_chatgpt::EffortUpdate {
+            before: 0,
+            effort: effort.clone(),
+            synthetic_user: false,
+        });
     let mut input = convert_input_items_with_provenance(
         &opts.prompt,
         frozen.system_prompt.clone(),
         &name_map,
-        updates,
+        EffortUpdates {
+            per_run: updates,
+            answer: answer_update.as_ref(),
+        },
         &ReplayPolicy {
             target_model: opts.target_model.as_ref(),
             target_family: frozen.family_id,
@@ -491,7 +506,7 @@ fn convert_input_items_with_provenance<'a>(
     prompt: &'a [Message],
     system_policy: SystemPromptPolicy,
     name_map: &crate::tool_name_alias::ToolNameMap,
-    updates: &[super::openai_responses_chatgpt::EffortUpdate],
+    updates: EffortUpdates<'_>,
     replay: &ReplayPolicy<'_>,
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
@@ -501,7 +516,8 @@ fn convert_input_items_with_provenance<'a>(
         SystemPromptPolicy::InstructionsField | SystemPromptPolicy::DeveloperMessage
     );
     let mut out = Vec::new();
-    let mut updates = updates.iter().peekable();
+    let answer_update = updates.answer;
+    let mut updates = updates.per_run.iter().peekable();
     let has_ordinals = prompt.iter().any(|message| message.ordinal.is_some());
     for (index, message) in prompt.iter().enumerate() {
         // Synthetic transform rows have no durable position and must not move an episode update.
@@ -528,6 +544,15 @@ fn convert_input_items_with_provenance<'a>(
         if skip_system && message.role == Role::System && !message.turn_system {
             continue;
         }
+        if let Some(update) =
+            answer_update.filter(|_| index + 1 == prompt.len() && message.role == Role::User)
+        {
+            let start = provenance.as_ref().map(|_| out.len());
+            append_effort_update(&mut out, update, true);
+            if let Some((sink, start)) = provenance.as_deref_mut().zip(start) {
+                sink.record_messages(start, out.len(), None);
+            }
+        }
         let start = provenance.as_ref().map(|_| out.len());
         match message.role {
             Role::System | Role::User => out.push(convert_easy_message(message, media)),
@@ -546,6 +571,14 @@ fn convert_input_items_with_provenance<'a>(
         }
     }
     out
+}
+
+/// The effort updates a request's input carries: one per run whose effort changed while
+/// keeping the cache, each before its run's first user message, and a fork ask's lowered
+/// effort for its answer alone, right before its question.
+struct EffortUpdates<'u> {
+    per_run: &'u [super::openai_responses_chatgpt::EffortUpdate],
+    answer: Option<&'u super::openai_responses_chatgpt::EffortUpdate>,
 }
 
 fn append_effort_update(

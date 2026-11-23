@@ -539,8 +539,7 @@ pub fn broca_role_describe_with_writers(
     }
     if broca_protocol::FORK_ANSWER_SERVED {
         // Served for heads kept in the session store (`broca_session_store`), where heads are
-        // created; a head not yet converted from a write-ahead log refuses each op with
-        // fork_unsupported.
+        // created.
         ops.extend(
             [
                 cortexkit_role_llm_runner::ops::SESSION_FORK_PREPARE,
@@ -550,6 +549,9 @@ pub fn broca_role_describe_with_writers(
             .map(String::from),
         );
         capabilities.push(cortexkit_role_llm_runner::capabilities::FORK_ANSWER.into());
+        // An ask's effort hint lowers the answer's effort only where the model keeps its cache
+        // (`broca_provider::effort_change::answer_effort`).
+        capabilities.push(cortexkit_role_llm_runner::capabilities::FORK_EFFORT.into());
     }
     let mut describe = cortexkit_role_llm_runner::describe::RoleDescribe::new(
         vec![Major {
@@ -1561,7 +1563,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "daedb2cc632f140b25d28d24ed045d8c143da847b1f9f02a602bec0165026801",
+            "f327c79644ce7769677c392d3ca21abc432d1b63ad4caecb38db1af07a60097b",
         );
     }
 
@@ -1761,7 +1763,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "a45680369323e281f4043211bfe07d3e575035d5a74c2985d9595e914b515f6a";
+        "246be3caf5d2319693d012f4605f8ef4a6f4690ccdb7836394ac8b49df51926c";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

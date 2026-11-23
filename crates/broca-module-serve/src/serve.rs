@@ -4840,9 +4840,9 @@ where
                     .await;
                 }
             };
-            // Broca declares neither `fork_effort` nor `fork_tools` (a fork renders at its source
-            // session's effort, with no tools): an effort hint, tool list or framing is unknown.
-            let undeclared = request.check_effort::<&str>(&[]);
+            // Broca declares `fork_effort` but not `fork_tools`: a tool list or framing is unknown.
+            let undeclared =
+                request.check_effort(&[cortexkit_role_llm_runner::capabilities::FORK_EFFORT]);
             if let Err(field) = undeclared.and_then(|()| request.check_tools::<&str>(&[])) {
                 return send_invalid_params(
                     writer,
@@ -4851,7 +4851,7 @@ where
                     epoch,
                     corr,
                     Some(field.to_owned()),
-                    "this runner takes no effort hint, tools or framing on session.fork_ask",
+                    "this runner takes no tools or framing on session.fork_ask",
                 )
                 .await;
             }

@@ -689,6 +689,8 @@ async fn a_forks_session_is_deleted_once_its_records_say_it_may_be() {
         idle_ms: None,
         retain_ms: None,
         detail: None,
+        effort: None,
+        effort_applied: None,
     };
     const IDLE_MS: u64 = 600_000;
     const RETAIN_MS: u64 = 3_600_000;

@@ -872,13 +872,8 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
         assert_eq!(code(&error), "invalid_params", "{method}");
         assert_eq!(error["detail"]["field"], "unexpected", "{method}");
     }
-    // Broca declares no `fork_effort`, so an effort hint, valid or not, is an unknown member.
-    for effort in [
-        json!("low"),
-        json!("medium"),
-        json!("high"),
-        json!("minimal"),
-    ] {
+    // Broca declares `fork_effort`, whose hints are closed: one outside them is refused.
+    for effort in [json!("minimal"), json!("max"), json!(2)] {
         let error = rig
             .call(
                 1,
@@ -1040,6 +1035,16 @@ async fn a_fork_answers_replays_and_ends_without_touching_the_head() {
         ),
         "ask_id_reuse"
     );
+    // The same question with an effort hint is a different ask too.
+    let hinted = rig
+        .call(
+            1,
+            "session.fork_ask",
+            json!({"fork_id": fork, "ask_id": "one", "question": "What changed?", "effort": "low"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&hinted), "ask_id_reuse");
     assert_eq!(rig.forks.calls().len(), 1);
 
     // A later ask carries the fork's conversation, on the same base.
@@ -1296,6 +1301,30 @@ async fn a_finished_answer_follows_the_base_and_a_cut_off_one_does_not() {
     // An answer cut off at the output limit isn't the head's to carry on as it is.
     assert_eq!(texts(&call.base), [SYSTEM, "hello"]);
     assert_eq!(call.base_digest, rendered_digest(&call.base));
+}
+
+/// A hint lowers an answer's effort only where the head's model keeps its cache across the
+/// change. The rig's head runs with no render config of its own, so the hint is taken and
+/// changes nothing: the call carries no answer effort and the reply names none.
+#[tokio::test]
+async fn an_effort_hint_the_head_cannot_take_leaves_the_answer_as_it_is() {
+    let mut rig = Rig::head("hint", vec![text_step("a", "head reply")]).await;
+    let fork = rig.prepare(1).await.unwrap();
+    rig.forks.answer(answered("one"));
+    let reply = rig
+        .call(
+            1,
+            "session.fork_ask",
+            json!({"fork_id": fork, "ask_id": "one", "question": "q", "effort": "low"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply["answer"], "one");
+    assert!(reply.get("effort_applied").is_none(), "{reply}");
+    assert_eq!(
+        rig.forks.calls()[0].request.render_episodes.answer_effort,
+        None
+    );
 }
 
 #[tokio::test]

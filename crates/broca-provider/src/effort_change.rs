@@ -40,7 +40,7 @@ pub fn keeps_cache(frozen: &FrozenRenderConfig) -> bool {
 /// Haiku 5.5 with thinking disabled answer 400), and only with its beta: a Claude Code persona
 /// request on a model its requests send `per-turn-control` for, or an api-key request, which adds
 /// [`PER_MESSAGE_EFFORT_BETA`].
-fn per_message_effort(frozen: &FrozenRenderConfig) -> bool {
+pub(crate) fn per_message_effort(frozen: &FrozenRenderConfig) -> bool {
     let adaptive = matches!(
         &frozen.variant,
         Some(FrozenVariant {
@@ -91,6 +91,32 @@ fn anthropic_effort(frozen: &FrozenRenderConfig) -> Option<&str> {
         }) => effort.as_deref(),
         _ => None,
     }
+}
+
+/// Reasoning efforts from least to most, as the providers spell them.
+const EFFORT_ORDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// The effort a fork's ask sends for its answer alone, given its caller's `hint` (llm-runner
+/// `fork_answer.effort_policy`), for a request whose run froze `frozen`: the hint, when it is
+/// lower than the effort the run froze, the catalog said an effort change keeps the model's
+/// cached prefix ([`keeps_cache`]), and the route has a form that changes the effort for one
+/// answer without touching the request's own settings: Anthropic's per-message effort, or
+/// OpenAI's input configuration update on a model that takes one. `None` otherwise, including
+/// for an effort that can't be ordered against the hint: the ask then runs at the run's own
+/// effort, never a guessed or a higher one.
+pub fn answer_effort(frozen: &FrozenRenderConfig, hint: &str) -> Option<String> {
+    let frozen_effort = match frozen.family_id {
+        WireFamilyId::AnthropicMessages if per_message_effort(frozen) => anthropic_effort(frozen)?,
+        WireFamilyId::OpenAiResponses | WireFamilyId::OpenAiResponsesChatgpt
+            if keeps_cache(frozen)
+                && crate::families::openai_responses_chatgpt::takes_effort_updates(frozen) =>
+        {
+            crate::families::openai_responses_chatgpt::responses_effort(frozen)?
+        }
+        _ => return None,
+    };
+    let rank = |effort: &str| EFFORT_ORDER.iter().position(|known| *known == effort);
+    (rank(hint)? < rank(frozen_effort)?).then(|| hint.to_owned())
 }
 
 /// One run's effort change, sent as a per-message effort.

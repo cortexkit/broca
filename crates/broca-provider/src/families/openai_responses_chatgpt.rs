@@ -127,6 +127,20 @@ pub(crate) fn takes_effort_updates(frozen: &FrozenRenderConfig) -> bool {
     })
 }
 
+/// The reasoning effort a Responses run sends at the request's top level: the effort it froze,
+/// else its reasoning policy's.
+pub(crate) fn responses_effort(config: &FrozenRenderConfig) -> Option<&str> {
+    config
+        .reasoning_effort
+        .as_deref()
+        .or(match &config.reasoning {
+            crate::policy::ReasoningPolicy::OpenAiResponsesReasoning { effort, .. } => {
+                Some(effort.as_str())
+            }
+            _ => None,
+        })
+}
+
 /// Whether a run recorded `config` with input configuration updates on: the ChatGPT backend's
 /// own flag, or on the platform API the run's catalog fact that effort changes keep the cache
 /// (both absent from configs recorded before the run could send updates).
@@ -164,22 +178,11 @@ pub(crate) fn effort_plan(
     {
         return None;
     }
-    fn effort(config: &FrozenRenderConfig) -> Option<&str> {
-        config
-            .reasoning_effort
-            .as_deref()
-            .or(match &config.reasoning {
-                crate::policy::ReasoningPolicy::OpenAiResponsesReasoning { effort, .. } => {
-                    Some(effort.as_str())
-                }
-                _ => None,
-            })
-    }
-    let anchor = effort(first)?.to_owned();
+    let anchor = responses_effort(first)?.to_owned();
     let mut in_force = anchor.as_str();
     let mut updates = Vec::new();
     for (episode, config) in opts.render_episodes.iter().zip(&configs).skip(1) {
-        let next = effort(config)?;
+        let next = responses_effort(config)?;
         if next != in_force {
             if !renders_effort_updates(config) {
                 return None;

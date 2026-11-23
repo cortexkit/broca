@@ -1317,6 +1317,13 @@ message! {
         14 opt retain_ms: u64,
         /// Owned by the fork's server: why an attempt was refused, and other facts no fold reads.
         15 opt detail: serde_json::Value,
+        /// The effort hint the ask's caller sent (llm-runner `fork_effort`), on the attempt's
+        /// `AskStarted`. Part of the ask's identity: a stored answer replays only for the same
+        /// hint, or for none when the ask sent none.
+        16 opt effort: String,
+        /// The lowered effort the attempt sent for its answer, on its `AskFinished`. Absent when
+        /// the hint changed nothing.
+        17 opt effort_applied: String,
     }
 }
 

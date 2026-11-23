@@ -51,6 +51,9 @@ pub struct Ask {
     /// The question of the ask's latest attempt. An ask whose answer is stored keeps the question
     /// that answer answered.
     pub question: String,
+    /// The effort hint of the ask's latest attempt, kept like its question: part of the ask's
+    /// identity, so a stored answer replays only for the same hint or the same absence of one.
+    pub effort: Option<String>,
     /// How many attempts have begun for the ask.
     pub attempts: u64,
     /// The stored answer, which every later ask with the same id and question replays.
@@ -64,6 +67,8 @@ pub struct StoredAnswer {
     pub finish: String,
     /// llm-runner `RunUsage` JSON.
     pub usage: serde_json::Value,
+    /// The lowered effort the answer was given at, when the ask's hint lowered it.
+    pub effort_applied: Option<String>,
     pub at_ms: u64,
 }
 
@@ -161,6 +166,7 @@ impl ForkState {
                 let question = fork.question.clone().ok_or_else(|| missing("question"))?;
                 let ask = self.asks.entry(ask_id.clone()).or_insert_with(|| Ask {
                     question: question.clone(),
+                    effort: None,
                     attempts: 0,
                     answer: None,
                 });
@@ -177,6 +183,7 @@ impl ForkState {
                 }
                 ask.attempts = attempt;
                 ask.question.clone_from(&question);
+                ask.effort.clone_from(&fork.effort);
                 if let Some(admission) = &fork.admission_id {
                     self.unreleased.insert(admission.clone());
                 }
@@ -213,6 +220,7 @@ impl ForkState {
                     answer,
                     finish,
                     usage,
+                    effort_applied: fork.effort_applied.clone(),
                     at_ms: fork.at_ms,
                 });
                 self.expiry_basis_ms = self.expiry_basis_ms.max(fork.at_ms);

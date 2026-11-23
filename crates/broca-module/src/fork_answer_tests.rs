@@ -53,3 +53,23 @@ fn account_refusals_carry_the_contract_detail() {
     );
     assert_eq!(ForkError::UnknownFork.detail(), None);
 }
+
+/// An ask's hint lowers its answer's effort through the provider's rule, read from the render
+/// config the base's run froze; a run with none lowers nothing.
+#[test]
+fn an_ask_lowers_its_effort_from_the_base_runs_frozen_config() {
+    use broca_provider::variant::{FrozenVariant, VariantRequest};
+    let mut opus = broca_provider::families::anthropic_apikey_frozen_config("claude-opus-5-5");
+    opus.effort_change_cache = true;
+    opus.variant = Some(FrozenVariant {
+        name: "high".into(),
+        request: VariantRequest::Anthropic {
+            thinking: Some(json!({"type": "adaptive"})),
+            effort: Some("high".into()),
+        },
+    });
+    let frozen = serde_json::to_value(&opus).unwrap();
+    assert_eq!(lowered_effort(&frozen, "low").as_deref(), Some("low"));
+    assert_eq!(lowered_effort(&frozen, "high"), None);
+    assert_eq!(lowered_effort(&Value::Null, "low"), None);
+}

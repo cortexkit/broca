@@ -171,3 +171,80 @@ fn a_platform_gpt6_effort_change_goes_in_as_a_configuration_update() {
     assert_eq!(body["reasoning"]["effort"], "low");
     assert!(!body["input"].to_string().contains("configuration_update"));
 }
+
+/// A fork's ask lowers its answer's effort only below the run's own, and only where the model
+/// keeps its cache across the change; a hint at or above the run's effort, or on a model the
+/// catalog didn't vouch for, sends the run's effort.
+#[test]
+fn a_fork_ask_lowers_its_answer_effort_only_where_the_cache_holds() {
+    assert_eq!(answer_effort(&opus("high"), "low").as_deref(), Some("low"));
+    assert_eq!(answer_effort(&opus("high"), "high"), None, "not lower");
+    assert_eq!(answer_effort(&opus("medium"), "high"), None, "never higher");
+    let mut no_fact = opus("high");
+    no_fact.effort_change_cache = false;
+    assert_eq!(
+        answer_effort(&no_fact, "low"),
+        None,
+        "the cache would be lost"
+    );
+    assert_eq!(
+        answer_effort(&opus("high"), "unheard-of"),
+        None,
+        "can't be ordered"
+    );
+}
+
+/// The lowered effort goes after the question as a per-message effort, so every byte before it
+/// is the request without the hint, and the top level keeps the run's effort.
+#[test]
+fn a_fork_answer_effort_follows_the_question_and_keeps_the_prefix() {
+    let frozen = opus("high");
+    let plain = request(std::slice::from_ref(&frozen));
+    let mut lowered = plain.clone();
+    std::sync::Arc::make_mut(&mut lowered.render_episodes).answer_effort = Some("low".into());
+    let parse = |opts: &CallOptions| -> Value {
+        serde_json::from_slice(&AnthropicMessages.render(&frozen, opts)).unwrap()
+    };
+    let (plain, lowered) = (parse(&plain), parse(&lowered));
+    assert_eq!(lowered["output_config"], json!({"effort": "high"}));
+    let before = plain["messages"].as_array().unwrap();
+    let after = lowered["messages"].as_array().unwrap();
+    assert_eq!(&after[..before.len()], &before[..]);
+    assert_eq!(after.len(), before.len() + 1);
+    assert_eq!(
+        after.last().unwrap(),
+        &json!({"role": "system", "content": [], "output_config": {"effort": "low"}})
+    );
+}
+
+/// On GPT-6 the lowered effort is a configuration update right before the question, the
+/// prompt's last message; the top-level effort stays the run's.
+#[test]
+fn a_fork_answer_effort_on_gpt6_is_an_update_before_the_question() {
+    use crate::families::{openai_responses::OpenAiResponses, openai_responses_frozen_config};
+    let mut frozen = openai_responses_frozen_config("gpt-6.2-sol");
+    frozen.reasoning = crate::policy::ReasoningPolicy::OpenAiResponsesReasoning {
+        effort: "high".into(),
+        summary: Some("auto".into()),
+    };
+    frozen.effort_change_cache = true;
+    let hint = answer_effort(&frozen, "low");
+    assert_eq!(hint.as_deref(), Some("low"));
+    let mut opts = request(std::slice::from_ref(&frozen));
+    std::sync::Arc::make_mut(&mut opts.render_episodes).answer_effort = hint;
+    let body: Value = serde_json::from_slice(&OpenAiResponses.render(&frozen, &opts)).unwrap();
+    assert_eq!(body["reasoning"]["effort"], "high");
+    let input = body["input"].as_array().unwrap();
+    let question = input.len() - 1;
+    assert!(
+        input[question - 1]
+            .to_string()
+            .contains("configuration_update")
+            && input[question - 1].to_string().contains("low"),
+        "{input:#?}"
+    );
+    assert!(
+        input[question].to_string().contains("question 1"),
+        "{input:#?}"
+    );
+}

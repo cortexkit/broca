@@ -271,6 +271,12 @@ pub struct RenderHistory {
     /// record by `broca_core::signed_floor`, never from memory, so a resumed or rebuilt request
     /// renders the same bytes.
     pub signed_floor: Option<u64>,
+    /// An effort for this request's answer alone, lower than the one its run froze: a fork's
+    /// ask that lowers its effort (llm-runner `fork_answer.effort_policy`). A renderer sends it
+    /// in the provider's form that changes the effort for one answer and leaves the request's
+    /// own settings and every earlier byte alone, so the cached prefix holds. Absent for every
+    /// other request.
+    pub answer_effort: Option<String>,
 }
 
 impl From<Vec<EpisodeRenderInput>> for RenderHistory {
@@ -280,6 +286,7 @@ impl From<Vec<EpisodeRenderInput>> for RenderHistory {
             raw_ordinals: false,
             compaction_prefix_len: None,
             signed_floor: None,
+            answer_effort: None,
         }
     }
 }

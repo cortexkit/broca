@@ -1091,6 +1091,8 @@ mod records {
         idle_ms,
         retain_ms,
         detail,
+        effort,
+        effort_applied,
     });
     crate::fuzzing::gen::fields!(Retention {
         event,

@@ -365,6 +365,8 @@ fn a_fork_fact_keeps_its_kind_number_and_bytes() {
         idle_ms: None,
         retain_ms: None,
         detail: None,
+        effort: None,
+        effort_applied: None,
     });
     assert_eq!(record.kind(), 107);
     assert_eq!(record.stream(), Stream::Ledger);

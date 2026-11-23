@@ -799,6 +799,13 @@ fn render_placed<R>(
         placed.push((message, prefix_blocks, Some(prompt_index)));
     }
     placed.extend(efforts.map(|effort| (effort_message(&effort.effort), None, None)));
+    // A fork's ask that lowers its effort sets it after the whole prompt, so only its answer
+    // uses it (see `effort_change::answer_effort`).
+    if let Some(effort) = opts.render_episodes.answer_effort.as_deref() {
+        if crate::effort_change::per_message_effort(frozen) {
+            placed.push((effort_message(effort), None, None));
+        }
+    }
 
     // Keep only surviving message identities. System messages are coalesced into the
     // separate system field, and an empty rendered message has no wire-message index.

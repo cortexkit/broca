@@ -24,6 +24,8 @@ fn fact(event: ForkEvent, at_ms: u64) -> Fork {
         idle_ms: None,
         retain_ms: None,
         detail: None,
+        effort: None,
+        effort_applied: None,
     }
 }
 

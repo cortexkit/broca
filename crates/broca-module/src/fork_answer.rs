@@ -40,7 +40,8 @@ use broca_session_store::session::{Session, SessionError};
 use crate::store_actor::recorded_warm::Through;
 use broca_records::session_storage::StorageClass;
 use cortexkit_role_llm_runner::fork_answer::{
-    ForkAskReply, ForkAskRequest, ForkEndReply, ForkEndRequest, ForkFinish, ForkPrepareReply,
+    ForkAskReply, ForkAskRequest, ForkEffort, ForkEndReply, ForkEndRequest, ForkFinish,
+    ForkPrepareReply,
 };
 use cortexkit_role_llm_runner::usage::RunUsage;
 use serde_json::{json, Value};
@@ -117,7 +118,9 @@ impl ForkError {
             Self::UnknownFork => "no such fork".into(),
             Self::ForkEnded => "the fork has ended".into(),
             Self::ForkBusy => "another ask is in flight on the fork".into(),
-            Self::AskIdReuse => "the ask id was used for a different question".into(),
+            Self::AskIdReuse => {
+                "the ask id was used for a different question or effort hint".into()
+            }
             Self::BaseUnavailable(reason) => {
                 format!("the fork's base request is unavailable: {reason}")
             }
@@ -214,6 +217,8 @@ fn record(fork_id: &str, event: ForkEvent, at_ms: u64) -> Fork {
         idle_ms: None,
         retain_ms: None,
         detail: None,
+        effort: None,
+        effort_applied: None,
     }
 }
 
@@ -835,11 +840,12 @@ impl ForkManager {
         request: ForkAskRequest,
     ) -> Result<ForkAskReply, ForkError> {
         let caller = caller_of(principal);
+        let hint = request.effort.map(effort_name);
         let mut fork = entry.lock().await;
         self.check_caller(&mut fork, head, caller).await?;
         if let Some(ask) = fork.state.asks.get(&request.ask_id) {
             if let Some(answer) = &ask.answer {
-                if ask.question != request.question {
+                if ask.question != request.question || ask.effort != hint {
                     return Err(ForkError::AskIdReuse);
                 }
                 return stored_reply(answer);
@@ -862,6 +868,9 @@ impl ForkManager {
             .ok_or_else(|| ForkError::BaseUnavailable("the head is gone".into()))?;
         let rebuilt = self.rebuild_base(&read, &base).await?;
         drop(read);
+        let applied = hint
+            .as_deref()
+            .and_then(|hint| lowered_effort(&rebuilt.config.frozen_render_config, hint));
         let fork_id = fork.state.fork_id.clone();
         let attempt = fork
             .state
@@ -874,10 +883,16 @@ impl ForkManager {
         started.ask_id = Some(request.ask_id.clone());
         started.attempt = Some(attempt);
         started.question = Some(request.question.clone());
+        started.effort.clone_from(&hint);
         started.admission_id = Some(admission_id.clone());
         fork.append(vec![started]).await?;
         fork.running = true;
-        let call = fork_request(&rebuilt.opts, &fork.state.branch, &request.question);
+        let mut call = fork_request(&rebuilt.opts, &fork.state.branch, &request.question);
+        if applied.is_some() {
+            Arc::make_mut(&mut call.render_episodes)
+                .answer_effort
+                .clone_from(&applied);
+        }
         let conversation_key =
             head_conversation_key(&rebuilt.config).map(|key| fork_conversation_key(&fork_id, key));
         drop(fork);
@@ -970,13 +985,17 @@ impl ForkManager {
                 finished.answer = Some(answer.clone());
                 finished.finish = Some(finish.clone());
                 finished.usage = Some(usage_value(&usage));
+                finished.effort_applied.clone_from(&applied);
                 finished.detail = spend_detail(&spent);
                 facts.push(finished);
                 // A reply that called a tool ends the fork: its answer stands as given.
                 if refused && fork.state.ended_at_ms.is_none() {
                     facts.push(record(&fork_id, ForkEvent::Ended, now));
                 }
-                Ok(ForkAskReply::new(answer, ForkFinish::parse(&finish), usage))
+                Ok(with_effort(
+                    ForkAskReply::new(answer, ForkFinish::parse(&finish), usage),
+                    applied.as_deref(),
+                ))
             }
             ForkCallOutcome::ModelFailed { usage, error } => {
                 let mut finished = record(&fork_id, ForkEvent::AskFinished, now);
@@ -985,13 +1004,17 @@ impl ForkManager {
                 finished.answer = Some(String::new());
                 finished.finish = Some(FINISH_MODEL_ERROR.into());
                 finished.usage = Some(usage_value(&usage));
+                finished.effort_applied.clone_from(&applied);
                 let mut detail = json!({ "error": error });
                 if let Some(spend) = spend_detail(&spent) {
                     detail[SPEND] = spend[SPEND].clone();
                 }
                 finished.detail = Some(detail);
                 facts.push(finished);
-                Ok(ForkAskReply::new("", ForkFinish::ModelError, usage))
+                Ok(with_effort(
+                    ForkAskReply::new("", ForkFinish::ModelError, usage),
+                    applied.as_deref(),
+                ))
             }
             ForkCallOutcome::Refused(refusal) => {
                 let error = match refusal {
@@ -1071,11 +1094,38 @@ impl ForkManager {
 fn stored_reply(answer: &crate::fork_state::StoredAnswer) -> Result<ForkAskReply, ForkError> {
     let usage: RunUsage = serde_json::from_value(answer.usage.clone())
         .map_err(|error| ForkError::Transient(format!("a stored answer's usage: {error}")))?;
-    Ok(ForkAskReply::new(
-        answer.answer.clone(),
-        ForkFinish::parse(&answer.finish),
-        usage,
+    Ok(with_effort(
+        ForkAskReply::new(
+            answer.answer.clone(),
+            ForkFinish::parse(&answer.finish),
+            usage,
+        ),
+        answer.effort_applied.as_deref(),
     ))
+}
+
+/// The wire spelling of an ask's effort hint: `low`, `medium` or `high`.
+fn effort_name(effort: ForkEffort) -> String {
+    serde_json::to_value(effort)
+        .ok()
+        .and_then(|name| name.as_str().map(str::to_owned))
+        .expect("an effort hint spells as a string")
+}
+
+/// `reply` naming the lowered effort its answer was given at, if any (llm-runner
+/// `fork_answer.effort_applied_values`).
+fn with_effort(mut reply: ForkAskReply, applied: Option<&str>) -> ForkAskReply {
+    reply.effort_applied = applied.and_then(|effort| serde_json::from_value(json!(effort)).ok());
+    reply
+}
+
+/// The effort an ask with `hint` sends for its answer, for a base whose run froze the render
+/// config `frozen`: `broca_provider::effort_change::answer_effort`, which lowers only where the
+/// model keeps its cache. A run with no render config of its own lowers nothing.
+fn lowered_effort(frozen: &Value, hint: &str) -> Option<String> {
+    let frozen: broca_provider::wire::FrozenRenderConfig =
+        serde_json::from_value(frozen.clone()).ok()?;
+    broca_provider::effort_change::answer_effort(&frozen, hint)
 }
 
 #[cfg(test)]
