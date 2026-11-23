@@ -332,6 +332,30 @@ fn remember_in(memo: &mut GrammarMemo, key: (String, [u8; 32])) {
     }
 }
 
+/// Puts a session's own record of a compiler refusal into the process memo. The memo is lost
+/// when broca restarts, but the session keeps the refusal: its run froze the downgrade at its
+/// start (`frozen_render_config` names the reason) or downgraded while it ran
+/// (`downgraded_while_running`). Without this, the session's first run admitted after a restart
+/// offers the strict submit tool again. Its tools then differ from those the session's earlier
+/// signed reasoning was made with, which Anthropic refuses, and the provider refuses the schema
+/// once more anyway.
+pub fn remember_session_refusal(frozen_render_config: &Value, downgraded_while_running: bool) {
+    let Some(so) = FrozenStructuredOutput::from_frozen_render_config(Some(frozen_render_config))
+    else {
+        return;
+    };
+    let refused = downgraded_while_running
+        || so.reason.as_deref() == Some(broca_protocol::structured_output::GRAMMAR_TOO_LARGE);
+    if let (true, Some(model)) = (
+        refused,
+        frozen_render_config
+            .get("wire_model_id")
+            .and_then(Value::as_str),
+    ) {
+        remember_grammar_refusal(model, &so.schema_jcs);
+    }
+}
+
 /// Only fresh admission consults the process memo. Resumes use the recorded decision even
 /// if another run in this process has since encountered the same compiler refusal.
 pub fn apply_grammar_memo(model: &str, frozen: &mut FrozenStructuredOutput) {
@@ -997,6 +1021,43 @@ mod tests {
             remember_in(&mut isolated, memo_key("bounded-test", &format!("{i}")));
         }
         assert_eq!(isolated.len(), 128);
+    }
+
+    /// A session remembers a compiler refusal across a restart, which empties the process memo:
+    /// its latest run's config, downgraded at the run's start or while it ran, puts the refusal
+    /// back for the next run of the same model and schema. A run that was never refused adds
+    /// nothing.
+    #[test]
+    fn a_sessions_own_refusal_reaches_the_memo() {
+        let strict = || {
+            decide(
+                WireFamilyId::AnthropicMessages,
+                "anthropic",
+                None,
+                CapabilityFlag::Known(true),
+                &request(Mode::SubmitTool, closed()),
+            )
+            .unwrap()
+        };
+        let config = |model: &str, so: &FrozenStructuredOutput| json!({"wire_model_id": model, "structured_output": so});
+        let mut at_start = strict();
+        at_start.downgrade_grammar();
+        remember_session_refusal(&config("session-memo-start", &at_start), false);
+        remember_session_refusal(&config("session-memo-running", &strict()), true);
+        remember_session_refusal(&config("session-memo-never", &strict()), false);
+        for (model, downgraded) in [
+            ("session-memo-start", true),
+            ("session-memo-running", true),
+            ("session-memo-never", false),
+        ] {
+            let mut next = strict();
+            apply_grammar_memo(model, &mut next);
+            assert_eq!(
+                next.delivery == SchemaDelivery::Unconstrained,
+                downgraded,
+                "{model}"
+            );
+        }
     }
 
     #[test]

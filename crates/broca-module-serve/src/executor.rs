@@ -1192,9 +1192,15 @@ async fn store_history(
                     run.run_id
                 ))
             })?;
+            let config = store_prior_config(run, start, parts)?;
+            // The session's record of a schema refusal outlives the process memo of refusals.
+            broca_provider::structured_output::remember_session_refusal(
+                &config.frozen_render_config,
+                run.structured_downgraded,
+            );
             Some(PriorRunView {
                 run_id: broca_protocol::RunId(run.run_id.clone()),
-                config: store_prior_config(run, start, parts)?,
+                config,
                 idle: run.finished.is_some(),
                 moved,
                 records_account_change:

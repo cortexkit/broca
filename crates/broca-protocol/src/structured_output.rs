@@ -99,12 +99,15 @@ pub struct FrozenStructuredOutput {
     pub instructions_paragraph_break: bool,
 }
 
+/// The `reason` of a strict schema downgraded after the provider refused to compile it.
+pub const GRAMMAR_TOO_LARGE: &str = "grammar_too_large";
+
 impl FrozenStructuredOutput {
     /// Anthropic's JSON output schema has no non-strict form. After a compilation refusal,
     /// final-text runs use prompt instructions while submit-tool runs omit the strict flag.
     pub fn downgrade_grammar(&mut self) {
         self.enforcement = enforcement::BEST_EFFORT.to_owned();
-        self.reason = Some("grammar_too_large".to_owned());
+        self.reason = Some(GRAMMAR_TOO_LARGE.to_owned());
         self.delivery = SchemaDelivery::Unconstrained;
     }
 
