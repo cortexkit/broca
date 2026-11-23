@@ -279,6 +279,7 @@ pub fn token_family_id(model: &str, api: image::Api) -> String {
         Family::ClaudeV47 | Family::ClaudeV5 | Family::ClaudeV5Sonnet => {
             ("claude-opus-5", image::Api::Other)
         }
+        Family::Gemini => ("gemini-3-pro", image::Api::Google),
         _ => ("", image::Api::Other),
     };
     let rule = image::rule_for(model, api);
@@ -514,6 +515,21 @@ mod tests {
             )
         );
         assert!(!single.exact);
+    }
+
+    /// Gemini 3 counts with its own exact family, and Gemini's per-image rule is that family's
+    /// default, so the label carries no image suffix: a provider that keeps counts per label
+    /// would otherwise read one family as two.
+    #[test]
+    fn gemini_heads_count_with_the_exact_gemini_family() {
+        assert!(family_for_model("gemini-3-pro").exact);
+        for model in ["gemini-3-pro", "google/gemini-3.1-pro"] {
+            assert_eq!(
+                token_family_id(model, image::Api::Google),
+                "gemini/1",
+                "{model}"
+            );
+        }
     }
 
     #[test]
