@@ -142,7 +142,10 @@ impl SubcCompactionPlane {
                 false,
             )
             .await
-            .map_err(|_| CompactionUnavailable)
+            .map_err(|error| {
+                log_unanswered(provider, ops::COMPACTION_SETUP, &error);
+                CompactionUnavailable
+            })
     }
 
     pub async fn close_session_routes(&self, bind: &BindIdentity) {
@@ -209,6 +212,27 @@ pub(crate) fn describe_refusal_is_routing(code: &str) -> bool {
     )
 }
 
+/// Logs a compaction call that broca counts as unanswered, with why: the daemon knew no such
+/// module, a refusal on the way (such as a route the daemon would not open yet), or a call lost
+/// in transport or out of time. The runtime only sees "no answer" and retries; this line is how
+/// a provider that never saw the call can tell a closed route from its own slow start.
+fn log_unanswered(provider: &str, method: &str, error: &FetchError) {
+    let (kind, code) = match error {
+        FetchError::UnknownModule => ("unknown_module", ""),
+        FetchError::Refused { code, .. } => ("refused", code.as_str()),
+        FetchError::ProviderRefused { code, .. } => ("provider_refused", code.as_str()),
+        FetchError::Lost(reason) => ("lost", reason.as_str()),
+    };
+    tracing::info!(
+        target: "broca.compaction",
+        provider,
+        method,
+        kind,
+        code,
+        "compaction call got no answer"
+    );
+}
+
 fn bounded(deadline: Instant) -> Instant {
     deadline.min(Instant::now() + Duration::from_millis(COMPACTION_CALL_BUDGET_MS))
 }
@@ -252,7 +276,10 @@ impl CompactionPlane for SubcCompactionPlane {
                     message,
                     ..
                 } => CallError::Refused(Refusal::new(&code, message, detail)),
-                _ => CallError::Unavailable,
+                other => {
+                    log_unanswered(provider, method, &other);
+                    CallError::Unavailable
+                }
             })
     }
 
@@ -472,5 +499,52 @@ mod reference_tests {
         );
         assert!(current_reference(&bind, "58710a071e777b22bf1b3734b691ef7d").is_err());
         assert!(current_reference(&bind, "unrelated").is_err());
+    }
+}
+
+#[cfg(test)]
+mod unanswered_log_tests {
+    use super::*;
+
+    /// Each unanswered call names its provider, method and why it got no answer, so a provider
+    /// that never saw a call can tell a closed route from its own slow start.
+    #[tokio::test]
+    async fn an_unanswered_compaction_call_logs_why() {
+        let ((), logs) = broca_test_support::capture_logs(async {
+            log_unanswered(
+                "magic-context",
+                "compaction.setup",
+                &FetchError::Refused {
+                    code: "module_warming".into(),
+                    detail: None,
+                    retryable: true,
+                },
+            );
+            log_unanswered(
+                "magic-context",
+                "compaction.setup",
+                &FetchError::Lost("timed out".into()),
+            );
+        })
+        .await;
+        let lines: Vec<(String, String, String)> = logs
+            .iter()
+            .filter(|event| event.target == "broca.compaction")
+            .map(|event| {
+                let field = |name: &str| event.fields.get(name).cloned().unwrap_or_default();
+                (field("provider"), field("kind"), field("code"))
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (
+                    "magic-context".into(),
+                    "refused".into(),
+                    "module_warming".into()
+                ),
+                ("magic-context".into(), "lost".into(), "timed out".into()),
+            ]
+        );
     }
 }
