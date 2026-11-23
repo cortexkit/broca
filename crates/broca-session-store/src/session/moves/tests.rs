@@ -58,6 +58,7 @@ async fn history<'a>(
         named_speaker: None,
         kept_notice: None,
         imported_ids: None,
+        render_identity: None,
         message_marks: None,
         submission_id: None,
         send_id: None,

@@ -159,10 +159,15 @@ pub async fn store_snapshot(
                 .and_then(|config| config.get("render_tags"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let frozen =
+            let part: Value =
                 serde_json::from_slice(config).map_err(|e| format!("render config: {e}"))?;
-            let render_config: Value =
-                serde_json::from_slice(config).map_err(|e| format!("render config: {e}"))?;
+            let render_config = std::sync::Arc::unwrap_or_clone(
+                start
+                    .render_config(std::sync::Arc::new(part))
+                    .map_err(|e| format!("render config: {e}"))?,
+            );
+            let frozen = serde_json::from_value(render_config.clone())
+                .map_err(|e| format!("render config: {e}"))?;
             // The next message gets its `EntryFacts` record (its id, time and part numbers) as
             // the run loop writes one: on a session on the compaction contract a message's
             // compaction entry, and so the request, can't be built without it. `tags` are the

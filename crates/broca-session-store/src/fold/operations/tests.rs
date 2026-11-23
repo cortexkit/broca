@@ -15,6 +15,7 @@ fn start() -> Record {
         named_speaker: None,
         kept_notice: None,
         imported_ids: None,
+        render_identity: None,
         message_marks: None,
         run_id: "r".into(),
         model: serde_json::from_value::<ModelHandle>(

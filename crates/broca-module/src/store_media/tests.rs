@@ -597,6 +597,7 @@ pub(crate) fn start(run: &str, setup: Vec<PartRef>) -> Record {
         seeded: None,
         refusal_schedule: None,
         imported_ids: None,
+        render_identity: None,
         message_marks: None,
     }))
 }

@@ -5,7 +5,7 @@ sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 by
 == record count
 7
 == records
-sha256:3326a6f463bab1f4a660fd4c645aced6c8c5ab00c4b17fba8ab810aa858afda6 (3499 bytes)
+sha256:c3055a6dc1202b62252aa96dbb116681f6b9209f7683fe81ba7a2227c5544f44 (3522 bytes)
 == tool calls
 []
 == run r1's spend facts
@@ -48,7 +48,7 @@ sha256:fca326339b16983a6d6d5a67fab99eb44512a54a2a2a2aa1baa02e05e9fc8c8a (3048 by
 == record count
 7
 == records
-sha256:3326a6f463bab1f4a660fd4c645aced6c8c5ab00c4b17fba8ab810aa858afda6 (3499 bytes)
+sha256:c3055a6dc1202b62252aa96dbb116681f6b9209f7683fe81ba7a2227c5544f44 (3522 bytes)
 == tool calls
 []
 == run r1's spend facts
@@ -91,7 +91,7 @@ sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 by
 == record count
 7
 == records
-sha256:2daca27afaf1f536ff3776ad22e215ca582b452f1de28dfaee436c7632ed858b (3496 bytes)
+sha256:286cf5c040957a93cf1d6f65af0df7eca78ab30bbac8fa85ae71fa17619b7253 (3519 bytes)
 == tool calls
 []
 == run r1's spend facts
@@ -134,7 +134,7 @@ sha256:ca1dbfe8c8af9278500a14e245eb752ab65aabcf4a5eef2f0e4194b0303ea7ab (3048 by
 == record count
 7
 == records
-sha256:2daca27afaf1f536ff3776ad22e215ca582b452f1de28dfaee436c7632ed858b (3496 bytes)
+sha256:286cf5c040957a93cf1d6f65af0df7eca78ab30bbac8fa85ae71fa17619b7253 (3519 bytes)
 == tool calls
 []
 == run r1's spend facts

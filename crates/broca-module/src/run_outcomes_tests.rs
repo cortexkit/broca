@@ -18,6 +18,7 @@ fn recorder() -> (Recorder, &'static Ring<RunOutcome>) {
 fn start(run: &str, seeded: bool) -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        render_identity: None,
         message_marks: None,
         named_speaker: None,
         kept_notice: None,

@@ -181,6 +181,7 @@ fn held_records(call_key: &str, module: &str) -> Vec<Record> {
 fn run_start(run: &str) -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        render_identity: None,
         message_marks: None,
         named_speaker: None,
         kept_notice: None,

@@ -723,6 +723,7 @@ mod tests {
             seeded: None,
             refusal_schedule: None,
             imported_ids: None,
+            render_identity: None,
             message_marks: None,
             named_speaker: None,
             kept_notice: None,

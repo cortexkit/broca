@@ -5,7 +5,8 @@
 
 use serde_json::Value;
 
-use broca_session_store::record::PartKind;
+use broca_protocol::request::Tool;
+use broca_session_store::record::{PartKind, RunStart};
 
 use super::{decode, LoopError};
 use crate::parts::Parts;
@@ -32,7 +33,9 @@ pub enum SetupParts {
 
 /// A run start's frozen config: the members of its `config` object and the setup parts of its
 /// plan manifest, in order. `part` reads a setup part's value; `wanted` says which parts to read
-/// at all.
+/// at all. The render config comes back whole, with the start's `render_identity` joined
+/// ([`RunStart::render_config`](broca_session_store::record::RunStart::render_config)).
+/// `not_object` names a config member, or a render config half, that isn't a JSON object.
 ///
 /// The inverse conversion (`today.rs`) rebuilds the record from this, and the serve executor
 /// rebuilds the config a new run's admission reads (`run_config_of_start`), so both read a run's
@@ -98,7 +101,15 @@ pub fn run_config_members<E>(
         if !read {
             continue;
         }
-        let value = part(setup)?;
+        let mut value = part(setup)?;
+        if setup.kind == PartKind::RenderConfig {
+            // The run's own identity members go back on top of the shared part; a start whose
+            // identity can't be joined reads as a config that isn't an object.
+            value = start
+                .render_config(std::sync::Arc::new(value))
+                .map(std::sync::Arc::unwrap_or_clone)
+                .map_err(|_| not_object())?;
+        }
         match member {
             Some(member) => {
                 config.insert(member.into(), value);
@@ -196,11 +207,38 @@ pub fn run_frozen_facts(
     serde_json::from_value(Value::Object(config)).map_err(|e| LoopError::Parts(e.to_string()))
 }
 
+/// The [`broca_core::signed_floor::tool_set_digest`] of the tools and render config `start`
+/// froze, read as [`admission_of_start`](super::admission_of_start) reads them; `None` for a seeded run.
+pub(super) fn tool_set_of_start(
+    start: &RunStart,
+    parts: &dyn Parts,
+) -> Result<Option<String>, LoopError> {
+    if start.seeded == Some(true) {
+        return Ok(None);
+    }
+    let part = |kind: PartKind| start.setup.iter().find(|part| part.kind == kind);
+    let tools = part(PartKind::Tools)
+        .map(|part| crate::parts::shared::<Vec<Tool>, _>(parts, part))
+        .transpose()
+        .map_err(LoopError::Parts)?;
+    let render_config = part(PartKind::RenderConfig)
+        .map(|part| crate::parts::shared::<Value, _>(parts, part))
+        .transpose()
+        .map_err(LoopError::Parts)?
+        .map(|render_config| start.render_config(render_config))
+        .transpose()
+        .map_err(|error| LoopError::Parts(error.to_string()))?;
+    Ok(Some(broca_core::signed_floor::tool_set_digest(
+        tools.as_deref().map_or(&[], Vec::as_slice),
+        render_config.as_deref().unwrap_or(&Value::Null),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
-    use broca_session_store::record::{PartRef, RunStart};
+    use broca_session_store::record::PartRef;
     use serde_json::json;
 
     use super::*;
@@ -297,6 +335,7 @@ mod tests {
             seeded: None,
             refusal_schedule: None,
             imported_ids: None,
+            render_identity: None,
             message_marks: None,
             named_speaker: None,
             kept_notice: None,
@@ -358,5 +397,59 @@ mod tests {
             broca_core::tags::computed_rules(&config)
         );
         assert!(facts.computed_rules().is_some_and(|rules| rules.render));
+    }
+
+    /// A start that keeps its identity beside a shared render config part reads, through every
+    /// reader, the same whole config as a start whose part holds all of it.
+    #[test]
+    fn every_reader_joins_the_run_identity_onto_the_shared_part() {
+        let mut parts = Noting::default();
+        let mut whole = planned_start(&mut parts);
+        // The split start keeps the part `planned_start` stored; the whole one names a part
+        // that holds the identity too.
+        let mut split = whole.clone();
+        let identity = json!({"prompt_cache_key": "session-key"});
+        let mut whole_config = json!({"family": "anthropic_messages", "beta": ["x"]});
+        whole_config["prompt_cache_key"] = identity["prompt_cache_key"].clone();
+        for part in &mut whole.setup {
+            if part.kind == PartKind::RenderConfig {
+                *part = parts.put(PartKind::RenderConfig, &whole_config).unwrap();
+            }
+        }
+        split.render_identity = Some(identity);
+
+        // The admission reader rebuilds the plan manifest, which this fixture's stand-in
+        // manifest parts don't make; the render config doesn't depend on it.
+        let without_manifest = |start: &RunStart| {
+            let mut start = start.clone();
+            if let Some(plan) = start
+                .setup
+                .iter()
+                .position(|part| part.kind == PartKind::Plan)
+            {
+                start.setup.truncate(plan);
+            }
+            start
+        };
+        let read = |start: &RunStart| {
+            (
+                run_frozen_facts(start, &parts)
+                    .unwrap()
+                    .frozen_render_config,
+                run_config_of_start(start, &parts)
+                    .unwrap()
+                    .frozen_render_config,
+                Value::clone(
+                    &crate::run::admission_of_start(&without_manifest(start), &parts)
+                        .unwrap()
+                        .render_config,
+                ),
+            )
+        };
+        let (facts, config, admission) = read(&split);
+        assert_eq!(facts, whole_config);
+        assert_eq!(config, whole_config);
+        assert_eq!(admission, whole_config);
+        assert_eq!(read(&whole), (facts, config, admission));
     }
 }

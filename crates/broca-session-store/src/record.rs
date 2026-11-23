@@ -669,7 +669,70 @@ message! {
         /// True, and present, exactly when `message_marks` keeps the notice, as
         /// `EntryFacts::kept_notice` says.
         31 opt [must] kept_notice: bool,
+        /// The members of the run's frozen render config that belong to this run or its
+        /// session alone (its prompt cache key and the identity a route sends, such as a
+        /// Claude Code persona's prompt id), as a JSON object of top-level render config
+        /// members. They are kept here rather than in the `RenderConfig` part, so runs on the
+        /// same route share that part. The run's whole config is the part with these members put
+        /// on top ([`RunStart::render_config`]). Absent when the part holds the whole config.
+        /// A reader that skipped it would render without the run's identity, so it is
+        /// must-understand.
+        32 opt [must] render_identity: serde_json::Value,
     }
+}
+
+/// A run start's render config that can't be built from its part and its `render_identity`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderConfigUnjoinable {
+    pub run_id: String,
+    /// Which half isn't a JSON object.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for RenderConfigUnjoinable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run {}: {}", self.run_id, self.reason)
+    }
+}
+
+impl RunStart {
+    /// The run's whole frozen render config, from `part`, its decoded `RenderConfig` setup part:
+    /// the part with the run's `render_identity` members put on top. Without `render_identity`
+    /// the part is the whole config and comes back unchanged.
+    pub fn render_config(
+        &self,
+        part: std::sync::Arc<serde_json::Value>,
+    ) -> Result<std::sync::Arc<serde_json::Value>, RenderConfigUnjoinable> {
+        join_render_identity(part, self.render_identity.as_ref()).map_err(|reason| {
+            RenderConfigUnjoinable {
+                run_id: self.run_id.clone(),
+                reason,
+            }
+        })
+    }
+}
+
+/// A whole frozen render config: `part`, a decoded `RenderConfig` setup part, with `identity`'s
+/// members put on top. Without an identity the part comes back unchanged. The error names the
+/// half that isn't a JSON object.
+pub fn join_render_identity(
+    part: std::sync::Arc<serde_json::Value>,
+    identity: Option<&serde_json::Value>,
+) -> Result<std::sync::Arc<serde_json::Value>, &'static str> {
+    let Some(identity) = identity else {
+        return Ok(part);
+    };
+    let identity = identity
+        .as_object()
+        .ok_or("render_identity is not a JSON object")?;
+    let mut config = std::sync::Arc::unwrap_or_clone(part);
+    let members = config
+        .as_object_mut()
+        .ok_or("the render config part is not a JSON object")?;
+    for (member, value) in identity {
+        members.insert(member.clone(), value.clone());
+    }
+    Ok(std::sync::Arc::new(config))
 }
 
 message! {
@@ -2055,6 +2118,8 @@ pub fn marks_kept_notice(marks: Option<&serde_json::Value>) -> Option<bool> {
         .then_some(true)
 }
 
+#[cfg(test)]
+mod render_identity_tests;
 #[cfg(test)]
 mod speaker_name_tests;
 #[cfg(test)]

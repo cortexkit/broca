@@ -154,6 +154,7 @@ impl Drop for Rig {
 fn store_start(run: &str, retention: Option<u64>, ts: u64) -> Record {
     Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        render_identity: None,
         message_marks: None,
         named_speaker: None,
         kept_notice: None,

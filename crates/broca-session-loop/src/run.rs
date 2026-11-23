@@ -1612,8 +1612,12 @@ pub fn admission_of_start(
         generation: decode(member("generation"))?.unwrap_or_default(),
         response_format: shared(parts, part(PartKind::ResponseFormat))?.unwrap_or_default(),
         provider_options: member("provider_options").unwrap_or(Value::Null),
-        render_config: shared(parts, part(PartKind::RenderConfig))?
-            .unwrap_or_else(|| Arc::new(Value::Null)),
+        render_config: match shared(parts, part(PartKind::RenderConfig))? {
+            Some(render_config) => start
+                .render_config(render_config)
+                .map_err(|error| LoopError::Parts(error.to_string()))?,
+            None => Arc::new(Value::Null),
+        },
         renderer_version: start.renderer_version,
         stop_when: decode(member("stop_when"))?.unwrap_or_default(),
         on_restart: decode(start.on_restart.clone())?,
@@ -3641,6 +3645,7 @@ async fn admit<W: Writer>(
     let message_marks = to_value(admission.send.message_marks.as_ref())?;
     records.push(Record::RunStart(Box::new(RunStart {
         imported_ids: None,
+        render_identity: None,
         named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
         kept_notice: broca_session_store::record::marks_kept_notice(message_marks.as_ref()),
         message_marks,
@@ -3858,7 +3863,7 @@ pub async fn signed_floor<W: Writer>(
                         episode.run_id
                     ))
                 })?;
-                let digest = tool_set_of_start(&start, parts)?;
+                let digest = start_config::tool_set_of_start(&start, parts)?;
                 floors.by_run.insert(episode.run_id.clone(), digest.clone());
                 digest
             }
@@ -3875,27 +3880,6 @@ pub async fn signed_floor<W: Writer>(
 #[derive(Default)]
 pub struct ToolSetCache {
     by_run: std::collections::HashMap<String, Option<String>>,
-}
-
-/// The [`broca_core::signed_floor::tool_set_digest`] of the tools and render config `start`
-/// froze, read as [`admission_of_start`] reads them; `None` for a seeded run.
-fn tool_set_of_start(start: &RunStart, parts: &dyn Parts) -> Result<Option<String>, LoopError> {
-    if start.seeded == Some(true) {
-        return Ok(None);
-    }
-    let part = |kind: PartKind| start.setup.iter().find(|part| part.kind == kind);
-    let tools = part(PartKind::Tools)
-        .map(|part| crate::parts::shared::<Vec<Tool>, _>(parts, part))
-        .transpose()
-        .map_err(LoopError::Parts)?;
-    let render_config = part(PartKind::RenderConfig)
-        .map(|part| crate::parts::shared::<Value, _>(parts, part))
-        .transpose()
-        .map_err(LoopError::Parts)?;
-    Ok(Some(broca_core::signed_floor::tool_set_digest(
-        tools.as_deref().map_or(&[], Vec::as_slice),
-        render_config.as_deref().unwrap_or(&Value::Null),
-    )))
 }
 
 /// The request for step `step_id`: the conversation as the folds hold it, under the run's

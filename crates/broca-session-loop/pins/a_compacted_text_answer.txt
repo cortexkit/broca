@@ -5,7 +5,7 @@ sha256:4fa946df6b02151bc2c8646b1a261d7dea442fdc19fa3ab2e1d9ebec957e4352 (2828 by
 == record count
 9
 == records
-sha256:68961769c7ee7385a1a16da7a91a4c2ec82099ac510fe4928cc6c259198bd8ac (5031 bytes)
+sha256:e0809c5650c69f3c86a0fdf4d339a2e99c98742be820aa482b898ff196dd030a (5054 bytes)
 == tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":1},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
@@ -18,7 +18,7 @@ sha256:4fa946df6b02151bc2c8646b1a261d7dea442fdc19fa3ab2e1d9ebec957e4352 (2828 by
 == record count
 9
 == records
-sha256:68961769c7ee7385a1a16da7a91a4c2ec82099ac510fe4928cc6c259198bd8ac (5031 bytes)
+sha256:e0809c5650c69f3c86a0fdf4d339a2e99c98742be820aa482b898ff196dd030a (5054 bytes)
 == tool calls
 [
     "compaction.setup {\"accepts_images\":false,\"context_window\":100000,\"detects\":[\"chain_reset\",\"model_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":1},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",

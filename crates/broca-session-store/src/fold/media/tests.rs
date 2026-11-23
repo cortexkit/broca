@@ -130,6 +130,7 @@ pub(crate) fn start(run: &str, setup: Vec<PartRef>, seeded: bool) -> Record {
         seeded: seeded.then_some(true),
         refusal_schedule: None,
         imported_ids: None,
+        render_identity: None,
         message_marks: None,
     }))
 }

@@ -493,6 +493,9 @@ fn read_render_config<T>(
     };
     let config = broca_session_loop::parts::shared::<serde_json::Value, _>(parts, part)
         .map_err(|error| StoreHeadError::Setup(format!("run {}: {error}", start.run_id)))?;
+    let config = start
+        .render_config(config)
+        .map_err(|error| StoreHeadError::Setup(error.to_string()))?;
     Ok(Some(read(&config)))
 }
 

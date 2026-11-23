@@ -749,6 +749,7 @@ mod records {
         message_marks,
         named_speaker,
         kept_notice,
+        render_identity,
     });
     crate::fuzzing::gen::fields!(RunEnd {
         run_id,

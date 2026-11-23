@@ -929,6 +929,7 @@ async fn startup_recovery_work_ignores_idle_store_sessions() {
                             named_speaker: None,
                             kept_notice: None,
                             imported_ids: None,
+                            render_identity: None,
                             message_marks: None,
                             run_id: "orphan".into(),
                             model: broca_protocol::ModelHandle::new("stub", "m"),
