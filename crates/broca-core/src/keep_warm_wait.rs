@@ -359,8 +359,8 @@ mod tests {
         assert_eq!(*driver.stops.lock().unwrap(), ["budget"]);
         assert_eq!(
             driver.warms.load(Ordering::SeqCst),
-            1,
-            "fourteen spent leaves no room for another ten-unit warm"
+            2,
+            "two warms at fourteen reach the rewrite's twenty-one; counted at ten, a third would go"
         );
     }
 }

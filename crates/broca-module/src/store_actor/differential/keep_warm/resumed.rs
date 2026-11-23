@@ -109,8 +109,9 @@ impl RunExecutor for Warming {
         _: u64,
         _: u64,
     ) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        // Two warms reach one rewrite's cost, so `auto` stops after the second.
         Ok(broca_core::keep_warm::WarmCosts {
-            warm: 0.4,
+            warm: 0.5,
             bust: 1.0,
         })
     }

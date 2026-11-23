@@ -31,9 +31,11 @@ impl WarmCosts {
         (costs.warm.is_finite() && costs.bust.is_finite()).then_some(costs)
     }
 
-    /// Do not buy a read that would make this wait cost as much as one cache bust. A small
-    /// rounding allowance prevents repeated fractional additions from buying an extra read
-    /// at mathematical equality. It is relative to the prices, not a fixed monetary floor.
+    /// Buy reads until what this wait spent reaches the cost of one cache bust (llm-runner
+    /// §9.3.5: `auto` warms "until the warms since the last real request reach the cost of one
+    /// cache rewrite"), so the last read may take the total to it or just past it. A small
+    /// rounding allowance stops repeated fractional additions that land a hair below the bust
+    /// from buying one more. It is relative to the prices, not a fixed monetary floor.
     pub fn allows_next(self, spent: f64) -> bool {
         if [self.warm, self.bust, spent]
             .iter()
@@ -41,9 +43,8 @@ impl WarmCosts {
         {
             return false;
         }
-        let next = spent + self.warm;
-        let tolerance = f64::EPSILON * 16.0 * self.bust.abs().max(next.abs());
-        next.is_finite() && self.bust - next > tolerance
+        let tolerance = f64::EPSILON * 16.0 * self.bust.abs().max(spent.abs());
+        self.bust - spent > tolerance
     }
 }
 
@@ -74,7 +75,7 @@ pub fn allows_warm(
             Ok(costs) if costs.allows_next(spent) => Ok(()),
             Ok(_) => Err((
                 STOP_BUDGET,
-                "one cache rewrite costs no more than the next warm".into(),
+                "the warms since the last real request cost one cache rewrite".into(),
             )),
             Err(detail) => Err((STOP_BUDGET, detail)),
         },
@@ -98,11 +99,11 @@ mod tests {
     #[test]
     fn rent_or_buy_matches_provider_ratio_table() {
         let cases = [
-            ("Anthropic 5m", 0.1, 1.25, 0.0, 0, 12),
-            ("Anthropic 1h", 0.1, 2.0, 0.0, 0, 19),
-            ("Opus 5.5 5m", 0.05, 1.25, 0.0, 0, 24),
-            ("Opus 5.5 1h", 0.05, 2.0, 0.0, 0, 39),
-            ("Codex", 0.05, 1.0, 8.0, 16, 19),
+            ("Anthropic 5m", 0.1, 1.25, 0.0, 0, 13),
+            ("Anthropic 1h", 0.1, 2.0, 0.0, 0, 20),
+            ("Opus 5.5 5m", 0.05, 1.25, 0.0, 0, 25),
+            ("Opus 5.5 1h", 0.05, 2.0, 0.0, 0, 40),
+            ("Codex", 0.05, 1.0, 8.0, 16, 20),
         ];
         for (name, read, bust, output, output_tokens, expected) in cases {
             let costs = WarmCosts::from_ratios(125_000, read, bust, output, output_tokens).unwrap();
@@ -121,13 +122,15 @@ mod tests {
     fn rent_or_buy_stops_exactly_at_boundary_including_fractional_rounding() {
         let costs = WarmCosts::from_ratios(1, 0.1, 1.0, 0.0, 0).unwrap();
         let mut spent = 0.0;
-        for _ in 0..9 {
+        for _ in 0..10 {
             assert!(costs.allows_next(spent));
             spent += costs.warm;
         }
+        // Ten reads of 0.1 add up to a hair below 1.0, which counts as reaching it.
+        assert!(spent < 1.0);
         assert!(!costs.allows_next(spent));
-        assert!(!costs.allows_next(0.9));
-        assert!(costs.allows_next(0.89));
+        assert!(costs.allows_next(0.9));
+        assert!(costs.allows_next(0.99));
         assert!(!costs.allows_next(1.0));
     }
 
@@ -147,9 +150,10 @@ mod tests {
         assert!(WarmCosts::from_ratios(100, 0.0, 1.0, 0.0, 0)
             .unwrap()
             .allows_next(0.0));
-        assert!(!WarmCosts::from_ratios(100, 1e-20, 1e-20, 0.0, 0)
-            .unwrap()
-            .allows_next(0.0));
+        // A read that costs a whole rewrite is bought once: that one read reaches the cap.
+        let even = WarmCosts::from_ratios(100, 1e-20, 1e-20, 0.0, 0).unwrap();
+        assert!(even.allows_next(0.0));
+        assert!(!even.allows_next(even.warm));
     }
 
     mod modes {
@@ -178,9 +182,9 @@ mod tests {
 
         #[test]
         fn auto_stops_at_the_cost_of_one_rewrite_whatever_the_count() {
-            assert!(allows_warm(&KeepWarm::Auto, costs(), 8.0, 100, LATE_EVENING_UTC_MS).is_ok());
+            assert!(allows_warm(&KeepWarm::Auto, costs(), 9.0, 100, LATE_EVENING_UTC_MS).is_ok());
             assert_eq!(
-                allows_warm(&KeepWarm::Auto, costs(), 9.0, 0, LATE_EVENING_UTC_MS)
+                allows_warm(&KeepWarm::Auto, costs(), 10.0, 0, LATE_EVENING_UTC_MS)
                     .unwrap_err()
                     .0,
                 STOP_BUDGET

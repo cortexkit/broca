@@ -1346,9 +1346,10 @@ impl WarmScript {
         })
     }
     fn costs(&self) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        // Three warms reach one rewrite's cost, so each wait sends three.
         Ok(broca_core::keep_warm::WarmCosts {
             warm: 1.0,
-            bust: 3.5,
+            bust: 3.0,
         })
     }
     fn note(&self, attempt: &broca_protocol::ModelAttempt) {
