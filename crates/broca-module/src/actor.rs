@@ -22,7 +22,7 @@ pub use crate::session_cmd::{
 };
 
 pub(crate) use crate::session_cmd::{
-    CancelAuthority, CancelOutcome, CutLockReply, LineageCmd, RetractOutcome,
+    CancelAuthority, CancelOutcome, CutLockReply, LineageCmd, ReleaseOutcome, RetractOutcome,
     SessionFlushPrefixOutcome, SessionRefreshOutcome, SessionRefreshPolicyOutcome,
     SubscribeOutcome, WarmOutcome,
 };

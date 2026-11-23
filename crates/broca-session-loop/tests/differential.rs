@@ -2221,6 +2221,7 @@ impl Scenario {
             directives: None,
             session_class: None,
             retention: None,
+            retention_policy: None,
             title: None,
             on_restart: None,
             keep_warm: warm_script().map(|_| broca_protocol::request::KeepWarm::Auto),

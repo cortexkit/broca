@@ -3233,7 +3233,14 @@ impl LlmRunnerSubject for BrocaSubject {
         // retention and its daemon clock only when the production writer switch enables
         // both admission and the retention group in role.describe.
         if broca_module_serve::RETENTION_WRITER_ENABLED {
-            capabilities.extend([Capability::Retention, Capability::RetentionClock]);
+            // role.describe declares session_retention beside retention, from the same
+            // switch. Its cases drive policy sends and session.release on ordinary routes, the
+            // retention clock above, and the held model step.
+            capabilities.extend([
+                Capability::Retention,
+                Capability::RetentionClock,
+                Capability::SessionRetention,
+            ]);
         }
         if self.service_tier_enabled {
             capabilities.insert(Capability::ServiceTier);
@@ -3278,6 +3285,18 @@ impl LlmRunnerSubject for BrocaSubject {
 
     fn flow_session_start_stamps(&self) -> Option<(RouteStamp, RouteStamp)> {
         Some(scope_fixture_stamps(FLOW_SCOPE_REF))
+    }
+
+    // A starter under its parent's scope, and the parent. broca lets only a plain scope's owner
+    // start a session under it, so the starter runs under the flow scope, where a flow's sender
+    // starts the flow's sessions.
+    fn retention_scope_stamps(&self) -> Option<(RouteStamp, RouteStamp)> {
+        Some(scope_fixture_stamps(FLOW_SCOPE_REF))
+    }
+
+    // broca saves no request dumps; `session.request_dump` rebuilds them from records.
+    fn request_dumps_unsupported(&self) -> bool {
+        true
     }
 
     fn session_usage_fixtures(&self) -> bool {
@@ -3383,6 +3402,17 @@ impl LlmRunnerSubject for BrocaSubject {
                 .unwrap();
         }
         let mut fields = self.fixture_send_fields(session, first);
+        // A flow's send carries no tools. The kit's cases that check who may release a session
+        // start it over the flow scope (see `retention_scope_stamps`).
+        if self
+            .shared
+            .flow_scope_sessions
+            .lock()
+            .unwrap()
+            .contains(session)
+        {
+            fields.remove("tools");
+        }
         let planned = self.shared.plan_sessions.lock().unwrap().contains(session);
         place_cache_once(&mut fields, first, planned);
         fields

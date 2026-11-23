@@ -194,6 +194,11 @@ pub enum LineageCmd {
         send_id: String,
         reply: oneshot::Sender<SessionFlushPrefixOutcome>,
     },
+    /// `session.release` (llm-runner `session_retention`) from the attested `principal`.
+    Release {
+        principal: Option<broca_protocol::BindPrincipal>,
+        reply: oneshot::Sender<ReleaseOutcome>,
+    },
     /// Report the actor's current status.
     Status {
         reply: oneshot::Sender<LineageStatus>,
@@ -286,6 +291,8 @@ pub enum SendOutcome {
         holder: Option<String>,
     },
     RetentionInvalid(crate::retention::InvalidRetention),
+    /// Refused for the send's storage policy, or because the session was released.
+    RetentionRefused(crate::retention::policy::Refusal),
     SessionClassInvalid(String),
     InputTokenBudgetInvalid(String),
     ServiceTierInvalid {
@@ -506,6 +513,21 @@ pub enum SessionRefreshPolicyOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionFlushPrefixOutcome {
     Flushed { pending_generation: Option<u64> },
+    Reopen,
+    Error(String),
+}
+
+/// How the actor answered a `session.release`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReleaseOutcome {
+    /// The release is recorded: `Pending` until the session is deleted, `Deleted` when this call
+    /// deleted it before answering.
+    Released(cortexkit_role_llm_runner::session_retention::ReleaseState),
+    /// The caller isn't the principal that made the session's first send.
+    NotOwner(Box<broca_core::OwnerMismatch>),
+    /// The session's first send recorded no principal, and the caller presented one: no
+    /// caller with an identity owns the session.
+    Unowned,
     Reopen,
     Error(String),
 }

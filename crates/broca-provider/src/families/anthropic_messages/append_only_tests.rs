@@ -150,6 +150,7 @@ fn request(dir: &std::path::Path, run: &str, model: &str, user: Message) -> RunR
         directives: None,
         session_class: None,
         retention: None,
+        retention_policy: None,
         title: None,
         on_restart: None,
         keep_warm: None,

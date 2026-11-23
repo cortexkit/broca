@@ -50,6 +50,7 @@ pub(crate) fn frozen_input(media: Option<serde_json::Value>) -> HeadInput {
 fn quote_request(model: &HeadModel) -> SubmissionRequest {
     SubmissionRequest {
         message_marks: Default::default(),
+        retention_policy: None,
         account_route: None,
         route_decision_id: None,
         service_tier_level: None,

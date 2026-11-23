@@ -118,6 +118,8 @@ impl SendParamsExt for SendParams {
             session_class,
             on_restart,
             retention,
+            // Decoded and checked by the serve handler, which sets the request's policy.
+            retention_policy: _,
             prompt,
             prompt_blocks,
             system,
@@ -232,6 +234,7 @@ impl SendParamsExt for SendParams {
             .transpose()?;
         let submission = SubmissionRequest {
             message_marks: Default::default(),
+            retention_policy: None,
             route_decision_id,
             account_route,
             service_tier_level: None,
@@ -417,6 +420,7 @@ mod tests {
             client_message_id: None,
             on_restart: None,
             retention: None,
+            retention_policy: None,
             conversation_key: None,
             service_tier: None,
             prompt: prompt.to_string(),

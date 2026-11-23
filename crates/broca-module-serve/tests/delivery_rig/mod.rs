@@ -849,6 +849,21 @@ impl Rig {
         Self::start_fresh(tag, idle_ttl, false).await
     }
 
+    /// [`Rig::start`] with retention installed over the rig's own leases, as the module installs
+    /// it at startup: what deletes a session a storage policy or a release ends.
+    #[allow(dead_code)]
+    pub async fn start_with_retention(tag: &str) -> Self {
+        let rig = Self::start(tag).await;
+        rig.registry.set_retention_service(Arc::new(
+            broca_module::retention::RetentionService::new(
+                &rig.dir,
+                Arc::new(FileLeaseStore::new(rig.dir.join("leases"))),
+            )
+            .unwrap(),
+        ));
+        rig
+    }
+
     async fn start_fresh(tag: &str, idle_ttl: Duration, daemon_scopes: bool) -> Self {
         let dir = broca_test_support::scratch_root()
             .join(format!("broca-send-delivery-{}-{tag}", std::process::id()));

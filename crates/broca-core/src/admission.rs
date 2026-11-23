@@ -34,6 +34,9 @@ pub fn submission_difference(
 ) -> Option<&'static str> {
     let SubmissionRequest {
         message_marks: _,
+        // Checked against the session's own policy instead: once frozen it can't change, so a
+        // retry carrying another one is refused for that.
+        retention_policy: _,
         route_decision_id: existing_route_decision_id,
         account_route: existing_account_route,
         staged_uploads: _,
@@ -67,6 +70,7 @@ pub fn submission_difference(
     } = existing;
     let SubmissionRequest {
         message_marks: _,
+        retention_policy: _,
         route_decision_id: requested_route_decision_id,
         account_route: requested_account_route,
         staged_uploads: _,
@@ -281,6 +285,7 @@ fn identity_digest_v1(
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
         message_marks: _,
+        retention_policy: _, // Outside send identity, as `submission_difference` says.
         route_decision_id,
         account_route,
         staged_uploads: _,
@@ -711,6 +716,7 @@ mod tests {
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
             message_marks: Default::default(),
+            retention_policy: None,
             account_route: None,
             route_decision_id: None,
             service_tier_level: None,

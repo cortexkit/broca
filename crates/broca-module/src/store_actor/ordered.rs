@@ -645,6 +645,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             records.push(
                 ended(&submission_id.0, &SendEndReason::Expired).map_err(SendOutcome::Error)?,
             );
+        } else {
+            // A send refused as expired freezes nothing; one queued freezes its policy with it.
+            records.extend(self.retention_set(run_prepared.retention_policy.clone()));
         }
         // The queued record keeps the send's media, stored as the session's own objects before
         // the batch, as a queued send's are.

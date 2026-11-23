@@ -42,9 +42,14 @@ impl StoreRuntime {
         if now_ms == 0 && markers.is_empty() {
             return Ok((None, None));
         }
+        // A session a storage policy or a release deleted is no longer there at all (llm-runner
+        // `session_retention`): its runs aren't known, and with no session at the address since,
+        // the session isn't either.
+        let expired_marker = |marker: &&Marker| marker.policy_deleted != Some(true);
         if let Some(run) = run {
             if let Some(marker) = markers
                 .iter()
+                .filter(expired_marker)
                 .find(|marker| marker.runs.iter().any(|id| id == run))
             {
                 return Ok((Some(marker.expired_at_ms), None));
@@ -62,14 +67,13 @@ impl StoreRuntime {
             return Ok((None, None));
         }
         let Some(view) = self.current_view(key).await? else {
+            let newest = markers.iter().max_by_key(|m| m.seq);
+            if newest.is_some_and(|marker| marker.policy_deleted == Some(true)) {
+                return Err(OpenError::UnknownSession);
+            }
             return Ok((
                 run.is_none()
-                    .then(|| {
-                        markers
-                            .iter()
-                            .max_by_key(|m| m.seq)
-                            .map(|m| m.expired_at_ms)
-                    })
+                    .then(|| newest.map(|m| m.expired_at_ms))
                     .flatten(),
                 None,
             ));

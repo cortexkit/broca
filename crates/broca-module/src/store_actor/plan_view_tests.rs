@@ -157,6 +157,7 @@ async fn ask(commands: &Harness, request: StoreReadRequest) -> StoreReadReply {
                 live_step: live_step.as_ref(),
                 stream_head: None,
                 entry_speaks_for,
+                class: None,
             };
             crate::store_reads::execute(&view, &context, &request).await
         }

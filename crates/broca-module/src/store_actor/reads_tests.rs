@@ -596,6 +596,8 @@ impl Module {
             live_step: None,
             stream_head: None,
             entry_speaks_for: crate::store_entries::EntryAttribution::Known(false),
+            // The root the actor's session is in, so a head names the policy it names.
+            class: Some(broca_records::session_storage::StorageClass::Ordinary),
         };
         execute(&view, &context, request).await
     }

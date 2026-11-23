@@ -3,7 +3,7 @@
 == session.read
 "Ok(SessionReadResponse { messages: [], next_from_ordinal: None, head: None, lineage_id: None, history_version: 0, incarnation: \"unwritten\", lineage_state: SessionReadLineageState { last_run_id: None, state: \"idle\", reason: None, error: None, usage: None }, tools: None, tools_run_id: None, deferred_calls: None, late_approvals: None, open_batch: None, next_late_after: None })"
 == session.head
-"Ok(HeadResponse { mode3: false, last_run_rich_ui: None, lineage_id: None, last_ordinal: None, first_ordinal: None, history_version: 0, head: None, last_run_state: None, updated_at: None, cache: None, title: None, input: None, model: None, service_tier: None, usage: None, sender: None, incarnation: \"unwritten\", last_run_error: None })"
+"Ok(HeadResponse { mode3: false, last_run_rich_ui: None, lineage_id: None, last_ordinal: None, first_ordinal: None, history_version: 0, head: None, last_run_state: None, updated_at: None, cache: None, title: None, input: None, model: None, service_tier: None, usage: None, sender: None, incarnation: \"unwritten\", last_run_error: None, retention_policy: None, retention_state: None, released: None })"
 == run.result
 "Err(UnknownRun(\"r1\"))"
 == run.tool_calls
@@ -19,7 +19,7 @@
 == session.read
 "Ok(SessionReadResponse { messages: [], next_from_ordinal: None, head: None, lineage_id: None, history_version: 0, incarnation: \"unwritten\", lineage_state: SessionReadLineageState { last_run_id: None, state: \"idle\", reason: None, error: None, usage: None }, tools: None, tools_run_id: None, deferred_calls: None, late_approvals: None, open_batch: None, next_late_after: None })"
 == session.head
-"Ok(HeadResponse { mode3: false, last_run_rich_ui: None, lineage_id: None, last_ordinal: None, first_ordinal: None, history_version: 0, head: None, last_run_state: None, updated_at: None, cache: None, title: None, input: None, model: None, service_tier: None, usage: None, sender: None, incarnation: \"unwritten\", last_run_error: None })"
+"Ok(HeadResponse { mode3: false, last_run_rich_ui: None, lineage_id: None, last_ordinal: None, first_ordinal: None, history_version: 0, head: None, last_run_state: None, updated_at: None, cache: None, title: None, input: None, model: None, service_tier: None, usage: None, sender: None, incarnation: \"unwritten\", last_run_error: None, retention_policy: None, retention_state: None, released: None })"
 == run.result
 "Err(UnknownRun(\"r1\"))"
 == run.tool_calls

@@ -514,7 +514,285 @@ async fn a_later_send_shortens_the_retention(cipher: Cipher) {
     new.stop().await;
 }
 
+fn principal(module_id: &str) -> broca_protocol::BindPrincipal {
+    broca_protocol::BindPrincipal::Reserved {
+        module_id: module_id.into(),
+    }
+}
+
+fn owner() -> broca_protocol::BindPrincipal {
+    principal("starter")
+}
+
+impl Retained {
+    /// Sends `run` from `principal`, carrying the storage policy `keep` (llm-runner
+    /// `session_retention`) with no archive, backup or dumps.
+    async fn send_kept(
+        &self,
+        run: &str,
+        keep: cortexkit_role_llm_runner::session_retention::Keep,
+        principal: Option<broca_protocol::BindPrincipal>,
+    ) -> SendOutcome {
+        let policy = cortexkit_role_llm_runner::session_retention::RetentionPolicy::new(
+            keep, 0, false, false,
+        );
+        self.send_policy(run, Some(policy), principal).await
+    }
+
+    /// Sends `run` from `principal`, carrying the storage policy `policy` when there is one.
+    async fn send_policy(
+        &self,
+        run: &str,
+        policy: Option<cortexkit_role_llm_runner::session_retention::RetentionPolicy>,
+        principal: Option<broca_protocol::BindPrincipal>,
+    ) -> SendOutcome {
+        let mut request = request("hello");
+        request.retention_policy = policy;
+        request.principal = principal;
+        self.submit(run, request).await.unwrap()
+    }
+
+    async fn submit(
+        &self,
+        run: &str,
+        request: broca_protocol::SubmissionRequest,
+    ) -> Result<SendOutcome, crate::registry::OpenError> {
+        self.module
+            .registry
+            .route_submission_with_retention(
+                &self.module.key,
+                RunId(run.into()),
+                self.module.caller.shape(run, &SendKey::Minted, request),
+                RunKind::FreshOrResume,
+                SendKey::Minted,
+                false,
+                broca_protocol::Delivery::Queue,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+    }
+
+    /// Moves the retention clock past the wall clock the run loop stamps its records with, as
+    /// the two agree outside tests: the session's last activity is then behind it.
+    fn caught_up(&self) {
+        self.advance(broca_core::clock::epoch_millis().unwrap() + 1_000);
+    }
+
+    async fn release(
+        &self,
+        principal: Option<broca_protocol::BindPrincipal>,
+    ) -> crate::actor::ReleaseOutcome {
+        self.module
+            .registry
+            .route_session_release(&self.module.key, principal)
+            .await
+            .unwrap()
+    }
+
+    /// Asserts the session reads as never there: deleted by its policy or its release, not
+    /// expired.
+    async fn never_there(&self) {
+        let error = self
+            .module
+            .registry
+            .read(SessionReadRequest::new(self.module.key.clone(), None, None))
+            .await
+            .expect_err("a released session is gone once deleted");
+        assert!(matches!(error, ServeError::UnknownSession), "{error:?}");
+        let error = self
+            .module
+            .registry
+            .check_expired(&self.module.key, Some("r1"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::registry::OpenError::UnknownSession),
+            "{error:?}"
+        );
+    }
+}
+
+fn released(
+    state: cortexkit_role_llm_runner::session_retention::ReleaseState,
+) -> crate::actor::ReleaseOutcome {
+    crate::actor::ReleaseOutcome::Released(state)
+}
+
+/// Its owner's release deletes an idle session at once, which then reads as never there, answers
+/// a repeated release `absent`, and starts again at its next send.
+async fn a_released_idle_session_is_deleted_at_once(cipher: Cipher) {
+    use cortexkit_role_llm_runner::session_retention::{Keep, ReleaseState};
+    let new = retained(cipher, TTL, None).await;
+    new.send_kept("r1", Keep::forever(), Some(owner())).await;
+    new.idle().await;
+    new.caught_up();
+    assert_eq!(
+        new.release(Some(owner())).await,
+        released(ReleaseState::deleted())
+    );
+    new.deleted().await;
+    new.never_there().await;
+    assert_eq!(
+        new.release(Some(owner())).await,
+        released(ReleaseState::absent())
+    );
+    assert!(matches!(
+        new.send_kept("r2", Keep::forever(), Some(owner())).await,
+        SendOutcome::Active { .. }
+    ));
+    assert!(new.runtime.holds(&new.module.key).unwrap());
+    new.stop().await;
+}
+
+/// Only the principal of the session's first send releases it: another principal, or a caller
+/// with none, is refused and records nothing.
+async fn only_the_first_sender_releases_a_session(cipher: Cipher) {
+    use cortexkit_role_llm_runner::session_retention::Keep;
+    let new = retained(cipher, TTL, None).await;
+    new.send_kept("r1", Keep::forever(), Some(owner())).await;
+    new.idle().await;
+    let stranger = principal("stranger");
+    for principal in [Some(stranger), None] {
+        assert!(
+            matches!(
+                new.release(principal).await,
+                crate::actor::ReleaseOutcome::NotOwner(_)
+            ),
+            "only the first sender may release"
+        );
+    }
+    assert!(new.runtime.holds(&new.module.key).unwrap());
+    new.stop().await;
+}
+
+/// A release during a run answers `pending`, and the session is deleted when the run ends.
+async fn a_release_during_a_run_deletes_once_it_ends(cipher: Cipher) {
+    use cortexkit_role_llm_runner::session_retention::{Keep, ReleaseState};
+    let gate = Arc::new(Notify::new());
+    let new = retained(cipher, TTL, Some(gate.clone())).await;
+    new.send_kept("r1", Keep::forever(), Some(owner())).await;
+    assert_eq!(
+        new.release(Some(owner())).await,
+        released(ReleaseState::pending())
+    );
+    assert_eq!(
+        new.release(Some(owner())).await,
+        released(ReleaseState::pending())
+    );
+    assert!(new.runtime.holds(&new.module.key).unwrap());
+    gate.notify_one();
+    new.idle().await;
+    new.caught_up();
+    new.deleted().await;
+    new.never_there().await;
+    new.stop().await;
+}
+
+/// A send queued before its session's release still runs to its end: a release only refuses
+/// sends that arrive after it. The session is deleted once the queued run has ended.
+async fn a_send_queued_before_a_release_still_runs(cipher: Cipher) {
+    use cortexkit_role_llm_runner::session_retention::{Keep, ReleaseState};
+    let gate = Arc::new(Notify::new());
+    let new = retained(cipher, TTL, Some(gate.clone())).await;
+    new.send_kept("r1", Keep::forever(), Some(owner())).await;
+    let queued = new.send_kept("r2", Keep::forever(), Some(owner())).await;
+    assert!(matches!(queued, SendOutcome::Pending { .. }), "{queued:?}");
+    assert_eq!(
+        new.release(Some(owner())).await,
+        released(ReleaseState::pending())
+    );
+    let late = new.send_kept("r3", Keep::forever(), Some(owner())).await;
+    assert!(
+        matches!(late, SendOutcome::RetentionRefused(_)),
+        "a send after the release is refused: {late:?}"
+    );
+    broca_test_support::wait_until("the queued run ran", || async {
+        // A notify holds at most one permit, so each poll lets the waiting model step go.
+        gate.notify_one();
+        let page = new
+            .module
+            .registry
+            .read(SessionReadRequest::new(new.module.key.clone(), None, None))
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        // Each run adds its input and its reply.
+        if page.messages.len() == 4 {
+            Ok(())
+        } else {
+            Err(format!("{} messages", page.messages.len()))
+        }
+    })
+    .await;
+    new.idle().await;
+    assert!(new.runtime.holds(&new.module.key).unwrap());
+    new.caught_up();
+    new.deleted().await;
+    new.never_there().await;
+    new.stop().await;
+}
+
+/// Only the session's owner replaces the policy broca assigned it (llm-runner §9.14): a send
+/// carrying any policy from another principal, even the assigned one, is refused as not the
+/// owner and writes nothing, while the owner's replacement is taken.
+async fn only_the_owner_replaces_an_assigned_policy(cipher: Cipher) {
+    use cortexkit_role_llm_runner::session_retention::{Keep, RetentionPolicy};
+    let new = retained(cipher, TTL, None).await;
+    assert!(matches!(
+        new.send_policy("r1", None, Some(owner())).await,
+        SendOutcome::Active { .. }
+    ));
+    new.idle().await;
+    let messages = || async {
+        new.module
+            .registry
+            .read(SessionReadRequest::new(new.module.key.clone(), None, None))
+            .await
+            .unwrap()
+            .messages
+            .len()
+    };
+    let before = messages().await;
+    for policy in [
+        RetentionPolicy::new(Keep::days(7), 0, false, false),
+        RetentionPolicy::new(Keep::forever(), 0, false, false),
+    ] {
+        let refused = new
+            .send_policy("r2", Some(policy), Some(principal("stranger")))
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                SendOutcome::ScopeRefused(broca_core::ScopeRefusal::OwnerMismatch(mismatch))
+                    if matches!(&**mismatch, broca_core::OwnerMismatch::FirstPrincipal { first, .. } if *first == owner())
+            ),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(messages().await, before, "a refused send writes nothing");
+    let replaced = new
+        .send_policy(
+            "r3",
+            Some(RetentionPolicy::new(Keep::days(7), 0, false, false)),
+            Some(owner()),
+        )
+        .await;
+    assert!(
+        matches!(replaced, SendOutcome::Active { .. }),
+        "{replaced:?}"
+    );
+    new.stop().await;
+}
+
 cipher_tests!(
+    only_the_owner_replaces_an_assigned_policy,
+    a_send_queued_before_a_release_still_runs,
+    a_released_idle_session_is_deleted_at_once,
+    only_the_first_sender_releases_a_session,
+    a_release_during_a_run_deletes_once_it_ends,
     a_later_send_shortens_the_retention,
     retained_creating_sends_validate_alike,
     swept_retained_reads_and_fresh_sends_match,

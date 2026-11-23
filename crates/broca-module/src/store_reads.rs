@@ -265,6 +265,9 @@ pub struct ReadContext<'a> {
     /// Whether compaction entries the read serves keep `speaks_for`: whether the session's
     /// compaction provider declared `compaction-entry-speaks-for/v1`.
     pub entry_speaks_for: crate::store_entries::EntryAttribution,
+    /// The root the session is stored in, which decides the storage policy broca assigns a
+    /// session its starter sent none. `None` where the read serves no head.
+    pub class: Option<broca_records::session_storage::StorageClass>,
 }
 
 impl ReadContext<'_> {
@@ -349,6 +352,17 @@ pub async fn execute<B: SessionBackend>(
                 head.reply.head = crate::store_read::stream_head(session, ctx.stream_head)
                     .await?
                     .map(broca_wire::CursorWire::from);
+                if let Some(class) = ctx.class {
+                    crate::retention::policy::fill_head(
+                        &mut head.reply,
+                        &session.operations,
+                        class,
+                        session.open_log_activity_ms(),
+                    )
+                    .map_err(|error| {
+                        ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent))
+                    })?;
+                }
                 Ok(Box::new(head))
             }
             .await,

@@ -35,6 +35,8 @@ use crate::store_open::StoreRuntime;
 pub(crate) mod counters;
 #[path = "retention_store_deadlines.rs"]
 mod kept;
+#[path = "retention_store_marks.rs"]
+pub(crate) mod marks;
 
 /// What retention keeps between passes about the sessions in the session store.
 #[derive(Default)]
@@ -49,6 +51,10 @@ pub(super) struct StoreRetention {
     /// of small head reads every pass otherwise cost more disk reads than anything else broca
     /// does while idle. Kept in memory only: a restart's first pass reads every head once.
     stamps: Mutex<HashMap<String, HeadStamp>>,
+    /// The class of each session the last full pass found marked outside the ephemeral root
+    /// ([`marks`]), by address, so a pass between full passes reads a due one from its own root.
+    /// A session not named here lives in the ephemeral root.
+    marked_classes: Mutex<HashMap<String, StorageClass>>,
     /// Whether `deadlines` was filled from the kept file, which the first pass does.
     loaded: std::sync::atomic::AtomicBool,
     /// Whether `deadlines` changed since it was last kept.
@@ -147,6 +153,44 @@ pub fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)
     )))
 }
 
+/// When the session whose records are `records`, folded into `operations`, is due for deletion.
+/// A session whose starter (the first send carrying one) froze a storage policy is kept by that policy (llm-runner
+/// `session_retention`, [`super::policy::deadline`]); any other by its older `retention`
+/// seconds ([`store_policy`]). A release ends either sooner. `None` when nothing makes it due.
+/// A frozen policy that no longer decodes is refused: nothing a reader can't decide is deleted.
+pub(crate) fn session_deadline(
+    records: &[(u64, Record)],
+    operations: &broca_session_store::fold::operations::Operations,
+) -> Result<Option<u64>, String> {
+    let legacy = || store_policy(records).and_then(|(_, _, deadline)| deadline);
+    if operations.retention_policy.is_none() && operations.released_at_ms.is_none() {
+        return Ok(legacy());
+    }
+    let legacy = operations.retention_policy.is_none().then(legacy).flatten();
+    let starter = operations
+        .retention_policy
+        .as_ref()
+        .map(cortexkit_role_llm_runner::session_retention::RetentionPolicy::from_value)
+        .transpose()
+        .map_err(|field| format!("the session's frozen retention policy is damaged at {field}"))?;
+    let busy = operations
+        .run
+        .as_ref()
+        .is_some_and(|run| run.finished.is_none())
+        || !operations.queue.is_empty();
+    let activity = records
+        .iter()
+        .filter_map(|(_, record)| record.activity_ms())
+        .max();
+    Ok(super::policy::deadline(
+        starter.as_ref(),
+        operations.released_at_ms,
+        legacy,
+        busy,
+        activity,
+    ))
+}
+
 /// What an operator's deletion of a session in the session store came to
 /// ([`RetentionService::delete_store_session_for_operator`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -173,11 +217,21 @@ impl RetentionService {
         now_ms: u64,
     ) -> Result<bool, String> {
         let _deleting = Deleting::start(&self.store.deleting, key);
-        let backend = LocalBackend::new(StorageClass::Ephemeral.store_root(runtime.state_root()));
+        let addr = SessionAddr(broca_core::session_addr(key));
+        // A session with a storage policy may be kept in any root; one with only the older
+        // retention is in the ephemeral one.
+        let Some(class) =
+            broca_records::session_storage::session_storage_class(runtime.state_root(), &addr.0)
+                .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let backend = LocalBackend::new(class.store_root(runtime.state_root()));
         self.delete_expired_store_session(
             runtime,
             &backend,
-            &SessionAddr(broca_core::session_addr(key)),
+            class,
+            &addr,
             key,
             &crate::store_open::triple(key),
             now_ms,
@@ -195,10 +249,11 @@ impl RetentionService {
             .contains(key)
     }
 
-    /// Deletes every session in the session store's ephemeral root whose retention policy expired
-    /// at or before `now_ms`, each under its lease, and returns the sessions deleted. One that
-    /// can't be decided or deleted now is logged and decided again on the next pass. This is the
-    /// full pass: it lists every session folder and checks every head for a change (see
+    /// Deletes every session in the session store's ephemeral root, and every session marked in
+    /// its other roots ([`marks`]), whose retention policy expired at or before `now_ms`, each
+    /// under its lease, and returns the sessions deleted. One that can't be decided or deleted
+    /// now is logged and decided again on the next pass. This is the full pass: it lists every
+    /// session folder and mark, and checks every head for a change (see
     /// [`crate::retention::FULL_PASS_EVERY`]).
     pub(crate) async fn sweep_store(
         &self,
@@ -241,10 +296,21 @@ impl RetentionService {
                 return Vec::new();
             }
         };
+        let mut sessions: Vec<(StorageClass, SessionAddr)> = addresses
+            .into_iter()
+            .map(|addr| (StorageClass::Ephemeral, addr))
+            .collect();
+        for class in marks::MARKED {
+            match marks::marked(&class.store_root(runtime.state_root())) {
+                Ok(marked) => sessions.extend(marked.into_iter().map(|addr| (class, addr))),
+                Err(error) => tracing::warn!(target: "retention", class = class.name(), %error,
+                    "retention pass skips a root's marked sessions; their marks can't be listed"),
+            }
+        }
         // A set, not a scan of the list for each cached deadline: the ephemeral root holds tens
         // of thousands of sessions, and the scan cost each pass their count squared.
-        let listed: std::collections::HashSet<&str> =
-            addresses.iter().map(|addr| addr.0.as_str()).collect();
+        let listed: std::collections::HashSet<String> =
+            sessions.iter().map(|(_, addr)| addr.0.clone()).collect();
         {
             let mut deadlines = self
                 .store
@@ -261,6 +327,15 @@ impl RetentionService {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|address, _| listed.contains(address.as_str()));
+            *self
+                .store
+                .marked_classes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = sessions
+                .iter()
+                .filter(|(class, _)| *class != StorageClass::Ephemeral)
+                .map(|(class, addr)| (addr.0.clone(), *class))
+                .collect();
         }
         for addr in cut_short {
             if let Err(error) = self.finish_store_deletion(runtime, &backend, &addr) {
@@ -268,7 +343,7 @@ impl RetentionService {
                     "a deletion a crash cut short is left to finish on the next pass");
             }
         }
-        self.expire_each(runtime, &root, addresses, now_ms).await
+        self.expire_each(runtime, &root, sessions, now_ms).await
     }
 
     /// A pass between full passes: deletes the sessions whose kept deadline is at or before
@@ -290,30 +365,55 @@ impl RetentionService {
             .filter(|(_, (_, deadline))| deadline.is_some_and(|deadline| deadline <= now_ms))
             .map(|(address, _)| SessionAddr(address.clone()))
             .collect();
+        let due = {
+            let marked = self
+                .store
+                .marked_classes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            due.into_iter()
+                .map(|addr| {
+                    let class = marked
+                        .get(&addr.0)
+                        .copied()
+                        .unwrap_or(StorageClass::Ephemeral);
+                    (class, addr)
+                })
+                .collect()
+        };
         self.expire_each(runtime, &root, due, now_ms).await
     }
 
-    /// Decides and deletes each session of `addresses` in the ephemeral root `root`, then keeps
-    /// the deadlines found on disk for the next restart.
+    /// Decides and deletes each session of `sessions`, each in the root of its class, then keeps
+    /// the deadlines found in the ephemeral root `root` for the next restart.
     async fn expire_each(
         &self,
         runtime: &StoreRuntime,
         root: &std::path::Path,
-        addresses: Vec<SessionAddr>,
+        sessions: Vec<(StorageClass, SessionAddr)>,
         now_ms: u64,
     ) -> Vec<BindIdentity> {
         use std::sync::atomic::Ordering;
         let mut deleted = Vec::new();
-        for addr in addresses {
+        for (class, addr) in sessions {
             // A backend of its own for each session: a backend keeps every log it opens open
             // until it is dropped, and one shared across the whole pass held a file open for
             // each of the tens of thousands of sessions it read.
-            let session_backend = LocalBackend::new(root);
+            let session_backend = LocalBackend::new(class.store_root(runtime.state_root()));
             match self
-                .expire_store_session(runtime, &session_backend, &addr, now_ms)
+                .expire_store_session(runtime, &session_backend, class, &addr, now_ms)
                 .await
             {
                 Ok(Some(key)) => deleted.push(key),
+                Ok(None) if class != StorageClass::Ephemeral => {
+                    if let Err(error) = self
+                        .unmark_settled(runtime, &session_backend, class, &addr)
+                        .await
+                    {
+                        tracing::warn!(target: "retention", session = %addr.0, %error,
+                            "a marked session's mark is kept; the session couldn't be read");
+                    }
+                }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(target: "retention", session = %addr.0, %error,
@@ -379,12 +479,14 @@ impl RetentionService {
         Ok(())
     }
 
-    /// Deletes the session at `addr` in the ephemeral root when its policy expired at or before
-    /// `now_ms` and its lease is free, and returns who it was. `None` when it is kept.
+    /// Deletes the session at `addr` in the root of `class`, which `backend` reads, when its
+    /// policy expired at or before `now_ms` and its lease is free, and returns who it was. `None`
+    /// when it is kept.
     async fn expire_store_session(
         &self,
         runtime: &StoreRuntime,
         backend: &LocalBackend,
+        class: StorageClass,
         addr: &SessionAddr,
         now_ms: u64,
     ) -> Result<Option<BindIdentity>, String> {
@@ -448,7 +550,7 @@ impl RetentionService {
         };
         let deleting = Deleting::start(&self.store.deleting, &key);
         let deleted = self
-            .delete_expired_store_session(runtime, backend, addr, &key, &triple, now_ms)
+            .delete_expired_store_session(runtime, backend, class, addr, &key, &triple, now_ms)
             .await;
         drop(deleting);
         drop(lease);
@@ -508,18 +610,17 @@ impl RetentionService {
                 }
             }
         }
-        let records =
+        // A writer moved the head between the probe and the read: decided on the next pass.
+        let deadline =
             match Session::view_at(backend, addr.clone(), triple, deployment, &position).await {
-                Ok(view) => view.records_from(0).await,
-                Err(error) => Err(error),
+                Ok(view) => match view.records_from(0).await {
+                    Ok(records) => session_deadline(&records, &view.operations)?,
+                    Err(SessionError::Moved) => return Ok(None),
+                    Err(error) => return Err(self.unreadable_store_session(addr, error)),
+                },
+                Err(SessionError::Moved) => return Ok(None),
+                Err(error) => return Err(self.unreadable_store_session(addr, error)),
             };
-        let records = match records {
-            Ok(records) => records,
-            // A writer moved the head between the probe and the read: decided on the next pass.
-            Err(SessionError::Moved) => return Ok(None),
-            Err(error) => return Err(self.unreadable_store_session(addr, error)),
-        };
-        let deadline = store_policy(&records).and_then(|(_, _, deadline)| deadline);
         let previous = self
             .store
             .deadlines
@@ -534,6 +635,41 @@ impl RetentionService {
         Ok(deadline)
     }
 
+    /// Removes the mark of the session at `addr` in the root of `class`, which `backend` reads,
+    /// once nothing can make it due: it is gone, or it is neither released nor kept by a
+    /// starter's policy that ends. A session not readable yet keeps its mark.
+    async fn unmark_settled(
+        &self,
+        runtime: &StoreRuntime,
+        backend: &LocalBackend,
+        class: StorageClass,
+        addr: &SessionAddr,
+    ) -> Result<(), String> {
+        let root = class.store_root(runtime.state_root());
+        let Some((stored, _)) = backend.read_stored_head(addr).map_err(described)? else {
+            return marks::remove(&root, addr).map_err(|error| error.to_string());
+        };
+        let triple = head::stored_triple(&stored).map_err(described)?;
+        if head::stored_cipher(&stored).map_err(described)? != Cipher::None && !runtime.key_loaded()
+        {
+            return Ok(());
+        }
+        let deployment = runtime.deployment();
+        let Some(position) = Session::stored_position(backend, addr, deployment)
+            .await
+            .map_err(described)?
+        else {
+            return Ok(());
+        };
+        let view = Session::view_at(backend, addr.clone(), &triple, deployment, &position)
+            .await
+            .map_err(described)?;
+        if !marks::needs_mark(class, &view.operations) {
+            marks::remove(&root, addr).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Counts the session at `addr` as unreadable and says why.
     fn unreadable_store_session(&self, addr: &SessionAddr, error: SessionError) -> String {
         self.mark_unreadable_address(addr.0.clone());
@@ -542,10 +678,12 @@ impl RetentionService {
 
     /// Deletes the session `key` at `addr` when, read again now under its lease, its policy has
     /// expired at or before `now_ms`. Returns whether it was deleted. The caller holds the lease.
+    #[allow(clippy::too_many_arguments)]
     async fn delete_expired_store_session(
         &self,
         runtime: &StoreRuntime,
         backend: &LocalBackend,
+        class: StorageClass,
         addr: &SessionAddr,
         key: &BindIdentity,
         triple: &SessionTriple,
@@ -555,7 +693,7 @@ impl RetentionService {
         // A head in two roots is damage, which is never resolved by deleting one of them.
         if broca_records::session_storage::session_storage_class(state_root, &addr.0)
             .map_err(|error| error.to_string())?
-            != Some(StorageClass::Ephemeral)
+            != Some(class)
         {
             return Ok(false);
         }
@@ -582,7 +720,7 @@ impl RetentionService {
             .records_from(0)
             .await
             .map_err(|error| self.unreadable_store_session(addr, error))?;
-        let Some(deadline) = store_policy(&records).and_then(|(_, _, deadline)| deadline) else {
+        let Some(deadline) = session_deadline(&records, &view.operations)? else {
             return Ok(false);
         };
         if deadline > now_ms {
@@ -607,6 +745,10 @@ impl RetentionService {
             deadline,
         )
         .await?;
+        if class != StorageClass::Ephemeral {
+            marks::remove(&class.store_root(state_root), addr)
+                .map_err(|error| error.to_string())?;
+        }
         tracing::info!(target: "retention", session = %addr.0, expired_at_ms = deadline,
             "expired session deleted from the new storage");
         Ok(true)
@@ -745,6 +887,11 @@ impl RetentionService {
                     })
                     .collect(),
                 history_version: Some(view.head().history_version),
+                // A session kept by a starter's policy, or released, reads as never there once
+                // deleted (llm-runner `session_retention`), not as expired.
+                policy_deleted: (view.operations.retention_policy.is_some()
+                    || view.operations.released_at_ms.is_some())
+                .then_some(true),
             },
             view.head().cipher(),
             deployment,

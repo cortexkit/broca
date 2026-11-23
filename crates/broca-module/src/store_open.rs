@@ -820,6 +820,7 @@ impl StoreRuntime {
             entry_speaks_for: crate::store_entries::EntryAttribution::Catalog(
                 self.executor.compaction_plane(),
             ),
+            class: Some(class),
         }
     }
 

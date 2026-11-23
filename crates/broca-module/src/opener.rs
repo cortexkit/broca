@@ -253,13 +253,21 @@ impl<L: LeaseStore + 'static> DefaultOpener<L> {
             },
             (None, None) => return Err(OpenError::UnknownSession),
         };
-        if retention.is_some() && registry.retention_service().is_none() {
+        // A session a policy may delete needs the service that deletes it.
+        let deletes = retention.is_some()
+            || matches!(
+                creating,
+                Some(StoreCreation::Placed(class))
+                    if class != broca_records::session_storage::StorageClass::Ordinary
+            );
+        if deletes && registry.retention_service().is_none() {
             return Err(OpenError::Open(
                 "retention service is not configured".into(),
             ));
         }
         let class = creating.map(|creation| {
             let durable = match creation {
+                StoreCreation::Placed(class) => return class,
                 StoreCreation::Send | StoreCreation::Head => {
                     broca_records::session_storage::selected_for_backup(
                         session_class.as_deref(),

@@ -48,6 +48,15 @@ Object {
         "model": String("m2"),
         "provider": String("stub"),
     },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
+    },
     "updated_at": Bool(true),
     "usage": Object {
         "by_model": Array [
@@ -91,6 +100,15 @@ Object {
     "model": Object {
         "model": String("m2"),
         "provider": String("stub"),
+    },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
     },
     "sender": Object {
         "interrupt": Bool(true),
@@ -145,6 +163,15 @@ Object {
     "model": Object {
         "model": String("m2"),
         "provider": String("stub"),
+    },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
     },
     "sender": Object {
         "interrupt": Bool(true),

@@ -14,6 +14,15 @@ Object {
         "model": String("m"),
         "provider": String("stub"),
     },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
+    },
     "sender": Object {
         "interrupt": Bool(true),
         "modes": Array [
@@ -43,6 +52,15 @@ Object {
         "model": String("m"),
         "provider": String("stub"),
     },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
+    },
     "sender": Object {
         "interrupt": Bool(true),
         "modes": Array [
@@ -71,6 +89,15 @@ Object {
     "model": Object {
         "model": String("m"),
         "provider": String("stub"),
+    },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
     },
     "sender": Object {
         "interrupt": Bool(true),
@@ -446,6 +473,15 @@ Object {
         "model": String("m"),
         "provider": String("stub"),
     },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
+    },
     "sender": Object {
         "interrupt": Bool(true),
         "modes": Array [
@@ -493,6 +529,15 @@ Object {
         "model": String("m"),
         "provider": String("stub"),
     },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
+    },
     "sender": Object {
         "interrupt": Bool(true),
         "modes": Array [
@@ -539,6 +584,15 @@ Object {
     "model": Object {
         "model": String("m"),
         "provider": String("stub"),
+    },
+    "retention_policy": Object {
+        "archive_after_days": Number(0),
+        "backup": Bool(false),
+        "keep": String("forever"),
+        "request_dumps": Bool(false),
+    },
+    "retention_state": Object {
+        "source": String("runner"),
     },
     "sender": Object {
         "interrupt": Bool(true),

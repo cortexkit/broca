@@ -14,6 +14,7 @@ fn marker() -> Marker {
         next_notice_seq: 77,
         runs: vec!["deleted-run".into()],
         history_version: None,
+        policy_deleted: None,
     }
 }
 

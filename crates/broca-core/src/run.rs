@@ -62,6 +62,10 @@ pub struct RunRequest {
     /// Retention accepted for this send, recorded in a new episode's `RunStarted` but never
     /// included in a provider request. Resuming an existing episode cannot change its policy.
     pub retention: Option<u64>,
+    /// The storage policy this run's start freezes (llm-runner `session_retention`), as
+    /// admission decoded it: set only on the run of the session's first send carrying one,
+    /// whose start's batch records it.
+    pub retention_policy: Option<serde_json::Value>,
     pub on_restart: Option<broca_protocol::request::OnRestart>,
     /// The run's warming, which admission takes from the session's cache policy; restored from
     /// the run's start when it resumes. `None` warms nothing.
@@ -166,6 +170,7 @@ impl RunRequest {
             directives: req.directives,
             session_class: None,
             retention: None,
+            retention_policy: None,
             on_restart: req.on_restart,
             keep_warm: None,
             project_id: req.project_id,

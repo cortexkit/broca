@@ -35,6 +35,12 @@ crate::message! {
         /// the new history for it. Absent on markers written before it was kept; an older build
         /// skips it.
         8 opt history_version: u64,
+        /// True when a storage policy or its owner's release deleted the session (llm-runner
+        /// `session_retention`): its head and reads then refuse `unknown_session` rather than
+        /// read `expired`, and its runs are no longer known. Absent on markers of sessions the
+        /// older retention seconds deleted, and on every marker written before it was kept; an
+        /// older build skips it and reads such a session as expired.
+        9 opt policy_deleted: bool,
     }
 }
 

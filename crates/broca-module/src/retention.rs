@@ -164,5 +164,7 @@ impl RetentionService {
     }
 }
 
+#[path = "retention_policy.rs"]
+pub mod policy;
 #[path = "retention_store.rs"]
 pub mod store;

@@ -95,6 +95,7 @@ pub fn admission<P: Provider>(
             title: req.title.clone(),
             session_class: req.session_class.clone(),
             retention_secs: req.retention,
+            retention_policy: req.retention_policy.clone(),
             principal: req.principal.clone(),
             sent_by: control.display_sent_by.clone(),
             scope: req.scope.clone(),

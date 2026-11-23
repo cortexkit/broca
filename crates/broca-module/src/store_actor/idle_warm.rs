@@ -62,6 +62,10 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
             return Err("run_active_or_closing".into());
         }
         let operations = self.session.operations();
+        // Its owner ended a released session: nothing keeps its cache.
+        if operations.released_at_ms.is_some() {
+            return Err("released".into());
+        }
         let run = operations.run.as_ref().ok_or("no_run")?;
         let start = run.start.as_ref().ok_or("no_run_start")?;
         if run.finished.is_none()

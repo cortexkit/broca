@@ -69,6 +69,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             live_step: live_step.as_ref(),
             stream_head: self.fanout.as_ref().and_then(|fanout| fanout.head()),
             entry_speaks_for,
+            class: self.class_placement.as_ref().map(|(class, _)| *class),
         };
         crate::store_reads::answer_in_memory(&mut self.session, &context, request).await
     }

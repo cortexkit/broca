@@ -1532,6 +1532,8 @@ pub enum ServeError {
         expired_at_ms: u64,
     },
     RetentionInvalid(crate::retention::InvalidRetention),
+    /// Refused for its storage policy, or because the session was released.
+    RetentionRefused(crate::retention::policy::Refusal),
     VariantUnsupported(broca_core::run::VariantRefusal),
     ToolAliasInvalid(broca_core::run::ToolAliasInvalid),
     ServiceTierInvalid {
@@ -1695,6 +1697,7 @@ impl std::fmt::Display for ServeError {
             }
             ServeError::Expired { expired_at_ms } => write!(f, "lineage expired at {expired_at_ms}"),
             ServeError::RetentionInvalid(_) => write!(f, "invalid retention"),
+            ServeError::RetentionRefused(refusal) => write!(f, "{refusal}"),
             ServeError::SessionHeld(s) => write!(f, "session '{s}' held by a live writer"),
             ServeError::VariantUnsupported(e) => write!(f, "open failed: run resolution failed: {e}"),
             ServeError::ToolAliasInvalid(e) => write!(f, "{e}"),
@@ -2458,6 +2461,17 @@ pub trait ServeHandler: Send + Sync {
         None
     }
 
+    /// `session.release` (llm-runner `session_retention`): the session's owner ends it, and it is
+    /// deleted once nothing runs or waits in it. The default has no session to release.
+    async fn session_release(
+        &self,
+        _session: &LineageKey,
+        _principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Result<cortexkit_role_llm_runner::session_retention::ReleaseReply, SessionChangeError>
+    {
+        Err(SessionChangeError::unsupported("session.release"))
+    }
+
     /// Accept a `session.refresh`: fetch, record durably, and hold pending. `refetch` is the
     /// providers it asked to read afresh, empty when it named none. Implemented by the
     /// registry through the lineage actor; the default has no session to refresh.
@@ -3039,6 +3053,7 @@ impl ServeHandler for crate::LineageRegistry {
             .await?
         {
             SendOutcome::RetentionInvalid(detail) => Err(ServeError::RetentionInvalid(detail)),
+            SendOutcome::RetentionRefused(refusal) => Err(ServeError::RetentionRefused(refusal)),
             SendOutcome::SessionClassInvalid(message) => Err(ServeError::InvalidParams {
                 field: "session_class".into(),
                 message,
@@ -4013,6 +4028,35 @@ impl ServeHandler for crate::LineageRegistry {
             Ok(crate::actor::SessionFlushPrefixOutcome::Error(error)) => {
                 Err(SessionChangeError::Transient(error))
             }
+            Err(error) => Err(SessionChangeError::Transient(error.to_string())),
+        }
+    }
+
+    async fn session_release(
+        &self,
+        session: &LineageKey,
+        principal: Option<&broca_protocol::BindPrincipal>,
+    ) -> Result<cortexkit_role_llm_runner::session_retention::ReleaseReply, SessionChangeError>
+    {
+        use crate::actor::ReleaseOutcome;
+        use cortexkit_role_llm_runner::session_retention::ReleaseReply;
+        match self
+            .route_session_release(session, principal.cloned())
+            .await
+        {
+            Ok(ReleaseOutcome::Released(state)) => Ok(ReleaseReply::new(state)),
+            Ok(ReleaseOutcome::NotOwner(mismatch)) => {
+                Err(SessionChangeError::OwnerMismatch(mismatch))
+            }
+            Ok(ReleaseOutcome::Unowned) => Err(SessionChangeError::Unsupported(
+                "session.release: the session's first send recorded no principal, so no caller \
+                 presenting one owns it"
+                    .into(),
+            )),
+            Ok(ReleaseOutcome::Reopen) => Err(SessionChangeError::Transient(
+                "the session actor is closing; retry the release".into(),
+            )),
+            Ok(ReleaseOutcome::Error(error)) => Err(SessionChangeError::Transient(error)),
             Err(error) => Err(SessionChangeError::Transient(error.to_string())),
         }
     }

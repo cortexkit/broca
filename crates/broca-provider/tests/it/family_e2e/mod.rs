@@ -410,6 +410,7 @@ async fn family_e2e<F: WireFamily + 'static>(
         directives: None,
         session_class: None,
         retention: None,
+        retention_policy: None,
         title: None,
         on_restart: None,
         keep_warm: None,

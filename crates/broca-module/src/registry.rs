@@ -541,6 +541,9 @@ pub(crate) enum StoreCreation {
     /// A send labelled [`HEAD_SESSION_CLASS`], placed as a send is. A head starts only in the
     /// session store; if it can't be created there, it is refused.
     Head,
+    /// A send carrying a storage policy (llm-runner `session_retention`), which picks its root
+    /// whatever its label or `backup_classes` say (`crate::retention::policy::class_for`).
+    Placed(broca_records::session_storage::StorageClass),
 }
 
 /// The session label of an agent head. A session a send with this label creates starts in the
@@ -1426,7 +1429,8 @@ impl LineageRegistry {
         key: &LineageKey,
     ) -> Result<Option<Option<broca_protocol::BindPrincipal>>, OpenError> {
         match self.check_authorization_expired(key).await {
-            Err(OpenError::Expired { .. }) => return Ok(None),
+            // A deleted session has no sender: the next send starts a new one.
+            Err(OpenError::Expired { .. } | OpenError::UnknownSession) => return Ok(None),
             Err(error) => return Err(error),
             Ok(()) => {}
         }
@@ -1954,8 +1958,11 @@ impl LineageRegistry {
                 }
             }
         }
-        // How the session starts if this send creates it.
-        let creation = if session_class.as_deref() == Some(HEAD_SESSION_CLASS) {
+        // How the session starts if this send creates it: in the root its storage policy picks,
+        // else as its label and retention always placed it.
+        let creation = if let Some(policy) = &request.retention_policy {
+            StoreCreation::Placed(crate::retention::policy::class_for(policy))
+        } else if session_class.as_deref() == Some(HEAD_SESSION_CLASS) {
             StoreCreation::Head
         } else {
             StoreCreation::Send
@@ -2420,6 +2427,38 @@ impl LineageRegistry {
                 Ok(SessionFlushPrefixOutcome::Reopen) => continue,
                 Ok(other) => return Ok(other),
                 Err(_) => continue,
+            }
+        }
+    }
+
+    /// Route a `session.release` (llm-runner `session_retention`) through the session's actor. A
+    /// session that doesn't exist, never created or already deleted, answers `absent`.
+    pub async fn route_session_release(
+        &self,
+        key: &LineageKey,
+        principal: Option<broca_protocol::BindPrincipal>,
+    ) -> Result<crate::actor::ReleaseOutcome, OpenError> {
+        use crate::actor::{LineageCmd, ReleaseOutcome};
+        use cortexkit_role_llm_runner::session_retention::ReleaseState;
+        loop {
+            self.check_move(key, true)?;
+            let handle = match self.actor_for(key).await {
+                Err(OpenError::UnknownSession | OpenError::Expired { .. }) => {
+                    return Ok(ReleaseOutcome::Released(ReleaseState::absent()))
+                }
+                handle => handle?,
+            };
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let cmd = LineageCmd::Release {
+                principal: principal.clone(),
+                reply,
+            };
+            if handle.send(cmd).await.is_err() {
+                continue;
+            }
+            match rx.await {
+                Ok(ReleaseOutcome::Reopen) | Err(_) => continue,
+                Ok(other) => return Ok(other),
             }
         }
     }

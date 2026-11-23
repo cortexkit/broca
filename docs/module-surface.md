@@ -2553,7 +2553,8 @@ complete store per class: `session-store-durable/`, `session-store/` (ordinary) 
 `session-store-ephemeral/`. A first send whose class is listed creates the session in
 `session-store-durable/`; unclassed sessions and other labels use `session-store/`. A send with
 `retention` always uses `session-store-ephemeral/` and is never backed up, even if its class is
-listed: deletion takes precedence. Changing configuration never moves an existing session. The
+listed: deletion takes precedence. A send with a storage policy (`retention_policy`, below) is
+placed by its policy instead. Changing configuration never moves an existing session. The
 root holding a session's head is authoritative afterwards, and a head found in two roots is
 refused `session_in_two_classes`.
 
@@ -2567,6 +2568,51 @@ the seeded run records it, and the session is deleted once that long passes afte
 activity with no run active or paused. The import's own time counts as activity. `retention`
 is part of the import's payload, so a repeat must carry the same value. Session addressing and
 leases remain keyed by the original session triple.
+
+### Storage policies and release
+
+`role.describe` declares llm-runner's `session_retention` with `max_days: 3650`,
+`max_unreleased_hold_ms: 86400000` and `required: false`, and lists `session.release`.
+
+`session.send.retention_policy` is `{keep, archive_after_days, backup, request_dumps}`, where
+`keep` is `"none"`, `{"days": N}` (1 to 3650) or `"forever"`. A value that fails the contract's
+check refuses `invalid_params` naming the member's path, and a send carrying both
+`retention` and `retention_policy` refuses `invalid_params` naming `retention_policy`; nothing
+is written for a refused send. The first send carrying a policy freezes it in a `Retention`
+record, written in the same batch as the send's own record. A later send carrying the same
+policy writes nothing; a different one refuses `retention_conflict` with `detail.frozen`.
+
+A new session is placed by its policy: `backup: true` in `session-store-durable/`, else
+`keep: "forever"` in `session-store/`, else `session-store-ephemeral/`. A session whose
+starter sent none keeps a policy broca assigns (`retention_state.source: "runner"`) from what
+already decides its storage: `keep: {days}` from its `retention` seconds, rounded up to whole
+days, else `forever`, backed up in the durable root. Its owner (the principal of its first
+send) may replace an assigned policy once; another sender's different policy refuses
+`retention_conflict`, and a replacement that changes `backup` refuses `backup_unsupported`
+(`reason: "backup_fixed_at_creation"`), because a session never moves between roots.
+`archive_after_days` is checked and changes nothing: broca has one storage tier.
+
+A session is deleted at its deadline: last activity plus `days`, or last run end plus
+`max_unreleased_hold_ms` for `keep: "none"`, or the release time once released. Nothing is
+due while a run is active or paused or a send is queued. A session outside the ephemeral root
+that can come due is marked (`retained/<address>` in its root), so retention's pass reads it
+without reading every head.
+
+`session.release {}` answers `{state}`: `deleted` when the session was deleted before the
+answer, `pending` while a run, a pause or a queued send holds it, and `absent` when no session
+is at the name. Only the principal of the session's first send may release it; another
+principal, a parent scope's owner included, refuses `scope_owner_mismatch`. A release stops
+idle cache warming at once. Until deletion, `session.head` carries `released: {at_ms,
+delete_after_ms}`, reads serve as before, and every send refuses `session_released` with
+`detail.delete_after_ms`.
+
+`session.head` carries `retention_policy` (the frozen or assigned policy, exactly as accepted)
+and `retention_state: {source, request_dumps_unsupported?}`. broca saves no request dumps
+(`session.request_dump` rebuilds requests from records), so `request_dumps: true` sets
+`request_dumps_unsupported`. A session a policy or a release deleted is gone: its head and reads
+refuse `unknown_session`, `session.media_read` refuses `unknown_media`, and the next send starts
+a new incarnation. Its expiry marker stays: it holds no content, only the next free tag and
+notice numbers, so a session started again at the name never reuses a number.
 
 A file import records its attested owner and scope but applies no plan. Its owner's first
 `session.send` must carry `plan` and passes ordinary plan admission, including compaction
@@ -2812,7 +2858,7 @@ Paused, interrupted, successful and never-written sessions carry no error summar
 
 Compaction Setup continues to omit `ride_wait_max_ms`, `view_apply` and child-run
 `session_retention`: broca does not promise provider-chosen ride waits, marked
-next-step view application, or the per-session retention policy group.
+next-step view application, or storage policies for a compaction provider's child runs.
 
 ## Mode-3 compaction
 

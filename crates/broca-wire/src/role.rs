@@ -174,6 +174,17 @@ pub struct HeadResponse {
     /// Paused, interrupted and successful runs never carry an error summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_error: Option<cortexkit_role_llm_runner::read::LastRunError>,
+    /// The session's storage policy (llm-runner `session_retention`), exactly as its starter's
+    /// send carried it or as broca assigned it, and who set it. Absent on a session never
+    /// written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_policy: Option<cortexkit_role_llm_runner::session_retention::RetentionPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_state: Option<cortexkit_role_llm_runner::session_retention::RetentionState>,
+    /// From the moment its owner released the session until it is deleted: when, and the
+    /// earliest time it may be deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released: Option<cortexkit_role_llm_runner::session_retention::Released>,
 }
 
 impl Default for HeadResponse {
@@ -197,6 +208,9 @@ impl Default for HeadResponse {
             sender: None,
             incarnation: "unwritten".into(),
             last_run_error: None,
+            retention_policy: None,
+            retention_state: None,
+            released: None,
         }
     }
 }
@@ -341,6 +355,15 @@ pub const DELIVERY_MODES: &[cortexkit_role_llm_runner::delivery_order::Mode] = &
     cortexkit_role_llm_runner::delivery_order::Mode::Steer,
     cortexkit_role_llm_runner::delivery_order::Mode::IdleStart,
 ];
+
+/// The longest `keep: {days}` broca accepts (llm-runner `session_retention`), which
+/// `role.describe` declares as `max_days`.
+pub const RETENTION_MAX_DAYS: u32 = 3650;
+
+/// How long a `keep: "none"` session nobody released is kept after its last run, which
+/// `role.describe` declares as `max_unreleased_hold_ms`. A starter that crashed before releasing
+/// would otherwise leave its session forever.
+pub const MAX_UNRELEASED_HOLD_MS: u64 = 86_400_000;
 
 /// Discovery follows all installed writers through one capability calculation. Decoding
 /// compaction, retention or hook records alone does not promise to execute those writers.
@@ -508,6 +531,12 @@ pub fn broca_role_describe_with_writers(
         capabilities.push(cortexkit_role_llm_runner::capabilities::RETENTION.into());
     }
     let mut ops = ops;
+    // Storage policies and `session.release` (llm-runner `session_retention`) delete sessions,
+    // so they come with the retention writer, as `retention` (whole-session seconds) does.
+    if retention_writer {
+        capabilities.push(cortexkit_role_llm_runner::capabilities::SESSION_RETENTION.into());
+        ops.push(cortexkit_role_llm_runner::ops::SESSION_RELEASE.into());
+    }
     if broca_protocol::FORK_ANSWER_SERVED {
         // Served for heads kept in the session store (`broca_session_store`), where heads are
         // created; a head not yet converted from a write-ahead log refuses each op with
@@ -579,6 +608,15 @@ pub fn broca_role_describe_with_writers(
         describe.retention = Some(cortexkit_role_llm_runner::describe::Retention::new(
             2_592_000, 3_600_000,
         ));
+        // No `min_hold_days`: nothing reads a session after it is deleted (spend facts are not
+        // session content and stay). A send may still omit its policy while starters switch to it.
+        describe = describe.with_session_retention(
+            cortexkit_role_llm_runner::describe::SessionRetention::new(
+                crate::RETENTION_MAX_DAYS,
+                crate::MAX_UNRELEASED_HOLD_MS,
+                false,
+            ),
+        );
     }
     if broca_protocol::service_tier_enabled() {
         describe
@@ -885,6 +923,9 @@ mod pinned_reply_bytes {
                 cache: None,
                 input: None,
                 last_run_error: None,
+                retention_policy: None,
+                retention_state: None,
+                released: None,
             },
             "session_head.json",
             SESSION_HEAD_SHA256,
@@ -921,9 +962,51 @@ mod pinned_reply_bytes {
                 cache: None,
                 input: None,
                 last_run_error: None,
+                retention_policy: None,
+                retention_state: None,
+                released: None,
             },
             "session_head.title.json",
             SESSION_HEAD_TITLE_SHA256,
+        );
+    }
+
+    /// A released session's head, from its release until it is deleted (llm-runner
+    /// `session_retention`): its policy, who set it, and when it was released and may be
+    /// deleted.
+    #[test]
+    fn a_released_session_head_carries_its_release() {
+        use cortexkit_role_llm_runner::session_retention::{
+            Keep, Released, RetentionPolicy, RetentionSource, RetentionState,
+        };
+        let head = HeadResponse {
+            incarnation: "00112233445566778899aabbccddeeff".into(),
+            last_ordinal: Some(4),
+            first_ordinal: Some(1),
+            history_version: 1,
+            head: Some(CursorWire::new(12, 0)),
+            last_run_state: Some(LastRunState {
+                awaits: None,
+                run_id: "run-1".into(),
+                state: "active".into(),
+                reason: None,
+                resume_not_before_ms: None,
+            }),
+            updated_at: Some(1_790_000_000_500),
+            retention_policy: Some(RetentionPolicy::new(Keep::none(), 0, false, false)),
+            retention_state: Some(RetentionState::new(RetentionSource::starter())),
+            released: Some(Released::new(1_790_000_000_000, 1_790_000_000_500)),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&head).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["released"],
+            serde_json::json!({"at_ms": 1_790_000_000_000_u64, "delete_after_ms": 1_790_000_000_500_u64})
+        );
+        assert_eq!(
+            value["retention_state"],
+            serde_json::json!({"source": "starter"})
         );
     }
 
@@ -955,6 +1038,9 @@ mod pinned_reply_bytes {
             cache: None,
             input: Some(head_input()),
             last_run_error: None,
+            retention_policy: None,
+            retention_state: None,
+            released: None,
         };
         assert_golden(
             head.clone(),
@@ -1634,6 +1720,9 @@ mod pinned_reply_bytes {
                 }),
                 input: None,
                 last_run_error: None,
+                retention_policy: None,
+                retention_state: None,
+                released: None,
             },
             "session_head.cache.json",
             SESSION_HEAD_CACHE_SHA256,
@@ -1672,7 +1761,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "62ab0df923174b0adbbb605ccc640c446713fb61213e332060049358f41a9546";
+        "a45680369323e281f4043211bfe07d3e575035d5a74c2985d9595e914b515f6a";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

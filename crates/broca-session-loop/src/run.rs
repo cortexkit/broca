@@ -76,6 +76,8 @@ mod resolved;
 use resolved::{resolve, Resolved};
 mod stops;
 use stops::{hard_stop, stop_before_batch, stopped_batch, stopped_batch_in};
+mod send_facts;
+pub use send_facts::SendFacts;
 mod setup;
 use setup::{store_setup, Setup};
 mod start_config;
@@ -199,33 +201,6 @@ pub struct Admission {
     /// at a usage wall or sign-in loss tells routing. Not frozen: a run read back from its
     /// start reads false.
     pub head_turn: bool,
-}
-
-/// What the send that started a run recorded about itself.
-#[derive(Debug, Clone, Default)]
-pub struct SendFacts {
-    /// The queued send the run consumes, when it started from the queue.
-    pub submission_id: Option<String>,
-    /// The caller's idempotency key, and the digest of the request it was sent with: a retry
-    /// under the key is compared with the digest.
-    pub send_id: Option<String>,
-    pub request_identity_digest: Option<String>,
-    /// The caller's label for the send.
-    pub title: Option<String>,
-    pub session_class: Option<String>,
-    /// How long the session is kept after its last activity, in seconds.
-    pub retention_secs: Option<u64>,
-    /// Who sent it, as the daemon attested; and, for a send another module made on the owner's
-    /// behalf, that module.
-    pub principal: Option<broca_protocol::BindPrincipal>,
-    pub sent_by: Option<broca_protocol::BindPrincipal>,
-    /// The scope the session's runs are frozen to.
-    pub scope: Option<broca_protocol::SessionScope>,
-    /// What the input hooks did to the run's input, as evidence: the input itself is already
-    /// the hooks' final value.
-    pub hooks: Option<broca_records::record::Hooks>,
-    /// The send's display marks, which the run's start records for its input.
-    pub message_marks: Option<broca_protocol::MessageMarks>,
 }
 
 /// The seams a run calls. None of them is owned by the run.
@@ -1675,6 +1650,8 @@ pub fn admission_of_start(
             title: start.title.clone(),
             session_class: start.session_class.clone(),
             retention_secs: start.retention_secs,
+            // Its own record beside the start, which a start read back never writes again.
+            retention_policy: None,
             principal: decode(start.principal.clone())?,
             sent_by: decode(
                 start
@@ -3632,6 +3609,14 @@ async fn admit<W: Writer>(
     // contract: once the batch commits, the session is enrolled for good.
     if let Some(enrolled) = enrolled {
         records.push(Record::CompactionEnrolled(enrolled));
+    }
+    // And the storage policy the send freezes: the batch that holds the send holds its policy.
+    if let Some(policy) = &admission.send.retention_policy {
+        records.push(Record::Retention(broca_session_store::record::Retention {
+            event: broca_session_store::record::RetentionEvent::Set,
+            at_ms: admission.written_at_ms.or(admission.ts_ms).unwrap_or(0),
+            policy: Some(policy.clone()),
+        }));
     }
     // The start's seq is the one the batch took, which a writer shared with the session actor
     // knows only once it is appended.

@@ -375,3 +375,147 @@ async fn head_run_error_matches_status(storage: &str) {
 async fn store_head_run_error_carries_provider_code_from_status() {
     head_run_error_matches_status("store").await;
 }
+
+/// A head serves the session's storage policy (llm-runner `session_retention`): the one broca
+/// assigns when the session's first send carried none, or the one that send carried. A policy
+/// asking for request dumps, which broca doesn't save, is flagged in `retention_state`. Its owner's release of an idle session deletes it at once, and the
+/// head is then unknown.
+#[tokio::test]
+async fn heads_carry_the_sessions_storage_policy() {
+    let mut rig = Rig::start_with_retention("head-retention-assigned").await;
+    rig.script.push(&[Step::Text("ready")]);
+    let sent = rig.send("plain", "a session with no policy", None).await;
+    assert_eq!(sent.header.ty, subc_protocol::FrameType::Response);
+    rig.wait_idle().await;
+    let head = rig
+        .request(7, json!({"method":"session.head","params":{}}))
+        .await;
+    capture_runner_display_sample("retention.assigned.head.json", &head);
+    let head = result(&head);
+    assert_eq!(
+        head["retention_policy"],
+        json!({"keep":"forever","archive_after_days":0,"backup":false,"request_dumps":false})
+    );
+    assert_eq!(head["retention_state"], json!({"source":"runner"}));
+    assert!(head.get("released").is_none(), "{head}");
+    rig.finish().await;
+
+    let mut rig = Rig::start_with_retention("head-retention-starter").await;
+    rig.script.push(&[Step::Text("ready")]);
+    let policy =
+        json!({"keep":{"days":7},"archive_after_days":0,"backup":false,"request_dumps":true});
+    let sent = rig
+        .send_with(
+            "kept",
+            "a session kept a week",
+            None,
+            json!({"retention_policy": policy}),
+        )
+        .await;
+    assert_eq!(
+        sent.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&sent.body)
+    );
+    rig.wait_idle().await;
+    let head = rig
+        .request(7, json!({"method":"session.head","params":{}}))
+        .await;
+    capture_runner_display_sample("retention.starter.head.json", &head);
+    let head = result(&head);
+    assert_eq!(head["retention_policy"], policy);
+    assert_eq!(
+        head["retention_state"],
+        json!({"source":"starter","request_dumps_unsupported":true})
+    );
+    // A starter's frozen policy never changes: a send carrying another one is refused, naming
+    // the frozen policy, and writes nothing.
+    let other =
+        json!({"keep":"forever","archive_after_days":0,"backup":false,"request_dumps":false});
+    let conflict = rig
+        .send_with(
+            "other",
+            "keep it forever instead",
+            None,
+            json!({"retention_policy": other}),
+        )
+        .await;
+    capture_runner_display_sample("retention.conflict.send.json", &conflict);
+    assert_eq!(conflict.header.ty, subc_protocol::FrameType::Error);
+    let error: serde_json::Value = serde_json::from_slice(&conflict.body).unwrap();
+    assert_eq!(error["code"], "retention_conflict", "{error}");
+    assert_eq!(error["detail"]["frozen"], policy, "{error}");
+    let released = rig
+        .request(7, json!({"method":"session.release","params":{}}))
+        .await;
+    capture_runner_display_sample("retention.release.deleted.json", &released);
+    assert_eq!(result(&released), json!({"state":"deleted"}));
+    let head = rig
+        .request(7, json!({"method":"session.head","params":{}}))
+        .await;
+    capture_runner_display_sample("retention.deleted.head.json", &head);
+    assert_eq!(head.header.ty, subc_protocol::FrameType::Error);
+    let error: serde_json::Value = serde_json::from_slice(&head.body).unwrap();
+    assert_eq!(error["code"], "unknown_session", "{error}");
+    let again = rig
+        .request(7, json!({"method":"session.release","params":{}}))
+        .await;
+    capture_runner_display_sample("retention.release.absent.json", &again);
+    assert_eq!(result(&again), json!({"state":"absent"}));
+    rig.finish().await;
+
+    // A release while a run holds the session waits for it: `pending`, the head says when the
+    // session was released and may be deleted, and a send is refused until the run ends and
+    // deletes it.
+    let mut rig = Rig::start_with_retention("head-retention-pending").await;
+    rig.script.push(&[Step::Text("held answer")]);
+    rig.script.hold_model(true);
+    let sent = rig
+        .send_with(
+            "held",
+            "a session released mid-run",
+            None,
+            json!({"retention_policy": {"keep":"none","archive_after_days":0,"backup":false,"request_dumps":false}}),
+        )
+        .await;
+    assert_eq!(sent.header.ty, subc_protocol::FrameType::Response);
+    rig.wait_entered().await;
+    let pending = rig
+        .request(7, json!({"method":"session.release","params":{}}))
+        .await;
+    capture_runner_display_sample("retention.release.pending.json", &pending);
+    assert_eq!(result(&pending), json!({"state":"pending"}));
+    let head = rig
+        .request(7, json!({"method":"session.head","params":{}}))
+        .await;
+    capture_runner_display_sample("retention.released.head.json", &head);
+    let released = result(&head)["released"].clone();
+    assert!(released["at_ms"].is_u64(), "{released}");
+    let refused = rig.send("after-release", "one more", None).await;
+    capture_runner_display_sample("retention.released.send.json", &refused);
+    assert_eq!(refused.header.ty, subc_protocol::FrameType::Error);
+    let error: serde_json::Value = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!(error["code"], "session_released", "{error}");
+    assert_eq!(
+        error["detail"]["delete_after_ms"], released["delete_after_ms"],
+        "{error}"
+    );
+    rig.script.hold_model(false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let head = rig
+            .request(7, json!({"method":"session.head","params":{}}))
+            .await;
+        let body: serde_json::Value = serde_json::from_slice(&head.body).unwrap();
+        if body["code"] == "unknown_session" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the released session was not deleted after its run: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    rig.finish().await;
+}
