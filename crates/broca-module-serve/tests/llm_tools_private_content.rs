@@ -1472,16 +1472,23 @@ fn private_content_handoff() {
 
 /// Keep the cleanup probes independent of registration and connection-close timing.
 /// A stopped orphan may be automatically resumed or terminated when its helper
-/// dies. Parking leaves the process running, so only rig cleanup can end it.
+/// dies. Parking leaves the process running, so within a test only the rig's
+/// [`cleanup_recorded_processes`] can end it.
+/// A stand-in that cleanup missed exits on its own after [`HELD_STANDIN_LIMIT`], far longer
+/// than any probe runs, so a cleanup defect fails its probe without leaving processes for days.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_content_held_standin() {
     if std::env::var_os("PRIVATE_CONTENT_HELD_STANDIN").is_some() {
-        loop {
-            std::thread::park();
+        let deadline = std::time::Instant::now() + HELD_STANDIN_LIMIT;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            std::thread::park_timeout(left);
         }
     }
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HELD_STANDIN_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct CleanupProbe {
