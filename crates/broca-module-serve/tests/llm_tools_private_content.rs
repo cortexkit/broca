@@ -466,6 +466,24 @@ fn cleanup_recorded_processes(root: &Path) -> std::io::Result<()> {
     }
     let identities: Vec<_> = processes.into_iter().map(|(_, process)| process).collect();
     broca_test_support::RecordedProcess::await_exit(&identities)?;
+    // The reads above can miss a module the daemon spawned just before it stopped: a stopped
+    // process still finishes the system call it was in, so a ledger rename in flight when the
+    // daemon stopped can land after the second read. Every ledger writer is dead now, so this
+    // read is final, and anything it names that still runs is killed too.
+    let late: Vec<_> = recorded_processes(root)
+        .into_iter()
+        .filter(|(_, process)| process.is_running())
+        .map(|(role, process)| {
+            eprintln!(
+                "private-content rig: killing {role} {process:?}, recorded after the first pass"
+            );
+            if let Err(error) = process.kill() {
+                eprintln!("private-content rig: could not kill {process:?}: {error}");
+            }
+            process
+        })
+        .collect();
+    broca_test_support::RecordedProcess::await_exit(&late)?;
     if !locked {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
