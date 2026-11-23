@@ -805,6 +805,16 @@ impl CatalogSnapshot {
         self.0.catalog.output_limit(provider_id, model_id)
     }
 
+    /// Whether the catalog says a change of reasoning effort keeps this model's cached prefix
+    /// (`capability.effort_change_cache`). `false` when the fact is absent or false, or the
+    /// catalog does not list the model.
+    pub fn effort_change_keeps_cache(&self, provider_id: &str, model_id: &str) -> bool {
+        self.0
+            .catalog
+            .provider_and_model(provider_id, model_id)
+            .is_some_and(|(_, model)| model.effort_change_cache == Some(true))
+    }
+
     /// The upstream mode names this model has a priced input AND output rate for, sorted.
     /// Empty for a model the catalog does not list.
     pub fn priced_modes(&self, provider_id: &str, model_id: &str) -> Vec<String> {

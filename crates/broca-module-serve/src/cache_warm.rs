@@ -26,6 +26,15 @@ impl broca_module::CacheDeclarer for ProviderCacheDeclarer {
             requested_ttl_ms: declared.requested_ttl_ms,
         })
     }
+
+    /// The current catalog's `capability.effort_change_cache` for `model`, which admission
+    /// freezes into a run on it. A model the catalog doesn't list, or a catalog not yet loaded,
+    /// answers `false`.
+    fn effort_change_keeps_cache(&self, model: &broca_protocol::ModelHandle) -> bool {
+        broca_catalog::catalog().is_ok_and(|catalog| {
+            catalog.effort_change_keeps_cache(&model.provider_module_id, &model.model_id)
+        })
+    }
 }
 
 fn frozen_render_config(

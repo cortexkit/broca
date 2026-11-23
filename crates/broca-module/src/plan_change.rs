@@ -312,6 +312,23 @@ pub(crate) fn prefix_rebuilt(
         )
 }
 
+/// Whether a run on `model` at `variant` changes the effort of `latest`, the latest run's model
+/// and variant, in a way that loses the cached prefix: same model, another variant, and the
+/// catalog doesn't say an effort change keeps the cache (`keeps_cache`, asked only then). Such a
+/// run rides `effort_change`, which rebuilds the prefix as a change of model does (llm-runner
+/// §9.3.6), so it is a rebuild point for a pending change and for versioned tools.
+pub(crate) fn effort_change_rebuilds(
+    latest: Option<(&broca_protocol::ModelHandle, Option<&str>)>,
+    model: &broca_protocol::ModelHandle,
+    variant: Option<&str>,
+    keeps_cache: impl FnOnce() -> bool,
+) -> bool {
+    use broca_fetch_plan::session_change::model_key;
+    latest.is_some_and(|(last_model, last_variant)| {
+        model_key(last_model) == model_key(model) && last_variant != variant
+    }) && !keeps_cache()
+}
+
 /// Whether a run start on the model keyed `model` writes its session's prompt afresh, so a
 /// versioned tool's newer same-major definition can be taken there at no extra cost
 /// (llm-runner `tool_versions`): the run changes model from the previous run's
@@ -806,6 +823,47 @@ mod tests {
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "c").is_ok());
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "b").is_ok());
         assert!(later_send_plan(Some("a"), Some((Some("b"), Some("c"))), "a").is_err());
+    }
+
+    /// A change of effort on the same model is a rebuild point only when the catalog doesn't say
+    /// it keeps the cache, and the catalog is asked only for such a change.
+    #[test]
+    fn an_effort_change_that_loses_the_cache_is_a_rebuild_point() {
+        let opus = broca_protocol::ModelHandle::new("anthropic", "claude-opus-5-5");
+        let sonnet = broca_protocol::ModelHandle::new("anthropic", "claude-sonnet-5-5");
+        let unasked = || -> bool { panic!("the catalog is asked only about an effort change") };
+        assert!(effort_change_rebuilds(
+            Some((&opus, Some("high"))),
+            &opus,
+            Some("low"),
+            || false
+        ));
+        assert!(!effort_change_rebuilds(
+            Some((&opus, Some("high"))),
+            &opus,
+            Some("low"),
+            || true
+        ));
+        assert!(effort_change_rebuilds(
+            Some((&opus, None)),
+            &opus,
+            Some("max"),
+            || false
+        ));
+        assert!(!effort_change_rebuilds(
+            Some((&opus, Some("high"))),
+            &opus,
+            Some("high"),
+            unasked
+        ));
+        // A change of model is the model switch's rebuild, decided by its own rule.
+        assert!(!effort_change_rebuilds(
+            Some((&sonnet, Some("high"))),
+            &opus,
+            Some("low"),
+            unasked
+        ));
+        assert!(!effort_change_rebuilds(None, &opus, Some("low"), unasked));
     }
 
     /// A refresh adding a compaction provider rebuilds the request's prefix, so it applies at

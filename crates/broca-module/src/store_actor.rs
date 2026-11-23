@@ -2806,16 +2806,32 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 })
             })
             .transpose()?;
-        let rebuild = crate::plan_change::prefix_rebuilt(
-            plan.rebuild_since_accept,
-            crate::plan_change::adds_compaction(
-                self.session.operations().on_contract(),
-                current.as_deref(),
-                pending.as_ref(),
-            ),
-            self.session.operations().last_cache_send.as_ref(),
-            (self.now_ms)(),
+        // A latest run start that can't be read only loses this check: the run is then no
+        // rebuild point for its effort.
+        let latest = self.latest_admission().ok().flatten();
+        let effort_rebuild = crate::plan_change::effort_change_rebuilds(
+            latest
+                .as_ref()
+                .map(|latest| (&latest.model, latest.variant.as_deref())),
+            model,
+            variant,
+            || {
+                self.registry
+                    .as_ref()
+                    .is_some_and(|registry| registry.effort_change_keeps_cache(model))
+            },
         );
+        let rebuild = effort_rebuild
+            || crate::plan_change::prefix_rebuilt(
+                plan.rebuild_since_accept,
+                crate::plan_change::adds_compaction(
+                    self.session.operations().on_contract(),
+                    current.as_deref(),
+                    pending.as_ref(),
+                ),
+                self.session.operations().last_cache_send.as_ref(),
+                (self.now_ms)(),
+            );
         let applying = crate::plan_change::pending_applying(
             pending.as_ref(),
             rebuild,
@@ -2851,6 +2867,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         });
         let operations = self.session.operations();
         let rebuild_point = applies.is_some()
+            || effort_rebuild
             || crate::plan_change::run_rebuilds_prefix(
                 plan.last_model.as_deref(),
                 &model_key(model),

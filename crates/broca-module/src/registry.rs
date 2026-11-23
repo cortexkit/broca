@@ -2932,6 +2932,12 @@ impl RegistryHandle {
         self.inner.cache.declare(config)
     }
 
+    /// Whether an effort change keeps `model`'s cached prefix, as the installed declarer reads
+    /// the catalog; `false` without one.
+    pub(crate) fn effort_change_keeps_cache(&self, model: &broca_protocol::ModelHandle) -> bool {
+        self.inner.cache.effort_change_keeps_cache(model)
+    }
+
     /// Remember the cache declaration of the episode that admitted the session, for the reply
     /// to the admitting send.
     pub(crate) fn note_admitted_cache(

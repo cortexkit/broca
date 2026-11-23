@@ -1163,6 +1163,33 @@ fn mid_conversation_system_fact_is_optional_and_frozen_without_name_inference() 
     );
 }
 
+/// The snapshot reports a model's effort fact as true only when the catalog says so, and false
+/// for an absent fact or a model it does not list.
+#[test]
+fn the_snapshot_answers_whether_an_effort_change_keeps_the_cache() {
+    for (value, expected) in [
+        (None, false),
+        (Some(Value::Bool(false)), false),
+        (Some(Value::Bool(true)), true),
+    ] {
+        let mut page = response(100);
+        if let Some(value) = value {
+            page.models
+                .get_mut("anthropic/claude-sonnet-4-5")
+                .unwrap()
+                .insert(EFFORT_CHANGE_CACHE_FACT.into(), value);
+        }
+        let cache = CatalogCache::empty();
+        cache.refresh(page).unwrap();
+        let snapshot = cache.snapshot().unwrap();
+        assert_eq!(
+            snapshot.effort_change_keeps_cache("anthropic", "claude-sonnet-4-5"),
+            expected
+        );
+        assert!(!snapshot.effort_change_keeps_cache("anthropic", "not-a-model"));
+    }
+}
+
 #[test]
 fn server_side_fallback_reaches_the_resolved_row() {
     let mut page = response(100);

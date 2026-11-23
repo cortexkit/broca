@@ -45,6 +45,14 @@ impl CacheDeclaration {
 pub trait CacheDeclarer: Send + Sync {
     /// `None` when the config cannot be read as any family's.
     fn declare(&self, config: &broca_records::record::RunConfig) -> Option<CacheDeclaration>;
+
+    /// Whether the model catalog says a change of reasoning effort keeps `model`'s cached prefix
+    /// (`capability.effort_change_cache`), as admission will freeze it into a run on that model.
+    /// Unknown answers `false`, so the change is treated as losing the cache.
+    fn effort_change_keeps_cache(&self, model: &broca_protocol::ModelHandle) -> bool {
+        let _ = model;
+        false
+    }
 }
 
 /// Target capacity for cache facts. Shared clocks may exceed this target because
@@ -120,6 +128,12 @@ impl CacheTable {
         config: &broca_records::record::RunConfig,
     ) -> Option<CacheDeclaration> {
         self.declarer.get()?.declare(config)
+    }
+
+    pub(crate) fn effort_change_keeps_cache(&self, model: &broca_protocol::ModelHandle) -> bool {
+        self.declarer
+            .get()
+            .is_some_and(|declarer| declarer.effort_change_keeps_cache(model))
     }
 
     /// Remove facts when the session's lineage is deleted.
