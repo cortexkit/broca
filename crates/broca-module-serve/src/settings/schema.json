@@ -1,16 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "broca",
+  "title": "Broca",
   "description": "Settings for broca, the module that runs agent sessions.",
   "type": "object",
   "unevaluatedProperties": false,
   "properties": {
     "classifier_routing": {
       "type": "object",
+      "title": "Decision model routing",
       "description": "Routed decision models.",
       "properties": {
         "enabled": {
           "type": "boolean",
+          "title": "Let routing choose the decision model",
           "description": "Let routing choose the decision model for classify requests.",
           "default": false,
           "x-ck-apply": "module_restart",
@@ -27,10 +29,12 @@
     },
     "storage_sync": {
       "type": "object",
+      "title": "Storage durability",
       "description": "How session storage makes its writes durable.",
       "properties": {
         "full_flush": {
           "type": "boolean",
+          "title": "Flush the drive's cache on every sync",
           "description": "Flush the drive's own cache on every sync (macOS F_FULLFSYNC), for a machine that can lose power. About 4 ms per sync.",
           "default": false,
           "x-ck-apply": "module_restart",
@@ -47,10 +51,12 @@
     },
     "service_tier": {
       "type": "object",
+      "title": "Service tiers",
       "description": "Faster service tiers.",
       "properties": {
         "enabled": {
           "type": "boolean",
+          "title": "Offer faster service tiers",
           "description": "Accept a send's service_tier and offer the tiers a model has.",
           "default": false,
           "x-ck-apply": "module_restart",
@@ -67,6 +73,7 @@
     },
     "bus_run_events_enabled": {
       "type": "boolean",
+      "title": "Publish run events on the bus",
       "description": "Publish run starts and ends on the message bus.",
       "default": false,
       "x-ck-apply": "module_restart",
@@ -76,6 +83,7 @@
     },
     "chatgpt_force_https": {
       "type": "boolean",
+      "title": "Send ChatGPT requests over HTTPS",
       "description": "Send ChatGPT requests over HTTPS instead of the WebSocket. Read on every request.",
       "default": false,
       "x-ck-apply": "live",
@@ -85,6 +93,7 @@
     },
     "backup_classes": {
       "type": "array",
+      "title": "Backed-up session classes",
       "description": "Session classes whose sessions are kept in backed-up storage.",
       "default": [
         "head"
@@ -96,12 +105,14 @@
       "items": {
         "type": "string",
         "pattern": "^[a-z0-9_-]{1,32}$",
+        "title": "Session class",
         "description": "A session class.",
         "x-ck-required": true
       }
     },
     "private_content_providers": {
       "type": "array",
+      "title": "Providers allowed private content",
       "description": "Providers a run holding private browser content may be sent to without asking.",
       "default": [
         "anthropic",
@@ -114,6 +125,7 @@
       "items": {
         "type": "string",
         "pattern": "^[a-z0-9-]{1,64}$",
+        "title": "Provider",
         "description": "A provider id.",
         "x-ck-required": true
       },
@@ -121,10 +133,12 @@
     },
     "llm_tools": {
       "type": "object",
+      "title": "Model tools",
       "description": "The model tools broca serves.",
       "properties": {
         "advertise_tags": {
           "type": "boolean",
+          "title": "List chat tags in tool descriptions",
           "description": "List chat tags in the tool descriptions.",
           "default": false,
           "x-ck-apply": "module_restart",
@@ -134,6 +148,7 @@
         },
         "image_references": {
           "type": "boolean",
+          "title": "Accept image references",
           "description": "Accept image references as tool input.",
           "default": false,
           "x-ck-apply": "module_restart",
@@ -150,10 +165,12 @@
     },
     "session_storage": {
       "type": "object",
+      "title": "Session storage",
       "description": "Session storage.",
       "properties": {
         "deployment_key_id": {
           "type": "integer",
+          "title": "Storage key id",
           "description": "The id of the storage key in the vault.",
           "default": 1,
           "x-ck-apply": "module_restart",
@@ -165,6 +182,7 @@
         },
         "encryption": {
           "type": "string",
+          "title": "Encrypt new sessions",
           "description": "Whether new sessions are encrypted.",
           "default": "on",
           "x-ck-apply": "module_restart",
@@ -185,10 +203,12 @@
     },
     "account_selection": {
       "type": "object",
+      "title": "Account selection",
       "description": "How runs choose a provider account.",
       "properties": {
         "routing_module": {
           "type": "string",
+          "title": "Routing module",
           "description": "The routing module to ask. Empty finds the one routing provider.",
           "default": "",
           "x-ck-apply": "module_restart",
@@ -205,10 +225,12 @@
     },
     "import": {
       "type": "object",
+      "title": "Session imports",
       "description": "Session imports from files.",
       "properties": {
         "roots": {
           "type": "array",
+          "title": "Import folders",
           "description": "Folders an import may read from. Empty means broca's own import folder.",
           "default": [],
           "x-ck-apply": "module_restart",
@@ -217,6 +239,7 @@
           ],
           "items": {
             "type": "string",
+            "title": "Folder",
             "description": "An absolute folder.",
             "x-ck-kind": "path",
             "x-ck-required": true
@@ -230,6 +253,7 @@
       ]
     },
     "max_same_account_wait": {
+      "title": "Wait for the same account",
       "description": "How long a run may wait for its own account's usage limit to reset.",
       "default": {
         "kind": "minutes",
@@ -241,10 +265,12 @@
       ],
       "oneOf": [
         {
+          "title": "A number of minutes",
           "type": "object",
           "properties": {
             "kind": {
               "const": "minutes",
+              "title": "Form",
               "description": "Which form this is.",
               "x-ck-required": true,
               "type": "string"
@@ -252,6 +278,7 @@
             "minutes": {
               "type": "integer",
               "minimum": 0,
+              "title": "Minutes to wait",
               "description": "Minutes to wait.",
               "default": 15
             }
@@ -263,10 +290,12 @@
           "unevaluatedProperties": false
         },
         {
+          "title": "As long as the prompt cache lasts",
           "type": "object",
           "properties": {
             "kind": {
               "const": "max",
+              "title": "Form",
               "description": "Which form this is.",
               "x-ck-required": true,
               "type": "string"
@@ -281,14 +310,17 @@
     },
     "providers": {
       "type": "object",
+      "title": "Provider endpoints",
       "description": "Provider endpoint overrides, by provider id.",
       "patternProperties": {
         "^[a-z0-9][a-z0-9._-]{0,63}$": {
           "type": "object",
+          "title": "Provider",
           "description": "One provider's override.",
           "properties": {
             "base_url": {
               "type": "string",
+              "title": "Base URL",
               "description": "An absolute HTTP(S) URL.",
               "x-ck-required": true
             }
@@ -308,26 +340,32 @@
     },
     "tool_name_aliases": {
       "type": "object",
+      "title": "Tool name aliases",
       "description": "Tool names sent to a provider, by credential route.",
       "patternProperties": {
         "^[a-z0-9][a-z0-9:._-]{0,127}$": {
+          "title": "Route",
           "description": "The names for one route.",
           "oneOf": [
             {
+              "title": "Rename tools",
               "type": "object",
               "properties": {
                 "kind": {
                   "const": "names",
+                  "title": "Form",
                   "description": "Which form this is.",
                   "x-ck-required": true,
                   "type": "string"
                 },
                 "names": {
                   "type": "object",
+                  "title": "Names",
                   "description": "Tool name to the name sent.",
                   "patternProperties": {
                     "^[A-Za-z0-9_.-]{1,128}$": {
                       "type": "string",
+                      "title": "Name sent",
                       "description": "The name sent.",
                       "x-ck-required": true
                     }
@@ -343,16 +381,19 @@
               "unevaluatedProperties": false
             },
             {
+              "title": "Prefix every tool",
               "type": "object",
               "properties": {
                 "kind": {
                   "const": "prefix_all",
+                  "title": "Form",
                   "description": "Which form this is.",
                   "x-ck-required": true,
                   "type": "string"
                 },
                 "prefix": {
                   "type": "string",
+                  "title": "Prefix",
                   "description": "A prefix every tool name gets.",
                   "x-ck-required": true
                 }
@@ -375,10 +416,12 @@
     },
     "anthropic_fallbacks": {
       "type": "object",
+      "title": "Anthropic refusal fallbacks",
       "description": "Fallbacks when an Anthropic model refuses a turn.",
       "properties": {
         "server_side": {
           "type": "boolean",
+          "title": "Let Anthropic hand off refused turns",
           "description": "Ask Anthropic to hand a refused turn to another model itself.",
           "default": false,
           "x-ck-apply": "module_restart",
@@ -388,10 +431,12 @@
         },
         "refusal_resend": {
           "type": "object",
+          "title": "Resend refused turns",
           "description": "Send a refused turn again to another model.",
           "properties": {
             "enabled": {
               "type": "boolean",
+              "title": "Enabled",
               "description": "Turn the resend on.",
               "default": false,
               "x-ck-apply": "module_restart",
@@ -401,10 +446,12 @@
             },
             "models": {
               "type": "object",
+              "title": "Fallback models",
               "description": "Refusing model to the model the turn is sent to.",
               "patternProperties": {
                 "^[a-z0-9][a-z0-9.-]{0,127}$": {
                   "type": "string",
+                  "title": "Fallback model",
                   "description": "The fallback model.",
                   "x-ck-required": true
                 }
@@ -437,20 +484,25 @@
     },
     "cache": {
       "type": "object",
+      "title": "Prompt cache",
       "description": "Prompt cache lifetimes.",
       "properties": {
         "provider_ttl": {
           "type": "object",
+          "title": "Cache lifetimes by provider",
           "description": "Cache rows by provider id.",
           "patternProperties": {
             "^[a-z0-9][a-z0-9._-]{0,63}$": {
+              "title": "Provider",
               "description": "One provider's cache row.",
               "oneOf": [
                 {
+                  "title": "Cache markers",
                   "type": "object",
                   "properties": {
                     "kind": {
                       "const": "markers",
+                      "title": "Form",
                       "description": "Which form this is.",
                       "x-ck-required": true,
                       "type": "string"
@@ -461,6 +513,7 @@
                         "5m",
                         "1h"
                       ],
+                      "title": "Main marker lifetime",
                       "description": "The lifetime of the main markers.",
                       "x-ck-required": true
                     },
@@ -470,6 +523,7 @@
                         "5m",
                         "1h"
                       ],
+                      "title": "Short marker lifetime",
                       "description": "The lifetime of the short markers.",
                       "x-ck-required": true
                     }
@@ -482,16 +536,19 @@
                   "unevaluatedProperties": false
                 },
                 {
+                  "title": "Retention hint",
                   "type": "object",
                   "properties": {
                     "kind": {
                       "const": "retention",
+                      "title": "Form",
                       "description": "Which form this is.",
                       "x-ck-required": true,
                       "type": "string"
                     },
                     "retention": {
                       "type": "string",
+                      "title": "Retention hint",
                       "description": "The retention hint sent. Empty sends none.",
                       "default": ""
                     }
@@ -520,18 +577,22 @@
     },
     "billing": {
       "type": "object",
+      "title": "Billing",
       "description": "How usage is charged.",
       "properties": {
         "charge_basis": {
           "type": "object",
+          "title": "Charge basis",
           "description": "Charge basis by provider id, then by sign-in method.",
           "patternProperties": {
             "^[a-z0-9][a-z0-9._-]{0,63}$": {
               "type": "object",
+              "title": "Provider",
               "description": "One provider's rows.",
               "patternProperties": {
                 "^[a-z][a-z0-9_-]{0,31}$": {
                   "type": "string",
+                  "title": "Sign-in method",
                   "description": "How a run on this method is charged.",
                   "enum": [
                     "metered_api",
@@ -560,9 +621,11 @@
     },
     "context_management": {
       "type": "object",
+      "title": "Context management",
       "description": "How a session's prompt is kept inside the model's context window.",
       "properties": {
         "default": {
+          "title": "Default for every project",
           "description": "The choice for every project not listed.",
           "default": {
             "kind": "none"
@@ -573,10 +636,12 @@
           ],
           "oneOf": [
             {
+              "title": "None",
               "type": "object",
               "properties": {
                 "kind": {
                   "const": "none",
+                  "title": "Form",
                   "description": "Which form this is.",
                   "x-ck-required": true,
                   "type": "string"
@@ -588,16 +653,19 @@
               "unevaluatedProperties": false
             },
             {
+              "title": "Prompt transform",
               "type": "object",
               "properties": {
                 "kind": {
                   "const": "transform",
+                  "title": "Form",
                   "description": "Which form this is.",
                   "x-ck-required": true,
                   "type": "string"
                 },
                 "provider": {
                   "type": "string",
+                  "title": "Module",
                   "description": "The module that edits the prompt.",
                   "x-ck-required": true
                 }
@@ -609,10 +677,12 @@
               "unevaluatedProperties": false
             },
             {
+              "title": "Compaction",
               "type": "object",
               "properties": {
                 "kind": {
                   "const": "compaction",
+                  "title": "Form",
                   "description": "Which form this is.",
                   "x-ck-required": true,
                   "type": "string"
@@ -627,9 +697,11 @@
         },
         "projects": {
           "type": "object",
+          "title": "By project",
           "description": "The choice by project folder.",
           "patternProperties": {
             "^/.*$": {
+              "title": "Project",
               "description": "The choice for this project.",
               "default": {
                 "kind": "none"
@@ -640,10 +712,12 @@
               ],
               "oneOf": [
                 {
+                  "title": "None",
                   "type": "object",
                   "properties": {
                     "kind": {
                       "const": "none",
+                      "title": "Form",
                       "description": "Which form this is.",
                       "x-ck-required": true,
                       "type": "string"
@@ -655,16 +729,19 @@
                   "unevaluatedProperties": false
                 },
                 {
+                  "title": "Prompt transform",
                   "type": "object",
                   "properties": {
                     "kind": {
                       "const": "transform",
+                      "title": "Form",
                       "description": "Which form this is.",
                       "x-ck-required": true,
                       "type": "string"
                     },
                     "provider": {
                       "type": "string",
+                      "title": "Module",
                       "description": "The module that edits the prompt.",
                       "x-ck-required": true
                     }
@@ -676,10 +753,12 @@
                   "unevaluatedProperties": false
                 },
                 {
+                  "title": "Compaction",
                   "type": "object",
                   "properties": {
                     "kind": {
                       "const": "compaction",
+                      "title": "Form",
                       "description": "Which form this is.",
                       "x-ck-required": true,
                       "type": "string"

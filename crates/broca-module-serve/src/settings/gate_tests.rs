@@ -48,7 +48,7 @@ impl Daemon {
     async fn accept_declaration(&mut self) -> u64 {
         let (corr, declare) = self.request("config.declare").await;
         assert_eq!(declare["user_file"], "/config/broca.jsonc");
-        assert_eq!(declare["schema"]["title"], "broca");
+        assert_eq!(declare["schema"]["title"], "Broca");
         self.send(FrameType::Response, corr, json!({"op": "config.declare"}))
             .await;
         self.request("config.get").await.0
