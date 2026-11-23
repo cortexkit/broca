@@ -548,8 +548,8 @@ async fn a_restarted_pass_reads_no_session_the_kept_deadlines_already_decide() {
 }
 
 /// A pass decides a session whose head file hasn't changed since the last pass from its kept
-/// deadline, without opening the head: the sweep runs every five minutes over every session in
-/// the ephemeral root. Once that deadline has passed, the session is read and deleted as before.
+/// deadline, without opening the head: a full pass goes over every session in the ephemeral
+/// root. Once that deadline has passed, the session is read and deleted as before.
 #[tokio::test]
 async fn a_later_pass_reads_no_head_that_has_not_changed() {
     let rig = Rig::new("unchanged-heads", Duration::from_secs(600)).await;
@@ -588,6 +588,80 @@ async fn a_later_pass_reads_no_head_that_has_not_changed() {
         "a kept deadline that has passed still deletes the session"
     );
     assert!(!rig.holds(&key));
+}
+
+/// A pass between full passes reads only the sessions whose kept deadline has come. It lists no
+/// folder, so a session seeded after the last full pass waits for the next one even once it has
+/// expired, while a kept session whose deadline has come is deleted at once.
+#[tokio::test]
+async fn a_pass_between_full_passes_deletes_only_sessions_whose_kept_deadline_came() {
+    let rig = Rig::new("due-passes", Duration::from_secs(600)).await;
+    let records = || {
+        [
+            store_start("r1", Some(SECONDS), STARTED_MS),
+            store_end("r1", ENDED_MS),
+            store_billed("r1"),
+        ]
+    };
+    let kept = rig.key("kept");
+    rig.seed(&kept, &records(), false).await;
+    assert!(rig
+        .service
+        .sweep_store(&rig.runtime, DEADLINE_MS - 1)
+        .await
+        .is_empty());
+    let unlisted = rig.key("unlisted");
+    rig.seed(&unlisted, &records(), false).await;
+
+    assert!(rig
+        .service
+        .sweep_due_store(&rig.runtime, DEADLINE_MS - 1)
+        .await
+        .is_empty());
+    assert_eq!(
+        rig.service.sweep_due_store(&rig.runtime, DEADLINE_MS).await,
+        vec![kept.clone()]
+    );
+    assert!(!rig.holds(&kept));
+    assert!(
+        rig.holds(&unlisted),
+        "a pass between full passes found a session no full pass had listed"
+    );
+    assert_eq!(
+        rig.service.sweep_store(&rig.runtime, DEADLINE_MS).await,
+        vec![unlisted.clone()]
+    );
+    assert!(!rig.holds(&unlisted));
+}
+
+/// The first pass is full, then one in every `FULL_PASS_EVERY`, and a pass the clock's change
+/// started is full and counts as the latest.
+#[test]
+fn full_passes_come_first_then_every_full_pass_every_passes() {
+    use crate::retention::{next_pass, FULL_PASS_EVERY};
+    let mut since_full = 0;
+    let mut fulls = Vec::new();
+    for pass in 0..(2 * FULL_PASS_EVERY + 1) {
+        let full;
+        (full, since_full) = next_pass(since_full, false);
+        if full {
+            fulls.push(pass);
+        }
+    }
+    assert_eq!(fulls, vec![0, FULL_PASS_EVERY, 2 * FULL_PASS_EVERY]);
+    let (full, since_full) = next_pass(5, true);
+    assert!(full);
+    let mut cheap = 0;
+    let mut since = since_full;
+    loop {
+        let full;
+        (full, since) = next_pass(since, false);
+        if full {
+            break;
+        }
+        cheap += 1;
+    }
+    assert_eq!(cheap, FULL_PASS_EVERY - 1);
 }
 
 /// A fork's session in the ephemeral root, which holds only its fork's records, is kept until

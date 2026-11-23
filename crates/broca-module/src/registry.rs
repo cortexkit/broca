@@ -3050,8 +3050,15 @@ impl LineageRegistry {
         let _ = self.inner.retention.set(service);
     }
 
-    /// Deletes the retained sessions whose policy has expired, each under its lease.
+    /// Deletes the retained sessions whose policy has expired, each under its lease, in a full
+    /// pass (see [`crate::retention::FULL_PASS_EVERY`]).
     pub async fn sweep_once(&self, now_ms: u64) -> Result<usize, OpenError> {
+        self.sweep(now_ms, true).await
+    }
+
+    /// One retention pass: a full one, or one that reads only the sessions whose kept deadline
+    /// has come.
+    async fn sweep(&self, now_ms: u64, full: bool) -> Result<usize, OpenError> {
         let Some(service) = self.inner.retention.get().cloned() else {
             return Ok(0);
         };
@@ -3066,17 +3073,23 @@ impl LineageRegistry {
         };
         let mut deleted = 0;
         if let Some(runtime) = self.store_runtime() {
-            for key in service.sweep_store(&runtime, now_ms).await {
+            let found = if full {
+                service.sweep_store(&runtime, now_ms).await
+            } else {
+                service.sweep_due_store(&runtime, now_ms).await
+            };
+            for key in found {
                 self.evict_retention_caches(&key);
                 deleted += 1;
             }
         }
-        tracing::info!(target: "retention", deleted, "retention sweep complete");
+        tracing::info!(target: "retention", deleted, full, "retention sweep complete");
         Ok(deleted)
     }
 
-    /// Runs a pass every five minutes. A clock-change notification also runs a pass immediately,
-    /// so tests can advance time rather than wait days.
+    /// Runs a pass every five minutes, the first and every [`crate::retention::FULL_PASS_EVERY`]th
+    /// of them full. A clock-change notification also runs a full pass immediately, so tests can
+    /// advance time rather than wait days.
     pub async fn run_retention_sweeper(&self) -> Result<(), OpenError> {
         let Some(service) = self.inner.retention.get().cloned() else {
             return Ok(());
@@ -3093,12 +3106,15 @@ impl LineageRegistry {
             _ = self.inner.stopping.cancelled() => Ok(()),
             result = &mut poll => result.map_err(|e| OpenError::Open(e.to_string())),
             _ = async {
+                let mut since_full = 0;
                 loop {
-                    tokio::select! {
-                        _ = interval.tick() => {},
-                        _ = changes.changed() => {},
-                    }
-                    if self.sweep_once(service.clock.now_ms()).await.is_err() {
+                    let clock_changed = tokio::select! {
+                        _ = interval.tick() => false,
+                        _ = changes.changed() => true,
+                    };
+                    let full;
+                    (full, since_full) = crate::retention::next_pass(since_full, clock_changed);
+                    if self.sweep(service.clock.now_ms(), full).await.is_err() {
                         tracing::warn!(target: "retention", "retention sweep deferred; retrying next pass");
                     }
                 }

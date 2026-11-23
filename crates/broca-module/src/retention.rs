@@ -13,6 +13,26 @@ use broca_protocol::BindIdentity;
 
 pub const MAX_RETENTION_SECONDS: u64 = 2_592_000;
 pub const SWEEP_INTERVAL_MS: u64 = 300_000;
+/// Every this many passes, a pass reads the whole ephemeral root: it lists every session folder
+/// and checks every head for a change. The passes between read only the sessions whose kept
+/// deadline has come. Listing the root's tens of thousands of folders costs about 100 MB of disk
+/// metadata reads each time, so the full pass runs about once an hour. A session created or
+/// changed since the last full pass is found by the next one; its reads answer expired from its
+/// own records until then (`store_expiry`), so a late deletion frees disk late and nothing else.
+pub const FULL_PASS_EVERY: u32 = 12;
+
+/// Whether the next pass is full, and the count of passes since the last full one to carry to
+/// the pass after it. `since_full` starts at 0, so the first pass is full. A pass the clock's
+/// change started is full too, so a test that moves the clock sees every session.
+pub(crate) fn next_pass(since_full: u32, clock_changed: bool) -> (bool, u32) {
+    let full = clock_changed || since_full == 0;
+    let since_full = if full {
+        1
+    } else {
+        (since_full + 1) % FULL_PASS_EVERY
+    };
+    (full, since_full)
+}
 
 pub(crate) use cortexkit_role_llm_runner::errors::RetentionInvalidDetail as InvalidRetention;
 pub use cortexkit_role_llm_runner::errors::{ExpiredDetail, EXPIRED};

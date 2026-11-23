@@ -197,7 +197,9 @@ impl RetentionService {
 
     /// Deletes every session in the session store's ephemeral root whose retention policy expired
     /// at or before `now_ms`, each under its lease, and returns the sessions deleted. One that
-    /// can't be decided or deleted now is logged and decided again on the next pass.
+    /// can't be decided or deleted now is logged and decided again on the next pass. This is the
+    /// full pass: it lists every session folder and checks every head for a change (see
+    /// [`crate::retention::FULL_PASS_EVERY`]).
     pub(crate) async fn sweep_store(
         &self,
         runtime: &StoreRuntime,
@@ -217,11 +219,25 @@ impl RetentionService {
             }
         }
         let backend = LocalBackend::new(&root);
-        let (addresses, cut_short) = match backend.stored_sessions_and_deletions() {
-            Ok(found) => found,
-            Err(error) => {
+        // Listing checks a head file in each of tens of thousands of folders, which takes a
+        // second or more of blocking file system calls: kept off the async worker threads.
+        let listing = {
+            let root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                LocalBackend::new(root).stored_sessions_and_deletions()
+            })
+            .await
+        };
+        let (addresses, cut_short) = match listing {
+            Ok(Ok(found)) => found,
+            Ok(Err(error)) => {
                 tracing::warn!(target: "retention", error = ?error,
                     "retention pass over the new storage deferred; its ephemeral root can't be listed");
+                return Vec::new();
+            }
+            Err(error) => {
+                tracing::warn!(target: "retention", %error,
+                    "retention pass over the new storage deferred; listing its ephemeral root failed");
                 return Vec::new();
             }
         };
@@ -252,13 +268,47 @@ impl RetentionService {
                     "a deletion a crash cut short is left to finish on the next pass");
             }
         }
+        self.expire_each(runtime, &root, addresses, now_ms).await
+    }
+
+    /// A pass between full passes: deletes the sessions whose kept deadline is at or before
+    /// `now_ms`, read again first, and lists nothing. A session no full pass has read yet, or one
+    /// changed since the last, waits for the next full pass. Before the first full pass nothing
+    /// is kept, so this reads nothing.
+    pub(crate) async fn sweep_due_store(
+        &self,
+        runtime: &StoreRuntime,
+        now_ms: u64,
+    ) -> Vec<BindIdentity> {
+        let root = StorageClass::Ephemeral.store_root(runtime.state_root());
+        let due: Vec<SessionAddr> = self
+            .store
+            .deadlines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, (_, deadline))| deadline.is_some_and(|deadline| deadline <= now_ms))
+            .map(|(address, _)| SessionAddr(address.clone()))
+            .collect();
+        self.expire_each(runtime, &root, due, now_ms).await
+    }
+
+    /// Decides and deletes each session of `addresses` in the ephemeral root `root`, then keeps
+    /// the deadlines found on disk for the next restart.
+    async fn expire_each(
+        &self,
+        runtime: &StoreRuntime,
+        root: &std::path::Path,
+        addresses: Vec<SessionAddr>,
+        now_ms: u64,
+    ) -> Vec<BindIdentity> {
+        use std::sync::atomic::Ordering;
         let mut deleted = Vec::new();
         for addr in addresses {
             // A backend of its own for each session: a backend keeps every log it opens open
             // until it is dropped, and one shared across the whole pass held a file open for
             // each of the tens of thousands of sessions it read.
-            let session_backend =
-                LocalBackend::new(StorageClass::Ephemeral.store_root(runtime.state_root()));
+            let session_backend = LocalBackend::new(root);
             match self
                 .expire_store_session(runtime, &session_backend, &addr, now_ms)
                 .await
@@ -278,7 +328,7 @@ impl RetentionService {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            if let Err(error) = kept::save(&root, &deadlines) {
+            if let Err(error) = kept::save(root, &deadlines) {
                 // Only the next restart pays: its first pass reads the sessions again.
                 self.store.changed.store(true, Ordering::Relaxed);
                 tracing::warn!(target: "retention", %error,
