@@ -78,6 +78,11 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             Ok(prepared) => prepared,
             Err(outcome) => {
                 if idle_auto {
+                    // The stop line names only the outcome; what refused the warm is here.
+                    if let WarmOutcome::Refused(refusal) = outcome.as_ref() {
+                        tracing::info!(session = %broca_core::session_addr(&self.key),
+                            code = %refusal.code, "idle cache warm refused: {}", refusal.message);
+                    }
                     if let Some(registry) = &self.registry {
                         registry.stop_idle_warm(&self.key, "warm_refused");
                     }
