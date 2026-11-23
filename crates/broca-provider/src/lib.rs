@@ -37,6 +37,7 @@ pub mod person_media;
 pub mod policy;
 pub mod reasoning;
 pub mod registry;
+pub mod render_identity;
 pub mod request_dump;
 mod request_invalid;
 mod safe_provider_code;

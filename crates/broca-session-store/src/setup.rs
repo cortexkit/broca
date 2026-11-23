@@ -5,10 +5,11 @@
 //! the model, each tool provider's catalog answer, the system text, the plan, and so on. Each is
 //! a **part**, named in records by the plain SHA-256 of its canonical bytes (`PartRef`). The
 //! tools, catalog answers and system text are mostly shared by many sessions (many sessions of
-//! one project start with the same tools), so each is stored once, not in every run start. The
-//! render config is not: it carries per-session identifiers (the prompt cache key, and on some
-//! routes the Claude Code persona's or Code Assist's session identity), so most sessions store a
-//! render config of their own, about 1.5 KB.
+//! one project start with the same tools), so each is stored once, not in every run start. So
+//! is the render config: the members that belong to one run or one session (the prompt cache key,
+//! a Claude Code persona's or Code Assist's identity, ChatGPT's turn ids) stay in the run start's
+//! own `render_identity`, so runs on one route share one render config part. Run starts written
+//! before that kept the whole config in the part, about 1.5 to 3.9 KB per session or per run.
 //!
 //! Storage:
 //! - **Name:** a part is stored under an HMAC of its digest with the deployment's naming key. A
@@ -24,16 +25,16 @@
 //! - **Verification:** a read checks the decrypted bytes against the digest the record names. A
 //!   missing or corrupt part is damage to the session that names it, never an absent value.
 //! - **Lifetime:** parts are never deleted, not even when the last session naming one is:
-//!   deleting one safely would need every session's run starts checked first. With a render
-//!   config per session, the store grows by a few megabytes a day. Storing a part that is
-//!   already there changes nothing.
+//!   deleting one safely would need every session's run starts checked first. The store grows
+//!   only when tools, system text, plans or a route's render config change. Storing a part that
+//!   is already there changes nothing.
 //!
 //! A run start that names a part is written only after the part's store returned durable, so a
 //! crash can never leave a record naming a part that isn't there.
 //!
 //! Parts must never carry session content (the conversation): the run's account and routing
-//! decisions stay in the run's own record. The render config's per-session identifiers are the
-//! one exception, described above.
+//! decisions stay in the run's own record, as its render identity does. Run starts written
+//! before the render identity was split out are the one exception, described above.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -51,8 +52,8 @@ const AAD_CONTEXT: &[u8] = b"broca-setup-part-v1";
 pub const PLAIN_PREFIX: &str = "plain/";
 
 /// Parts the in-memory cache holds before it starts over. The parts most sessions share number
-/// in the hundreds, and each session read adds its own render config, so this bounds a cache
-/// that would otherwise grow without limit.
+/// in the hundreds, but each older session read adds its own render config (see the module
+/// header), so this bounds a cache that would otherwise grow without limit.
 const CACHE_CAP: usize = 4096;
 
 /// The deployment's setup-store keys for one cipher mode: one to name parts, one to seal them.

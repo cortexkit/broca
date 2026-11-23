@@ -76,6 +76,8 @@ mod resolved;
 use resolved::{resolve, Resolved};
 mod stops;
 use stops::{hard_stop, stop_before_batch, stopped_batch, stopped_batch_in};
+mod setup;
+use setup::{store_setup, Setup};
 mod start_config;
 pub use start_config::{
     run_config_members, run_config_of_run, run_config_of_start, run_frozen_facts, ConfigMembers,
@@ -3458,90 +3460,6 @@ fn refusal_schedule<W: Writer>(
     .map_err(|e| LoopError::Parts(e.to_string()))
 }
 
-/// The setup parts a run's start names, as [`store_setup`] stored them, and what remains of its
-/// manifest, which stays with the run's choices.
-struct Setup {
-    parts: Vec<PartRef>,
-    manifest_rest: Option<Value>,
-}
-
-/// Stores the run's setup parts, then has the run hold their shared decoded values in place of
-/// the ones its send gave: its tools, response format, system text, render config and manifest
-/// with its tool list. Its resume and the session's next run (which inherits its tools) read
-/// the same parts, so every request of the session renders the same values, and every run of
-/// the process on the same parts holds one copy of each. A part that doesn't decode refuses the
-/// run.
-fn store_setup(parts: &mut dyn Parts, admission: &mut Admission) -> Result<Setup, LoopError> {
-    let mut setup = Vec::new();
-    // A planned run's system text is part of its manifest; any other run's is its own part.
-    let global_system = (admission.manifest.is_none() && !admission.global_system.is_empty())
-        .then(|| serde_json::to_value(&admission.global_system))
-        .transpose()
-        .map_err(|e| LoopError::Parts(e.to_string()))?
-        .unwrap_or(Value::Null);
-    for (kind, value) in [
-        (PartKind::Tools, serde_json::to_value(&admission.tools)),
-        (
-            PartKind::ResponseFormat,
-            serde_json::to_value(&admission.response_format),
-        ),
-        (PartKind::GlobalSystem, Ok(global_system)),
-        (
-            PartKind::RenderConfig,
-            Ok(Value::clone(&admission.render_config)),
-        ),
-    ] {
-        let value = value.map_err(|e| LoopError::Parts(e.to_string()))?;
-        if value.is_null() {
-            continue;
-        }
-        setup.push(parts.put(kind, &value).map_err(LoopError::Parts)?);
-    }
-    // A manifest's shared members are setup parts after the run config's, in the order the
-    // resume reads them back; what remains of it stays with the run's choices.
-    let config_parts = setup.len();
-    let manifest_rest = match &admission.manifest {
-        Some(manifest) => manifest_parts(manifest, parts, &mut setup)?,
-        None => None,
-    };
-    let parts = &*parts;
-    fn decoded<T>(parts: &dyn Parts, part: &PartRef) -> Result<Arc<T>, LoopError>
-    where
-        T: serde::de::DeserializeOwned + Send + Sync + 'static,
-    {
-        crate::parts::shared(parts, part).map_err(|error| {
-            LoopError::Parts(format!("the run's {:?} setup part: {error}", part.kind))
-        })
-    }
-    for part in &setup[..config_parts] {
-        match part.kind {
-            PartKind::Tools => admission.tools = decoded(parts, part)?,
-            PartKind::ResponseFormat => admission.response_format = decoded(parts, part)?,
-            PartKind::GlobalSystem => admission.global_system = decoded(parts, part)?,
-            PartKind::RenderConfig => admission.render_config = decoded(parts, part)?,
-            _ => {}
-        }
-    }
-    if admission.manifest.is_some() {
-        // The reference the run's start makes to its manifest, as a later read takes it.
-        let reference = broca_session_store::fold::operations::ManifestRef {
-            parts: setup[config_parts..].to_vec(),
-            rest: manifest_rest.clone(),
-        };
-        let manifest = stored_manifest(&reference, parts)?;
-        // On the current compaction contract a planned run renders its manifest's system
-        // text, as `global_system` decided before the manifest was read back.
-        if admission.compaction_plan_version.is_some() {
-            admission.global_system = manifest_system(&reference, &manifest, parts)?;
-        }
-        admission.manifest = Some(manifest);
-    }
-    Ok(Setup {
-        parts: setup,
-        manifest_rest,
-    })
-}
-
 /// Writes the run's start, naming the setup parts [`store_setup`] stored. `refusal_schedule` is
 /// what [`refusal_schedule`] decided. `checkpoint` is the highest part number the session has
 /// shown ([`shown_high`]), which the run's computed numbering continues after. `enrolled` is the
@@ -3558,6 +3476,7 @@ async fn admit<W: Writer>(
     let Setup {
         parts: setup,
         manifest_rest,
+        render_identity,
     } = setup;
     let tool_names = admission
         .tools
@@ -3645,7 +3564,7 @@ async fn admit<W: Writer>(
     let message_marks = to_value(admission.send.message_marks.as_ref())?;
     records.push(Record::RunStart(Box::new(RunStart {
         imported_ids: None,
-        render_identity: None,
+        render_identity,
         named_speaker: broca_session_store::record::marks_name_speaker(message_marks.as_ref()),
         kept_notice: broca_session_store::record::marks_kept_notice(message_marks.as_ref()),
         message_marks,

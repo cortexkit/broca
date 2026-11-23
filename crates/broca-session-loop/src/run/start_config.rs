@@ -399,6 +399,20 @@ mod tests {
         assert!(facts.computed_rules().is_some_and(|rules| rules.render));
     }
 
+    /// `start` without its plan manifest. The admission reader rebuilds the manifest, which
+    /// this fixture's stand-in manifest parts don't make; the render config doesn't depend on it.
+    fn without_manifest(start: &RunStart) -> RunStart {
+        let mut start = start.clone();
+        if let Some(plan) = start
+            .setup
+            .iter()
+            .position(|part| part.kind == PartKind::Plan)
+        {
+            start.setup.truncate(plan);
+        }
+        start
+    }
+
     /// A start that keeps its identity beside a shared render config part reads, through every
     /// reader, the same whole config as a start whose part holds all of it.
     #[test]
@@ -418,19 +432,6 @@ mod tests {
         }
         split.render_identity = Some(identity);
 
-        // The admission reader rebuilds the plan manifest, which this fixture's stand-in
-        // manifest parts don't make; the render config doesn't depend on it.
-        let without_manifest = |start: &RunStart| {
-            let mut start = start.clone();
-            if let Some(plan) = start
-                .setup
-                .iter()
-                .position(|part| part.kind == PartKind::Plan)
-            {
-                start.setup.truncate(plan);
-            }
-            start
-        };
         let read = |start: &RunStart| {
             (
                 run_frozen_facts(start, &parts)
@@ -451,5 +452,48 @@ mod tests {
         assert_eq!(config, whole_config);
         assert_eq!(admission, whole_config);
         assert_eq!(read(&whole), (facts, config, admission));
+    }
+
+    /// A run's identity stays out of its render config part: two runs whose configs differ only
+    /// in identity store one part, each start keeps its own identity, and the run holds the
+    /// whole config, the same one its resume reads back.
+    #[test]
+    fn runs_differing_only_in_identity_share_one_render_config_part() {
+        let mut parts = Noting::default();
+        let base = without_manifest(&planned_start(&mut parts));
+        let shared = json!({"family": "anthropic_messages", "beta": ["x"]});
+        let mut digests = Vec::new();
+        for key in ["key-a", "key-b"] {
+            let mut whole = shared.clone();
+            whole["prompt_cache_key"] = json!(key);
+            let mut start = base.clone();
+            for part in &mut start.setup {
+                if part.kind == PartKind::RenderConfig {
+                    *part = parts.put(PartKind::RenderConfig, &whole).unwrap();
+                }
+            }
+            let mut admission = crate::run::admission_of_start(&start, &parts).unwrap();
+            let setup = crate::run::setup::store_setup(&mut parts, &mut admission).unwrap();
+            assert_eq!(*admission.render_config, whole);
+            assert_eq!(
+                setup.render_identity,
+                Some(json!({"prompt_cache_key": key}))
+            );
+            let part = setup
+                .parts
+                .iter()
+                .find(|part| part.kind == PartKind::RenderConfig)
+                .unwrap();
+            assert_eq!(parts.get(part).unwrap(), shared);
+            digests.push(part.digest);
+            let stored = RunStart {
+                setup: setup.parts.clone(),
+                render_identity: setup.render_identity.clone(),
+                ..start
+            };
+            let resumed = crate::run::admission_of_start(&stored, &parts).unwrap();
+            assert_eq!(*resumed.render_config, whole);
+        }
+        assert_eq!(digests[0], digests[1]);
     }
 }
