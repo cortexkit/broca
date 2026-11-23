@@ -383,7 +383,6 @@ version = "0.4.111"
 dependencies = [
  "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]

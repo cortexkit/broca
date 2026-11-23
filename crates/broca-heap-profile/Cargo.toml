@@ -5,11 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Opt-in Linux allocation-site accounting for the broca memory load harness"
+description = "Opt-in sampling heap profiler for finding what a running broca holds"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }

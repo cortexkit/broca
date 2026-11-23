@@ -250,6 +250,20 @@ sys.exit(19 if os.environ.get("FAIL_STEP") == name else 0)
         self.assertNotIn("CI log", result.stdout)
         self.assertIn("pid        4321", result.stdout)
 
+    def test_features_need_no_publish_and_reach_staging(self):
+        result = self.deploy("--live-approved", "--features", "heap-profile")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("add --no-publish", result.stderr)
+        self.assertEqual(self.steps(), [])
+        self.assertEqual(self.git("tag", "--list"), "")
+        result = self.deploy("--live-approved", "--no-publish", "--features", "heap-profile")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        [(_, stage)] = [record for record in self.records() if record[0] == "stage"]
+        self.assertEqual(stage[stage.index("--features") + 1], "heap-profile")
+        self.assertNotIn("publish", self.steps())
+        self.assertNotIn("tag-when-green", result.stdout)
+        self.assertIn("never published", result.stdout)
+
 
 class PublicationTests(Fixture):
     def setUp(self):

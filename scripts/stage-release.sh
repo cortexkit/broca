@@ -21,12 +21,17 @@
 # judgement about what changed; the script measures it, and cannot make it.
 #
 # Usage: scripts/stage-release.sh [--marker STRING] [--gone STRING] [--control STRING] [--keep-days N]
+#                                 [--features LIST]
+# --features builds ck-broca with those Cargo features of broca-module-serve, such as
+# heap-profile for a profiling build. Such a build is for this machine only: deploy.sh accepts it
+# only with --no-publish, and the staged-artifact summary this script prints names the features.
 set -euo pipefail
 
 KEEP_DAYS=2
 MARKER=""
 CONTROL=""
 PROBE_ONLY=""
+FEATURES=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --keep-days) KEEP_DAYS=${2:?--keep-days needs a number}; shift 2 ;;
@@ -34,6 +39,7 @@ while [[ $# -gt 0 ]]; do
         --control)   CONTROL=${2:?--control needs a string}; shift 2 ;;
     --gone)      GONE=${2:?--gone needs a string}; shift 2 ;;
         --probe-only) PROBE_ONLY=${2:?--probe-only needs an artifact path}; shift 2 ;;
+        --features)  FEATURES=${2:?--features needs a list}; shift 2 ;;
         *) echo "stage-release: unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -387,7 +393,7 @@ BUILD_LOG=$(mktemp "${TMPDIR:-/tmp}/broca-release-build.XXXXXX")
 build_status=0
 set +e
 {
-    python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve --bin ck-broca --bin broca-session --quiet 2>&1 1>&3 3>&- | tee "$BUILD_LOG" >&2
+    python3 scripts/lib/cargo-watchdog.py --step "build signed release artifact" -- cargo build --release --locked -p broca-module-serve --bin ck-broca --bin broca-session ${FEATURES:+--features "$FEATURES"} --quiet 2>&1 1>&3 3>&- | tee "$BUILD_LOG" >&2
     build_status=${PIPESTATUS[0]}
 } 3>&1
 set -e
@@ -744,6 +750,7 @@ mv -f "$CURRENT.tmp" "$CURRENT"
 
 echo "== staged"
 echo "   path    $STAGED"
+echo "   features ${FEATURES:-none}"
 echo "   current $CURRENT"
 echo "   sidecar $STAGED.sha256.postsign"
 [[ $(uname -s) != Darwin ]] || echo "   dSYM    $STAGED_DSYM"

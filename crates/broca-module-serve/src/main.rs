@@ -47,8 +47,6 @@ const OPENAI_DECISIONS_SERVED: bool = false;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     broca_module::diagnostics::initialize();
     broca_module_serve::serve::initialize_session_readers();
-    #[cfg(feature = "heap-profile")]
-    broca_heap_profile::start();
     run_runtime(serve_main())?
 }
 
@@ -164,6 +162,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
         .map_err(|e| ServeIoError(e.to_string()))?
         .path;
+    // A profiling build answers heap snapshot requests from a folder in its state root.
+    #[cfg(feature = "heap-profile")]
+    broca_heap_profile::start(state_root.join("heap-profile"));
     // broca's settings, read once: every component they shape reads its own section from here.
     // broca registers first, and takes the daemon's settings when the daemon manages them;
     // then it never reads the file. Under a daemon that doesn't, it reads broca.jsonc.

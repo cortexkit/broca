@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Deploy committed local bytes first; publishing and CI follow in a detached worker.
 # Usage: scripts/deploy.sh --marker STRING --control STRING [--live-approved] [--no-publish]
+#                          [--features LIST]
 # --no-publish deploys to this machine only: nothing is pushed to GitHub, so no CI run, master
 # fast-forward or public tag follows. Use it for development deploys, whose release suites have
 # not run; publish later with the printed command.
+# --features builds ck-broca with those Cargo features, such as heap-profile. It needs
+# --no-publish: a featured build is never the release, so it is never pushed or tagged as one.
 set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-MARKER="" CONTROL=""
+MARKER="" CONTROL="" FEATURES=""
 placement_args=()
 publish=1
 while [ "$#" -gt 0 ]; do
@@ -19,12 +22,19 @@ while [ "$#" -gt 0 ]; do
       shift 2 ;;
     --live-approved) placement_args+=(--live-approved); shift ;;
     --no-publish) publish=0; shift ;;
+    --features)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "deploy: usage error: --features requires a list" >&2; exit 2; }
+      FEATURES="$2"; shift 2 ;;
     *) echo "deploy: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$MARKER" ] && [ -n "$CONTROL" ] || {
-  echo "usage: scripts/deploy.sh --marker STRING --control STRING [--live-approved] [--no-publish]" >&2; exit 2;
+  echo "usage: scripts/deploy.sh --marker STRING --control STRING [--live-approved] [--no-publish] [--features LIST]" >&2; exit 2;
 }
+if [ -n "$FEATURES" ] && [ "$publish" -eq 1 ]; then
+  echo "deploy: REFUSING -- --features builds a development binary; add --no-publish" >&2
+  exit 2
+fi
 dirty="$(git status --porcelain)" || { echo "deploy: cannot read worktree status" >&2; exit 2; }
 if [ -n "$dirty" ]; then
   echo "deploy: REFUSING -- dirty working tree; commit the change before deploying." >&2
@@ -46,7 +56,7 @@ logs="$HOME/.local/state/cortexkit/broca/deploys"
 mkdir -p "$logs"
 logdir="$(mktemp -d "$logs/${sha:0:8}.XXXXXX")"
 echo "deploy: logs $logdir"
-if ! bash scripts/stage-release.sh --marker "$MARKER" --control "$CONTROL" 2>&1 | tee "$logdir/stage.log"; then
+if ! bash scripts/stage-release.sh --marker "$MARKER" --control "$CONTROL" ${FEATURES:+--features "$FEATURES"} 2>&1 | tee "$logdir/stage.log"; then
   echo "deploy: STAGING FAILED; nothing placed or restarted. See $logdir/stage.log" >&2
   exit 1
 fi
@@ -161,7 +171,10 @@ if ! python3 scripts/lib/acceptance_scoped.py --placement-report "$report" \
 fi
 cat "$logdir/acceptance-scoped.log"
 ci_log="$logdir/ci.log"
-if [ "$publish" -eq 0 ]; then
+if [ -n "$FEATURES" ]; then
+  echo "deploy: --features $FEATURES: a development build, deployed here only and never published."
+  echo "deploy: redeploy the release build of $version to replace it."
+elif [ "$publish" -eq 0 ]; then
   echo "deploy: --no-publish: deployed here only. Publish later with: scripts/tag-when-green.sh $sha $version"
 elif ! TAG_WHEN_GREEN_LOG="$ci_log" bash scripts/tag-when-green.sh "$sha" "$version"; then
   echo "deploy: live acceptance checks finished (direct: $direct_verdict; worker: PASS; scoped: PASS), but could not start background publication. Retry scripts/tag-when-green.sh $sha $version" >&2
