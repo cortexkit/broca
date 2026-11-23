@@ -1,8 +1,8 @@
 //! Where a request stops sending kept signed reasoning because a run's tools changed.
 //!
 //! Anthropic binds signed thinking to the request's tool set as well as to the bytes before it.
-//! Adding, removing or renaming a tool, or changing a tool's description or input schema,
-//! invalidates every signed thinking block sent before that request, and the model provider
+//! Adding, removing or renaming a tool, or changing a tool's description, input schema or
+//! `strict` flag, invalidates every signed thinking block sent before that request, and the model provider
 //! refuses a later request that still carries one. Only the set of tools counts: their order,
 //! the tool choice and cache markers don't. A run freezes its tools when it starts, so the set
 //! can only change where a run starts. The floor is the first message of the newest run whose
@@ -17,7 +17,7 @@
 
 use broca_protocol::request::Tool;
 use broca_protocol::structured_output::{
-    FrozenStructuredOutput, Mode, SUBMIT_RESULT_DESCRIPTION, SUBMIT_RESULT_TOOL,
+    FrozenStructuredOutput, Mode, SchemaDelivery, SUBMIT_RESULT_DESCRIPTION, SUBMIT_RESULT_TOOL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,7 +30,11 @@ use serde_json::Value;
 /// mode and reply deadline) is never sent, so it doesn't count either. From the run's frozen
 /// render config come the two things that change what the provider sees: an operator alias
 /// renames a tool on the wire, and a run admitted with a `submit_tool` structured output offers
-/// the `submit_result` tool besides its own. Each tool is compared by its canonical JSON (RFC
+/// the `submit_result` tool besides its own, marked `strict` when its schema is delivered
+/// strictly. Each run's admission decides that delivery from the model catalog's
+/// `capability.structured_output` fact for the route: strict only when the fact says the route
+/// enforces schemas. A catalog update between two runs can change the fact, so two runs of one
+/// session with the same schema can still offer different submit tools. Each tool is compared by its canonical JSON (RFC
 /// 8785), so two storages that hold the same schema with its keys in another order agree.
 pub fn tool_set_digest(tools: &[Tool], frozen_render_config: &Value) -> String {
     use sha2::Digest as _;
@@ -51,6 +55,7 @@ pub fn tool_set_digest(tools: &[Tool], frozen_render_config: &Value) -> String {
                 SUBMIT_RESULT_TOOL,
                 SUBMIT_RESULT_DESCRIPTION,
                 frozen.schema(),
+                frozen.delivery == SchemaDelivery::Strict,
             )
         });
     let shown = tools
@@ -60,20 +65,25 @@ pub fn tool_set_digest(tools: &[Tool], frozen_render_config: &Value) -> String {
                 tool.name.as_str(),
                 tool.description.as_str(),
                 &tool.input_schema,
+                false,
             )
         })
         .chain(
             submit
                 .as_ref()
-                .map(|(name, description, schema)| (*name, *description, schema)),
+                .map(|(name, description, schema, strict)| (*name, *description, schema, *strict)),
         )
-        .map(|(name, description, schema)| {
-            serde_jcs::to_string(&serde_json::json!({
+        .map(|(name, description, schema, strict)| {
+            let mut shown = serde_json::json!({
                 "name": wire_name(name),
                 "description": description,
                 "input_schema": schema,
-            }))
-            .expect("a tool declaration is JSON")
+            });
+            // Only a strict tool carries the flag, so every other tool's digest is unchanged.
+            if strict {
+                shown["strict"] = Value::Bool(true);
+            }
+            serde_jcs::to_string(&shown).expect("a tool declaration is JSON")
         })
         .collect::<std::collections::BTreeSet<_>>();
     let bytes = serde_json::to_vec(&shown).expect("strings serialize");
@@ -250,7 +260,26 @@ mod tests {
             "enforcement": "enforced", "delivery": "strict",
         }});
         assert!(FrozenStructuredOutput::from_frozen_render_config(Some(&submit)).is_some());
-        assert_ne!(tool_set_digest(&[read, grep], &submit), base);
+        assert_ne!(
+            tool_set_digest(&[read.clone(), grep.clone()], &submit),
+            base
+        );
+        // The same submit tool without `strict` is another tool to the provider. A session's
+        // runs admitted before and after the catalog's structured-output fact turned true for the
+        // route offer it both ways. Only strict delivery renders the flag, so non-strict and
+        // unconstrained delivery agree.
+        let mut unconstrained = submit.clone();
+        unconstrained["structured_output"]["delivery"] = json!("unconstrained");
+        let mut non_strict = submit.clone();
+        non_strict["structured_output"]["delivery"] = json!("non_strict");
+        assert_ne!(
+            tool_set_digest(&[read.clone(), grep.clone()], &unconstrained),
+            tool_set_digest(&[read.clone(), grep.clone()], &submit)
+        );
+        assert_eq!(
+            tool_set_digest(&[read.clone(), grep.clone()], &unconstrained),
+            tool_set_digest(&[read, grep], &non_strict)
+        );
     }
 
     #[test]
