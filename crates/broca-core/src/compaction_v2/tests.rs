@@ -926,6 +926,40 @@ fn compaction_v2_restore_checks_checksum_and_applied_identity() {
         .contains("no matching stored view"));
 }
 
+/// An effort change on the same model rides `effort_change` unless the run sends it in a
+/// cache-keeping form; a thinking change always rides it; a change of model is `model_change`
+/// only (llm-runner §9.3.6).
+#[test]
+fn effort_changes_ride_only_when_they_lose_the_cache() {
+    use cortexkit_role_compaction::{ride::RideCause, setup::ModelRef};
+    let at = |variant: &str, thinking: &str, keeps: bool| session_conditions::SendContext {
+        model: ModelRef::new("anthropic", "claude-opus-5-5").with_variant(variant),
+        account: None,
+        surface: "same".into(),
+        thinking: Some(thinking.into()),
+        effort_keeps_cache: keeps,
+    };
+    let conditions = session_conditions::conditions(at("high", "a", true).model, 1000, 100, true);
+    let causes = |previous, current| {
+        session_conditions::ride_causes(Some(&previous), &current, false, false, 1, &conditions)
+    };
+    assert!(causes(at("high", "a", true), at("low", "a", true)).is_empty());
+    assert_eq!(
+        causes(at("high", "a", false), at("low", "a", false)),
+        [RideCause::EffortChange]
+    );
+    assert_eq!(
+        causes(at("high", "a", true), at("high", "b", true)),
+        [RideCause::EffortChange]
+    );
+    let mut other = at("low", "a", true);
+    other.model = ModelRef::new("anthropic", "claude-sonnet-5-5").with_variant("low");
+    assert_eq!(
+        causes(at("high", "a", true), other),
+        [RideCause::ModelChange]
+    );
+}
+
 #[test]
 fn compaction_v2_rides_include_every_simultaneous_cause() {
     use cortexkit_role_compaction::{ride::RideCause, setup::ModelRef};
@@ -933,11 +967,15 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
         model: ModelRef::new("openai", "old"),
         account: Some("a".into()),
         surface: "old".into(),
+        thinking: None,
+        effort_keeps_cache: false,
     };
     let current = session_conditions::SendContext {
         model: ModelRef::new("anthropic", "new").with_service_tier("priority"),
         account: Some("b".into()),
         surface: "new".into(),
+        thinking: None,
+        effort_keeps_cache: false,
     };
     let conditions = session_conditions::conditions(current.model.clone(), 1000, 100, true);
     assert_eq!(
@@ -964,7 +1002,7 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
     let setup = session_conditions::setup_request("unchanged-preset", &conditions, 100, true);
     assert_eq!(setup.preset, "unchanged-preset");
     assert_eq!(setup.model, current.model);
-    assert_eq!(setup.detects.len(), 7);
+    assert_eq!(setup.detects.len(), 8);
     assert_eq!(setup.view_anchor, Some(true));
     assert_eq!(
         setup.rules.history_edit_cost,
@@ -1379,6 +1417,8 @@ fn send_context() -> session_conditions::SendContext {
         model: setup().model,
         account: None,
         surface: "same".into(),
+        thinking: None,
+        effort_keeps_cache: false,
     }
 }
 

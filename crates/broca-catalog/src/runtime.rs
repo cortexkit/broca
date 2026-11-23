@@ -68,6 +68,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "capability.attachment",
     "capability.input_modalities",
     "capability.mid_conversation_system",
+    "capability.effort_change_cache",
     "capability.reasoning",
     "capability.reasoning_options",
     "capability.server_side_fallback",
@@ -99,6 +100,9 @@ pub(crate) const MODEL_KIND_CHAT: &str = "chat";
 /// list above, the row reader, the `carries_…` scan and the tests.
 pub(crate) const SERVER_SIDE_FALLBACK_FACT: &str = "capability.server_side_fallback";
 pub(crate) const MID_CONVERSATION_SYSTEM_FACT: &str = "capability.mid_conversation_system";
+/// The catalog fact saying a change of the model's reasoning effort between requests keeps the
+/// provider's cached prefix, when sent in the provider's cache-keeping form (llm-runner §9.3.6).
+pub(crate) const EFFORT_CHANGE_CACHE_FACT: &str = "capability.effort_change_cache";
 
 /// The successful `catalog.get` response persisted as the last-known-good document.
 ///
@@ -181,6 +185,9 @@ struct LoadedCatalog {
     carries_server_side_fallback: bool,
     /// Refresh equal-version last-known-good data fetched before `mid_conversation_system` was requested.
     carries_mid_conversation_system: bool,
+    /// Refresh equal-version last-known-good data fetched before `effort_change_cache` was
+    /// requested, so its rows don't keep reading "no fact" until fusiform mints a new version.
+    carries_effort_change_cache: bool,
     /// Present rows this catalog left out or kept from the catalog it replaced, because their
     /// facts could not be used. Shared with an equal-version republish, which reuses the index
     /// these describe.
@@ -236,6 +243,13 @@ fn response_carries_mid_conversation_system(response: &FusiformCatalogResponse) 
         .models
         .values()
         .any(|facts| facts.contains_key(MID_CONVERSATION_SYSTEM_FACT))
+}
+
+fn response_carries_effort_change_cache(response: &FusiformCatalogResponse) -> bool {
+    response
+        .models
+        .values()
+        .any(|facts| facts.contains_key(EFFORT_CHANGE_CACHE_FACT))
 }
 
 fn response_carries_routing_facts(response: &FusiformCatalogResponse) -> bool {
@@ -345,6 +359,9 @@ struct ServingModel {
     /// not take a model offline.
     server_side_fallback: Option<bool>,
     mid_conversation_system: Option<bool>,
+    /// `capability.effort_change_cache`: whether an effort change keeps the cached prefix. Absent,
+    /// null or not a boolean reads as `None`, which the run counts as `false` (it rides).
+    effort_change_cache: Option<bool>,
     /// Upstream mode names (`fast`, `priority`, ...) for which fusiform serves BOTH a priced
     /// input and a priced output rate, sorted. A mode missing either side is unpriced and is
     /// not listed; see `priced_modes_fact`.
@@ -380,6 +397,7 @@ impl Default for ServingModel {
             reasoning_default_effort: None,
             server_side_fallback: None,
             mid_conversation_system: None,
+            effort_change_cache: None,
             priced_modes: Vec::new(),
             mode_wire_ids: BTreeMap::new(),
             wire_family: None,
@@ -422,6 +440,7 @@ impl ServingModel {
             reasoning_default_effort: model.reasoning_default_effort.clone(),
             server_side_fallback: model.server_side_fallback,
             mid_conversation_system: model.mid_conversation_system,
+            effort_change_cache: model.effort_change_cache,
             // The legacy snapshot path carries no fusiform mode rates, so it offers no tier
             // that needs one.
             priced_modes: Vec::new(),
@@ -462,6 +481,7 @@ impl ServingModel {
             reasoning_default_effort: self.reasoning_default_effort.clone(),
             server_side_fallback: self.server_side_fallback,
             mid_conversation_system: self.mid_conversation_system,
+            effort_change_cache: self.effort_change_cache,
             release_date: None,
             status: None,
             overlay: Overlay::default(),
@@ -1587,6 +1607,7 @@ fn serving_model_from_facts(
         mid_conversation_system: facts
             .get(MID_CONVERSATION_SYSTEM_FACT)
             .and_then(Value::as_bool),
+        effort_change_cache: facts.get(EFFORT_CHANGE_CACHE_FACT).and_then(Value::as_bool),
         priced_modes: priced_modes_fact(identity, facts)?,
         mode_wire_ids: mode_wire_ids_fact(identity, facts),
         wire_family: None,
@@ -2336,6 +2357,8 @@ impl CatalogCache {
                         != current.carries_server_side_fallback
                     || response_carries_mid_conversation_system(&response)
                         != current.carries_mid_conversation_system
+                    || response_carries_effort_change_cache(&response)
+                        != current.carries_effort_change_cache
                     || response_carries_temperature_facts(&response)
                         != current.carries_temperature_facts
                 {
@@ -2373,6 +2396,7 @@ impl CatalogCache {
                     carries_display_names: current.carries_display_names,
                     carries_server_side_fallback: current.carries_server_side_fallback,
                     carries_mid_conversation_system: current.carries_mid_conversation_system,
+                    carries_effort_change_cache: current.carries_effort_change_cache,
                     carries_temperature_facts: current.carries_temperature_facts,
                     excluded_rows: Arc::clone(&current.excluded_rows),
                 });
@@ -2470,6 +2494,7 @@ impl CatalogCache {
             // The vendored snapshot serves no `capability.server_side_fallback`.
             carries_server_side_fallback: false,
             carries_mid_conversation_system: false,
+            carries_effort_change_cache: false,
             carries_temperature_facts: [false; 3],
             excluded_rows: Arc::from([]),
         });
@@ -2546,6 +2571,7 @@ fn loaded(
         carries_display_names: response_carries_display_names(response),
         carries_server_side_fallback: response_carries_server_side_fallback(response),
         carries_mid_conversation_system: response_carries_mid_conversation_system(response),
+        carries_effort_change_cache: response_carries_effort_change_cache(response),
         carries_temperature_facts: response_carries_temperature_facts(response),
         excluded_rows: assembled.excluded_rows.into(),
     })

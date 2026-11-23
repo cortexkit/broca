@@ -78,7 +78,7 @@ pub async fn earlier_context<W: Writer>(
         return Ok(Some((run, None)));
     }
     let earlier = crate::run::admission_of_start(&start, parts)?;
-    let context = v2::host::context_of(&frozen(&earlier), earlier.manifest.as_deref());
+    let context = send_context(&earlier);
     Ok(Some((run, Some(context))))
 }
 
@@ -981,6 +981,31 @@ fn spanning_repetition(
 
 /// The run's frozen choices in the shape read by compaction conditions. The admission does not
 /// include the model variant, service tier, or account choice, so those read as none.
+/// What a ride compares between `admission`'s run and another: [`v2::host::context_of`], with
+/// how the run's request sends an effort change, read from its render config
+/// (`broca_provider::effort_change`). A config that doesn't read as one keeps no cache across a
+/// change, so the change rides.
+fn send_context(admission: &Admission) -> v2::conditions::SendContext {
+    with_effort_facts(
+        v2::host::context_of(&frozen(admission), admission.manifest.as_deref()),
+        &admission.render_config,
+    )
+}
+
+/// `context` with the effort facts of the run whose render config is `render_config`.
+fn with_effort_facts(
+    mut context: v2::conditions::SendContext,
+    render_config: &serde_json::Value,
+) -> v2::conditions::SendContext {
+    if let Ok(config) =
+        serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(render_config.clone())
+    {
+        context.thinking = broca_provider::effort_change::thinking_mode(&config);
+        context.effort_keeps_cache = broca_provider::effort_change::keeps_cache(&config);
+    }
+    context
+}
+
 pub fn frozen(admission: &Admission) -> v2::host::Frozen<'_> {
     v2::host::Frozen {
         model: &admission.model,
@@ -1007,10 +1032,7 @@ fn previous<W: Writer>(
 ) -> Result<Option<v2::conditions::SendContext>, LoopError> {
     match writer.operations().last_send_run.as_deref() {
         None => Ok(None),
-        Some(run) if run == admission.run_id => Ok(Some(v2::host::context_of(
-            &frozen(admission),
-            admission.manifest.as_deref(),
-        ))),
+        Some(run) if run == admission.run_id => Ok(Some(send_context(admission))),
         Some(run) => match &ctx.earlier {
             Some((earlier, context)) if earlier == run => Ok(context.clone()),
             _ => Err(LoopError::Parts(format!(
@@ -1220,7 +1242,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         Ok(conditions) => conditions,
         Err(message) => return Ok(Send::Unavailable(message)),
     };
-    let current = v2::host::context_of(&frozen(admission), admission.manifest.as_deref());
+    let current = send_context(admission);
     let previous = previous(writer, moved_from.unwrap_or(admission), ctx)?;
     let plane = v2::runtime::BoundPlane {
         plane: seams.compaction_plane,

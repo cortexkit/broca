@@ -482,7 +482,15 @@ impl WireFamily for AnthropicMessages {
         if let Some(x_app) = policy.x_app {
             headers.push(("x-app".to_string(), x_app.to_string()));
         }
-        if let Some(beta) = anthropic_beta_header(frozen) {
+        // A run that may send a per-message effort carries its beta on every request, so the
+        // header doesn't change when the first change arrives.
+        let per_message_effort = crate::effort_change::keeps_cache(frozen)
+            .then_some(crate::effort_change::PER_MESSAGE_EFFORT_BETA);
+        let beta = match (anthropic_beta_header(frozen), per_message_effort) {
+            (Some(beta), Some(effort)) => Some(format!("{beta},{effort}")),
+            (beta, effort) => beta.or(effort.map(str::to_owned)),
+        };
+        if let Some(beta) = beta {
             headers.push(("anthropic-beta".to_string(), beta));
         }
         // Auth attaches HERE, after render — never on the rendered/hashed bytes.
@@ -766,16 +774,47 @@ fn render_placed<R>(
         drop(rendered_messages);
         return render_placed(frozen, &replaced, media, provenance, use_body);
     }
+    // Each later run's effort change, when the run keeps the cache across it, goes in as an
+    // empty system message that sets the effort (see `effort_change`): after the run's first
+    // user message, before the first message positioned later. A message with no position (a
+    // transform's) never moves one.
+    let effort_plan = crate::effort_change::anthropic_plan(frozen, opts);
+    let has_ordinals = opts.prompt.iter().any(|message| message.ordinal.is_some());
+    let mut efforts = effort_plan
+        .iter()
+        .flat_map(|plan| &plan.messages)
+        .peekable();
+    let mut placed: Vec<(Node<'_>, Option<u32>, Option<usize>)> =
+        Vec::with_capacity(rendered_messages.len());
+    for (message, prefix_blocks, prompt_index) in rendered_messages {
+        let position = opts.prompt[prompt_index]
+            .ordinal
+            .map(|ordinal| ordinal as usize)
+            .or_else(|| (!has_ordinals).then_some(prompt_index));
+        if let Some(position) = position {
+            while let Some(effort) = efforts.next_if(|effort| effort.after < position) {
+                placed.push((effort_message(&effort.effort), None, None));
+            }
+        }
+        placed.push((message, prefix_blocks, Some(prompt_index)));
+    }
+    placed.extend(efforts.map(|effort| (effort_message(&effort.effort), None, None)));
+
     // Keep only surviving message identities. System messages are coalesced into the
     // separate system field, and an empty rendered message has no wire-message index.
     let mut rendered_indices = vec![None; opts.prompt.len()];
-    let (mut messages, cache_prefix_blocks): (Vec<Node<'_>>, Vec<Option<u32>>) = rendered_messages
+    let (mut messages, cache_prefix_blocks): (Vec<Node<'_>>, Vec<Option<u32>>) = placed
         .into_iter()
         .enumerate()
         .map(|(wire_index, (message, prefix_blocks, prompt_index))| {
-            rendered_indices[prompt_index] = Some(wire_index);
+            if let Some(prompt_index) = prompt_index {
+                rendered_indices[prompt_index] = Some(wire_index);
+            }
             if let Some(sink) = provenance.as_deref_mut() {
-                sink.record_message(wire_index, opts.prompt[prompt_index].ordinal);
+                sink.record_message(
+                    wire_index,
+                    prompt_index.and_then(|index| opts.prompt[index].ordinal),
+                );
             }
             (message, prefix_blocks)
         })
@@ -850,7 +889,9 @@ fn render_placed<R>(
                     .remove("thinking");
             }
         }
-        if let Some(effort) = effort {
+        // With per-message efforts, the top level keeps the effort they change from.
+        let top_level = effort_plan.as_ref().map(|plan| &plan.top_level);
+        if let Some(effort) = top_level.or(effort.as_ref()) {
             rest["output_config"] = json!({ "effort": effort });
         }
     }
@@ -917,6 +958,12 @@ fn content_of<'n, 'a>(message: &'n Node<'a>) -> Option<&'n [Node<'a>]> {
         Some(NodeRef::Node(node)) => node.as_array(),
         _ => None,
     }
+}
+
+/// An empty system message that sets the effort from its position on (Anthropic's per-message
+/// effort).
+fn effort_message(effort: &str) -> Node<'static> {
+    Node::value(json!({ "role": "system", "content": [], "output_config": { "effort": effort } }))
 }
 
 /// A `{"type":"text","text":...}` block.

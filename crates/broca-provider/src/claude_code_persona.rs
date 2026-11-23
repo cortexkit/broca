@@ -515,6 +515,23 @@ pub fn select_legacy_betas(body: &Value, model: &str, host_betas: &[&str]) -> St
     kept.join(",")
 }
 
+/// Whether the persona's main requests to `model` carry `per-turn-control`, the beta that lets a
+/// request change effort with a per-message `output_config`. Claude Code 2.1.302 sends it on
+/// Sonnet 5.5, Opus 5.5, Fable 5.1 and Haiku 5.5; its 2.1.325 catalog adds Fable 5.2 and Mythos
+/// 5.2, and Opus 5 and Mythos 5.1 take it too (Anthropic's per-message effort page lists them).
+pub fn sends_per_turn_control(model: &str) -> bool {
+    [
+        "claude-sonnet-5-5",
+        "claude-opus-5",
+        "claude-fable-5-1",
+        "claude-fable-5-2",
+        "claude-haiku-5-5",
+        "claude-mythos-5",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+}
+
 /// Main-request betas measured from interactive Claude Code 2.1.302 with default flags.
 /// These apply to main requests regardless of body shape; auxiliary title/quota requests
 /// have different lists. Advisor and fallback-credit betas require features broca does not use.
@@ -531,15 +548,7 @@ pub fn select_betas(body: &Value, model: &str, host_betas: &[&str]) -> String {
     } else {
         betas.insert(0, "claude-code-20250219");
     }
-    if [
-        "claude-sonnet-5-5",
-        "claude-opus-5-5",
-        "claude-fable-5-1",
-        "claude-haiku-5-5",
-    ]
-    .iter()
-    .any(|prefix| model.starts_with(prefix))
-    {
+    if sends_per_turn_control(model) {
         betas.push(PER_TURN_CONTROL_BETA);
     }
     betas.extend([

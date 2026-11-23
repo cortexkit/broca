@@ -109,6 +109,7 @@ fn chatgpt_spec() -> (ProviderSpec, ModelSpec) {
         reasoning_default_effort: None,
         server_side_fallback: None,
         mid_conversation_system: None,
+        effort_change_cache: None,
         input_modalities: Default::default(),
         release_date: None,
         status: None,

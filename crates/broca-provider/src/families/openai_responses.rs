@@ -217,6 +217,13 @@ fn with_platform_body<R>(
     with_prepared_request_body(frozen, opts, media, provenance, |prepared, _| {
         let mut body = prepared.body;
         finish_platform_body(frozen, &mut body.rest);
+        // A session whose effort changed sends the first run's effort here; the later runs'
+        // efforts went into the input as configuration updates.
+        if let Some(anchor) = prepared.effort_anchor {
+            if body.rest["reasoning"].is_object() {
+                body.rest["reasoning"]["effort"] = Value::String(anchor);
+            }
+        }
         use_body(&body.into_node())
     })
 }
@@ -235,7 +242,8 @@ pub(crate) struct PreparedRequestBody<'a> {
     pub body: ResponsesBody<'a>,
     /// The request as structured output prepares it.
     pub prepared: &'a CallOptions,
-    /// The ChatGPT effort anchor planned over `prepared`; `None` when no plan applies.
+    /// The effort the request's top level keeps when later runs' efforts go in as input
+    /// configuration updates; `None` when no plan applies.
     pub effort_anchor: Option<String>,
 }
 

@@ -810,6 +810,7 @@ fn map_model(model_id: &str, entry: &Value, raw_policy: RawPolicy) -> ModelSpec 
         mid_conversation_system: entry
             .get("mid_conversation_system")
             .and_then(Value::as_bool),
+        effort_change_cache: entry.get("effort_change_cache").and_then(Value::as_bool),
         release_date: entry
             .get("release_date")
             .and_then(Value::as_str)

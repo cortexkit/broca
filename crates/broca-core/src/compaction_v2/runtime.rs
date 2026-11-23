@@ -800,6 +800,7 @@ pub fn detects(cache_expired: bool) -> Vec<RideCause> {
         RideCause::CacheExpired,
         RideCause::ChainReset,
         RideCause::ModelChange,
+        RideCause::EffortChange,
         RideCause::TierChange,
         RideCause::AccountChange,
         RideCause::SurfaceChange,

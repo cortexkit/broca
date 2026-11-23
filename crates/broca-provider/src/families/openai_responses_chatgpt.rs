@@ -110,19 +110,39 @@ pub fn reduce_episodes(
     reduced
 }
 
+/// Whether `frozen`'s model takes an effort change as an input configuration update, which
+/// keeps the cached prefix: a GPT-6 or later model, on the ChatGPT backend or the platform API
+/// (OpenAI's reasoning guide, "Change reasoning mid-conversation").
+pub(crate) fn takes_effort_updates(frozen: &FrozenRenderConfig) -> bool {
+    matches!(
+        frozen.family_id,
+        crate::spec::WireFamilyId::OpenAiResponsesChatgpt
+            | crate::spec::WireFamilyId::OpenAiResponses
+    ) && EFFORT_UPDATE_MODEL_FAMILIES.iter().any(|prefix| {
+        frozen.wire_model_id == *prefix
+            || frozen
+                .wire_model_id
+                .strip_prefix(prefix)
+                .is_some_and(|tail| tail.starts_with('.') || tail.starts_with('-'))
+    })
+}
+
+/// Whether a run recorded `config` with input configuration updates on: the ChatGPT backend's
+/// own flag, or on the platform API the run's catalog fact that effort changes keep the cache
+/// (both absent from configs recorded before the run could send updates).
+fn renders_effort_updates(config: &FrozenRenderConfig) -> bool {
+    match config.family_id {
+        crate::spec::WireFamilyId::OpenAiResponsesChatgpt => config.chatgpt_effort_updates,
+        crate::spec::WireFamilyId::OpenAiResponses => config.effort_change_cache,
+        _ => false,
+    }
+}
+
 pub(crate) fn effort_plan(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
 ) -> Option<(String, Vec<EffortUpdate>)> {
-    if frozen.family_id != crate::spec::WireFamilyId::OpenAiResponsesChatgpt
-        || !EFFORT_UPDATE_MODEL_FAMILIES.iter().any(|prefix| {
-            frozen.wire_model_id == *prefix
-                || frozen
-                    .wire_model_id
-                    .strip_prefix(prefix)
-                    .is_some_and(|tail| tail.starts_with('.') || tail.starts_with('-'))
-        })
-    {
+    if !takes_effort_updates(frozen) {
         return None;
     }
     #[cfg(test)]
@@ -137,7 +157,7 @@ pub(crate) fn effort_plan(
     // The first episode's recorded flag decides whether the session uses input updates.
     // If it lacks the flag, even episodes appended after an upgrade keep the old request
     // shape: inserting updates would change bytes already admitted for that session.
-    if !first.chatgpt_effort_updates
+    if !renders_effort_updates(first)
         || configs.iter().any(|config| {
             config.family_id != frozen.family_id || config.wire_model_id != frozen.wire_model_id
         })
@@ -161,7 +181,7 @@ pub(crate) fn effort_plan(
     for (episode, config) in opts.render_episodes.iter().zip(&configs).skip(1) {
         let next = effort(config)?;
         if next != in_force {
-            if !config.chatgpt_effort_updates {
+            if !renders_effort_updates(config) {
                 return None;
             }
             updates.push(EffortUpdate {

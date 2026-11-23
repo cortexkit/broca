@@ -65,6 +65,10 @@ pub fn context_of(config: &Frozen<'_>, manifest: Option<&PlanManifest>) -> SendC
             .auth_selection
             .and_then(crate::compaction::view::selection_account_label),
         surface,
+        // What the request sends for an effort change is the renderer's to say; the run loop
+        // fills these from the run's render config.
+        thinking: None,
+        effort_keeps_cache: false,
     }
 }
 

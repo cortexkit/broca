@@ -24,6 +24,7 @@ mod codex_retry_after;
 pub mod conformance;
 pub mod credential_hosts;
 pub mod credential_refresh;
+pub mod effort_change;
 pub mod families;
 pub mod hash;
 mod json_text;

@@ -313,6 +313,13 @@ pub struct FrozenRenderConfig {
     /// the episode starts. Old frozen blobs lack this field and keep request-level effort.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chatgpt_effort_updates: bool,
+    /// The model's `capability.effort_change_cache` when the run started: an effort change from
+    /// the run before keeps the provider's cached prefix, sent in the family's cache-keeping
+    /// form, so the run rides nothing for it (llm-runner §9.3.6). Frozen so a resumed run
+    /// decides the same way whatever the catalog says by then. Older configs lack it and read
+    /// `false`, the answer for a model with no fact: the change rides `effort_change`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub effort_change_cache: bool,
     /// Released Codex policy and identity. Absence retains legacy request bytes on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chatgpt_wire: Option<crate::chatgpt_wire::ChatgptWire>,

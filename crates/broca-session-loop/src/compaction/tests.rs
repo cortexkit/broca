@@ -196,3 +196,29 @@ fn a_cut_keeping_from_tool_results_seals_from_the_call_that_asked_for_them() {
     assert_eq!(super::turn_start(&conversation, 4), 4);
     assert_eq!(super::turn_start(&conversation, 2), 2);
 }
+
+/// A ride reads whether the run keeps the cache across an effort change from its frozen render
+/// config, so a model whose catalog fact says so rides nothing for the change.
+#[test]
+fn the_send_context_reads_the_runs_effort_facts() {
+    use cortexkit_role_compaction::setup::ModelRef;
+    let context = || broca_core::compaction_v2::conditions::SendContext {
+        model: ModelRef::new("anthropic", "claude-opus-5-5"),
+        account: None,
+        surface: "same".into(),
+        thinking: None,
+        effort_keeps_cache: false,
+    };
+    let mut config = broca_provider::families::anthropic_apikey_frozen_config("claude-opus-5-5");
+    config.effort_change_cache = true;
+    let read = super::with_effort_facts(context(), &serde_json::to_value(&config).unwrap());
+    assert!(read.effort_keeps_cache);
+    config.effort_change_cache = false;
+    let read = super::with_effort_facts(context(), &serde_json::to_value(&config).unwrap());
+    assert!(!read.effort_keeps_cache);
+    let unread = super::with_effort_facts(context(), &serde_json::json!({"not": "a config"}));
+    assert!(
+        !unread.effort_keeps_cache,
+        "a config that doesn't read rides"
+    );
+}

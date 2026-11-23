@@ -14,6 +14,13 @@ pub struct SendContext {
     /// None means the host has no account identity to compare, not an account switch.
     pub account: Option<String>,
     pub surface: String,
+    /// The thinking the request sends, where the family has a thinking mode apart from its
+    /// effort (Anthropic's `thinking` object): any change of it loses the cache, so it always
+    /// rides `effort_change`. `None` on families whose effort is their only reasoning setting.
+    pub thinking: Option<String>,
+    /// The run's frozen `capability.effort_change_cache`: its request sends an effort change
+    /// from the run before in a form that keeps the cached prefix (llm-runner §9.3.6).
+    pub effort_keeps_cache: bool,
 }
 
 /// Every applicable cause, without precedence suppressing a simultaneous cause.
@@ -36,9 +43,15 @@ pub fn ride_causes(
     if let Some(previous) = previous {
         if previous.model.provider != current.model.provider
             || previous.model.model != current.model.model
-            || previous.model.variant != current.model.variant
         {
             causes.push(RideCause::ModelChange);
+        } else if previous.thinking != current.thinking
+            || (previous.model.variant != current.model.variant && !current.effort_keeps_cache)
+        {
+            // Same model, other effort or thinking (llm-runner §9.3.6). An effort change the
+            // request sends in its cache-keeping form loses nothing, so it rides nothing; one it
+            // can't, and any thinking change, tells the provider the cache is gone.
+            causes.push(RideCause::EffortChange);
         }
         if previous.model.service_tier != current.model.service_tier {
             causes.push(RideCause::TierChange);

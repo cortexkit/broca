@@ -177,6 +177,11 @@ pub struct ModelSpec {
     /// Missing or false is unsupported, never an admission error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mid_conversation_system: Option<bool>,
+    /// `capability.effort_change_cache`: a change of reasoning effort between requests keeps the
+    /// provider's cached prefix when sent in its cache-keeping form. `None` (no fact) reads as
+    /// `false`: most providers lose the cache on an effort change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_change_cache: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_date: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
