@@ -5,4 +5,3 @@
 10669 crates/broca-module-serve/src/serve.rs every route's handler; split by operation family
     6550 crates/broca-session-loop/src/run.rs the run loop; split into model step, tool batch and between-step work (compaction views, messages sent into a running run)
 6196 crates/broca-wire/src/lib.rs wire types of every op; split by op family
-6073 crates/broca-catalog/src/runtime.rs catalog resolution; split poller, cache and resolution
