@@ -6,9 +6,8 @@
 # written in (crates/broca-records/src/floor.rs; today only the session store's
 # `session-storage/v1`). A build whose known-feature table does not cover the floor could not
 # serve sessions that exist here: placing it is a rollback onto unreadable data. place-release
-# asks the candidate build for its table (`ck-broca --wal-known-features`) and refuses unless it
-# covers the floor. The file and the flag keep the names they had when the floor listed the old
-# log format's frame features.
+# asks the candidate build for its table (`ck-broca --known-features`) and refuses unless it
+# covers the floor.
 #
 # These scripts only READ the floor. The session store raises it before it writes its first
 # session in a state root; it only ever grows.
@@ -24,14 +23,14 @@ broca_state_root() {
   printf '%s\n' "${BROCA_STATE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/broca}"
 }
 
-broca_wal_floor_path() {
-  printf '%s/wal-feature-floor\n' "$(broca_state_root)"
+broca_floor_path() {
+  printf '%s/feature-floor\n' "$(broca_state_root)"
 }
 
 # Prints the floor's names, one per line. A missing file is an empty floor (nothing gated has
 # been written here yet). Returns 2 when the file exists but cannot be read: a floor nobody can
 # read must not be treated as an empty one.
-broca_wal_floor_names() {
+broca_floor_names() {
   local file="$1" line
   [ -e "$file" ] || return 0
   [ -r "$file" ] || return 2
@@ -47,9 +46,9 @@ broca_wal_floor_names() {
 }
 
 # One line for a card: the names comma-separated, or `none`.
-broca_wal_floor_summary() {
+broca_floor_summary() {
   local names
-  names="$(broca_wal_floor_names "$1")" || { printf 'UNREADABLE\n'; return 0; }
+  names="$(broca_floor_names "$1")" || { printf 'UNREADABLE\n'; return 0; }
   if [ -z "$names" ]; then
     printf 'none\n'
   else

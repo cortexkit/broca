@@ -1,10 +1,10 @@
-//! `ck-broca --wal-known-features` is read by placement tooling to decide whether a staged
+//! `ck-broca --known-features` is read by placement tooling to decide whether a staged
 //! build can read every storage format already written on the machine (the feature floor,
 //! `broca_records::floor`). Its output is that contract: the known-name table, sorted, one name
 //! per line, nothing else, exit 0.
 
 #[test]
-fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
+fn known_features_prints_the_sorted_table_and_nothing_else() {
     let data_home = broca_test_support::scratch_root()
         .join(format!("broca-known-features-{}", std::process::id()));
     let output = broca_test_support::retry_executable_file_busy(|| {
@@ -12,7 +12,7 @@ fn wal_known_features_prints_the_sorted_table_and_nothing_else() {
             env!("CARGO_BIN_EXE_ck-broca"),
             broca_test_support::scratch_root(),
         )
-        .arg("--wal-known-features")
+        .arg("--known-features")
         // Point the data home at a scratch directory so that, if the probe ever reached logger
         // setup, it would write there and not into the operator's real log directory.
         .env("XDG_DATA_HOME", &data_home)

@@ -3,9 +3,8 @@
 //! A build that does not know one of those names cannot serve the sessions written in it, so
 //! placing it would roll the machine back onto data it cannot read. `scripts/place-release.sh`
 //! reads this file and refuses a staged build whose known-name table
-//! (`ck-broca --wal-known-features`) does not cover it; `scripts/wal-floor.sh` describes the
-//! same format from the reading side. The file and the flag keep the names they had when the
-//! floor listed the old log format's frame features.
+//! (`ck-broca --known-features`) does not cover it; `scripts/feature-floor.sh` describes the
+//! same format from the reading side.
 //!
 //! The session store raises the floor BEFORE it writes its first session in a state root: a
 //! crash between the two then leaves a floor that names a format nothing uses yet, which only
@@ -24,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
 /// The floor's file name, in broca's state root.
-pub const FEATURE_FLOOR_FILENAME: &str = "wal-feature-floor";
+pub const FEATURE_FLOOR_FILENAME: &str = "feature-floor";
 
 /// The session store's format (`broca-session-store`), whose sessions live under the state
 /// root's [`crate::SESSION_STORAGE_DIR`] and its sibling class folders. The store raises the
@@ -32,7 +31,7 @@ pub const FEATURE_FLOOR_FILENAME: &str = "wal-feature-floor";
 /// refuses every build that predates the session store.
 pub const SESSION_STORAGE_FEATURE: &str = "session-storage/v1";
 
-/// Every feature name this build knows, which `ck-broca --wal-known-features` prints for release
+/// Every feature name this build knows, which `ck-broca --known-features` prints for release
 /// placement to check against the floor.
 pub const KNOWN_FEATURES: &[&str] = &[SESSION_STORAGE_FEATURE];
 

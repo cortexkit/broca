@@ -78,7 +78,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // Reject stray invocations before opening logs or reading config: discovery probes are
     // not daemon boots and must not leave records in the operator's production log.
     let args = parse_launch_args(std::env::args_os().skip(1)).unwrap_or_else(|error| {
-        eprintln!("ck-broca: {error}\nvalid arguments: --subc <connection-file>, --version (-V), --wal-known-features");
+        eprintln!("ck-broca: {error}\nvalid arguments: --subc <connection-file>, --version (-V), --known-features");
         std::process::exit(2);
     });
     let conn_path = match args {
@@ -386,9 +386,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|error| ServeIoError(format!("open run index: {error}")))?,
     );
     let run_index = Some(index);
-    // Older builds kept spend caps in `caps.db` beside this file. Spend caps were removed, so the
-    // file is no longer opened; it is left on disk untouched rather than deleted.
-
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
     // poll below can dial that sibling module.
@@ -1552,7 +1549,7 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
     let mut args = args.into_iter();
     let mut conn_path = None;
     let mut version = false;
-    let mut wal_known_features = false;
+    let mut known_features = false;
     while let Some(arg) = args.next() {
         if arg == "--subc" {
             if conn_path.is_some() {
@@ -1565,8 +1562,8 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
             conn_path = Some(PathBuf::from(value));
         } else if arg == "--version" || arg == "-V" {
             version = true;
-        } else if arg == "--wal-known-features" {
-            wal_known_features = true;
+        } else if arg == "--known-features" {
+            known_features = true;
         } else {
             return Err(format!("unknown argument {arg:?}"));
         }
@@ -1574,7 +1571,7 @@ fn parse_launch_args(args: impl IntoIterator<Item = OsString>) -> Result<LaunchA
     if version {
         return Ok(LaunchArgs::Version);
     }
-    if wal_known_features {
+    if known_features {
         return Ok(LaunchArgs::WalKnownFeatures);
     }
     conn_path

@@ -13,7 +13,7 @@ of exit codes), a fake `ck` that records restart requests, and fake ps/lsof proc
 The staged and deployed files are compiled Mach-O binaries, so file-kind and signing
 checks run for real instead of being stubbed out. They answer `--version` like ck-broca and
 exit 0 on everything else, so the placement gate's smoke run passes and
-`--wal-known-features` reports an empty table.
+`--known-features` reports an empty table.
 """
 
 from __future__ import annotations

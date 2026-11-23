@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run broca's operator script suites: the Python tests that guard release, placement,
-# WAL-reading and dependency tooling. CI and the local gate both call this one list, so a
+# state-root and dependency tooling. CI and the local gate both call this one list, so a
 # suite added here runs in both places. Before this file existed the list lived only in
 # CI, and a conflict between two dependency checks reached CI after passing the local gate.
 #
@@ -64,7 +64,7 @@ suites=(
     # Every script locates broca's state root by the daemon's rule.
     scripts/test-state-root.py
     # The one-time rewrite of a feature floor written before the old log format was removed.
-    scripts/test-shrink-feature-floor.py
+    scripts/test-migrate-feature-floor.py
     # Verifies quickcheck's unconditional guards and feature propagation behavior.
     scripts/test-quickcheck-guards.py
     # The gate's phase order (fmt, clippy, prewarm, tests) and its log, with cargo stubbed.

@@ -1,6 +1,14 @@
 use super::*;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const CUT: &str = "0123456789abcdef0123456789abcdef";
+/// Writes a staged session's bytes durably, as an import leaves them for activation to install.
+fn stage(root: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    broca_records::move_fence::durable_dir(root, path.parent().unwrap())?;
+    std::fs::write(path, bytes)?;
+    broca_records::move_fence::sync_dir(path.parent().unwrap())
+}
+
 fn root(tag: &str) -> PathBuf {
     let root =
         broca_test_support::scratch_root().join(format!("cut-state-{}-{tag}", std::process::id()));
@@ -31,10 +39,10 @@ impl Artifacts {
         }
     }
     fn staged(&self, reference: &str) -> PathBuf {
-        broca_records::move_fence::staging_path(&self.root.join("wal"), CUT, reference).unwrap()
+        self.root.join("staging").join(CUT).join(reference)
     }
     fn path(&self, reference: &str) -> PathBuf {
-        self.root.join(format!("wal/{reference}.wal"))
+        self.root.join("sessions").join(reference)
     }
     fn ref_names(state: &CutState) -> Vec<String> {
         serde_json::to_value(state.refs.as_ref().unwrap())
@@ -97,13 +105,8 @@ impl CutArtifacts for Artifacts {
                 Op::Export => {}
                 Op::Import => {
                     let bytes = format!("cut:{name}");
-                    broca_records::move_fence::stage(
-                        &self.root,
-                        &self.staged(&name),
-                        bytes.as_bytes(),
-                        &broca_records::move_fence::digest(bytes.as_bytes()),
-                    )
-                    .map_err(unavailable)?;
+                    stage(&self.root, &self.staged(&name), bytes.as_bytes())
+                        .map_err(unavailable)?;
                 }
                 Op::Activate => {
                     if name == "b" && self.fail_b.load(Ordering::SeqCst) {
@@ -387,13 +390,7 @@ async fn pending_import_verifies_the_entire_ref_set_before_recording_completion(
         ..CutState::default()
     };
     store.save(CUT, &state).unwrap();
-    broca_records::move_fence::stage(
-        &root,
-        &artifacts.staged("a"),
-        b"cut:a",
-        &broca_records::move_fence::digest(b"cut:a"),
-    )
-    .unwrap();
+    stage(&root, &artifacts.staged("a"), b"cut:a").unwrap();
     store.reconcile_boot(&artifacts).await.unwrap();
     assert_eq!(store.load(CUT).unwrap().step, Step::None);
     assert!(!store
@@ -401,13 +398,7 @@ async fn pending_import_verifies_the_entire_ref_set_before_recording_completion(
         .unwrap()
         .replies
         .contains_key(Op::Import.method()));
-    broca_records::move_fence::stage(
-        &root,
-        &artifacts.staged("b"),
-        b"invalid",
-        &broca_records::move_fence::digest(b"invalid"),
-    )
-    .unwrap();
+    stage(&root, &artifacts.staged("b"), b"invalid").unwrap();
     store.reconcile_boot(&artifacts).await.unwrap();
     assert!(!artifacts.staged("b").exists());
     store
@@ -476,7 +467,7 @@ async fn activate_failure_fences_the_first_installed_ref_and_refuses_abort() {
     let root = root("activate");
     let store = CutStore::new(&root);
     let artifacts = Artifacts::new(root.clone());
-    broca_records::move_fence::durable_dir(&root, &root.join("wal")).unwrap();
+    broca_records::move_fence::durable_dir(&root, &root.join("sessions")).unwrap();
     store
         .execute(
             contract::ADMITTED_CALLER,

@@ -56,11 +56,11 @@ class PythonHelper(unittest.TestCase):
 
 
 class ShellReader(unittest.TestCase):
-    """wal-floor.sh, which place-release.sh and stage-release.sh source, agrees with the helper."""
+    """feature-floor.sh, which place-release.sh and stage-release.sh source, agrees with the helper."""
 
     def shell_root(self, env: dict[str, str]) -> str:
         result = subprocess.run(
-            ["bash", "-c", f'source "{SCRIPTS / "wal-floor.sh"}" && broca_state_root'],
+            ["bash", "-c", f'source "{SCRIPTS / "feature-floor.sh"}" && broca_state_root'],
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env},
             capture_output=True,
             text=True,
@@ -75,13 +75,13 @@ class ShellReader(unittest.TestCase):
 
     def test_floor_file_follows_the_state_root(self) -> None:
         result = subprocess.run(
-            ["bash", "-c", f'source "{SCRIPTS / "wal-floor.sh"}" && broca_wal_floor_path'],
+            ["bash", "-c", f'source "{SCRIPTS / "feature-floor.sh"}" && broca_floor_path'],
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "XDG_DATA_HOME": "/xdg", "HOME": "/h"},
             capture_output=True,
             text=True,
             check=True,
         )
-        self.assertEqual(result.stdout.strip(), "/xdg/cortexkit/broca/wal-feature-floor")
+        self.assertEqual(result.stdout.strip(), "/xdg/cortexkit/broca/feature-floor")
 
 
 class NoScriptHardCodesTheRoot(unittest.TestCase):

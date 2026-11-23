@@ -75,7 +75,7 @@ fn status_value(state: &CutState) -> Result<Value, ErrorBody> {
     serde_json::to_value(reply).map_err(unavailable)
 }
 
-/// Pause the affected session actors and hold their single-writer WAL leases,
+/// Pause the affected session actors and hold their single-writer session leases,
 /// acquired in sorted session-ref order. Commands and new actor opens can proceed
 /// when this guard drops, so all files and the move's completion must be fsynced first.
 pub trait CutGuard: Send {}
@@ -83,7 +83,7 @@ impl<T: Send> CutGuard for T {}
 
 /// Filesystem and door operations for one move batch. Admission checks must not
 /// mutate. Apply and recovery are idempotent and may touch only this cut's freezes,
-/// staging, tombstones and installed WALs. Recovery returns a reply only after
+/// staging, tombstones and installed sessions. Recovery returns a reply only after
 /// checking every session named by the batch, not just its first artifact.
 #[async_trait::async_trait]
 pub trait CutArtifacts: Send + Sync {

@@ -584,10 +584,10 @@ class ReleaseCardFloorArms(unittest.TestCase):
         return lines[0]
 
     def test_the_card_prints_the_floor_names(self):
-        (self.state / "wal-feature-floor").write_text("alpha\nbeta\n")
+        (self.state / "feature-floor").write_text("alpha\nbeta\n")
         line = self.card()
         self.assertIn("alpha, beta", line)
-        self.assertIn(str(self.state / "wal-feature-floor"), line)
+        self.assertIn(str(self.state / "feature-floor"), line)
 
     def test_the_card_says_none_without_a_floor_file(self):
         self.assertIn("floor    none", self.card())

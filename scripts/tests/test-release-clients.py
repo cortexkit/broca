@@ -32,7 +32,7 @@ class StageClientsTests(unittest.TestCase):
             root = Path(directory)
             scripts = root / "scripts"
             scripts.mkdir()
-            for name in ("stage-release.sh", "dsym.sh", "wal-floor.sh", "running-image.sh", "signing-posture.sh", "nonshipping-markers.sh"):
+            for name in ("stage-release.sh", "dsym.sh", "feature-floor.sh", "running-image.sh", "signing-posture.sh", "nonshipping-markers.sh"):
                 shutil.copy2(ROOT / "scripts" / name, scripts / name)
             (scripts / "lib").mkdir()
             shutil.copy2(ROOT / "scripts/lib/artifact-probe.sh", scripts / "lib/artifact-probe.sh")

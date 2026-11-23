@@ -83,11 +83,11 @@ fn missing_subc_refuses_before_logger_or_state_creation() {
 #[test]
 fn fast_probes_remain_side_effect_free() {
     let scratch = Scratch::new("probes");
-    for flag in ["--version", "-V", "--wal-known-features"] {
+    for flag in ["--version", "-V", "--known-features"] {
         let output = scratch.spawn(&[flag]);
         assert!(output.status.success(), "{output:?}");
         let stdout = String::from_utf8(output.stdout).unwrap();
-        if flag == "--wal-known-features" {
+        if flag == "--known-features" {
             let mut names = broca_records::floor::KNOWN_FEATURES.to_vec();
             names.sort_unstable();
             let expected: String = names.iter().map(|name| format!("{name}\n")).collect();

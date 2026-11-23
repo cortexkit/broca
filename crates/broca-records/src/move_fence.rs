@@ -302,17 +302,20 @@ fn exclusive_link(temp: &Path, destination: &Path) -> io::Result<()> {
     })
 }
 
+/// Freezes writes to the session whose fence files sit beside `sidecar` for the cut `wanted`
+/// names: the `.moving` file, published whole with an exclusive link, so only one cut owns it.
+/// A session already moved away refuses; a freeze another cut owns is returned as its refusal.
 pub fn freeze(
     state_root: &Path,
-    wal: &Path,
+    sidecar: &Path,
     wanted: &Freeze,
 ) -> io::Result<Result<Freeze, MoveRefusal>> {
-    if let Some(moved) = read_json::<Moved>(&wal.with_extension("moved"))? {
+    if let Some(moved) = read_json::<Moved>(&sidecar.with_extension("moved"))? {
         return Ok(Err(MoveRefusal::Moved {
             holder: moved.holder,
         }));
     }
-    let path = wal.with_extension("moving");
+    let path = sidecar.with_extension("moving");
     let parent = path.parent().unwrap_or(Path::new("."));
     durable_dir(state_root, parent)?;
     let bytes = serde_json::to_vec(wanted).map_err(invalid)?;
@@ -344,41 +347,41 @@ pub fn freeze(
     }
 }
 
-pub fn abort_freeze(wal: &Path, cut_id: &str) -> io::Result<()> {
-    if let Some(owner) = read_json::<Freeze>(&wal.with_extension("moving"))? {
+pub fn abort_freeze(sidecar: &Path, cut_id: &str) -> io::Result<()> {
+    if let Some(owner) = read_json::<Freeze>(&sidecar.with_extension("moving"))? {
         if owner.cut_id == cut_id {
-            unlink(&wal.with_extension("moving"))?;
+            unlink(&sidecar.with_extension("moving"))?;
         }
     } else {
-        unlink(&wal.with_extension("moving"))?;
+        unlink(&sidecar.with_extension("moving"))?;
     }
     Ok(())
 }
 
 pub fn release(
     state_root: &Path,
-    wal: &Path,
+    sidecar: &Path,
     cut_id: &str,
     holder: &str,
 ) -> io::Result<Result<(), MoveRefusal>> {
-    let moved_path = wal.with_extension("moved");
+    let moved_path = sidecar.with_extension("moved");
     if let Some(moved) = read_json::<Moved>(&moved_path)? {
         if moved.cut_id == cut_id && moved.holder == holder {
-            if let Some(owner) = read_json::<Freeze>(&wal.with_extension("moving"))? {
+            if let Some(owner) = read_json::<Freeze>(&sidecar.with_extension("moving"))? {
                 if owner.cut_id != cut_id {
                     return Ok(Err(MoveRefusal::Moving {
                         cut_id: owner.cut_id,
                     }));
                 }
             }
-            unlink(&wal.with_extension("moving"))?;
+            unlink(&sidecar.with_extension("moving"))?;
             return Ok(Ok(()));
         }
         return Ok(Err(MoveRefusal::Moved {
             holder: moved.holder,
         }));
     }
-    let owner = read_json::<Freeze>(&wal.with_extension("moving"))?
+    let owner = read_json::<Freeze>(&sidecar.with_extension("moving"))?
         .ok_or_else(|| invalid("release has no owned freeze"))?;
     if owner.cut_id != cut_id {
         return Ok(Err(MoveRefusal::Moving {
@@ -386,7 +389,7 @@ pub fn release(
         }));
     }
     // Publish the tombstone first. A crash before unlink still refuses both reads
-    // and writes; tombstone precedence prevents the old WAL being exposed.
+    // and writes; tombstone precedence keeps the moved session hidden.
     atomic_json(
         state_root,
         &moved_path,
@@ -396,13 +399,13 @@ pub fn release(
             lineage_id: owner.lineage_id,
         },
     )?;
-    unlink(&wal.with_extension("moving"))?;
+    unlink(&sidecar.with_extension("moving"))?;
     Ok(Ok(()))
 }
 
 /// Find a pending release or activation naming this session's shared contract
-/// ref. Refuse on unreadable cut JSON: otherwise a reader could append to an
-/// installed WAL before the move's completion is durably recorded.
+/// ref. Refuse on unreadable cut JSON: otherwise a writer could append to an
+/// installed session before the move's completion is durably recorded.
 /// `session_ref` is the agent-data ref (`cortexkit_role_llm_runner::session_ref`), never the
 /// session's address. `state_root`
 /// is broca's state root, which keeps the cuts under `agent-data/`.
@@ -457,100 +460,6 @@ pub fn cut_fence(state_root: &Path, session_ref: &str) -> io::Result<Option<Stri
         }
     }
     Ok(None)
-}
-
-pub fn check(wal: &Path, session_ref: &str, write: bool) -> io::Result<Result<(), MoveRefusal>> {
-    check_refs(wal, &[session_ref], write)
-}
-
-/// [`check`] for a session that cut files may name by more than one reference (the
-/// folder-based v1 reference and the runner-identity v2 one). A write is fenced by a pending
-/// cut naming any of them before the moved tombstone is consulted, so the precedence of a
-/// pending release over a tombstone does not depend on which reference the cut recorded.
-pub fn check_refs(
-    wal: &Path,
-    session_refs: &[&str],
-    write: bool,
-) -> io::Result<Result<(), MoveRefusal>> {
-    if wal
-        .components()
-        .any(|part| part.as_os_str() == "wal-staging")
-    {
-        return Err(invalid("wal-staging is not a live session population"));
-    }
-    // Move sidecars stay at the original session address in wal/, regardless of
-    // which live tree holds the transcript bytes.
-    let canonical = wal
-        .parent()
-        .filter(|parent| {
-            parent
-                .file_name()
-                .is_some_and(|name| name == "wal-durable" || name == "wal-ephemeral")
-        })
-        .and_then(|parent| Some(parent.parent()?.join("wal").join(wal.file_name()?)));
-    let wal = canonical.as_deref().unwrap_or(wal);
-    if write {
-        for session_ref in session_refs {
-            let wal_root = wal.parent().unwrap_or(Path::new("."));
-            if let Some(cut_id) =
-                cut_fence(wal_root.parent().unwrap_or(Path::new(".")), session_ref)?
-            {
-                return Ok(Err(MoveRefusal::Moving { cut_id }));
-            }
-        }
-    }
-    if let Some(moved) = read_json::<Moved>(&wal.with_extension("moved"))? {
-        return Ok(Err(MoveRefusal::Moved {
-            holder: moved.holder,
-        }));
-    }
-    if write {
-        if let Some(owner) = read_json::<Freeze>(&wal.with_extension("moving"))? {
-            return Ok(Err(MoveRefusal::Moving {
-                cut_id: owner.cut_id,
-            }));
-        }
-    }
-    Ok(Ok(()))
-}
-
-/// Staging is owned by one cut and kept outside `wal/` and `wal-archive/`, so
-/// transcript readers, retention sweeps and archive folds never discover it.
-pub fn staging_path(wal_root: &Path, cut_id: &str, address: &str) -> io::Result<PathBuf> {
-    if [cut_id, address].iter().any(|s| {
-        s.is_empty()
-            || !s
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    }) {
-        return Err(invalid("invalid staging cut or address"));
-    }
-    Ok(wal_root
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("wal-staging")
-        .join(cut_id)
-        .join(format!("{address}.wal")))
-}
-
-/// Verify before publishing staging; a mismatch leaves no file for activation.
-pub fn stage(state_root: &Path, path: &Path, bytes: &[u8], digest: &str) -> io::Result<()> {
-    use sha2::{Digest, Sha256};
-    if format!("{:x}", Sha256::digest(bytes)) != digest {
-        return Err(invalid("digest_mismatch"));
-    }
-    let parent = path.parent().ok_or_else(|| invalid("staging path"))?;
-    durable_dir(state_root, parent)?;
-    let temp = path.with_extension("wal.tmp");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(temp, path)?;
-    sync_dir(parent)
 }
 
 pub fn digest(bytes: &[u8]) -> String {

@@ -13,7 +13,7 @@ is not using and report a clean result about the wrong machine state.
 
 Every operator script that locates the state root goes through default_state_root() so there is one
 copy of the rule on this side too. scripts/test-state-root.py checks that no script spells the old
-hard-coded path any more, and that the shell reader in wal-floor.sh agrees with this one.
+hard-coded path any more, and that the shell reader in feature-floor.sh agrees with this one.
 
 Operator config uses default_config_home(), a separate ladder matching the supervisor's
 config resolver: XDG_CONFIG_HOME, Windows APPDATA or USERPROFILE/AppData/Roaming, then

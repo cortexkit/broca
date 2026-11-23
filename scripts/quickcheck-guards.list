@@ -2,7 +2,7 @@
 # Pins the retry class each default ServeHandler refusal carries.
 broca-module|it|open_failed_classes::|broca-module/test-clock|crates/broca-module/tests/it/open_failed_classes.rs|default_refusals_carry_their_retry_class|Keeps the default refusals' error classes pinned when serve.rs changes.
 # Pins the sorted WAL feature names exposed by the daemon's read-only probe.
-broca-module-serve|it|wal_known_features::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/wal_known_features.rs|wal_known_features_prints_the_sorted_table_and_nothing_else|Protects the known-feature table used by placement tooling.
+broca-module-serve|it|known_features::|broca-module-serve/test-clock|crates/broca-module-serve/tests/it/known_features.rs|known_features_prints_the_sorted_table_and_nothing_else|Protects the known-feature table used by placement tooling.
 # Admission read-budget and credential-source regressions run in ck-broca's bin tests above.
 # Prevents shipped Rust sources from reading the launch nonce directly.
 broca-module-serve|launch_nonce|no_shipped_code_reads_a_launch_nonce_variable_directly|broca-module-serve/test-clock|crates/broca-module-serve/tests/launch_nonce.rs|no_shipped_code_reads_a_launch_nonce_variable_directly|Keeps production launch-nonce reads behind the shared accessor.

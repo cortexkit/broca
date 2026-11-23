@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--version")) {
         puts("ck-broca 0.0.1"); return 0;
     }
-    if (argc > 1 && !strcmp(argv[1], "--wal-known-features")) {
+    if (argc > 1 && !strcmp(argv[1], "--known-features")) {
         puts("known-feature"); return 0;
     }
     if (getenv("NO_DUMP")) prctl(PR_SET_DUMPABLE, 0);
@@ -536,7 +536,7 @@ def stub_binary(
 ) -> None:
     """A shell script standing in for ck-broca.
 
-    version=None makes `--version` fail; features=None makes `--wal-known-features` an unknown
+    version=None makes `--version` fail; features=None makes `--known-features` an unknown
     flag (the pre-flag build, which exits 1 asking for --subc). `signed` pre-seeds a signature
     with those flags, as staging or an earlier placement would have left it.
     """
@@ -550,7 +550,7 @@ def stub_binary(
         f"# identity {path.name}\n"
         'case "$1" in\n'
         f"  --version) {smoke} ;;\n"
-        f"  --wal-known-features) {known} ;;\n"
+        f"  --known-features) {known} ;;\n"
         "  *) echo 'Error: \"missing required --subc <connection-file>\"' >&2; exit 1 ;;\n"
         "esac\n"
     ).encode()
@@ -599,7 +599,7 @@ class GateBase(unittest.TestCase):
         self.rollback = self.tmp / "rollback"
         self.state = self.tmp / "state"
         self.state.mkdir()
-        self.floor = self.state / "wal-feature-floor"
+        self.floor = self.state / "feature-floor"
         self.codesign_log = self.tmp / "codesign.log"
         self.fake_bin = self.tmp / "fake-bin"
         self.fake_bin.mkdir()
@@ -1000,7 +1000,7 @@ else:
         self.floor.write_text("alpha\nbeta\n")
         stub_binary(self.staged, features=["alpha"])
         result = self.place()
-        self.assert_refused(result, "wal-feature-floor")
+        self.assert_refused(result, "feature-floor")
         self.assertIn("does not know: beta", result.stderr)
         self.assertIn(str(self.floor), result.stderr)
 
@@ -1012,7 +1012,7 @@ else:
         self.floor.write_text("archive-index/v2\nscope/v1\n")
         stub_binary(self.staged, features=["plan-manifest/v1", "scope/v1", "steer-queue/v1"])
         result = self.place()
-        self.assert_refused(result, "wal-feature-floor")
+        self.assert_refused(result, "feature-floor")
         self.assertIn("does not know: archive-index/v2", result.stderr)
         stub_binary(self.staged, signed="adhoc,runtime", features=[
             "archive-index/v2", "plan-manifest/v1", "scope/v1", "steer-queue/v1"])
@@ -1025,8 +1025,8 @@ else:
         self.floor.write_text("alpha\n")
         stub_binary(self.staged, features=None)
         result = self.place()
-        self.assert_refused(result, "wal-feature-floor")
-        self.assertIn("'--wal-known-features' exited 1", result.stderr)
+        self.assert_refused(result, "feature-floor")
+        self.assertIn("'--known-features' exited 1", result.stderr)
 
     def test_an_unreadable_floor_is_not_an_empty_one(self) -> None:
         if os.geteuid() == 0:
@@ -1157,7 +1157,7 @@ class VerifyDeploySigningTests(GateBase):
     def verify(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(VERIFY), "--bin", str(self.dest), "--staged", str(self.staged),
-             "--marker", "wal-known-features", "--control", "missing required"],
+             "--marker", "known-features", "--control", "missing required"],
             env=self.env(BROCA_TEST_BIN=str(self.dest)),
             capture_output=True,
             text=True,

@@ -62,7 +62,7 @@
 #   runtime-flag        the copy's code signature carries the hardened-runtime flag
 #   get-task-allow      the copy's entitlements let a debugger attach
 #   smoke-run           the copy fails to start: `--version` must exit 0 and name a version
-#   wal-feature-floor   the copy cannot read a storage format this machine's sessions already use
+#   feature-floor   the copy cannot read a storage format this machine's sessions already use
 
 set -euo pipefail
 
@@ -128,7 +128,7 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO_ROOT/scripts/lib/exit-guard.sh"
 source "$REPO_ROOT/scripts/signing-posture.sh"
-source "$REPO_ROOT/scripts/wal-floor.sh"
+source "$REPO_ROOT/scripts/feature-floor.sh"
 source "$REPO_ROOT/scripts/running-image.sh"
 source "$REPO_ROOT/scripts/dsym.sh"
 source "$REPO_ROOT/scripts/release-clients.sh"
@@ -601,18 +601,18 @@ if [ "$smoke_rc" -ne 0 ] || ! [[ $SMOKE_LINE =~ $smoke_re ]]; then
     "An exit status above 128 is a signal: macOS kills a binary whose signature does not validate."
 fi
 
-# wal-feature-floor: the floor lists the storage formats this machine's sessions are already
+# feature-floor: the floor lists the storage formats this machine's sessions are already
 # written in, and a build that does not know one of them cannot serve those sessions. Placing it
-# would roll the machine back to a reader that cannot read its own data. See scripts/wal-floor.sh.
-WAL_FLOOR_FILE="$(broca_wal_floor_path)"
-if ! FLOOR_NAMES="$(broca_wal_floor_names "$WAL_FLOOR_FILE")"; then
-  echo "place-release: REFUSING -- placement gate check 'wal-feature-floor' cannot read the floor." >&2
-  echo "  file  $WAL_FLOOR_FILE" >&2
+# would roll the machine back to a reader that cannot read its own data. See scripts/feature-floor.sh.
+FLOOR_FILE="$(broca_floor_path)"
+if ! FLOOR_NAMES="$(broca_floor_names "$FLOOR_FILE")"; then
+  echo "place-release: REFUSING -- placement gate check 'feature-floor' cannot read the floor." >&2
+  echo "  file  $FLOOR_FILE" >&2
   echo "  A floor nobody can read is not an empty floor. Nothing has been placed." >&2
   exit 2
 fi
 set +e
-KNOWN_FEATURES="$(run_candidate "$TMP" --wal-known-features 2>/dev/null)"
+KNOWN_FEATURES="$(run_candidate "$TMP" --known-features 2>/dev/null)"
 known_rc=$?
 set -e
 if [ "$known_rc" -eq 0 ]; then
@@ -627,21 +627,21 @@ if [ "$known_rc" -eq 0 ]; then
     esac
   done <<<"$FLOOR_NAMES"
   if [ -n "$missing" ]; then
-    gate_refuse wal-feature-floor "$TMP" \
-      "the floor at $WAL_FLOOR_FILE lists feature(s) this build does not know: $missing" \
+    gate_refuse feature-floor "$TMP" \
+      "the floor at $FLOOR_FILE lists feature(s) this build does not know: $missing" \
       "sessions on this machine were written with them, and this build cannot read them."
   fi
-  FLOOR_VERDICT="covered by the copy's --wal-known-features"
+  FLOOR_VERDICT="covered by the copy's --known-features"
 elif [ -n "$FLOOR_NAMES" ]; then
   # A build older than the flag cannot say what it knows. With a non-empty floor, that is a build
   # that predates every storage format the floor can name, so it cannot read what the floor lists.
-  gate_refuse wal-feature-floor "$TMP" \
-    "'--wal-known-features' exited $known_rc, so this build cannot report which storage formats" \
-    "it reads, and the floor at $WAL_FLOOR_FILE is not empty."
+  gate_refuse feature-floor "$TMP" \
+    "'--known-features' exited $known_rc, so this build cannot report which storage formats" \
+    "it reads, and the floor at $FLOOR_FILE is not empty."
 else
   # No floor, or an empty one: nothing on this machine is written in a format the floor guards,
   # so an older build is as placeable as it always was.
-  FLOOR_VERDICT="empty, not checked (the copy predates --wal-known-features)"
+  FLOOR_VERDICT="empty, not checked (the copy predates --known-features)"
 fi
 
 # Prepare the client before publishing any binary. A missing, wrong-version or unsignable
@@ -832,8 +832,8 @@ if [ "$BROCA_DEPLOY_HOST" = Darwin ]; then
 else
   echo "   signing   not applicable on Linux; ELF is unsigned (no macOS debugger-attachment protection claimed)"
 fi
-echo "   floor     $(broca_wal_floor_summary "$WAL_FLOOR_FILE") -- ${FLOOR_VERDICT}"
-echo "             ($WAL_FLOOR_FILE)"
+echo "   floor     $(broca_floor_summary "$FLOOR_FILE") -- ${FLOOR_VERDICT}"
+echo "             ($FLOOR_FILE)"
 
 if [ "$AFTER_SHA" != "$STAGED_SHA" ]; then
   echo "place-release: PLACED BYTES DO NOT MATCH THE STAGED ARTIFACT." >&2

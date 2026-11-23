@@ -41,12 +41,14 @@ paths rather than begin an empty history (`crates/broca-module-serve/src/state_r
   request-dumps/            request bodies written by the operator's request dump
   logs/                     daily log files
   state-format              format marker, when present; naming the removed broca-state/2 refuses startup
-  wal-feature-floor         storage formats this root's sessions use; placement checks it
+  feature-floor             storage formats this root's sessions use; placement checks it
   broca.lock                held by the one ck-broca serving this root   (below)
 ```
 
-Folders named `wal*` or `conversion-*` and a `caps.db` are left over from the old log format and
-removed features. broca does not read them.
+A root that served a build before 0.4.112 may still hold folders named `wal*`, `media`,
+`media-durable`, `media-ephemeral` or `conversion-*`, a `conversion-ledger.db`, a `caps.db` and a
+`wal-feature-floor`. broca reads none of them; `scripts/migrate-feature-floor.py` moves the floor
+and removes the rest.
 
 Only one `ck-broca` process may serve a state root. At boot, before it touches anything else
 in the root, it takes an exclusive OS advisory lock on `broca.lock` (`flock` on Unix,

@@ -49,9 +49,9 @@ cd "$ROOT"
 source "$ROOT/scripts/dsym.sh"
 # The WAL feature floor is printed on the card so the placing seat sees which feature names the
 # build must know; place-release enforces it.
-source "$ROOT/scripts/wal-floor.sh"
+source "$ROOT/scripts/feature-floor.sh"
 source "$ROOT/scripts/nonshipping-markers.sh"
-WAL_FLOOR_FILE=$(broca_wal_floor_path)
+FLOOR_FILE=$(broca_floor_path)
 
 # THE BUILD SCRATCH AREA, NOT THE SEAM THE PLACER READS. Age-swept below, so it must never
 # be pointed at a shared directory: the sweeper deletes by mtime and cannot tell my residue
@@ -229,7 +229,7 @@ if [[ -n "${CONTROL:-}" ]]; then
       marker   ${m_table}:${MARKER}   staged ${m_new} / deployed ${m_old}
       control  ${c_table}:${CONTROL}   staged ${c_new} / deployed ${c_old}${GONE:+
       gone     ${g_table}:${GONE}   staged ${g_new} / deployed ${g_old}   <- a removal; the deployed count is its control}
-      floor    $(broca_wal_floor_summary "$WAL_FLOOR_FILE")   ($WAL_FLOOR_FILE)
+      floor    $(broca_floor_summary "$FLOOR_FILE")   ($FLOOR_FILE)
    Both carry the table on purpose: a control read by the other instrument proves
    nothing about the one that measured the marker."
 fi
@@ -755,8 +755,8 @@ echo "   current $CURRENT"
 echo "   sidecar $STAGED.sha256.postsign"
 [[ $(uname -s) != Darwin ]] || echo "   dSYM    $STAGED_DSYM"
 echo "   sha256  $STAGED_SHA"
-echo "   floor   $(broca_wal_floor_summary "$WAL_FLOOR_FILE")   ($WAL_FLOOR_FILE)"
-echo "           place-release refuses a build whose --wal-known-features does not cover it."
+echo "   floor   $(broca_floor_summary "$FLOOR_FILE")   ($FLOOR_FILE)"
+echo "           place-release refuses a build whose --known-features does not cover it."
 echo "   NAME THIS EXACT PATH ON THE CARD. A hash without a path invites a glob over a"
 echo "   shared seam, and the seam holds every previous release."
 [[ $swept -gt 0 ]] && echo "   swept   $swept artifact(s) older than ${KEEP_DAYS}d"
