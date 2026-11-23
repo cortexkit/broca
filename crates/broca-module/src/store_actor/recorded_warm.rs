@@ -137,11 +137,13 @@ async fn rebuild<W: Writer>(
             operations.enrolled_through()
         };
         // Through the facts that place the step's own assistant message, so the fold knows its
-        // ordinal; nothing later, so a later cut's marker never reaches it.
+        // ordinal; nothing later, so a later cut's marker never reaches it. A step whose reply was
+        // never placed (the provider refused it, or it was cut off) is folded through its
+        // attempt, which is everything its request held.
         let placed_at = records[attempt_at..]
             .iter()
             .position(|(_, record)| matches!(record, Record::EntryFacts(facts) if facts.mid == mid))
-            .map_or(records.len() - 1, |at| attempt_at + at);
+            .map_or(attempt_at, |at| attempt_at + at);
         folded = conversation_as_of(
             &records[..=placed_at],
             writer.conversation().appends_in_conversation,
@@ -167,6 +169,14 @@ async fn rebuild<W: Writer>(
                 .iter()
                 .position(|entry| entry.facts.as_ref().is_some_and(|facts| facts.mid == mid))
                 .map(|at| conversation.window_start() + at as u64)
+        })
+        .or_else(|| {
+            // An unplaced reply's request ends after the last message folded so far.
+            let answered = records[attempt_at..]
+                .iter()
+                .any(|(_, record)| matches!(record, Record::EntryFacts(facts) if facts.mid == mid));
+            (as_of && through == Through::Request && !answered)
+                .then(|| conversation.window_start() + conversation.entries.len() as u64)
         })
         .ok_or("the recorded step's tool turn is outside the conversation window")?;
     let run_at = records[..=attempt_at]

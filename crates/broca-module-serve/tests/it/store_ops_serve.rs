@@ -1178,6 +1178,58 @@ async fn request_dump_writes_each_steps_request_for_the_operator_only() {
     );
 }
 
+/// A step the provider refused placed no reply, so nothing in the conversation marks where its
+/// request ended. `session.request_dump` still writes that request as the provider received it:
+/// everything the session held when the step was sent, after an earlier run's tool turn.
+#[tokio::test]
+async fn request_dump_writes_a_refused_steps_request() {
+    let refused = vec![NormalizedEvent::Control(ProviderControl::Error {
+        error: broca_protocol::ProviderError {
+            provider_details: None,
+            cause: None,
+            provider_subcode: None,
+            refusal: None,
+            class: broca_protocol::ErrorClass::Permanent,
+            message: "400: invalid request".into(),
+            status: Some(400),
+            retry_after_secs: None,
+            provider_code: Some("request_invalid".into()),
+            resets_at_ms: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None,
+            account_continue: None,
+        },
+        retries_used: 0,
+    })];
+    let mut rig = Rig::start_attempting(
+        "request-dump-refused",
+        vec![read_step("a1"), text_step("a2", "done"), refused],
+    )
+    .await;
+    rig.send("r1", "first", Some(compacting_plan())).await;
+    rig.send("r2", "second", None).await;
+    let sent: Vec<Vec<u8>> = rig.requests.lock().unwrap().clone();
+    assert_eq!(sent.len(), 3, "the refused run sent one request");
+
+    rig.bind_session(1, Principal::Direct).await;
+    let reply = rig
+        .result(1, "session.request_dump", json!({"run_id": "r2"}))
+        .await;
+    let steps = reply["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{reply}");
+    assert_eq!(steps[0]["outcome"], "written", "{reply}");
+    assert_eq!(
+        steps[0]["recorded_sha256"],
+        broca_core::render::request_digest_hex(&sent[2]),
+        "{reply}"
+    );
+    let folder = PathBuf::from(reply["folder"].as_str().unwrap());
+    assert_eq!(std::fs::read(folder.join("s1.json")).unwrap(), sent[2]);
+}
+
 /// `session.delete` reaches the store through the serve path on the operator's own route only.
 /// While the run's actor holds the session open it answers `transient`; once the actor has closed
 /// idle, the session is read, and its run's spend, which this rig never exports, refuses the
