@@ -108,14 +108,13 @@ pub fn setup_request(
     // The runtime leaves the floor out for a provider that doesn't declare it reads one.
     setup.signed_floor = conditions.signed_floor.clone();
     setup.statement_seq = conditions.statement_seq;
-    enable_metadata_writer_view_anchor(&mut setup);
+    // Asks the provider for a view's anchor (`built_through`, `new_signed`; W5.1). Broca seals
+    // both into the view checksum it checks (`received.rs`), stores them with the view, and plans
+    // every view through the view library, which strips a signed part newer than the anchor
+    // when `new_signed` allows it instead of refusing the view. This one constructor covers
+    // live and serving Setup.
+    setup.view_anchor = Some(true);
     setup
-}
-
-fn enable_metadata_writer_view_anchor(_setup: &mut SetupRequest) {
-    // When cortexkit-role-compaction exposes Setup's view_anchor, set it to
-    // Some(true) here: this common constructor covers both live and serving Setup,
-    // and this activation point belongs only to builds that durably store anchors.
 }
 
 /// The library, rather than host-local tables, owns the rule defaults.

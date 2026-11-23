@@ -965,6 +965,7 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
     assert_eq!(setup.preset, "unchanged-preset");
     assert_eq!(setup.model, current.model);
     assert_eq!(setup.detects.len(), 7);
+    assert_eq!(setup.view_anchor, Some(true));
     assert_eq!(
         setup.rules.history_edit_cost,
         cortexkit_role_compaction::rules::EditCost::FullResend

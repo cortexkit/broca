@@ -111,7 +111,7 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
         let mut expected: serde_json::Value = serde_json::from_str(vector).unwrap();
         // The synthetic session has no applied view, newest entry, or signed floor. Broca
         // detects more causes than the example runner, explicitly names its default service
-        // tier, and this is its first notice.
+        // tier, asks for view anchors on Setup, and this is its first notice.
         expected["params"]
             .as_object_mut()
             .unwrap()
@@ -124,6 +124,7 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
                 .remove("applied_view");
             expected["params"].as_object_mut().unwrap().remove("newest");
             expected["params"]["detects"] = serde_json::to_value(runtime::detects(true)).unwrap();
+            expected["params"]["view_anchor"] = json!(true);
         } else {
             expected["params"]["conditions"]["model"]["service_tier"] = json!("standard");
             expected["params"]["conditions"]
