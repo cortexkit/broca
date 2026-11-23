@@ -68,7 +68,8 @@ impl RegistryHandle {
         decision["session"] = serde_json::json!(broca_core::session_addr(key));
         let mut line = decision.to_string();
         line.push('\n');
-        let written = std::fs::OpenOptions::new()
+        // Like every file in the state root, readable by its owner alone.
+        let written = broca_owner_only::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
