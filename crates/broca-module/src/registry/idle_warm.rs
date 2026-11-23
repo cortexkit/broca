@@ -32,6 +32,8 @@ impl RegistryHandle {
             // process restart rebuilding eligibility from durable records, can try again.
             stops.insert(key.clone());
         }
+        #[cfg(feature = "test-clock")]
+        self.note_decision(key, serde_json::json!({ "stopped": reason }));
         drop(schedules);
         drop(stops);
         if let Some(scheduled) = scheduled {
@@ -44,6 +46,36 @@ impl RegistryHandle {
                 tracing::info!(target: "cache_warm", session = %broca_core::session_addr(key),
                     reason, next_due_ms = scheduled.due_ms, "idle cache warming stopped");
             }
+        }
+    }
+
+    /// Under the test clock, appends the session's newest idle-warm decision (armed with its due
+    /// time, or stopped with why) as a line of `test-clock-warms.jsonl` beside the clock's control
+    /// file. A harness moving the clock waits on it: after each move, for every due warm to have
+    /// been sent and decided again. Callers hold the schedule locks, so lines are in decision
+    /// order. Release builds have no test clock and write nothing.
+    #[cfg(feature = "test-clock")]
+    fn note_decision(&self, key: &LineageKey, mut decision: serde_json::Value) {
+        use std::io::Write as _;
+        let Some(path) = self
+            .inner
+            .retention
+            .get()
+            .and_then(|service| service.clock.harness_file("test-clock-warms.jsonl"))
+        else {
+            return;
+        };
+        decision["session"] = serde_json::json!(broca_core::session_addr(key));
+        let mut line = decision.to_string();
+        line.push('\n');
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+        if let Err(error) = written {
+            tracing::warn!(target: "cache_warm", path = %path.display(), %error,
+                "could not note an idle warm decision for the test clock");
         }
     }
 
@@ -65,6 +97,8 @@ impl RegistryHandle {
     pub(crate) fn arm_idle_warm(&self, key: &LineageKey, due_ms: u64, now_ms: u64) {
         let stops = self.inner.idle_warm_stops.lock().unwrap();
         if self.is_stopping() || stops.contains(key) {
+            #[cfg(feature = "test-clock")]
+            self.note_decision(key, serde_json::json!({ "stopped": "not_rearmed" }));
             return;
         }
         let id = self
@@ -80,20 +114,25 @@ impl RegistryHandle {
                 cancel: cancel.clone(),
             },
         );
+        #[cfg(feature = "test-clock")]
+        self.note_decision(key, serde_json::json!({ "armed_due_ms": due_ms }));
         drop(stops);
         if let Some(previous) = previous {
             previous.cancel.cancel();
         }
         tracing::debug!(target: "cache_warm", session = %broca_core::session_addr(key),
             reason = "cache_alive", next_due_ms = due_ms, "idle cache warming armed");
+        let clock = self
+            .inner
+            .retention
+            .get()
+            .map(|service| service.clock.clone());
         let inner = std::sync::Arc::downgrade(&self.inner);
         let stopping = self.stopping_signal();
         let key = key.clone();
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(due_ms.saturating_sub(now_ms));
         tokio::spawn(async move {
             let work = async {
-                tokio::time::sleep_until(deadline).await;
+                until_due(clock.as_ref(), due_ms, now_ms).await;
                 let Some(inner) = inner.upgrade() else { return };
                 let registry = LineageRegistry { inner };
                 let result = registry.route_warm_mode(&key, None, true).await;
@@ -117,5 +156,35 @@ impl RegistryHandle {
                 _ = work => {},
             }
         });
+    }
+}
+
+/// Waits until `due_ms` on the daemon's clock. A test clock moves without real time passing, so
+/// the wait recomputes whenever that clock changes, as [`broca_core::Clock::subscribe`] asks of
+/// its timers. Without the daemon's clock (a registry that runs no retention), the wait is real
+/// time from `now_ms`, the time the caller armed it at.
+async fn until_due(clock: Option<&broca_core::Clock>, due_ms: u64, now_ms: u64) {
+    let wait = |now: u64| std::time::Duration::from_millis(due_ms.saturating_sub(now));
+    let Some(clock) = clock else {
+        tokio::time::sleep(wait(now_ms)).await;
+        return;
+    };
+    let mut changes = clock.subscribe();
+    loop {
+        let now = clock.now_ms();
+        if now >= due_ms {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(wait(now)) => {}
+            changed = changes.changed() => {
+                // The clock outlives every timer it serves, so a closed watch can only mean
+                // teardown: wait out the real time instead of polling a closed channel.
+                if changed.is_err() {
+                    tokio::time::sleep(wait(now)).await;
+                    return;
+                }
+            }
+        }
     }
 }

@@ -1,8 +1,8 @@
 PASS cache_policy_plan_decode
-N/A keep_warm_auto_warms_idle_session: adapter has no idle keep-warm price fixture
-N/A keep_warm_auto_stops_at_one_rewrite: adapter has no idle keep-warm price fixture
-N/A keep_warm_auto_rearms_after_real_request: adapter has no idle keep-warm price fixture
-N/A keep_warm_off_sends_no_warms: adapter has no idle keep-warm price fixture
+PASS keep_warm_auto_warms_idle_session
+PASS keep_warm_auto_stops_at_one_rewrite
+PASS keep_warm_auto_rearms_after_real_request
+PASS keep_warm_off_sends_no_warms
 PASS cache_policy_send_decode
 PASS cache_policy_plan_refusals
 PASS cache_policy_send_refusals

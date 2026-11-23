@@ -340,6 +340,10 @@ mod evidence;
 mod fork_answer;
 #[path = "llm_runner_conformance/held_late_results.rs"]
 mod held_late_results;
+/// The idle keep-warm cases move the daemon's clock through its `test-clock` control file.
+#[cfg(feature = "test-clock")]
+#[path = "llm_runner_conformance/keep_warm.rs"]
+mod keep_warm;
 #[path = "llm_runner_conformance/output_refs.rs"]
 mod output_refs;
 #[path = "llm_runner_conformance/reader_identity.rs"]
@@ -452,6 +456,8 @@ struct Shared {
     /// assistant messages in a request no longer says which turn comes next.
     #[cfg(feature = "test-clock")]
     counted_turns: Mutex<HashMap<String, usize>>,
+    #[cfg(feature = "test-clock")]
+    keep_warm: Mutex<keep_warm::Fixture>,
     /// The `mid` of every message a `session.read` answered, keyed by the message's JSON: broca
     /// keys a part `<mid>#<index>`, so naming a message's parts needs the message's `mid`.
     read_mids: Mutex<HashMap<String, String>>,
@@ -671,6 +677,8 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
         output_refs::catalog_row(),
     );
+    #[cfg(feature = "test-clock")]
+    models.extend(keep_warm::catalog_rows());
     let mut media = output_refs::catalog_row();
     media["limit.context"] = json!(16_000_000);
     models.insert(
@@ -856,7 +864,11 @@ async fn serve_model_request(
     let tier_session = request["prompt_cache_key"]
         .as_str()
         .and_then(|key| shared.service_tier_keys.lock().unwrap().get(key).cloned());
-    let session = if let Some(session) = tier_session {
+    #[cfg(feature = "test-clock")]
+    let warm_session = keep_warm::session_for_model(&shared, model);
+    #[cfg(not(feature = "test-clock"))]
+    let warm_session: Option<String> = None;
+    let session = if let Some(session) = tier_session.or(warm_session) {
         Some(session)
     } else if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
@@ -1087,6 +1099,20 @@ async fn serve_model_request(
         let headers = format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
         stream.write_all(headers.as_bytes()).await?;
         stream.write_all(body.as_bytes()).await?;
+        return stream.shutdown().await;
+    }
+    #[cfg(feature = "test-clock")]
+    if keep_warm::is_session(&shared, &session) {
+        let reply = keep_warm::answer(
+            &shared,
+            &session,
+            &id,
+            model,
+            &turn,
+            &request,
+            &buffer[body_start..body_start + length],
+        );
+        stream.write_all(reply.as_bytes()).await?;
         return stream.shutdown().await;
     }
     let media_fixture = model.ends_with(MEDIA_FIXTURE_MODEL);
@@ -2702,6 +2728,20 @@ impl BrocaSubject {
                 .send_fields_with_plan(session, first, &Map::new())
                 .unwrap();
         }
+        // The keep-warm cases freeze their cache policy into a plan, on the session's own
+        // priced Messages row.
+        #[cfg(feature = "test-clock")]
+        if let Some(model) = keep_warm::model_of(&self.shared, session) {
+            if !self.shared.plan_sessions.lock().unwrap().contains(session) {
+                return self
+                    .send_fields_with_plan(session, first, &Map::new())
+                    .unwrap();
+            }
+            return json!({"model":{"provider":output_refs::PROVIDER,"model":model}})
+                .as_object()
+                .unwrap()
+                .clone();
+        }
         if let Some(accepts) = self
             .shared
             .attachment_models
@@ -3005,6 +3045,42 @@ impl LlmRunnerSubject for BrocaSubject {
 
     fn model_finish_reason_source(&self) -> Option<&'static str> {
         Some("openai.chat_completions")
+    }
+
+    #[cfg(feature = "test-clock")]
+    async fn configure_keep_warm_prices(
+        &self,
+        handle: &Live,
+        session: &str,
+        _prices: &cortexkit_role_llm_runner_conformance::KeepWarmPrices,
+    ) -> Result<Option<cortexkit_role_llm_runner_conformance::KeepWarmPrices>, HarnessError> {
+        self.configure_keep_warm(handle, session)
+    }
+
+    #[cfg(feature = "test-clock")]
+    async fn advance_warm_clock(
+        &self,
+        handle: &Live,
+        by: Duration,
+    ) -> Result<Option<()>, HarnessError> {
+        self.advance_keep_warm_clock(handle, by).await.map(Some)
+    }
+
+    /// broca takes a request's prompt-cache lifetime from its cache policy, so the fixture's
+    /// requests carry the lifetime `ttl: short` asks Messages for, and the kit sizes its clock
+    /// steps from that rather than setting one of its own.
+    #[cfg(feature = "test-clock")]
+    async fn fixture_cache_lifetime(&self, _session: &str) -> Result<Option<u64>, HarnessError> {
+        Ok(Some(keep_warm::LIFETIME_MS))
+    }
+
+    #[cfg(feature = "test-clock")]
+    async fn keep_warm_requests(
+        &self,
+        session: &str,
+        cursor: u64,
+    ) -> Result<Option<cortexkit_role_llm_runner_conformance::KeepWarmRequests>, HarnessError> {
+        Ok(self.keep_warm_journal(session, cursor))
     }
 
     async fn configure_service_tier(

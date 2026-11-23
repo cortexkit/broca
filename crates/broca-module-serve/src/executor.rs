@@ -3641,31 +3641,36 @@ impl LiveLoopExecutor {
         provider: &str,
         prior_run: Option<&PriorRunView>,
     ) -> Result<Option<CachePolicy>, String> {
-        Ok(if self.provider_base_url.is_some() {
-            None
-        } else if fresh_episode {
-            let family_for_cache = family_override.or_else(|| {
-                broca_catalog::catalog()
-                    .ok()
-                    .and_then(|catalog| catalog.wire_family(provider, req.model.model_id.as_str()))
-            });
-            match family_for_cache {
-                Some(family) => {
-                    let policy = broca_module_serve::resolve_cache_policy(
-                        family,
-                        provider,
-                        req.cache.as_ref(),
-                        &self.cache_table,
-                        &req.session,
-                    );
-                    warn_single_call_cache_markers(&policy, &req.tools);
-                    policy
+        // The `BROCA_PROVIDER_BASE_URL` mock endpoint is opaque, so it gets no provider default:
+        // only a lifetime the caller asked for, as it gets only a cache key the caller named.
+        let opaque = self.provider_base_url.is_some();
+        Ok(
+            if opaque && req.cache.as_ref().and_then(|cache| cache.ttl).is_none() {
+                None
+            } else if fresh_episode {
+                let family_for_cache = family_override.or_else(|| {
+                    broca_catalog::catalog().ok().and_then(|catalog| {
+                        catalog.wire_family(provider, req.model.model_id.as_str())
+                    })
+                });
+                match family_for_cache {
+                    Some(family) => {
+                        let policy = broca_module_serve::resolve_cache_policy(
+                            family,
+                            provider,
+                            req.cache.as_ref(),
+                            &self.cache_table,
+                            &req.session,
+                        );
+                        warn_single_call_cache_markers(&policy, &req.tools);
+                        policy
+                    }
+                    None => None,
                 }
-                None => None,
-            }
-        } else {
-            prior_run.and_then(|prior| frozen_cache_policy(&prior.config))
-        })
+            } else {
+                prior_run.and_then(|prior| frozen_cache_policy(&prior.config))
+            },
+        )
     }
 
     /// The prompt-cache key a fresh episode freezes: the caller's `cache.key`, else the
@@ -4461,6 +4466,14 @@ impl RunExecutor for LiveLoopExecutor {
         prefix_tokens: u64,
         ttl_ms: u64,
     ) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        // The mock endpoint resolves no credential, so its runs froze none to price by.
+        if self.provider_base_url.is_some() && config.auth_selection.is_none() {
+            return broca_module_serve::cache_warm::credential_free_warm_prices(
+                config,
+                prefix_tokens,
+                ttl_ms,
+            );
+        }
         broca_module_serve::cache_warm::automatic_warm_prices(config, prefix_tokens, ttl_ms)
     }
 
@@ -4487,6 +4500,10 @@ impl RunExecutor for LiveLoopExecutor {
         config: &broca_records::record::RunConfig,
         headers: &std::collections::BTreeMap<String, String>,
     ) -> Result<(), String> {
+        // The mock endpoint's runs froze no account, and it has no quota to ask about.
+        if self.provider_base_url.is_some() && config.auth_selection.is_none() {
+            return Ok(());
+        }
         let (method, _) = config
             .auth_selection
             .as_ref()

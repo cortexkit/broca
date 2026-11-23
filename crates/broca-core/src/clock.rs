@@ -147,6 +147,15 @@ impl Clock {
         }))
     }
 
+    /// A file beside the test clock's control file, where a component reports what it did at a
+    /// clock reading, so a harness moving the clock knows when the move has been acted on. `None`
+    /// for a clock with no control file.
+    #[cfg(feature = "test-clock")]
+    pub fn harness_file(&self, name: &str) -> Option<std::path::PathBuf> {
+        let control = self.inner.control.as_ref()?;
+        Some(control.parent()?.join(name))
+    }
+
     /// `refresh`, calling `probe` after the control file is read and before the read is applied.
     /// `probe` is passed whether the refresh holds the clock's lock at that moment.
     #[cfg(all(test, feature = "test-clock"))]

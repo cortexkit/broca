@@ -124,3 +124,38 @@ async fn idle_timer_cancellation_and_wal_storage_never_dispatch_warm() {
     assert_eq!(opens.load(Ordering::SeqCst), 0);
     assert!(calls.try_recv().is_err());
 }
+
+/// A test clock moves without real time passing. An armed warm fires once the daemon's clock
+/// reaches its due time, not after the real wait it was armed with (an hour here).
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn an_idle_warm_fires_when_the_daemon_clock_reaches_it() {
+    let dir =
+        broca_test_support::scratch_root().join(format!("idle-warm-clock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let control = dir.join("test-clock");
+    std::fs::write(&control, r#"{"now_ms":1000}"#).unwrap();
+    let leases = Arc::new(broca_core::FileLeaseStore::new(dir.join("leases")));
+    let service = Arc::new(crate::retention::RetentionService::new(&dir, leases).unwrap());
+    let (warms, mut calls) = tokio::sync::mpsc::unbounded_channel();
+    let registry = LineageRegistry::new(Arc::new(Opener {
+        opens: Arc::new(AtomicU64::new(0)),
+        warms,
+        store: true,
+    }));
+    registry.set_retention_service(service.clone());
+    let key = LineageKey::new("/project", "test", "head");
+    let due = 1000 + 3_600_000;
+    registry.handle().arm_idle_warm(&key, due, 1000);
+    std::fs::write(&control, format!(r#"{{"now_ms":{due}}}"#)).unwrap();
+    assert!(service.clock.refresh().unwrap());
+    let fired = tokio::time::timeout(std::time::Duration::from_secs(30), calls.recv()).await;
+    assert_eq!(
+        fired.ok().flatten(),
+        Some(true),
+        "the warm fires at its due time on the daemon's clock"
+    );
+    registry.handle().stop_idle_warm(&key, "shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}

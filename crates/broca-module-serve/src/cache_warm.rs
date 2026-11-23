@@ -69,10 +69,28 @@ pub fn automatic_warm_prices(
     prefix_tokens: u64,
     ttl_ms: u64,
 ) -> Result<broca_core::keep_warm::WarmCosts, String> {
+    let (method, _) = frozen_credential(config).ok_or("pricing_unavailable: auth_method")?;
+    warm_prices_as(config, prefix_tokens, ttl_ms, method.is_subscription())
+}
+
+/// [`automatic_warm_prices`] for a run that froze no credential because its endpoint takes
+/// none (`BROCA_PROVIDER_BASE_URL`'s mock): priced at the catalog's metered rates.
+pub fn credential_free_warm_prices(
+    config: &broca_records::record::RunConfig,
+    prefix_tokens: u64,
+    ttl_ms: u64,
+) -> Result<broca_core::keep_warm::WarmCosts, String> {
+    warm_prices_as(config, prefix_tokens, ttl_ms, false)
+}
+
+fn warm_prices_as(
+    config: &broca_records::record::RunConfig,
+    prefix_tokens: u64,
+    ttl_ms: u64,
+    subscription: bool,
+) -> Result<broca_core::keep_warm::WarmCosts, String> {
     let frozen =
         frozen_render_config(config).map_err(|error| format!("pricing_unavailable: {error}"))?;
-    let (method, _) = frozen_credential(config).ok_or("pricing_unavailable: auth_method")?;
-    let subscription = method.is_subscription();
     broca_catalog::keep_warm::warm_prices(
         &config.model.provider_module_id,
         &config.model.model_id,
