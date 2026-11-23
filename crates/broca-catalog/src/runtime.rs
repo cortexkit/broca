@@ -83,6 +83,7 @@ pub const FUSIFORM_FACT_PREFIXES: &[&str] = &[
     "wire.shape",
     "route.reasoning_wire_ids",
     "route.reasoning_default",
+    "route.mode_wire_ids",
     "successor",
 ];
 
@@ -348,6 +349,10 @@ struct ServingModel {
     /// input and a priced output rate, sorted. A mode missing either side is unpriced and is
     /// not listed; see `priced_modes_fact`.
     priced_modes: Vec<String>,
+    /// `route.mode_wire_ids`: the model id this row's route serves an upstream mode at, by mode
+    /// name, for a vendor that offers a mode as a model of its own (Kimi's `-highspeed` twin is
+    /// `fast`). Empty when the row names none; see `mode_wire_ids_fact`.
+    mode_wire_ids: BTreeMap<String, String>,
     wire_family: Option<WireFamilyId>,
     /// `model.kind` as served: `Some(kind)` when fusiform states one, `None` when it is absent
     /// or null. `None` means the catalog does not say, never that the model is a chat model.
@@ -376,6 +381,7 @@ impl Default for ServingModel {
             server_side_fallback: None,
             mid_conversation_system: None,
             priced_modes: Vec::new(),
+            mode_wire_ids: BTreeMap::new(),
             wire_family: None,
             kind: None,
         }
@@ -419,6 +425,7 @@ impl ServingModel {
             // The legacy snapshot path carries no fusiform mode rates, so it offers no tier
             // that needs one.
             priced_modes: Vec::new(),
+            mode_wire_ids: BTreeMap::new(),
             wire_family: (model_family != provider_family).then_some(model_family),
             // The vendored models.dev snapshot has no `model.kind`.
             kind: None,
@@ -785,6 +792,16 @@ impl CatalogSnapshot {
             .catalog
             .provider_and_model(provider_id, model_id)
             .map(|(_, model)| model.priced_modes.clone())
+            .unwrap_or_default()
+    }
+
+    /// The model ids this model's route serves its modes at (`route.mode_wire_ids`), by mode
+    /// name. Empty when the row names none, or the catalog does not list the model.
+    pub fn mode_wire_ids(&self, provider_id: &str, model_id: &str) -> BTreeMap<String, String> {
+        self.0
+            .catalog
+            .provider_and_model(provider_id, model_id)
+            .map(|(_, model)| model.mode_wire_ids.clone())
             .unwrap_or_default()
     }
 
@@ -1571,6 +1588,7 @@ fn serving_model_from_facts(
             .get(MID_CONVERSATION_SYSTEM_FACT)
             .and_then(Value::as_bool),
         priced_modes: priced_modes_fact(identity, facts)?,
+        mode_wire_ids: mode_wire_ids_fact(identity, facts),
         wire_family: None,
         kind: model_kind_fact(identity, facts)?,
     })
@@ -1657,6 +1675,36 @@ fn server_side_fallback_fact(identity: &str, facts: &BTreeMap<String, Value>) ->
             None
         }
     }
+}
+
+/// `route.mode_wire_ids`, an object from mode name to model id. A value that is not such an
+/// object is reported and read as naming none, like every optional routing fact: it must not
+/// take the row offline, and a caller asking for the mode is then refused as unmapped.
+fn mode_wire_ids_fact(identity: &str, facts: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
+    let fact = "route.mode_wire_ids";
+    let parsed = match facts.get(fact) {
+        None | Some(Value::Null) => Some(BTreeMap::new()),
+        Some(Value::Object(ids)) => ids
+            .iter()
+            .map(|(mode, id)| {
+                Some((
+                    mode.clone(),
+                    id.as_str().filter(|id| !id.is_empty())?.to_owned(),
+                ))
+            })
+            .collect(),
+        Some(_) => None,
+    };
+    parsed.unwrap_or_else(|| {
+        tracing::warn!(
+            target: "catalog",
+            model = identity,
+            fact,
+            "a catalog fact has an unexpected value; it is read as unstated and the row still \
+             serves"
+        );
+        BTreeMap::new()
+    })
 }
 
 /// The modes this row has a priced input AND output rate for, from `rate.input.mode.<mode>`

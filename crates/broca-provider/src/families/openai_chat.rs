@@ -175,7 +175,8 @@ impl WireFamily for OpenAiChat {
             OpenAiChatNormalizer::new(step_id, frozen.usage)
                 .with_reasoning_echo(frozen.reasoning_echo)
                 // The body renders the token-limit field from this same value.
-                .with_max_output_tokens(frozen.max_output_tokens),
+                .with_max_output_tokens(frozen.max_output_tokens)
+                .with_wire_mode(&frozen.wire_model_id, frozen.wire_mode.as_deref()),
         )
     }
 }
@@ -752,6 +753,10 @@ pub struct OpenAiChatNormalizer {
     /// The chunks' top-level `service_tier`, verbatim; the last non-null value wins. OpenAI and
     /// xAI put it on every chunk; servers that don't report one (or send `null`) leave it `None`.
     service_tier_used: Option<String>,
+    /// The model a route serves the fast mode at, when the request went to it.
+    mode_model: Option<String>,
+    /// `fast` once a chunk names [`Self::mode_model`] as the model that served the step.
+    speed_used: Option<String>,
 }
 
 impl OpenAiChatNormalizer {
@@ -779,7 +784,21 @@ impl OpenAiChatNormalizer {
             terminal_observed: false,
             emitted_final: false,
             service_tier_used: None,
+            mode_model: None,
+            speed_used: None,
         }
+    }
+
+    /// A request sent to the model a route serves a mode at (`FrozenRenderConfig::wire_mode`,
+    /// such as Kimi's `-highspeed` twin) was served at that mode when the response names that
+    /// model: it serves nothing else. Its step then reports the speed, as Anthropic reports fast
+    /// mode in its usage. A response naming another model reports none.
+    pub fn with_wire_mode(mut self, wire_model_id: &str, mode: Option<&str>) -> Self {
+        self.mode_model = mode
+            .and_then(crate::service_tier::tier_for_mode)
+            .filter(|tier| *tier == crate::service_tier::ServiceTier::Priority)
+            .map(|_| wire_model_id.to_owned());
+        self
     }
 
     /// Record the rendered output cap so an output-ceiling error can name it.
@@ -829,6 +848,11 @@ impl OpenAiChatNormalizer {
 
         if let Some(tier) = v.get("service_tier").and_then(Value::as_str) {
             self.service_tier_used = Some(tier.to_owned());
+        }
+        if let (Some(mode_model), Some(served)) =
+            (&self.mode_model, v.get("model").and_then(Value::as_str))
+        {
+            self.speed_used = (served == mode_model).then(|| "fast".to_owned());
         }
 
         // A trailing usage-only chunk has `choices: []` + a `usage` object.
@@ -1344,7 +1368,7 @@ impl StreamNormalizer for OpenAiChatNormalizer {
                 usage: self.usage,
                 finish_reason,
                 service_tier_used: self.service_tier_used.clone(),
-                speed_used: None,
+                speed_used: self.speed_used.clone(),
                 // No non-Anthropic family reports a server-side fallback or per-model usage.
                 served_model: None,
                 usage_iterations: None,

@@ -143,6 +143,14 @@ pub fn frozen_service_tier(render: &serde_json::Value) -> &'static str {
         Some("ultrafast") => "ultrafast",
         Some("priority" | "fast") => "fast",
         _ if render.get("speed").and_then(serde_json::Value::as_str) == Some("fast") => "fast",
+        // A route that serves the tier as a model of its own records the upstream mode it sent.
+        _ if matches!(
+            render.get("wire_mode").and_then(serde_json::Value::as_str),
+            Some("fast" | "priority")
+        ) =>
+        {
+            "fast"
+        }
         _ => "standard",
     }
 }

@@ -320,6 +320,44 @@ fn chat_without_a_reported_tier_records_none() {
     );
 }
 
+/// A route that serves fast as a model of its own (Kimi's `-highspeed` twin) reports no tier
+/// field. A step was served fast when the response names the twin model the request went to;
+/// a response naming another model reports no speed, and a run on the base model reports none.
+#[test]
+fn chat_records_fast_when_the_twin_model_served_the_step() {
+    let twin = |model: &str| chat_stream("null").replace("gpt-4o-mini", model);
+    let mut frozen = openai_chat_frozen_config("k3.1-pro-highspeed");
+    frozen.wire_mode = Some("fast".into());
+    let fast = Served {
+        service_tier_used: None,
+        speed_used: Some("fast".into()),
+    };
+    assert_eq!(
+        served(
+            &OpenAiChat,
+            &frozen,
+            &[],
+            twin("k3.1-pro-highspeed").as_bytes()
+        ),
+        fast
+    );
+    assert_eq!(
+        served(&OpenAiChat, &frozen, &[], twin("k3.1-pro").as_bytes()),
+        nothing(),
+        "a response from another model was not served at the twin's mode"
+    );
+    assert_eq!(
+        served(
+            &OpenAiChat,
+            &openai_chat_frozen_config("k3.1-pro-highspeed"),
+            &[],
+            twin("k3.1-pro-highspeed").as_bytes()
+        ),
+        nothing(),
+        "without a frozen wire mode, a model id alone claims no speed"
+    );
+}
+
 // ─────────── Gemini API: the `x-gemini-service-tier` header, and `usageMetadata.serviceTier` ───────────
 
 /// The synthetic Gemini stream's body tier field, which the header tests remove so

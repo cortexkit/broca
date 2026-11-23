@@ -9,6 +9,7 @@
 //!
 //! Behind the `live` feature (it pulls the provider's live transport).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use broca_provider::credential_refresh::SharedSecretRefresher;
@@ -1084,7 +1085,7 @@ fn resolve_provider_inner(
             opts.queued_service_tier,
             "openai-compatible",
             model,
-            &[],
+            TierModes::none(),
         )?;
         // No catalog row either: support is unknown, and the family is OpenAI Chat.
         apply_structured_output(
@@ -1306,7 +1307,10 @@ fn resolve_provider_inner(
             opts.queued_service_tier,
             provider_id,
             &format!("{provider_id}/{model_id}"),
-            &catalog.priced_modes(provider_id, model_id),
+            TierModes {
+                priced: &catalog.priced_modes(provider_id, model_id),
+                wire_ids: &catalog.mode_wire_ids(provider_id, model_id),
+            },
         )?;
         // Support is read from the same catalog row the variant resolves against.
         apply_structured_output(
@@ -1501,7 +1505,10 @@ fn resolve_provider_inner(
         opts.queued_service_tier,
         provider_id,
         &format!("{provider_id}/{model_id}"),
-        &catalog.priced_modes(provider_id, model_id),
+        TierModes {
+            priced: &catalog.priced_modes(provider_id, model_id),
+            wire_ids: &catalog.mode_wire_ids(provider_id, model_id),
+        },
     )?;
     apply_structured_output(
         &mut frozen,
@@ -1865,7 +1872,10 @@ fn freeze_refusal_fallback(
             opts.queued_service_tier,
             provider_id,
             &catalog_model,
-            &catalog.priced_modes(provider_id, fallback_model),
+            TierModes {
+                priced: &catalog.priced_modes(provider_id, fallback_model),
+                wire_ids: &catalog.mode_wire_ids(provider_id, fallback_model),
+            },
         )
         .is_ok()
         {
@@ -2047,13 +2057,13 @@ fn apply_service_tier(
     queued: Option<&str>,
     provider_id: &str,
     catalog_model: &str,
-    priced_modes: &[String],
+    modes: TierModes<'_>,
 ) -> Result<(), String> {
     if let Some(level) = queued {
         if restored.is_some() || requested.is_some() {
             return Err("service_tier_level conflicts with the legacy service_tier member".into());
         }
-        return apply_queued_service_tier(frozen, level, provider_id, catalog_model, priced_modes);
+        return apply_queued_service_tier(frozen, level, provider_id, catalog_model, modes);
     }
     if let Some(restored) = restored {
         return broca_provider::service_tier::freeze_service_tier(frozen, provider_id, restored);
@@ -2061,6 +2071,20 @@ fn apply_service_tier(
     let Some(requested) = requested else {
         return Ok(());
     };
+    let priced_modes = modes.priced;
+    // A vendor that offers the tier as a model of its own is asked for it by that model id, with
+    // no tier field, and only when the catalog prices the mode on this row. Only OpenAI Chat
+    // reports the speed such a step was served at (from `wire_mode`); on another family the
+    // run's facts couldn't say it, so the tier is refused there as unmapped.
+    let twin = modes.wire_ids.iter().find(|(mode, _)| {
+        broca_provider::service_tier::tier_for_mode(mode) == Some(requested)
+            && priced_modes.contains(mode)
+    });
+    if let Some((mode, wire)) = twin.filter(|_| frozen.family_id == WireFamilyId::OpenAiChat) {
+        frozen.wire_model_id = wire.clone();
+        frozen.wire_mode = Some(mode.clone());
+        return Ok(());
+    }
     let family = frozen.family_id;
     if let Err(reason) =
         broca_provider::service_tier::tier_offered(provider_id, family, requested, priced_modes)
@@ -2083,8 +2107,9 @@ fn apply_queued_service_tier(
     level: &str,
     provider_id: &str,
     catalog_model: &str,
-    priced_modes: &[String],
+    modes: TierModes<'_>,
 ) -> Result<(), String> {
+    let priced_modes = modes.priced;
     let legacy = match level {
         "standard" => {
             // Standard is available even on wires without a service-level request field.
@@ -2126,8 +2151,27 @@ fn apply_queued_service_tier(
         None,
         provider_id,
         catalog_model,
-        priced_modes,
+        modes,
     )
+}
+
+/// What a model's catalog row says about its tiers: the upstream modes it prices
+/// (`priced_modes`) and the model ids its route serves modes at (`route.mode_wire_ids`).
+#[derive(Clone, Copy)]
+struct TierModes<'a> {
+    priced: &'a [String],
+    wire_ids: &'a BTreeMap<String, String>,
+}
+
+impl<'a> TierModes<'a> {
+    /// A route with no catalog row: no mode is priced or served as a model.
+    fn none() -> Self {
+        static NONE: BTreeMap<String, String> = BTreeMap::new();
+        Self {
+            priced: &[],
+            wire_ids: &NONE,
+        }
+    }
 }
 
 /// Check an enqueue against its model row and selected family without making a model call.
@@ -2137,9 +2181,14 @@ pub fn check_service_tier_level(
     provider_id: &str,
     catalog_model: &str,
     priced_modes: &[String],
+    mode_wire_ids: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let mut frozen = broca_provider::families::frozen_config_for_family(family, catalog_model);
-    apply_queued_service_tier(&mut frozen, level, provider_id, catalog_model, priced_modes).map_err(
+    let modes = TierModes {
+        priced: priced_modes,
+        wire_ids: mode_wire_ids,
+    };
+    apply_queued_service_tier(&mut frozen, level, provider_id, catalog_model, modes).map_err(
         |error| format!("service_tier {level:?} is unsupported for {catalog_model}: {error}"),
     )
 }

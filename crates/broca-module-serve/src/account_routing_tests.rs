@@ -4524,3 +4524,95 @@ async fn the_last_credential_is_sent_only_when_routing_could_pick_it() {
         warm_credential_request(declared, Some("oauth:anthropic:acct-b"), true, None).await;
     assert!(pinned.get("warm_credential").is_none(), "{pinned}");
 }
+
+/// The routing calls of a fast run on a route that serves fast as a model of its own (Kimi's
+/// `k3.1-pro-highspeed` twin of `k3.1-pro`), written under `BROCA_SPEED_TWIN_ROUTING_SAMPLES`
+/// when set, for routing to check against its handlers. Routing is asked for the BASE model at
+/// `service_tier: fast`: broca picks the twin id after routing answers, when it builds the
+/// run's render config, and sends it only to the provider. The reports name no model, tier or speed, so they read as for any run.
+#[tokio::test]
+async fn speed_twin_routing_samples() {
+    let Some(dir) = std::env::var_os("BROCA_SPEED_TWIN_ROUTING_SAMPLES") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, bytes: &[u8]| std::fs::write(dir.join(name), bytes).unwrap();
+    let provider = "kimi-code-plan-global";
+    let listing = listing(vec![row(
+        "apikey:kimi-code-plan-global",
+        None,
+        provider,
+        "apikey",
+    )]);
+    let candidates = Candidates::api_keys(&listing, provider, &|_| true);
+    let params = account_for_params(&AccountForRequest {
+        account_route: None,
+        pool: None,
+        credential_id: None,
+        service_tier: Some("fast"),
+        decision_id: None,
+        provider,
+        model: "k3.1-pro",
+        conversation_key: "broca-session:abc",
+        admission_id: "run-1",
+        initial_input_bytes: 42,
+        candidates: &candidates,
+        hold_cap: AccountHoldCap::default(),
+        head_turn: false,
+        warm_credential: None,
+    });
+    assert_eq!(params["model"], "k3.1-pro");
+    assert_eq!(params["service_tier"], "fast");
+    // Through the client, so the sample is the request's bytes as broca sends them, to a
+    // router that serves service tiers.
+    // Routing admits an API key as the account whose id is the credential id, and broca
+    // names that account on the served attempt.
+    let key = "apikey:kimi-code-plan-global";
+    let chosen = FakeRouting::choosing(key, key);
+    let routing = Arc::new(FakeRouting {
+        reply: Mutex::new(chosen.reply.lock().unwrap().clone()),
+        tiers: true,
+        ..FakeRouting::default()
+    });
+    client(&routing)
+        .account_for(params, tokio::time::Instant::now() + ADMISSION_BUDGET)
+        .await;
+    let sent = routing.request_bytes.lock().unwrap()[0].clone();
+    let sent_params: Value = serde_json::from_slice::<Value>(&sent).unwrap()["params"].clone();
+    assert_eq!(
+        sent_params["service_tier"], "fast",
+        "the router is asked for the tier"
+    );
+    write("account_for.json", &sent);
+    let pretty = |value: Value| serde_json::to_vec_pretty(&value).unwrap();
+    write(
+        "admission_started.json",
+        &pretty(admission_started_body(
+            "run-1:admission_started",
+            "run-1",
+            "run-1",
+        )),
+    );
+    write(
+        "attempt.json",
+        &pretty(served_attempt_body(
+            "run-1:attempt:1",
+            "run-1",
+            &attempt(Some(200), AttemptAccountObservation::default()),
+            None,
+            key,
+            key,
+        )),
+    );
+    write(
+        "run_finished.json",
+        &pretty(run_finished_body(
+            "run-1:run_finished",
+            "run-1",
+            "run-1",
+            broca_protocol::RunFinishReason::Completed,
+            None,
+        )),
+    );
+}

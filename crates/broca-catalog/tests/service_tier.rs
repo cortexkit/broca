@@ -25,6 +25,10 @@
 //!   - `fireworks-ai/accounts/fireworks/models/kimi-k2-instruct`: the luna row's fast-mode
 //!     rates renamed to fireworks' mode name `priority`, so a priced tier meets a provider with
 //!     no broca mapping.
+//! - `kimi-code-plan-global/k3.1-pro` is copied verbatim from fusiform's served fixture at
+//!   fusiform commit b7993dc, case "catalog.get — speed twin k3.1-pro apikey": a route that
+//!   serves fast as a model of its own (`route.mode_wire_ids`), with fast-mode rates.
+//!   `kimi-code-plan-global/test-twin-unpriced` is that row DERIVED without its mode rates.
 
 mod gated {
     use std::sync::{Arc, Once};
@@ -363,6 +367,42 @@ mod gated {
             error.contains("has no service-tier mapping in broca"),
             "{error}"
         );
+    }
+
+    /// A route that serves fast as a model of its own (Kimi's `-highspeed` twin) is sent that
+    /// model id, with no tier field. The frozen config records the mode it sent, so the run's
+    /// facts name the tier the caller asked for; the standard tier keeps the base model.
+    #[test]
+    fn a_mode_served_as_its_own_model_is_sent_as_that_model() {
+        let model = "kimi-code-plan-global/k3.1-pro";
+        let fast = resolve_with_queued(model, AuthMethod::ApiKey, None, None, Some("fast"))
+            .expect("fast is offered on its twin model");
+        assert_eq!(fast.frozen.family_id, WireFamilyId::OpenAiChat);
+        assert_eq!(fast.frozen.wire_model_id, "k3.1-pro-highspeed");
+        assert_eq!(fast.frozen.wire_mode.as_deref(), Some("fast"));
+        let body = body_of(&fast);
+        assert_eq!(body["model"], "k3.1-pro-highspeed");
+        assert!(body.get("service_tier").is_none(), "{body}");
+        assert_eq!(fast.frozen.service_tier_request, None);
+        let frozen = serde_json::to_value(&fast.frozen).unwrap();
+        assert_eq!(broca_protocol::frozen_service_tier(&frozen), "fast");
+
+        let standard = resolve_with_queued(model, AuthMethod::ApiKey, None, None, Some("standard"))
+            .expect("standard needs no mode");
+        assert_eq!(standard.frozen.wire_model_id, "k3.1-pro");
+        assert_eq!(standard.frozen.wire_mode, None);
+        let frozen = serde_json::to_value(&standard.frozen).unwrap();
+        assert_eq!(broca_protocol::frozen_service_tier(&frozen), "standard");
+
+        // A twin the catalog doesn't price is not offered: routing couldn't price its steps.
+        let unpriced = resolve_with_queued(
+            "kimi-code-plan-global/test-twin-unpriced",
+            AuthMethod::ApiKey,
+            None,
+            None,
+            Some("fast"),
+        );
+        assert!(unpriced.is_err(), "an unpriced twin is refused");
     }
 
     /// A resume re-applies the frozen tier from broca's table alone: it renders fast mode on a

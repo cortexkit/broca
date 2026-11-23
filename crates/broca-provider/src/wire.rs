@@ -272,6 +272,13 @@ pub struct FrozenRenderConfig {
     /// is omitted, keeping every other render byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<String>,
+    /// The upstream mode (`fast`, ...) that `wire_model_id` serves, when the route offers that
+    /// mode as a model of its own (catalog `route.mode_wire_ids`, such as Kimi's `-highspeed`
+    /// twin) and the caller's tier chose it. Never rendered: the twin's id is the mode, and the
+    /// request carries no tier field. Kept so the run's facts name the tier it asked for and
+    /// the speed it was served at. `None` is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_mode: Option<String>,
     /// The caller's service tier and the provider it was admitted against. Never rendered: the
     /// bytes are in `service_tier` / `speed`. Kept so a provider's refusal can be recognised
     /// and reported as a refusal of this tier. `None` (no tier requested) is omitted.

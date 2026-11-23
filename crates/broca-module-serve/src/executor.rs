@@ -4277,6 +4277,7 @@ impl RunExecutor for LiveLoopExecutor {
                     &model.provider,
                     &format!("{}/{}", model.provider, model.model),
                     &catalog.priced_modes(&model.provider, &model.model),
+                    &catalog.mode_wire_ids(&model.provider, &model.model),
                 )
                 .map_err(|_| PlanModelProblem::UnsupportedTier)?;
             }
@@ -4346,6 +4347,7 @@ impl RunExecutor for LiveLoopExecutor {
                 request.model.provider_module_id, request.model.model_id
             ),
             &catalog.priced_modes(&request.model.provider_module_id, &request.model.model_id),
+            &catalog.mode_wire_ids(&request.model.provider_module_id, &request.model.model_id),
         )
     }
     fn check_account_route(

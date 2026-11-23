@@ -268,6 +268,48 @@ fn pooled_fast_run() -> (Vec<BillingRecord>, Vec<AttemptEvidence>) {
     (records, attempts)
 }
 
+/// A fast run on a route that serves fast as a model of its own: Kimi's `k3.1-pro` was sent as
+/// its `k3.1-pro-highspeed` twin, which the frozen config records as `wire_model_id` with
+/// `wire_mode` set to `fast`, and the twin
+/// answered, so the step reports speed `fast`.
+fn speed_twin_run() -> (Vec<BillingRecord>, Vec<AttemptEvidence>) {
+    let mut start = started(10, "twin", Some(100));
+    if let BillingEvent::RunStarted { config, .. } = &mut start.event {
+        **config = crate::billing::tests::config(
+            "kimi-code-plan-global",
+            "k3.1-pro",
+            Some("apikey:kimi-code-plan-global"),
+        );
+        config.frozen_render_config =
+            json!({"wire_model_id": "k3.1-pro-highspeed", "wire_mode": "fast"});
+    }
+    let mut fast = step(20, 1, usage(30, 120), 0);
+    if let BillingEvent::StepFinished { speed_used, .. } = &mut fast.event {
+        *speed_used = Some("fast".into());
+    }
+    let records = vec![start, fast, terminal(30, Some(200))];
+    (records, vec![attempt(15, 1, 1, "complete", true)])
+}
+
+/// A twin-served step's fact names the base model, the fast tier the run asked for and the fast
+/// speed it was served at: the usage export prices it at the base row's fast-mode rates.
+#[test]
+fn a_speed_twin_attempt_names_the_base_model_at_fast() {
+    let (records, attempts) = speed_twin_run();
+    let facts = compute_attempt_facts(
+        &records,
+        &RunId("twin".into()),
+        &attempts,
+        "instance-a",
+        &resolver,
+    );
+    let fact = serde_json::to_value(&facts.attempts[0]).unwrap();
+    assert_eq!(fact["provider"], "kimi-code-plan-global");
+    assert_eq!(fact["model"], "k3.1-pro");
+    assert_eq!(fact["requested_service_tier"], "fast");
+    assert_eq!(fact["served_speed"], "fast");
+}
+
 /// A ChatGPT-login run of two steps on `gpt-6.2-sol`. Before step 1's model ran, the provider
 /// removed two reasoning items whose earlier context had changed; step 2's response reported no
 /// change.
@@ -381,6 +423,15 @@ fn write_attempt_fact_samples_when_requested() {
             RunId("run".into()),
             vec![attempt(25, 1, 1, "complete", true)],
         ),
+        {
+            let (records, attempts) = speed_twin_run();
+            (
+                "speed-twin-served-fast",
+                records,
+                RunId("twin".into()),
+                attempts,
+            )
+        },
         {
             let (records, attempts) = reasoning_removed_run();
             (
