@@ -619,3 +619,159 @@ async fn a_gated_scope_sends_nothing() {
     assert_eq!(gate.0.load(Ordering::Relaxed), 1);
     assert!(rig.sessions.sent().is_empty());
 }
+
+/// Every `llm_complete` reply shape a caller decodes, as the tool-provider route writes it: the
+/// catalog listing both tools, a text answer, a JSON answer, its replay, and refusals before and
+/// after the call, each for a consumer with no result format and one that declared
+/// `tool-result/v1`.
+/// Written under `BROCA_LLM_COMPLETE_SAMPLE_DIR` when it names a folder, for the callers to decode
+/// before the tool is served.
+#[tokio::test]
+async fn route_replies_for_the_callers() {
+    use crate::system_one::{BatchCatalog, Config, ModelPin, SystemOne};
+    struct NoBatchCatalog;
+    impl BatchCatalog for NoBatchCatalog {
+        fn row(&self, _: &str) -> Option<broca_catalog::ModelBatchRow> {
+            None
+        }
+    }
+    /// The private-content answer that the caller's flow read none of the person's private
+    /// content, so it may reach any provider routing picks.
+    struct Unmarked;
+    #[async_trait]
+    impl super::super::Asks for Unmarked {
+        async fn marked(
+            &self,
+            _scope_ref: &str,
+            _parent_scope_ref: Option<&str>,
+        ) -> Option<broca_subc::PrivateContent> {
+            Some(broca_subc::PrivateContent::unmarked())
+        }
+
+        async fn flow_providers(
+            &self,
+            _flow_id: &str,
+        ) -> Result<broca_subc::FlowPolicy, broca_subc::FlowProvidersError> {
+            Err(broca_subc::FlowProvidersError::Unanswered(
+                "no Basal behind this route".into(),
+            ))
+        }
+    }
+    let dir = std::env::var_os("BROCA_LLM_COMPLETE_SAMPLE_DIR").map(std::path::PathBuf::from);
+    let mut json_answer = completed(r#"{"colour":"teal"}"#, Some(1_000), Some(500));
+    json_answer["structured_output"] = json!({"mode": "final_text", "enforcement": "enforced",
+        "validation": "passed", "value": {"colour": "teal"}});
+    let refused_by_provider = json!({"state": "error", "usage": {"steps": 0, "unreported_steps": 0},
+        "error": {"class": "transient", "message": "upstream stream ended early",
+                  "provider_code": "provider_error"}});
+    let schema = json!({"type": "object", "properties": {"colour": {"type": "string"}},
+                        "required": ["colour"]});
+    let mut json_call = text_call();
+    json_call["output_schema"] = schema;
+    let mut over_ceiling = text_call();
+    over_ceiling["max_cost_usd"] = json!(0.005);
+    for (format, folder) in [
+        (None, "bare"),
+        (Some(super::super::route::TOOL_RESULT_V1), "tool-result-v1"),
+    ] {
+        let ends = vec![
+            completed("Teal.", Some(1_000), Some(500)),
+            json_answer.clone(),
+            refused_by_provider.clone(),
+        ];
+        let rig = rig(
+            FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+            FakeSessions::ending(ends),
+        );
+        let system = SystemOne::new(
+            rig.store.clone(),
+            "samples",
+            Arc::new(NoBatchCatalog),
+            Vec::<ModelPin>::new(),
+            Config::default(),
+            Arc::default(),
+        )
+        .with_store_role(crate::system_one::LLM_CLASSIFY_STORE_ROLE);
+        let tools = Arc::new(
+            super::super::route::LlmTools::new(
+                Arc::new(system),
+                crate::config::LlmToolsConfig {
+                    advertise_tags: true,
+                    image_references: false,
+                    private_content_providers: Vec::new(),
+                },
+                Arc::new(Unmarked),
+            )
+            .with_complete(rig.complete.clone()),
+        );
+        let consumer = super::super::route::ConsumerFormat {
+            result_format: format,
+            held_reply: false,
+        };
+        let ask = |body: Value| {
+            let tools = tools.clone();
+            async move {
+                tools
+                    .answer_for_consumer(
+                        &serde_json::to_vec(&body).unwrap(),
+                        Some(&principal()),
+                        &flow_scope(),
+                        consumer,
+                    )
+                    .await
+            }
+        };
+        let call = |args: &Value, key: &str| json!({"name": COMPLETE_TOOL_NAME, "call_key": key, "arguments": args});
+        let samples = [
+            (
+                "catalog",
+                ask(json!({"name": "tool.catalog", "arguments": {"params": {}}})).await,
+            ),
+            ("text-answer", ask(call(&text_call(), "k-text")).await),
+            ("json-answer", ask(call(&json_call, "k-json")).await),
+            ("json-answer-replay", ask(call(&json_call, "k-json")).await),
+            (
+                "refused-provider-error",
+                ask(call(&text_call(), "k-failed")).await,
+            ),
+            (
+                "refused-cost-exceeded",
+                ask(call(&over_ceiling, "k-over")).await,
+            ),
+        ];
+        let mut texts = Vec::new();
+        for (name, answer) in samples {
+            let (kind, bytes) = match answer {
+                Ok(raw) => ("ok", raw.get().as_bytes().to_vec()),
+                Err(body) => ("refused", body),
+            };
+            texts.push((name, kind, bytes));
+        }
+        // The catalog lists both tools; a JSON answer replays byte for byte.
+        let catalog: Value = serde_json::from_slice(&texts[0].2).unwrap();
+        let names: Vec<_> = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["llm_classify", COMPLETE_TOOL_NAME]);
+        assert_eq!(texts[2].2, texts[3].2);
+        assert_eq!(
+            texts.iter().map(|(_, kind, _)| *kind).collect::<Vec<_>>(),
+            ["ok", "ok", "ok", "ok", "refused", "refused"],
+            "{:?}",
+            texts
+                .iter()
+                .map(|(name, _, bytes)| format!("{name}: {}", String::from_utf8_lossy(bytes)))
+                .collect::<Vec<_>>()
+        );
+        if let Some(dir) = &dir {
+            let folder = dir.join(folder);
+            std::fs::create_dir_all(&folder).unwrap();
+            for (name, kind, bytes) in &texts {
+                std::fs::write(folder.join(format!("{name}.{kind}.json")), bytes).unwrap();
+            }
+        }
+    }
+}
