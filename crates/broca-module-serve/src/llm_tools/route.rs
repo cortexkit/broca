@@ -110,6 +110,8 @@ pub struct LlmTools {
     /// Grants that have already released a call in this process. Only the first release by
     /// each grant is logged, so a run of calls under one grant writes one line.
     released_grants: Mutex<std::collections::HashSet<String>>,
+    /// `llm.complete/v1`, when this broca serves it: listed in the catalog and answered only then.
+    complete: Option<Arc<super::complete::Complete>>,
 }
 
 impl LlmTools {
@@ -132,6 +134,7 @@ impl LlmTools {
             consent_workers: Mutex::new(std::collections::HashSet::new()),
             consent_stop: tokio_util::sync::CancellationToken::new(),
             released_grants: Mutex::new(std::collections::HashSet::new()),
+            complete: None,
             held: Arc::new(super::held::HeldCalls::new(
                 Arc::new(GrantsStore::open_in_memory().expect("in-memory grants store opens")),
                 crate::serve::process_launch_id().into(),
@@ -141,6 +144,12 @@ impl LlmTools {
 
     pub fn with_held(mut self, held: Arc<super::held::HeldCalls>) -> Self {
         self.held = held;
+        self
+    }
+
+    /// Serve `llm.complete/v1` beside classify.
+    pub fn with_complete(mut self, complete: Arc<super::complete::Complete>) -> Self {
+        self.complete = Some(complete);
         self
     }
 
@@ -433,22 +442,7 @@ impl LlmTools {
                     self.system.image_references(),
                 )
                 .map_err(unspent)?;
-                let pin =
-                    cortexkit_role_tool_provider::call::check_call(&call).map_err(|error| {
-                        Spend::Nothing
-                            .mark_body(serde_json::to_vec(&error).expect("call refusal encodes"))
-                    })?;
-                if let Some(pin) = pin {
-                    let digest =
-                        cortexkit_role_tool_provider::catalog::schema_digest(&self.input_schema())
-                            .expect("contract schema has a digest");
-                    if pin.schema_digest != digest {
-                        return Err(serde_json::to_vec(&json!({"code":"tool_schema_changed", "message":"the pinned tool schema is no longer served", "detail":{"tool":call.name, "expected":pin.schema_digest, "current":digest, "no_spend":true}})).expect("refusal encodes"));
-                    }
-                    if pin.semantics != 1 {
-                        return Err(serde_json::to_vec(&json!({"code":"tool_semantics_changed", "message":"the pinned tool semantics are no longer served", "detail":{"tool":call.name, "expected":pin.semantics, "current":1, "no_spend":true}})).expect("refusal encodes"));
-                    }
-                }
+                self.check_pin(&call, &self.input_schema())?;
                 let held = if let Some(call_key) = &call.call_key {
                     self.held.replay(
                         &admission,
@@ -481,6 +475,25 @@ impl LlmTools {
                     None => answer,
                 }
             }
+            super::complete::COMPLETE_TOOL_NAME if self.complete.is_some() => {
+                let complete = self.complete.as_ref().expect("checked above");
+                let envelope: RawEnvelope<'_> = serde_json::from_slice(body)
+                    .map_err(|e| unspent(Refusal::invalid_params("arguments", e.to_string())))?;
+                self.check_pin(&call, &super::complete::Complete::input_schema())?;
+                let answer = complete
+                    .answer(
+                        principal,
+                        scope,
+                        envelope.arguments,
+                        call.call_key.as_deref(),
+                        &self.private_content,
+                    )
+                    .await;
+                match consumer.result_format {
+                    Some(_) => answer.and_then(as_tool_result),
+                    None => answer,
+                }
+            }
             _ => Err(Spend::Nothing.mark_body(
                 serde_json::to_vec(&subc_protocol::ErrorBody::new(
                     "unknown_method",
@@ -489,6 +502,24 @@ impl LlmTools {
                 .expect("error encodes"),
             )),
         }
+    }
+
+    /// Refuse a call whose pin names a schema or semantics this broca no longer serves.
+    fn check_pin(&self, call: &ToolCallRequest, schema: &Value) -> Result<(), Vec<u8>> {
+        let pin = cortexkit_role_tool_provider::call::check_call(call).map_err(|error| {
+            Spend::Nothing.mark_body(serde_json::to_vec(&error).expect("call refusal encodes"))
+        })?;
+        if let Some(pin) = pin {
+            let digest = cortexkit_role_tool_provider::catalog::schema_digest(schema)
+                .expect("contract schema has a digest");
+            if pin.schema_digest != digest {
+                return Err(serde_json::to_vec(&json!({"code":"tool_schema_changed", "message":"the pinned tool schema is no longer served", "detail":{"tool":call.name, "expected":pin.schema_digest, "current":digest, "no_spend":true}})).expect("refusal encodes"));
+            }
+            if pin.semantics != 1 {
+                return Err(serde_json::to_vec(&json!({"code":"tool_semantics_changed", "message":"the pinned tool semantics are no longer served", "detail":{"tool":call.name, "expected":pin.semantics, "current":1, "no_spend":true}})).expect("refusal encodes"));
+            }
+        }
+        Ok(())
     }
 
     fn catalog(&self, arguments: &Value, result_format: Option<&'static str>) -> Answer {
@@ -524,9 +555,31 @@ impl LlmTools {
         if self.config.advertise_tags {
             tool["capabilities"] = json!([classify::TAG]);
         }
+        // The generation of a catalog listing only classify stays what it was, so a consumer's
+        // pinned generation doesn't change until completion is listed.
         let generation = hash(&tool);
+        let mut tools = vec![tool];
+        if self.complete.is_some() {
+            let schema = super::complete::Complete::input_schema();
+            let mut complete = json!({
+                "name":super::complete::COMPLETE_TOOL_NAME, "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).expect("contract schema has a digest"),
+                "semantics":1, "capabilities":[], "description":"Ask a model routing picks for your demand to complete one prompt, as text or as JSON matching a schema.",
+                "input_schema":schema,
+                "modes":cortexkit_llm_tools::MODES,
+                "result_format":result_format.unwrap_or(CONTENT_V1),
+            });
+            if self.config.advertise_tags {
+                complete["capabilities"] = json!([cortexkit_llm_tools::complete::TAG]);
+            }
+            tools.push(complete);
+        }
+        let generation = if tools.len() > 1 {
+            hash(&json!(tools))
+        } else {
+            generation
+        };
         let mut answer =
-            json!({"generation":generation,"tools":[tool],"capabilities":{"late_results":true}});
+            json!({"generation":generation,"tools":tools,"capabilities":{"late_results":true}});
         if let Some(composition) = request.composition {
             answer["composition_digest"] = json!(hash(
                 &serde_json::to_value(composition).expect("composition encodes")

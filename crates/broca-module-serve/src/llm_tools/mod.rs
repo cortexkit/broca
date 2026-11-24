@@ -2,6 +2,7 @@
 //! paid outcomes use a separate System One instance so tool waits cannot starve classifiers.
 
 mod admission;
+pub mod complete;
 pub mod consent;
 pub mod held;
 mod held_images;

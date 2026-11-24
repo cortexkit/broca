@@ -42,6 +42,74 @@ pub(super) fn admit(
     call_key: Option<&str>,
     image_references: bool,
 ) -> Result<Admission, Refusal> {
+    let (scope, stamped) = admit_scope(principal, scope)?;
+    let value: Value = serde_json::from_str(arguments.get())
+        .map_err(|error| Refusal::invalid_params("arguments", error.to_string()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| Refusal::invalid_params("arguments", "arguments must be an object"))?;
+    for field in object.keys() {
+        if !["model", "questions", "item", "max_cost_usd"].contains(&field.as_str()) {
+            return Err(Refusal::invalid_params(
+                field,
+                format!("unknown argument {field}"),
+            ));
+        }
+    }
+    if !object.get("max_cost_usd").is_some_and(Value::is_number) {
+        return Err(Refusal::invalid_params(
+            "max_cost_usd",
+            "max_cost_usd is a required non-negative number",
+        ));
+    }
+    let request: classify::Request = serde_json::from_str(arguments.get())
+        .map_err(|e| Refusal::invalid_params("arguments", e.to_string()))?;
+    let model = request
+        .model
+        .as_deref()
+        .ok_or_else(|| Refusal::invalid_params("model", "model is required for llm.classify"))?;
+    (if image_references {
+        classify::validate_request_with_image_references(&request)
+    } else {
+        classify::validate_request(&request)
+    })
+    .map_err(|e| match e {
+        cortexkit_llm_tools::ValidationError::Role(refusal) => refusal,
+        cortexkit_llm_tools::ValidationError::NegativeCost { field } => {
+            Refusal::invalid_params(field, "cost must not be negative")
+        }
+        other => Refusal::invalid_params("arguments", other.to_string()),
+    })?;
+    let (batch_id, _) = call_id(principal, stamped, call_key)?;
+    let args_digest = hash(&value);
+    let raw: RawArguments<'_> = serde_json::from_str(arguments.get())
+        .expect("validated arguments have their required fields");
+    // JSON Canonicalization Scheme (JCS) defines replay identity, not the provider payload. Preserve question order and
+    // structured state JSON exactly as the caller supplied them.
+    let params = format!(
+        "{{\"batch_id\":{},\"model\":{},\"questions\":{},\"items\":[{}],\"max_cost_usd\":{}}}",
+        serde_json::to_string(&batch_id).expect("batch id encodes"),
+        serde_json::to_string(&request.model).expect("model encodes"),
+        raw.questions.get(),
+        raw.item.get(),
+        raw.max_cost_usd.get(),
+    );
+    Ok(Admission {
+        scope,
+        batch_id,
+        args_digest,
+        params,
+        provider: model.split('/').next().unwrap_or_default().into(),
+    })
+}
+
+/// The scope a model tool call is attributed to, from the daemon's stamp on its route, and the
+/// stamp itself. A run or flow scope is required; Basal may call only from a flow, or from a
+/// program run linked to its parent scope.
+pub(super) fn admit_scope<'a>(
+    principal: Option<&BindPrincipal>,
+    scope: &'a SendScope,
+) -> Result<(BatchScope, &'a broca_protocol::SessionScope), Refusal> {
     let stamp = match scope {
         SendScope::Stamped(bind) => Some(&bind.scope),
         _ => None,
@@ -100,83 +168,43 @@ pub(super) fn admit(
             "model tools require a daemon-stamped agent and run or flow",
         ));
     };
-    let value: Value = serde_json::from_str(arguments.get())
-        .map_err(|error| Refusal::invalid_params("arguments", error.to_string()))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| Refusal::invalid_params("arguments", "arguments must be an object"))?;
-    for field in object.keys() {
-        if !["model", "questions", "item", "max_cost_usd"].contains(&field.as_str()) {
-            return Err(Refusal::invalid_params(
-                field,
-                format!("unknown argument {field}"),
-            ));
-        }
-    }
-    if !object.get("max_cost_usd").is_some_and(Value::is_number) {
-        return Err(Refusal::invalid_params(
-            "max_cost_usd",
-            "max_cost_usd is a required non-negative number",
+    Ok((scope, stamped))
+}
+
+/// The key a call's record is stored under, and whether the call has one of its own. A keyed
+/// call's key hashes the caller, the stamp's owner, scope and epoch, and the `call_key`, so one
+/// caller's key can never name another's record. A call without a `call_key` gets a random key
+/// and is never replayed.
+pub(super) fn call_id(
+    principal: Option<&BindPrincipal>,
+    stamped: &broca_protocol::SessionScope,
+    call_key: Option<&str>,
+) -> Result<(String, bool), Refusal> {
+    let Some(call_key) = call_key else {
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random)
+            .map_err(|_| crate::system_one::internal_refusal("cannot generate a fresh batch id"))?;
+        return Ok((
+            random.iter().map(|byte| format!("{byte:02x}")).collect(),
+            false,
         ));
-    }
-    let request: classify::Request = serde_json::from_str(arguments.get())
-        .map_err(|e| Refusal::invalid_params("arguments", e.to_string()))?;
-    let model = request
-        .model
-        .as_deref()
-        .ok_or_else(|| Refusal::invalid_params("model", "model is required for llm.classify"))?;
-    (if image_references {
-        classify::validate_request_with_image_references(&request)
-    } else {
-        classify::validate_request(&request)
-    })
-    .map_err(|e| match e {
-        cortexkit_llm_tools::ValidationError::Role(refusal) => refusal,
-        cortexkit_llm_tools::ValidationError::NegativeCost { field } => {
-            Refusal::invalid_params(field, "cost must not be negative")
-        }
-        other => Refusal::invalid_params("arguments", other.to_string()),
+    };
+    let principal = principal.ok_or_else(|| {
+        refusal(
+            "scope_required",
+            "a keyed model tool requires a stamped caller principal",
+        )
     })?;
-    let batch_id = if let Some(call_key) = call_key {
-        let principal = principal.ok_or_else(|| {
-            refusal(
-                "scope_required",
-                "a keyed model tool requires a stamped caller principal",
-            )
-        })?;
+    Ok((
         hash(&json!({
             "principal": principal.as_owner_string(),
             "owner": stamped.owner.as_owner_string(),
             "scope_ref": stamped.scope_ref,
             "scope_epoch": stamped.scope_epoch,
             "call_key": call_key,
-        }))
-    } else {
-        let mut random = [0u8; 32];
-        getrandom::fill(&mut random)
-            .map_err(|_| crate::system_one::internal_refusal("cannot generate a fresh batch id"))?;
-        random.iter().map(|byte| format!("{byte:02x}")).collect()
-    };
-    let args_digest = hash(&value);
-    let raw: RawArguments<'_> = serde_json::from_str(arguments.get())
-        .expect("validated arguments have their required fields");
-    // JSON Canonicalization Scheme (JCS) defines replay identity, not the provider payload. Preserve question order and
-    // structured state JSON exactly as the caller supplied them.
-    let params = format!(
-        "{{\"batch_id\":{},\"model\":{},\"questions\":{},\"items\":[{}],\"max_cost_usd\":{}}}",
-        serde_json::to_string(&batch_id).expect("batch id encodes"),
-        serde_json::to_string(&request.model).expect("model encodes"),
-        raw.questions.get(),
-        raw.item.get(),
-        raw.max_cost_usd.get(),
-    );
-    Ok(Admission {
-        scope,
-        batch_id,
-        args_digest,
-        params,
-        provider: model.split('/').next().unwrap_or_default().into(),
-    })
+        })),
+        true,
+    ))
 }
 
 fn basal_scope_required() -> Refusal {

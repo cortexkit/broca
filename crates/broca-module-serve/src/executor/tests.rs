@@ -54,6 +54,7 @@ mod signed_out {
     include!("../signed_out_reaudit_tests.rs");
 }
 include!("../fork_executor_tests.rs");
+include!("../llm_complete_session_tests.rs");
 
 /// A new episode whose request has `inherit_frozen_cache` set (a steer or interrupt
 /// that omitted `cache`) takes the cache policy and caller cache key frozen in the

@@ -478,6 +478,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     charge_basis_table.publish_for_health();
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
     let mut classifier_router = None;
+    // The routing client `llm.complete/v1` asks for its model, when broca reaches routing.
+    let complete_routing: Option<Arc<broca_module_serve::account_routing::RoutingClient>>;
     // Where the session store's deployment key is read from: the vault, by grant. `None`
     // when the module reads no vault, so sessions kept in the session store stay refused.
     let mut store_key_source: Option<Arc<dyn broca_module_serve::store_key::DeploymentKeySource>> =
@@ -849,6 +851,9 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             registry.batches_in_flight_gauge(),
         );
+        complete_routing = classifier_router
+            .as_ref()
+            .map(|routing| routing.client.clone());
         let service = if let Some(routing) = classifier_router {
             service.with_routing(routing)
         } else {
@@ -894,25 +899,30 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .expire_due(broca_module_serve::llm_tools::held::epoch_ms())
         .map_err(|error| ServeIoError(format!("recover held deadlines: {error}")))?;
     let _held_timers = held_calls.spawn_timers(registry.stopping_signal());
-    let llm_tools = Arc::new(
-        broca_module_serve::llm_tools::LlmTools::new(
+    let llm_tools = {
+        let tools = broca_module_serve::llm_tools::LlmTools::new(
             Arc::new(system_one.fork_for_tools()),
             llm_tools_config,
             llm_tools_asks,
-        )
-        .with_held(held_calls.clone())
-        .with_consent(
-            Arc::new(broca_module_serve::llm_tools::consent::Consent::new(
-                held_calls.store.clone(),
-                Arc::new(broca_module_serve::llm_tools::consent::SubcConsentIo::new(
-                    plan_conn.clone(),
-                    llm_tools_identity,
-                    scope_describer.clone(),
-                )),
+        );
+        match complete_routing {
+            Some(routing) if broca_module_serve::llm_tools::complete::SERVED => {
+                tools.with_complete(Arc::new(system_one.complete(routing, registry.clone())))
+            }
+            _ => tools,
+        }
+    };
+    let llm_tools = Arc::new(llm_tools.with_held(held_calls.clone()).with_consent(
+        Arc::new(broca_module_serve::llm_tools::consent::Consent::new(
+            held_calls.store.clone(),
+            Arc::new(broca_module_serve::llm_tools::consent::SubcConsentIo::new(
+                plan_conn.clone(),
+                llm_tools_identity,
+                scope_describer.clone(),
             )),
-            registry.stopping_signal(),
-        ),
-    );
+        )),
+        registry.stopping_signal(),
+    ));
     llm_tools
         .recover_authorized()
         .map_err(|error| ServeIoError(format!("recover authorized held calls: {error}")))?;

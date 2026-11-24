@@ -541,6 +541,23 @@ impl SystemOne {
         (self.clock)()
     }
 
+    /// The `llm.complete/v1` tool over this service's batch store, as this process, on its clock.
+    /// It records under its own store role, so its keys never meet a batch's.
+    pub fn complete(
+        &self,
+        select: Arc<dyn crate::llm_tools::complete::Select>,
+        sessions: Arc<dyn crate::llm_tools::complete::Sessions>,
+    ) -> crate::llm_tools::complete::Complete {
+        crate::llm_tools::complete::Complete::new(
+            Arc::clone(&self.store),
+            self.owner.clone(),
+            select,
+            sessions,
+            "broca",
+        )
+        .with_clock(self.clock.clone())
+    }
+
     pub(crate) fn admit_tool(
         &self,
         params: &str,
