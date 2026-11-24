@@ -199,6 +199,7 @@ async fn module(
             render_config: Some(image_render_config()),
             notes_sends: false,
             hold: None,
+            attempt_digest: None,
         }),
         sent: Arc::clone(sent),
         stop,

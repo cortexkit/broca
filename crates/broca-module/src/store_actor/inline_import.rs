@@ -6,6 +6,10 @@ use crate::actor::ImportOutcome;
 use broca_core::{ImportError, ImportRequest};
 use broca_session_store::record::{Input, Placement, RunEnd, RunStart};
 
+/// The most messages an inline import writes: its one batch holds each message with its entry
+/// facts, and the run's start and end, within the log's `u16::MAX` records a batch.
+pub(super) const INLINE_IMPORT_MAX_MESSAGES: usize = (u16::MAX as usize - 2) / 2;
+
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     pub(super) async fn inline_import(&mut self, request: ImportRequest) -> (ImportOutcome, bool) {
         let result = self.import_inline(request).await;
@@ -115,6 +119,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             kept_notice: None,
         };
         let mut records = vec![Record::RunStart(Box::new(start))];
+        let message_count = messages.len();
         for message in messages {
             records.push(Record::Input(Input {
                 run_id: run_id.clone(),
@@ -159,6 +164,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             },
         )
         .map_err(SessionError::Fold)?;
+        // The whole import is one batch, and the log writes at most `u16::MAX` records in one.
+        // A larger import is refused here, with nothing written, rather than failing in the
+        // write, which retires the actor as if its session had failed.
+        if records.len() > usize::from(u16::MAX) {
+            return Ok(ImportOutcome::Error(ImportError::TooManyMessages {
+                count: message_count,
+                max: INLINE_IMPORT_MAX_MESSAGES,
+            }));
+        }
         // Imported messages were supplied by the caller, not produced by the synthetic run.
         // Display attribution therefore names no producing run, including on assistant messages.
         for record in &mut records {

@@ -1497,49 +1497,20 @@ impl LineageRegistry {
         ))
     }
 
-    /// Reuse an existing actor's admission source without opening or recovering a lineage.
-    pub(crate) async fn warm_cancel_authority(
+    /// The checks a cancel's authorization makes before its ownership lookup: an expired
+    /// session's authorization, and a session this registry can't serve for another reason than
+    /// a move. A moving or moved session goes on to the ownership lookup's full log validation.
+    async fn check_cancel_reachable(
         &self,
         key: &LineageKey,
-        principal: Option<&broca_protocol::BindPrincipal>,
-        scope: &broca_protocol::SendScope,
-        at: broca_records::record::RunCancelAt,
-    ) -> Result<Option<crate::actor::CancelAuthority>, crate::serve::ServeError> {
+    ) -> Result<(), crate::serve::ServeError> {
         self.check_authorization_expired(key).await?;
         match self.check_move(key, true) {
-            // Moving/moved sessions need owner_ownership's full log validation. Cached
-            // authority could hide corrupt history; move errors must wait for authorization.
-            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) => {
-                return Ok(None)
+            Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) | Ok(()) => {
+                Ok(())
             }
-            Err(error) => return Err(error.into()),
-            Ok(()) => {}
+            Err(error) => Err(error.into()),
         }
-        let handle = {
-            let slots = self.inner.slots.lock().unwrap();
-            match slots.get(key) {
-                Some(Entry::Open { handle, .. }) => Some(handle.clone()),
-                _ => None,
-            }
-        };
-        if let Some(handle) = handle {
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            if handle
-                .send(crate::actor::LineageCmd::SenderPolicy {
-                    principal: principal.cloned(),
-                    scope: scope.clone(),
-                    at,
-                    reply,
-                })
-                .await
-                .is_ok()
-            {
-                if let Ok(result) = rx.await {
-                    return result;
-                }
-            }
-        }
-        Ok(None)
     }
 
     pub(crate) async fn resolve_cancel_authority(
@@ -1550,12 +1521,7 @@ impl LineageRegistry {
         at: broca_records::record::RunCancelAt,
     ) -> Result<crate::actor::CancelAuthority, crate::serve::ServeError> {
         use crate::{actor::CancelAuthority, serve::ServeError};
-        if let Some(authority) = self
-            .warm_cancel_authority(key, principal, scope, at)
-            .await?
-        {
-            return Ok(authority);
-        }
+        self.check_cancel_reachable(key).await?;
         let ownership = self.owner_ownership(key).await?;
         let refusal =
             match broca_core::scope_admission::decide_owner_access(&ownership, principal, scope) {

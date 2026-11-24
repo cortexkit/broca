@@ -289,6 +289,7 @@ async fn side_with_events(
         render_config: None,
         notes_sends: false,
         hold: None,
+        attempt_digest: None,
         inner: provider.clone(),
         gate: gate.clone(),
     };

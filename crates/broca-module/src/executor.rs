@@ -5,8 +5,8 @@
 //! close teardown, races) PURE and deterministically testable: the race harness drives a
 //! CONTROLLABLE fake executor (signal exactly when a run finishes, hold a run open while a
 //! close/subscribe races), which a real LLM loop could never do reproducibly. The real
-//! adapter wraps `broca_core::run_loop_under_lease` and is the only place that touches the
-//! loop.
+//! adapter runs each store job through `broca_session_loop` (see [`StoreRunJob`]) and is the
+//! only place that touches the loop.
 
 use std::sync::Arc;
 
@@ -24,12 +24,11 @@ pub use fork::{ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, Fo
 /// Which start mode a run uses (the coordinator decides; the executor obeys).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunKind {
-    /// A fresh run, or resume the last (unfinished) episode of an existing lineage — the
-    /// executor distinguishes these from
-    /// the session's log (empty ⇒ fresh, non-empty ⇒ resume).
+    /// A fresh run, or resume the last (unfinished) run of an existing session — the executor
+    /// distinguishes these from the session's records (none ⇒ fresh, some ⇒ resume).
     FreshOrResume,
-    /// Append a NEW episode (turn) to an IDLE lineage (the prior conversation is the
-    /// prefix). Only valid over a finished lineage.
+    /// Append a NEW run to an IDLE session (the prior conversation is the prefix). Only valid
+    /// over a session whose runs have finished.
     AppendEpisode,
     /// Continue a run that paused awaiting re-auth (after the credential refreshed).
     ResumeAfterAuth,
@@ -230,8 +229,8 @@ pub trait RunExecutor: Send + Sync + 'static {
     }
 
     /// Build the provider from the recorded run config and a freshly read credential, then
-    /// re-send the last model request with output suppressed. Requests re-rendered from the
-    /// session's write-ahead log must match their recorded body digest before sending.
+    /// re-send the last model request with output suppressed. Requests rebuilt from the
+    /// session's records must match their recorded body digest before sending.
     /// Provider errors after sending mean a request may have been sent; other errors mean
     /// none was sent. The default executor cannot warm.
     async fn warm(&self, _job: WarmJob) -> Result<broca_core::WarmSent, WarmError> {

@@ -158,12 +158,6 @@ pub enum LineageCmd {
         scope: broca_protocol::SendScope,
         reply: oneshot::Sender<CancelOutcome>,
     },
-    SenderPolicy {
-        principal: Option<broca_protocol::BindPrincipal>,
-        scope: broca_protocol::SendScope,
-        at: broca_records::record::RunCancelAt,
-        reply: oneshot::Sender<Result<Option<CancelAuthority>, crate::serve::ServeError>>,
-    },
     /// Retract a still-pending queued submission (durable tombstone). Replies the outcome.
     Retract {
         submission_id: broca_protocol::SubmissionId,

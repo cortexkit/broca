@@ -89,7 +89,15 @@ pub(super) struct Gated {
     /// When set, each call keeps its request's bytes while it waits at the gate, as a transport
     /// keeps a request's body for its call, and says it reached the gate.
     pub(super) hold: Option<Arc<Hold>>,
+    /// When set, each attempt the script reports carries the digest this gives the step's
+    /// request, as a transport records the digest of the body it sent, so a warm rebuilding that
+    /// request from the records can match it.
+    pub(super) attempt_digest: Option<AttemptDigest>,
 }
+
+/// The digest a real transport would record for a step's request (see [`Gated::attempt_digest`]).
+pub(super) type AttemptDigest =
+    Arc<dyn Fn(&broca_protocol::request::CallOptions) -> String + Send + Sync>;
 
 /// What a gated provider keeps of the call waiting at its gate (see [`Gated::hold`]).
 #[derive(Default)]
@@ -247,7 +255,26 @@ impl broca_core::provider::Provider for Gated {
             gate.notified().await;
         }
         drop(body);
-        self.inner.step(step_id, opts).await
+        let events = self.inner.step(step_id, opts).await;
+        let Some(digest) = &self.attempt_digest else {
+            return events;
+        };
+        let sha256 = digest(opts);
+        let mut events = events;
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(mut event) = events.recv().await {
+                if let NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) =
+                    &mut event
+                {
+                    attempt.request_body_sha256.clone_from(&sha256);
+                }
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
     }
 
     async fn step_with_shutdown_seal(
@@ -426,6 +453,7 @@ pub(super) fn executor(
             render_config: None,
             notes_sends: false,
             hold: None,
+            attempt_digest: None,
         },
         drain_gate: None,
         planes: Planes::default(),

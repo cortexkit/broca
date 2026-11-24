@@ -34,7 +34,7 @@
 //!   and starting a run on an idle session when its list names `idle_start` (see `ordered`).
 //! - a send's attachments, staged from its uploads and stored as the session's own objects
 //!   before the record that names them: a send's run start, its queued record or its steer;
-//! - `session.warm` on an idle session, re-sending the request its loop would send next (see
+//! - `session.warm` on an idle session, re-sending its most recent recorded request (see
 //!   `warm`);
 //! - a send's service tier level, admitted by the service-tier rule and sent at the level it
 //!   was admitted at (see `service_tier`);
@@ -94,7 +94,7 @@ pub struct StoreActor<B: SessionBackend> {
     recovery_registered: bool,
     run: Option<ActiveRun>,
     /// Non-durable one-shot hints, retained for queued sends and same-process pause resumes.
-    /// Reopening loses the hints, as it does in the log actor.
+    /// Reopening the session loses them.
     one_shot_runs: std::collections::HashSet<RunId>,
     one_shot_submissions: std::collections::HashSet<broca_protocol::SubmissionId>,
     /// Set when the actor is to close as soon as nothing holds it open, instead of waiting out
@@ -433,6 +433,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let exit = self
             .serve_until_exit(&mut commands, None, None, None, None)
             .await;
+        self.finish_pending_warm().await;
         self.stop_for_shutdown().await;
         self.collect_on_exit(&exit).await;
         if !self.session.unsynced() {
@@ -708,6 +709,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Some((&life.registry, life.gen)),
             )
             .await;
+        // A session retention expired is deleted, so its pending warm is aborted below instead.
+        if !matches!(exit, Exit::Expired(_)) {
+            self.finish_pending_warm().await;
+        }
         let stop_reason = match &exit {
             Exit::Idle => None,
             Exit::Expired(_) => Some("expired"),
@@ -2000,14 +2005,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     Ok(()) => self.release_waiter = Some(reply),
                     Err(outcome) => drop(reply.send(outcome)),
                 }
-                false
-            }
-            // The registry decides whether a sender may cancel from the session's stored owner
-            // summary, which carries the senders the latest accepted refresh grants
-            // (`broca_session_loop::owner::ownership_with_plan`), as it decides for a session no
-            // actor holds. This actor keeps no cached answer of its own to give first.
-            LineageCmd::SenderPolicy { reply, .. } => {
-                let _ = reply.send(Ok(None));
                 false
             }
             LineageCmd::IdleTick => self.idle_holds().is_empty(),
@@ -4717,9 +4714,6 @@ fn reopen(command: LineageCmd) {
         LineageCmd::Cancel { reply, .. } | LineageCmd::CancelFrom { reply, .. } => {
             let _ = reply.send(CancelOutcome::Reopen);
         }
-        LineageCmd::SenderPolicy { reply, .. } => {
-            let _ = reply.send(Ok(None));
-        }
         LineageCmd::Retract { reply, .. } => {
             let _ = reply.send(RetractOutcome::Reopen);
         }
@@ -4828,7 +4822,6 @@ fn refuse(command: LineageCmd) {
         | LineageCmd::Cancel { .. }
         | LineageCmd::CancelFrom { .. }
         | LineageCmd::Retract { .. }
-        | LineageCmd::SenderPolicy { .. }
         | LineageCmd::SessionRefresh { .. }
         | LineageCmd::SessionRefreshPolicy { .. }
         | LineageCmd::SessionFlushPrefix { .. }

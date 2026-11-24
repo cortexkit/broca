@@ -352,3 +352,77 @@ async fn an_inline_import_read_error_retires_an_idle_actor() {
         Some(RunFinishReason::Completed)
     );
 }
+
+/// An inline import of `count` alternating user and assistant messages under run `run_id`.
+async fn import_many(commands: &Commands, run_id: &str, count: usize) -> ImportOutcome {
+    let messages = (0..count)
+        .map(|at| {
+            Message::new(
+                if at % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                vec![ContentBlock::Text {
+                    text: format!("message {at}").into(),
+                }],
+            )
+        })
+        .collect();
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::Import {
+            request: Box::new(ImportRequest {
+                project_id: None,
+                principal: None,
+                run_id: RunId(run_id.into()),
+                session: bind(),
+                messages,
+                origin: ImportOrigin {
+                    source_ref: "fixture:transcript".into(),
+                },
+            }),
+            reply,
+        })
+        .unwrap();
+    answer.await.unwrap()
+}
+
+/// An inline import is written as one batch, which holds at most `u16::MAX` records: each message
+/// with its entry facts, and the run's start and end. One more message than fits is refused by
+/// name, with nothing written, and the actor serves on: the most that fits imports.
+#[tokio::test]
+async fn an_inline_import_past_one_batch_is_refused_and_the_actor_serves_on() {
+    let max = (usize::from(u16::MAX) - 2) / 2;
+    let backend: &'static ReadFault = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let (commands, served) = serve(session, backend, executor(Vec::new(), None));
+    let outcome = import_many(&commands, "too-many", max + 1).await;
+    assert_eq!(
+        outcome,
+        ImportOutcome::Error(ImportError::TooManyMessages {
+            count: max + 1,
+            max
+        }),
+    );
+    assert_eq!(status(&commands).await, LineageStatus::Idle);
+    assert!(matches!(
+        import_many(&commands, "fits", max).await,
+        ImportOutcome::Imported(_)
+    ));
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(
+        session.operations().run.as_ref().unwrap().run_id,
+        "fits",
+        "the refused import wrote nothing"
+    );
+}

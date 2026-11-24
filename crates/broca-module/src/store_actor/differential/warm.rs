@@ -3,9 +3,10 @@
 //! The module runs a scripted model whose frozen render config is a first-party Anthropic one
 //! with one-hour cache markers, so the session's cache policy allows a warm, read with the
 //! provider families' own rules, as the serving layer installs them. Each refusal decided before
-//! anything is sent is pinned. A warm the store sends re-sends the request its loop would send
-//! next, rendered by the real Anthropic transport and checked against the digest the actor
-//! computed; its record dates the session's cache, which a restarted module reads back.
+//! anything is sent is pinned. A warm the store sends re-sends the session's most recent request,
+//! rebuilt from its records, rendered by the real Anthropic transport and checked against the
+//! digest its attempt recorded; its record dates the session's cache, which a restarted module
+//! reads back.
 
 use std::sync::{Arc, Mutex};
 
@@ -207,6 +208,19 @@ async fn registry_at(
     let render_config = config.map(|config| serde_json::to_value(config).unwrap());
     let mut store_loop = super::executor(steps, None);
     store_loop.provider.render_config = render_config;
+    // Each attempt records the digest the real transport gives its request, as it would.
+    store_loop.provider.attempt_digest = config.cloned().map(|frozen| {
+        Arc::new(move |opts: &CallOptions| {
+            let live = broca_provider::LiveProvider::new(
+                AnthropicMessages,
+                frozen.clone(),
+                AuthHandle::Bearer("t".into()),
+            );
+            broca_core::render::request_digest_hex(&broca_core::provider::Provider::render_request(
+                &live, opts,
+            ))
+        }) as crate::store_actor::tests::AttemptDigest
+    });
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
         store: store_loop,
         sent: Arc::clone(sent),
@@ -521,11 +535,11 @@ async fn warm_refusals_answer_alike(cipher: Cipher) {
     );
 }
 
-/// A warm of a session whose last request reached the cache re-sends the request its loop would
-/// send next: the bytes the real transport renders from the session's state, with the digest the
-/// actor computed. It answers with the policy's lifetime counted from the warm's own send, and
-/// its record dates the cache: a module restarted on the same state root warms the session again
-/// from that clock.
+/// A warm of a session whose last request reached the cache re-sends that request: the bytes the
+/// real transport renders from the request rebuilt from the session's records, which have the
+/// digest the request's attempt recorded. It answers with the policy's lifetime counted from the
+/// warm's own send, and its record dates the cache: a module restarted on the same state root
+/// warms the session again from that clock.
 async fn a_warm_resends_the_next_request_and_dates_the_cache(cipher: Cipher) {
     let now = crate::actor::epoch_ms();
     let config = warmable();
@@ -556,7 +570,11 @@ async fn a_warm_resends_the_next_request_and_dates_the_cache(cipher: Cipher) {
         .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
         .filter_map(|block| block["text"].as_str().map(str::to_owned))
         .collect();
-    assert_eq!(texts, ["hello", "hi"], "the session's next request");
+    assert_eq!(
+        texts,
+        ["hello"],
+        "the session's most recent request, not the one its loop would send next"
+    );
     assert_eq!(reply.ttl_ms, 3_600_000);
     assert_eq!(reply.cache_read_tokens, Some(1_000));
     assert_eq!(reply.expiry_basis, broca_wire::EXPIRY_BASIS_ESTIMATED);

@@ -359,8 +359,6 @@ pub(crate) fn flush(facts: &ChangeFacts) -> Result<Option<u64>, Option<u64>> {
 /// Adding one rebuilds the request's prefix: the system text moves above the conversation and
 /// part numbers show. So such a refresh applies at the next run whatever its policy, and its
 /// `RefreshApplied` record says `applied_by: "fold"`, as one applied after a prefix rebuild does.
-/// Only a session in the session store takes such a refresh; one kept in the write-ahead log
-/// refuses it.
 pub(crate) fn adds_compaction(
     on_contract: bool,
     current: Option<&PlanManifest>,

@@ -41,10 +41,10 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
         };
         let after_billed =
             matches!(records.last(), Some((_, Record::Billed(billed))) if billed.run_id == run_id);
-        let late_warm = records.iter().any(|(_, record)| {
-            matches!(record, Record::Warmed(warm)
-            if warm.run_id == run_id && warm.trigger.as_deref() == Some("keep_warm"))
-        });
+        // Automatic and manual warms alike: each is exported as its own fact.
+        let late_warm = records
+            .iter()
+            .any(|(_, record)| matches!(record, Record::Warmed(warm) if warm.run_id == run_id));
         if !after_billed || !late_warm {
             return;
         }

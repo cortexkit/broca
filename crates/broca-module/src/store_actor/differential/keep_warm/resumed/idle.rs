@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod account_move;
 mod billing_recovery;
+mod manual;
 
 cipher_tests!(
     idle_head_uses_hour_lifetime_and_stops_at_durable_cap,

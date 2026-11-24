@@ -40,6 +40,9 @@ struct Warming {
     no_cache: bool,
     fail: bool,
     store: Option<crate::store_actor::tests::LoopExecutor>,
+    /// When set, each warm signals the first notification as it starts, then waits for the
+    /// second before it sends.
+    gate: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 async fn cold_cache_predecessor_rebuilds_the_previous_run_lazily(cipher: Cipher) {
@@ -117,6 +120,10 @@ impl RunExecutor for Warming {
     }
 
     async fn warm(&self, job: WarmJob) -> Result<broca_core::WarmSent, WarmError> {
+        if let Some((started, release)) = &self.gate {
+            started.notify_one();
+            release.notified().await;
+        }
         self.warm_configs.lock().unwrap().push(job.config.clone());
         if self.fail {
             return Err(WarmError::Unavailable("test refusal".into()));

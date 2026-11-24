@@ -7,13 +7,11 @@
 //! cache's clock is the session's own: the operations fold's last request that reached the
 //! cache (`last_cache_send`), a warm included.
 //!
-//! The request warmed is the one the run loop would send for the latest run's next step, built
-//! from the session's state without any provider (`broca_session_loop::run::offline_request`).
-//! Its prefix is the prefix the
-//! session's last request cached. The actor renders it with the frozen config's wire family to
-//! learn its digest; the executor renders it again with the provider it builds and sends it
-//! only when the bytes match. A request holding media is refused by name: rendering media from
-//! the session's own objects isn't built.
+//! The request warmed is the latest run's most recent real request, rebuilt from the session's
+//! records (`recorded_warm::recorded_request`) with the digest its attempt recorded: its prefix
+//! is the prefix that request cached. The executor renders it with the provider it builds and
+//! sends it only when the bytes have that digest, else nothing is sent. A latest run with no
+//! recorded attempt is refused `warm_prefix_unavailable`.
 
 use std::sync::Arc;
 
@@ -211,7 +209,6 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             }
         }
 
-        let step_id = run.completed_steps + 1;
         let unavailable = |reason: String| {
             Box::new(WarmOutcome::Refused(broca_wire::WarmRefusal::new(
                 Refusal::WarmPrefixUnavailable {
@@ -220,8 +217,11 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 },
             )))
         };
+        // The session's most recent real request, rebuilt from its records with the digest its
+        // attempt recorded: the executor sends it only if it renders to those bytes. A session
+        // with no recorded attempt for its latest run has nothing to re-send.
+        let request = self.recorded_warm_request().await.map_err(unavailable)?;
         if idle_auto {
-            let request = self.recorded_warm_request().await.map_err(unavailable)?;
             let records = self.idle_warm_records().await.map_err(unavailable)?;
             let headers = records
                 .iter()
@@ -246,70 +246,47 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             }
             // A quota query may outlast the prefix it was meant to protect.
             self.idle_warm_due().await.map_err(unavailable)?;
-            let mut media = Some(self.run_media().await);
-            let renderer = super::recorded_warm::media(&mut media).map_err(unavailable)?;
-            return Ok(Prepared {
-                run_id: request.run_id.0.clone(),
-                step_id: request.step_id.0,
-                request_body_sha256: request.request_body_sha256.clone(),
-                ttl_ms: ttl_ms.unwrap_or_default(),
-                requested_ttl_ms,
-                job: WarmJob {
-                    session: self.key.clone(),
-                    config: request.config.clone(),
-                    base: WarmBase::RecordedMedia {
-                        request: Box::new(request),
-                        renderer,
-                    },
-                    attempt_hook: None,
-                },
-            });
         }
-        let opts = broca_session_loop::run::offline_request(
-            &self.session,
-            &self.parts,
-            &self.key,
-            step_id,
-        )
-        .await
-        .map_err(|error| unavailable(format!("the session's next request: {error:?}")))?;
-        if opts
-            .prompt
-            .iter()
-            .any(|message| !broca_session_store::session::message_media(message).is_empty())
-        {
-            return Err(Box::new(WarmOutcome::Error(unserved(
-                "a warm whose request holds media",
-            ))));
-        }
-        let frozen: broca_provider::wire::FrozenRenderConfig =
-            serde_json::from_value(config.frozen_render_config.clone())
-                .map_err(|error| unavailable(format!("the session's render config: {error}")))?;
-        let family = broca_provider::registry::wire_family(frozen.family_id)
-            .ok_or_else(|| unavailable("the session's wire family isn't known".into()))?;
-        let body = family.render_with_provenance(&frozen.for_step(&opts), &opts, None);
-        let request_body_sha256 = broca_core::render::request_digest_hex(&body);
-        let job = WarmJob {
-            session: self.key.clone(),
-            config: config.clone(),
-            base: WarmBase::Recorded(Box::new(broca_core::RecordedRequest {
-                run_id: broca_protocol::RunId(start.run_id.clone()),
-                step_id: broca_protocol::StepId(step_id),
-                config,
-                opts,
-                request_body_sha256: request_body_sha256.clone(),
-                route: None,
-            })),
-            attempt_hook: None,
-        };
+        let mut media = Some(self.run_media().await);
+        let renderer = super::recorded_warm::media(&mut media).map_err(unavailable)?;
         Ok(Prepared {
-            run_id: start.run_id.clone(),
-            step_id,
-            request_body_sha256,
+            run_id: request.run_id.0.clone(),
+            step_id: request.step_id.0,
+            request_body_sha256: request.request_body_sha256.clone(),
             ttl_ms: ttl_ms.unwrap_or_default(),
             requested_ttl_ms,
-            job,
+            job: WarmJob {
+                session: self.key.clone(),
+                config: request.config.clone(),
+                base: WarmBase::RecordedMedia {
+                    request: Box::new(request),
+                    renderer,
+                },
+                attempt_hook: None,
+            },
         })
+    }
+
+    /// Before the actor closes, a warm still being sent is awaited and recorded like any other:
+    /// it may already have reached the provider, and once the actor is gone nothing would record
+    /// or bill it, while it could still be sending after the session's lease was released.
+    pub(super) async fn finish_pending_warm(&mut self) {
+        enum Next {
+            Warmed(Result<Result<broca_core::WarmSent, WarmError>, tokio::task::JoinError>),
+            MediaBuilt(Result<super::MediaHistory, tokio::task::JoinError>),
+        }
+        while let Some(pending) = self.warm.as_mut() {
+            // A warm of a recorded request waits for the session's media, which only this actor
+            // delivers, so a media build in progress is still taken while the warm is awaited.
+            let next = tokio::select! {
+                result = &mut pending.task => Next::Warmed(result),
+                built = super::media_built(&mut self.media_build) => Next::MediaBuilt(built),
+            };
+            match next {
+                Next::Warmed(result) => self.finish_warm(result).await,
+                Next::MediaBuilt(built) => self.media_built(built).await,
+            }
+        }
     }
 
     /// The warm's task ended: record a warm the provider answered, durable before its caller
@@ -403,6 +380,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                 }));
             return;
         }
+        let run_id = pending.run_id.clone();
         let digest =
             |hex: &str| sha256_digest(hex).ok_or_else(|| format!("{hex} is not a SHA-256 digest"));
         let headers: std::collections::BTreeMap<String, String> =
@@ -412,7 +390,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             digest(&sent.warm_body_sha256),
         ) {
             (Ok(request_body_sha256), Ok(warm_body_sha256)) => Record::Warmed(Warmed {
-                run_id: pending.run_id,
+                run_id: run_id.clone(),
                 step_id: pending.step_id,
                 trigger: None,
                 request_body_sha256,
@@ -444,12 +422,40 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
         )
         .await
         {
-            // The provider answered (and billed) the warm; only its record failed.
+            // The provider answered (and may have charged) the warm, but without its record the
+            // session's cache clock and spend don't show it, so the caller isn't told it warmed.
             tracing::warn!(
                 target: "cache",
                 session = %self.key.session,
-                "a warm on the new storage was sent but not recorded: {error:?}",
+                "a warm was sent but not recorded: {error:?}",
             );
+            let _ = pending.reply.send(WarmOutcome::Error(format!(
+                "the warm was sent, but its record could not be written: {error:?}"
+            )));
+            return;
+        }
+        // Every warm is exported as its own spend fact. A warm of a run that hasn't ended is
+        // billed with that run when it ends; any other run was billed already, so its facts are
+        // inserted again, which adds only the warm's. A failed insert is recovered when the
+        // session next opens (`bill_recorded_idle_warms`).
+        let run_unfinished = self
+            .session
+            .operations()
+            .run
+            .as_ref()
+            .is_some_and(|run| run.run_id == run_id && run.finished.is_none());
+        if let (Some(billing), false) = (&self.billing, run_unfinished) {
+            if let Err(error) = billing
+                .insert(&self.session, &self.key, &self.parts, &run_id)
+                .await
+            {
+                tracing::warn!(
+                    target: "cache_warm",
+                    session = %broca_core::session_addr(&self.key),
+                    %error,
+                    "a recorded warm's spend fact was not exported; the next open exports it",
+                );
+            }
         }
         let _ = pending
             .reply
