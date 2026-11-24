@@ -933,7 +933,16 @@ impl VaultClient {
                     self.module_id, self.ready_timeout, ROUTE_OPEN_ATTEMPT_TIMEOUT
                 ))
             })?
-            .map_err(map_conn_err)
+            .map_err(|error| match error {
+                // The open exhausted its readiness budget on a refusal that can clear.
+                // It is not a broken vault reply or a terminal daemon rejection.
+                ConnError::Rejected(ref message)
+                    if crate::connection::route_open_is_retryable(message.code()) =>
+                {
+                    VaultError::Transport(format!("vault route remained unavailable: {message}"))
+                }
+                other => map_conn_err(other),
+            })
     }
 
     /// Return the cached route or share one in-flight open with every concurrent
@@ -1233,9 +1242,8 @@ fn map_exhausted_conn_err(error: ConnError) -> VaultError {
     }
 }
 
-/// Map a consumer-connection error to a vault error. An `Error` FRAME (subc `Rejected`) is a
-/// PROTOCOL error unless the retry path has identified an exhausted `unknown_channel` restart
-/// window. Other Error frames indicate a malformed request or another authoritative rejection.
+/// Map a consumer-connection error after the caller has handled any retryable rejections.
+/// Remaining `Error` frames indicate a malformed request or another terminal rejection.
 fn map_conn_err(e: ConnError) -> VaultError {
     match e {
         ConnError::Rejected(m) => {

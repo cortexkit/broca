@@ -189,28 +189,32 @@ pub fn default_method(listing: &ScopedList, provider: &str) -> Option<AuthMethod
     })
 }
 
-/// Exact public keys take precedence; otherwise metadata must identify one active row.
 /// Empty provider mappings are deliberately excluded even from exact-id matches.
+pub(crate) fn exact_credential_row<'a>(
+    listing: &'a ScopedList,
+    key: &str,
+) -> Option<&'a ScopedCredential> {
+    listing
+        .credentials
+        .iter()
+        .find(|row| row.state == "active" && !row.provider_ids.is_empty() && row.id == key)
+}
+
+/// Exact public keys take precedence; otherwise metadata must identify one active row.
 pub fn credential_row<'a>(
     listing: &'a ScopedList,
     key: &CredentialId,
 ) -> Result<Option<&'a ScopedCredential>, broca_core::RunError> {
-    let eligible = |row: &&ScopedCredential| row.state == "active" && !row.provider_ids.is_empty();
     let key_text = key.to_id_string();
-    if let Some(row) = listing
-        .credentials
-        .iter()
-        .filter(eligible)
-        .find(|row| row.id == key_text)
-    {
+    if let Some(row) = exact_credential_row(listing, &key_text) {
         return Ok(Some(row));
     }
     let mut candidates: Vec<_> = listing
         .credentials
         .iter()
-        .filter(eligible)
         .filter(|row| {
-            row.auth_method.as_deref() == Some(key.method.as_token())
+            row.state == "active"
+                && row.auth_method.as_deref() == Some(key.method.as_token())
                 && row.provider_ids.iter().any(|id| id == &key.provider)
         })
         .collect();

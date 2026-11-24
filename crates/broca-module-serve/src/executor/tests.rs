@@ -788,7 +788,7 @@ fn an_unreachable_vault_served_from_cache_records_no_request() {
         &cache,
         &gauge,
         "apikey:openai",
-        raw.result,
+        raw,
         1_000,
         VAULT_MIN_TTL_MS,
     );
@@ -993,7 +993,7 @@ fn successful_resolve_populates_lkg_for_connectivity_fallback() {
         &cache,
         gauge.as_ref(),
         "apikey:openai",
-        Ok(token.clone()),
+        VaultGet::replied(Ok(token.clone())),
         now_ms,
         VAULT_MIN_TTL_MS,
     )
@@ -1004,7 +1004,7 @@ fn successful_resolve_populates_lkg_for_connectivity_fallback() {
         &cache,
         gauge.as_ref(),
         "apikey:openai",
-        Err(VaultError::Transport("credentials offline".into())),
+        VaultGet::no_reply(VaultError::Transport("credentials offline".into())),
         now_ms,
         VAULT_MIN_TTL_MS,
     )
@@ -1031,7 +1031,7 @@ fn late_older_vault_reply_cannot_regress_lkg() {
             &cache,
             gauge.as_ref(),
             credential_id,
-            Ok(reply),
+            VaultGet::replied(Ok(reply)),
             now_ms,
             VAULT_MIN_TTL_MS,
         )
@@ -1042,7 +1042,7 @@ fn late_older_vault_reply_cannot_regress_lkg() {
         &cache,
         gauge.as_ref(),
         credential_id,
-        Err(VaultError::Transport("credentials offline".into())),
+        VaultGet::no_reply(VaultError::Transport("credentials offline".into())),
         now_ms,
         VAULT_MIN_TTL_MS,
     )
@@ -1064,7 +1064,7 @@ fn late_older_vault_reply_cannot_regress_lkg() {
         &cache,
         gauge.as_ref(),
         credential_id,
-        Err(VaultError::Transport("credentials offline".into())),
+        VaultGet::no_reply(VaultError::Transport("credentials offline".into())),
         now_ms,
         VAULT_MIN_TTL_MS,
     )

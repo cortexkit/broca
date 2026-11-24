@@ -851,8 +851,8 @@ async fn a_vault_route_refusal_that_never_clears_gives_up_within_the_ready_budge
     let result = broca_test_support::wait_for("vault readiness deadline", auth, || {
         format!("route opens: {}", daemon.route_open_count())
     }).await.unwrap();
-    assert!(matches!(result, Err(RunError::Config(ref message)) if message.contains("target_unavailable")),
-        "the last wire refusal must reach admission: {:?}", result.err());
+    assert!(matches!(result, Err(RunError::Transient(ref message)) if message.contains("target_unavailable")),
+        "the last retryable wire refusal must reach admission as transient: {:?}", result.err());
     daemon.assert_healthy();
     assert!(daemon.route_open_count() > 1);
     // The daemon can receive a route-open frame after the clock advance even if the client
@@ -868,10 +868,8 @@ async fn a_vault_route_refusal_that_never_clears_gives_up_within_the_ready_budge
 
 /// A ROUTE OPEN THE DAEMON REFUSED RECORDS NO REQUEST -- and the cached token is still served.
 ///
-/// The refusal comes from the daemon, so the vault never saw a credential.get. It surfaces as
-/// `VaultError::Protocol`, the same variant as an undecodable vault reply, which is why the
-/// record cannot be decided from the error variant: deciding that way recorded this request.
-/// The refusal outlasts the retry budget, so the warm cache has to serve the run.
+/// The refusal comes from the daemon, so the vault never saw a credential.get. It outlasts
+/// the retry budget, so the warm cache has to serve the run.
 #[tokio::test]
 async fn a_refused_vault_route_served_from_cache_records_no_request() {
     let root = fresh_vault_root("route-refused-cache-served");
@@ -927,10 +925,126 @@ async fn a_refused_vault_route_served_from_cache_records_no_request() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn an_undecodable_vault_reply_refuses_even_with_a_cached_token() {
+    let root = fresh_vault_root("undecodable-vault-reply");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_capturing_vault(&root, &daemon).await;
+
+    executor
+        .decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None)
+        .await
+        .unwrap_or_else(|error| panic!("the initial read must warm the cache: {error:?}"));
+    daemon.record.lock().unwrap().credential_replies.insert(
+        "apikey:deepseek".into(),
+        [serde_json::json!({"result": {"unknown_field": true}})].into(),
+    );
+
+    let result = executor
+        .decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None)
+        .await;
+    daemon.assert_healthy();
+    assert_eq!(daemon.scoped_reads().len(), 2);
+    assert!(
+        matches!(result, Err(RunError::Config(ref message)) if message.contains("decode credential.get")),
+        "an undecodable vault answer must refuse permanently despite the warm cache: {:?}",
+        result.err()
+    );
+
+    drop(executor);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// Rows for scoped-read tests: the synthetic key has one metadata match whose id differs,
 /// and the other provider keys have exact matches.
 fn synthetic_rows() -> Arc<broca_module_serve::account_routing::ListingCache> {
     listed_credentials([("apikey:synthetic", "apikey:synthetic:main")])
+}
+
+#[tokio::test]
+async fn a_missing_paid_account_pin_does_not_read_the_only_other_account() {
+    let root = fresh_vault_root("missing-paid-account-pin");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let executor = executor_with_vault_addressing(
+        &root,
+        &daemon,
+        Duration::from_secs(2),
+        synthetic_rows(),
+        supervised_broca_identity(),
+    )
+    .await;
+
+    let result = executor
+        .decide_auth("synthetic", None, true, Some(AuthMethod::ApiKey), Some("removed"))
+        .await;
+    daemon.assert_healthy();
+    assert!(
+        matches!(result, Err(RunError::Config(ref message)) if message.contains("apikey:synthetic:removed")),
+        "the missing pin must refuse permanently instead of charging the listed account: {:?}",
+        result.err()
+    );
+    assert!(daemon.scoped_reads().is_empty());
+
+    let listed_pin = executor
+        .decide_auth("synthetic", None, true, Some(AuthMethod::ApiKey), Some("main"))
+        .await
+        .unwrap_or_else(|error| panic!("the listed pin must still resolve: {error:?}"));
+    assert_eq!(
+        listed_pin.selection.unwrap().resolved_credential_id.as_deref(),
+        Some("apikey:synthetic:main")
+    );
+    let reads = daemon.scoped_reads();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0]["credential_id"], "apikey:synthetic:main");
+
+    drop(executor);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn a_remapped_key_cannot_use_the_old_vault_record_during_an_outage() {
+    let root = fresh_vault_root("remapped-key-outage");
+    let daemon = CapturingVaultDaemon::start_expiring(
+        &root,
+        ExpiryScript { drop_read: Some(2), ..ExpiryScript::default() },
+    )
+    .await;
+    let listing = synthetic_rows();
+    let executor = executor_with_vault_addressing(
+        &root,
+        &daemon,
+        Duration::from_secs(2),
+        Arc::clone(&listing),
+        supervised_broca_identity(),
+    )
+    .await;
+
+    let admit = || executor.decide_auth("synthetic", None, true, Some(AuthMethod::ApiKey), None);
+    let initial = admit().await.unwrap_or_else(|error| panic!("initial read failed: {error:?}"));
+    let selection = initial.selection.unwrap();
+    assert_eq!(selection.credential_id, "apikey:synthetic");
+    assert_eq!(selection.resolved_credential_id.as_deref(), Some("apikey:synthetic:main"));
+
+    let cached = admit().await.unwrap_or_else(|error| panic!("the same record should serve from cache: {error:?}"));
+    let selection = cached.selection.unwrap();
+    assert_eq!(selection.resolved_credential_id.as_deref(), Some("apikey:synthetic:main"));
+    assert!(selection.vault_request.is_none(), "the stand-in dropped the read");
+
+    let replacement = listed_credentials([("apikey:synthetic", "apikey:synthetic:replacement")]);
+    listing.store((*replacement.get().unwrap().0).clone());
+    let result = admit().await;
+    assert!(
+        matches!(result, Err(RunError::Transient(_))),
+        "an outage reading a different record must refuse rather than serve the old token: {:?}",
+        result.err()
+    );
+    daemon.assert_healthy();
+
+    drop(executor);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// A key is read by grant as its resolved vault row id.
@@ -1809,11 +1923,11 @@ async fn account_mismatch_does_not_populate_lkg() {
 
     assert!(matches!(executor.decide_auth_with_account("openai", None, None, None, true,
         Some(AuthMethod::Chatgpt), None, &choice, None).await,
-        Err(RunError::Config(message)) if message.starts_with("credential not configured or unusable:")),
+        Err(RunError::Transient(message)) if message.contains("target_unavailable")),
         "a routed admission must not serve the mismatched token during an outage");
     assert!(matches!(executor.decide_auth("openai", None, true,
         Some(AuthMethod::Chatgpt), Some("second")).await,
-        Err(RunError::Config(message)) if message.starts_with("credential not configured or unusable:")),
+        Err(RunError::Transient(message)) if message.contains("target_unavailable")),
         "a static admission sharing the credential key must not serve the mismatched token");
     assert!(outage_daemon.requests().is_empty());
     assert!(outage_daemon.route_open_count() >= 2);

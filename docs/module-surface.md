@@ -784,7 +784,9 @@ retain their original hints across restart; a resumed run keeps its frozen crede
 and accepts no fresh auth pin.
 
 The static exception is an API-key send that explicitly pins `auth.account` and supplies no
-pool, credential hint, account route or routing decision. Other API-key sends ask routing with
+pool, credential hint, account route or routing decision. That pin must name an exact eligible
+vault row; if it is no longer listed, broca refuses permanently rather than using another key.
+Other API-key sends ask routing with
 `mode: "admit"` and load the answered `account.credential_id`, never the credential hint.
 Broca validates that the answer declares method `apikey` and names an active, readable API key
 in its own vault listing. Its `provider_ids` must contain the credential provider, or be empty

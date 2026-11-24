@@ -4051,7 +4051,7 @@ async fn sleep_until_or_never(at: Option<time::Instant>) {
 }
 
 /// The protocol owns whether an individual route open may retry its refusal.
-fn route_open_is_retryable(code: &str) -> bool {
+pub(crate) fn route_open_is_retryable(code: &str) -> bool {
     // Model a future root-local retryable code without changing the pinned protocol.
     // The stand-in is unreachable in shipping builds and has no effect on real codes.
     #[cfg(all(test, feature = "test-clock"))]

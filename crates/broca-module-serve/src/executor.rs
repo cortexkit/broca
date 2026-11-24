@@ -179,7 +179,6 @@ pub struct UnreportedRejection {
 /// re-read and no report (see `refresh_expiring_secret`).
 struct VaultTokenRefresher {
     vault: Arc<VaultAuth>,
-    credential_key: String,
     vault_id: String,
     served_version: Arc<AtomicU64>,
     served_expires_at_ms: Arc<std::sync::Mutex<Option<i64>>>,
@@ -225,10 +224,10 @@ impl VaultTokenRefresher {
 
     /// Accounts for a failed vault read in the cache and the health gauge, the same way for
     /// both refresh paths.
-    fn note_read_failure(&self, error: &VaultError) {
+    fn note_read_failure(&self, error: &VaultError, vault_replied: bool) {
         let error_class = lkg_error_class(error);
-        evict_if_vault_authoritative(&self.vault.cache, &self.credential_key, error_class);
-        if error_class == LkgErrorClass::Connectivity {
+        evict_if_vault_authoritative(&self.vault.cache, &self.vault_id, error_class);
+        if error_class == LkgErrorClass::Connectivity || !vault_replied {
             self.vault.gauge.stamp_error();
         } else {
             self.vault.gauge.stamp_ok();
@@ -242,7 +241,7 @@ impl SecretRefresher for VaultTokenRefresher {
             let rejected = self.served_version.load(Ordering::SeqCst);
             // The provider's rejection is authoritative for the version it rejected: never
             // let this process's cache serve it again, whatever the vault answers next.
-            evict_for_provider_rejection(&self.vault.cache, &self.credential_key, status, rejected);
+            evict_for_provider_rejection(&self.vault.cache, &self.vault_id, status, rejected);
             // Recorded before sending, so the run-end report is skipped even when this one
             // is lost in transit: the rule is at most one report per rejected version.
             *self
@@ -286,7 +285,7 @@ impl SecretRefresher for VaultTokenRefresher {
                     tracing::warn!(target: "credentials", "credential reread outcome=refreshed vault_id='{}' old_version={rejected} new_version={}", self.vault_id, token.record_version);
                     self.vault
                         .cache
-                        .insert(self.credential_key.clone(), token.clone());
+                        .insert(self.vault_id.clone(), token.clone());
                     self.served_version
                         .store(token.record_version, Ordering::SeqCst);
                     self.set_served_expiry(token.expires_at_ms);
@@ -311,7 +310,7 @@ impl SecretRefresher for VaultTokenRefresher {
                 // Any other read failure proves nothing about the sign-in: the provider's 401
                 // stays the run's error and the run pauses for sign-in as before.
                 Err(error) => {
-                    self.note_read_failure(&error);
+                    self.note_read_failure(&error, got.vault_replied);
                     tracing::warn!(target: "credentials", "credential reread outcome=reread_failed vault_id='{}' rejected_version={rejected} error_class={:?} vault_replied={}", self.vault_id, lkg_error_class(&error), got.vault_replied);
                     if matches!(error, VaultError::NeedsReauth) {
                         RejectedRefresh::NeedsReauth
@@ -371,7 +370,7 @@ impl SecretRefresher for VaultTokenRefresher {
                     }
                     self.vault
                         .cache
-                        .insert(self.credential_key.clone(), token.clone());
+                        .insert(self.vault_id.clone(), token.clone());
                     self.set_served_expiry(token.expires_at_ms);
                     // The same version is the token already held. Its expiry is taken from
                     // the vault's answer above, so the check is not repeated on stale data,
@@ -400,7 +399,7 @@ impl SecretRefresher for VaultTokenRefresher {
                 // A definite sign-in loss is distinct from a read that could not tell.
                 // The transport can still use the held token until its own expiry.
                 Err(error) => {
-                    self.note_read_failure(&error);
+                    self.note_read_failure(&error, got.vault_replied);
                     if matches!(error, VaultError::NeedsReauth) {
                         return ExpiringRefresh::NeedsReauth {
                             held_expires_at_ms: expires_at_ms,
@@ -616,8 +615,9 @@ fn lkg_decision(
     }
 }
 
-/// Process-only token cache. It deliberately has no `Debug` implementation and is never
-/// persisted or logged; entries are cloned only into a run's existing secret auth path.
+/// Process-only tokens keyed by the vault record read, not the public key that resolved to it.
+/// This keeps tokens and record versions from crossing a listing remap. Entries are never
+/// logged or persisted, and are cloned only into a run's existing secret auth path.
 #[derive(Default)]
 pub struct VaultLkgCache {
     entries: Mutex<HashMap<String, VaultToken>>,
@@ -688,9 +688,7 @@ fn epoch_millis() -> i64 {
 
 fn lkg_error_class(error: &VaultError) -> LkgErrorClass {
     match error {
-        VaultError::Transport(_) | VaultError::Protocol(_) | VaultError::VaultLocked => {
-            LkgErrorClass::Connectivity
-        }
+        VaultError::Transport(_) | VaultError::VaultLocked => LkgErrorClass::Connectivity,
         // AUTHORITATIVE NEGATIVES: the vault replied, and the reply says this credential
         // cannot be used -- the grant needs re-auth, or the handle does not exist at all.
         // Both evict, because the doc on LkgErrorClass promises an authoritative reply never
@@ -747,15 +745,15 @@ fn recorded_vault_request(
 fn resolve_vault_outcome(
     cache: &VaultLkgCache,
     gauge: &broca_module_serve::serve::VaultGauge,
-    credential_id: &str,
-    outcome: Result<VaultToken, VaultError>,
+    vault_id: &str,
+    outcome: VaultGet,
     now_ms: i64,
     min_ttl_ms: i64,
 ) -> Result<VaultToken, VaultError> {
-    match outcome {
+    match outcome.result {
         Ok(token) => {
             gauge.stamp_ok();
-            cache.insert(credential_id.to_string(), token.clone());
+            cache.insert(vault_id.to_string(), token.clone());
             Ok(token)
         }
         // Refused in this process before anything was sent: it says nothing about the vault,
@@ -764,13 +762,17 @@ fn resolve_vault_outcome(
         Err(error) => {
             let error_class = lkg_error_class(&error);
             // Authoritative re-auth state must invalidate older process memory.
-            evict_if_vault_authoritative(cache, credential_id, error_class);
+            evict_if_vault_authoritative(cache, vault_id, error_class);
             if error_class != LkgErrorClass::Connectivity {
-                gauge.stamp_ok();
+                if outcome.vault_replied {
+                    gauge.stamp_ok();
+                } else {
+                    gauge.stamp_error();
+                }
                 return Err(error);
             }
 
-            let cached = cache.get(credential_id);
+            let cached = cache.get(vault_id);
             let cached_meta = cached.as_ref().map(|token| CachedCredentialMeta {
                 expires_at_ms: token.expires_at_ms,
             });
@@ -1935,7 +1937,7 @@ pub struct VaultAuth {
     /// The health gauge this executor stamps from vault-call outcomes, so the
     /// `health.check` reply reports live vault reachability without probing anything.
     pub gauge: std::sync::Arc<broca_module_serve::serve::VaultGauge>,
-    /// Process-only last-known-good credentials keyed by canonical credential id.
+    /// Process-only last-known-good credentials keyed by the resolved vault record id.
     pub cache: VaultLkgCache,
     /// The latest `credential.list_scoped` answer: the candidate accounts broca offers
     /// routing when it asks which account a run should use.
@@ -2087,13 +2089,15 @@ async fn report_rejection_after_run(
     };
     // Provider rejection is authoritative even if the best-effort vault report cannot be
     // delivered; never let this process serve the rejected token again.
-    // The cache is keyed by the selection's credential id, exactly as the read stored it.
-    evict_for_provider_rejection(
-        &vault.cache,
-        &selection.credential_id,
-        rejection.status,
-        rejection.record_version,
-    );
+    // Use the record actually read, not a public key the listing might have since remapped.
+    if let Some(vault_id) = selection.resolved_credential_id.as_deref() {
+        evict_for_provider_rejection(
+            &vault.cache,
+            vault_id,
+            rejection.status,
+            rejection.record_version,
+        );
+    }
     let _ = report_wire_auth_failure(vault, selection, rejection.status, rejection.record_version)
         .await;
 }
@@ -3823,6 +3827,13 @@ impl LiveLoopExecutor {
                     // would hide the misconfiguration the operator needs to see.
                     let vault_id = match frozen_resolved_id {
                         Some(id) => id.to_owned(),
+                        None if fresh_episode
+                            && frozen_credential_id.is_none()
+                            && pinned_account.is_some()
+                            && key.method == AuthMethod::ApiKey =>
+                        {
+                            vault.addressing.vault_id_for_pin(&key)?
+                        }
                         None => {
                             let row = if frozen_credential_id.is_none()
                                 && pinned_method.is_none()
@@ -3870,7 +3881,7 @@ impl LiveLoopExecutor {
             // replace a failure with a token the vault did not serve for this request.
             let recorded_request = recorded_vault_request(&got, vault_request);
             // Reject a different account before it can enter the shared cache: static
-            // admissions using the same credential key do not have a routed-account check.
+            // admissions using the same vault record do not have a routed-account check.
             if let (Some((routed_vault_id, routed_account, ..)), Ok(token)) = (&routed, &got.result)
             {
                 vault.gauge.stamp_ok();
@@ -3879,8 +3890,8 @@ impl LiveLoopExecutor {
             let outcome = resolve_vault_outcome(
                 &vault.cache,
                 vault.gauge.as_ref(),
-                &credential_key,
-                got.result,
+                &vault_id,
+                got,
                 epoch_millis(),
                 VAULT_MIN_TTL_MS,
             );
@@ -3979,7 +3990,6 @@ impl LiveLoopExecutor {
             InRunRefresh {
                 refresher: SharedSecretRefresher(Arc::new(VaultTokenRefresher {
                     vault: Arc::clone(vault),
-                    credential_key: credential_key.clone(),
                     vault_id: vault_id.clone(),
                     served_version: Arc::clone(&served_version),
                     served_expires_at_ms: Arc::clone(&served_expires_at_ms),

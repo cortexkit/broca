@@ -336,6 +336,22 @@ impl VaultAddressing {
         Ok(crate::auth_routing::credential_row(&listing, key)?.map(|row| row.id.clone()))
     }
 
+    /// A caller pin is not a method/provider alias: a missing row must not charge another account.
+    pub fn vault_id_for_pin(&self, key: &CredentialId) -> Result<String, broca_core::RunError> {
+        let (listing, _) = self
+            .listing
+            .get()
+            .ok_or(broca_core::RunError::CredentialsUnavailable)?;
+        let id = key.to_id_string();
+        if crate::auth_routing::exact_credential_row(&listing, &id).is_some() {
+            Ok(id)
+        } else {
+            Err(broca_core::RunError::Config(format!(
+                "pinned vault credential '{id}' is not listed as an eligible active row"
+            )))
+        }
+    }
+
     /// Frozen vault ids are authoritative even before the listing is loaded. Older selections
     /// without one resolve their frozen key, never the current default method.
     pub fn vault_id_for_selection(
