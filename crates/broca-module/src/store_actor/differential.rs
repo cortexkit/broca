@@ -1465,6 +1465,7 @@ mod one_shot;
 mod ordered;
 mod pauses;
 mod photo_sends;
+mod plan_notes;
 mod refresh;
 #[cfg(feature = "test-clock")]
 mod retention;

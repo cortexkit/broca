@@ -3,10 +3,59 @@
 //! waits under `notes_until_rebuild`.
 
 use super::*;
+use broca_protocol::session_change::{NoteKind, NotesDelivery};
+use broca_session_store::record::{PlanNote, PlanNoteKind, PlanNotes};
+
+/// The records of `admission`'s plan change, which its start's batch writes after the run's
+/// input so the start is still followed directly by its input: the pending change the run
+/// applies, and the notes it delivers about a change still pending.
+pub(super) fn change_records<W: Writer>(
+    admission: &Admission,
+    writer: &W,
+) -> impl Iterator<Item = Record> {
+    let applied = (admission.applies_refresh.as_ref())
+        .map(|applied| Record::RefreshApplied(refresh_applied(applied)));
+    let notes = (admission.plan_notes.as_ref())
+        .map(|notes| Record::PlanNotes(at_input(notes, writer, admission.input.len())));
+    applied.into_iter().chain(notes)
+}
+
+/// The record of `delivery`, the notes a run start delivers, anchored at the last of the
+/// `inputs` messages the start appends to `writer`'s conversation: every request from the run's
+/// first renders the notes right after that message.
+fn at_input<W: Writer>(delivery: &NotesDelivery, writer: &W, inputs: usize) -> PlanNotes {
+    let conversation = writer.conversation();
+    let last_input =
+        conversation.window_start() - 1 + conversation.messages.len() as u64 + inputs as u64;
+    record(delivery, last_input)
+}
+
+/// The record of `delivery`, the notes a run start delivers, anchored at the conversation
+/// entry of ordinal `anchor`.
+fn record(delivery: &NotesDelivery, anchor: u64) -> PlanNotes {
+    PlanNotes {
+        generation: delivery.generation,
+        anchor,
+        notes: delivery
+            .notes
+            .iter()
+            .map(|note| PlanNote {
+                kind: match note.kind {
+                    NoteKind::System => PlanNoteKind::System,
+                    NoteKind::ToolRemoval => PlanNoteKind::ToolRemoval,
+                },
+                text: note.text.clone(),
+                form: note.form.clone(),
+            })
+            .collect(),
+        refused_tools: delivery.refused_tools.clone(),
+        model_key: delivery.model_key.clone(),
+    }
+}
 
 /// A run start's application of a pending plan change, as the record that follows the run's
 /// input in the start's batch keeps it.
-pub(super) fn refresh_applied(
+fn refresh_applied(
     applied: &broca_protocol::session_change::AppliedChange,
 ) -> broca_session_store::record::RefreshApplied {
     broca_session_store::record::RefreshApplied {
@@ -15,7 +64,7 @@ pub(super) fn refresh_applied(
         manifest_digest: applied.manifest_digest.clone(),
         composition_digest: applied.composition_digest.clone(),
         absent_items: applied.absent_items.clone(),
-        reason: None,
+        reason: applied.reason.clone(),
     }
 }
 

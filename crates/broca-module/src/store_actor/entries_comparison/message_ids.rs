@@ -301,6 +301,7 @@ async fn message_ids_use_served_facts_after_compaction_enrolment() {
             "immediately".into(),
             Box::new(refreshed),
             Vec::new(),
+            None,
         )
         .await
         .unwrap();

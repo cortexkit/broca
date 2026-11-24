@@ -4655,6 +4655,7 @@ where
                     request.policy,
                     request.generation,
                     request.refetch.unwrap_or_default(),
+                    request.system_note,
                 )
                 .await
             {
@@ -4684,20 +4685,10 @@ where
                         .await;
                     }
                 };
-            if let Err(field) = request.check_policy() {
-                return send_invalid_params(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    Some(field.into()),
-                    &format!(
-                        "policy must be one of {}",
-                        cortexkit_role_llm_runner::rungs::ALL.join(", ")
-                    ),
-                )
-                .await;
+            if let Some((field, message)) = serve_refresh::policy_refusal(&request.policy) {
+                let field = Some(field.into());
+                return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
+                    .await;
             }
             // `send_id` is required: a missing or empty key is `invalid_params`, not a reuse.
             if request.send_id.is_empty() {

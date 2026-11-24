@@ -28,7 +28,12 @@ cipher_tests!(
 /// A plan whose system text is `text`, offering the tools `tools` from one provider. With
 /// `pinned`, its system text item names the model it was written for, so a run on another
 /// model is refused. With `chooses`, the plan chooses the session's next-run model.
-fn plan(text: &str, tools: &[&str], pinned: Option<Value>, chooses: Option<Value>) -> Value {
+pub(super) fn plan(
+    text: &str,
+    tools: &[&str],
+    pinned: Option<Value>,
+    chooses: Option<Value>,
+) -> Value {
     let composition = json!({
         "providers": [{"provider": "fixture", "tools": tools
             .iter()
@@ -55,7 +60,7 @@ fn plan(text: &str, tools: &[&str], pinned: Option<Value>, chooses: Option<Value
 }
 
 /// The manifest an admitter fetches for `plan`, under the plan identity `identity`.
-fn manifest(plan: &Value, identity: &str) -> broca_records::record::PlanManifest {
+pub(super) fn manifest(plan: &Value, identity: &str) -> broca_records::record::PlanManifest {
     let tools = plan["composition"]["providers"][0]["tools"]
         .as_array()
         .unwrap()
@@ -183,6 +188,7 @@ async fn drive(
                         (*policy).into(),
                         Box::new(manifest.clone()),
                         Vec::new(),
+                        None,
                     )
                     .await
                     .expect("the refresh is routed")

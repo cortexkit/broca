@@ -49,12 +49,12 @@ PASS fork_answer_conversation_key_bounded
 PASS fork_answer_survives_restart
 N/A history_intake_growing_prefix: history_intake is not declared
 N/A history_intake_send_waits_for_history: history_intake is not declared
-N/A plan_notes_requires_session_change: plan_notes is not declared
-N/A plan_notes_undeclared_policy_refused: adapter supplies no plan-note fixture
-N/A plan_notes_pending_until_reconcile: plan_notes is not declared
-N/A plan_notes_not_stored_entries: plan_notes is not declared
-N/A plan_notes_removed_tool_refused: plan_notes is not declared
-N/A plan_notes_system_note_not_full_text: plan_notes is not declared
+PASS plan_notes_requires_session_change
+N/A plan_notes_undeclared_policy_refused: plan_notes is declared
+N/A plan_notes_pending_until_reconcile: adapter supplies no plan-note fixture
+N/A plan_notes_not_stored_entries: adapter supplies no plan-note fixture
+N/A plan_notes_removed_tool_refused: adapter supplies no plan-note fixture
+N/A plan_notes_system_note_not_full_text: adapter supplies no plan-note fixture
 PASS media_refs_media_are_refs
 PASS media_refs_large_payloads_inline
 PASS media_refs_descriptor_digests

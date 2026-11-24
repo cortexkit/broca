@@ -696,6 +696,7 @@ async fn concurrent_identical_refreshes_fetch_and_write_once() {
             "immediately".into(),
             1,
             Vec::new(),
+            None,
         ),
         registry.session_refresh(
             &rig.session,
@@ -705,6 +706,7 @@ async fn concurrent_identical_refreshes_fetch_and_write_once() {
             "immediately".into(),
             1,
             Vec::new(),
+            None,
         ),
     );
     assert_eq!(one, two);

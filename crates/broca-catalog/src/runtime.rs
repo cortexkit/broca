@@ -815,6 +815,24 @@ impl CatalogSnapshot {
             .is_some_and(|(_, model)| model.effort_change_cache == Some(true))
     }
 
+    /// Whether this model's route takes a system-role turn in the middle of the conversation,
+    /// as admission freezes it into a run (`broca_provider::turn_system::catalog_support`).
+    /// `false` when the catalog does not list the model or has no renderer for its provider.
+    pub fn turn_system_form(&self, provider_id: &str, model_id: &str) -> bool {
+        self.0
+            .catalog
+            .provider_and_model(provider_id, model_id)
+            .is_some_and(|(provider, model)| {
+                provider.spec.as_ref().is_some_and(|spec| {
+                    broca_provider::turn_system::catalog_support(
+                        spec.wire_family,
+                        &spec.id,
+                        &model.to_spec(model_id),
+                    )
+                })
+            })
+    }
+
     /// The upstream mode names this model has a priced input AND output rate for, sorted.
     /// Empty for a model the catalog does not list.
     pub fn priced_modes(&self, provider_id: &str, model_id: &str) -> Vec<String> {

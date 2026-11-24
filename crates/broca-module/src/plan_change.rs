@@ -19,6 +19,8 @@ pub(crate) struct Accepted {
     pub policy: String,
     /// The providers it asked to read afresh, empty when it named none.
     pub refetch: Vec<String>,
+    /// Its note on a changed system text, under `notes_until_rebuild`.
+    pub system_note: Option<String>,
     pub run_in_progress: bool,
     pub applies_from_next_run: bool,
 }
@@ -36,6 +38,8 @@ pub(crate) struct ChangeFacts {
     pub current_manifest: Option<Arc<PlanManifest>>,
     /// A flush hasn't reached a new run yet.
     pub flushed: bool,
+    /// The pending refresh's note on a changed system text, if it sent one.
+    pub pending_note: Option<String>,
     /// The refresh accepted under the request's generation, if one was.
     pub accepted: Option<Accepted>,
     /// How the request's generation applied (`fold` or `append`), if it did.
@@ -84,6 +88,7 @@ pub(crate) fn refresh_order(
     plan_identity: &str,
     policy: &str,
     refetch: &[String],
+    system_note: Option<&str>,
 ) -> Result<Option<(bool, bool)>, SessionChangeError> {
     use cortexkit_role_llm_runner::session_change::{refresh_order_with_refetch, RefreshOrder};
     fn named(list: &[String]) -> Option<&[String]> {
@@ -107,6 +112,13 @@ pub(crate) fn refresh_order(
                 .accepted
                 .as_ref()
                 .expect("a repeat names an accepted refresh");
+            // An identical repeat carries the same note too (llm-runner `plan_notes`); another
+            // body under an accepted generation is stale, as any other change would be.
+            if accepted.system_note.as_deref() != system_note {
+                return Err(SessionChangeError::GenerationStale {
+                    accepted: facts.accepted_generation,
+                });
+            }
             Ok(Some((
                 accepted.run_in_progress,
                 accepted.applies_from_next_run,
@@ -139,18 +151,27 @@ pub(crate) enum RefreshAcceptance {
 /// `manifest`, made where it writes: generation order against what the session accepted since
 /// the serve layer looked, the compaction item, which stays the session's for its life once it
 /// has one (a session in the session store may gain one, see [`ChangeFacts::enrollment`]), and the
-/// rungs the changed surfaces support. A new refresh's reply says whether a run is in progress
-/// and whether the change applies from the next run, which it does under `immediately` or after
-/// a flush.
+/// rungs the changed surfaces support, and the note `notes_until_rebuild` needs exactly when the
+/// system text changed (llm-runner `plan_notes`). A new refresh's reply says whether a run is in
+/// progress and whether the change applies from the next run, which it does under `immediately`
+/// or after a flush.
 pub(crate) fn accept_refresh(
     facts: &ChangeFacts,
     generation: u64,
     policy: &str,
     manifest: &PlanManifest,
     refetch: &[String],
+    system_note: Option<&str>,
     run_in_progress: bool,
 ) -> RefreshAcceptance {
-    match refresh_order(facts, generation, &manifest.plan_identity, policy, refetch) {
+    match refresh_order(
+        facts,
+        generation,
+        &manifest.plan_identity,
+        policy,
+        refetch,
+        system_note,
+    ) {
         Ok(Some((run_in_progress, applies_from_next_run))) => {
             return RefreshAcceptance::Repeat {
                 run_in_progress,
@@ -198,10 +219,47 @@ pub(crate) fn accept_refresh(
             rung: policy.into(),
         });
     }
+    if let Err(field) = check_system_note(
+        facts.current_manifest.as_deref(),
+        manifest,
+        policy,
+        system_note,
+    ) {
+        return RefreshAcceptance::Refused(field);
+    }
     RefreshAcceptance::Accept {
         run_in_progress,
         applies_from_next_run: policy == "immediately" || facts.flushed,
     }
+}
+
+/// llm-runner's check of a refresh's `system_note` against what it changes: under
+/// `notes_until_rebuild` a note is required exactly when the fetched system text differs from
+/// the applied plan's (none applied reads as empty text), and at most 8,192 bytes; under any
+/// other policy there is none.
+pub(crate) fn check_system_note(
+    current: Option<&PlanManifest>,
+    next: &PlanManifest,
+    policy: &str,
+    system_note: Option<&str>,
+) -> Result<(), SessionChangeError> {
+    let changed = current.map_or("", |current| current.system_text.as_str()) != next.system_text;
+    cortexkit_role_llm_runner::plan_notes::check_refresh(
+        policy,
+        system_note,
+        changed,
+        &[cortexkit_role_llm_runner::capabilities::PLAN_NOTES],
+    )
+    .map_err(|field| SessionChangeError::InvalidParams {
+        field: field.into(),
+        message: if field == "system_note" {
+            "under notes_until_rebuild a system_note is required exactly when the system text \
+             changes, and is at most 8192 bytes"
+                .into()
+        } else {
+            format!("policy {policy} is not accepted")
+        },
+    })
 }
 
 /// Classify a `session.refresh_policy` without side effects: `Ok(true)` for an identical repeat
@@ -254,6 +312,23 @@ pub(crate) fn check_policy(
         return Err(SessionChangeError::RungUnsupported {
             surface: surface.into(),
             rung: policy.into(),
+        });
+    }
+    // A change of system text can wait under `notes_until_rebuild` only with the note its
+    // refresh recorded; otherwise the owner sends the refresh again with one.
+    if policy == cortexkit_role_llm_runner::plan_notes::NOTES_UNTIL_REBUILD
+        && facts.pending_note.is_none()
+        && facts
+            .current_manifest
+            .as_deref()
+            .map_or("", |current| current.system_text.as_str())
+            != pending.manifest.system_text
+    {
+        return Err(SessionChangeError::InvalidParams {
+            field: "system_note".into(),
+            message: "the pending refresh changes the system text and recorded no system_note; \
+                      send session.refresh again with one"
+                .into(),
         });
     }
     Ok(false)
@@ -366,12 +441,13 @@ pub(crate) fn view_waiting(operations: &broca_session_store::fold::operations::O
 }
 
 /// The plan a new run of a session that already ran freezes (`StoreActor::run_plan`): its
-/// manifest, the pending change it applies, and whether it starts at a prefix rebuild or
-/// applies that change.
+/// manifest, the pending change it applies, whether it starts at a prefix rebuild or applies
+/// that change, and the plan notes it delivers about a change that keeps waiting.
 pub(crate) type RunPlan = (
     Option<Arc<PlanManifest>>,
     Option<broca_protocol::session_change::AppliedChange>,
     bool,
+    Option<broca_protocol::session_change::NotesDelivery>,
 );
 
 /// The pending change, when it applies at a run start on `model`: `rebuild` and `flushed` say
@@ -524,6 +600,7 @@ mod tests {
                 plan_identity: "plan-2".into(),
                 policy: "immediately".into(),
                 refetch: Vec::new(),
+                system_note: None,
                 run_in_progress: true,
                 applies_from_next_run: true,
             }),
@@ -531,25 +608,99 @@ mod tests {
         }
     }
 
+    /// llm-runner `plan_notes`: an identical repeat carries the same note, so another note under
+    /// an accepted generation is stale; a note is required exactly when the system text changes;
+    /// and a policy change to `notes_until_rebuild` needs the note the pending refresh recorded.
+    #[test]
+    fn a_system_note_repeats_with_its_refresh_and_comes_exactly_with_a_system_change() {
+        let mut facts = facts();
+        facts.accepted.as_mut().unwrap().system_note = Some("Be brief.".into());
+        assert_eq!(
+            refresh_order(&facts, 2, "plan-2", "immediately", &[], Some("Be brief.")),
+            Ok(Some((true, true)))
+        );
+        for note in [None, Some("Be long.")] {
+            assert_eq!(
+                refresh_order(&facts, 2, "plan-2", "immediately", &[], note),
+                Err(SessionChangeError::GenerationStale { accepted: 2 }),
+                "{note:?}"
+            );
+        }
+        let current = manifest("old", &["a"], "text");
+        let (same, changed) = (
+            manifest("new", &["b"], "text"),
+            manifest("new", &["a"], "other"),
+        );
+        let field = |result: Result<(), SessionChangeError>| match result {
+            Ok(()) => None,
+            Err(SessionChangeError::InvalidParams { field, .. }) => Some(field),
+            Err(other) => panic!("{other:?}"),
+        };
+        let notes = "notes_until_rebuild";
+        assert_eq!(
+            field(check_system_note(
+                Some(&current),
+                &changed,
+                notes,
+                Some("n")
+            )),
+            None
+        );
+        assert_eq!(
+            field(check_system_note(Some(&current), &same, notes, None)),
+            None
+        );
+        for (next, note) in [(&changed, None), (&same, Some("n"))] {
+            assert_eq!(
+                field(check_system_note(Some(&current), next, notes, note)),
+                Some("system_note".into())
+            );
+        }
+        assert_eq!(
+            field(check_system_note(
+                Some(&current),
+                &changed,
+                "immediately",
+                Some("n")
+            )),
+            Some("system_note".into())
+        );
+        // A policy change to notes needs the pending refresh's note when the text changes.
+        let mut pending = facts;
+        pending.accepted = None;
+        pending.pending = Some(PendingState {
+            generation: 3,
+            policy: "on_prefix_rebuild".into(),
+            manifest: Arc::new(changed),
+        });
+        pending.accepted_generation = 3;
+        assert!(matches!(
+            check_policy(&pending, 3, notes, "s1"),
+            Err(SessionChangeError::InvalidParams { field, .. }) if field == "system_note"
+        ));
+        pending.pending_note = Some("n".into());
+        assert_eq!(check_policy(&pending, 3, notes, "s1"), Ok(false));
+    }
+
     #[test]
     fn a_refresh_is_a_repeat_new_or_stale_by_what_was_accepted() {
         let facts = facts();
         assert_eq!(
-            refresh_order(&facts, 2, "plan-2", "immediately", &[]),
+            refresh_order(&facts, 2, "plan-2", "immediately", &[], None),
             Ok(Some((true, true)))
         );
         assert_eq!(
-            refresh_order(&facts, 3, "plan-3", "immediately", &[]),
+            refresh_order(&facts, 3, "plan-3", "immediately", &[], None),
             Ok(None)
         );
         assert_eq!(
-            refresh_order(&facts, 2, "plan-other", "immediately", &[]),
+            refresh_order(&facts, 2, "plan-other", "immediately", &[], None),
             Err(SessionChangeError::GenerationStale { accepted: 2 })
         );
         let mut older = facts;
         older.accepted = None;
         assert_eq!(
-            refresh_order(&older, 1, "plan-1", "immediately", &[]),
+            refresh_order(&older, 1, "plan-1", "immediately", &[], None),
             Err(SessionChangeError::GenerationStale { accepted: 2 })
         );
     }
@@ -572,19 +723,20 @@ mod tests {
                 2,
                 "plan-2",
                 "immediately",
-                &list(&["aft", "plexus"])
+                &list(&["aft", "plexus"]),
+                None,
             ),
             Ok(Some((true, true)))
         );
         for other in [list(&[]), list(&["aft"]), list(&["plexus", "aft"])] {
             assert_eq!(
-                refresh_order(&facts, 2, "plan-2", "immediately", &other),
+                refresh_order(&facts, 2, "plan-2", "immediately", &other, None),
                 Err(SessionChangeError::GenerationStale { accepted: 2 }),
                 "{other:?}"
             );
         }
         assert_eq!(
-            refresh_order(&facts, 3, "plan-2", "immediately", &list(&["aft"])),
+            refresh_order(&facts, 3, "plan-2", "immediately", &list(&["aft"]), None),
             Ok(None)
         );
     }
@@ -594,7 +746,7 @@ mod tests {
         let mut facts = facts();
         let next = manifest("plan-3", &["a"], "text");
         assert_eq!(
-            accept_refresh(&facts, 3, "on_prefix_rebuild", &next, &[], false),
+            accept_refresh(&facts, 3, "on_prefix_rebuild", &next, &[], None, false),
             RefreshAcceptance::Accept {
                 run_in_progress: false,
                 applies_from_next_run: false
@@ -602,7 +754,7 @@ mod tests {
         );
         facts.flushed = true;
         assert_eq!(
-            accept_refresh(&facts, 3, "on_prefix_rebuild", &next, &[], true),
+            accept_refresh(&facts, 3, "on_prefix_rebuild", &next, &[], None, true),
             RefreshAcceptance::Accept {
                 run_in_progress: true,
                 applies_from_next_run: true
@@ -615,6 +767,7 @@ mod tests {
                 "immediately",
                 &manifest("plan-2", &[], ""),
                 &[],
+                None,
                 false
             ),
             RefreshAcceptance::Repeat {
@@ -633,7 +786,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            accept_refresh(&facts, 3, "immediately", &compacting, &[], false),
+            accept_refresh(&facts, 3, "immediately", &compacting, &[], None, false),
             RefreshAcceptance::Refused(SessionChangeError::InvalidParams { field, .. })
                 if field == "plan.compaction_item"
         ));
@@ -644,6 +797,7 @@ mod tests {
                 "on_system_rebuild",
                 &manifest("plan-3", &["b"], "text"),
                 &[],
+                None,
                 false
             ),
             RefreshAcceptance::Refused(SessionChangeError::RungUnsupported {
@@ -937,7 +1091,7 @@ mod tests {
             ..ChangeFacts::default()
         };
         assert_eq!(
-            accept_refresh(&today, 1, "immediately", &adding, &[], false),
+            accept_refresh(&today, 1, "immediately", &adding, &[], None, false),
             RefreshAcceptance::Refused(fixed.clone())
         );
         let store = ChangeFacts {
@@ -954,17 +1108,18 @@ mod tests {
             "immediately",
             &adding,
             &[],
+            None,
             false
         )));
         let mut cut = store.clone();
         cut.enrollment.as_mut().unwrap().window_whole = false;
         assert_eq!(
-            accept_refresh(&cut, 1, "immediately", &adding, &[], false),
+            accept_refresh(&cut, 1, "immediately", &adding, &[], None, false),
             not_addable(Refusal::WindowNotWhole)
         );
         let silent = with_item("silent", "", Some(item.clone()));
         assert_eq!(
-            accept_refresh(&store, 1, "immediately", &silent, &[], false),
+            accept_refresh(&store, 1, "immediately", &silent, &[], None, false),
             not_addable(Refusal::NoSystemText)
         );
         let mut quiet = store.clone();
@@ -975,6 +1130,7 @@ mod tests {
             "immediately",
             &silent,
             &[],
+            None,
             false
         )));
         let pending = ChangeFacts {
@@ -993,6 +1149,7 @@ mod tests {
             "immediately",
             &again,
             &[],
+            None,
             false
         )));
         let mut other = item.clone();
@@ -1002,7 +1159,7 @@ mod tests {
             with_item("changed", "text", Some(other)),
         ] {
             assert_eq!(
-                accept_refresh(&pending, 2, "immediately", &next, &[], false),
+                accept_refresh(&pending, 2, "immediately", &next, &[], None, false),
                 RefreshAcceptance::Refused(fixed.clone())
             );
             let today_pending = ChangeFacts {
@@ -1010,7 +1167,7 @@ mod tests {
                 ..pending.clone()
             };
             assert_eq!(
-                accept_refresh(&today_pending, 2, "immediately", &next, &[], false),
+                accept_refresh(&today_pending, 2, "immediately", &next, &[], None, false),
                 RefreshAcceptance::Refused(fixed.clone())
             );
         }

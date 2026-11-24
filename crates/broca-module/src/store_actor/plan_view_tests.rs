@@ -205,6 +205,7 @@ async fn refresh(
             policy: policy.into(),
             manifest: Box::new(manifest),
             refetch: Vec::new(),
+            system_note: None,
             reply,
         })
         .unwrap();

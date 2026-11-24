@@ -108,6 +108,7 @@ pub fn admission<P: Provider>(
         },
         pre_model_error: control.pre_model_error.clone(),
         applies_refresh: control.applies_refresh.clone(),
+        plan_notes: control.plan_notes.clone(),
         rebuild_point: control.rebuild_point,
         head_turn: req.head_turn,
     })

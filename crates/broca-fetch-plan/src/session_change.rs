@@ -103,7 +103,11 @@ pub fn unsupported_surface(
     next: &PlanManifest,
     policy: &str,
 ) -> Option<&'static str> {
-    if TOOLS_RUNGS.contains(&policy) && SYSTEM_TEXT_RUNGS.contains(&policy) {
+    // `notes_until_rebuild` (llm-runner `plan_notes`) is no rung: it waits for its own reconcile
+    // points whatever surface changed.
+    if (TOOLS_RUNGS.contains(&policy) && SYSTEM_TEXT_RUNGS.contains(&policy))
+        || policy == cortexkit_role_llm_runner::plan_notes::NOTES_UNTIL_REBUILD
+    {
         return None;
     }
     let tools_changed = current.is_none_or(|old| old.tools != next.tools);
@@ -189,6 +193,7 @@ impl EffectiveState {
                 .iter()
                 .map(|item| serde_json::to_value(item).expect("an absent item encodes"))
                 .collect(),
+            reason: None,
         }
     }
 }

@@ -126,6 +126,11 @@ pub struct RunControl {
     /// the run's start; this crate's log loop ignores it, because it works the application out
     /// again from the log.
     pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
+    /// What a fresh run tells the model about a change still pending under
+    /// `notes_until_rebuild` (llm-runner `plan_notes`), which the session store's run loop
+    /// records after the run's input in the batch of its start. `None` when the run delivers
+    /// nothing new.
+    pub plan_notes: Option<broca_protocol::session_change::NotesDelivery>,
     /// Whether a fresh run starts at a prefix rebuild of its session, or applies a pending
     /// plan change: the points where it takes a versioned tool's same-major definition
     /// (llm-runner `tool_versions`). Not frozen: a run read back from its start has none.
@@ -194,6 +199,7 @@ impl Default for RunControl {
             manifest: None,
             manifest_system_override: false,
             applies_refresh: None,
+            plan_notes: None,
             rebuild_point: false,
             account_reporter: None,
             keep_warm: None,

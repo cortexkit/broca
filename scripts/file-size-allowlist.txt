@@ -2,6 +2,6 @@
 # each had when the limit began, which it may not grow past. scripts/check-file-sizes.sh reads
 # this file. Lower or drop an entry when its file shrinks.
 13586 crates/broca-provider/src/transport.rs provider HTTP and socket transport; split retry, socket and stream
-7087 crates/broca-module-serve/src/serve.rs every route's handler; split by operation family
+7078 crates/broca-module-serve/src/serve.rs every route's handler; split by operation family
 6429 crates/broca-session-loop/src/run.rs the run loop; split into model step, tool batch and between-step work (applying the compaction provider's prompt edits, messages sent into a running run)
 6163 crates/broca-wire/src/lib.rs wire types of every op; split by op family

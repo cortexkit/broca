@@ -1,36 +1,86 @@
 //! The request checks `session.refresh` makes before anything reaches the session.
 
-use cortexkit_role_llm_runner::session_change::RefreshRequest;
+use cortexkit_role_llm_runner::{
+    capabilities,
+    plan_notes::{self, PlanNotesRefreshRequest},
+};
 use std::collections::BTreeSet;
 
 /// `params` decoded as a `session.refresh` request, or its first `invalid_params` refusal: the
 /// field it names, when it names one, and the message. `output_refs_advertised` is whether this
-/// runner declares the `output_refs` group. Nothing is written for a refused request.
+/// runner declares the `output_refs` group. broca declares `plan_notes` and not
+/// `refresh_relaunch`, so the request is llm-runner's plan-notes view of the body. Nothing is
+/// written for a refused request.
 pub(super) fn decode(
     params: &serde_json::Value,
     output_refs_advertised: bool,
-) -> Result<RefreshRequest, (Option<String>, String)> {
-    let request: RefreshRequest = serde_json::from_value(params.clone()).map_err(|error| {
-        (
-            broca_wire::failing_field::<RefreshRequest>(params, &error),
-            error.to_string(),
-        )
-    })?;
+) -> Result<PlanNotesRefreshRequest, (Option<String>, String)> {
+    let request: PlanNotesRefreshRequest =
+        serde_json::from_value(params.clone()).map_err(|error| {
+            (
+                broca_wire::failing_field::<PlanNotesRefreshRequest>(params, &error),
+                error.to_string(),
+            )
+        })?;
     match params_refusal(&request, output_refs_advertised) {
         Some((field, message)) => Err((Some(field.into()), message)),
         None => Ok(request),
     }
 }
 
+/// The `invalid_params` refusal of a `session.refresh_policy` asking for `policy`, as the field
+/// it names and the message, or `None` for a policy this runner serves. broca declares
+/// `plan_notes`, so `notes_until_rebuild` is served beside the rungs.
+pub(super) fn policy_refusal(policy: &str) -> Option<(&'static str, String)> {
+    plan_notes::check_policy(policy, &[capabilities::PLAN_NOTES])
+        .err()
+        .map(|field| {
+            let rungs = cortexkit_role_llm_runner::rungs::ALL.join(", ");
+            let notes = plan_notes::NOTES_UNTIL_REBUILD;
+            (field, format!("policy must be one of {rungs}, or {notes}"))
+        })
+}
+
 /// The first refusal a decoded `request` earns, as the field it names and the message, or
 /// `None` when the request may go to the session.
 fn params_refusal(
-    request: &RefreshRequest,
+    request: &PlanNotesRefreshRequest,
     output_refs_advertised: bool,
 ) -> Option<(&'static str, String)> {
-    if let Err(field) = request.check_policy() {
+    if request.required.is_some() {
+        return Some((
+            "required",
+            "required needs the refresh_relaunch group".into(),
+        ));
+    }
+    if let Err(field) = plan_notes::check_policy(&request.policy, &[capabilities::PLAN_NOTES]) {
         let rungs = cortexkit_role_llm_runner::rungs::ALL.join(", ");
-        return Some((field, format!("policy must be one of {rungs}")));
+        return Some((
+            field,
+            format!(
+                "policy must be one of {rungs}, or {}",
+                plan_notes::NOTES_UNTIL_REBUILD
+            ),
+        ));
+    }
+    // Whether a note is required depends on the fetched system text, which the session checks
+    // where it writes; its policy and size don't.
+    if let Some(note) = &request.system_note {
+        if request.policy != plan_notes::NOTES_UNTIL_REBUILD {
+            return Some((
+                "system_note",
+                format!(
+                    "system_note needs policy {}",
+                    plan_notes::NOTES_UNTIL_REBUILD
+                ),
+            ));
+        }
+        if note.len() > plan_notes::SYSTEM_NOTE_MAX {
+            return Some((
+                "system_note",
+                format!("system_note is over {} bytes", plan_notes::SYSTEM_NOTE_MAX),
+            ));
+        }
     }
     // broca declares `tool_versions` (`broca_wire::role`), so `refetch` is served once its list
     // names the plan's own providers.
@@ -39,7 +89,10 @@ fn params_refusal(
             return Some(("refetch", message));
         }
     }
-    if let Err(field) = request.check_output_refs(output_refs_advertised) {
+    if let Err(field) = cortexkit_role_llm_runner::output_refs::check_plan(
+        &serde_json::Value::Object(request.plan.clone()),
+        output_refs_advertised,
+    ) {
         return Some((
             field,
             "a plan item carries output_refs on a runner without the group".into(),
@@ -80,10 +133,10 @@ fn check_refetch_providers(
 #[cfg(test)]
 mod tests {
     use super::params_refusal;
-    use cortexkit_role_llm_runner::session_change::RefreshRequest;
+    use cortexkit_role_llm_runner::plan_notes::PlanNotesRefreshRequest;
     use serde_json::json;
 
-    fn request(extra: serde_json::Value) -> RefreshRequest {
+    fn request(extra: serde_json::Value) -> PlanNotesRefreshRequest {
         let mut body = json!({
             "plan": {
                 "tool_items": [{"provider": "aft"}],
@@ -130,6 +183,33 @@ mod tests {
                 "{refetch}"
             );
         }
+    }
+
+    /// broca declares `plan_notes`: its policy is accepted, and a system note only with it and
+    /// within llm-runner's size. `required` belongs to `refresh_relaunch`, which broca doesn't
+    /// declare.
+    #[test]
+    fn notes_until_rebuild_and_its_system_note_pass_and_misuse_is_refused_by_field() {
+        assert_eq!(
+            refused_field(json!({"policy": "notes_until_rebuild"})),
+            None
+        );
+        assert_eq!(
+            refused_field(json!({"policy": "notes_until_rebuild", "system_note": "Be brief."})),
+            None
+        );
+        assert_eq!(
+            refused_field(json!({"system_note": "Be brief."})),
+            Some("system_note")
+        );
+        assert_eq!(
+            refused_field(json!({
+                "policy": "notes_until_rebuild",
+                "system_note": "x".repeat(8_193),
+            })),
+            Some("system_note")
+        );
+        assert_eq!(refused_field(json!({"required": true})), Some("required"));
     }
 
     #[test]

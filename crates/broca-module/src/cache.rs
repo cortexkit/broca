@@ -53,6 +53,14 @@ pub trait CacheDeclarer: Send + Sync {
         let _ = model;
         false
     }
+
+    /// Whether the model catalog says `model`'s route takes a system-role turn in the middle of
+    /// the conversation, the only form plan notes go out in (llm-runner `plan_notes`). Unknown
+    /// answers `false`: a change of system text then applies in full rather than as a note.
+    fn turn_system_form(&self, model: &broca_protocol::ModelHandle) -> bool {
+        let _ = model;
+        false
+    }
 }
 
 /// Target capacity for cache facts. Shared clocks may exceed this target because
@@ -134,6 +142,12 @@ impl CacheTable {
         self.declarer
             .get()
             .is_some_and(|declarer| declarer.effort_change_keeps_cache(model))
+    }
+
+    pub(crate) fn turn_system_form(&self, model: &broca_protocol::ModelHandle) -> bool {
+        self.declarer
+            .get()
+            .is_some_and(|declarer| declarer.turn_system_form(model))
     }
 
     /// Remove facts when the session's lineage is deleted.

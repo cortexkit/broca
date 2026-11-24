@@ -48,6 +48,7 @@ pub(crate) async fn facts<B: SessionBackend>(
         pending,
         current_manifest,
         flushed: plan.flushed_since_accept,
+        pending_note: plan.pending_note.clone(),
         enrollment: Some(enrollment_facts(session, parts)?),
         ..ChangeFacts::default()
     };
@@ -63,6 +64,7 @@ pub(crate) async fn facts<B: SessionBackend>(
                         .to_owned(),
                     policy: refresh.policy,
                     refetch: refresh.refetch,
+                    system_note: refresh.system_note,
                     run_in_progress: refresh.run_in_progress,
                     applies_from_next_run: refresh.applies_from_next_run,
                 }),

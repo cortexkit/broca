@@ -1396,12 +1396,13 @@ async fn a_caller_dropped_from_the_plan_loses_its_forks_for_good() {
                 .route_session_refresh(
                     &key,
                     generation,
-                    "next_run".into(),
+                    "immediately".into(),
                     Box::new(manifest(
                         &format!("plan-{}", generation + 1),
                         json!({ "fork_callers": callers }),
                     )),
                     Vec::new(),
+                    None,
                 )
                 .await
                 .unwrap();

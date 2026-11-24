@@ -73,7 +73,7 @@ use call_plan::{hook_plan, plan_calls, CallPlan};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
 mod plan_notes;
-use plan_notes::{refresh_applied, removed_tools, with_plan_notes};
+use plan_notes::{removed_tools, with_plan_notes};
 mod resolved;
 use resolved::{resolve, Resolved};
 mod stops;
@@ -194,6 +194,9 @@ pub struct Admission {
     /// run's input in the batch of its start. Like `pre_model_error`, a run read back from its
     /// start has none: the record that followed the start keeps it.
     pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
+    /// The notes the run delivers about a change pending under `notes_until_rebuild`; like
+    /// `applies_refresh`, recorded in its start's batch and absent on a run read back.
+    pub plan_notes: Option<broca_protocol::session_change::NotesDelivery>,
     /// Whether the run starts at a prefix rebuild of its session or applies a pending plan
     /// change, where it takes a versioned tool's current same-major definition (see
     /// `crate::plan::take_compatible_tools`). Not frozen: a run read back from its start reads
@@ -1669,6 +1672,7 @@ pub fn admission_of_start(
         },
         pre_model_error: None,
         applies_refresh: None,
+        plan_notes: None,
         rebuild_point: false,
         head_turn: false,
     })
@@ -3590,11 +3594,7 @@ async fn admit<W: Writer>(
             pruned: Vec::new(),
         }));
     }
-    // The pending plan change this run applies is recorded after its input, so the start is
-    // still followed directly by its input.
-    if let Some(applied) = &admission.applies_refresh {
-        records.push(Record::RefreshApplied(refresh_applied(applied)));
-    }
+    records.extend(plan_notes::change_records(admission, writer));
     // So is the session's enrollment, in the same batch as the start that moves it onto the
     // contract: once the batch commits, the session is enrolled for good.
     if let Some(enrolled) = enrolled {

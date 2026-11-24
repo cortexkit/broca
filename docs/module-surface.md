@@ -1071,6 +1071,17 @@ run after an applied compaction view, model switch, or prefix flush). A new run 
 rebuild. A flush is a durable rebuild boundary; with nothing pending it does not change request
 bytes or promise a provider cache miss.
 
+broca also declares `plan_notes`: a refresh may wait under the policy `notes_until_rebuild`,
+with a short `system_note` exactly when it changes the system text. The applied plan's system
+text and tools keep rendering, and each run tells the model of the change in notes: the system
+note and the fixed wording for each removed tool, as system-role turns right after the run's
+user turn. A call to a removed tool is refused with that wording. Notes are runner records, so
+reads and history never show them. The change applies in full at the first run that loses the
+prompt cache anyway (a flush, a model change, an effort change that loses the cache, a lapsed
+cache, a refresh adding a compaction provider), once the oldest pending change is six hours old, or at
+once when it changes the system text on a route with no system-role turn (`no_note_form`). Tool
+additions and changed definitions get no note; they wait for that full apply.
+
 In `session.baseline`, top-level composition and absence facts describe the frozen prefix.
 After a refresh applies, `effective.composition_digest` copies the applied manifest's composition
 digest (omitted when unavailable), and `effective.absent_items` reports its absent optional items

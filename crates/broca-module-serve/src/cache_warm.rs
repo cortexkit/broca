@@ -35,6 +35,12 @@ impl broca_module::CacheDeclarer for ProviderCacheDeclarer {
             catalog.effort_change_keeps_cache(&model.provider_module_id, &model.model_id)
         })
     }
+
+    fn turn_system_form(&self, model: &broca_protocol::ModelHandle) -> bool {
+        broca_catalog::catalog().is_ok_and(|catalog| {
+            catalog.turn_system_form(&model.provider_module_id, &model.model_id)
+        })
+    }
 }
 
 fn frozen_render_config(

@@ -350,6 +350,8 @@ struct Prepared {
     /// The pending plan refresh the run applies by freezing its manifest, which its start's
     /// batch records.
     applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
+    /// What the run tells the model about a change still pending under `notes_until_rebuild`.
+    plan_notes: Option<broca_protocol::session_change::NotesDelivery>,
     /// Whether the run starts at a prefix rebuild or applies a pending change.
     rebuild_point: bool,
 }
@@ -1999,10 +2001,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 policy,
                 manifest,
                 refetch,
+                system_note,
                 reply,
             } => {
                 let _ = reply.send(
-                    self.session_refresh(generation, policy, manifest, refetch)
+                    self.session_refresh(generation, policy, manifest, refetch, system_note)
                         .await,
                 );
                 false
@@ -2263,6 +2266,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             input_hooks: prepared.hooks,
             pre_model_error: prepared.pre_model_error,
             applies_refresh: prepared.applies_refresh,
+            plan_notes: prepared.plan_notes,
             rebuild_point: prepared.rebuild_point,
             ..Default::default()
         };
@@ -2821,24 +2825,70 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     .is_some_and(|registry| registry.effort_change_keeps_cache(model))
             },
         );
+        let adds_compaction = crate::plan_change::adds_compaction(
+            self.session.operations().on_contract(),
+            current.as_deref(),
+            pending.as_ref(),
+        );
+        let last_cache = self.session.operations().last_cache_send.as_ref();
+        let now_ms = (self.now_ms)();
         let rebuild = effort_rebuild
             || crate::plan_change::prefix_rebuilt(
                 plan.rebuild_since_accept,
-                crate::plan_change::adds_compaction(
-                    self.session.operations().on_contract(),
-                    current.as_deref(),
-                    pending.as_ref(),
-                ),
-                self.session.operations().last_cache_send.as_ref(),
-                (self.now_ms)(),
+                adds_compaction,
+                last_cache,
+                now_ms,
             );
-        let applying = crate::plan_change::pending_applying(
-            pending.as_ref(),
-            rebuild,
-            plan.flushed_since_accept,
-            plan.last_model.as_deref(),
-            model,
-        );
+        // A change waiting under `notes_until_rebuild` (llm-runner `plan_notes`) follows rules of
+        // its own (`crate::plan_notes`): a rebuild an earlier run already paid for is no reason
+        // to apply it now, only a cache this run loses anyway is.
+        let notes = pending
+            .as_ref()
+            .filter(|pending| pending.policy == broca_core::plan_notes::NOTES_UNTIL_REBUILD)
+            .map(|pending| {
+                // No recorded rebuild counts here: `false` leaves the compaction provider joining
+                // and a proven lapse of the cache.
+                let cache_lost = plan.flushed_since_accept
+                    || effort_rebuild
+                    || plan
+                        .last_model
+                        .as_deref()
+                        .is_some_and(|last| last != model_key(model))
+                    || crate::plan_change::prefix_rebuilt(
+                        false,
+                        adds_compaction,
+                        last_cache,
+                        now_ms,
+                    );
+                let at_start = crate::plan_notes::at_start(&crate::plan_notes::Facts {
+                    current: current.as_deref(),
+                    pending: &pending.manifest,
+                    generation: pending.generation,
+                    system_note: plan.pending_note.as_deref(),
+                    delivered: &plan.notes,
+                    window_start: self.session.conversation().window_start(),
+                    pending_since_ms: plan.pending_since_ms,
+                    now_ms,
+                    cache_lost,
+                    turn_system: self
+                        .registry
+                        .as_ref()
+                        .is_some_and(|registry| registry.turn_system_form(model)),
+                    model_key: model_key(model),
+                });
+                (cache_lost, at_start)
+            });
+        let applying = match &notes {
+            Some((_, crate::plan_notes::AtStart::Apply { .. })) => pending.as_ref(),
+            Some((_, crate::plan_notes::AtStart::Wait(_))) => None,
+            None => crate::plan_change::pending_applying(
+                pending.as_ref(),
+                rebuild,
+                plan.flushed_since_accept,
+                plan.last_model.as_deref(),
+                model,
+            ),
+        };
         // A pending change that doesn't apply yet may still lend this run its newer rich UI
         // stamp, when the stamp was declared for the system text the run keeps.
         let current = match applying {
@@ -2848,23 +2898,37 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let manifest = crate::plan_change::run_manifest(current, applying, false, model, variant)
             .map_err(SendOutcome::PlanRefused)?;
         let applies = applying.map(|pending| {
-            let applied_by = applies_at_run_start(
-                &pending.policy,
-                rebuild,
-                plan.flushed_since_accept,
-                plan.last_model.as_deref(),
-                &model_key(model),
-            )
-            .expect("the pending change applies at this run");
-            EffectiveState::of(
+            let (applied_by, reason) = match &notes {
+                Some((cache_lost, crate::plan_notes::AtStart::Apply { reason })) => {
+                    (if *cache_lost { "fold" } else { "append" }, *reason)
+                }
+                _ => (
+                    applies_at_run_start(
+                        &pending.policy,
+                        rebuild,
+                        plan.flushed_since_accept,
+                        plan.last_model.as_deref(),
+                        &model_key(model),
+                    )
+                    .expect("the pending change applies at this run"),
+                    None,
+                ),
+            };
+            let mut applied = EffectiveState::of(
                 &pending.manifest,
                 Applying {
                     generation: pending.generation,
                     applied_by,
                 },
             )
-            .applied_change()
+            .applied_change();
+            applied.reason = reason.map(str::to_owned);
+            applied
         });
+        let delivery = match notes {
+            Some((_, crate::plan_notes::AtStart::Wait(delivery))) => delivery,
+            _ => None,
+        };
         let operations = self.session.operations();
         let rebuild_point = applies.is_some()
             || effort_rebuild
@@ -2876,7 +2940,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 operations.last_cache_send.as_ref(),
                 (self.now_ms)(),
             );
-        Ok((manifest, applies, rebuild_point))
+        Ok((manifest, applies, rebuild_point, delivery))
     }
 
     /// Freezes the session's fetch plan into a run about to start according to
@@ -2891,11 +2955,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         start.prepared.tools_were_omitted = tools_were_omitted;
         let first_run = self.session.operations().owner.needs_admission();
         if !first_run {
-            let (manifest, applies, rebuild_point) =
+            let (manifest, applies, rebuild_point, plan_notes) =
                 self.run_plan(&start.request.model, start.request.variant.as_deref())?;
             start.manifest = manifest;
             start.prepared.applies_refresh = applies;
             start.prepared.rebuild_point = rebuild_point;
+            start.prepared.plan_notes = plan_notes;
         }
         crate::plan_episode::require_confining_scope(
             start.manifest.as_deref(),
@@ -4029,6 +4094,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         policy: String,
         manifest: Box<broca_records::record::PlanManifest>,
         refetch: Vec<String>,
+        system_note: Option<String>,
     ) -> crate::actor::SessionRefreshOutcome {
         use crate::actor::SessionRefreshOutcome;
         use crate::plan_change::RefreshAcceptance;
@@ -4042,6 +4108,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             &policy,
             &manifest,
             &refetch,
+            system_note.as_deref(),
             self.run.is_some(),
         ) {
             RefreshAcceptance::Repeat {
@@ -4074,8 +4141,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             manifest: rest,
             selection: broca_session_loop::plan::recorded_selection(&manifest),
             refetch,
-            system_note: None,
-            accepted_at_ms: None,
+            system_note,
+            accepted_at_ms: Some((self.now_ms)()),
         });
         match self.append_own(record).await {
             Ok(()) => {

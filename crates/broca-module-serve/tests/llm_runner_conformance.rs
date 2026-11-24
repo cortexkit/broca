@@ -3280,6 +3280,9 @@ impl LlmRunnerSubject for BrocaSubject {
             // runs its cases. The host fixes no tool set, so the outside-host-set case
             // reports inapplicable by name.
             Capability::SessionChange,
+            // role.describe declares plan_notes. The adapter supplies no plan-note fixture (see
+            // `plan_notes_fixture`), so only the declaration's own case runs.
+            Capability::PlanNotes,
             // role.describe declares system_text_default (tool-provider 0.12), and the
             // adapter implements both of its hooks, so the kit runs those cases.
             Capability::SystemTextDefault,
@@ -3584,6 +3587,18 @@ impl LlmRunnerSubject for BrocaSubject {
         // The kit's scripted mock route speaks OpenAI Chat, not Responses. Its template
         // cases therefore exercise the required user-authority fall-through, without skips.
         false
+    }
+
+    /// No plan-note fixture: broca delivers plan notes only as a system-role turn, and the kit's
+    /// scripted mock route (OpenAI Chat) has none, so a refresh changing the system text applies
+    /// in full there, recorded with the reason `no_note_form`, rather than as a note the cases
+    /// could observe. The note
+    /// path is tested in broca's own session tests on a route that has the form
+    /// (`store_actor::differential::plan_notes`).
+    fn plan_notes_fixture(
+        &self,
+    ) -> Option<cortexkit_role_llm_runner_conformance::PlanNotesFixture> {
+        None
     }
 
     /// A plan for `session.refresh` of `session`. `ChangedTools` is a tool-free plan: the

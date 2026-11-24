@@ -1641,6 +1641,7 @@ async fn in_memory_reads_refuse_only_where_they_did_before() {
             "on_prefix_rebuild".into(),
             Box::new(manifest),
             Vec::new(),
+            None,
         )
         .await
         .unwrap();

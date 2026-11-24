@@ -44,7 +44,44 @@ pub struct AppliedChange {
     pub manifest_digest: String,
     pub composition_digest: Option<String>,
     pub absent_items: Vec<serde_json::Value>,
+    /// Why a change under `notes_until_rebuild` applied in full at a run that is no flush,
+    /// model change, lost prompt cache or six-hour wait: `no_note_form` when it changes the
+    /// system text and the run's route has no system-role turn a note could use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
+
+/// What a run start tells the model about the change pending under `notes_until_rebuild`
+/// (llm-runner `plan_notes`) while the applied plan keeps rendering: the notes it delivers after
+/// its user turn, the tools the change removes, which the gate refuses from this run on, and the
+/// model key the notes' form was chosen for. The session store records it in the start's batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotesDelivery {
+    pub generation: u64,
+    pub notes: Vec<DeliveredNote>,
+    pub refused_tools: Vec<String>,
+    pub model_key: String,
+}
+
+/// One note a run start delivers: the plan owner's system note, or a removed tool's fixed
+/// wording, and the form it renders in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredNote {
+    pub kind: NoteKind,
+    pub text: String,
+    pub form: String,
+}
+
+/// What a [`DeliveredNote`] announces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteKind {
+    System,
+    ToolRemoval,
+}
+
+/// The only form broca delivers notes in: a persistent system-role turn at the note's place in
+/// the conversation, never one cleared at the next user turn.
+pub const NOTE_FORM_TURN_SYSTEM: &str = "turn_system";
 
 /// The key a run's model is compared by when deciding whether the model switched between runs.
 pub fn model_key(model: &ModelHandle) -> String {

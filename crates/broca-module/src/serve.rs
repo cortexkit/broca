@@ -2473,7 +2473,8 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// Accept a `session.refresh`: fetch, record durably, and hold pending. `refetch` is the
-    /// providers it asked to read afresh, empty when it named none. Implemented by the
+    /// providers it asked to read afresh, empty when it named none, and `system_note` the
+    /// owner's note on a changed system text under `notes_until_rebuild`. Implemented by the
     /// registry through the lineage actor; the default has no session to refresh.
     #[allow(clippy::too_many_arguments)]
     async fn session_refresh(
@@ -2485,6 +2486,7 @@ pub trait ServeHandler: Send + Sync {
         _policy: String,
         _generation: u64,
         _refetch: Vec<String>,
+        _system_note: Option<String>,
     ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
         Err(SessionChangeError::unsupported("session.refresh"))
     }
@@ -3751,8 +3753,9 @@ impl ServeHandler for crate::LineageRegistry {
         policy: String,
         generation: u64,
         refetch: Vec<String>,
+        system_note: Option<String>,
     ) -> Result<cortexkit_role_llm_runner::session_change::RefreshReply, SessionChangeError> {
-        use cortexkit_role_llm_runner::{rungs, session_change};
+        use cortexkit_role_llm_runner::{plan_notes::NOTES_UNTIL_REBUILD, rungs, session_change};
         let supported = self
             .store_holding(session)
             .map_err(|error| SessionChangeError::Transient(error.to_string()))?
@@ -3779,11 +3782,11 @@ impl ServeHandler for crate::LineageRegistry {
         .map_err(|field| {
             SessionChangeError::FetchRefused(broca_fetch_plan::Refusal::invalid(field))
         })?;
-        if !rungs::ALL.contains(&policy.as_str()) {
+        if !rungs::ALL.contains(&policy.as_str()) && policy != NOTES_UNTIL_REBUILD {
             return Err(SessionChangeError::InvalidParams {
                 field: "policy".into(),
                 message: format!(
-                    "policy must be one of {}; got {policy}",
+                    "policy must be one of {}, or {NOTES_UNTIL_REBUILD}; got {policy}",
                     rungs::ALL.join(", ")
                 ),
             });
@@ -3801,6 +3804,7 @@ impl ServeHandler for crate::LineageRegistry {
             &plan_identity,
             &policy,
             &refetch,
+            system_note.as_deref(),
         )? {
             return Ok(session_change::RefreshReply::new(
                 cortexkit_role_llm_runner::baseline::PendingChange {
@@ -3903,6 +3907,12 @@ impl ServeHandler for crate::LineageRegistry {
                 rung: policy,
             });
         }
+        crate::plan_change::check_system_note(
+            read.facts.current_manifest.as_deref(),
+            &admitted.manifest,
+            &policy,
+            system_note.as_deref(),
+        )?;
         // Durably record the accepted generation, policy and fetched manifest before replying.
         match self
             .route_session_refresh(
@@ -3911,6 +3921,7 @@ impl ServeHandler for crate::LineageRegistry {
                 policy.clone(),
                 Box::new(admitted.manifest),
                 refetch,
+                system_note,
             )
             .await
         {
@@ -3949,11 +3960,12 @@ impl ServeHandler for crate::LineageRegistry {
             .read_change(session, Some(generation), Some(&send_id), |error| error)
             .await?;
         read.check_owner(principal, scope)?;
-        if !rungs::ALL.contains(&policy.as_str()) {
+        let notes = cortexkit_role_llm_runner::plan_notes::NOTES_UNTIL_REBUILD;
+        if !rungs::ALL.contains(&policy.as_str()) && policy != notes {
             return Err(SessionChangeError::InvalidParams {
                 field: "policy".into(),
                 message: format!(
-                    "policy must be one of {}; got {policy}",
+                    "policy must be one of {}, or {notes}; got {policy}",
                     rungs::ALL.join(", ")
                 ),
             });

@@ -455,6 +455,9 @@ pub fn broca_role_describe_with_writers(
         // A mid-session plan change: refresh, its policy and a prefix flush. All three
         // ops are served together, owner-only; the group is declared only then.
         cortexkit_role_llm_runner::capabilities::SESSION_CHANGE,
+        // A refresh can wait under `notes_until_rebuild`: until a run that loses the prompt cache
+        // anyway, the applied plan keeps rendering and the model is told of the change in notes.
+        cortexkit_role_llm_runner::capabilities::PLAN_NOTES,
         // A versioned tool's calls carry its major (`tp2`); a call refused for a new major
         // raises `tool_changed`; a refresh can name providers to read afresh; and a run at a
         // prefix rebuild takes a same-major tool's current definition.
@@ -1428,6 +1431,7 @@ mod pinned_reply_bytes {
             );
             assert!(checked.declares(cortexkit_role_llm_runner::capabilities::TAG_READ));
             assert!(checked.declares(cortexkit_role_llm_runner::capabilities::CACHE_POLICY));
+            assert!(checked.declares(cortexkit_role_llm_runner::capabilities::PLAN_NOTES));
             // The person's steer hands calls back exactly when this build records notices.
             assert_eq!(
                 checked.declares(cortexkit_role_llm_runner::capabilities::CALL_YIELD),
@@ -1437,7 +1441,6 @@ mod pinned_reply_bytes {
                 "adopt_open",
                 "stop_all",
                 "history_intake",
-                "plan_notes",
                 "restart_survival",
             ] {
                 assert!(!checked.declares(group), "{group}");
@@ -1563,7 +1566,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "f327c79644ce7769677c392d3ca21abc432d1b63ad4caecb38db1af07a60097b",
+            "02bc19fdb98a7b62814b394d20b8e6898e2f2106bb63c1bd9ccfdce7a89648ff",
         );
     }
 
@@ -1763,7 +1766,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "246be3caf5d2319693d012f4605f8ef4a6f4690ccdb7836394ac8b49df51926c";
+        "3001de4e526c4ddf1a1929452bae1ba2f3e8b426455d6f18575753fdcf2eb9bb";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -2351,6 +2351,7 @@ impl LineageRegistry {
         policy: String,
         manifest: Box<broca_records::record::PlanManifest>,
         refetch: Vec<String>,
+        system_note: Option<String>,
     ) -> Result<crate::actor::SessionRefreshOutcome, OpenError> {
         use crate::actor::{LineageCmd, SessionRefreshOutcome};
         loop {
@@ -2363,6 +2364,7 @@ impl LineageRegistry {
                 policy: policy.clone(),
                 manifest: manifest.clone(),
                 refetch: refetch.clone(),
+                system_note: system_note.clone(),
                 reply,
             };
             if handle.send(cmd).await.is_err() {
@@ -2947,6 +2949,12 @@ impl RegistryHandle {
     /// the catalog; `false` without one.
     pub(crate) fn effort_change_keeps_cache(&self, model: &broca_protocol::ModelHandle) -> bool {
         self.inner.cache.effort_change_keeps_cache(model)
+    }
+
+    /// Whether `model`'s route takes a system-role turn mid-conversation (see
+    /// [`crate::cache::CacheDeclarer::turn_system_form`]).
+    pub(crate) fn turn_system_form(&self, model: &broca_protocol::ModelHandle) -> bool {
+        self.inner.cache.turn_system_form(model)
     }
 
     /// Remember the cache declaration of the episode that admitted the session, for the reply

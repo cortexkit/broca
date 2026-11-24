@@ -171,7 +171,8 @@ pub enum LineageCmd {
     },
     /// Accept a mid-session plan change, durable before its reply. The manifest was fetched
     /// by the serve layer with the same admission code as a first send. Applies at the next run
-    /// selected by its policy (`immediately` or `on_prefix_rebuild`), never inside a running episode.
+    /// selected by its policy (`immediately`, `on_prefix_rebuild` or `notes_until_rebuild`),
+    /// never inside a running episode.
     SessionRefresh {
         generation: u64,
         policy: String,
@@ -179,6 +180,9 @@ pub enum LineageCmd {
         /// The providers the refresh asked to read afresh (llm-runner `refetch`), empty when
         /// it named none; part of what an identical repeat repeats.
         refetch: Vec<String>,
+        /// The owner's note on a changed system text, under `notes_until_rebuild` only; part of
+        /// what an identical repeat repeats.
+        system_note: Option<String>,
         reply: oneshot::Sender<SessionRefreshOutcome>,
     },
     /// Change when the pending plan takes effect, durable before its reply. Idempotent on `send_id`.
