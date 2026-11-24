@@ -659,12 +659,16 @@ impl ViewCache {
     /// again after this many others were read reloads.
     pub const MAX_ENTRIES: usize = 64;
 
-    /// What all kept views hold together, by their walked size (see [`CachedBytes`]): 256 MiB.
-    /// A view holds its open log's records and the folds built from them. A read of a session
+    /// What all kept views hold together, by their walked size (see [`CachedBytes`]): 96 MiB.
+    /// A closed session's view held about 3 MB in production (64 views, 177 MB), so this keeps
+    /// about 30 of them, and the entry cap binds only for small sessions. A head read of an
+    /// unchanged closed session no longer needs its view (see `store_open`'s kept heads), so the
+    /// views kept here serve page reads. A view holds its open log's records and the state built
+    /// from them (its runs, queued sends and owed spend, among others). A read of a session
     /// whose view isn't kept loads it from storage again, as every read did before views were
     /// kept, and a session whose view alone passes the bound is never kept. A session that long
     /// and in use is open, and its actor answers its reads.
-    pub const MAX_BYTES: u64 = 256 * 1024 * 1024;
+    pub const MAX_BYTES: u64 = 96 * 1024 * 1024;
 }
 
 impl<V: CachedBytes> ViewCache<V> {

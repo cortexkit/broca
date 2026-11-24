@@ -518,7 +518,7 @@ later return an error. Authorization and migration refusals are not counted. The
 `session_reads` and `actor_opens` counters remain available with their existing meanings.
 
 `health.check.metrics.views_over_cap` counts the views of closed sessions broca loaded and didn't
-keep because each alone was larger than the view cache's byte cap (256 MiB, counted by walking
+keep because each alone was larger than the view cache's byte cap (96 MiB, counted by walking
 each view); each read of such a session while it is closed loads it again. `memory.report` gives
 the same count for its process under `closed_session_views.views_over_cap`, and each such view
 logs one INFO line with the session address and its counted size. Counts reset on restart.
