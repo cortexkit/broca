@@ -34,7 +34,10 @@ struct Guard;
 
 impl Guard {
     fn enter() -> Option<Self> {
-        BUSY.try_with(|busy| (!busy.replace(true)).then_some(Self))
+        // `then`, never `then_some`: a guard built and dropped unused would clear the flag a
+        // guard further up this thread still holds, and the next allocation would then take the
+        // state lock this thread may already hold.
+        BUSY.try_with(|busy| (!busy.replace(true)).then(|| Self))
             .ok()
             .flatten()
     }
@@ -54,7 +57,7 @@ struct Header {
     weight: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Site {
     #[serde(serialize_with = "serialize_stack")]
     stack: [usize; DEPTH],
@@ -165,7 +168,9 @@ fn sample(size: usize) -> (usize, usize) {
         return (UNSAMPLED, 0);
     }
     let weight = estimate(size);
-    let id = state().lock().unwrap().allocate(stack(), weight);
+    // Walk the stack before taking the lock, so no thread holds it while the unwinder runs.
+    let stack = stack();
+    let id = state().lock().unwrap().allocate(stack, weight);
     (id, weight)
 }
 
@@ -310,8 +315,17 @@ fn image_base() -> usize {
 }
 
 fn snapshot() -> Vec<u8> {
-    let state = state().lock().unwrap();
-    let sites: Vec<&Site> = state.sites.iter().filter(|site| site.bytes > 0).collect();
+    // Copy the live sites out and serialize after letting go of the lock, so threads allocating
+    // meanwhile wait only for the copy, and nothing the serializer allocates can need the lock.
+    let copied: Vec<Site> = state()
+        .lock()
+        .unwrap()
+        .sites
+        .iter()
+        .filter(|site| site.bytes > 0)
+        .cloned()
+        .collect();
+    let sites: Vec<&Site> = copied.iter().collect();
     serde_json::to_vec(&Snapshot {
         sample_bytes: SAMPLE_BYTES,
         image_base: image_base(),
