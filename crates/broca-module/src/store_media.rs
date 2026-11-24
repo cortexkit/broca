@@ -650,9 +650,9 @@ impl RunMedia {
             (None, Some(index)) => {
                 index.render_with_provenance(config, opts, render_tags, provenance)
             }
-            // The session captured no media, so no medium the prompt names is one of its own: a
-            // compaction view's inserted image, say. Each renders as its provenance marker, as an
-            // index holding nothing places it.
+            // The session captured no media, so no medium the prompt names is one of its own. A
+            // compaction view's inserted image renders from the bytes the request carries
+            // (`CallOptions::view_media`); any other renders as its provenance marker.
             (None, None) => uncaptured()
                 .map_err(|reason| Box::new(refusal(reason)))?
                 .render_with_provenance(config, opts, render_tags, provenance),
@@ -676,8 +676,9 @@ impl RunMedia {
     }
 }
 
-/// The index of a session that captured no media. It reads no bytes: a prompt can only name media
-/// it doesn't hold, and those render as markers.
+/// The index of a session that captured no media. It reads no bytes of its own: a prompt can only
+/// name media it doesn't hold, a view's inserted image (whose bytes the request carries) or one
+/// that renders as a marker.
 fn uncaptured() -> Result<MediaIndex, String> {
     #[derive(Debug)]
     struct Nothing;

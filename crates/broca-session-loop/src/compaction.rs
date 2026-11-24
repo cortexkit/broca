@@ -777,13 +777,16 @@ pub async fn offline_prompt<W: Writer>(
         &transcript.entries,
         &rides,
         view.as_ref().map_or(&[][..], |view| view.edits.as_slice()),
-        // A view's inserted image isn't a medium the session captured, so the request shows
-        // its provenance marker in its place; only its reference
-        // is needed, checked as the view was when accepted.
+        // A view's inserted image is no medium the session captured: the prompt names it by
+        // reference, and its bytes come from the view itself.
         v2::host::image_reference,
     )
     .map_err(LoopError::Parts)?;
-    finish(&opts, prompt, admission).map_err(LoopError::Parts)
+    let media = view
+        .as_ref()
+        .map(v2::host::inserted_media)
+        .unwrap_or_default();
+    finish(&opts, prompt, media, admission).map_err(LoopError::Parts)
 }
 
 /// The ride envelopes a request of `admission`'s run renders with: the window's own, or, for a
@@ -1086,11 +1089,6 @@ fn conditions_for<W: Writer>(
         // applied, so its request carried none.
         conditions.last_prompt_view = conditions.last_prompt_tokens.map(|_| 0);
     }
-    // A view's inserted image renders here as its provenance marker, never the image (see
-    // `v2::host::image_reference`), so the session tells its provider it takes none, whatever
-    // its model takes, and the provider inserts none. One it inserted before is still accepted
-    // (`v2::views::check_boundary`).
-    conditions.accepts_images = Some(false);
     Ok(conditions)
 }
 
@@ -1154,14 +1152,17 @@ fn prompt_view(
 }
 
 /// Completes a compacted prompt from `prompt`, using the run's settings, the rendering inputs and
-/// the system text above it.
+/// the system text above it. `media` holds the bytes of the images the applied view inserted.
 fn finish(
     boundary: &broca_protocol::request::CallOptions,
     prompt: Vec<broca_protocol::Message>,
+    media: broca_protocol::request::ViewMedia,
     admission: &Admission,
 ) -> Result<broca_protocol::request::CallOptions, String> {
     let opts = v2::render::options(boundary, prompt);
-    Ok(v2::systems::view(&opts, &admission.global_system)?.unwrap_or(opts))
+    let mut opts = v2::systems::view(&opts, &admission.global_system)?.unwrap_or(opts);
+    opts.view_media = std::sync::Arc::new(media);
+    Ok(opts)
 }
 
 /// Applies at step `step`'s boundary the view the provider handed over, if it still fits the
@@ -1297,9 +1298,8 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             overflow,
         },
         &read_back,
-        // A view's inserted image isn't a medium the session captured, so the request shows
-        // its provenance marker in its place; only its reference
-        // is needed, checked as the view was when accepted.
+        // A view's inserted image is no medium the session captured: the prompt names it by
+        // reference, and its bytes come from the view itself (`Prepared::Ready::media`).
         v2::host::image_reference,
         // The new loop never sizes a request before sending it: a byte count can't say what a
         // provider counts (an image's base64 is a few thousand tokens to the provider, not its
@@ -1318,6 +1318,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             applied,
             restored,
             releasable,
+            media,
             ..
         } => {
             release_unread(writer, kept, &restored, &releasable, window_start).await?;
@@ -1325,7 +1326,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
                 .provider
                 .set_cache_evidence_view(applied.map(|view| view.version));
             Ok(Send::Ready(Box::new(
-                finish(&opts, prompt, admission).map_err(LoopError::Parts)?,
+                finish(&opts, prompt, media, admission).map_err(LoopError::Parts)?,
             )))
         }
         v2::request::Prepared::CompactionUnavailable => Ok(Send::Unavailable(

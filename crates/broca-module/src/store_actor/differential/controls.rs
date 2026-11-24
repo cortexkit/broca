@@ -1088,15 +1088,15 @@ async fn token_count_pages_and_notices_are_alike(cipher: broca_session_store::ke
         .map(|(_, body)| body.clone())
         .collect();
     assert!(!new_notices.is_empty());
-    // Each reading names the view its request was rendered under, none here (`0`), and the
-    // loop states it takes no inserted images, which it renders only as markers.
+    // Each reading names the view its request was rendered under, none here (`0`). The model's
+    // frozen config names no media, so whether it takes images goes unstated.
     let without_view = |notice: &Value| {
         let mut notice = notice.clone();
         let conditions = notice["conditions"].as_object_mut().unwrap();
         let view = conditions.remove("last_prompt_view");
         let expected = conditions.get("last_prompt_tokens").map(|_| json!(0));
         assert_eq!(view, expected, "{notice:?}");
-        assert_eq!(conditions.remove("accepts_images"), Some(json!(false)));
+        assert_eq!(conditions.remove("accepts_images"), None);
         masked(&notice)
     };
     broca_test_support::pin!(

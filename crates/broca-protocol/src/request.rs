@@ -368,6 +368,39 @@ pub struct CallOptions {
     /// Renderer-only metadata: canonical request bytes and their hash domain stay unchanged.
     #[serde(skip)]
     pub declared_markers: Vec<DeclaredMessageMarker>,
+    /// The bytes of the images the applied compaction view inserted into `prompt`, which name
+    /// them by reference only. A render input like the fields above, never request content.
+    #[serde(skip)]
+    pub view_media: Arc<ViewMedia>,
+}
+
+/// The bytes of the media a compaction view inserted, by digest (`MediaRef::sha256`). A view's
+/// inserted image is no medium the session captured, so the session's own media can't supply it;
+/// the view holds its bytes, and the request it applies to carries them here for its render.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ViewMedia(std::collections::BTreeMap<String, Arc<[u8]>>);
+
+impl ViewMedia {
+    /// Adds `bytes`, whose digest is `sha256`.
+    pub fn insert(&mut self, sha256: String, bytes: Arc<[u8]>) {
+        self.0.insert(sha256, bytes);
+    }
+
+    /// The bytes whose digest is `sha256`, if the view inserted them.
+    pub fn get(&self, sha256: &str) -> Option<&[u8]> {
+        self.0.get(sha256).map(|bytes| &bytes[..])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Names the digests, never the bytes.
+impl std::fmt::Debug for ViewMedia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
 }
 
 impl CallOptions {
@@ -386,6 +419,7 @@ impl CallOptions {
             marker_order_version: None,
             render_episodes: Arc::default(),
             declared_markers: Vec::new(),
+            view_media: Arc::default(),
         }
     }
 
@@ -406,6 +440,7 @@ impl CallOptions {
             marker_order_version: self.marker_order_version,
             render_episodes: Arc::clone(&self.render_episodes),
             declared_markers: self.declared_markers.clone(),
+            view_media: Arc::clone(&self.view_media),
         }
     }
 }

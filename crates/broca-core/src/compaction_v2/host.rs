@@ -212,13 +212,41 @@ pub fn last_prompt<'e>(
     })
 }
 
+/// The reference a request's prompt names a view's inserted image by. The prompt carries only
+/// the reference; the image's bytes reach the render through [`inserted_media`].
 pub fn image_reference(
     image: &super::protocol::view::InsertedImage,
 ) -> Result<broca_protocol::MediaRef, String> {
+    decoded(image).map(|(reference, _)| reference)
+}
+
+/// The bytes of every image `view` inserts, by digest, for the requests it applies to
+/// (`CallOptions::view_media`). Each was checked when the view was accepted
+/// (`views::check_boundary`); one that no longer decodes is left out, and its reference then
+/// renders as a marker.
+pub fn inserted_media(view: &super::protocol::view::View) -> broca_protocol::request::ViewMedia {
+    let mut media = broca_protocol::request::ViewMedia::default();
+    for edit in &view.edits {
+        let super::protocol::view::EditOp::Insert { message, .. } = &edit.op else {
+            continue;
+        };
+        for image in &message.images {
+            if let Ok((reference, bytes)) = decoded(image) {
+                media.insert(reference.sha256, bytes.into());
+            }
+        }
+    }
+    media
+}
+
+fn decoded(
+    image: &super::protocol::view::InsertedImage,
+) -> Result<(broca_protocol::MediaRef, Vec<u8>), String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&image.data)
         .map_err(|error| error.to_string())?;
-    crate::media_validation::validate_media(&bytes, &image.media_type)
-        .map_err(|reason| format!("compaction image refused: {reason:?}"))
+    let reference = crate::media_validation::validate_media(&bytes, &image.media_type)
+        .map_err(|reason| format!("compaction image refused: {reason:?}"))?;
+    Ok((reference, bytes))
 }

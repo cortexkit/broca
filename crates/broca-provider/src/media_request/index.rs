@@ -128,8 +128,14 @@ impl MediaIndex {
                 aging.apply(profile, AgingEvent::Boundary);
             }
         }
-        let mut bundle = prepare(&self.session, frozen.media.as_ref(), &opts.prompt, &aging)
-            .map_err(|error| refusal(error.code(), error.to_string()))?;
+        let mut bundle = prepare(
+            &self.session,
+            frozen.media.as_ref(),
+            &opts.prompt,
+            &aging,
+            &opts.view_media,
+        )
+        .map_err(|error| refusal(error.code(), error.to_string()))?;
         super::render_prepared_with_provenance(
             &*family,
             &frozen,

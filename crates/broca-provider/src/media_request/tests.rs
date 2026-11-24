@@ -250,7 +250,7 @@ fn planned(
 ) -> (PreparedBundle, Vec<AgingEvent>) {
     let events = state.select_view(profile, &session.bindings(prompt));
     (
-        prepare(session, Some(profile), prompt, state).unwrap(),
+        prepare(session, Some(profile), prompt, state, &Default::default()).unwrap(),
         events,
     )
 }
@@ -297,7 +297,16 @@ fn fresh_protected_bundle_over_trigger_is_full_on_retry_and_every_resume_cut() {
         .iter()
         .all(|media| media.base64 == STANDARD.encode(&fixture.bytes)));
     assert_eq!(
-        bytes(&prepare(&session, Some(&profile), &prompt, &aging).unwrap()),
+        bytes(
+            &prepare(
+                &session,
+                Some(&profile),
+                &prompt,
+                &aging,
+                &Default::default()
+            )
+            .unwrap()
+        ),
         bytes(&first)
     );
     let mut rebuilt = MediaAging::default();
@@ -305,7 +314,16 @@ fn fresh_protected_bundle_over_trigger_is_full_on_retry_and_every_resume_cut() {
         rebuilt.apply(&profile, event);
     }
     assert_eq!(
-        bytes(&prepare(&session, Some(&profile), &prompt, &rebuilt).unwrap()),
+        bytes(
+            &prepare(
+                &session,
+                Some(&profile),
+                &prompt,
+                &rebuilt,
+                &Default::default()
+            )
+            .unwrap()
+        ),
         bytes(&first),
         "aging rebuilt from its own events"
     );
@@ -377,7 +395,14 @@ fn later_text_pressure_caps_person_media_below_aging_thresholds() {
     fit_request(&limited, &mut first, |bundle| bytes(bundle).len() as u64).unwrap();
     assert_eq!(reasons(&first, "request_cap"), 1);
     assert_eq!(reasons(&first, "aged"), 0);
-    let mut retry = prepare(&session, Some(&profile), &prompt, &aging).unwrap();
+    let mut retry = prepare(
+        &session,
+        Some(&profile),
+        &prompt,
+        &aging,
+        &Default::default(),
+    )
+    .unwrap();
     fit_request(&limited, &mut retry, |bundle| bytes(bundle).len() as u64).unwrap();
     assert_eq!(bytes(&retry), bytes(&first));
 }
@@ -505,7 +530,14 @@ fn stored_media_profiles_and_session_scope_fail_closed_without_reading_foreign_b
     profile.modalities.image = Some(false);
     assert_eq!(
         reasons(
-            &prepare(&session, Some(&profile), &prompt, &MediaAging::default()).unwrap(),
+            &prepare(
+                &session,
+                Some(&profile),
+                &prompt,
+                &MediaAging::default(),
+                &Default::default()
+            )
+            .unwrap(),
             "modality"
         ),
         1
@@ -514,7 +546,14 @@ fn stored_media_profiles_and_session_scope_fail_closed_without_reading_foreign_b
     profile.image.user_message = MediaCarrier::Marker;
     assert_eq!(
         reasons(
-            &prepare(&session, Some(&profile), &prompt, &MediaAging::default()).unwrap(),
+            &prepare(
+                &session,
+                Some(&profile),
+                &prompt,
+                &MediaAging::default(),
+                &Default::default()
+            )
+            .unwrap(),
             "carrier"
         ),
         1
@@ -523,7 +562,14 @@ fn stored_media_profiles_and_session_scope_fail_closed_without_reading_foreign_b
     profile.image.max_item_bytes = Some(crate::media_profile::ByteLimit::Decoded(1));
     assert_eq!(
         reasons(
-            &prepare(&session, Some(&profile), &prompt, &MediaAging::default()).unwrap(),
+            &prepare(
+                &session,
+                Some(&profile),
+                &prompt,
+                &MediaAging::default(),
+                &Default::default()
+            )
+            .unwrap(),
             "too_large"
         ),
         1
@@ -532,7 +578,14 @@ fn stored_media_profiles_and_session_scope_fail_closed_without_reading_foreign_b
     let foreign = fixture.session(History::default().start(&[]).step(1));
     assert_eq!(
         reasons(
-            &prepare(&foreign, Some(&profile), &prompt, &MediaAging::default()).unwrap(),
+            &prepare(
+                &foreign,
+                Some(&profile),
+                &prompt,
+                &MediaAging::default(),
+                &Default::default()
+            )
+            .unwrap(),
             "provenance"
         ),
         1
@@ -546,14 +599,27 @@ fn stored_media_profiles_and_session_scope_fail_closed_without_reading_foreign_b
         .lock()
         .unwrap()
         .insert(fixture.media.sha256.clone(), b"corrupt".to_vec());
-    let err = prepare(&session, Some(&profile), &prompt, &MediaAging::default()).unwrap_err();
+    let err = prepare(
+        &session,
+        Some(&profile),
+        &prompt,
+        &MediaAging::default(),
+        &Default::default(),
+    )
+    .unwrap_err();
     assert_eq!(err.code(), "media_object_corrupt");
     assert!(err.to_string().contains(&fixture.media.sha256));
     objects.lock().unwrap().remove(&fixture.media.sha256);
     assert_eq!(
-        prepare(&session, Some(&profile), &prompt, &MediaAging::default())
-            .unwrap_err()
-            .code(),
+        prepare(
+            &session,
+            Some(&profile),
+            &prompt,
+            &MediaAging::default(),
+            &Default::default()
+        )
+        .unwrap_err()
+        .code(),
         "media_object_missing"
     );
 }
@@ -601,7 +667,16 @@ fn forty_screenshots_stay_in_payload_cap_with_bounded_aging_prefix_changes() {
             resumed.apply(&profile, event);
         }
         assert_eq!(
-            bytes(&prepare(&session, Some(&profile), &prompt, &resumed).unwrap()),
+            bytes(
+                &prepare(
+                    &session,
+                    Some(&profile),
+                    &prompt,
+                    &resumed,
+                    &Default::default()
+                )
+                .unwrap()
+            ),
             bytes(&bundle),
             "resume step {n}"
         );
@@ -688,7 +763,14 @@ fn running_aging_follows_each_screenshot_step() {
         history.step(n).feed(&mut session);
         aging.fold_changes(&profile, session.take_changes());
         aging.apply(&profile, AgingEvent::Boundary);
-        let live = prepare(&session, Some(&profile), &prompt, &aging).unwrap();
+        let live = prepare(
+            &session,
+            Some(&profile),
+            &prompt,
+            &aging,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(live.encoded_media_bytes() <= profile.request_cap_bytes);
         if n == 41 {
             break;
@@ -712,9 +794,134 @@ fn running_aging_follows_each_screenshot_step() {
     }
     assert_eq!(
         reasons(
-            &prepare(&session, Some(&profile), &prompt, &aging).unwrap(),
+            &prepare(
+                &session,
+                Some(&profile),
+                &prompt,
+                &aging,
+                &Default::default()
+            )
+            .unwrap(),
             "aged"
         ),
         35
+    );
+}
+
+/// A compaction view's inserted image is no capture: it is shown from the bytes the request
+/// carries (`CallOptions::view_media`). Without those bytes it renders as its provenance marker,
+/// and for a model that reads no images, as its modality marker.
+#[test]
+fn a_view_inserted_image_is_shown_from_the_requests_view_media() {
+    let fixture = Fixture::new();
+    let profile = profile();
+    let session = fixture.session(&mut History::default());
+    let prompt = vec![fixture.person()];
+    let mut view = ViewMedia::default();
+    view.insert(fixture.media.sha256.clone(), fixture.bytes.clone().into());
+
+    let shown = prepare(
+        &session,
+        Some(&profile),
+        &prompt,
+        &MediaAging::default(),
+        &view,
+    )
+    .unwrap();
+    assert_eq!(shown.media.len(), 1, "the view's image is shown");
+    assert_eq!(shown.media[0].base64, STANDARD.encode(&fixture.bytes));
+    assert!(!shown.media[0].protected);
+    assert_eq!(reasons(&shown, "provenance"), 0);
+
+    let unknown = prepare(
+        &session,
+        Some(&profile),
+        &prompt,
+        &MediaAging::default(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(unknown.media.is_empty());
+    assert_eq!(reasons(&unknown, "provenance"), 1, "no bytes: its marker");
+
+    let text_model = prepare(&session, None, &prompt, &MediaAging::default(), &view).unwrap();
+    assert!(text_model.media.is_empty());
+    assert_eq!(
+        reasons(&text_model, "modality"),
+        1,
+        "no images read: its marker"
+    );
+}
+
+/// `png` with a text chunk added before its end: other bytes, still a valid PNG.
+fn other_png(png: &[u8]) -> Vec<u8> {
+    fn crc(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    let chunk = b"tEXtkey\0view";
+    let end = png.len() - 12;
+    let mut out = png[..end].to_vec();
+    out.extend_from_slice(&((chunk.len() - 4) as u32).to_be_bytes());
+    out.extend_from_slice(chunk);
+    out.extend_from_slice(&crc(chunk).to_be_bytes());
+    out.extend_from_slice(&png[end..]);
+    out
+}
+
+/// A view's image counts toward the request's limits like the session's own media, and is never
+/// protected: a request over its limits drops it instead of being refused.
+#[test]
+fn request_fitting_drops_a_view_image_beside_a_protected_capture() {
+    let fixture = Fixture::new();
+    let profile = profile();
+    let input = vec![fixture.person()];
+    let mut captured = input.clone();
+    broca_protocol::content::stamp_ordinals(&mut captured);
+    let mut history = History::default();
+    history.start(&input).step(1);
+    let session = fixture.session(&mut history);
+    let drawn = other_png(&fixture.bytes);
+    let reference = broca_core::media_validation::validate_media(&drawn, "image/png").unwrap();
+    let mut prompt = vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Media(reference.clone())],
+    )];
+    prompt.extend(captured);
+    let mut view = ViewMedia::default();
+    view.insert(reference.sha256.clone(), drawn.clone().into());
+    let mut aging = MediaAging::default();
+    aging.select_view(&profile, &session.bindings(&prompt));
+
+    let mut bundle = prepare(&session, Some(&profile), &prompt, &aging, &view).unwrap();
+    assert_eq!(bundle.media.len(), 2, "the view's image and the person's");
+    // Over the cap while both are shown.
+    fit_request(&profile, &mut bundle, |bundle| {
+        if bundle.media.len() > 1 {
+            u64::MAX
+        } else {
+            0
+        }
+    })
+    .unwrap();
+    assert_eq!(bundle.media.len(), 1);
+    assert_eq!(
+        bundle.media[0].reference, fixture.media,
+        "the person's image stays"
+    );
+    assert_eq!(
+        reasons(&bundle, "request_cap"),
+        1,
+        "the view's image is marked"
     );
 }

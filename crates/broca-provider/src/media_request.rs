@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use broca_core::media_request::{MediaBinding, MediaChange, MediaId, MediaLocation, SessionMedia};
 use broca_protocol::{
-    content::media_not_shown_marker, media_event::MediaEvent, ContentBlock, MediaKind,
-    MediaMarkerReason, MediaRef, Message, ToolOutput, ToolOutputPart,
+    content::media_not_shown_marker, media_event::MediaEvent, request::ViewMedia, ContentBlock,
+    MediaKind, MediaMarkerReason, MediaRef, Message, ToolOutput, ToolOutputPart,
 };
 
 use crate::media_profile::{MediaCarrier, MediaProfile};
@@ -462,11 +462,17 @@ impl std::error::Error for PrepareError {}
 /// Hydrate an already-selected view. `aging` must have received the view's metadata deltas and
 /// durable Boundary first. Preparation is pure with respect to that state, so attempts and
 /// retries cannot themselves advance aging. A resumed caller rebuilds it with `MediaAging::replay`.
+///
+/// A reference the session never captured is a compaction view's inserted image when
+/// `view_media` holds its bytes: it is shown under the same per-item checks and request limits
+/// as the session's own media, and is not aged (the view decides how long it stays). Any other
+/// uncaptured reference renders as its provenance marker.
 pub fn prepare(
     session: &SessionMedia,
     profile: Option<&MediaProfile>,
     prompt: &[Message],
     aging: &MediaAging,
+    view_media: &ViewMedia,
 ) -> Result<PreparedBundle, PrepareError> {
     let bindings = session.bindings(prompt);
     let mut by_location: HashMap<_, _> = bindings
@@ -489,6 +495,39 @@ pub fn prepare(
     let mut repeats = BTreeMap::<MediaId, u32>::new();
     for (location, reference, tool) in references(prompt) {
         let binding = by_location.remove(&(location.message, location.block, location.part));
+        if binding.is_none() {
+            if let Some(bytes) = view_media.get(&reference.sha256) {
+                match profile.map_or(Err(MediaMarkerReason::Modality), |profile| {
+                    eligibility(profile, reference, tool).map(|()| profile)
+                }) {
+                    Ok(profile) => bundle.media.push(PreparedMedia {
+                        // Ordered before every capture, so request fitting drops it first
+                        // among the user's images: it is the prompt's oldest.
+                        id: Occurrence {
+                            capture: MediaId {
+                                record: 0,
+                                message: location.message,
+                                block: location.block,
+                                part: location.part,
+                            },
+                            repetition: 0,
+                        },
+                        location,
+                        reference: reference.clone(),
+                        carrier: if tool {
+                            profile.kind(reference.kind).tool_result
+                        } else {
+                            profile.kind(reference.kind).user_message
+                        },
+                        protected: false,
+                        tool,
+                        base64: STANDARD.encode(bytes),
+                    }),
+                    Err(reason) => mark(&mut bundle.prompt, location, reference, reason),
+                }
+                continue;
+            }
+        }
         let id = binding.map(|binding| {
             let repetition = repeats.entry(binding.id).or_default();
             let id = Occurrence {

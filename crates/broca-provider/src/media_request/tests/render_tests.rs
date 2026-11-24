@@ -277,7 +277,14 @@ async fn failed_image_capture_keeps_the_numbered_label_before_its_failure_line()
     ] {
         let family = crate::registry::wire_family(id).unwrap();
         let frozen = frozen_config_for_family(id, "model");
-        let mut bundle = prepare(&session, None, &prompt, &MediaAging::default()).unwrap();
+        let mut bundle = prepare(
+            &session,
+            None,
+            &prompt,
+            &MediaAging::default(),
+            &Default::default(),
+        )
+        .unwrap();
         let bytes = render_prepared(
             &*family,
             &frozen,
@@ -470,7 +477,14 @@ fn prepared_tool_tag_table_preserves_text_targets_and_image_labels_on_every_fami
                 frozen.media = (mode != "unavailable").then_some(profile.clone());
                 let mut aging = MediaAging::default();
                 aging.select_view(&profile, &session.bindings(&prompt));
-                let mut bundle = prepare(&session, frozen.media.as_ref(), &prompt, &aging).unwrap();
+                let mut bundle = prepare(
+                    &session,
+                    frozen.media.as_ref(),
+                    &prompt,
+                    &aging,
+                    &Default::default(),
+                )
+                .unwrap();
                 if mode == "request_cap" && !bundle.media.is_empty() {
                     bundle.mark(0, MediaMarkerReason::RequestCap);
                 }
@@ -591,7 +605,14 @@ fn media_free_marker_looking_text_keeps_legacy_render_bytes() {
     );
     let legacy = crate::families::OpenAiChat.render(&frozen, &opts);
     opts.prompt = prompt.clone();
-    let mut prepared = prepare(&session, None, &prompt, &MediaAging::default()).unwrap();
+    let mut prepared = prepare(
+        &session,
+        None,
+        &prompt,
+        &MediaAging::default(),
+        &Default::default(),
+    )
+    .unwrap();
     let actual = render_prepared(
         &crate::families::OpenAiChat,
         &frozen,

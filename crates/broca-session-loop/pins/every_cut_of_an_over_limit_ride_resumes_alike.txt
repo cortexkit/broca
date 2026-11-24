@@ -1,37 +1,37 @@
 == cut after record 4 of 22: request count
 3
 == cut after record 4 of 22: request 0
-sha256:0ce358f98ef33a48ac5067f258ea0f6408854a40f17d55c1e5615cf312b00dfb (2857 bytes)
+sha256:c2ba5c2296d6d1aef915c30b52b05b2046d525cff064589c7f3c85e36e85fcea (2877 bytes)
 == cut after record 4 of 22: request 1
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 4 of 22: request 2
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 4 of 22: record count
 19
 == cut after record 4 of 22: records
 sha256:04ae433dd0d75e10ee63c303c5de9ccf1e0733e66d3d94d1957d318a1a5cc760 (13730 bytes)
 == cut after record 4 of 22: tool calls
-sha256:588665ee282ce53eea8dd7b368c27ca0d503026f19710ce4a169b6d141b705fb (4233 bytes)
+sha256:c87aa6cfcd30d2be801d52add8e09262796df7809d8538c5a65a4070dfdb0c1f (4108 bytes)
 == cut after record 5 of 22: request count
 3
 == cut after record 5 of 22: request 0
-sha256:0ce358f98ef33a48ac5067f258ea0f6408854a40f17d55c1e5615cf312b00dfb (2857 bytes)
+sha256:c2ba5c2296d6d1aef915c30b52b05b2046d525cff064589c7f3c85e36e85fcea (2877 bytes)
 == cut after record 5 of 22: request 1
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 5 of 22: request 2
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 5 of 22: record count
 19
 == cut after record 5 of 22: records
 sha256:04ae433dd0d75e10ee63c303c5de9ccf1e0733e66d3d94d1957d318a1a5cc760 (13730 bytes)
 == cut after record 5 of 22: tool calls
-sha256:588665ee282ce53eea8dd7b368c27ca0d503026f19710ce4a169b6d141b705fb (4233 bytes)
+sha256:c87aa6cfcd30d2be801d52add8e09262796df7809d8538c5a65a4070dfdb0c1f (4108 bytes)
 == cut after record 8 of 22: request count
 2
 == cut after record 8 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 8 of 22: request 1
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 8 of 22: record count
 11
 == cut after record 8 of 22: records
@@ -42,9 +42,9 @@ sha256:e2d3816c7fbb2a5a5f96d7a2e8eda708b6e64717bb334daecd1b04816f6da428 (10383 b
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {} key#1 recorder=true\"",
     "\"batch_finished\"",
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"events\":[{\"event\":\"view_refused\",\"refusal\":{\"code\":\"stale_part\",\"mid\":\"<mid#2>\",\"part\":\"0\"},\"version\":1}],\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"events\":[{\"event\":\"view_refused\",\"refusal\":{\"code\":\"stale_part\",\"mid\":\"<mid#2>\",\"part\":\"0\"},\"version\":1}],\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 10 of 22: request count
 0
@@ -63,57 +63,57 @@ sha256:e2d3816c7fbb2a5a5f96d7a2e8eda708b6e64717bb334daecd1b04816f6da428 (10383 b
 == cut after record 14 of 22: request count
 2
 == cut after record 14 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 14 of 22: request 1
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 14 of 22: record count
 9
 == cut after record 14 of 22: records
 sha256:10f0e96cb9c51b8e3ffc7458d965fcd6331323832aa7b6de5a27b351f79bfd52 (2375 bytes)
 == cut after record 14 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 15 of 22: request count
 2
 == cut after record 15 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 15 of 22: request 1
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 15 of 22: record count
 8
 == cut after record 15 of 22: records
 sha256:88d7fb7500bbac1182e88e2bbd9fcbcd5ca0d8c51decdc569a8854dffe4d80a7 (2342 bytes)
 == cut after record 15 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 16 of 22: request count
 2
 == cut after record 16 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 16 of 22: request 1
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 16 of 22: record count
 8
 == cut after record 16 of 22: records
 sha256:88d7fb7500bbac1182e88e2bbd9fcbcd5ca0d8c51decdc569a8854dffe4d80a7 (2342 bytes)
 == cut after record 16 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 17 of 22: request count
 2
 == cut after record 17 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 17 of 22: request 1
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 17 of 22: record count
 7
 == cut after record 17 of 22: records
@@ -126,14 +126,14 @@ sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
 == cut after record 17 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 18 of 22: request count
 1
 == cut after record 18 of 22: request 0
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 18 of 22: record count
 6
 == cut after record 18 of 22: records
@@ -145,8 +145,8 @@ sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
 == cut after record 18 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"applied_view\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#1>\",\"mid\":\"<mid#2>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"applied_view\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#1>\",\"mid\":\"<mid#2>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 21 of 22: request count
 0
@@ -160,37 +160,37 @@ sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 by
 == cut after record 4 of 22: request count
 3
 == cut after record 4 of 22: request 0
-sha256:0ce358f98ef33a48ac5067f258ea0f6408854a40f17d55c1e5615cf312b00dfb (2857 bytes)
+sha256:c2ba5c2296d6d1aef915c30b52b05b2046d525cff064589c7f3c85e36e85fcea (2877 bytes)
 == cut after record 4 of 22: request 1
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 4 of 22: request 2
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 4 of 22: record count
 19
 == cut after record 4 of 22: records
 sha256:04ae433dd0d75e10ee63c303c5de9ccf1e0733e66d3d94d1957d318a1a5cc760 (13730 bytes)
 == cut after record 4 of 22: tool calls
-sha256:588665ee282ce53eea8dd7b368c27ca0d503026f19710ce4a169b6d141b705fb (4233 bytes)
+sha256:c87aa6cfcd30d2be801d52add8e09262796df7809d8538c5a65a4070dfdb0c1f (4108 bytes)
 == cut after record 5 of 22: request count
 3
 == cut after record 5 of 22: request 0
-sha256:0ce358f98ef33a48ac5067f258ea0f6408854a40f17d55c1e5615cf312b00dfb (2857 bytes)
+sha256:c2ba5c2296d6d1aef915c30b52b05b2046d525cff064589c7f3c85e36e85fcea (2877 bytes)
 == cut after record 5 of 22: request 1
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 5 of 22: request 2
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 5 of 22: record count
 19
 == cut after record 5 of 22: records
 sha256:04ae433dd0d75e10ee63c303c5de9ccf1e0733e66d3d94d1957d318a1a5cc760 (13730 bytes)
 == cut after record 5 of 22: tool calls
-sha256:588665ee282ce53eea8dd7b368c27ca0d503026f19710ce4a169b6d141b705fb (4233 bytes)
+sha256:c87aa6cfcd30d2be801d52add8e09262796df7809d8538c5a65a4070dfdb0c1f (4108 bytes)
 == cut after record 8 of 22: request count
 2
 == cut after record 8 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 8 of 22: request 1
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 8 of 22: record count
 11
 == cut after record 8 of 22: records
@@ -201,9 +201,9 @@ sha256:e2d3816c7fbb2a5a5f96d7a2e8eda708b6e64717bb334daecd1b04816f6da428 (10383 b
     "\"register [\\\"c1 key#1 approved=false\\\"]\"",
     "\"dispatch_guarded c1 {} key#1 recorder=true\"",
     "\"batch_finished\"",
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"events\":[{\"event\":\"view_refused\",\"refusal\":{\"code\":\"stale_part\",\"mid\":\"<mid#2>\",\"part\":\"0\"},\"version\":1}],\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"events\":[{\"event\":\"view_refused\",\"refusal\":{\"code\":\"stale_part\",\"mid\":\"<mid#2>\",\"part\":\"0\"},\"version\":1}],\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 10 of 22: request count
 0
@@ -222,57 +222,57 @@ sha256:e2d3816c7fbb2a5a5f96d7a2e8eda708b6e64717bb334daecd1b04816f6da428 (10383 b
 == cut after record 14 of 22: request count
 2
 == cut after record 14 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 14 of 22: request 1
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 14 of 22: record count
 9
 == cut after record 14 of 22: records
 sha256:10f0e96cb9c51b8e3ffc7458d965fcd6331323832aa7b6de5a27b351f79bfd52 (2375 bytes)
 == cut after record 14 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 15 of 22: request count
 2
 == cut after record 15 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 15 of 22: request 1
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 15 of 22: record count
 8
 == cut after record 15 of 22: records
 sha256:88d7fb7500bbac1182e88e2bbd9fcbcd5ca0d8c51decdc569a8854dffe4d80a7 (2342 bytes)
 == cut after record 15 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 16 of 22: request count
 2
 == cut after record 16 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 16 of 22: request 1
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 16 of 22: record count
 8
 == cut after record 16 of 22: records
 sha256:88d7fb7500bbac1182e88e2bbd9fcbcd5ca0d8c51decdc569a8854dffe4d80a7 (2342 bytes)
 == cut after record 16 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 17 of 22: request count
 2
 == cut after record 17 of 22: request 0
-sha256:29f968195790c5989881837ae294e682db8c89a929487899291e12bc6332abbe (12573 bytes)
+sha256:f49f28e91b538625d88b6616886c32e60a11e37f5edc7e38d6aeb4060d675544 (12593 bytes)
 == cut after record 17 of 22: request 1
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 17 of 22: record count
 7
 == cut after record 17 of 22: records
@@ -285,14 +285,14 @@ sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
 == cut after record 17 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#0>\",\"mid\":\"<mid#1>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.ride {\"causes\":[\"over_limit\"],\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"}},\"deadline_ms\":2000,\"request_tokens\":4377}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#2>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 18 of 22: request count
 1
 == cut after record 18 of 22: request 0
-sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 bytes)
+sha256:e9c3728b4c65174eb54b82524eb3039727d5385299fbcbd97af06a0c31f18b91 (4608 bytes)
 == cut after record 18 of 22: record count
 6
 == cut after record 18 of 22: records
@@ -304,8 +304,8 @@ sha256:10faf2ce541d5589e5e8e93094175180e2e1e1377301ba3a59c505ee5b1ecea9 (4588 by
 {"RunEnd":{"error":null,"interrupt_reason":null,"kind":"RunEnd","reason":"completed","retries_used":0,"run_id":"r1","ts_ms":"<normalized>","usage":{"input_tokens":200,"output_tokens":40}}}
 == cut after record 18 of 22: tool calls
 [
-    "compaction.setup {\"accepts_images\":false,\"applied_view\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#1>\",\"mid\":\"<mid#2>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
-    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"conditions\":{\"accepts_images\":false,\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
+    "compaction.setup {\"applied_view\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"context_window\":1200,\"detects\":[\"chain_reset\",\"model_change\",\"effort_change\",\"tier_change\",\"account_change\",\"surface_change\",\"over_limit\"],\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"newest\":{\"digest\":\"<digest#1>\",\"mid\":\"<mid#2>\",\"ordinal\":3},\"now\":\"<time>\",\"output_reserve\":0,\"preset\":\"head\",\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"view_anchor\":true}",
+    "compaction.notice {\"applied_view\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"conditions\":{\"context_window\":1200,\"last_prompt_tokens\":100,\"model\":{\"model\":\"m\",\"provider\":\"stub\",\"service_tier\":\"standard\"},\"output_reserve\":0,\"rules\":{\"history_edit_cost\":\"suffix\",\"signed_parts\":\"none\"},\"system_tokens\":{\"count\":7,\"exact\":false},\"tools_tokens\":{\"count\":37,\"exact\":false}},\"entries\":[{\"completed_at\":\"<time>\",\"digest\":\"<digest#3>\",\"generated_under\":{\"checksum\":\"<checksum#0>\",\"version\":1},\"mid\":\"<mid#4>\",\"ordinal\":4,\"parts\":[{\"digest\":\"<digest#5>\",\"id\":\"0\",\"kind\":\"text\",\"tag\":3,\"text\":\"done\",\"tokens\":{\"count\":4}}],\"reasoning_tokens\":{\"count\":16,\"measured\":false},\"role\":\"assistant\",\"usage\":{\"output_tokens\":20,\"prompt_tokens\":100},\"written_at\":\"<time>\"}],\"newest\":{\"digest\":\"<digest#3>\",\"mid\":\"<mid#4>\",\"ordinal\":4},\"seq\":1,\"token_family\":\"o200k/1+img:anthropic-2576-4784\",\"token_family_exact\":false}",
 ]
 == cut after record 21 of 22: request count
 0

@@ -1116,11 +1116,9 @@ async fn a_run_after_a_view_drops_a_photo_renders_alike(cipher: Cipher) {
 }
 
 /// A view that inserts a user message carrying an image, as Magic Context inserts the image it
-/// draws of its memories, renders alike. The image isn't a medium the session captured, so on
-/// both storages the request shows its provenance marker in its place, never its bytes. Until
-/// the session store rendered it, such a view applied there and then failed every request. The
-/// new storage tells its provider it takes no images, whatever the model takes, yet accepts the
-/// view: a provider repeats an insert it made before, and refusing it would hold an older view.
+/// draws of its memories, shows the image to a model that reads images. The image isn't a
+/// medium the session captured: the request carries its bytes from the view, and the session
+/// tells its provider it takes images because its model does.
 async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
     let plan = super::controls::compacting_plan();
     let png = base64(&bytes_of(PNG));
@@ -1156,19 +1154,18 @@ async fn a_view_inserting_an_image_renders_alike(cipher: Cipher) {
         "the store's calls state their conditions"
     );
     assert!(
-        store_stated.iter().all(|value| *value == json!(false)),
-        "the store states it takes no images: {store_stated:?}"
+        store_stated.iter().all(|value| *value == json!(true)),
+        "the session states it takes images, as its model does: {store_stated:?}"
     );
     let store = sides.pop().unwrap();
     let new = store.sent();
     sent_pinned(&new, "");
     let last = String::from_utf8_lossy(new.last().unwrap().as_ref().unwrap()).into_owned();
     assert!(last.contains("Memories."), "the view applied: {last}");
-    assert!(!last.contains(&png), "the image's bytes were sent: {last}");
+    assert!(last.contains(&png), "the image's bytes were sent: {last}");
     assert!(
-        last.contains("[media not shown: kind=image mime=image/png")
-            && last.contains("reason=provenance]"),
-        "its marker stands in its place: {last}"
+        !last.contains("[media not shown:"),
+        "no marker stands in its place: {last}"
     );
 }
 

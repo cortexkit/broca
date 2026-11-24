@@ -62,6 +62,9 @@ pub enum Prepared {
         /// The blocks of the stored prompt, by position and block index, whose content the
         /// request's render didn't read (`render::releasable`), for the caller to release.
         releasable: Vec<(usize, Vec<usize>)>,
+        /// The bytes of the images the applied view inserted, which `prompt` names by reference
+        /// only (`host::inserted_media`).
+        media: broca_protocol::request::ViewMedia,
     },
     CompactionUnavailable,
     ContextCeiling {
@@ -276,6 +279,10 @@ pub async fn prepare_reading_back(
         request_tokens: tokens,
         restored,
         releasable,
+        media: view
+            .as_ref()
+            .map(super::host::inserted_media)
+            .unwrap_or_default(),
     })
 }
 

@@ -76,8 +76,8 @@ pub fn check_moved(
 ///
 /// A view's inserted image is accepted whatever the session stated it takes: a provider repeats
 /// an insert it made before (Magic Context repeats its image of the session's memories until its
-/// next fold), so refusing it would hold the session on an older view. Its request shows the
-/// image's provenance marker, never the image (`host::image_reference`).
+/// next fold), so refusing it would hold the session on an older view. A model that reads no
+/// images is shown the image's marker in its place (`host::inserted_media`).
 pub fn check_boundary(
     entries: &[Entry],
     view: &View,
