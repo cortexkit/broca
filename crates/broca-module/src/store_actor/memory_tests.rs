@@ -703,7 +703,10 @@ fn the_view_cache_holds_no_more_than_its_byte_cap() {
                     .unwrap()
                     .unwrap();
                 let load = Session::view_at(*backend, addr(), &triple, &deployment, &position);
-                cache.view(&format!("s{n}"), position, load).await.unwrap();
+                cache
+                    .view(&format!("s{n}"), position, "test", load)
+                    .await
+                    .unwrap();
             }
         })
     });

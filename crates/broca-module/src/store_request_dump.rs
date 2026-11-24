@@ -40,7 +40,7 @@ pub async fn serve(
         return Ok(None);
     };
     let Some(view) = runtime
-        .current_view(key)
+        .current_view_for(key, "session.request_dump")
         .await
         .map_err(|error| unreadable("read the session", format!("{error:?}")))?
     else {

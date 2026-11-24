@@ -3104,7 +3104,7 @@ impl ServeHandler for crate::LineageRegistry {
             });
         };
         crate::store_tag_read::check_owner(self, session, request, principal, scope).await?;
-        let Some(view) = store.current_view(session).await? else {
+        let Some(view) = store.current_view_for(session, "tag_read").await? else {
             return Err(ServeError::TagReadRefused {
                 code: cortexkit_role_llm_runner::errors::UNKNOWN_CALL,
                 message: format!("no call has key {}", request.call_key),

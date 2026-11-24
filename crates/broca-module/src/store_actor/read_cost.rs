@@ -470,6 +470,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
                     .view(
                         &addr,
                         position,
+                        "test",
                         Session::view_at(
                             backend(),
                             built.addr.clone(),
@@ -550,6 +551,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
                 .view(
                     &addr,
                     position,
+                    "test",
                     Session::view_at(
                         backend(),
                         built.addr.clone(),
@@ -579,6 +581,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
                 .view(
                     &addr,
                     position,
+                    "test",
                     Session::view_at(
                         backend(),
                         built.addr.clone(),

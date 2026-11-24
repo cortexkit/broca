@@ -176,7 +176,7 @@ pub struct MemorySetupStore {
 }
 
 /// A bounded cache: its caps and what it holds.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryCache {
     /// Entries held.
     pub entries: u64,
@@ -206,4 +206,19 @@ pub struct MemoryCache {
     /// session was written since that view loaded. Absent for other caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reloads: Option<u64>,
+    /// For the closed-session view cache: the same counts by the read or check that loaded each
+    /// view (`run.result`, `session.read`, `expiry` and so on). Absent for other caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loads_by_reason: Option<std::collections::BTreeMap<String, ViewLoads>>,
+}
+
+/// Closed-session views loaded for one reason since broca started.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewLoads {
+    /// Views loaded from storage.
+    pub loads: u64,
+    /// Their walked bytes when they loaded.
+    pub loaded_bytes: u64,
+    /// Of those, the ones that replaced a kept view of a session written since.
+    pub reloads: u64,
 }

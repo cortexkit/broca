@@ -52,7 +52,7 @@ pub async fn rebuild_store_from_sessions_with_progress(
                 return Err("session head identity differs from its address".into());
             }
             let view = runtime
-                .current_view(&bind)
+                .current_view_for(&bind, "late_results")
                 .await
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or("inventoried session disappeared")?;

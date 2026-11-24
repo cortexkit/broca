@@ -28,7 +28,7 @@ pub(super) async fn cancellation_identities(
         return Ok(HashMap::new());
     };
     let view = runtime
-        .current_view(&first.bind)
+        .current_view_for(&first.bind, "held_withdrawals")
         .await
         .map_err(|error| error.to_string())?
         .ok_or("withdrawal session is missing")?;

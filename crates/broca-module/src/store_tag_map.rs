@@ -41,7 +41,7 @@ pub async fn serve(
     let Some(class) = store.class_of(key)? else {
         return Ok(TagMapResponse::unnumbered());
     };
-    let Some(view) = store.current_view(key).await? else {
+    let Some(view) = store.current_view_for(key, "session.tag_map").await? else {
         return Ok(TagMapResponse::unnumbered());
     };
     let parts = store.parts_for(class, view.head().cipher());

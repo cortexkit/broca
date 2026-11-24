@@ -72,7 +72,7 @@ impl StoreRuntime {
         {
             return Ok((None, None));
         }
-        let Some(view) = self.current_view(key).await? else {
+        let Some(view) = self.current_view_for(key, "expiry").await? else {
             let newest = markers.iter().max_by_key(|m| m.seq);
             if newest.is_some_and(|marker| marker.policy_deleted == Some(true)) {
                 return Err(OpenError::UnknownSession);

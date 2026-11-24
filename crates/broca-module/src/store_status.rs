@@ -1191,7 +1191,7 @@ pub async fn status_needs_actor(
     store: &crate::store_open::StoreRuntime,
     key: &broca_protocol::BindIdentity,
 ) -> Result<bool, crate::registry::OpenError> {
-    let Some(session) = store.current_view(key).await? else {
+    let Some(session) = store.current_view_for(key, "run.status").await? else {
         return Ok(false);
     };
     Ok(crate::store_actor::recovery_changes_reads(

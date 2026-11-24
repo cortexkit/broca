@@ -333,7 +333,7 @@ impl ForkManager {
         };
         let view = self
             .runtime
-            .current_view(key)
+            .current_view_for(key, "fork")
             .await
             .map_err(|error| ForkError::Transient(format!("read the head: {error:?}")))?;
         Ok(view.map(|view| Head {

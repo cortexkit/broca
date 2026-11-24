@@ -525,8 +525,21 @@ impl StoreRuntime {
         &self,
         key: &BindIdentity,
     ) -> Result<Option<Arc<crate::store_read::StoredView<LocalBackend>>>, OpenError> {
+        self.current_view_for(key, "unnamed").await
+    }
+
+    /// [`current_view`](Self::current_view), counting a load under `reason` in the memory
+    /// report (see `store_reads::ViewCache::view`).
+    pub async fn current_view_for(
+        &self,
+        key: &BindIdentity,
+        reason: &'static str,
+    ) -> Result<Option<Arc<crate::store_read::StoredView<LocalBackend>>>, OpenError> {
         match self.class_of(key)? {
-            Some(class) => self.current_view_in(key, class).await.map_err(view_error),
+            Some(class) => self
+                .current_view_in(key, class, reason)
+                .await
+                .map_err(view_error),
             None => Ok(None),
         }
     }
@@ -536,6 +549,7 @@ impl StoreRuntime {
         &self,
         key: &BindIdentity,
         class: StorageClass,
+        reason: &'static str,
     ) -> Result<Option<Arc<crate::store_read::StoredView<LocalBackend>>>, SessionError> {
         let addr = SessionAddr(broca_core::session_addr(key));
         let backend = self.backend(class);
@@ -546,7 +560,7 @@ impl StoreRuntime {
                 Ok(None) => return Ok(None),
                 Err(error) => return Err(error),
             };
-            match self.view_at(key, class, position).await {
+            match self.view_at(key, class, position, reason).await {
                 // A writer moved the head between the probe and the load: probe again.
                 Err(SessionError::Moved) => continue,
                 Err(SessionError::Missing) => return Ok(None),
@@ -601,6 +615,7 @@ impl StoreRuntime {
         key: &BindIdentity,
         class: StorageClass,
         position: Position,
+        reason: &'static str,
     ) -> Result<Arc<crate::store_read::StoredView<LocalBackend>>, SessionError> {
         let addr = broca_core::session_addr(key);
         let triple = triple(key);
@@ -615,7 +630,7 @@ impl StoreRuntime {
             .await?;
             Ok(crate::store_read::StoredView::new(Box::new(view), position).await)
         };
-        self.views.view(&addr, position, load).await
+        self.views.view(&addr, position, reason, load).await
     }
 
     /// Serves `request` on the session `key`: by its store actor when the registry holds one open,
@@ -655,7 +670,7 @@ impl StoreRuntime {
         if !request.is_authorization() && registry.open_handle(key).is_none() {
             let current = match probed.take() {
                 Some(view) => Ok(Some(view)),
-                None => self.current_view_in(key, class).await,
+                None => self.current_view_in(key, class, request.name()).await,
             };
             let needs_actor = match current {
                 Ok(Some(view)) => {
@@ -699,7 +714,10 @@ impl StoreRuntime {
         };
         let current = match probed {
             Some(view) => Some(view),
-            None => self.current_view_in(key, class).await.map_err(view_error)?,
+            None => self
+                .current_view_in(key, class, request.name())
+                .await
+                .map_err(view_error)?,
         };
         let Some(view) = current else {
             return Ok(None);
@@ -738,7 +756,11 @@ impl StoreRuntime {
                 return Ok(Some(reply));
             }
         }
-        let Some(view) = self.current_view_in(key, class).await.map_err(view_error)? else {
+        let Some(view) = self
+            .current_view_in(key, class, request.name())
+            .await
+            .map_err(view_error)?
+        else {
             return Ok(None);
         };
         let slot = registry.and_then(|registry| registry.slot_state(key));
@@ -783,7 +805,7 @@ impl StoreRuntime {
                 }) => match if let Some(view) = probed.filter(|view| view.position() == position) {
                     Ok(Arc::clone(view))
                 } else {
-                    self.view_at(key, class, position).await
+                    self.view_at(key, class, position, request.name()).await
                 } {
                     Ok(view) => {
                         let counts = self.views.token_counts(&addr);

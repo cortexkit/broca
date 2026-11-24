@@ -123,6 +123,33 @@ impl StoreReadRequest {
     pub(crate) fn is_internal(&self) -> bool {
         matches!(self, Self::HeldCalls { .. })
     }
+
+    /// The read's name, as the memory report counts the closed-session views it loads.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::RunAdmission(_) => "run.admission",
+            Self::RunStatus(_) | Self::RunStatusReply(_) => "run.status",
+            Self::RunResult(_) => "run.result",
+            Self::RunToolCalls(_) => "run.tool_calls",
+            Self::SendStatus { .. } => "send_status",
+            Self::Head => "session.head",
+            Self::Page(_) => "session.read",
+            Self::Entries { .. } => "session.entries",
+            Self::AuthorizationOwnership
+            | Self::AuthorizationRead(_)
+            | Self::AuthorizationSubmissionSender(_) => "authorization",
+            Self::Compaction { .. } => "compaction",
+            Self::HistoryHead { .. } => "session.history",
+            Self::Media { .. } => "session.media_read",
+            Self::TagLocation(_) | Self::WritingView { .. } | Self::OutputRefNamespace => {
+                "output_refs"
+            }
+            Self::PlanChange { .. } | Self::PlanIdentities => "plan_change",
+            Self::Baseline => "session.baseline",
+            Self::PlanView => "session.plan_view",
+            Self::HeldCalls { .. } => "held_calls",
+        }
+    }
 }
 
 /// What a `session.read` page asks of the session itself.
@@ -578,6 +605,8 @@ struct CacheInner<V> {
     /// Of those loads, the ones that replaced a view of the same session at an older position:
     /// the session was written since its view loaded.
     reloads: u64,
+    /// The same three counts per reason a view was loaded for (see [`ViewCache::view`]).
+    by_reason: std::collections::BTreeMap<&'static str, broca_wire::ViewLoads>,
 }
 
 /// Views of closed sessions this process loaded and didn't keep because each alone was larger
@@ -600,6 +629,7 @@ impl<V> Default for CacheInner<V> {
             loads: 0,
             loaded_bytes: 0,
             reloads: 0,
+            by_reason: Default::default(),
         }
     }
 }
@@ -616,6 +646,8 @@ struct CacheEntry<V> {
     used: u64,
     /// Whether it replaced a view of its session at an older position.
     replaced_older: bool,
+    /// Why the view was loaded: the read or check that asked for it first.
+    reason: &'static str,
 }
 
 /// What a kept view holds, as [`ViewCache`] counts it against its byte cap.
@@ -688,11 +720,13 @@ impl<V: CachedBytes> ViewCache<V> {
 
     /// The view of the session at `addr` at `position`: the kept one, or the one `load` loads,
     /// which is then kept. Concurrent callers for the same position share one load. A failed load
-    /// keeps nothing, and the next caller loads again.
+    /// keeps nothing, and the next caller loads again. `reason` names the read or check asking,
+    /// which the memory report counts loads by.
     pub async fn view<E>(
         &self,
         addr: &str,
         position: Position,
+        reason: &'static str,
         load: impl std::future::Future<Output = Result<V, E>>,
     ) -> Result<Arc<V>, E> {
         let cell = {
@@ -731,6 +765,7 @@ impl<V: CachedBytes> ViewCache<V> {
                             bytes: 0,
                             used: clock,
                             replaced_older,
+                            reason,
                         },
                     );
                     if let Some(replaced) = replaced {
@@ -751,11 +786,15 @@ impl<V: CachedBytes> ViewCache<V> {
                 // one byte, so a counted entry is never taken for an unloaded one.
                 entry.loaded = view.loaded_bytes().max(1);
                 entry.bytes = entry.loaded + view.grown_bytes();
-                let (loaded, reload) = (entry.loaded, entry.replaced_older);
+                let (loaded, reload, reason) = (entry.loaded, entry.replaced_older, entry.reason);
                 inner.bytes += entry.bytes;
                 inner.loads += 1;
                 inner.loaded_bytes += loaded;
                 inner.reloads += u64::from(reload);
+                let by_reason = inner.by_reason.entry(reason).or_default();
+                by_reason.loads += 1;
+                by_reason.loaded_bytes += loaded;
+                by_reason.reloads += u64::from(reload);
             }
         }
         for (addr, bytes) in inner.evict(self.max_entries, self.max_bytes) {
@@ -793,6 +832,13 @@ impl<V: CachedBytes> ViewCache<V> {
             loads: Some(inner.loads),
             loaded_bytes: Some(inner.loaded_bytes),
             reloads: Some(inner.reloads),
+            loads_by_reason: Some(
+                inner
+                    .by_reason
+                    .iter()
+                    .map(|(reason, loads)| ((*reason).to_owned(), loads.clone()))
+                    .collect(),
+            ),
         }
     }
 
@@ -894,7 +940,7 @@ mod tests {
                     (Arc::clone(&cache), Arc::clone(&loads), Arc::clone(&release));
                 tokio::spawn(async move {
                     cache
-                        .view("s", at(1, 10), async {
+                        .view("s", at(1, 10), "test", async {
                             loads.fetch_add(1, Ordering::SeqCst);
                             release.notified().await;
                             Ok::<_, ()>(7)
@@ -916,7 +962,7 @@ mod tests {
         }
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         let again = cache
-            .view("s", at(1, 10), async {
+            .view("s", at(1, 10), "test", async {
                 loads.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, ()>(8)
             })
@@ -931,19 +977,58 @@ mod tests {
     async fn a_new_position_loads_again_and_replaces_the_old_view() {
         let cache: ViewCache<u64> = ViewCache::new(4, u64::MAX);
         let load = |value: u64| async move { Ok::<_, ()>(value) };
-        assert_eq!(*cache.view("s", at(1, 10), load(1)).await.unwrap(), 1);
-        assert_eq!(*cache.view("s", at(2, 10), load(2)).await.unwrap(), 2);
-        assert_eq!(*cache.view("s", at(2, 11), load(3)).await.unwrap(), 3);
+        assert_eq!(
+            *cache.view("s", at(1, 10), "test", load(1)).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            *cache
+                .view("s", at(2, 10), "run.result", load(2))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            *cache.view("s", at(2, 11), "test", load(3)).await.unwrap(),
+            3
+        );
+        // A reader served the kept view counts no load under its own reason.
+        assert_eq!(
+            *cache.view("s", at(2, 11), "expiry", load(9)).await.unwrap(),
+            3
+        );
         assert_eq!(cache.usage().0, 1);
         // A failed load keeps nothing, and the next reader loads.
-        assert!(cache.view("s", at(3, 1), async { Err(()) }).await.is_err());
-        assert_eq!(*cache.view("s", at(3, 1), load(4)).await.unwrap(), 4);
+        assert!(cache
+            .view("s", at(3, 1), "test", async { Err(()) })
+            .await
+            .is_err());
+        assert_eq!(
+            *cache.view("s", at(3, 1), "test", load(4)).await.unwrap(),
+            4
+        );
         // The memory report counts each load that succeeded and its bytes, and the three that
         // replaced a view of the session at an older position.
         let memory = cache.memory(|view| *view as usize);
         assert_eq!(memory.loads, Some(4));
         assert_eq!(memory.loaded_bytes, Some(1 + 2 + 3 + 4));
         assert_eq!(memory.reloads, Some(3));
+        // And the same counts by the reason of the reader whose load filled the view.
+        let by = |loads, loaded_bytes, reloads| broca_wire::ViewLoads {
+            loads,
+            loaded_bytes,
+            reloads,
+        };
+        assert_eq!(
+            memory.loads_by_reason,
+            Some(
+                [
+                    ("run.result".to_owned(), by(1, 2, 1)),
+                    ("test".to_owned(), by(3, 1 + 3 + 4, 2)),
+                ]
+                .into()
+            )
+        );
     }
 
     /// The least recently used view goes first, by count and by estimated bytes.
@@ -951,19 +1036,28 @@ mod tests {
     async fn the_cache_stays_within_its_bounds() {
         let load = |value: u64| async move { Ok::<_, ()>(value) };
         let cache: ViewCache<u64> = ViewCache::new(2, u64::MAX);
-        cache.view("a", at(1, 1), load(1)).await.unwrap();
-        cache.view("b", at(1, 1), load(2)).await.unwrap();
-        cache.view("a", at(1, 1), load(9)).await.unwrap();
-        cache.view("c", at(1, 1), load(3)).await.unwrap();
+        cache.view("a", at(1, 1), "test", load(1)).await.unwrap();
+        cache.view("b", at(1, 1), "test", load(2)).await.unwrap();
+        cache.view("a", at(1, 1), "test", load(9)).await.unwrap();
+        cache.view("c", at(1, 1), "test", load(3)).await.unwrap();
         assert_eq!(cache.usage().0, 2);
         // `b` was the least recently used, so it is loaded again.
-        assert_eq!(*cache.view("b", at(1, 1), load(4)).await.unwrap(), 4);
-        assert_eq!(*cache.view("c", at(1, 1), load(9)).await.unwrap(), 3);
+        assert_eq!(
+            *cache.view("b", at(1, 1), "test", load(4)).await.unwrap(),
+            4
+        );
+        assert_eq!(
+            *cache.view("c", at(1, 1), "test", load(9)).await.unwrap(),
+            3
+        );
 
         let per_view = 500;
         let cache: ViewCache<u64> = ViewCache::new(10, 2 * per_view);
         for name in ["a", "b", "c"] {
-            cache.view(name, at(1, 100), load(per_view)).await.unwrap();
+            cache
+                .view(name, at(1, 100), "test", load(per_view))
+                .await
+                .unwrap();
         }
         assert_eq!(cache.usage(), (2, 2 * per_view));
     }
@@ -974,18 +1068,27 @@ mod tests {
     async fn a_view_over_the_byte_cap_is_counted_and_never_kept() {
         let load = |value: u64| async move { Ok::<_, ()>(value) };
         let cache: ViewCache<u64> = ViewCache::new(10, 1_000);
-        cache.view("a", at(1, 1), load(400)).await.unwrap();
-        cache.view("b", at(1, 1), load(400)).await.unwrap();
+        cache.view("a", at(1, 1), "test", load(400)).await.unwrap();
+        cache.view("b", at(1, 1), "test", load(400)).await.unwrap();
         let before = super::views_over_cap();
         assert_eq!(
-            *cache.view("big", at(1, 1), load(1_001)).await.unwrap(),
+            *cache
+                .view("big", at(1, 1), "test", load(1_001))
+                .await
+                .unwrap(),
             1_001
         );
         assert_eq!(cache.usage(), (2, 800));
         assert_eq!(cache.memory(|_| 0).views_over_cap, Some(1));
         assert!(super::views_over_cap() > before);
         // The views that fit are still served without loading.
-        assert_eq!(*cache.view("a", at(1, 1), load(9)).await.unwrap(), 400);
-        assert_eq!(*cache.view("b", at(1, 1), load(9)).await.unwrap(), 400);
+        assert_eq!(
+            *cache.view("a", at(1, 1), "test", load(9)).await.unwrap(),
+            400
+        );
+        assert_eq!(
+            *cache.view("b", at(1, 1), "test", load(9)).await.unwrap(),
+            400
+        );
     }
 }
