@@ -136,6 +136,7 @@ fn outcome(run: &str, at_ms: i64, provider: Option<&str>, kind: OutcomeKind) -> 
         at_ms,
         run_id: run.into(),
         provider: provider.map(str::to_owned),
+        model: provider.map(|_| "model".to_owned()),
         credential: Some("credential".into()),
         kind,
     }
@@ -148,8 +149,28 @@ fn error(run: &str, at_ms: i64, class: Option<&str>, code: Option<&str>) -> RunO
         OutcomeKind::Error {
             class: class.map(str::to_owned),
             code: code.map(str::to_owned),
+            status: None,
+            step: None,
         },
     )
+}
+
+/// A run on `model` that ended in `class` `code` with HTTP 400 at its second step.
+fn refused(run: &str, at_ms: i64, model: &str, class: &str, code: &str) -> RunOutcome {
+    RunOutcome {
+        model: Some(model.into()),
+        ..outcome(
+            run,
+            at_ms,
+            Some("google-codeassist"),
+            OutcomeKind::Error {
+                class: Some(class.into()),
+                code: Some(code.into()),
+                status: Some(400),
+                step: Some(2),
+            },
+        )
+    }
 }
 fn interrupted(run: &str, at_ms: i64, reason: Option<&str>) -> RunOutcome {
     outcome(
@@ -702,7 +723,30 @@ fn diagnostics_findings_v1_vectors_match_serving_replies() {
             OutcomeKind::Error {
                 class: Some("auth_required".into()),
                 code: None,
+                status: None,
+                step: None,
             },
+        ),
+        refused(
+            "refused-1",
+            NOW - 3000,
+            "claude-sonnet",
+            "permanent",
+            "request_invalid",
+        ),
+        refused(
+            "refused-2",
+            NOW - 2000,
+            "claude-sonnet",
+            "permanent",
+            "request_invalid",
+        ),
+        refused(
+            "refused-3",
+            NOW - 1000,
+            "claude-sonnet",
+            "permanent",
+            "request_invalid",
         ),
     ];
     let reply = answer(json!({}), Some(&principal()), &head, NOW, |since| {
@@ -789,10 +833,88 @@ fn diagnostics_error_floors_require_bursts_but_auth_requires_one() {
         after
             .findings
             .iter()
-            .filter(|f| f.severity == Severity::Error)
+            .filter(|f| f.check == "run_errors" && f.severity == Severity::Error)
             .count(),
         2
     );
+}
+
+/// Three runs on one model ending in the same permanent error within fifteen minutes are an error
+/// finding at once, below `run_errors`' floor, and its summary names the model, step and status.
+/// Two runs, a third outside the fifteen minutes, the same code split across two models, or a
+/// burst of transient errors raise nothing, and `run_errors` is unchanged by the burst.
+#[test]
+fn model_failing_names_one_model_failing_the_same_way_three_times_in_fifteen_minutes() {
+    let since = NOW - DEFAULT_WINDOW_MS;
+    let failing = |outcomes: Vec<RunOutcome>| {
+        report(
+            healthy().with_outcomes(since, outcomes),
+            NOW,
+            DEFAULT_WINDOW_MS,
+        )
+        .findings
+        .into_iter()
+        .filter(|f| f.check == "model_failing")
+        .collect::<Vec<_>>()
+    };
+    let burst = |model: &str, ages: &[i64]| -> Vec<RunOutcome> {
+        ages.iter()
+            .enumerate()
+            .map(|(n, age)| {
+                refused(
+                    &format!("{model}-{n}"),
+                    NOW - age,
+                    model,
+                    "permanent",
+                    "request_invalid",
+                )
+            })
+            .collect()
+    };
+    let minute = 60_000;
+
+    let three = burst("claude-sonnet", &[14 * minute, 5 * minute, minute]);
+    let found = failing(three.clone());
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(found[0].severity, Severity::Error);
+    assert_eq!(found[0].count, 3);
+    assert_eq!(
+        found[0].summary,
+        "3 runs on google-codeassist/claude-sonnet ended in permanent request_invalid within 15 \
+         minutes; one ended at step 2, HTTP 400."
+    );
+    assert_eq!(found[0].samples[0]["model"], "claude-sonnet");
+    let run_errors = report(
+        healthy().with_outcomes(since, three),
+        NOW,
+        DEFAULT_WINDOW_MS,
+    )
+    .findings
+    .into_iter()
+    .filter(|f| f.check == "run_errors")
+    .count();
+    assert_eq!(
+        run_errors, 0,
+        "three permanent errors stay below run_errors' floor"
+    );
+
+    assert!(failing(burst("claude-sonnet", &[2 * minute, minute])).is_empty());
+    assert!(failing(burst("claude-sonnet", &[16 * minute, 2 * minute, minute])).is_empty());
+    let mut split = burst("claude-sonnet", &[2 * minute, minute]);
+    split.extend(burst("claude-opus", &[2 * minute, minute]));
+    assert!(failing(split).is_empty());
+    let limited = (0..5)
+        .map(|n| {
+            refused(
+                &format!("limited-{n}"),
+                NOW - minute,
+                "claude-sonnet",
+                "transient",
+                "rate_limited",
+            )
+        })
+        .collect();
+    assert!(failing(limited).is_empty());
 }
 
 #[test]

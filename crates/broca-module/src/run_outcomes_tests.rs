@@ -99,18 +99,20 @@ fn outcome(at_ms: i64, run: &str, credential: &str, kind: OutcomeKind) -> RunOut
         at_ms,
         run_id: run.into(),
         provider: Some("anthropic".into()),
+        model: Some("m".into()),
         credential: Some(credential.into()),
         kind,
     }
 }
 
-/// A run's error end carries its provider, its credential (the one an account move chose, once
-/// there is one), the error's class and its provider code.
+/// A run's error end carries its provider and model, its credential (the one an account move
+/// chose, once there is one), the error's class, provider code and HTTP status, and the last step
+/// the run started.
 #[test]
-fn an_error_end_names_the_provider_credential_class_and_code() {
+fn an_error_end_names_the_provider_model_credential_class_code_status_and_step() {
     let (mut recorder, ring) = recorder();
-    let error =
-        json!({"class": "permanent", "message": "no credit", "provider_code": "billing_exhausted"});
+    let error = json!({"class": "permanent", "message": "no credit",
+        "provider_code": "billing_exhausted", "status": 402});
     durable(
         &mut recorder,
         &[
@@ -120,6 +122,7 @@ fn an_error_end_names_the_provider_credential_class_and_code() {
                 ts_ms: None,
                 auth_selection: json!({"credential_id": "oauth:anthropic:acct2"}),
             }),
+            step("r1"),
             end("r1", RunFinishReason::Error, Some(error)),
         ],
     );
@@ -132,6 +135,8 @@ fn an_error_end_names_the_provider_credential_class_and_code() {
             OutcomeKind::Error {
                 class: Some("permanent".into()),
                 code: Some("billing_exhausted".into()),
+                status: Some(402),
+                step: Some(2),
             },
         )]
     );
@@ -243,7 +248,9 @@ fn outcomes_wait_for_durability_and_seeded_runs_report_nothing() {
             "oauth:anthropic:acct1",
             OutcomeKind::Error {
                 class: None,
-                code: None
+                code: None,
+                status: None,
+                step: None,
             },
         )]
     );

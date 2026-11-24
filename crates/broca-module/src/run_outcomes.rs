@@ -24,6 +24,8 @@ pub struct RunOutcome {
     pub run_id: String,
     /// The model provider module the run's start froze; absent when its start isn't known.
     pub provider: Option<String>,
+    /// The model id the run's start froze; absent when its start isn't known.
+    pub model: Option<String>,
     /// The credential the run used: its start's, or the one an account move chose since.
     pub credential: Option<String>,
     pub kind: OutcomeKind,
@@ -31,11 +33,15 @@ pub struct RunOutcome {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutcomeKind {
-    /// The run ended `error`. `class` is the provider error's wire class and `code` its
-    /// provider code; both are absent when the end recorded no provider error.
+    /// The run ended `error`. `class` is the provider error's class (`transient`, `permanent`,
+    /// `auth_required` or `context_overflow`), `code` its
+    /// provider code and `status` its HTTP status; each is absent when the end recorded no
+    /// provider error, or the error had none. `step` is the last step the run started.
     Error {
         class: Option<String>,
         code: Option<String>,
+        status: Option<u16>,
+        step: Option<u64>,
     },
     /// The run ended `interrupted`, with the reason its end recorded.
     Interrupted { reason: Option<String> },
@@ -58,9 +64,10 @@ impl RingEvent for RunOutcome {
             }
         };
         limit(&mut self.provider, 256);
+        limit(&mut self.model, 256);
         limit(&mut self.credential, 512);
         match &mut self.kind {
-            OutcomeKind::Error { class, code } => {
+            OutcomeKind::Error { class, code, .. } => {
                 limit(class, 64);
                 limit(code, 128);
             }
@@ -90,7 +97,10 @@ fn credential_of(selection: &serde_json::Value) -> Option<String> {
 struct OpenRun {
     run_id: String,
     provider: Option<String>,
+    model: Option<String>,
     credential: Option<String>,
+    /// The last step it started.
+    step: Option<u64>,
     /// Seeded from an import or a fork: it never calls a provider, so it has no outcomes.
     seeded: bool,
     /// Its last reported outcome is a pause no later outcome has cleared.
@@ -102,7 +112,9 @@ impl OpenRun {
         Self {
             run_id: start.run_id.clone(),
             provider: Some(start.model.provider_module_id.clone()),
+            model: Some(start.model.model_id.clone()),
             credential: start.auth_selection.as_ref().and_then(credential_of),
+            step: None,
             seeded: start.seeded == Some(true),
             paused: false,
         }
@@ -147,6 +159,11 @@ impl Recorder {
     }
 
     fn project(&mut self, record: &Record) {
+        if let Record::StepStart(start) = record {
+            if let Some(run) = self.run.as_mut().filter(|run| run.run_id == start.run_id) {
+                run.step = Some(start.step_id);
+            }
+        }
         let (run_id, at_ms, kind) = match record {
             Record::RunStart(start) => {
                 self.run = Some(OpenRun::started(start));
@@ -186,7 +203,13 @@ impl Recorder {
                         let shared = error.map(broca_protocol::caller::SharedProviderError::from);
                         OutcomeKind::Error {
                             class: shared.as_ref().map(|error| error.class_wire().to_owned()),
+                            status: shared.as_ref().and_then(|error| error.as_inner().status),
                             code: shared.and_then(|error| error.as_inner().provider_code.clone()),
+                            step: self
+                                .run
+                                .as_ref()
+                                .filter(|run| run.run_id == end.run_id)
+                                .and_then(|run| run.step),
                         }
                     }
                     RunFinishReason::Interrupted => OutcomeKind::Interrupted {
@@ -212,8 +235,12 @@ impl Recorder {
         if open.as_ref().is_some_and(|run| run.seeded) {
             return;
         }
-        let (provider, credential) = open.as_ref().map_or((None, None), |run| {
-            (run.provider.clone(), run.credential.clone())
+        let (provider, model, credential) = open.as_ref().map_or((None, None, None), |run| {
+            (
+                run.provider.clone(),
+                run.model.clone(),
+                run.credential.clone(),
+            )
         });
         if let Some(run) = open {
             run.paused = matches!(kind, OutcomeKind::Paused { .. });
@@ -224,6 +251,7 @@ impl Recorder {
                 .unwrap_or_else(|| (self.now_ms)()),
             run_id: run_id.clone(),
             provider,
+            model,
             credential,
             kind,
         });
@@ -315,6 +343,7 @@ pub async fn paused_at_open<B: SessionBackend>(
             .unwrap_or_else(wall_now_ms),
         run_id: run.run_id.clone(),
         provider: open.provider,
+        model: open.model,
         credential: open.credential,
         kind: OutcomeKind::Paused {
             reason: pause.reason,

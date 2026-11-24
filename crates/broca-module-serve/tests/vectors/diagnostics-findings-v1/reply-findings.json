@@ -9,6 +9,10 @@
         "since_ms": 199999000,
         "truncated": false
       },
+      "model_failing": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
       "run_errors": {
         "since_ms": 199999000,
         "truncated": false
@@ -31,6 +35,54 @@
       }
     },
     "findings": [
+      {
+        "check": "model_failing",
+        "count": 3,
+        "first_seen_ms": 199997000,
+        "hint": "Read a sampled run's error with broca-session result --run-id. One model failing the same way every time usually means broca sends something that model's route refuses.",
+        "key": "[\"google-codeassist\",\"claude-sonnet\",\"permanent\",\"request_invalid\"]",
+        "last_seen_ms": 199999000,
+        "samples": [
+          {
+            "at_ms": 199997000,
+            "credential_id": "credential",
+            "error_class": "permanent",
+            "error_code": "request_invalid",
+            "http_status": 400,
+            "interrupt_reason": null,
+            "model": "claude-sonnet",
+            "provider_module_id": "google-codeassist",
+            "run_id": "refused-1",
+            "step": 2
+          },
+          {
+            "at_ms": 199998000,
+            "credential_id": "credential",
+            "error_class": "permanent",
+            "error_code": "request_invalid",
+            "http_status": 400,
+            "interrupt_reason": null,
+            "model": "claude-sonnet",
+            "provider_module_id": "google-codeassist",
+            "run_id": "refused-2",
+            "step": 2
+          },
+          {
+            "at_ms": 199999000,
+            "credential_id": "credential",
+            "error_class": "permanent",
+            "error_code": "request_invalid",
+            "http_status": 400,
+            "interrupt_reason": null,
+            "model": "claude-sonnet",
+            "provider_module_id": "google-codeassist",
+            "run_id": "refused-3",
+            "step": 2
+          }
+        ],
+        "severity": "error",
+        "summary": "3 runs on google-codeassist/claude-sonnet ended in permanent request_invalid within 15 minutes; one ended at step 2, HTTP 400."
+      },
       {
         "check": "paused_runs",
         "count": 1,
@@ -65,9 +117,12 @@
             "credential_id": "credential",
             "error_class": "permanent",
             "error_code": "billing_exhausted",
+            "http_status": null,
             "interrupt_reason": null,
+            "model": "model",
             "provider_module_id": "openai",
-            "run_id": "billing"
+            "run_id": "billing",
+            "step": null
           }
         ],
         "severity": "error",
@@ -86,9 +141,12 @@
             "credential_id": "credential",
             "error_class": "auth_required",
             "error_code": null,
+            "http_status": null,
             "interrupt_reason": null,
+            "model": null,
             "provider_module_id": null,
-            "run_id": "unattributed-error"
+            "run_id": "unattributed-error",
+            "step": null
           }
         ],
         "severity": "error",

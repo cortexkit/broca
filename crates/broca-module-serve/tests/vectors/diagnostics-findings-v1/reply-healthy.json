@@ -9,6 +9,10 @@
         "since_ms": 199999000,
         "truncated": false
       },
+      "model_failing": {
+        "since_ms": 199999000,
+        "truncated": false
+      },
       "run_errors": {
         "since_ms": 199999000,
         "truncated": false

@@ -196,7 +196,7 @@ fn unavailable(check: &str, now: i64) -> Finding {
 /// The class and provider code of an error outcome, and the reason of an interruption.
 fn outcome_fields(outcome: &RunOutcome) -> (Option<&str>, Option<&str>, Option<&str>) {
     match &outcome.kind {
-        OutcomeKind::Error { class, code } => (class.as_deref(), code.as_deref(), None),
+        OutcomeKind::Error { class, code, .. } => (class.as_deref(), code.as_deref(), None),
         OutcomeKind::Interrupted { reason } => (None, None, reason.as_deref()),
         OutcomeKind::Paused { .. } | OutcomeKind::Resumed => (None, None, None),
     }
@@ -222,9 +222,17 @@ fn group(
         f.last_seen_ms = f.last_seen_ms.max(at);
         if f.samples.len() < 5 {
             let (class, code, interrupt) = outcome_fields(row);
-            f.samples.push(json!({"run_id":row.run_id,"at_ms":row.at_ms,
+            let mut sample = json!({"run_id":row.run_id,"at_ms":row.at_ms,
                 "provider_module_id":row.provider,"credential_id":row.credential,
-                "error_class":class,"error_code":code,"interrupt_reason":interrupt}));
+                "error_class":class,"error_code":code,"interrupt_reason":interrupt});
+            // Where an error happened, so a reader can tell one model refusing every request
+            // from scattered failures without reading the run first.
+            if let OutcomeKind::Error { status, step, .. } = &row.kind {
+                sample["model"] = json!(row.model);
+                sample["http_status"] = json!(status);
+                sample["step"] = json!(step);
+            }
+            f.samples.push(sample);
         }
     }
     groups.into_values().collect()
@@ -276,6 +284,7 @@ fn run_findings(
         f.summary = format!("{} runs ended in error in the window{dropped}.",f.count);
         findings.push(f);
     }
+    model_failing(&errors, now, findings);
     let interruptions: Vec<_> = runs
         .window
         .events
@@ -291,7 +300,7 @@ fn run_findings(
         f.summary = format!("{} runs ended interrupted outside a restart seal{dropped}.",f.count);
         findings.push(f);
     }
-    for check in ["run_errors", "interrupted_runs"] {
+    for check in ["run_errors", "model_failing", "interrupted_runs"] {
         coverage.insert(
             check.into(),
             Coverage {
@@ -299,6 +308,55 @@ fn run_findings(
                 truncated: runs.window.truncated,
             },
         );
+    }
+}
+
+/// How recent and how many runs of one model ending in one error make `model_failing`.
+const BURST_WINDOW_MS: i64 = 15 * 60 * 1000;
+const BURST_RUNS: u64 = 3;
+
+/// The `model_failing` finding: one model's runs ending in the same error again and again in the
+/// last fifteen minutes, which usually means the model's route refuses what broca sends, so every
+/// run on it fails. `run_errors` reports the same runs among all of the window's errors, at its
+/// own thresholds; this check catches the burst at once and names the model in its summary,
+/// which is the part digests print.
+///
+/// Only errors that retrying the same request can't fix count: `permanent` ones, and errors
+/// broca raised itself (no provider error, so no class). A burst of rate limits or overloads is
+/// the provider's state, an overflow is each session's own size, and a credential failure is
+/// already reported by `run_errors` at its first run.
+fn model_failing(errors: &[&RunOutcome], now: i64, findings: &mut Vec<Finding>) {
+    let recent: Vec<_> = errors
+        .iter()
+        .copied()
+        .filter(|outcome| now.saturating_sub(outcome.at_ms) <= BURST_WINDOW_MS)
+        .filter(|outcome| matches!(outcome_fields(outcome).0, None | Some("permanent")))
+        .collect();
+    for mut f in group(&recent, "model_failing", |r| {
+        let (class, code, _) = outcome_fields(r);
+        json!([r.provider, r.model, class, code]).to_string()
+    }, "Read a sampled run's error with broca-session result --run-id. One model failing the same way every time usually means broca sends something that model's route refuses.") {
+        if f.count < BURST_RUNS {
+            continue;
+        }
+        let sample = &f.samples[0];
+        let text = |field: &str| sample[field].as_str().unwrap_or("unknown").to_owned();
+        let error = match (sample["error_class"].as_str(), sample["error_code"].as_str()) {
+            (Some(class), Some(code)) => format!("{class} {code}"),
+            (Some(class), None) => format!("{class} with no provider code"),
+            (None, _) => "an error broca raised itself".to_owned(),
+        };
+        f.severity = Severity::Error;
+        f.summary = format!(
+            "{} runs on {}/{} ended in {} within 15 minutes; one ended at step {}, HTTP {}.",
+            f.count,
+            text("provider_module_id"),
+            text("model"),
+            error,
+            sample["step"].as_u64().map_or("unknown".to_owned(), |step| step.to_string()),
+            sample["http_status"].as_u64().map_or("unknown".to_owned(), |status| status.to_string()),
+        );
+        findings.push(f);
     }
 }
 
@@ -418,7 +476,12 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
     match &evidence.runs {
         Ok(runs) => run_findings(runs, now, window, &mut findings, &mut coverage),
         Err(_) => {
-            for check in ["paused_runs", "run_errors", "interrupted_runs"] {
+            for check in [
+                "paused_runs",
+                "run_errors",
+                "model_failing",
+                "interrupted_runs",
+            ] {
                 findings.push(unavailable(check, now));
             }
         }
