@@ -1730,6 +1730,15 @@ async fn in_memory_reads_refuse_only_where_they_did_before() {
         .map(|read| (*read).to_owned())
         .collect();
     assert_eq!(stored, before, "the reads the actor answered from storage");
+    // The memory report names each such read with the line in the session store that needed
+    // storage.
+    let sites = crate::store_reads::stored_reads().unwrap_or_default();
+    assert!(
+        sites
+            .keys()
+            .any(|site| site.starts_with("run.status @ ") && site.contains("broca-session-store")),
+        "{sites:?}"
+    );
     m.gate.notify_one();
     m.ended("r3", "completed").await;
 }

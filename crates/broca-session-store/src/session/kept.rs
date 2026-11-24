@@ -287,10 +287,24 @@ impl KeptRecords {
     }
 }
 
+/// Where the first read that needed storage refused, while reads came from memory only: the
+/// source line that asked for storage, so the memory report can say which reads a session's
+/// actor sends to storage.
+#[derive(Default)]
+pub(crate) struct RefusedAt(std::sync::Mutex<Option<&'static std::panic::Location<'static>>>);
+
+impl RefusedAt {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<&'static std::panic::Location<'static>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Reads from memory only while it lives (see [`Session::in_memory`]).
 pub struct InMemory<'a> {
     flag: &'a AtomicBool,
-    refused: &'a AtomicBool,
+    refused: &'a RefusedAt,
 }
 
 impl InMemory<'_> {
@@ -298,7 +312,13 @@ impl InMemory<'_> {
     /// swallowed the refusal still learns of it here, so it never serves what that read made of
     /// it.
     pub fn refused(&self) -> bool {
-        self.refused.load(Ordering::SeqCst)
+        self.refused.lock().is_some()
+    }
+
+    /// The source line of the first read that refused while this guard lived (see
+    /// [`refused`](Self::refused)).
+    pub fn refused_at(&self) -> Option<&'static std::panic::Location<'static>> {
+        *self.refused.lock()
     }
 }
 
@@ -314,7 +334,7 @@ impl<B: SessionBackend> Session<B> {
     /// owner takes this around a read it answers between its own writes, so the read never waits
     /// on storage. Writes are never refused by it.
     pub fn in_memory(&self) -> InMemory<'_> {
-        self.memory_refused.store(false, Ordering::SeqCst);
+        *self.memory_refused.lock() = None;
         self.memory_only.store(true, Ordering::SeqCst);
         InMemory {
             flag: &self.memory_only,
@@ -322,10 +342,14 @@ impl<B: SessionBackend> Session<B> {
         }
     }
 
-    /// Refuses a read that is about to touch the backend while reads come from memory only.
+    /// Refuses a read that is about to touch the backend while reads come from memory only,
+    /// keeping where the first one refused.
+    #[track_caller]
     pub(crate) fn storage_read(&self) -> Result<(), SessionError> {
         if self.memory_only.load(Ordering::SeqCst) {
-            self.memory_refused.store(true, Ordering::SeqCst);
+            self.memory_refused
+                .lock()
+                .get_or_insert(std::panic::Location::caller());
             return Err(SessionError::NotInMemory);
         }
         Ok(())

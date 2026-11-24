@@ -619,17 +619,48 @@ pub async fn answer_in_memory<B: SessionBackend>(
     // instead, and is answered from storage by the caller.
     let reply = execute(session, ctx, request).now_or_never();
     let needs_storage = memory.refused();
+    let refused_at = memory.refused_at();
     drop(memory);
     match reply {
         Some(reply) if !needs_storage => StoreReadOutcome::Served(Box::new(reply)),
-        _ => StoreReadOutcome::Stored {
-            position: session.position(),
-            live_step: ctx.live_step.cloned(),
-            entry_speaks_for: ctx.entry_speaks_for.clone(),
-            stream_head: ctx.stream_head,
-            compaction: None,
-        },
+        _ => {
+            count_stored_read(request.name(), refused_at);
+            StoreReadOutcome::Stored {
+                position: session.position(),
+                live_step: ctx.live_step.cloned(),
+                entry_speaks_for: ctx.entry_speaks_for.clone(),
+                stream_head: ctx.stream_head,
+                compaction: None,
+            }
+        }
     }
+}
+
+/// Reads open sessions' actors sent to storage, by `<read> @ <source line>` (see
+/// `broca_wire::MemoryCache::stored_reads`). Process-wide, like the other load counts.
+static STORED_READS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Counts one read an actor couldn't answer from memory: `at` is where it needed storage, or
+/// `None` for a read that would have waited without asking for storage.
+fn count_stored_read(read: &str, at: Option<&'static std::panic::Location<'static>>) {
+    let site = at.map_or_else(
+        || "waited".to_owned(),
+        |at| format!("{}:{}", at.file(), at.line()),
+    );
+    *STORED_READS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(format!("{read} @ {site}"))
+        .or_default() += 1;
+}
+
+pub(crate) fn stored_reads() -> Option<std::collections::BTreeMap<String, u64>> {
+    let counts = STORED_READS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    (!counts.is_empty()).then_some(counts)
 }
 
 /// Views of closed sessions, each loaded at a position and kept while it is the newest position
@@ -919,6 +950,7 @@ impl<V: CachedBytes> ViewCache<V> {
                     .collect(),
             ),
             top_sessions: Some(inner.top_sessions()),
+            stored_reads: stored_reads(),
         }
     }
 

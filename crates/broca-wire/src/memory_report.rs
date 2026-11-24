@@ -243,6 +243,12 @@ pub struct MemoryCache {
     /// broca started, most first, at most ten. Absent for other caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_sessions: Option<Vec<SessionViewLoads>>,
+    /// For the closed-session view cache: how many reads an open session's actor couldn't
+    /// answer from memory since broca started, by the read and the source line that needed
+    /// storage (`session.read @ crates/.../read.rs:532`). Each such read is served from the
+    /// session as stored, which loads a view. Absent when there were none, and for other caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_reads: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// One closed session's view loads since broca started.

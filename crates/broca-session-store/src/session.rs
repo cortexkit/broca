@@ -437,8 +437,8 @@ pub struct Session<B: SessionBackend> {
     media: media_index::MediaState,
     /// Set while reads come from memory only (see [`Session::in_memory`]).
     memory_only: std::sync::atomic::AtomicBool,
-    /// Set when a read refused for needing storage while reads came from memory only.
-    memory_refused: std::sync::atomic::AtomicBool,
+    /// Where a read refused for needing storage while reads came from memory only.
+    memory_refused: kept::RefusedAt,
     retired_tag_floor: u64,
     /// What the session's facts repeat, held once (see `crate::interned`).
     interner: crate::interned::Interner,
