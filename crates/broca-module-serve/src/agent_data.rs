@@ -248,7 +248,7 @@ pub(crate) async fn dispatch(
     }
     // Drop also records cancelled calls, so a disconnected caller cannot hide
     // its operation's rate or elapsed time from the process log.
-    let _observation = OpObservation {
+    let observation = OpObservation {
         op: rpc.method.clone(),
         cut_id: rpc
             .params
@@ -263,10 +263,17 @@ pub(crate) async fn dispatch(
             .map_or(0, Vec::len),
         start: Instant::now(),
     };
-    service
+    let result = service
         .cuts
         .execute(caller, &rpc.method, &rpc.params, &service.artifacts)
-        .await
+        .await;
+    // The mover shows only a refusal's code, so the reason is kept here, on the computer that
+    // refused: many codes (`unavailable` above all) stand for several causes.
+    if let Err(refusal) = &result {
+        tracing::warn!(op = %rpc.method, cut_id = %observation.cut_id, code = ?refusal.code,
+            message = %refusal.message, detail = ?refusal.detail, "agent-data op refused");
+    }
+    result
 }
 
 struct Driver {
