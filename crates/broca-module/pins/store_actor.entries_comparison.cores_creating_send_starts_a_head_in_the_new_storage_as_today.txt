@@ -68,7 +68,7 @@ Array [
     },
 ]
 == a head's three turns: {}
-sha256:dc6df28f45fe93fc6c499ef91a420f215245bc58dfd405d4fb563b41a94af4c0 (5591 bytes)
+sha256:74a6908efb51d2d0a0c0fc58a3edf4b03e1adac80a255189a141ac94d2b80397 (5557 bytes)
 == a head's three turns: {"limit":1}
 Object {
     "messages": Array [
@@ -171,7 +171,6 @@ Object {
                 ],
                 "role": String("user"),
             },
-            "notice": Bool(true),
             "ordinal": Number(1),
             "part_keys": Array [
                 String("m0#0"),
@@ -299,9 +298,9 @@ Object {
     "older": Bool(true),
 }
 == a head's three turns: older page 0
-sha256:5f7f86c621d26e02595eaeb2836d30bd3b0875e0556292813fa984212319fa5f (4689 bytes)
+sha256:4843dc8c9f5de3843b1173d0bc33f56b8c8b5e9620a654bd37d70e6f4911fe86 (4655 bytes)
 == a head's three turns: the oldest page
-sha256:5f7f86c621d26e02595eaeb2836d30bd3b0875e0556292813fa984212319fa5f (4689 bytes)
+sha256:4843dc8c9f5de3843b1173d0bc33f56b8c8b5e9620a654bd37d70e6f4911fe86 (4655 bytes)
 == a head's three turns: a newer page
 Object {
     "messages": Array [
@@ -347,7 +346,6 @@ Object {
                 ],
                 "role": String("user"),
             },
-            "notice": Bool(true),
             "ordinal": Number(1),
             "part_keys": Array [
                 String("m0#0"),
@@ -467,7 +465,6 @@ Object {
                 ],
                 "role": String("user"),
             },
-            "notice": Bool(true),
             "ordinal": Number(1),
             "part_keys": Array [
                 String("m0#0"),
@@ -602,6 +599,6 @@ Object {
     "older": Bool(true),
 }
 == a head's three turns: display {"form":"display"}
-sha256:2606ee0f243020258e49a3680f6eb85423cc12cbbed26873a571d04b8d97c631 (4864 bytes)
+sha256:3f6fe255fe277864392dc85e9a4241aee159a91cc7c00b4504d96b7fe07f410c (4826 bytes)
 == a head's three turns: display {"form":"display","from_ordinal":1,"limit":3}
-sha256:c5d85a7b17e45a1252b815382d8fe8d0a87cc05821a8dc4489b160741fc22aff (2379 bytes)
+sha256:21bdc31b0a3e7ac13d4365362f2734c701065c0746857f99a32612823c5f3e48 (2341 bytes)

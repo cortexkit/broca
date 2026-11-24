@@ -212,9 +212,37 @@ async fn invalid_or_unauthorized_marks_refuse_before_any_write() {
     rig.finish().await;
 }
 
+/// Starts the head's session with a plain send whose run finishes: a notice never creates a
+/// session, so a test of a marked send first gives it a session to land in.
+async fn open_head(rig: &mut Rig, plan: &Value) {
+    rig.script.push(&[Step::Text("opened")]);
+    let opened = send_plan(rig, 8, "opening", "open the head", Some(plan), json!({})).await;
+    assert_eq!(
+        opened.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&opened.body)
+    );
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+}
+
+/// The session's one message carrying `mark`, from a read or history reply's `messages`.
+fn marked<'a>(messages: &'a Value, mark: &str) -> &'a Value {
+    let found: Vec<&Value> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry[mark] == true || entry["row"][mark] == true)
+        .collect();
+    assert_eq!(found.len(), 1, "one message marked {mark}: {messages}");
+    found[0]
+}
+
 async fn retry_fixture(tag: &str, marks: Value, hold: bool) -> (Rig, Value, subc_protocol::Frame) {
     let (mut rig, _) = scoped_plan_rig(tag, false).await;
     let plan = vector("plans/broca-head-no-compaction.json");
+    open_head(&mut rig, &plan).await;
     rig.script.hold_model(hold);
     rig.script.push(&[Step::Text("answer")]);
     let sent = send_plan(&mut rig, 8, "marked-key", "same words", Some(&plan), marks).await;
@@ -227,7 +255,7 @@ async fn retry_fixture(tag: &str, marks: Value, hold: bool) -> (Rig, Value, subc
     if hold {
         rig.wait_entered().await;
     } else {
-        rig.wait_for_finished(1).await;
+        rig.wait_for_finished(2).await;
         rig.wait_idle().await;
     }
     (rig, plan, sent)
@@ -301,7 +329,7 @@ async fn a_changed_speaker_name_refuses_the_retry_naming_speaks_for() {
     assert_eq!(reply.body, sent.body);
     assert_eq!(rig.records().await, before);
     rig.script.hold_model(false);
-    rig.wait_for_finished(1).await;
+    rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     rig.finish().await;
 }
@@ -312,6 +340,8 @@ async fn a_changed_speaker_name_refuses_the_retry_naming_speaks_for() {
 #[tokio::test]
 async fn a_named_agent_notice_is_stored_and_served_with_both_marks() {
     let (mut rig, _) = scoped_plan_rig("named-agent-notice", false).await;
+    let plan = vector("plans/broca-head-no-compaction.json");
+    open_head(&mut rig, &plan).await;
     let marks = json!({"speaks_for":{"agent_id":"agent-a","name":"Ada"},"notice":true});
     rig.script.push(&[Step::Text("answer")]);
     let sent = send_plan(
@@ -319,7 +349,7 @@ async fn a_named_agent_notice_is_stored_and_served_with_both_marks() {
         8,
         "named-notice",
         "words of another agent",
-        Some(&vector("plans/broca-head-no-compaction.json")),
+        Some(&plan),
         marks.clone(),
     )
     .await;
@@ -331,7 +361,7 @@ async fn a_named_agent_notice_is_stored_and_served_with_both_marks() {
         String::from_utf8_lossy(&sent.body)
     );
     let run_id = result(&sent)["run_id"].as_str().unwrap().to_owned();
-    rig.wait_for_finished(1).await;
+    rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     let status = rig
         .request(8, json!({"method":"run.status","params":{"run_id":run_id}}))
@@ -345,7 +375,8 @@ async fn a_named_agent_notice_is_stored_and_served_with_both_marks() {
         )
         .await;
     sample("named-marks-read.json", &read);
-    let entry = &result(&read)["messages"][0];
+    let read = result(&read);
+    let entry = marked(&read["messages"], "notice");
     assert_eq!(entry["speaks_for"], marks["speaks_for"], "{entry}");
     assert_eq!(entry["notice"], true, "{entry}");
     let records = rig.records().await;
@@ -367,8 +398,10 @@ async fn a_named_agent_notice_is_stored_and_served_with_both_marks() {
         )
         .await,
     );
-    assert_eq!(read["messages"][0]["speaks_for"], marks["speaks_for"]);
-    assert_eq!(read["messages"][0]["notice"], true);
+    assert_eq!(
+        marked(&read["messages"], "notice")["speaks_for"],
+        marks["speaks_for"]
+    );
     rig.finish().await;
 }
 
@@ -381,7 +414,7 @@ async fn identical_marks_retry_replays_original_reply_without_writing() {
     assert_eq!(reply.body, sent.body);
     assert_eq!(rig.records().await, before);
     rig.script.hold_model(false);
-    rig.wait_for_finished(1).await;
+    rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     rig.finish().await;
 }
@@ -396,7 +429,7 @@ async fn notice_absent_and_false_retry_replay_original_reply_without_writing() {
         assert_eq!(rig.records().await, before);
     }
     rig.script.hold_model(false);
-    rig.wait_for_finished(1).await;
+    rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     rig.finish().await;
 }
@@ -482,13 +515,15 @@ async fn assert_undeclared_notice_member(wanted: &str) {
 #[tokio::test]
 async fn a_kept_notice_is_served_kept_and_survives_reopen() {
     let (mut rig, _) = scoped_plan_rig("message-marks-keep", false).await;
+    let plan = vector("plans/broca-head-no-compaction.json");
+    open_head(&mut rig, &plan).await;
     rig.script.push(&[Step::Text("answer")]);
     let sent = send_plan(
         &mut rig,
         8,
         "kept-words",
         "the person's words",
-        Some(&vector("plans/broca-head-no-compaction.json")),
+        Some(&plan),
         json!({"notice":true,"keep":true}),
     )
     .await;
@@ -499,7 +534,7 @@ async fn a_kept_notice_is_served_kept_and_survives_reopen() {
         "{}",
         String::from_utf8_lossy(&sent.body)
     );
-    rig.wait_for_finished(1).await;
+    rig.wait_for_finished(2).await;
     rig.wait_idle().await;
     let default = rig
         .request(8, json!({"method":"session.read","params":{}}))
@@ -513,10 +548,15 @@ async fn a_kept_notice_is_served_kept_and_survives_reopen() {
     let read = read_kept(&mut rig).await;
     sample("keep-read.json", &read);
     let read = result(&read);
-    assert_eq!(
-        read["messages"][0]["message"],
-        default["messages"][0]["message"]
-    );
+    let kept = marked(&read["messages"], "keep");
+    let ordinal = &kept["ordinal"];
+    let served = default["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["ordinal"] == *ordinal)
+        .expect("the default read serves the kept notice");
+    assert_eq!(kept["message"], served["message"]);
     assert_eq!(read["history_version"], default["history_version"]);
     for form in ["raw", "display"] {
         let history = rig
@@ -527,14 +567,13 @@ async fn a_kept_notice_is_served_kept_and_survives_reopen() {
             .await;
         sample(&format!("keep-history-{form}.json"), &history);
         let history = result(&history);
-        let entry = &history["messages"][0];
-        let marked = if form == "display" {
+        let entry = marked(&history["messages"], "keep");
+        let row = if form == "display" {
             &entry["row"]
         } else {
             entry
         };
-        assert_eq!(marked["notice"], true, "{form}: {history}");
-        assert_eq!(marked["keep"], true, "{form}: {history}");
+        assert_eq!(row["notice"], true, "{form}: {history}");
     }
     assert!(rig.registry().stop_and_seal().await);
     let mut rig = rig.restart().await;
@@ -544,8 +583,7 @@ async fn a_kept_notice_is_served_kept_and_survives_reopen() {
     rig.finish().await;
 }
 
-/// An `include_display_facts` read whose first message is the kept notice, checked as served
-/// with both marks.
+/// An `include_display_facts` read holding the kept notice, checked as served with both marks.
 async fn read_kept(rig: &mut Rig) -> subc_protocol::Frame {
     let read = rig
         .request(
@@ -554,9 +592,8 @@ async fn read_kept(rig: &mut Rig) -> subc_protocol::Frame {
         )
         .await;
     let body = result(&read);
-    let entry = &body["messages"][0];
+    let entry = marked(&body["messages"], "keep");
     assert_eq!(entry["notice"], true, "{entry}");
-    assert_eq!(entry["keep"], true, "{entry}");
     read
 }
 

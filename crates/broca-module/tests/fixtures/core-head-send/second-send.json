@@ -3,6 +3,7 @@
   "params": {
     "notice": true,
     "prompt": "Continue the synthetic project.",
-    "send_id": "send_sample_second_0123456789abcdef"
+    "send_id": "send_sample_second_0123456789abcdef",
+    "session_class": "head"
   }
 }

@@ -1982,16 +1982,25 @@ impl LineageRegistry {
                 }
                 BindOwnership::Unreadable(error) => return Ok(SendOutcome::Error(error)),
             };
-            if let Err(field) = broca_core::scope_admission::admit_message_marks(
+            let marks = match broca_core::scope_admission::admit_message_marks(
                 &request.message_marks,
                 &ownership,
                 request.principal.as_ref(),
                 &request.scope,
                 order.as_ref().map(|order| order.modes.as_slice()),
             ) {
-                return Ok(SendOutcome::StructuredOutputInvalid {
-                    field: field.into(),
-                });
+                Ok(marks) => marks,
+                Err(field) => {
+                    return Ok(SendOutcome::StructuredOutputInvalid {
+                        field: field.into(),
+                    });
+                }
+            };
+            // A notice is news for a session that is there to read it, never a session's first
+            // message (llm-runner §9.7.3): to a name with no session, never created or deleted
+            // after release or expiry, it is refused `unknown_session` and writes nothing.
+            if marks.is_some_and(|marks| marks.notice) && self.store_holding(key)?.is_none() {
+                return Err(OpenError::UnknownSession);
             }
         }
         loop {

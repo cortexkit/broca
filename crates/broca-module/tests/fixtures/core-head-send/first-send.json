@@ -1,8 +1,10 @@
 {
   "method": "session.send",
   "params": {
-    "notice": true,
     "plan": {
+      "cache": {
+        "keep_warm": "auto"
+      },
       "compaction_item": {
         "params": {},
         "preset": "head",
@@ -47,102 +49,95 @@
                 "capabilities": [],
                 "name": "ctx_search"
               }
-            ],
-            "upfront": [
-              "ctx_expand",
-              "ctx_memory",
-              "ctx_note",
-              "ctx_reduce",
-              "ctx_search"
             ]
           },
           {
-            "provider": "prefrontal-core",
+            "provider": "prefrontal",
             "tools": [
               {
                 "capabilities": [
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "ask"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "athena"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "athena_view"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:inbox/v1"
+                  "prefrontal:inbox/v1"
                 ],
                 "name": "inbox"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:knowhow.read/v1"
+                  "prefrontal:knowhow.read/v1"
                 ],
                 "name": "knowhow"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "notify"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "peer_inbox"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "peer_list"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "peer_send"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:review/v1"
+                  "prefrontal:review/v1"
                 ],
                 "name": "review"
               },
               {
                 "capabilities": [
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "room"
               },
               {
                 "capabilities": [
                   "call.yield/v1",
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "room_wait"
               },
               {
                 "capabilities": [
                   "call.yield/v1",
-                  "prefrontal-core:sidekick.research/v1"
+                  "prefrontal:sidekick.research/v1"
                 ],
                 "name": "sidekick"
               },
               {
                 "capabilities": [
                   "call.yield/v1",
-                  "prefrontal-core:runner-head-tools/v1"
+                  "prefrontal:runner-head-tools/v1"
                 ],
                 "name": "work"
               }
@@ -168,7 +163,7 @@
           }
         ]
       },
-      "composition_digest": "a57a6e1cb5183788a7d4b5755f6eff1ccf4a097733cc00fc7ae4e14475968591",
+      "composition_digest": "02cf5684a91cebaa64630a8870484ec0c87cda0e7084298d8ba0d1eea4a24b17",
       "model": {
         "model": "gpt-6.1-sol",
         "provider": "openai",
@@ -186,9 +181,6 @@
           "module": "occipital",
           "person": true,
           "succeeds": "thalamus-harness"
-        },
-        {
-          "module": "prefrontal-core"
         },
         {
           "module": "magic-context"
@@ -222,7 +214,7 @@
             }
           },
           "preset": "head",
-          "provider": "prefrontal-core"
+          "provider": "prefrontal"
         },
         {
           "params": {},
@@ -252,14 +244,7 @@
             "compacting": true
           },
           "preset": "head",
-          "provider": "magic-context",
-          "upfront": [
-            "ctx_expand",
-            "ctx_memory",
-            "ctx_note",
-            "ctx_reduce",
-            "ctx_search"
-          ]
+          "provider": "magic-context"
         },
         {
           "params": {
@@ -269,7 +254,7 @@
             "relayed_tools": []
           },
           "preset": "runner_head",
-          "provider": "prefrontal-core"
+          "provider": "prefrontal"
         }
       ]
     },

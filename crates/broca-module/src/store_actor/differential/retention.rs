@@ -787,8 +787,56 @@ async fn only_the_owner_replaces_an_assigned_policy(cipher: Cipher) {
     new.stop().await;
 }
 
+/// A notice never creates a session (llm-runner §9.7.3): to a name with no session, never
+/// created or deleted after its release, it is refused `unknown_session` and writes nothing. To
+/// a session that is there it is taken.
+async fn a_notice_never_creates_a_session(cipher: Cipher) {
+    use cortexkit_role_llm_runner::session_retention::{Keep, ReleaseState};
+    let new = retained(cipher, TTL, None).await;
+    let notice = |principal: broca_protocol::BindPrincipal| {
+        let mut request = request("news for the session");
+        request.message_marks = serde_json::json!({"notice": true})
+            .as_object()
+            .unwrap()
+            .clone();
+        request.principal = Some(principal);
+        request
+    };
+    let refused = new.submit("n1", notice(owner())).await;
+    assert!(
+        matches!(refused, Err(crate::registry::OpenError::UnknownSession)),
+        "{refused:?}"
+    );
+    assert!(!new.runtime.holds(&new.module.key).unwrap());
+    new.send_kept("r1", Keep::forever(), Some(owner())).await;
+    new.idle().await;
+    let taken = new.submit("n2", notice(owner())).await.unwrap();
+    assert!(
+        !matches!(
+            taken,
+            SendOutcome::Error(_) | SendOutcome::StructuredOutputInvalid { .. }
+        ),
+        "{taken:?}"
+    );
+    new.idle().await;
+    new.caught_up();
+    assert_eq!(
+        new.release(Some(owner())).await,
+        released(ReleaseState::deleted())
+    );
+    new.deleted().await;
+    let refused = new.submit("n3", notice(owner())).await;
+    assert!(
+        matches!(refused, Err(crate::registry::OpenError::UnknownSession)),
+        "{refused:?}"
+    );
+    new.never_there().await;
+    new.stop().await;
+}
+
 cipher_tests!(
     only_the_owner_replaces_an_assigned_policy,
+    a_notice_never_creates_a_session,
     a_send_queued_before_a_release_still_runs,
     a_released_idle_session_is_deleted_at_once,
     only_the_first_sender_releases_a_session,

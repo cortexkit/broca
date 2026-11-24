@@ -2201,13 +2201,12 @@ async fn a_view_applied_after_a_seal_is_answered_as_against_every_entry() {
     broca_test_support::pin!("a cut into the sealed history", into_sealed);
 }
 
-/// One of core's sends to a new head, as core serializes it for transport: its `session.send`
-/// params. Core's runner-head sample (prefrontal-core's
-/// `write_broca_head_first_send_sample`, at core commit 83d9e536) gave them, with synthetic
-/// names: the creating send, carrying the head's fetch plan and `session_class: "head"`, and the
-/// next send, carrying neither. Core retries the creating send byte for byte. The creating send
-/// here leaves out the sample's `plan.cache`: core adds it only for a runner whose describe
-/// declares `cache_policy`, which broca's doesn't.
+/// One of prefrontal's sends to a new head, as prefrontal serializes it for transport: its
+/// `session.send` params. Prefrontal's runner-head sample (`write_broca_head_first_send_sample`,
+/// written against broca's own `role.describe`) gave them, with synthetic names: the creating
+/// send, carrying the head's fetch plan and `session_class: "head"` and no notice mark, since a
+/// notice never creates a session, and the next send, marked a notice. Prefrontal retries the
+/// creating send byte for byte.
 fn core_head_send(name: &str) -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/core-head-send")
@@ -2219,8 +2218,8 @@ fn core_head_send(name: &str) -> Value {
 
 /// The request the serve layer hands the registry for core's send `params` on core's head
 /// route, which broca's wire decoder must take: the prompt as the user's message, marked a
-/// notice, sent by core over its head scope. A send creating the session runs the model its
-/// plan selects; a later one names none, and inherits the session's.
+/// notice when the send is one, sent by core over its head scope. A send creating the session
+/// runs the model its plan selects; a later one names none, and inherits the session's.
 fn core_head_request(params: &Value, creating: bool) -> SubmissionRequest {
     let decoded: broca_wire::SendParams =
         serde_json::from_value(params.clone()).expect("broca decodes core's send");
@@ -2241,7 +2240,9 @@ fn core_head_request(params: &Value, creating: bool) -> SubmissionRequest {
             .map(str::to_owned);
     }
     sent.inherit_frozen = [broca_protocol::request::InheritedParam::Model].into();
-    sent.message_marks = [("notice".to_owned(), params["notice"].clone())]
+    sent.message_marks = params
+        .get("notice")
+        .map(|notice| ("notice".to_owned(), notice.clone()))
         .into_iter()
         .collect();
     let core = broca_protocol::BindPrincipal::Reserved {
