@@ -2568,7 +2568,7 @@ async fn reader_answers_health_ping_during_authorization_and_permit_waits() {
     assert_eq!(serve.await.unwrap().unwrap(), ServeEnd::Goodbye);
 }
 
-/// A handler whose WAL presence probe blocks its thread until the test releases it, and
+/// A handler whose session-log presence probe blocks its thread until the test releases it, and
 /// records whether the release arrived in time.
 struct BlockingProbeHandler {
     entered: tokio::sync::Notify,
@@ -2930,7 +2930,7 @@ async fn the_send_path_wal_probe_does_not_block_the_runtime_worker() {
     assert_eq!((reply.header.ty, reply.header.corr), (FrameType::Error, 3));
     assert!(
         handler.released.load(Ordering::SeqCst),
-        "the WAL presence probe must not run on the runtime worker"
+        "the log presence probe must not run on the runtime worker"
     );
     serve.abort();
 }

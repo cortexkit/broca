@@ -422,7 +422,7 @@ impl HookRuntime<'_> {
                         serde_json::from_value(
                             serde_json::to_value(ask).expect("ApprovalAsk serializes"),
                         )
-                        .expect("WAL preserves ApprovalAsk"),
+                        .expect("the log preserves ApprovalAsk"),
                     );
                     // Keep the first provider's approval question for this tool call. A later
                     // provider must not replace the consent terms the human will answer.

@@ -38,7 +38,7 @@ cargo test --locked -p broca-module-serve --features test-clock \
   --test llm_runner_conformance mc_e2e::real_mc_async_compaction_end_to_end -- --nocapture
 ```
 
-The artifact directory must be fresh. The lane retains the report, WAL records,
+The artifact directory must be fresh. The lane retains the report, log records,
 bus observations, private module logs and state, and (if reached) the request
 bytes on both sides of SIGKILL. It verifies open MC database paths with `lsof`.
 
@@ -46,7 +46,7 @@ The run checks, in order:
 
 - the first run's frozen plan carries the worker items and params above;
 - each later turn waits until the previous run's last advance notice is in the
-  WAL and observed on the bus;
+  session's log and observed on the bus;
 - after three tool outputs, the scripted model calls `ctx_reduce` on the `§N§`
   tags of the two oldest, and Magic Context acknowledges it;
 - turns with more tool output continue until the advance notice's estimate
@@ -60,7 +60,7 @@ The run checks, in order:
   If none reaches the gate within the shared hang guard, the test fails naming
   the session ref, the announced versions and any published before the gate;
 - with that view's ACK held, broca's store holds a durable receipt for exactly
-  that `(session_ref, view_version)`, or its WAL already records a decision on
+  that `(session_ref, view_version)`, or its log already records a decision on
   it (applied, refused, or passed over for a newer view), since a decision
   clears the receipt; then the broker ACK, the applied view, and that broca
   applied the newest announced version;

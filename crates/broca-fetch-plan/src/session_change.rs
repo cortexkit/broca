@@ -5,7 +5,7 @@
 //! A `session.refresh_policy` that changes the pending rung is durable as
 //! `WalRecord::SessionRefreshPolicyChanged`, and a `session.flush_prefix` as
 //! `WalRecord::SessionPrefixFlushed`. All three require the `session-change/v1`
-//! must-understand feature: a reader without it refuses the WAL rather than running the next
+//! must-understand feature: a reader without it refuses the log rather than running the next
 //! episode with the wrong tools or answering an identical repeat as stale.
 //!
 //! This module folds those records with the session's `RunStarted` episodes, its applied

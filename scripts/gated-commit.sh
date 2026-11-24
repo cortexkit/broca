@@ -14,8 +14,8 @@
 # That is not a vigilance problem. The notation has no way to mark which of several commands
 # carries the verdict, so the meaning lives only in the author's head and evaporates under any
 # edit that adds a step. It has bitten this repo (a red quickcheck pushed because `git add`
-# succeeded) and a sibling repo (`grep -c` exiting 0 on a match, letting a failed clippy
-# through) within hours of each other, with no surface similarity between the two instances.
+# succeeded) and a sibling repo (`grep -c` exiting 0 on a match, letting a failed clippy through)
+# within hours of each other, with no surface similarity between the two instances.
 #
 # The fix is not remembering. It is making the guarded path SHORTER than the unguarded one, so
 # there is no keystroke argument for typing the chain by hand.
@@ -27,7 +27,7 @@
 # PREFER THE FILE FORM FOR ANYTHING LONGER THAN A LINE. A commit message is prose about code, so
 # it naturally contains backticks, $, and quotes -- and inside `-m "..."` the shell evaluates all
 # three BEFORE git sees them. On 2026-09-04 a message reading "those lines now carry
-# `session=<name> wal=<addr>`" committed as "those lines now carry .": command substitution ate
+# `session=<name> log=<addr>`" committed as "those lines now carry .": command substitution ate
 # the only sentence that said what the change does, and the commit landed and pushed with exit 0.
 #
 # The failure is silent in the worst direction -- the gate passes, the commit succeeds, and the

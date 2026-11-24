@@ -1,10 +1,10 @@
 //! The durable single-writer lease, provided by the shared `cortexkit-lease` crate.
 //!
-//! A multi-session daemon must never have two live writers on one session's WAL, so
+//! A multi-session daemon must never have two live writers on one session's log, so
 //! `start_run` acquires this lease and FAILS if a live writer holds it. The lease's
-//! monotonic `epoch` is the lease-tenure stamp every WAL append carries for forensic
+//! monotonic `epoch` is the lease-tenure stamp every log append carries for forensic
 //! correlation. It is not compared on the append path and does not reject a stale stamp;
-//! single-writer safety comes from the OS lock plus the WAL file-integrity check.
+//! single-writer safety comes from the OS lock plus the log file-integrity check.
 //!
 //! The mechanics (OS advisory lock for liveness + persisted epoch stamp) live in
 //! `cortexkit-lease`, shared across CortexKit modules. This module is only the seam

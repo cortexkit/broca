@@ -132,8 +132,8 @@ impl Rig {
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("XDG_DATA_HOME", &data_home)
             // broca's state root defaults to the data home pinned above, but an operator's
-            // exported BROCA_STATE_ROOT would override that and send this rig's WAL into their
-            // real state. The daemon passes its environment to the module, so drop it here.
+            // exported BROCA_STATE_ROOT would override that and send this rig's session log into
+            // their real state. The daemon passes its environment to the module, so drop it here.
             .env_remove("BROCA_STATE_ROOT")
             .env("SUBC_PORT", "0")
             .kill_on_drop(true)

@@ -582,7 +582,7 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
     );
     let state_root = broca_module_serve::state_root::resolve_state_root()?;
     let catalog_cache = Arc::new(broca_catalog::CatalogCache::open(
-        state_root.path.join("catalog/fusiform-lkg.json"),
+        state_root.join("catalog/fusiform-lkg.json"),
     ));
     broca_catalog::install_global_catalog_cache(catalog_cache);
 
@@ -594,7 +594,7 @@ async fn run() -> Result<String, Box<dyn std::error::Error>> {
     let install_id = if dry {
         "0".repeat(64)
     } else {
-        claude_code_identity::load_or_create_install_id(&state_root.path)?
+        claude_code_identity::load_or_create_install_id(&state_root)?
     };
     let version = ClaudeCodePersona::CURRENT_VERSION;
     assert_eq!(

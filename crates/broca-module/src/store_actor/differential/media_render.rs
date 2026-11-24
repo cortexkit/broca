@@ -262,7 +262,7 @@ fn install_store(
     if !(holds_media || tools) {
         return Ok(None);
     }
-    let media = job_media.ok_or_else(|| RunError::Wal("store_media_unavailable".into()))?;
+    let media = job_media.ok_or_else(|| RunError::Log("store_media_unavailable".into()))?;
     let lazy = crate::store_media::LazyRenderer::new(media, Box::new(|media| Ok(media.renderer())));
     provider.set_media_request_renderer(lazy.renderer());
     Ok(Some(lazy))

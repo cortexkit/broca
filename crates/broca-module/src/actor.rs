@@ -128,7 +128,7 @@ pub(crate) fn inherit_frozen_parameters(
             InheritedParam::Budget => {
                 request.budget.clone_from(&frozen.budget);
                 // Inherit tool-call reminders without restoring the preceding episode's old cap.
-                // An omitted input cap comes from the session-wide WAL checkpoint instead.
+                // An omitted input cap comes from the session-wide log checkpoint instead.
                 if let Some(budget) = &mut request.budget {
                     budget.max_input_tokens = None;
                 }

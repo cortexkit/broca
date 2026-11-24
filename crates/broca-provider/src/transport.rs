@@ -234,7 +234,7 @@ impl ProviderHttpClient {
             .seed_accepted_send(account, evidence);
     }
 
-    /// Read accepted-attempt evidence without loading a session or reading its WAL.
+    /// Read accepted-attempt evidence without loading a session or reading its log.
     /// `None` means not loaded in this process; `Some(None)` means loaded with no accepted
     /// send on this account. This distinction lets admission count conservative cold starts.
     pub fn session_last_accepted_at_ms(
@@ -9456,8 +9456,8 @@ mod tests {
     }
 
     /// A real ChatGPT/Codex 429 body for an account whose plan allowance was used up, copied byte
-    /// for byte from the terminal error broca's write-ahead log recorded for a production run on
-    /// 2026-09-16 (WAL file `4430787e24105d49.wal`). Using the captured bytes rather than a
+    /// for byte from the terminal error recorded in broca's session log for a production run on
+    /// 2026-09-16 (log file `4430787e24105d49.wal`). Using the captured bytes rather than a
     /// hand-written body pins the shape the backend actually sends.
     const CHATGPT_USAGE_LIMIT_BODY: &str = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":1790021043,"eligible_promo":null,"resets_in_seconds":441721}}"#;
 
@@ -10937,9 +10937,9 @@ mod tests {
     }
 
     /// An Antigravity (Code Assist) quota-wall 429 body. Everything up to and including
-    /// `"quotaResetTimeStamp": "2026-` is copied byte for byte from the terminal error broca's
-    /// write-ahead log recorded for a production run on 2026-10-03 (WAL file
-    /// `5224d2a1d3c2f34b.wal`); the log's message cap cut the body there. The rest is COMPLETED
+    /// `"quotaResetTimeStamp": "2026-` is copied byte for byte from the terminal error recorded
+    /// in broca's log for a production run on 2026-10-03 (log file `5224d2a1d3c2f34b.wal`); the
+    /// log's message cap cut the body there. The rest is COMPLETED
     /// by hand: the timestamp `2026-10-03T03:40:39Z` (the last 429 at 03:19:38Z plus the stated
     /// 21m0.96s delay) and the closing brackets. The real timestamp value is unknown.
     const CODE_ASSIST_QUOTA_EXHAUSTED_BODY: &str = r#"{

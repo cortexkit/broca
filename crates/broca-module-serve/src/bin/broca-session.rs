@@ -58,7 +58,7 @@ struct Args {
     /// The session identity: project root, harness, session name.
     #[arg(long, global = true)]
     project_root: Option<PathBuf>,
-    /// An OPAQUE key component: joined with U+001F into the WAL, lease, store and idempotency
+    /// An OPAQUE key component: joined with U+001F into the log, lease, store and idempotency
     /// keys, validated only for that separator.
     ///
     /// This default REACHES THE DAEMON as of v0.3.106. It did not before: until then
@@ -68,7 +68,7 @@ struct Args {
     /// `RouteTarget::ToolProvider`, where the closed enum that motivated it actually lives.
     ///
     /// CONSEQUENCE FOR AN OPERATOR REOPENING AN OLD SESSION: a session this CLI created before
-    /// v0.3.106 is addressed under `runner`, because harness is joined into the WAL filename.
+    /// v0.3.106 is addressed under `runner`, because harness is joined into the log filename.
     /// Passing `--harness runner` reopens it; the default now names a different lineage. 79
     /// such sessions exist (measured 2026-09-20), 3 of which were ever reopened.
     #[arg(long, global = true)]
@@ -92,7 +92,6 @@ struct Args {
 fn state_root(root: Option<&PathBuf>) -> Result<PathBuf, String> {
     root.cloned().map(Ok).unwrap_or_else(|| {
         broca_module_serve::state_root::resolve_state_root()
-            .map(|resolved| resolved.path)
             .map_err(|_| "cannot resolve state root".into())
     })
 }

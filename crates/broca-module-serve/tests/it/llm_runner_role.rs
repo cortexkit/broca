@@ -1,7 +1,7 @@
 //! The `llm-runner/v1` role surface through the real serve path: `session.read`,
 //! `session.subscribe`, `session.head`, `run.result`, `role.describe` and their refusals.
 //!
-//! Every run goes through the real core loop over a real file WAL (the delivery rig), so each
+//! Every run goes through the real core loop over a real session log (the delivery rig), so each
 //! record a test reads back was written by core or the lineage actor exactly as in production.
 
 use broca_module::ServeHandler;
@@ -932,7 +932,7 @@ async fn a_held_tool_turn_keeps_the_part_keys_a_read_exposed() {
 }
 // ---- helpers ------------------------------------------------------------------------------
 
-/// Keep the captured frame template, substituting only this run's two WAL observations.
+/// Keep the captured frame template, substituting only this run's two log observations.
 /// The expected clocks come from durable records, never from the stream being checked.
 fn tool_turn_sample_with_recorded_times(sample: &str, records: &[Record]) -> String {
     sample
@@ -991,7 +991,7 @@ async fn read(rig: &mut Rig, params: serde_json::Value) -> ReadPage {
     serde_json::from_value(result(&reply)).unwrap()
 }
 
-/// Send a refused request and prove it wrote nothing: the WAL holds the same bytes after it.
+/// Send a refused request and prove it wrote nothing: the log holds the same bytes after it.
 async fn refused_writing_nothing(
     rig: &mut Rig,
     method: &str,
@@ -1003,7 +1003,7 @@ async fn refused_writing_nothing(
     assert_eq!(
         rig.records().await.len(),
         before.len(),
-        "{method} {params} was refused {body} but the WAL grew"
+        "{method} {params} was refused {body} but the log grew"
     );
     assert_eq!(rig.records().await, before);
     body
@@ -1867,7 +1867,7 @@ async fn the_admitting_send_and_session_baseline_answer_the_same_baseline() {
 
     let second = rig.send("turn-2", "again", None).await;
     assert!(result(&second).get("baseline").is_none());
-    // The refusal below must write nothing, which it proves by comparing WAL bytes before and
+    // The refusal below must write nothing, which it proves by comparing log bytes before and
     // after. Let the second run finish first, or its own records land between the two reads.
     rig.wait_for_finished(2).await;
     rig.wait_idle().await;
@@ -2156,11 +2156,11 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
     assert_eq!(result(&baseline)["state"], "active", "baseline send");
     rig.wait_for_finished(1).await;
     rig.wait_idle().await;
-    // The checks below compare against this head and this WAL, so nothing they claim to have
+    // The checks below compare against this head and this log, so nothing they claim to have
     // refused may have written.
     for flag in [true, false] {
         let before = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
-        let wal = rig.records().await;
+        let recorded = rig.records().await;
         let plan = serde_json::json!({"items":[{"output_refs":flag}]});
         let mut requests = vec![(
             ops::SESSION_SEND,
@@ -2192,7 +2192,7 @@ async fn unsupported_output_refs_precedes_plan_overrides_and_never_writes() {
             );
             assert_eq!(
                 rig.records().await,
-                wal,
+                recorded,
                 "{method} must refuse before writing"
             );
             let after = result(&call(&mut rig, ops::SESSION_HEAD, serde_json::json!({})).await);
@@ -2425,7 +2425,7 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
         rig.wait_idle().await;
         let page = read(&mut rig, serde_json::json!({})).await;
         let descriptors = read(&mut rig, serde_json::json!({"media":"descriptors"})).await;
-        let wal = rig.records().await;
+        let recorded = rig.records().await;
         assert!(rig.registry().stop_and_seal().await);
         rig = rig.restart().await;
         let replay = assistant_frame(
@@ -2439,16 +2439,16 @@ async fn stateful_text_control_is_plain_text_live_and_in_attach_replay() {
         // Reopening the session appends only its new writer's record; attaching adds nothing.
         let after = rig.records().await;
         assert_eq!(
-            after[..wal.len()],
-            wal[..],
+            after[..recorded.len()],
+            recorded[..],
             "attaching never rewrites provider state"
         );
         assert!(
-            after[wal.len()..]
+            after[recorded.len()..]
                 .iter()
                 .all(|record| matches!(record, Record::WriterOpened(_))),
             "{:?}",
-            &after[wal.len()..]
+            &after[recorded.len()..]
         );
         rig.finish().await;
         eprintln!(

@@ -8,8 +8,8 @@ pub(crate) fn insert(
     address: &str,
     session: &BindIdentity,
 ) -> Result<usize, StoreError> {
-    // A re-keyed WAL can retain older project/harness/session identities. Only
-    // the identity whose derived address matches the WAL's address owns it.
+    // A re-keyed log can retain older project/harness/session identities. Only
+    // the identity whose derived address matches the log's address owns it.
     if session_addr(session) != address {
         return Ok(0);
     }
@@ -63,7 +63,7 @@ impl SessionRefIndex for SessionInventory {
             }
         };
         // Share one bounded budget between the connection mutex and SQLite's
-        // write lock. Routine migration contention must not create a WAL gap.
+        // write lock. Routine migration contention must not create a log gap.
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err("session-ref store busy timeout before write".into());

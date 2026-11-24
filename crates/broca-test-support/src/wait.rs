@@ -41,8 +41,8 @@ pub fn wait_until_sync<T>(description: &str, mut observe: impl FnMut() -> Result
 }
 
 /// Await one event with the same hang guard as [`wait_until`]. The diagnostic
-/// callback runs only on timeout, so it can inspect a WAL or registry snapshot.
-/// Wrap the whole polling loop, not each iteration, so an async probe that never
+/// callback runs only on timeout, so it can inspect the session's log or registry
+/// snapshot. Wrap the whole polling loop, not each iteration, so an async probe that never
 /// answers cannot evade the hang guard or reset it with partial progress.
 pub async fn wait_for<T>(
     description: &str,

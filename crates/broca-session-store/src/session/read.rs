@@ -822,12 +822,12 @@ impl<B: SessionBackend> Session<B> {
     /// The ordinal of the message with id `mid`, if it's on the current branch. The id tells
     /// where to look: a new id names the seq of the record that announced it, the `StepStart`
     /// or `BatchStart` of the step or batch that writes the message, or for any other message
-    /// its `EntryFacts`; an id converted from a WAL log names its position in that log's
-    /// history. Either way, the entry found there must carry exactly that id, so an id from an
-    /// abandoned branch, or from another session, never resolves to the message that took its
-    /// place. Messages converted from a session without entry facts have none, and their
-    /// `m<position>` ids resolve by position alone: no message written since lacks facts, so
-    /// nothing else can sit at a converted message's ordinal.
+    /// its `EntryFacts`; an id carried over when the session was converted into the session
+    /// store names its position in the session's history. Either way, the entry found there must
+    /// carry exactly that id, so an id from an abandoned branch, or from another session, never
+    /// resolves to the message that took its place. Messages converted from a session without
+    /// entry facts have none, and their `m<position>` ids resolve by position alone: no message
+    /// written since lacks facts, so nothing else can sit at a converted message's ordinal.
     pub async fn find_message(&self, mid: &str) -> Result<Option<u64>, SessionError> {
         let candidate = if mid.starts_with('g') {
             let Some(seq) = minted_seq(mid) else {

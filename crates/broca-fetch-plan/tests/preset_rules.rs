@@ -1,4 +1,4 @@
-//! Preset syntax is checked before any provider fetch or WAL write.
+//! Preset syntax is checked before any provider fetch or log write.
 use serde_json::{json, Value};
 
 fn plan() -> Value {

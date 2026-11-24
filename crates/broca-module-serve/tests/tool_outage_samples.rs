@@ -4,13 +4,14 @@
 //! `Completed` with the attributed unavailable result (proven undelivered: nothing was sent).
 //! The wait itself is pinned by broca-subc's paused-clock tests; here the rig's scripted plane
 //! stands in for the wait by returning the exact result the real plane builds, so every byte
-//! below comes from the real producers: the core loop, the WAL, `session.read`, the history
+//! below comes from the real producers: the core loop,
+//! the session's log, `session.read`, the history
 //! display, and the live-event projection with its subscribe encoding.
 //!
 //! The first test drives that outage through a synthetic session and writes the four artifacts
 //! plus a SHA256SUMS file under `.cortexkit/internal-docs/samples/tool-outage/` (untracked;
 //! collected out of band, never committed). The second test re-drives the same outage and
-//! decodes the WAL `tool_result` record's output with the shapes a build at the base commit
+//! decodes the log `tool_result` record's output with the shapes a build at the base commit
 //! knew, proving an older broca reads the new fields by ignoring them.
 
 mod delivery_rig;
@@ -30,7 +31,7 @@ use subc_protocol::Frame;
 const OUTAGE_CODE: &str = "target_unavailable";
 const OUTAGE_DETAIL: &str = "supervised_not_registered";
 
-/// The exact stored payload bytes of the call's `tool_result` frame. The WAL file is
+/// The exact stored payload bytes of the call's `tool_result` frame. The log file is
 /// binary-framed (length, version, sequence, fence, digest, payload), so scan every `{`
 /// position, stream-decode one JSON value there, and take the first value that is (or
 /// wraps, under a `requires` envelope) the call's `tool_result` record.

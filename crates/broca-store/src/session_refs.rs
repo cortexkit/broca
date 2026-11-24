@@ -77,7 +77,7 @@ fn init_schema_measured(
     rekey_v2(conn)
 }
 
-/// Rebuild external aliases at startup without changing stored WAL addresses.
+/// Rebuild external aliases at startup without changing stored log addresses.
 /// Multiple addresses deliberately survive under one alias so resolution can
 /// refuse a pair of harness/session names shared by different roots.
 ///

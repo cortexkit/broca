@@ -3,7 +3,7 @@
 //! the strip-or-defer rule for signed reasoning, the context ceiling, and advance notices.
 //!
 //! Everything here is a pure function of the session's folded [`CompactionState`] and its
-//! transcript. The run loop records each decision in the WAL (`CompactionViewApplied`,
+//! transcript. The run loop records each decision in the log (`CompactionViewApplied`,
 //! `CompactionNotice`) before anything renders or publishes it, so a resumed run renders the
 //! same bytes without asking the provider again.
 
@@ -502,7 +502,7 @@ pub fn reported_prompt_tokens(message: &str) -> Option<u64> {
 /// person, while equal accounts give equal labels and different accounts give different
 /// labels. The 32-hex form fits the contract's `[A-Za-z0-9._-]{1,64}` grammar.
 ///
-/// Pure, so the run loop and the WAL fold share it: the same vault account id always maps
+/// Pure, so the run loop and the log fold share it: the same vault account id always maps
 /// to the same label within a runner.
 pub fn account_label(account_ref: &str) -> String {
     use sha2::{Digest, Sha256};

@@ -1,5 +1,5 @@
 //! Output references to tool outputs (llm-runner §9.13) through the real serve path and core
-//! loop over a real file WAL.
+//! loop over a real session log.
 //!
 //! The first tests pin bytes that output references must never change: the default
 //! `session.read` page of a session whose reply names a tool output, and the plan manifest a
@@ -775,7 +775,7 @@ async fn refusals_carry_the_contract_codes_and_write_nothing() {
         referencing_session("refs-refusals", "see $$tc(2), $$tc(1) and $$tc(99)").await;
     let set = format!("{scope}/m3");
     let foreign = "00000000-0000-4000-8000-000000000000";
-    let wal = rig.records().await;
+    let recorded = rig.records().await;
     let cases = [
         (
             "session.output_refs",
@@ -848,7 +848,7 @@ async fn refusals_carry_the_contract_codes_and_write_nothing() {
         let frame = call(&mut rig, 7, "session.output_refs", json!({"set_id": alias})).await;
         assert_eq!(refusal(&frame)["code"], "unknown_ref", "{alias}");
     }
-    assert_eq!(rig.records().await, wal, "a refusal writes nothing");
+    assert_eq!(rig.records().await, recorded, "a refusal writes nothing");
     rig.finish().await;
 }
 
@@ -880,7 +880,7 @@ async fn ids_are_session_bound_and_access_follows_session_read() {
     let read = call(&mut rig, 11, "session.read", json!({})).await;
     let read_refusal = refusal(&read);
     assert_eq!(read_refusal["code"], "sender_not_owner");
-    let wal = rig.records().await;
+    let recorded = rig.records().await;
     for (method, params) in [
         ("session.history", json!({"form":"display"})),
         ("session.output_refs", json!({"set_id": set})),
@@ -900,7 +900,7 @@ async fn ids_are_session_bound_and_access_follows_session_read() {
             "output_refs.sender_not_owner.json",
         );
     }
-    assert_eq!(rig.records().await, wal, "a refusal writes nothing");
+    assert_eq!(rig.records().await, recorded, "a refusal writes nothing");
     rig.finish().await;
 }
 

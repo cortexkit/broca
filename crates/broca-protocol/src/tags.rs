@@ -3,9 +3,9 @@
 //!
 //! Under the stored-ledger rules (`runner-tags/v1`) a number was assigned to every part when
 //! broca wrote the record carrying it, and stored in that record. Under the computed rules
-//! (`runner-tags/v2`) no WAL record stores a number: a part shows a number only when it counts and its run
-//! renders tags, numbered in the order a request renders the transcript ([`number_message`]),
-//! and the model's own tag notation is cleaned wherever its text is exposed
+//! (`runner-tags/v2`) no log record stores a number: a part shows a number only when it
+//! counts and its run renders tags, numbered in the order a request renders the transcript
+//! ([`number_message`]), and the model's own tag notation is cleaned wherever its text is exposed
 //! ([`exposed_message`]).
 //!
 //! Tags are metadata, never message content: a message's stored bytes, its serialized form and
@@ -91,8 +91,8 @@ pub struct ComputedTags {
     pub clean: bool,
     /// The highest number shown before this message's first part, so its counted parts are
     /// numbered `base + 1`, `base + 2`, ... in block order. Derived from the transcript, never
-    /// recorded in the WAL; it lets a reader that holds only the last stored message continue
-    /// numbering after it.
+    /// recorded in the session's log; it lets a reader that holds only the last stored message
+    /// continue numbering after it.
     pub base: u64,
 }
 
@@ -181,8 +181,8 @@ impl From<&MessageTags> for PartTags {
     }
 }
 
-/// A message's tags as it is held in memory. Never serialized: the WAL keeps tags on the
-/// records that carry the parts, and the store keeps them beside each message row.
+/// A message's tags as it is held in memory. Never serialized: the session's log keeps tags on
+/// the records that carry the parts, and the store keeps them beside each message row.
 ///
 /// Equality always holds, so two messages with the same content compare equal whether or not
 /// their tags were attached. Tags are not content, and every equality check on messages in

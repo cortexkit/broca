@@ -1112,7 +1112,7 @@ async fn module_options_with_render(
         N.fetch_add(1, Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    // The WAL store's folder sits in the state root `dir`, beside the session store.
+    // The session log's folder sits in the state root `dir`, beside the session store.
     let mut store_loop = executor(steps.clone(), gate.clone());
     store_loop.provider.render_config = render_config;
     let executor: Arc<dyn RunExecutor> = Arc::new(store_loop);
@@ -1274,7 +1274,7 @@ impl Module {
 }
 
 /// With the switch on, a session that exists nowhere starts in the session store: its head is
-/// written, no WAL is, and the feature floor names the session store before anything else. The
+/// written, no log is, and the feature floor names the session store before anything else. The
 /// actor closes when idle, and the next send reopens the session from its head and runs after
 /// the first run.
 #[tokio::test]

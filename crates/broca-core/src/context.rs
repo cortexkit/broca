@@ -26,40 +26,6 @@ pub enum ReadView {
 mod model_page;
 pub use model_page::ModelEntry;
 
-/// A page-read failure that distinguishes expected attribution migration from store faults.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StorePageReadError {
-    /// The WAL can recover attribution, but this projection has not stored it yet.
-    AttributionStale,
-    /// Existing store errors retain their diagnostic text without implying a repair class.
-    Failure(String),
-}
-
-impl std::fmt::Display for StorePageReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AttributionStale => {
-                f.write_str("store message run attribution requires WAL backfill")
-            }
-            Self::Failure(message) => f.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for StorePageReadError {}
-
-impl From<String> for StorePageReadError {
-    fn from(message: String) -> Self {
-        Self::Failure(message)
-    }
-}
-
-impl From<&str> for StorePageReadError {
-    fn from(message: &str) -> Self {
-        Self::Failure(message.into())
-    }
-}
-
 /// Where a session's materialized transcript holds a runner-tagged part, from the store's tag
 /// index (see [`MaterializedStore::tag_location`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +33,7 @@ pub struct TagLocation {
     /// The part's `(transcript ordinal, block index)`, when a materialized message holds it.
     pub found: Option<(u64, usize)>,
     /// How many transcript messages the index covers: the materialized prefix. A tag not
-    /// found can only be in the transcript past this ordinal, which the WAL after the store's
+    /// found can only be in the transcript past this ordinal, which the log after the store's
     /// watermark holds.
     pub indexed_through: u64,
 }
@@ -81,7 +47,7 @@ pub trait RunEventBodies: Send + Sync {
 }
 
 /// Identity candidates are useful even when discovery is incomplete. Only a complete
-/// snapshot can establish absence or uniqueness; candidates still require WAL checks.
+/// snapshot can establish absence or uniqueness; candidates still require log checks.
 #[derive(Default, Debug)]
 pub struct SessionRefs {
     pub sessions: std::collections::BTreeMap<String, (String, BindIdentity)>,
@@ -93,7 +59,7 @@ pub trait SessionRefResolver: Send + Sync {
     fn named_refs(&self, name: &str, limit: u32) -> Result<SessionRefs, String>;
 }
 
-/// Identity discovery and projection maintenance do not authorize moving a WAL
+/// Identity discovery and projection maintenance do not authorize moving a session store
 /// or record whether an ownership transfer completed.
 pub trait SessionInventory: SessionRefResolver + crate::SessionRefIndex {
     /// Runs the census over the sessions stored under `root`. An empty or unfinished census
@@ -192,8 +158,8 @@ pub trait ExportIndex: Send + Sync {
     /// Durably mark run ids executed on another machine so they are not billed
     /// again here. This additive set (the billing floor) is scoped by the session
     /// and the move's `cut_id`; repeats preserve all previously recorded ids.
-    /// The ids must come from [`crate::imported_run_ids`] against the local WAL
-    /// before replacement. Commit before installing the received WAL so a crash
+    /// The ids must come from [`crate::imported_run_ids`] against the local session's log
+    /// before replacement. Commit before installing the received session store so a crash
     /// cannot expose imported episodes to local billing. Projection resets and
     /// retention must never remove the set.
     ///
@@ -256,7 +222,7 @@ pub struct SessionReadMessage {
 }
 
 /// The lifecycle vocabulary returned beside a transcript page. The names match the run-status
-/// wire state strings, with `Idle` added for a session whose WAL has no episode yet.
+/// wire state strings, with `Idle` added for a session whose log has no episode yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionReadStateKind {
     Idle,
@@ -325,7 +291,7 @@ impl SessionReadReason {
     }
 }
 
-/// The lineage state paired with a transcript page, derived from the same WAL snapshot used
+/// The lineage state paired with a transcript page, derived from the same log snapshot used
 /// to assemble that page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionReadLineageState {

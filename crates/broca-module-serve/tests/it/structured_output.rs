@@ -1,4 +1,4 @@
-//! Structured output through broca's real serving path and WAL-backed runner: admission
+//! Structured output through broca's real serving path and log-backed runner: admission
 //! refusals by field, the submit tool ending a run, the result on `run.status` and `run.result`,
 //! and a frozen schema surviving a restart between steps.
 use crate::delivery_rig::*;

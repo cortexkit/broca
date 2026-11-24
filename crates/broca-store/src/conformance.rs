@@ -1,7 +1,7 @@
 //! Shared materialized-store conformance tests.
 //!
 //! The functions in this module are generic over the stable `SessionStore` trait so
-//! every backend is checked against the same WAL projection invariants. The module
+//! every backend is checked against the same log projection invariants. The module
 //! lives in `broca-store` behind a test-only feature because the SQLite crate already
 //! owns the reference tests and all required test fixtures; a separate dev crate
 //! would add another workspace member without reducing coupling.

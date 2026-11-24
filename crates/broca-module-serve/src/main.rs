@@ -155,13 +155,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         "broca.jsonc",
     )
     .map_err(ServeIoError)?;
-    // Where the WAL, leases and run index live. Resolved before any connection is made so a
-    // machine that cannot place its durable state refuses to start by name instead of first
-    // registering and then failing. See `state_root` for the rule, and for why the location is a
-    // contract with astrocyte rather than a private choice. Resolving writes nothing.
-    let state_root = broca_module_serve::state_root::resolve_for_launch(&conn_path)
-        .map_err(|e| ServeIoError(e.to_string()))?
-        .path;
+    // Where the session store, leases and run index live. Resolved before any connection is
+    // made so a machine that cannot place its durable state refuses to start by name instead
+    // of first registering and then failing. See `state_root` for the rule, and for why the
+    // location is a contract with astrocyte rather than a private choice. Resolving writes
+    // nothing.
+    let state_root = broca_module_serve::state_root::resolve_state_root()
+        .map_err(|e| ServeIoError(e.to_string()))?;
     // A profiling build answers heap snapshot requests from a folder in its state root.
     #[cfg(feature = "heap-profile")]
     broca_heap_profile::start(state_root.join("heap-profile"));
@@ -966,7 +966,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         broca_module_serve::cache_warm::ProviderCacheDeclarer,
     ));
     // Store recovery has one owner: plain sessions open now, encrypted candidates wait for
-    // the deployment key. Neither pass waits for WAL discovery.
+    // the deployment key. Neither pass waits for discovery of the session's log.
     let _store_key = {
         let registry = registry.as_ref().clone();
         let store_slot = Arc::clone(&store_slot);
@@ -1062,7 +1062,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::pin!(stopping);
             // Keep the wire loop live for health probes and typed admission refusals while
             // actors drain. Losing the connection must not abandon the durable session jobs.
-            // Actor sealing owns final WAL syncs and lease release; transport loss cannot
+            // Actor sealing owns final log syncs and lease release; transport loss cannot
             // abandon those durability jobs before the bounded seal attempt completes.
             let sealed = tokio::select! {
                 biased;
@@ -1114,7 +1114,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             // 0, `eof` and `reset` are the connection ending without one, `error` is a fault.
             let cause = ServeEnd::cause_of(&result);
             let in_flight_at_goodbye = registry.slot_counts().runs_in_flight;
-            // Wait for final actor WAL syncs and lease release before dropping the runtime.
+            // Wait for final actor log syncs and lease release before dropping the runtime.
             let sealed = registry.stop_and_seal().await;
             let report = registry.shutdown_report().expect("stop records its outcome");
             // Stop the sweep supervisor; incomplete deletions recover from durable tombstones.
@@ -1255,22 +1255,17 @@ struct Gated {
 /// `settings::rewrite`), and returns that path. `old` is the file broca read before the gate; it
 /// is left as it was. `Err` stops the start: with the file not moved, the daemon would serve broca
 /// the defaults in place of the settings the old file holds.
-fn move_settings_file(
-    old: Option<&std::path::Path>,
-    conn_path: &std::path::Path,
-) -> Result<std::path::PathBuf, ServeIoError> {
+fn move_settings_file(old: Option<&std::path::Path>) -> Result<std::path::PathBuf, ServeIoError> {
     use broca_module_serve::settings::rewrite;
     let new = rewrite::daemon_settings_file().map_err(ServeIoError)?;
     let Some(old) = old else {
         return Ok(new);
     };
-    let data_dir = broca_module_serve::state_root::resolve_for_launch(conn_path)
-        .map_err(|error| {
-            ServeIoError(format!(
-                "broca.jsonc not moved: no state root for its old copy: {error}"
-            ))
-        })?
-        .path;
+    let data_dir = broca_module_serve::state_root::resolve_state_root().map_err(|error| {
+        ServeIoError(format!(
+            "broca.jsonc not moved: no state root for its old copy: {error}"
+        ))
+    })?;
     let moved = rewrite::move_old_file(old, &new, &data_dir).map_err(|error| {
         ServeIoError(format!(
             "broca.jsonc at {} could not be moved to {}: {error}",
@@ -1334,7 +1329,7 @@ async fn start_gated(
     // settings. The daemon's gate reads only its own path, so such a start refuses under it.
     let user_file = match (&old_file, explicit) {
         (Some(path), true) => path.clone(),
-        _ => move_settings_file(old_file.as_deref(), conn_path)?,
+        _ => move_settings_file(old_file.as_deref())?,
     };
     let (mut read_half, mut write_half) =
         tokio::io::split(registered_stream(conn_path, channel).await?);
@@ -1892,7 +1887,7 @@ mod state_directory_tests {
             };
             assert_eq!(
                 actual, expected.iter().map(|name| std::ffi::OsString::from(*name)).collect::<Vec<_>>(),
-                "boot must create {entry_id} and only its structural subdirectories before any session writes a WAL"
+                "boot must create {entry_id} and only its structural subdirectories before any session writes a log"
             );
         }
         assert!(

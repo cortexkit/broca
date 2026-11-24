@@ -1,11 +1,11 @@
-//! Indexed reads use a bounded native page and only the unprojected WAL suffix.
+//! Indexed reads use a bounded native page and only the unprojected log suffix.
 
-/// Distinguishes an incomplete compaction projection from ordinary store or WAL faults.
+/// Distinguishes an incomplete compaction projection from ordinary store or log faults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadError {
     /// Entry envelopes or their selection indexes have not been materialized yet.
     ProjectionNotReady,
-    /// A store or WAL fault, retaining its diagnostic text.
+    /// A store or log fault, retaining its diagnostic text.
     Failure(String),
 }
 

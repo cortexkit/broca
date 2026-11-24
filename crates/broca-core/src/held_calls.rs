@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// One ordered held-call fold for status reads and durable subscribe status events.
 /// Keys include the batch because a model may reuse a call id in a later step.
 ///
-/// The WAL projection drives it with [`Self::observe`]; the session-store projection calls the
+/// The log projection drives it with [`Self::observe`]; the session-store projection calls the
 /// same steps one by one from its own records.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HeldCallsProjection {

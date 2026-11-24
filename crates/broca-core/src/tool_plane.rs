@@ -14,7 +14,7 @@
 //!
 //! Orchestration the LOOP owns (not the plane): parallel-vs-sequential
 //! (`execution_mode`), source ordering of results, the approval gate, and the
-//! WAL durability barrier. The plane executes one call and fences it.
+//! log durability barrier. The plane executes one call and fences it.
 
 use async_trait::async_trait;
 use broca_protocol::{BindIdentity, RunId, SessionScope};
@@ -52,7 +52,7 @@ pub struct DispatchRegistration {
     pub approved: bool,
 }
 
-/// Ownership needed to find a call's WAL without consulting the run index.
+/// Ownership needed to find a call's log without consulting the run index.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LateResultRegistration {
     pub lineage: String,
@@ -93,7 +93,7 @@ pub struct ProviderHeldReply {
     pub detail_digest: Option<String>,
 }
 
-/// The batch's single WAL writer acknowledges this only after the held record is synced.
+/// The batch's single log writer acknowledges this only after the held record is synced.
 #[async_trait]
 pub trait ProviderHeldRecorder: Send + Sync {
     async fn sync_held(&self, reply: &ProviderHeldReply) -> Result<(), String>;

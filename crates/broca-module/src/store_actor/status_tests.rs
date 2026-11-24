@@ -192,7 +192,7 @@ fn reply<T: serde::Serialize>(reply: Result<T, crate::serve::ServeError>) -> Val
     }
 }
 
-async fn admission_case(store: bool, scoped: bool) {
+async fn admission_case(scoped: bool) {
     let side = side(vec![text_step("answer", "done")], None).await;
     let manifest: broca_records::record::PlanManifest = serde_json::from_value(json!({
         "plan": "{}", "plan_identity": "admission-plan", "composition_digest": "composition",
@@ -246,7 +246,7 @@ async fn admission_case(store: bool, scoped: bool) {
         .unwrap();
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     side.closed().await;
-    assert_eq!(side.in_store(), store);
+    assert!(side.in_store());
     let admission = side
         .registry
         .run_admission(&side.key, RunId("admitted".into()))
@@ -256,19 +256,12 @@ async fn admission_case(store: bool, scoped: bool) {
     assert_eq!(admission.run_id, "admitted");
     assert_eq!(admission.session_class.as_deref(), Some("sidekick"));
     assert!(admission.started_at_ms > 0);
-    assert_eq!(
-        admission.storage,
-        if store {
-            broca_wire::RunAdmissionStorage::Store
-        } else {
-            broca_wire::RunAdmissionStorage::Wal
-        }
-    );
+    assert_eq!(admission.storage, broca_wire::RunAdmissionStorage::Store);
     let bytes = serde_json::to_vec(&admission).unwrap();
     if let Ok(folder) = std::env::var("BROCA_ADMISSION_SCOPE_SAMPLES") {
         let phase = std::env::var("BROCA_ADMISSION_SAMPLE_PHASE").unwrap();
         assert!(matches!(phase.as_str(), "before" | "after"));
-        let storage = if store { "store" } else { "wal" };
+        let storage = "store";
         let scope = if scoped { "scoped" } else { "unscoped" };
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(
@@ -278,9 +271,8 @@ async fn admission_case(store: bool, scoped: bool) {
         .unwrap();
     }
     if !scoped {
-        let expected = r#"{"run_id":"admitted","session_class":"sidekick","started_at_ms":$TIME,"storage":"$STORAGE","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true,"result_formats":{"read":"text"}}}]}"#
-            .replace("$TIME", &admission.started_at_ms.to_string())
-            .replace("$STORAGE", if store { "store" } else { "wal" });
+        let expected = r#"{"run_id":"admitted","session_class":"sidekick","started_at_ms":$TIME,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true,"result_formats":{"read":"text"}}}]}"#
+            .replace("$TIME", &admission.started_at_ms.to_string());
         assert_eq!(
             bytes,
             expected.as_bytes(),
@@ -310,12 +302,12 @@ async fn admission_case(store: bool, scoped: bool) {
 
 #[tokio::test]
 async fn run_admission_store_freezes_class_and_aft_declarations() {
-    admission_case(true, false).await;
+    admission_case(false).await;
 }
 
 #[tokio::test]
 async fn run_admission_store_serves_recorded_scope() {
-    admission_case(true, true).await;
+    admission_case(true).await;
 }
 
 #[tokio::test]

@@ -854,7 +854,7 @@ impl StoreRuntime {
             // Release placement (`scripts/place-release.sh`) refuses to install a build that
             // doesn't know a listed feature, and builds older than the one that refuses
             // session-store sessions by name don't know this one. So once a session lives here,
-            // no build that would serve it from a WAL it doesn't have can be placed. The floor
+            // no build that would serve it from a log it doesn't have can be placed. The floor
             // is raised before the session's head exists.
             broca_records::floor::raise_floor(
                 &self
@@ -970,7 +970,7 @@ impl StoreRuntime {
         Ok(ActorHandle {
             gen,
             tx,
-            // The session store keeps no WAL, so there is no WAL offset to share.
+            // The session store keeps no shared log, so there is no log offset to share.
             run_in_flight,
             first_episode,
         })

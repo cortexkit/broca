@@ -98,7 +98,7 @@ impl Connections {
             .get(bind)
             .is_some_and(|entry| entry.active.upgrade().is_some())
         {
-            // The actor and WAL lease normally prevent this. A concurrent caller gets a
+            // The actor and log lease normally prevent this. A concurrent caller gets a
             // private connection, never the socket another run is still consuming.
             return None;
         }

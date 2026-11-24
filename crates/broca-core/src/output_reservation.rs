@@ -1,7 +1,7 @@
 //! Keeps a request's output reservation inside the run's context limit.
 //!
-//! A provider checks `input + max_output_tokens` against the model's context window, and some
-//! (Meta's Responses endpoint, for one) refuse a request that crosses it with a generic
+//! A provider checks `input + max_output_tokens` against the model's context window, and
+//! some (Meta's Responses endpoint, for one) refuse a request that crosses it with a generic
 //! `400 invalid parameters` rather than a context error, which the runner classes `permanent`.
 //! A long session that creeps up on its window therefore fails with an error nobody compacts
 //! for. Before each step the run loop estimates the request's input, and when the frozen output
@@ -16,11 +16,11 @@
 //! estimate errs high. [`margin`] covers what it does not see: content denser than two bytes per
 //! token and any provider-side accounting the reported usage leaves out.
 //!
-//! A lowered cap is recorded in the WAL (`output_reservation_clamped`, must-understand feature
-//! `output-reservation/v1`) before the request is sent. A resume of the step reuses it, and
-//! every rebuild of the step's request from the WAL (a cache warm, a cache dump) reads it back,
-//! so the clamp never depends on state a rebuild cannot see. A step that keeps the frozen cap
-//! writes nothing and renders exactly as before.
+//! A lowered cap is recorded in the session's log (`output_reservation_clamped`, must-understand
+//! feature `output-reservation/v1`) before the request is sent. A resume of the step reuses it,
+//! and every rebuild of the step's request from the log (a cache warm, a cache dump) reads it
+//! back, so the clamp never depends on state a rebuild cannot see. A step that keeps the frozen
+//! cap writes nothing and renders exactly as before.
 
 use broca_protocol::{ModelHandle, StepId};
 
@@ -61,9 +61,9 @@ struct Measured {
     model: ModelHandle,
 }
 
-/// What the loop needs from the WAL to estimate the next request's input and to reuse a cap a
-/// step already recorded. Folded from replayed records at run start and from the records the
-/// loop writes as it runs, so the live value and the replayed value agree.
+/// What the loop needs from the session's log to estimate the next request's input and to reuse
+/// a cap a step already recorded. Folded from replayed records at run start and from the
+/// records the loop writes as it runs, so the live value and the replayed value agree.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutputReservationHistory {
     current_model: Option<ModelHandle>,

@@ -340,7 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let install_id = if dry_run {
         "0".repeat(64)
     } else {
-        claude_code_identity::load_or_create_install_id(&state_root.path)?
+        claude_code_identity::load_or_create_install_id(&state_root)?
     };
     let persona = claude_code_identity::fresh_persona(
         &install_id,

@@ -104,7 +104,7 @@ fn one_step_text_reply() -> Vec<NormalizedEvent> {
 
 /// A stub provider whose step waits on a gate, so a run stays active while the test sends.
 /// `held` is signalled as the step reaches the gate: from then until the gate opens, the run
-/// writes nothing more to its WAL. Every step records how many messages its prompt held.
+/// writes nothing more to its log. Every step records how many messages its prompt held.
 struct GatedProvider {
     stub: StubProvider,
     gate: Option<(Arc<Notify>, Arc<Notify>)>,
@@ -612,11 +612,12 @@ fn golden(file: &str) -> Vec<u8> {
 }
 
 /// The owner-mismatch refusal. The first stamped send freezes the owner's scope on a gated
-/// `RunStarted` (after the WAL feature floor lists `scope/v1`); afterwards a send from another
+/// `RunStarted` (after the log feature floor lists `scope/v1`); afterwards a send from another
 /// principal under the same stamp, from the owner without a stamp, from no principal at all,
 /// and from the owner under an earlier epoch of the same ref are each refused
 /// `scope_owner_mismatch` by name, and none of them writes anything. (A later epoch of the same
-/// ref reopens the session instead; see `a_later_epoch_of_the_owners_scope_reopens_an_idle_session`.)
+/// ref reopens the session instead; see
+/// `a_later_epoch_of_the_owners_scope_reopens_an_idle_session`.)
 #[tokio::test]
 async fn a_scoped_session_refuses_a_send_under_a_different_identity_or_none() {
     let mut rig = Rig::start("owner-mismatch", true, false).await;
@@ -698,7 +699,7 @@ async fn a_scoped_session_refuses_a_send_under_a_different_identity_or_none() {
 /// A scoped bind that reserves a new session's address makes the session its scope owner's
 /// before any send is admitted. Until the owner's first send, no other principal can start it:
 /// an unstamped send or import from another module is refused `scope_owner_mismatch` naming the
-/// reserving owner, both before the session has a WAL (the serve layer refuses it without
+/// reserving owner, both before the session has a log (the serve layer refuses it without
 /// opening the session) and once its actor has written one (the actor refuses it), and a bind
 /// stamped with another owner's scope is refused the same way. None of them starts a run or
 /// records an episode. The owner's first stamped send is then admitted and freezes its scope.
@@ -1184,9 +1185,9 @@ async fn basal_unscoped_delivery_refusal_preserves_wal_bytes() {
     rig.bind_ok(1, Some(core()), None).await;
     rig.send_ok(1, "owner-first").await;
     rig.wait_until_held().await;
-    // The run hands its step start to the WAL writer before calling the provider, so the
+    // The run hands its step start to the log writer before calling the provider, so the
     // provider can reach its gate before that record is on disk. Take the before-snapshot only
-    // once it is, or the late step start reads as a refused send writing to the WAL.
+    // once it is, or the late step start reads as a refused send writing to the log.
     rig.wait_for_step_started().await;
     let before = rig.stored().await;
     rig.bind_ok(
@@ -1211,7 +1212,7 @@ async fn basal_unscoped_delivery_refusal_preserves_wal_bytes() {
         assert_eq!(
             rig.stored().await,
             before,
-            "refused {delivery} changed the WAL"
+            "refused {delivery} changed the log"
         );
     }
     rig.gate.notify_one();

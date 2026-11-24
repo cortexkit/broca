@@ -1,4 +1,4 @@
-//! Project attribution for spend facts, separate from the identity stored in the WAL.
+//! Project attribution for spend facts, separate from the identity stored in the session's log.
 
 use broca_protocol::{session::UNSCOPED_SESSION_ROOT, BindIdentity};
 use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serializer};

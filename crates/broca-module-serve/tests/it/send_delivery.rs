@@ -2,7 +2,7 @@
 //! `queue` mode, pinned before anything else changed, and the behaviour a send's `delivery`
 //! selects.
 //!
-//! Every run goes through the real core loop over a real file WAL, so each record the tests
+//! Every run goes through the real core loop over a real session log, so each record the tests
 //! read back was written by core or the lineage actor exactly as in production. The model is a
 //! scripted provider and the one tool is an in-test tool plane that can hold a call open, so a
 //! test decides exactly when a run is inside a model step or inside a tool call.
@@ -543,7 +543,7 @@ async fn accepted_steer_settings_retry_replays_after_the_active_run_changes() {
 }
 
 /// A paused session is not an idle one: a steer into it is refused `run_paused` naming the
-/// paused run (pinned bytes), and the WAL is byte-identical afterwards.
+/// paused run (pinned bytes), and the log is byte-identical afterwards.
 #[tokio::test]
 async fn a_steer_into_a_paused_run_is_refused_and_writes_nothing() {
     let mut rig = Rig::start("steer-paused").await;
@@ -666,7 +666,7 @@ async fn final_answer_with_late_steer(tag: &str, stop_when: serde_json::Value, l
             &run_1,
         );
     }
-    // A new registry and store must reconstruct both status and prompt from durable WAL.
+    // A new registry and store must reconstruct both status and prompt from durable log.
     rig.wait_closed().await;
     rig = rig.restart().await;
     let restarted = rig
@@ -720,7 +720,7 @@ async fn a_cancel_with_a_steer_pending_starts_no_new_turn() {
 }
 
 /// An interrupt during a model stream answers `pending` (pinned bytes) once its `Queued` is
-/// durable, and the order in the WAL is the guarantee: the `Queued{delivery: interrupt}`
+/// durable, and the order in the log is the guarantee: the `Queued{delivery: interrupt}`
 /// precedes the interrupted run's `Cancelled`, which precedes the new run. The aborted step
 /// leaves no assistant message, and the new message runs exactly once.
 #[tokio::test]
@@ -835,7 +835,7 @@ async fn an_interrupt_ends_a_paused_run_and_starts_the_message() {
 
 /// A plain send with a new `send_id` into a session whose last run is paused for auth is
 /// refused `run_paused` naming the paused run, with the same pinned bytes a steer gets, and the
-/// WAL is byte-identical afterwards. Before this refusal existed the same send was answered
+/// log is byte-identical afterwards. Before this refusal existed the same send was answered
 /// `active` naming the PAUSED run and its message was recorded nowhere.
 #[tokio::test]
 async fn a_plain_send_into_a_paused_session_is_refused_run_paused() {
@@ -1084,7 +1084,7 @@ async fn invalid_retention_writes_nothing(tag: &str, delivery: Option<&str>) {
     let before = rig.records().await;
     assert!(
         !before.is_empty(),
-        "the accepted run must reach its real WAL"
+        "the accepted run must reach its real log"
     );
     for retention in values
         .iter()
@@ -1528,8 +1528,9 @@ async fn a_steers_title_is_stored_on_its_steered_record() {
 }
 
 /// Every title the contract refuses is refused as `invalid_params` naming `title` (the first
-/// refusal compared with its golden fixture), on every delivery mode, before anything is written: the WAL stays
-/// empty on an unwritten session and byte-identical on one with a run in flight. The longest
+/// refusal compared with its golden fixture), on every delivery mode, before anything is
+/// written: the log stays empty on an unwritten session and byte-identical on one with a run
+/// in flight. The longest
 /// accepted title, 200 two-byte characters, is admitted whole.
 #[tokio::test]
 async fn an_invalid_title_is_refused_before_any_wal_write() {

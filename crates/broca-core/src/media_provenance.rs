@@ -1,12 +1,12 @@
 //! Where a `MediaRef` may enter a session.
 //!
 //! A media reference names bytes in the session's media store by digest. broca writes one into a
-//! WAL record only from its own capture path: committing a person's upload, or capturing a tool
+//! log record only from its own capture path: committing a person's upload, or capturing a tool
 //! reply. Both publish bytes broca holds and register them in the session's manifest before the
 //! record names them. A transcript a caller hands over (a wire message, a session import) holds
 //! no bytes, only claims, so a `media` block or a `Parts` media part in it would name an object
 //! the session never captured, possibly one another session stored. Such content is refused
-//! right after the supplied transcript is decoded, before it can reach a WAL record; a person
+//! right after the supplied transcript is decoded, before it can reach a log record; a person
 //! names media only through upload references.
 
 use broca_protocol::content::{ContentBlock, Message, ToolOutput, ToolOutputPart};

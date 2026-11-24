@@ -455,7 +455,7 @@ async fn inventory_wait_refusals_keep_the_precise_transient_code_and_reason() {
             Err(SessionAddressError::Unavailable(match self.0 {
                 "wait_expired" => InventoryUnavailable::WaitExpired,
                 "migration_failed" => {
-                    InventoryUnavailable::MigrationFailed("unreadable WAL".into())
+                    InventoryUnavailable::MigrationFailed("unreadable log".into())
                 }
                 "gap_marker" => InventoryUnavailable::GapMarker,
                 _ => unreachable!(),

@@ -99,7 +99,7 @@ pub struct RunRequest {
     pub budget: Option<BudgetConfig>,
     /// Caller-supplied context-window override, resolved against the catalog before execution.
     pub context_limit: Option<u64>,
-    /// Opaque caller-declared workload class, frozen into the WAL at admission.
+    /// Opaque caller-declared workload class, frozen into the log at admission.
     pub work_class: Option<String>,
     /// The caller's requested reasoning variant, recorded on RunStarted at admission.
     pub variant: Option<String>,
@@ -125,7 +125,7 @@ pub struct RunRequest {
     /// `RunStarted`; a resume writes no `RunStarted` and ignores it. Never byte-affecting.
     pub send_id: Option<String>,
     /// The canonical identity of the caller's request when its run id can repeat, recorded on
-    /// the `RunStarted` beside `send_id` so a keyed retry is compared against the WAL rather
+    /// the `RunStarted` beside `send_id` so a keyed retry is compared against the log rather
     /// than the run index. Never byte-affecting.
     pub request_identity_digest: Option<String>,
     /// The human-readable title the caller's send carried (for a drained queued submission, the
@@ -259,9 +259,9 @@ pub enum RunError {
     /// The session is already held by a live writer (only one writer per session).
     LeaseHeld(String),
     Lease(String),
-    /// A WAL write/barrier failed — FATAL: the run is aborted rather than continue
+    /// A log write/barrier failed — FATAL: the run is aborted rather than continue
     /// without durability guarantees. The lease is released on return.
-    Wal(String),
+    Log(String),
     /// The run task PANICKED (unwound) before producing a terminal — synthesized by a
     /// drop-guard on the run-driving task so a panic still reports a terminal to the
     /// coordinator (otherwise the coordinator would wait forever for a result that never
@@ -426,7 +426,7 @@ impl RunError {
             Self::LeaseHeld(_)
             | Self::CredentialsUnavailable
             | Self::Lease(_)
-            | Self::Wal(_)
+            | Self::Log(_)
             | Self::Panicked
             | Self::Transient(_)
             | Self::RoutingUnavailable(_) => ErrorClass::Transient,
@@ -442,7 +442,7 @@ impl std::fmt::Display for RunError {
             RunError::CredentialsUnavailable => write!(f, "the vault credential listing has not loaded yet"),
             RunError::CredentialAmbiguous { credential, candidate_ids } => write!(f, "credential {credential} is ambiguous: {}", candidate_ids.join(", ")),
             RunError::Lease(s) => write!(f, "lease error: {s}"),
-            RunError::Wal(s) => write!(f, "wal failure: {s}"),
+            RunError::Log(s) => write!(f, "session log failure: {s}"),
             RunError::Panicked => write!(f, "run task panicked before producing a terminal"),
             RunError::TagNumbering(overflow) => write!(f, "{overflow}"),
             RunError::VariantUnsupported(s) => write!(f, "run resolution failed: {s}"),

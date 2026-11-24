@@ -12,7 +12,7 @@ use {
 };
 
 /// Imports stay comfortably below the 64 MiB transport/frame limit, leaving room for
-/// the operation envelope and WAL record metadata.
+/// the operation envelope and log record metadata.
 pub const IMPORT_MAX_SERIALIZED_BYTES: usize = 48 * 1024 * 1024;
 /// A second sanity bound prevents tiny-message inputs from consuming unbounded memory.
 pub const IMPORT_MAX_MESSAGES: usize = 100_000;
@@ -59,7 +59,8 @@ pub struct ImportOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportError {
-    Wal(String),
+    /// Writing the imported history to the session's log failed.
+    Log(String),
     LineageNotEmpty,
     ImportIdReuse,
     TooManyMessages {
@@ -76,11 +77,11 @@ pub enum ImportError {
     },
     /// The request carried no importable messages, either because it arrived empty or because
     /// normalization dropped everything it had (a system-only transcript, or nothing but orphan
-    /// tool results). Refused before any WAL write: an empty episode is durable and consumes
+    /// tool results). Refused before any log write: an empty episode is durable and consumes
     /// the lineage, so the later real import fails `LineageNotEmpty` and the caller is left
     /// with a session that can never be filled.
     NoImportableContent,
-    /// The transcript names media directly. A `MediaRef` enters a WAL record only from broca's
+    /// The transcript names media directly. A `MediaRef` enters a log record only from broca's
     /// own capture path, which publishes bytes it holds; an imported reference holds none and
     /// could name an object the session never captured.
     SuppliedMedia(crate::media_provenance::SuppliedMedia),
@@ -89,7 +90,7 @@ pub enum ImportError {
 impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Wal(error) => write!(f, "wal failure: {error}"),
+            Self::Log(error) => write!(f, "session log failure: {error}"),
             // Both of these name what the caller must do next, not just what was refused: a
             // client renders this text verbatim, so a message that only states the rule leaves
             // a reader knowing the import failed and not knowing whether to retry, rename, or
@@ -172,7 +173,7 @@ pub fn prepare_inline(
         return Err(ImportError::SuppliedMedia(found));
     }
     let serialized =
-        serde_json::to_vec(&messages).map_err(|error| ImportError::Wal(error.to_string()))?;
+        serde_json::to_vec(&messages).map_err(|error| ImportError::Log(error.to_string()))?;
     let serialized_bytes = serialized.len();
     if serialized_bytes > IMPORT_MAX_SERIALIZED_BYTES {
         return Err(ImportError::TooLarge {
@@ -185,7 +186,7 @@ pub fn prepare_inline(
         "messages": &messages,
         "origin": {"kind": "import", "source_ref": &source_ref},
     }))
-    .map_err(|error| ImportError::Wal(error.to_string()))?;
+    .map_err(|error| ImportError::Log(error.to_string()))?;
     let request_digest = format!("{:x}", Sha256::digest(identity_bytes));
     let (messages, counts) = normalize_messages(messages);
     // Normalization can empty a request that arrived non-empty: it drops system messages, which
@@ -690,7 +691,7 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&normalized).unwrap(),
             serde_json::to_vec(&golden).unwrap(),
-            "normalized WAL input bytes must remain stable"
+            "normalized input bytes in the log must remain stable"
         );
     }
 }

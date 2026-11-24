@@ -91,10 +91,9 @@ pub enum StoreError {
     Sqlite(rusqlite::Error),
     Int(std::num::TryFromIntError),
     Json(serde_json::Error),
-    /// The WAL being projected is a corrupt lineage (replay refused to fabricate a
+    /// The log being projected is a corrupt lineage (replay refused to fabricate a
     /// prefix). Surfaced rather than silently materializing a wrong projection.
     Replay(broca_core::ReplayError),
-    AttributionStale,
     InconsistentSnapshot(&'static str),
     BusEvent(String),
     MarkedStateRoot(MarkedStateRoot),
@@ -111,9 +110,6 @@ impl std::fmt::Display for StoreError {
             StoreError::Sqlite(e) => write!(f, "sqlite: {e}"),
             StoreError::Json(e) => write!(f, "json: {e}"),
             StoreError::Replay(e) => write!(f, "replay: {e}"),
-            StoreError::AttributionStale => {
-                std::fmt::Display::fmt(&broca_core::StorePageReadError::AttributionStale, f)
-            }
             StoreError::BusEvent(e) => write!(f, "run event: {e}"),
             StoreError::MarkedStateRoot(e) => write!(f, "{e}"),
             StoreError::InconsistentSnapshot(message) => {
@@ -158,7 +154,7 @@ impl From<broca_core::ReplayError> for StoreError {
 /// SQLite-backed materialized store. The connection is behind a `Mutex` so the
 /// store is `Sync` (rusqlite `Connection` is `Send` not `Sync`).
 ///
-/// The single `Mutex<Connection>` serializes database access. Projection keeps WAL replay,
+/// The single `Mutex<Connection>` serializes database access. Projection keeps log replay,
 /// checkpoint folding, and JSON serialization outside that mutex so unrelated sessions wait
 /// only for the short snapshot and commit phases.
 pub struct SqliteStore {
@@ -638,7 +634,7 @@ mod tests {
 
         assert!(
             path.with_file_name("run-index.db-wal").exists(),
-            "WAL must survive close"
+            "the log must survive close"
         );
         assert!(
             path.with_file_name("run-index.db-shm").exists(),

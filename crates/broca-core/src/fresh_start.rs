@@ -126,9 +126,9 @@ pub fn admitted_hook_plan(
         .filter(|manifest| crate::hooks::has_transforms(manifest))
         .map(|manifest| crate::hooks::HookPlan::from_manifest(manifest))
         .transpose()
-        .map_err(RunError::Wal)?;
+        .map_err(RunError::Log)?;
     if hook_plan.is_some() && !hook_plane_installed {
-        return Err(RunError::Wal(
+        return Err(RunError::Log(
             "plan.step_transform_items requires an installed hook plane".into(),
         ));
     }
@@ -143,7 +143,7 @@ pub fn episode_input(
 ) -> Result<Vec<Message>, RunError> {
     match final_value {
         Some(value) => serde_json::from_value(value.clone())
-            .map_err(|error| RunError::Wal(format!("invalid recorded input hooks: {error}"))),
+            .map_err(|error| RunError::Log(format!("invalid recorded input hooks: {error}"))),
         None => Ok(input),
     }
 }

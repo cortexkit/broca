@@ -221,17 +221,17 @@ pub struct SendRequest {
     /// because the payload may preserve an omitted tool surface until admission.
     pub run_id: broca_protocol::RunId,
     /// The caller's `send_id` when `run_id` was derived from one. Such a send is deduplicated
-    /// against earlier sends with the same key, and the key is written on the WAL record that
+    /// against earlier sends with the same key, and the key is written on the log record that
     /// carries its message. `None` means a nonce-minted run id, which cannot repeat and so skips
     /// the identity digest and lookup.
     pub send_id: Option<String>,
-    /// The caller's human-readable title, recorded on the WAL record this send writes. Not part
+    /// The caller's human-readable title, recorded on the log record this send writes. Not part
     /// of the send's identity, so a retry with another title is answered as the first send was.
     pub title: Option<String>,
     /// The caller's request payload. An omitted `tools` value remains durable if this send is
     /// queued and resolves only when the episode starts.
     pub request: Box<broca_protocol::request::SubmissionRequest>,
-    /// Skip the derived transcript projection for this run. WAL durability and reads are unchanged.
+    /// Skip the derived transcript projection for this run. Log durability and reads are unchanged.
     pub skip_materialization: bool,
     pub kind: crate::executor::RunKind,
     /// How the send asked to be delivered when a run is already active (`Queue` when the
@@ -423,7 +423,7 @@ pub enum SendResponse {
 pub struct RunPausedRefusal {
     /// The paused run.
     pub run_id: String,
-    /// The pause reason as the WAL records it.
+    /// The pause reason as the log records it.
     pub reason: broca_protocol::PauseReason,
 }
 
@@ -1397,7 +1397,7 @@ pub(crate) fn run_status_response_with_reader_policy(
                     path: selection
                         .account_decision
                         .map(|decision| match decision.path.as_str() {
-                            // WAL AccountDecision fallback paths used the configured static account,
+                            // These AccountDecision fallback paths used the configured static account,
                             // so the wire reports "default", not a routed choice or caller pin.
                             "disabled" | "unreachable" | "unsupported" | "single_candidate"
                             | "legacy_static" | "candidates_unknown" | "auth_required" => {
@@ -2127,7 +2127,7 @@ pub trait ServeHandler: Send + Sync {
         Ok(None)
     }
 
-    /// The namespace output references use. A converted session retains its source WAL's
+    /// The namespace output references use. A converted session retains its source log's
     /// lineage even though its history cursors use the new store incarnation.
     async fn output_ref_namespace(
         &self,
@@ -2232,7 +2232,7 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// `run.status{run_id}` — the lifecycle state of a SPECIFIC run, via the three-tier
-    /// resolution (live actor → durable index terminal → WAL reconciliation). The wire
+    /// resolution (live actor → durable index terminal → log reconciliation). The wire
     /// surface of the durable run index: a consumer reaches a finished/crashed run's outcome
     /// here even when it's not in the consumer's live subscription.
     async fn run_status(
@@ -2284,7 +2284,7 @@ pub trait ServeHandler: Send + Sync {
     }
 
     /// `session.head` — the session's head without message bodies. For retained sessions,
-    /// `updated_at` is the durable activity timestamp that sets expiry, not the WAL mtime.
+    /// `updated_at` is the durable activity timestamp that sets expiry, not the log mtime.
     async fn head(&self, _session: &LineageKey) -> Result<broca_wire::HeadResponse, ServeError> {
         Err(ServeError::Open(
             "session.head is unsupported".into(),
@@ -2406,12 +2406,12 @@ pub trait ServeHandler: Send + Sync {
         None
     }
 
-    /// Whether the session was ever written (it has a WAL, live or archived). A send may leave
+    /// Whether the session was ever written (it has a log, live or archived). A send may leave
     /// runner parameters to the session's frozen values only then. An unavailable classifier
     /// refuses retryably rather than inventing history or discarding frozen settings.
     fn session_written(&self, _session: &LineageKey) -> Result<bool, ServeError> {
         Err(ServeError::Open(
-            "cannot determine whether the session has a WAL; retry the send".into(),
+            "cannot determine whether the session has a log; retry the send".into(),
             Some(broca_protocol::ErrorClass::Transient),
         ))
     }
@@ -2556,7 +2556,7 @@ impl crate::LineageRegistry {
     }
 
     /// What a plan-change op's preflight reads about `session`, for a request naming
-    /// `generation` and `send_id`. `wal_error` words a failure to read the session's WAL, as
+    /// `generation` and `send_id`. `wal_error` words a failure to read the session's log, as
     /// each op words it.
     async fn read_change(
         &self,
@@ -2971,7 +2971,7 @@ impl ServeHandler for crate::LineageRegistry {
             req.request.staged_uploads = request.staged_uploads;
         }
         // Opening an actor creates the lineage header. A fresh run scope has no frozen
-        // history to consult, so reject a wrong carrier or tools before creating any WAL.
+        // history to consult, so reject a wrong carrier or tools before creating any log.
         // Existing sessions still use the actor's authoritative frozen-ownership check.
         if broca_core::scope_admission::AGENT_RUN_SCOPES_WRITER_ENABLED
             && matches!(&req.request.scope, broca_protocol::SendScope::Stamped(bind) if bind.scope.run_id.is_some())
@@ -3003,8 +3003,8 @@ impl ServeHandler for crate::LineageRegistry {
                 }
             }
         }
-        // Opening a fresh actor writes the WAL's first frame, so refuse a scoped send with
-        // legacy tools before opening it. A session that already has episodes goes to the actor,
+        // Opening a fresh actor writes the session log's first frame, so refuse a scoped send with
+        // tools before opening it. A session that already has episodes goes to the actor,
         // so a resent `send_id` of an admitted run gets its recorded answer before the tool
         // check runs.
         if req.plan.is_none()
@@ -3521,7 +3521,7 @@ impl ServeHandler for crate::LineageRegistry {
             RetractOutcome::AlreadyStarted => Ok(RetractResponse::AlreadyStarted),
             RetractOutcome::NotPending => Ok(RetractResponse::NotPending),
             RetractOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
-            // This string combines WAL reads and writes; the original cause is unavailable.
+            // This string combines log reads and writes; the original cause is unavailable.
             RetractOutcome::Error(e) => Err(ServeError::Open(e, None)),
         }
     }
@@ -3766,7 +3766,7 @@ impl ServeHandler for crate::LineageRegistry {
         let _change_guard = self.lock_session_change(session).await;
         let read = self
             .read_change(session, Some(generation), None, |error| {
-                format!("cannot read the session WAL: {error}")
+                format!("cannot read the session's log: {error}")
             })
             .await?;
         read.check_owner(principal, scope)?;
@@ -4003,7 +4003,7 @@ impl ServeHandler for crate::LineageRegistry {
         let _change_guard = self.lock_session_change(session).await;
         let read = self
             .read_change(session, None, Some(&send_id), |error| {
-                format!("cannot read the session WAL: {error}")
+                format!("cannot read the session's log: {error}")
             })
             .await?;
         read.check_owner(principal, scope)?;

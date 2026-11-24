@@ -1,5 +1,5 @@
 //! Synchronous filesystem seam for durability tests. The default backend uses the same
-//! owner-only creation and platform-specific directory barriers as the WAL writer.
+//! owner-only creation and platform-specific directory barriers as the session's log writer.
 //!
 //! With the non-shipping `fs-override` feature, an override is scoped to one thread,
 //! not the process. Keep the entire synchronous program (including recovery and
@@ -70,7 +70,7 @@ impl FileOps for std::fs::File {
     }
 }
 
-/// Path operations used by the WAL. `sync_dir` must not imply a file-content sync.
+/// Path operations used by the session's log. `sync_dir` must not imply a file-content sync.
 pub trait FsOps: Send + Sync {
     fn open(&self, path: &Path, options: &OpenOptions) -> io::Result<Box<dyn FileOps>>;
     fn metadata(&self, path: &Path) -> io::Result<Metadata>;
@@ -257,7 +257,7 @@ thread_local! {
 
 #[cfg(feature = "fs-override")]
 fn current() -> Arc<dyn FsOps> {
-    // Keep the marker on the WAL I/O path so release staging and placement reject
+    // Keep the marker on the log I/O path so release staging and placement reject
     // artifacts built with fs-override, even if they never call with_fs_ops.
     std::hint::black_box("BROCA_TEST_FS_OVERRIDE_V1");
     CURRENT.with(|fs| fs.borrow().clone())

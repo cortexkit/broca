@@ -14,7 +14,7 @@ pub fn render_identity_error<P: Provider + ?Sized>(
     let current = provider.render_config_blob();
     let (message, provider_code) = if current.is_null() || frozen_render_config.is_null() {
         (
-            "resume refused: the current provider or the recorded WAL has a null frozen render \
+            "resume refused: the current provider or the recorded log has a null frozen render \
              config, so render identity cannot be verified; old WALs with a null frozen config \
              were never resume-safe and must be discarded",
             "frozen_render_config_unverifiable",

@@ -1,5 +1,5 @@
 //! The serve rig the delivery-mode tests share: the real serve path and core loop over a real
-//! file WAL, with a scripted provider and tool plane a test can hold inside a call.
+//! session log, with a scripted provider and tool plane a test can hold inside a call.
 //!
 //! Each test binary that includes this module uses a different part of it, so an item one
 //! binary leaves unused is not dead code.
@@ -169,7 +169,7 @@ pub struct Script {
     /// Model steps, consumed in order across every run. An exhausted script answers text.
     pub steps: Mutex<VecDeque<Step>>,
     /// Family-normalized events take precedence over generated steps so wire fixtures retain
-    /// their provider metadata through the real run loop and WAL writer.
+    /// their provider metadata through the real run loop and log writer.
     pub normalized_steps: Mutex<VecDeque<Vec<NormalizedEvent>>>,
     pub refusal_fallback_model: Mutex<Option<broca_protocol::ModelHandle>>,
     /// The prompt each model step was called with, in call order.
@@ -680,7 +680,7 @@ impl RunExecutor for CoreExec {
                 && (holds_media || !req.tools.is_empty())
             {
                 let media = media.ok_or_else(|| {
-                    StoreRunError::Admission(broca_core::RunError::Wal(
+                    StoreRunError::Admission(broca_core::RunError::Log(
                         "store_media_unavailable: the run was started without its media index"
                             .into(),
                     ))

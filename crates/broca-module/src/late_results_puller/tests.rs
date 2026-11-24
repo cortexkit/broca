@@ -1190,7 +1190,7 @@ async fn an_entry_whose_scope_differs_from_its_registration_is_a_no_op() {
 async fn an_entry_for_a_call_dispatched_to_another_module_is_a_no_op() {
     let call_key = "lineage:4";
     let bind = session("held");
-    // The WAL holds the call as held by `other`, while the entry arrives on `tools`' feed.
+    // The log holds the call as held by `other`, while the entry arrives on `tools`' feed.
     let rig = Rig::new(
         "other-module",
         Some((call_key, "other", bind.clone())),

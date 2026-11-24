@@ -3,12 +3,13 @@
 //! A queued send's reply names only its submission id, `sub-<run id>`. Callers derive the run id
 //! from it and poll `run.status` and `session.read` on that id to learn what became of the send.
 //! A send using the `delivery_order` group may never become a run of its own: it can be delivered
-//! into the run already going (as a steer, say), replaced, expire or be withdrawn. Broca answers the
-//! id for every one of those, from the WAL alone, so the answer survives a restart. This is a
-//! broca extension; the llm-runner role contract answers an id naming no run `unknown`.
+//! into the run already going (as a steer, say), replaced, expire or be withdrawn. Broca answers
+//! the id for every one of those, from the session's log alone, so the answer survives a restart.
+//! This is a broca extension; the llm-runner role contract answers an id naming no run `unknown`.
 //!
-//! The same holds for a re-send of the queued send's `send_id`: once the WAL records where the
-//! send was delivered, the re-send's `delivered` receipt says so, before and after a restart.
+//! The same holds for a re-send of the queued send's `send_id`: once the session's log records
+//! where the send was delivered, the re-send's `delivered` receipt says so, before and after a
+//! restart.
 
 use crate::delivery_rig::*;
 use broca_session_store::record::Record;
@@ -425,7 +426,7 @@ async fn send_status_writes_nothing_and_never_opens_a_closed_actor() {
     assert_eq!(
         rig.records().await,
         before,
-        "even an unknown send must not create a WAL"
+        "even an unknown send must not create a log"
     );
     rig.script.push(&[Step::Text("done")]);
     rig.send("first", "hi", None).await;

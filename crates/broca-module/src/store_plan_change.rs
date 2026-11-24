@@ -128,9 +128,9 @@ fn enrollment_facts<B: SessionBackend>(
 }
 
 /// What a plan-change op's preflight reads about `session`, as `ChangeRead::of_wal` reads it
-/// from a WAL: the scope and principal its first run froze, the module that opened its latest
-/// scoped run (`crate::serve::scope_plan_opener`), which a refreshed plan's senders are checked
-/// against, and its plan-change facts.
+/// from the session's log: the scope and principal its first run froze, the module that opened
+/// its latest scoped run (`crate::serve::scope_plan_opener`), which a refreshed plan's senders
+/// are checked against, and its plan-change facts.
 pub(crate) async fn change_read<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
@@ -162,8 +162,8 @@ pub(crate) async fn change_read<B: SessionBackend>(
 }
 
 /// The plan identities a later send's plan is checked against once the session took a refresh,
-/// as the serve layer reads them from a WAL: the applied plan's (the first run's before any
-/// applied) and the latest accepted one's. `None` before any refresh.
+/// as the serve layer reads them from the session's log: the applied plan's (the first run's
+/// before any applied) and the latest accepted one's. `None` before any refresh.
 pub(crate) async fn identities<B: SessionBackend>(
     session: &Session<B>,
 ) -> Result<Option<(Option<String>, Option<String>)>, String> {
@@ -207,7 +207,7 @@ pub(crate) async fn identities<B: SessionBackend>(
 
 /// What `session.baseline` reads about a session kept in the session store, before the serve layer
 /// checks the caller is the owner and adds the cache declaration (see `crate::serve`'s
-/// `baseline`, which reads the same facts from a WAL).
+/// `baseline`, which reads the same facts from the session's log).
 #[derive(Debug)]
 pub struct BaselineFacts {
     /// The scope and principal the session's first run froze; only its owner reads the baseline.

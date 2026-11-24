@@ -772,10 +772,10 @@ async fn live(model: &str, variant: Option<&str>, gap: Duration) -> Result<i32, 
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
                 .join(".local/share/cortexkit/run/subc-connection.json")
         });
-    let state_root = broca_module_serve::state_root::resolve_for_launch(&connection_file)
+    let state_root = broca_module_serve::state_root::resolve_state_root()
         .map_err(|_| "state root unavailable")?;
     broca_catalog::install_global_catalog_cache(Arc::new(broca_catalog::CatalogCache::open(
-        state_root.path.join("catalog/fusiform-lkg.json"),
+        state_root.join("catalog/fusiform-lkg.json"),
     )));
     let credential = CredentialId::parse(CREDENTIAL_ID).ok_or("invalid fixed credential id")?;
     let handle = load_devtools_handle(&credential)
@@ -796,7 +796,7 @@ async fn live(model: &str, variant: Option<&str>, gap: Duration) -> Result<i32, 
         .await
         .result
         .map_err(|_| "vault credential unavailable")?;
-    let install_seed = claude_code_identity::load_or_create_install_id(&state_root.path)
+    let install_seed = claude_code_identity::load_or_create_install_id(&state_root)
         .map_err(|_| "installation identity unavailable")?;
     let wire = chatgpt_identity::fresh(&install_seed, &bind, &scope, now_ms())
         .map_err(|_| "admission identity unavailable")?;

@@ -132,7 +132,6 @@ fn install_catalog(args: &Args) -> Result<PathBuf, String> {
         Some(path) => path.clone(),
         None => resolve_state_root()
             .map_err(|error| error.to_string())?
-            .path
             .join("catalog/fusiform-lkg.json"),
     };
     let cache = Arc::new(CatalogCache::open(&path));

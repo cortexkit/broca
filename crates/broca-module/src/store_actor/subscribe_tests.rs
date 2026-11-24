@@ -436,8 +436,8 @@ async fn a_subscribe_from_a_reads_head_misses_and_repeats_nothing() {
 
 /// A session whose first run's tool result carries two notes, as a run that delivered sends
 /// with that result records them: a ride from the module `occi` under the send id `ride-1`, with
-/// its envelope, and text delivered before envelopes existed, as a log converted from today's
-/// WAL storage holds it (no envelope, no send id). Built from the records a store actor wrote
+/// its envelope, and text delivered before envelopes existed, as a converted session holds it
+/// (no envelope, no send id). Built from the records a store actor wrote
 /// for [`script`]'s two runs, the notes put after the tool batch's end, written to a session of
 /// its own. Returns that session's backend, the seq of the ride (the other note follows it), and
 /// the session.

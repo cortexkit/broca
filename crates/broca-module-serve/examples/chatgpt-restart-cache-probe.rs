@@ -312,10 +312,10 @@ async fn live(model: &str) -> Result<(), &'static str> {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
                 .join(".local/share/cortexkit/run/subc-connection.json")
         });
-    let state_root = broca_module_serve::state_root::resolve_for_launch(&connection_file)
+    let state_root = broca_module_serve::state_root::resolve_state_root()
         .map_err(|_| "state_root_unavailable")?;
     let cache = Arc::new(broca_catalog::CatalogCache::open(
-        state_root.path.join("catalog/fusiform-lkg.json"),
+        state_root.join("catalog/fusiform-lkg.json"),
     ));
     broca_catalog::install_global_catalog_cache(cache);
     let credential = CredentialId::parse("chatgpt:openai").ok_or("invalid_fixed_credential_id")?;
@@ -336,9 +336,8 @@ async fn live(model: &str) -> Result<(), &'static str> {
         .await
         .result
         .map_err(|_| "vault_credential_unavailable")?;
-    let seed =
-        broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root.path)
-            .map_err(|_| "installation_identity_unavailable")?;
+    let seed = broca_module_serve::claude_code_identity::load_or_create_install_id(&state_root)
+        .map_err(|_| "installation_identity_unavailable")?;
     let wire = chatgpt_identity::fresh(&seed, &bind, &scope, now_ms())
         .map_err(|_| "admission_identity_unavailable")?;
     let method = AuthMethod::Chatgpt;

@@ -17,7 +17,7 @@ impl std::fmt::Display for PricingUnavailable {
 impl std::error::Error for PricingUnavailable {}
 
 /// Read the currently installed snapshot at every decision; no rates are persisted into the
-/// WAL. Service and speed tiers are deliberately ignored: only base/context brackets price
+/// session's log. Service and speed tiers are deliberately ignored: only base/context brackets price
 /// cache maintenance, so mode rates never fill a missing base rate.
 pub fn warm_prices(
     provider: &str,

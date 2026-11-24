@@ -1,7 +1,8 @@
-//! ENGRAM's session-door client. Admits a frozen WAL as hex-encoded opaque bytes and reads only
-//! sealed cuts, whose pages include the stream's sealed SHA-256 digest. Requests carry a session
-//! reference and byte offsets; the caller principal determines the stream, never a request field.
-//! Wire provenance: ENGRAM commit 50d65fc70ccc3e0082eaf1bde882ffaf7b2c2bcd on `integrate/session-door`.
+//! ENGRAM's session-door client. Admits a frozen session log as hex-encoded opaque bytes and
+//! reads only sealed cuts, whose pages include the stream's sealed SHA-256 digest. Requests carry
+//! a session reference and byte offsets; the caller principal determines the stream, never a
+//! request field. Wire provenance: ENGRAM commit 50d65fc70ccc3e0082eaf1bde882ffaf7b2c2bcd on
+//! `integrate/session-door`.
 
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -62,7 +63,7 @@ pub struct DoorCoverage {
 }
 
 /// A cut-bound page, including the sealed digest over the entire `[0, stream_end)` stream.
-/// The importer must hash all pages and compare with this digest before staging a WAL.
+/// The importer must hash all pages and compare with this digest before staging a session log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoorRead {
     pub bytes: Vec<u8>,
@@ -126,26 +127,27 @@ impl SessionDoorClient {
         decode_coverage(answer)
     }
 
-    /// Admit a frozen WAL's complete `[0, endOffset)` bytes, resuming from the door's durable end.
-    /// Already durable bytes are not resent. This never waits for cloud coverage or seals a cut.
+    /// Admit a frozen session log's complete `[0, endOffset)` bytes, resuming from the door's
+    /// durable end. Already durable bytes are not resent. This never waits for cloud coverage or
+    /// seals a cut.
     pub async fn admit(
         &self,
         session_ref: &str,
-        wal: &[u8],
+        log: &[u8],
         deadline: Instant,
     ) -> Result<DoorCoverage, SessionDoorError> {
         let mut coverage = self.offsets(session_ref, deadline).await?;
-        let mut offset = checked_offset(coverage.durable_offset, wal.len())?;
+        let mut offset = checked_offset(coverage.durable_offset, log.len())?;
         let mut mismatch_backoff = FIRST_BACKOFF;
-        while offset < wal.len() {
-            let end = offset.saturating_add(MAX_CALL_BYTES).min(wal.len());
+        while offset < log.len() {
+            let end = offset.saturating_add(MAX_CALL_BYTES).min(log.len());
             let answer = self
                 .call(
                     "session.admit",
                     json!({
                         "sessionRef": session_ref,
                         "fromOffset": offset as u64,
-                        "bytes": encode_hex(&wal[offset..end]),
+                        "bytes": encode_hex(&log[offset..end]),
                     }),
                     deadline,
                 )
@@ -173,7 +175,7 @@ impl SessionDoorClient {
                     if coverage.durable_offset < expected {
                         return Err(refused(&error));
                     }
-                    let next = checked_offset(coverage.durable_offset, wal.len())?;
+                    let next = checked_offset(coverage.durable_offset, log.len())?;
                     if next == offset {
                         backoff(deadline, &mut mismatch_backoff, &error).await?;
                     }
@@ -434,10 +436,10 @@ fn decode_coverage(value: Value) -> Result<DoorCoverage, SessionDoorError> {
 
 fn checked_offset(offset: u64, end: usize) -> Result<usize, SessionDoorError> {
     let offset = usize::try_from(offset)
-        .map_err(|_| unavailable("session-door durableOffset exceeds frozen WAL endOffset"))?;
+        .map_err(|_| unavailable("session-door durableOffset exceeds frozen log endOffset"))?;
     if offset > end {
         return Err(unavailable(
-            "session-door durableOffset exceeds frozen WAL endOffset",
+            "session-door durableOffset exceeds frozen log endOffset",
         ));
     }
     Ok(offset)

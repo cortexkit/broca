@@ -19,7 +19,7 @@ fn proof_capabilities() -> Vec<String> {
 #[tokio::test]
 async fn direct_carrier_routes_apply_proof_to_warm_dispatch_and_reopen() {
     let (conn, plane) = direct_plane(proof_capabilities());
-    let bind = BindIdentity::new("/local/wal-root", "broca", "carrier");
+    let bind = BindIdentity::new("/local/project-root", "broca", "carrier");
     plane.warm_bind(&bind, Duration::from_secs(1)).await.unwrap();
     plane.ensure_route(&bind, None, "aft", &ToolOpenGuard::default()).await.unwrap();
     plane.ensure_route(&bind, None, "other", &ToolOpenGuard::default()).await.unwrap();
@@ -34,7 +34,7 @@ async fn direct_carrier_routes_apply_proof_to_warm_dispatch_and_reopen() {
 async fn direct_carrier_never_falls_back_without_scope_and_proof_capabilities() {
     for capabilities in [vec![], vec![CAP_SCOPES_V1.into()]] {
         let (conn, plane) = direct_plane(capabilities);
-        let bind = BindIdentity::new("/local/wal-root", "broca", "carrier");
+        let bind = BindIdentity::new("/local/project-root", "broca", "carrier");
         let result = plane.warm_bind(&bind, Duration::from_secs(1)).await;
         assert!(matches!(result, Err(ToolPlaneError::ScopeRefused { code, .. }) if code == SCOPE_UNSUPPORTED));
         assert!(conn.opened_scopes().is_empty());
@@ -48,7 +48,7 @@ async fn direct_carrier_refusal_keeps_the_code_without_echoing_private_proof() {
     conn.script_route_open_sequence("aft", vec![RouteOpenScript::rejected_body(
         &subc_protocol::ErrorBody::new(subc_protocol::error_codes::SCOPE_BIND_PROOF_MISMATCH, &proof),
     )]);
-    let bind = BindIdentity::new("/local/wal-root", "broca", "carrier");
+    let bind = BindIdentity::new("/local/project-root", "broca", "carrier");
     let error = plane.warm_bind(&bind, Duration::from_secs(1)).await.unwrap_err();
     assert!(matches!(&error, ToolPlaneError::ScopeRefused { code, .. } if code == subc_protocol::error_codes::SCOPE_BIND_PROOF_MISMATCH));
     assert!(!error.to_string().contains(&proof));
@@ -58,7 +58,7 @@ async fn direct_carrier_refusal_keeps_the_code_without_echoing_private_proof() {
 async fn direct_carrier_mode_leaves_ordinary_unscoped_opens_unchanged() {
     let (conn, mut plane) = direct_plane(vec![]);
     plane.direct_carrier_scope = None;
-    let bind = BindIdentity::new("/local/wal-root", "broca", "ordinary");
+    let bind = BindIdentity::new("/local/project-root", "broca", "ordinary");
     plane.warm_bind(&bind, Duration::from_secs(1)).await.unwrap();
     assert_eq!(conn.opened_scopes(), vec![("ordinary".into(), None)]);
 }

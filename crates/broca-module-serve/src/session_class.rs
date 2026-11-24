@@ -1,4 +1,4 @@
-//! Boot configuration for backup placement. Existing WAL locations remain authoritative.
+//! Boot configuration for backup placement. Existing session-store locations remain authoritative.
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct BackupClasses(pub Vec<String>);

@@ -25,7 +25,8 @@ pub use fork::{ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, Fo
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunKind {
     /// A fresh run, or resume the last (unfinished) episode of an existing lineage — the
-    /// executor distinguishes these from the WAL (empty ⇒ fresh, non-empty ⇒ resume).
+    /// executor distinguishes these from
+    /// the session's log (empty ⇒ fresh, non-empty ⇒ resume).
     FreshOrResume,
     /// Append a NEW episode (turn) to an IDLE lineage (the prior conversation is the
     /// prefix). Only valid over a finished lineage.
@@ -398,7 +399,7 @@ async fn prepare_warm_base(
             let digest = broca_core::render::request_digest_hex(&rendered);
             if digest != recorded.request_body_sha256 {
                 return Err(WarmError::PrefixUnavailable(format!(
-                    "the request rebuilt from the WAL renders to {digest}, not the {} its step \
+                    "the request rebuilt from the session's log renders to {digest}, not the {} its step \
                      sent",
                     recorded.request_body_sha256
                 )));
@@ -424,7 +425,7 @@ fn warm_failure(failure: broca_core::WarmFailure) -> WarmError {
 pub enum WarmBase {
     /// The exact bytes the running run's transport sent for its most recent request.
     InFlight(broca_core::SentRequest),
-    /// The most recent request the WAL records, to be rendered again and checked against the
+    /// The most recent request the log records, to be rendered again and checked against the
     /// digest its step recorded.
     Recorded(Box<broca_core::RecordedRequest>),
     /// A recorded store request whose media bytes and rendering state must be ready first.

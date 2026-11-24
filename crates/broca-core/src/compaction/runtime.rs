@@ -1,12 +1,12 @@
-//! The run loop's calls into the session's compaction provider, and the WAL records that make
-//! them durable.
+//! The run loop's calls into the session's compaction provider, and the session's log
+//! records that make them durable.
 //!
 //! Setup is a call the run waits on before its first model call. After it, the provider
 //! announces each view it publishes with a `view_ready` event ([`CompactionViews`]). The run
 //! fetches the view with `view.get` only at a step boundary and applies it there
 //! ([`Runtime::views_at_boundary`], [`Runtime::apply_view`]). When the request's prefix is
 //! being rewritten anyway, the run also asks the provider for a view itself, with a short
-//! `compaction.ride`. Advance notices are recorded here and published from the durable WAL by
+//! `compaction.ride`. Advance notices are recorded here and published from the durable log by
 //! the bus publisher ([`Runtime::record_notice`]).
 
 use super::*;

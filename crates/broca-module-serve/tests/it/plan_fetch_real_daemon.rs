@@ -361,7 +361,7 @@ async fn a_plan_is_fetched_through_the_real_daemon_on_v1_routes() {
         json!({"provider": "no-such-module", "reason": "unknown_module"})
     );
 
-    // The real daemon fetcher is installed on the session registry, so admission, WAL
+    // The real daemon fetcher is installed on the session registry, so admission, log
     // freezing, model rendering and restart all exercise the same manifest.
     use crate::delivery_rig::{golden_path, result, Rig, Step};
     let mut rig = Rig::start("optional-tool-real-daemon").await;

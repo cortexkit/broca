@@ -1,9 +1,9 @@
-//! The control-stream projection: durable WAL records → the ordered control units a
+//! The control-stream projection: durable log records → the ordered control units a
 //! subscriber sees, each addressed by a durable cursor.
 //!
 //! This is a DIFFERENT output than [`crate::replay`]: replay produces the RESUME state
 //! (one prompt + a resolution for the loop); projection produces the STREAM (an ordered
-//! list of control units for subscribers). They read the same WAL but answer different
+//! list of control units for subscribers). They read the same session's log but answer different
 //! questions, so they're separate modules — and the two POSITIONS they use are kept
 //! apart by type (see [`Cursor`] vs the store's materialization watermark).
 //!
@@ -31,10 +31,10 @@ use broca_protocol::{
     FinishReason, RunId, ToolCallId,
 };
 
-/// A durable position in the control stream: the WAL seq of the source record plus the
+/// A durable position in the control stream: the log seq of the source record plus the
 /// 0-based index of this unit WITHIN that record's expansion (one record can project to
 /// several ordered units). Lineage-global and monotonic over fsynced seqs; it never
-/// resets at an episode boundary (WAL seq is monotonic across the whole lineage file).
+/// resets at an episode boundary (log seq is monotonic across the whole lineage file).
 ///
 /// This is NOT the materialization watermark (which is a turn-boundary-anchored seq the
 /// store uses for resume). Distinct type on purpose, so a code path can't pass one where

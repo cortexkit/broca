@@ -152,7 +152,7 @@ pub struct HeadResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<crate::HeadCacheWire>,
     /// The newest title any send to the session recorded (on a run start, a queued send or a
-    /// steer, whichever the WAL holds last). Absent, never empty, when no send carried one.
+    /// steer, whichever the log holds last). Absent, never empty, when no send carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// What a send that names no model can carry (llm-runner 0.5.1 §4.3). With media disabled,
@@ -337,7 +337,7 @@ impl std::ops::Deref for RoleDescribeResponse {
     }
 }
 
-/// Discovery for a build that can read compaction WAL records but cannot yet write them.
+/// Discovery for a build that can read compaction log records but cannot yet write them.
 /// The serving adapter must opt in after installing the provider adapter and ready/model ops.
 pub fn broca_role_describe(implementation_version: &str) -> RoleDescribeResponse {
     broca_role_describe_with_writers(implementation_version, false, false, false)

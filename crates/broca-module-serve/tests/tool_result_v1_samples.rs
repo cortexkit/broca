@@ -1,5 +1,5 @@
-//! Reader samples through the production serve/core/WAL path with pinned replies shaped like
-//! the AFT tool provider's encoder.
+//! Reader samples through the production serve/core path and the session's log with pinned
+//! replies shaped like the AFT tool provider's encoder.
 //! The daemon test separately covers route negotiation and the external tool transport.
 
 mod delivery_rig;

@@ -15,7 +15,7 @@ use crate::executor::RunKind;
 
 pub(crate) mod pre_user;
 
-/// Deadline for the Interrupted seal write (WAL barriers, replay and index update), measured
+/// Deadline for the Interrupted seal write (log barriers, replay and index update), measured
 /// from entry to shutdown sealing. Attempt handover and the aborted run's join spend this
 /// time too, but the join itself is not timed out. Child teardown and the writer join retain
 /// the session actor's registry slot and session lease until complete; only the registry's total
@@ -23,7 +23,7 @@ pub(crate) mod pre_user;
 pub(crate) const SHUTDOWN_SEAL_BOUND: Duration = Duration::from_secs(5);
 
 /// How a send's run id was chosen. That decides whether a retry can repeat the run id, and what
-/// the WAL records as the send's key.
+/// the log records as the send's key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendKey {
     /// The server minted a unique run id. The send can never repeat, so it pays for no identity
@@ -33,7 +33,7 @@ pub enum SendKey {
     /// there is no caller `send_id` to record.
     RunId,
     /// The run id was derived from the caller's `send_id`. A retry with the same key is
-    /// deduplicated, and the key is written on the WAL record that carries the message.
+    /// deduplicated, and the key is written on the log record that carries the message.
     SendId(String),
 }
 
@@ -209,7 +209,7 @@ pub enum LineageCmd {
         reply: oneshot::Sender<crate::memory_report::MemoryAnswer>,
     },
     /// Resolve a SPECIFIC run_id's lifecycle state: live actor → durable index terminal →
-    /// WAL reconciliation when the index still says Active or has no row. `None` means the
+    /// log reconciliation when the index still says Active or has no row. `None` means the
     /// run_id is unknown to this session.
     RunState {
         run_id: RunId,
@@ -313,12 +313,12 @@ pub enum SendOutcome {
     Active {
         run_id: RunId,
         /// On a retried steer only: its delivery receipt, naming the run whose model step first
-        /// rendered the steered message, once the WAL shows one has (see `steer_delivery`).
+        /// rendered the steered message, once the log shows one has (see `steer_delivery`).
         /// `None` on every other send.
         delivered: Option<Delivered>,
     },
     /// A retry with the same send identity and payload names a run whose finish reason
-    /// is already recorded in the durable run index or WAL.
+    /// is already recorded in the durable run index or the log.
     Finished {
         run_id: RunId,
         reason: broca_protocol::RunFinishReason,
@@ -426,7 +426,7 @@ pub enum SubscribeOutcome {
     Attached,
     /// The actor is closing — re-route through the registry (re-open).
     Reopen,
-    /// Attaching failed (a WAL barrier error while taking the durable head seq).
+    /// Attaching failed (a log barrier error while taking the durable head seq).
     Error(String),
 }
 
@@ -439,7 +439,7 @@ pub enum WarmOutcome {
     SessionMoved {
         holder: Option<String>,
     },
-    /// The provider answered the warm; its record is in the WAL.
+    /// The provider answered the warm; its record is in the log.
     Warmed(broca_wire::WarmReply),
     /// Refused with a typed body. Every refusal but `warm_failed` sent nothing.
     Refused(broca_wire::WarmRefusal),
@@ -447,7 +447,7 @@ pub enum WarmOutcome {
     Reopen,
     /// Nothing was sent: a dependency failed and a retry may succeed.
     Transient(String),
-    /// Nothing was sent: the session's WAL could not be read or written.
+    /// Nothing was sent: the session's log could not be read or written.
     Error(String),
 }
 

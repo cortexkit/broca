@@ -505,7 +505,7 @@ async fn crash_mid_dispatch(dir: std::path::PathBuf, cipher: Cipher) {
 }
 
 /// A call a crash cut off after dispatch lists as indeterminate. A store read recovers the
-/// session before answering, matching the WAL-backed actor after recovery, and subsequent reads
+/// session before answering, matching the log-backed actor after recovery, and subsequent reads
 /// keep the recorded unknown-outcome result unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_a_crash_cut_off_lists_as_indeterminate_alike() {

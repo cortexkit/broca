@@ -5,8 +5,8 @@
 //! batch serves the stored outcomes and asks the provider only for items still needing one.
 //! This file is the authority for those batches: nothing else can rebuild it. That is why it
 //! is its own SQLite file (`system-one.db`) rather than tables in `run-index.db`, which is a
-//! projection of the session WAL that broca may delete and rebuild at any time. Nothing here
-//! reads or writes a session, a lease or a WAL.
+//! projection of the session's log that broca may delete and rebuild at any time. Nothing here
+//! reads or writes a session, a lease or the session's log.
 //!
 //! Two tables:
 //!

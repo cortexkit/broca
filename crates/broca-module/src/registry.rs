@@ -80,7 +80,7 @@ pub struct SessionReadTools {
     pub tools: Arc<Vec<broca_protocol::request::Tool>>,
 }
 
-/// The session identity a lineage is keyed by — the same triple the lease + WAL + store
+/// The session identity a lineage is keyed by — the same triple the lease + log + store
 /// partition use, so one identity covers the whole session.
 pub type LineageKey = BindIdentity;
 
@@ -102,7 +102,7 @@ pub enum OpenError {
     SessionClassInvalid(String),
     /// The session's lease is held by another live writer (another process/host).
     LeaseHeld(String),
-    /// The lease store / WAL / replay failed while opening.
+    /// The lease store / log / replay failed while opening.
     Open(String),
     /// broca is stopping, so it opens no session. Nothing was written for the request.
     ModuleStopping,
@@ -236,16 +236,16 @@ impl Drop for OpenGuard {
 /// One registry slot for a session.
 enum Entry {
     /// An open is in flight; waiters await `ready` (a `Result`, so an open FAILURE wakes
-    /// them with the error instead of hanging — finding 10).
+    /// them with the error instead of hanging).
     Opening {
         gen: u64,
         ready: broadcast::Sender<Result<ActorHandle, OpenError>>,
     },
     /// An actor is live. `gen` is its identity (a finalizer/close only acts on its OWN
-    /// generation, so it can't clobber a newer actor — finding 11).
+    /// generation, so it can't clobber a newer actor).
     Open { gen: u64, handle: ActorHandle },
     /// The actor is tearing down; ops await `done` then re-open (the close holds the slot
-    /// so a new op can't race a half-torn state — finding 6/8).
+    /// so a new op can't race a half-torn state).
     Closing {
         gen: u64,
         done: broadcast::Sender<()>,
@@ -254,7 +254,7 @@ enum Entry {
 }
 
 /// Constructs + spawns the actor for a session (acquire lease → replay → spawn the actor
-/// task → return its handle). The registry stays agnostic to the lease/WAL/executor by
+/// task → return its handle). The registry stays agnostic to the lease/log/executor by
 /// depending on this seam — the race harness supplies a fake opener (fake lease + fake
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
@@ -337,13 +337,15 @@ pub trait LineageOpener: Send + Sync {
         Ok(self.store_holding(key)?.is_some())
     }
     /// Read-only admission capability. Hookless test openers inherit the fail-closed default;
-    /// an opener with a hook executor must report it without acquiring a lease or opening a WAL.
+    /// an opener with a hook executor must report it without acquiring a lease or
+    /// opening a session's log.
     fn hook_plane_available(&self) -> bool {
         false
     }
 
     /// Whether this opener's executor has a compaction plane. Defaults to false, the same
-    /// fail-closed reading as the hook plane, without acquiring a lease or opening a WAL.
+    /// fail-closed reading as the hook plane, without acquiring a lease or
+    /// opening a session's log.
     fn compaction_supported(&self) -> bool {
         false
     }
@@ -720,8 +722,8 @@ impl LineageRegistry {
         .await
     }
 
-    /// Prevent opening absent actors and pause existing actors, in contract ref
-    /// order. The returned guard remains held through the durable cut completion.
+    /// Prevent opening absent actors and pause existing actors, in session-ref order, so two
+    /// moves sharing sessions lock them in the same order. The returned guard remains held through the durable cut completion.
     /// This is the inspection mode: no actor closes and the guard takes no tenure.
     pub async fn lock_move_sessions(
         &self,
@@ -733,7 +735,8 @@ impl LineageRegistry {
     }
 
     /// Send a submission with its optional retention. Reject invalid bounds before creating
-    /// a WAL; then check the lineage's current policy under its lease to exclude racing sends.
+    /// a session's log; then check the lineage's current policy under its lease to exclude
+    /// racing sends.
     #[allow(clippy::too_many_arguments)]
     pub async fn route_submission_with_retention(
         &self,
@@ -769,7 +772,7 @@ impl LineageRegistry {
     }
 
     /// Route a send with its non-durable materialization policy. Command retries preserve the
-    /// policy; recovery from WAL alone safely defaults to materialization.
+    /// policy; recovery from the log alone safely defaults to materialization.
     pub async fn route_submission_with_materialization(
         &self,
         key: &LineageKey,
@@ -1442,7 +1445,7 @@ impl LineageRegistry {
     }
 
     /// Cancel/retract ownership from a live reader, a checkpoint plus its durable suffix, or
-    /// the complete WAL when no checkpoint is usable. Never open an actor to obtain it.
+    /// the complete log when no checkpoint is usable. Never open an actor to obtain it.
     pub(crate) async fn owner_ownership(
         &self,
         key: &LineageKey,
@@ -1633,8 +1636,8 @@ impl LineageRegistry {
     }
 
     /// The ownership a `route.bind` is checked against. The validated reader answers first,
-    /// from the live session, a cached or stored checkpoint plus its WAL suffix, or the whole
-    /// WAL. When that reader cannot prove it covered the whole history, the whole log is
+    /// from the live session, a cached or stored checkpoint plus its log suffix, or the whole
+    /// log. When that reader cannot prove it covered the whole history, the whole log is
     /// decoded instead, as stores without range proofs serve it. A validated-read error, or a
     /// failed whole-log fallback, is [`BindOwnership::Unreadable`]; a validated-read error is
     /// never retried against any other source.
@@ -1658,9 +1661,8 @@ impl LineageRegistry {
         ) {
             return BindOwnership::Known(broca_core::SessionOwnershipV1::default());
         }
-        // A session kept in the session store has no WAL to read. Its ownership comes from the
-        // owner summary the stored session keeps (`Operations::owner`), which records the same
-        // facts `durable_session_ownership` gathers from a WAL.
+        // A stored session's ownership comes from the owner summary it keeps
+        // (`Operations::owner`), so nothing is replayed to find it.
         match self.store_holding(key) {
             Ok(Some(store)) => store_bind_ownership(self, &store, key).await,
             // A session no send created has no run, so no owner yet.
@@ -1692,7 +1694,7 @@ async fn store_bind_ownership(
 /// The ownership of a session kept in the session store, as every authorization path reads it:
 /// the owner summary the stored session keeps (`Operations::owner`), with the first run's tools
 /// and plan read back from the deployment's setup parts. It records the same facts
-/// `durable_session_ownership` gathers from a WAL. A session whose creation never committed
+/// `durable_session_ownership` gathers from a log. A session whose creation never committed
 /// holds no run, so it has no owner yet.
 async fn store_session_ownership(
     registry: &LineageRegistry,
@@ -2463,7 +2465,7 @@ impl LineageRegistry {
         }
     }
 
-    /// The session's first episode, as its open actor knows it, with no read of the WAL or the
+    /// The session's first episode, as its open actor knows it, with no read of the log or the
     /// store. `None` when no actor holds the session or it has not learned the episode yet.
     pub fn first_episode(&self, key: &LineageKey) -> Option<broca_core::FirstEpisodeV1> {
         match self.inner.slots.lock().unwrap().get(key) {
@@ -2483,7 +2485,7 @@ impl LineageRegistry {
     }
 
     /// Expiring logs blocked from deletion because they are unreadable and the indexed
-    /// deadline cannot be proved to include every WAL record.
+    /// deadline cannot be proved to include every log record.
     pub fn retention_unreadable_sessions(&self) -> usize {
         self.inner
             .retention
@@ -2563,11 +2565,11 @@ impl LineageRegistry {
 
     /// Stop admission, allow short runs to finish, then seal and close all remaining actors.
     /// The shared 20-second budget reserves ten seconds below the supervisor's SIGKILL ceiling
-    /// for scheduling and process exit. Actors seal concurrently; large WAL reads never extend it.
+    /// for scheduling and process exit. Actors seal concurrently; large log reads never extend it.
     /// The actors' five-second deadline covers the Interrupted write, not child/writer joins.
     /// A blocked join retains its slot and lease until complete; this method still returns at
     /// the total deadline, leaving process exit to end the writer without releasing its lease early.
-    /// False means actors present during this stop could not finish: leave their WAL to crash
+    /// False means actors present during this stop could not finish: leave their logs to crash
     /// recovery, not cancellation. Earlier failures do not taint this result; unresolved recovery
     /// debt and lifetime failure events remain visible in [`Self::shutdown_report`].
     ///

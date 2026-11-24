@@ -1,7 +1,7 @@
 //! Two real supervised broca processes, a daemon-attested fake Entorhinal driver,
-//! and a fake session door. A cutId fixes the WAL's byte length and SHA-256;
+//! and a fake session door. A cutId fixes the session log's byte length and SHA-256;
 //! reads stop at that length, and broca installs only verified bytes. A returning
-//! Mac's old bytes must equal the beginning of the incoming WAL. Wire source:
+//! Mac's old bytes must equal the beginning of the incoming session log. Wire source:
 //! engram AGENT_SYNC.md (around line 279), commit 50d65fc. This tests broca
 //! against that contract, not live Engram interop.
 use super::*;

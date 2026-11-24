@@ -1,7 +1,7 @@
 //! Native path parity without mutating the test process's environment.
 
 use broca_module_serve::config_home::{config_file_with, config_home_with, ConfigHome};
-use broca_module_serve::state_root::{resolve_state_root_with, StateRootError, StateRootOrigin};
+use broca_module_serve::state_root::{resolve_state_root_with, StateRootError};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -32,19 +32,7 @@ fn state_root_matches_shared_path_golden() {
         let result = resolve_state_root_with(env);
         if let Some(path) = case["state"].as_str() {
             let resolved = result.unwrap_or_else(|error| panic!("{name}: {error}"));
-            assert_eq!(resolved.path, PathBuf::from(path), "{name}");
-            let explicit = case["env"]["BROCA_STATE_ROOT"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty());
-            assert_eq!(
-                resolved.origin,
-                if explicit {
-                    StateRootOrigin::Explicit
-                } else {
-                    StateRootOrigin::DataHome
-                },
-                "{name}"
-            );
+            assert_eq!(resolved, PathBuf::from(path), "{name}");
         } else {
             let error = result.expect_err(name);
             match (case["state_error"].as_str().unwrap(), error) {

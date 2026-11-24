@@ -134,7 +134,8 @@ printf 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\\nck-broca %s user tx
             "PLACE_RELEASE_WAIT_SECONDS": str(wait_seconds),
             "PLACE_RELEASE_POLL_SECONDS": "0.05",
             "PLACE_RELEASE_TEST_BUSY": "1" if busy else "",
-            # A private state root, so the host's real WAL feature floor cannot decide these arms.
+            # A private state root, so the host's real
+            # session-log feature floor cannot decide these arms.
             "BROCA_STATE_ROOT": str(self.tmp / "state"),
         }
         return subprocess.run(

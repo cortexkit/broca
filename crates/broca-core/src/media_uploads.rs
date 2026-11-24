@@ -1,4 +1,4 @@
-//! Session-owned staging. Uploads never publish objects or write a session WAL.
+//! Session-owned staging. Uploads never publish objects or write the session's log.
 
 use broca_protocol::BindIdentity;
 use cortexkit_role_llm_runner::attachments as wire;

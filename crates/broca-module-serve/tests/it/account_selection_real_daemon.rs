@@ -1446,7 +1446,7 @@ impl Rig {
     }
 
     /// The rig's shared failure dump for session `name`: the daemon's supervisor record of
-    /// broca, the daemon and broca log tails, and the session's WAL record kinds.
+    /// broca, the daemon and broca log tails, and the session's log record kinds.
     async fn diagnostics(&self, name: &str) -> String {
         format!(
             "{}{}",
@@ -1455,7 +1455,7 @@ impl Rig {
         )
     }
 
-    /// The log tails and WAL part of [`Self::diagnostics`], for a caller that cannot wait.
+    /// The log tails and session log part of [`Self::diagnostics`], for a caller that cannot wait.
     fn log_diagnostics(&self, name: &str) -> String {
         super::session_client::rig_diagnostics(
             &self.root.join("data-home/cortexkit"),
@@ -3150,7 +3150,7 @@ async fn caller_conversation_key_reaches_routing_and_retry_identity() {
         selection(&frames)["account_decision"]["conversation_key_source"],
         "caller"
     );
-    // Later episodes need the raw affinity in the WAL, not just its source or a digest.
+    // Later episodes need the raw affinity in the log, not just its source or a digest.
     assert_eq!(
         selection(&frames)["account_decision"]["conversation_key"],
         "consult:42:subject:phase"

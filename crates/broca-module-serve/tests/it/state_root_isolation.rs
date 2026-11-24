@@ -27,8 +27,8 @@ impl Machine {
         self.0.join("runtime").join("subc-connection.json")
     }
 
-    /// Where the old default put state: beside the connection file.
-    fn legacy_root(&self) -> PathBuf {
+    /// A `broca-state` directory beside the connection file, where broca must never put state.
+    fn connection_relative_root(&self) -> PathBuf {
         self.0.join("runtime").join("broca-state")
     }
 
@@ -65,34 +65,8 @@ impl Drop for Machine {
     }
 }
 
-/// A machine that ran on the old default keeps its WAL beside the connection file. Starting at
-/// the new default would silently begin an empty history, so the binary must refuse, naming
-/// both paths, before it connects to anything.
-#[test]
-fn boot_refuses_while_the_old_default_holds_a_wal() {
-    let machine = Machine::new("stranded");
-    std::fs::create_dir_all(machine.legacy_root().join("wal")).unwrap();
-
-    let output = machine.boot();
-    // `main` returns the error, and the runtime prints it with `Debug`, which escapes each
-    // backslash. On Windows every path separator would appear doubled, so undo that before
-    // looking for paths in the message.
-    let stderr = String::from_utf8_lossy(&output.stderr).replace("\\\\", "\\");
-    assert!(!output.status.success(), "{stderr}");
-    assert!(stderr.contains("refusing to start"), "{stderr}");
-    assert!(
-        stderr.contains(&machine.legacy_root().display().to_string())
-            && stderr.contains(&machine.new_root().display().to_string()),
-        "the refusal must name the old and the new location: {stderr}"
-    );
-    assert!(
-        !machine.new_root().join("wal").exists(),
-        "nothing may be written at the new default while the old one holds state"
-    );
-}
-
-/// A fresh machine, with state in neither place, gets past the state root: the boot then fails
-/// only because the connection file does not exist.
+/// A fresh machine gets past the state root: the boot then fails only because the connection
+/// file does not exist.
 #[test]
 fn a_fresh_machine_boots_past_the_state_root() {
     let machine = Machine::new("fresh");
@@ -111,7 +85,7 @@ fn a_fresh_machine_boots_past_the_state_root() {
 }
 
 /// With no BROCA_STATE_ROOT and no home at all, the binary refuses by name rather than putting
-/// the WAL under a path relative to wherever it was started.
+/// the session store under a path relative to wherever it was started.
 #[test]
 fn boot_without_any_home_refuses_by_name() {
     let machine = Machine::new("homeless");
@@ -139,7 +113,8 @@ fn boot_without_any_home_refuses_by_name() {
         "{stderr}"
     );
     assert!(
-        !machine.0.join("cwd").join("broca-state").exists() && !machine.legacy_root().exists(),
+        !machine.0.join("cwd").join("broca-state").exists()
+            && !machine.connection_relative_root().exists(),
         "no relative or connection-relative state root may be created"
     );
 }
@@ -164,7 +139,7 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Only the shared resolver in `state_root.rs` may read BROCA_STATE_ROOT or spell the old
 /// connection-relative `broca-state` directory. A second resolver in any binary is how the CLI
 /// and the daemon came to disagree about where state lives, and a revived `broca-state` fallback
-/// would put the WAL back among runtime files that cleanup removes.
+/// would put the session store back among runtime files that cleanup removes.
 #[test]
 fn only_the_shared_resolver_names_the_state_root() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -294,7 +269,7 @@ async fn every_broca_spawn_site_pins_its_state_root() {
             );
             assert!(!home.exists(), "{wrapper} wrote under the default home");
             assert!(
-                !machine.legacy_root().exists(),
+                !machine.connection_relative_root().exists(),
                 "{wrapper} used the connection-relative root"
             );
             assert_eq!(std::fs::read_dir(machine.0.join("cwd")).unwrap().count(), 0);

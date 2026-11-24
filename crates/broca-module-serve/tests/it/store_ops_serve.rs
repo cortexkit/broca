@@ -2,7 +2,8 @@
 //! each request goes over the wire into `serve_connection`, past its refusal of ops the new
 //! storage doesn't serve, into the registry and on to the store. The session is created in the
 //! new storage through the same registry the connection serves, by a send the store actor runs
-//! over a scripted provider; it has no WAL, so whatever a request reads, it read from the store.
+//! over a scripted provider; it has no session log, so whatever a request reads, it read from the
+//! store.
 //!
 //! The daemon side is played by the test: it sends the HELLO_ACK and binds each route.
 

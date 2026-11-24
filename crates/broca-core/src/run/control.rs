@@ -13,7 +13,7 @@ use broca_protocol::ProviderError;
 pub struct RunControl {
     /// Session-owned v2 state shared with compaction-runner pushed-view calls.
     pub compaction_session: Option<Arc<crate::compaction_v2::session::Session>>,
-    /// Receives durable entry changes without putting v2 notices in the WAL.
+    /// Receives durable entry changes without putting v2 notices in the log.
     pub compaction_changes: Option<Arc<dyn crate::compaction_v2::session::Changes>>,
     /// Wire admission supplies PLAN_VERSION only for a new log.
     /// Existing logs always take their mode from the first RunStarted.
@@ -41,7 +41,7 @@ pub struct RunControl {
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
     /// `RunFinished` and `RunPaused` timestamps. Unset uses the system clock.
     pub clock: Option<crate::Clock>,
-    /// Operator consent frozen only when a fresh episode is admitted; resumes use its WAL policy.
+    /// Operator consent frozen only when a fresh episode is admitted; resumes use its log policy.
     pub account_limit_pause: bool,
     /// Boot-loaded wait cap for new pauses. Committed pauses replay their recorded wake
     /// time without consulting configuration again.
@@ -53,7 +53,7 @@ pub struct RunControl {
     /// Per-model-call timeout (the provider watchdog). Normal expiry closes Interrupted
     /// and releases the lease after writer shutdown. On a `broca-state/2` root (a staging
     /// format startup now refuses), a reservation sync failure takes precedence and fails the
-    /// step with a WAL error instead; cancellation while awaiting permission releases the
+    /// step with a log error instead; cancellation while awaiting permission releases the
     /// known-unsent reservation.
     /// This does not bound public run completion: a kernel sync that never returns keeps
     /// exclusive writer ownership and requires supervisor-level process recovery.
@@ -61,7 +61,7 @@ pub struct RunControl {
     pub provider_call_timeout: Option<std::time::Duration>,
     /// Whether to emit ordinary payload-bearing control units (`AssistantMessage`, `ToolCall`,
     /// and `ToolResult`) on `out`. Direct loop consumers use these units, so this defaults to
-    /// `true`. Module subscribers reconstruct the same units from the durable WAL projection and
+    /// `true`. Module subscribers reconstruct the same units from the durable log projection and
     /// may disable this to avoid cloning payloads into an output channel that discards them.
     /// Lifecycle, pause, and error controls are never suppressed by this setting.
     pub emit_control_payloads: bool,
@@ -88,7 +88,7 @@ pub struct RunControl {
     pub auth_selection: Option<broca_records::record::AuthSelection>,
     /// The model's context-window limit, resolved at admission from a caller override or the
     /// catalog. A fresh run freezes it onto `RunConfig.context_limit`; a resume ignores this
-    /// and keeps the value already frozen in the WAL. `None` means neither source had one.
+    /// and keeps the value already frozen in the log. `None` means neither source had one.
     pub admitted_context_limit: Option<u64>,
     /// The catalog provider whose rows admission borrowed for a model whose provider the
     /// catalog doesn't carry (`RunConfig::served_provider`). A fresh run freezes it; a resume
@@ -114,7 +114,7 @@ pub struct RunControl {
     pub stop_requested: Option<CancellationToken>,
     /// The frozen plan manifest of a session admitted with a fetch plan. A fresh episode
     /// records it on its `RunStarted`: the first episode freezes it there, and every later one
-    /// repeats it so the episodes left after a WAL fold still carry it. A `RunStarted` carrying
+    /// repeats it so the episodes left after a log fold still carry it. A `RunStarted` carrying
     /// it is written as a gated frame that builds without `plan-manifest/v1` refuse to read.
     /// `None` for a session admitted without a plan, whose `RunStarted` any build reads.
     pub manifest: Option<Arc<broca_records::record::PlanManifest>>,
@@ -123,14 +123,14 @@ pub struct RunControl {
     pub manifest_system_override: bool,
     /// The pending plan change a fresh run applies by freezing `manifest`, with its baseline
     /// facts. The session store's run loop (`broca-session-loop`) records it in the batch of
-    /// the run's start; this crate's WAL loop ignores it, because it works the application out
-    /// again from the WAL.
+    /// the run's start; this crate's log loop ignores it, because it works the application out
+    /// again from the log.
     pub applies_refresh: Option<broca_protocol::session_change::AppliedChange>,
     /// Whether a fresh run starts at a prefix rebuild of its session, or applies a pending
     /// plan change: the points where it takes a versioned tool's same-major definition
     /// (llm-runner `tool_versions`). Not frozen: a run read back from its start has none.
     pub rebuild_point: bool,
-    /// Told the WAL position of a fresh run's `RunStarted` once it is durable, and of each
+    /// Told the log position of a fresh run's `RunStarted` once it is durable, and of each
     /// provider attempt record as it is appended, so the caller can report them to the routing
     /// module that chooses provider accounts. `None` reports nothing; either way the loop writes
     /// the same records.

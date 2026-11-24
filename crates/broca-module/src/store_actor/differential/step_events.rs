@@ -13,7 +13,7 @@ const INDEPENDENT_DURABLE_FIELDS: &[&str] = &[
     "started_at_ms",
     "finished_at_ms",
     "session_ref",
-    // Only session-store storage reports the assistant id; legacy WAL storage stays unchanged.
+    // The session store reports the assistant id; the comparison leaves it out.
     "message_id",
 ];
 

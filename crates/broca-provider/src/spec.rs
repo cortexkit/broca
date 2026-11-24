@@ -3,7 +3,7 @@
 //! are pure config over one of the ~5 wire families, with no bespoke code.
 //!
 //! These types are sourced from a catalog (e.g. models.dev) plus a local overlay,
-//! and the render-relevant subset is frozen into the run's WAL config so a resume
+//! and the render-relevant subset is frozen into the run's log config so a resume
 //! renders byte-identical bytes. They carry NO behavior — the wire family reads
 //! them. The unbounded `raw` passthrough is INGESTION-ONLY and is never read on the
 //! render/normalize path (so the frozen subset stays bounded and complete).
@@ -133,7 +133,7 @@ pub struct ProviderSpec {
     ///
     /// So the edit to be careful about is not one that reads `raw` here; it is one that
     /// WIDENS `FrozenRenderConfig` to include it. That would put unbounded upstream
-    /// fields into every WAL record and into the resume byte-identity domain, and
+    /// fields into every log record and into the resume byte-identity domain, and
     /// nothing would fail at the moment it was written.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub raw: Value,

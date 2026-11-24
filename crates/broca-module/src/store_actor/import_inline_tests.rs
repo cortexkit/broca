@@ -274,7 +274,7 @@ async fn an_inline_import_read_error_leaves_an_active_run_serving_and_completing
     assert!(
         matches!(
             outcome,
-            ImportOutcome::Error(ImportError::Wal(ref error)) if error.contains("import lookup failed once")
+            ImportOutcome::Error(ImportError::Log(ref error)) if error.contains("import lookup failed once")
         ),
         "{outcome:?}"
     );
@@ -334,7 +334,7 @@ async fn an_inline_import_read_error_retires_an_idle_actor() {
     assert!(
         matches!(
             outcome,
-            ImportOutcome::Error(ImportError::Wal(ref error)) if error.contains("import lookup failed once")
+            ImportOutcome::Error(ImportError::Log(ref error)) if error.contains("import lookup failed once")
         ),
         "{outcome:?}"
     );

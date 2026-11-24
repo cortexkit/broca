@@ -47,8 +47,8 @@ done
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 source "$ROOT/scripts/dsym.sh"
-# The WAL feature floor is printed on the card so the placing seat sees which feature names the
-# build must know; place-release enforces it.
+# The session's log feature floor is printed on the card so the placing seat sees which
+# feature names the build must know; place-release enforces it.
 source "$ROOT/scripts/feature-floor.sh"
 source "$ROOT/scripts/nonshipping-markers.sh"
 FLOOR_FILE=$(broca_floor_path)
@@ -732,16 +732,17 @@ for client in broca-session; do
     echo "   client  $client_staged"
 done
 
-# THE CURRENT-ARTIFACT MANIFEST. "Newest by mtime" is a fact about the directory; "current" is a
-# fact about the hand-off, and only the hand-off side knows it. The seam holds every previous
-# release (26 broca artifacts with verifying sidecars on 2026-09-18, all equally placeable to a
-# gate that only checks sidecars), so this file is the one statement of which one is armed.
+# THE CURRENT-ARTIFACT MANIFEST. "Newest by mtime" is a fact about the directory; "current"
+# is a fact about the hand-off, and only the hand-off side knows it. The seam holds every
+# previous release (26 broca artifacts with verifying sidecars on 2026-09-18, all equally
+# placeable to a gate that only checks sidecars), so this file is the one statement of which one
+# is armed.
 # Overwritten on every stage via rename-into-place, so it can never name two artifacts and can
 # never be older than the last hand-off. prune-staging.py reads it so pruning always keeps the
 # armed artifact. place-release.sh does NOT read it: the placement gate checks the artifact it is
-# handed (file kind, signature, dSYM, smoke run, WAL feature floor), not whether that artifact
-# is the current one, so the card must name the exact path printed below. Format is one line,
-# shasum-shaped plus a UTC stamp, so `shasum -c` on the first two fields still verifies the
+# handed (file kind, signature, dSYM, smoke run, session-log feature floor), not whether that
+# artifact is the current one, so the card must name the exact path printed below. Format is one
+# line, shasum-shaped plus a UTC stamp, so `shasum -c` on the first two fields still verifies the
 # named artifact.
 CURRENT="$SEAM/ck-broca.current"
 printf '%s  %s  %s\n' "$STAGED_SHA" "$(basename "$STAGED")" "$(date -u +%Y%m%dT%H%M%SZ)" > "$CURRENT.tmp"

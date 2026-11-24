@@ -80,7 +80,7 @@ pub struct MoveObservation {
 
 /// The service bridge resolves requested session references across live and
 /// archived sessions. Import plans derive format and identities from authenticated
-/// WAL bytes and require the door's sealed digest before publishing staging.
+/// log bytes and require the door's sealed digest before publishing staging.
 /// Divergence plans omit absent local sessions; the adapter marks them at_cut
 /// because they have no local bytes that the incoming cut could overwrite.
 #[async_trait::async_trait]
@@ -265,7 +265,7 @@ impl FileCutArtifacts {
             Some(freeze)
                 if freeze.end_offset != plan.end_offset || freeze.lineage_id != plan.lineage_id =>
             {
-                Err(unavailable("owned freeze does not match the planned WAL"))
+                Err(unavailable("owned freeze does not match the planned log"))
             }
             Some(_) => Ok(()),
             None if required => Err(unavailable("cut has no owned freeze")),

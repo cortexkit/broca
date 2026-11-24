@@ -236,7 +236,7 @@ fn tool_definition(name: &str) -> Tool {
 
 fn install_fusiform_lkg() -> Result<PathBuf, String> {
     let state_root = resolve_state_root().map_err(|error| error.to_string())?;
-    let path = state_root.path.join("catalog").join("fusiform-lkg.json");
+    let path = state_root.join("catalog").join("fusiform-lkg.json");
     let cache = Arc::new(CatalogCache::open(&path));
     cache.snapshot().map_err(|error| {
         format!(

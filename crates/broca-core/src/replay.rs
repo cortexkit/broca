@@ -1,6 +1,6 @@
-//! TURN-granular WAL replay.
+//! TURN-granular log replay.
 //!
-//! Reconstructs the PROVIDER-VALID prompt prefix from the WAL and classifies the
+//! Reconstructs the PROVIDER-VALID prompt prefix from the log and classifies the
 //! trailing state for resume. The load-bearing rule: a `model_step_finished`
 //! assistant message WITH tool calls is NOT committed to the prompt until its
 //! batch COMPLETES (every planned call has a terminal) — a bare `tool_use` with
@@ -29,7 +29,7 @@ pub use crate::tool_results::no_dispatch_result;
 
 use broca_protocol::PauseReason;
 use broca_protocol::{error::ProviderError, FinishReason, RunId, ToolCallId, Usage};
-/// WAL-derived identity of the run that produced one transcript message.
+/// Log-derived identity of the run that produced one transcript message.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunAttribution {
     pub run_id: String,
@@ -48,9 +48,9 @@ pub enum ReplayError {
     /// A new episode (`RunStarted`) opened while the PREVIOUS episode had no durable
     /// terminal (`RunFinished`). The lease + one-active-run-per-lineage invariant
     /// guarantee a new run only starts after the prior episode reaches a durable
-    /// terminal, so this is a corrupt lineage WAL — never fabricate a conversation
+    /// terminal, so this is a corrupt lineage log — never fabricate a conversation
     /// prefix from it; surface it for operator review (a real, distinct state from a
-    /// transient WAL IO error).
+    /// transient log IO error).
     CorruptLineage {
         /// The run_id of the unfinished episode that a new `RunStarted` tried to
         /// open over.
@@ -68,14 +68,14 @@ impl std::fmt::Display for ReplayError {
         match self {
             ReplayError::UnrecordedRefusalSchedule => {
                 write!(f,
-                "materialized prefix has no recorded refusal state; complete WAL replay required")
+                "materialized prefix has no recorded refusal state; complete log replay required")
             }
             ReplayError::CorruptLineage {
                 episode_run_id,
                 reason,
             } => write!(
                 f,
-                "corrupt lineage WAL at episode '{}': {reason}",
+                "corrupt session log at episode '{}': {reason}",
                 episode_run_id.0
             ),
             ReplayError::TagNumbering(overflow) => write!(f, "{overflow}"),
@@ -111,7 +111,7 @@ pub enum OpenCallState {
 pub const OVERLAPPING_BATCH_REASON: &str = "a tool batch opened over an uncommitted batch that \
      already holds dispatch intents, Prepared calls or results";
 
-/// A run state reconciled from the WAL, including terminal metadata absent from the index.
+/// A run state reconciled from the log, including terminal metadata absent from the index.
 ///
 /// Not `Eq`: `ProviderError` carries an `f64` retry hint.
 #[derive(Debug, Clone, PartialEq)]
@@ -129,15 +129,15 @@ pub struct ReconciledRunState {
     /// `run.status` report it. Read from the run's durable result record when it completed;
     /// derived as `absent` from its frozen settings when it ended any other way.
     pub structured_output: Option<broca_protocol::structured_output::StructuredOutputResult>,
-    /// Only the live actor fills this; WAL reconciliation never guesses an in-flight step.
+    /// Only the live actor fills this; log reconciliation never guesses an in-flight step.
     pub live_step: Option<broca_protocol::provider::InFlightStep>,
     /// Provider-held calls without a durable terminal, in held-record order.
     pub held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
     pub state: crate::RunIndexState,
     /// Durable steer send ids with no later StepStarted to give their input to the model,
-    /// in WAL order. Reported only after the run ends: adding the input to the transcript
+    /// in log order. Reported only after the run ends: adding the input to the transcript
     /// at RunFinished does not mean a model step received it. A present empty list means
-    /// WAL replay determined that no steers are undelivered; absence means not determined.
+    /// log replay determined that no steers are undelivered; absence means not determined.
     pub undelivered_steers: Option<Vec<String>>,
     pub final_step_finish_reason: Option<FinishReason>,
     pub indeterminate_tool_calls: Option<Vec<ToolCallId>>,

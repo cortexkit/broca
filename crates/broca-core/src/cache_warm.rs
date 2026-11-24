@@ -24,7 +24,7 @@ pub const WARM_EXPIRY_MARGIN_MS: u64 = 5_000;
 pub const EXPIRY_BASIS_ESTIMATED: &str = "estimated";
 
 /// New source-maintenance records opt into source-model billing attribution. Other trigger
-/// values, including absence, retain the historical projection for the same WAL bytes.
+/// values, including absence, retain the historical projection for the same log bytes.
 pub const SOURCE_KEEP_WARM_TRIGGER: &str = "source_keep_warm";
 
 /// The exact bytes of one rendered model request, as the transport sent them.
@@ -84,7 +84,7 @@ impl CacheClockReading {
 
 /// One session's cache clock, shared by every run of the session and by its warms. It lives in
 /// memory, so after a restart it starts empty; [`CacheClock::seed_if_unknown`] then rebuilds it
-/// from the session's WAL.
+/// from the session's log.
 #[derive(Clone, Default)]
 pub struct CacheClock(Arc<Mutex<Option<CacheClockReading>>>);
 
@@ -247,7 +247,7 @@ pub enum WarmFailure {
     Provider(Box<ProviderError>),
 }
 
-/// The most recent model request a session's WAL records, rebuilt as the run loop assembled it.
+/// The most recent model request a session's log records, rebuilt as the run loop assembled it.
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
     pub run_id: RunId,

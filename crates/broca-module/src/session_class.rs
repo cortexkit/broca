@@ -1,4 +1,4 @@
-//! A session's label and its WAL placement are fixed by its first admitted send.
+//! A session's label and its log placement are fixed by its first admitted send.
 //!
 //! A labelled session refuses a later, different label. An unlabelled session accepts a later
 //! label but ignores it: its placement was decided when it was created and cannot move. This

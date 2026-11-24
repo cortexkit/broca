@@ -426,7 +426,8 @@ impl HeldRuntime {
         self.recover_feeds(modules.into_iter().collect(), stopping.clone())
             .await;
         // Old inline registrations may belong to a provider with no held calls and no puller.
-        // Sweep a bounded page off the recovery path, rather than scanning every WAL at boot.
+        // Sweep a bounded page off the recovery path, rather than scanning every session log
+        // at boot.
         loop {
             tokio::select! {
                 biased;
@@ -470,7 +471,7 @@ impl HeldRuntime {
 }
 
 /// Open the store at `path`. A missing file, or one SQLite cannot open, is replaced by a fresh
-/// store that must be rebuilt from the WALs: the second value says so. An unreadable file is
+/// store that must be rebuilt from the session logs: the second value says so. An unreadable file is
 /// kept beside it for inspection rather than deleted.
 fn open_or_recreate(path: &Path) -> Result<(LateResultsStore, bool), String> {
     open_or_recreate_with_probe(path, |marker| marker.try_exists())
@@ -766,7 +767,7 @@ mod tests {
         assert_eq!(probes.get(), 1);
         assert!(
             !needs_rebuild,
-            "boot must not scan any WAL for an existing unheld root"
+            "boot must not scan any session log for an existing unheld root"
         );
         assert_eq!(
             std::fs::read(&path).unwrap(),

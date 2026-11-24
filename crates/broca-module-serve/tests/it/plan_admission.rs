@@ -1,4 +1,4 @@
-//! Fetch-plan admission through the real serve path and core loop over a real file WAL.
+//! Fetch-plan admission through the real serve path and core loop over a real session log.
 //!
 //! A session admitted without a plan (every session before plans existed) must keep exactly the
 //! bytes it had: its `RunStarted`, the reply to the send that admitted it, and its
@@ -298,7 +298,7 @@ async fn worker_plan_rig(tag: &str) -> (Rig, Arc<CountingAdmitter>) {
     (rig, admitter)
 }
 
-/// An unscoped route with a worker-preset plan is refused before any fetch or WAL byte, and the
+/// An unscoped route with a worker-preset plan is refused before any fetch or log byte, and the
 /// same plan is admitted once the route carries a scope.
 #[tokio::test]
 async fn a_worker_preset_plan_requires_a_scoped_route() {
@@ -315,7 +315,7 @@ async fn a_worker_preset_plan_requires_a_scoped_route() {
     );
     assert!(
         rig.records().await.is_empty(),
-        "refusal must precede the first WAL byte"
+        "refusal must precede the first log byte"
     );
     assert!(
         admitter.calls().is_empty(),
@@ -392,7 +392,7 @@ async fn invalid_reply_refuses_before_any_wal_write() {
             }
             assert!(
                 rig.records().await.is_empty(),
-                "{} wrote WAL bytes",
+                "{} wrote log bytes",
                 case["name"]
             );
         }
@@ -426,7 +426,7 @@ fn legacy_tools() -> Value {
     json!([{"name": "work", "description": "does work", "input_schema": {"type": "object"}}])
 }
 
-/// Admission must refuse the shape before writing even the first WAL frame, not leave a run
+/// Admission must refuse the shape before writing even the first log record, not leave a run
 /// whose every tool call lacks the preset required by scoped providers.
 #[tokio::test]
 async fn scoped_legacy_tools_require_a_plan_before_any_fetch_or_wal_write() {
@@ -1063,7 +1063,7 @@ async fn session_baseline_refuses_a_non_owner() {
     rig.finish().await;
 }
 
-/// A hook-bearing plan is refused before providers are fetched or the WAL is written.
+/// A hook-bearing plan is refused before providers are fetched or the log is written.
 #[tokio::test]
 async fn text_only_and_hook_only_plan_refuses_before_fetch_or_write() {
     let (mut rig, admitter) = plan_rig("plan-text-only-hook-refusal").await;
@@ -1106,8 +1106,8 @@ async fn a_second_session_with_the_same_plan_fetches_again() {
 /// Sets up how the admitter answers before one refused send.
 type Arrange = Box<dyn Fn(&CountingAdmitter)>;
 
-/// Every admission refusal writes nothing: the session's WAL is exactly as long as before. A
-/// refused first send leaves no WAL at all, and a later send with another plan (or with a
+/// Every admission refusal writes nothing: the session's log is exactly as long as before. A
+/// refused first send leaves no log at all, and a later send with another plan (or with a
 /// plan on a session admitted without one) is refused `plan_drift` naming both identities.
 #[tokio::test]
 async fn every_admission_refusal_writes_nothing() {
@@ -1216,7 +1216,7 @@ async fn every_admission_refusal_writes_nothing() {
     }
 
     // Admitted; then a later send whose plan reorders the system texts (a different plan
-    // identity) is refused `plan_drift`, and the WAL's bytes are unchanged.
+    // identity) is refused `plan_drift`, and the log's bytes are unchanged.
     rig.script.push(&[Step::Text("first")]);
     result(&send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await);
     rig.wait_for_finished(1).await;
@@ -1291,7 +1291,7 @@ async fn assert_model_refused(tag: &str, model: Value, send_model: Value) {
     assert_eq!(
         rig.records().await,
         before,
-        "refusal must preserve WAL bytes"
+        "refusal must preserve log bytes"
     );
     assert!(
         admitter.calls().is_empty(),
@@ -1457,7 +1457,7 @@ async fn plan_model_later_send_mismatch_refuses_before_fetch_or_write() {
     assert_eq!(
         rig.records().await,
         before,
-        "later refusal must preserve WAL bytes"
+        "later refusal must preserve log bytes"
     );
     assert_eq!(admitter.calls(), calls, "later refusal must fetch nothing");
     rig.finish().await;
@@ -1539,7 +1539,7 @@ async fn approve_on_unavailable_pass_refuses_before_any_fetch_or_wal_write() {
     assert_eq!(
         rig.records().await,
         before,
-        "refusal must preserve WAL bytes"
+        "refusal must preserve log bytes"
     );
     assert!(
         admitter.calls().is_empty(),
@@ -1635,7 +1635,7 @@ async fn approve_requires_scope_refuses_before_any_fetch_or_wal_write() {
         assert_eq!(frame.body, std::fs::read(path).unwrap());
         assert!(
             rig.records().await.is_empty(),
-            "refusal must precede the first WAL byte"
+            "refusal must precede the first log byte"
         );
         assert!(
             admitter.calls().is_empty(),
@@ -1685,7 +1685,7 @@ impl subc_client_rs::ModuleHandler for AdmissionTransform {
 }
 
 /// The real serve path freezes a role-routed declaration, but does not run hooks at admission.
-/// A declaration that no longer covers the plan refuses before the first WAL byte.
+/// A declaration that no longer covers the plan refuses before the first log byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn step_transforms_admit_through_the_role_route_and_freeze_the_declaration() {
     use subc_protocol::manifest::{Concurrency, ModuleManifest, ProviderRole};
@@ -1843,7 +1843,7 @@ async fn step_transforms_admit_through_the_role_route_and_freeze_the_declaration
 }
 
 /// The engine is staged but not advertised yet: admission refuses a compaction item
-/// before opening a WAL or invoking Setup. The writer release removes this guard and
+/// before opening the session's log or invoking Setup. The writer release removes this guard and
 /// parse_plan's refusal together when the complete route and model-view groups ship.
 #[tokio::test]
 async fn a_reader_without_an_installed_compaction_plane_refuses_before_writing() {
@@ -1895,7 +1895,7 @@ async fn a_reader_without_an_installed_compaction_plane_refuses_before_writing()
     );
     assert!(
         rig.records().await.is_empty(),
-        "dormant writer must produce zero WAL bytes"
+        "dormant writer must produce zero log bytes"
     );
     assert_eq!(
         plane.0.load(std::sync::atomic::Ordering::SeqCst),
@@ -2356,7 +2356,7 @@ async fn a_model_less_steer_checks_its_plan_against_the_inherited_model() {
     assert_eq!(
         rig.records().await,
         before,
-        "refusal must preserve WAL bytes"
+        "refusal must preserve log bytes"
     );
     rig.finish().await;
 }

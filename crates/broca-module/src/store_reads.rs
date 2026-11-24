@@ -85,7 +85,7 @@ pub enum StoreReadRequest {
     /// The compaction view the model step that wrote message `ordinal` (counting from 0) was
     /// rendered under, for output references (see `store_output_refs::writing_view`).
     WritingView { ordinal: u64 },
-    /// The namespace of output references: the source WAL's lineage after conversion, otherwise
+    /// The namespace of output references: the source log's lineage after conversion, otherwise
     /// the store incarnation. It is independent of the public history cursor's incarnation.
     OutputRefNamespace,
     /// What a plan-change op's preflight reads about the session, for a request naming

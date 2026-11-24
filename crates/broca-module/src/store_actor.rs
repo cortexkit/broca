@@ -94,7 +94,7 @@ pub struct StoreActor<B: SessionBackend> {
     recovery_registered: bool,
     run: Option<ActiveRun>,
     /// Non-durable one-shot hints, retained for queued sends and same-process pause resumes.
-    /// Reopening loses the hints, as it does in the WAL actor.
+    /// Reopening loses the hints, as it does in the log actor.
     one_shot_runs: std::collections::HashSet<RunId>,
     one_shot_submissions: std::collections::HashSet<broca_protocol::SubmissionId>,
     /// Set when the actor is to close as soon as nothing holds it open, instead of waiting out
@@ -4738,7 +4738,7 @@ fn refuse(command: LineageCmd) {
         }
         LineageCmd::Import { reply, .. } => {
             let _ = reply.send(crate::actor::ImportOutcome::Error(
-                broca_core::ImportError::Wal(unserved("an import")),
+                broca_core::ImportError::Log(unserved("an import")),
             ));
         }
         LineageCmd::RunState { reply, .. } => {

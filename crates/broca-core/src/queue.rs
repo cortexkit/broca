@@ -4,7 +4,7 @@
 //! prompt is durably QUEUED (`WalRecord::Queued{submission_id, message}`); it can be
 //! RETRACTED (`Retracted{submission_id}`) while still pending, or CONSUMED into a run
 //! (the coordinator writes `RunStarted{submission_id}`). This module derives the PENDING
-//! set and the retract decision PURELY from the durable WAL records — no in-memory queue,
+//! set and the retract decision PURELY from the durable log records — no in-memory queue,
 //! so the queue survives a crash and is unambiguous across one.
 //!
 //! The coordinator (a later phase) owns WHEN to drain/consume and serializes appends
@@ -23,7 +23,7 @@
 //! pending either way); a `RunStarted` consuming a retracted id is something the
 //! coordinator must not do — it checks [`retract_decision`]/`pending_submissions` under
 //! its lock before consuming — but even if it did, the set algebra removes the id once
-//! (it's not in pending). Order of `Queued`/`Retracted`/`RunStarted` in the WAL doesn't
+//! (it's not in pending). Order of `Queued`/`Retracted`/`RunStarted` in the log doesn't
 //! change the final set; the set is order-independent.
 
 use broca_protocol::{SubmissionId, SubmissionRequest};
@@ -62,7 +62,7 @@ pub struct PendingSubmission {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<broca_protocol::BindPrincipal>,
     /// The caller's `send_id`, from the `Queued` record. The drain writes it on the run it
-    /// starts, so the WAL keeps the key on the record that carries the message even when the
+    /// starts, so the log keeps the key on the record that carries the message even when the
     /// queue was rebuilt after a restart. Absent for sends without one and older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_id: Option<String>,

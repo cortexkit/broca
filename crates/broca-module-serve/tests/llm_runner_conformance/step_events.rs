@@ -127,9 +127,6 @@ fn durability(body: &Value, evidence: &[BTreeMap<String, String>]) -> Option<boo
             .and_then(|value| value.parse::<u64>().ok())
     };
     Some(match matching.get("storage").map(String::as_str) {
-        Some("wal") => number("synced_seq")
-            .zip(body["seq"].as_u64())
-            .is_some_and(|(synced, seq)| synced >= seq),
         Some("store") => number("synced_through")
             .zip(number("record_end"))
             .is_some_and(|(synced, end)| end > 0 && synced >= end),
@@ -202,25 +199,6 @@ mod tests {
     use cortexkit_role_llm_runner_conformance::ScriptedTurn;
 
     #[test]
-    fn durability_requires_matching_identity_and_an_actual_sync_bound() {
-        let body = json!({"session_ref":"ref", "log_incarnation":"lineage.writer", "attempt_id":"attempt", "seq":7});
-        let mut fields = BTreeMap::from([
-            ("session_ref".into(), "ref".into()),
-            ("log_incarnation".into(), "lineage.writer".into()),
-            ("attempt_id".into(), "attempt".into()),
-            ("step_seq".into(), "7".into()),
-            ("storage".into(), "wal".into()),
-            ("synced_seq".into(), "6".into()),
-        ]);
-        assert_eq!(durability(&body, &[fields.clone()]), Some(false));
-        fields.insert("synced_seq".into(), "8".into());
-        assert_eq!(durability(&body, &[fields.clone()]), Some(true));
-        fields.insert("attempt_id".into(), "another".into());
-        assert_eq!(durability(&body, &[fields]), None);
-        assert_eq!(durability(&body, &[]), None);
-    }
-
-    #[test]
     fn store_durability_requires_the_writer_byte_bound() {
         let body = json!({"session_ref":"ref", "log_incarnation":"incarnation", "attempt_id":"attempt", "seq":7});
         let mut fields = BTreeMap::from([
@@ -236,7 +214,12 @@ mod tests {
         fields.insert("synced_through".into(), "1200".into());
         assert_eq!(durability(&body, &[fields.clone()]), Some(true));
         fields.remove("record_end");
-        assert_eq!(durability(&body, &[fields]), Some(false));
+        assert_eq!(durability(&body, &[fields.clone()]), Some(false));
+        // Evidence for another attempt, or none at all, proves nothing about this step.
+        fields.insert("record_end".into(), "1200".into());
+        fields.insert("attempt_id".into(), "another".into());
+        assert_eq!(durability(&body, &[fields]), None);
+        assert_eq!(durability(&body, &[]), None);
     }
 
     #[cfg(feature = "test-clock")]

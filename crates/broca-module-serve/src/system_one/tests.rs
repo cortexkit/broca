@@ -1025,15 +1025,15 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
 }
 
 /// Serving batches writes only its database and owner-lifetime lock, leaving the run index
-/// and the session WAL tree byte for byte as they were.
+/// and the session-store tree byte for byte as they were.
 #[tokio::test]
-async fn the_store_never_touches_the_run_index_or_any_wal() {
+async fn the_store_never_touches_the_run_index_or_any_session_log() {
     let root = broca_test_support::scratch_root()
         .join(format!("system-one-state-root-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("wal/ab")).unwrap();
+    std::fs::create_dir_all(root.join("session-store/logs/ab")).unwrap();
     std::fs::write(root.join("run-index.db"), b"run index bytes").unwrap();
-    std::fs::write(root.join("wal/ab/session.wal"), b"wal bytes").unwrap();
+    std::fs::write(root.join("session-store/logs/ab/change"), b"log bytes").unwrap();
     use sha2::{Digest, Sha256};
     let owner_file = root.join(format!(
         "system-one.db.owner-{:x}.lock",

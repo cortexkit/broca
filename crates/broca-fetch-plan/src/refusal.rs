@@ -1,6 +1,6 @@
 //! Why a send carrying a plan is not admitted, as the refusal code and detail its reply carries.
 //! Every refusal is decided before anything is written, so a refused send leaves the session's
-//! WAL exactly as it was.
+//! log exactly as it was.
 
 use cortexkit_role_llm_runner::errors::{self, PlanDriftDetail, ToolNameCollisionDetail};
 use serde_json::{json, Value};

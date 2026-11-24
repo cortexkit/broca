@@ -215,7 +215,7 @@ impl RunExecutor for ReadyExecutor {
         };
         let result = async {
             let media = media.ok_or_else(|| {
-                StoreRunError::Admission(RunError::Wal("the run has no media fold".into()))
+                StoreRunError::Admission(RunError::Log("the run has no media fold".into()))
             })?;
             let builds = self.builds.load(Ordering::SeqCst);
             let lazy = crate::store_media::LazyRenderer::new(

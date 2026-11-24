@@ -36,7 +36,7 @@ pub struct MediaCost {
 }
 
 /// Deltas derived from durable captures and the selected compaction view. These are replay
-/// inputs, not new WAL records. Replay them in order, with a Boundary after selecting each
+/// inputs, not new log records. Replay them in order, with a Boundary after selecting each
 /// durable step's view. Reapplying an unchanged Boundary on retry is idempotent.
 #[derive(Debug, Clone, Copy)]
 pub enum AgingEvent {
@@ -160,7 +160,7 @@ impl MediaAging {
         events
     }
 
-    /// Fold the core's reference-only WAL projection. No transcript walk or byte read is
+    /// Fold the core's reference-only log projection. No transcript walk or byte read is
     /// needed on an unchanged view. Apply Boundary after the step's selected view is final.
     pub fn fold_changes(
         &mut self,

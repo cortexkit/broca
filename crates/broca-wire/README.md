@@ -42,7 +42,7 @@ page. For example:
 ```
 
 Requests without `late_after` retain existing message pagination. Sessions with
-no approval records retain their legacy response bytes. A read whose WAL tail
+no approval records retain their existing response bytes. A read whose log tail
 is incomplete explicitly reports
 `open_batch: {"state":"not_reported","reason":"incomplete_tail"}` and omits
 unavailable approval lists. An explicit late continuation requiring that
@@ -95,7 +95,7 @@ text written for the test. Regenerate it from the first captured body.
 
 A retained session becomes expired at its retention deadline for reads and status,
 including when a closed call still owes a question withdrawal. A new send at that
-address creates a fresh lineage; it never reopens the expired transcript. The WAL
+address creates a fresh lineage; it never reopens the expired transcript. The session's log
 and its side files are deleted within `delete_within_ms` (3,600,000 ms), independently
 of the question provider's availability.
 
@@ -122,15 +122,15 @@ than null when the durable record carries no value.
 
 - `agent_run_scopes_unsupported`: terminal. A reader-only build can decode an
   agent-run scope but cannot freeze or advance a session under it, including an
-  internal resume. `detail` names the scope; no WAL bytes are appended.
+  internal resume. `detail` names the scope; no log bytes are appended.
 - `scope_run_mismatch`: terminal. A send changed a frozen agent-run identifier.
-  `detail.field` is `run_id` or `agent_id`; no WAL bytes are appended.
+  `detail.field` is `run_id` or `agent_id`; no log bytes are appended.
 - `scope_owner_mismatch`: the existing identity refusal for a wrong carrier or
   an owner attempting to drive an agent-run scope. Only `reserved:basal` may
   drive these model-only sessions.
 
 `agent_run_scope_tests::agent_run_scope_refusal_bytes_are_pinned` pins the new
 reply shapes. The broca daemon module advertises `agent-run-scopes/v1` to promise
-admission of Basal's model-only run scopes, and requires that WAL feature for
+admission of Basal's model-only run scopes, and requires that storage feature for
 frozen run identities. The unsupported refusal
 remains decodable for older readers, but this writer no longer produces it.

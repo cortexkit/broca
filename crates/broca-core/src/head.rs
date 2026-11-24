@@ -1,4 +1,4 @@
-//! Small, replayable head facts, committed with the projection's exact WAL watermark.
+//! Small, replayable head facts, committed with the projection's exact log watermark.
 
 use broca_protocol::RunId;
 use cortexkit_role_llm_runner::{read::HeadModel, usage::SessionUsage};

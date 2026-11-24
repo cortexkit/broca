@@ -416,9 +416,9 @@ type FenceKey = (SessionKey, ToolCallId);
 /// The at-most-once fence: a repeated `(session, tool_call_id)` returns the prior result,
 /// EVICTED at batch terminal so it stays bounded to live batches (the at-most-once
 /// guarantee only needs to hold within a batch's life — a resume re-dispatches an
-/// un-recorded call within the same batch; the WAL is the cross-batch/cross-run durability,
-/// not this in-memory map). Extracted so the keying (collision-safety) and the eviction
-/// (bounded growth) are unit-testable without a live connection.
+/// un-recorded call within the same batch; the session's log is the cross-batch/cross-run
+/// durability, not this in-memory map). Extracted so the keying (collision-safety) and the
+/// eviction (bounded growth) are unit-testable without a live connection.
 #[derive(Default)]
 struct Fence {
     /// The deduped results, keyed by `(session, tool_call_id)`.
@@ -2110,7 +2110,7 @@ impl SubcToolPlane {
                 }
                 if let Some(key) = key {
                     // Accepted holds return above. Only inline answers can retire a watch at
-                    // the batch's durability barrier without inspecting the WAL again.
+                    // the batch's durability barrier without inspecting the log again.
                     let registered = self
                         .registered_keys
                         .lock()
@@ -3932,8 +3932,8 @@ impl SubcToolPlane {
             Ok(())
         };
         // Evict this batch's fence entries — the at-most-once guarantee only needs to hold
-        // within a batch's life (the WAL is the cross-batch durability), so without eviction
-        // the fence would grow unbounded over thousands of batches.
+        // within a batch's life (the session's log is the cross-batch durability), so without
+        // eviction the fence would grow unbounded over thousands of batches.
         self.fence.lock().unwrap().evict_batch(&ctx.batch_id);
         self.batch_manifests
             .lock()

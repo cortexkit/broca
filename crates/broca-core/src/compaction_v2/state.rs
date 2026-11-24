@@ -32,7 +32,7 @@ pub struct State {
 }
 
 /// Each method returns only after its record has crossed the durability barrier.
-/// The WAL adapter owns record encoding, including deduplication of stored edits.
+/// The log adapter owns record encoding, including deduplication of stored edits.
 ///
 /// Its methods are plain `async fn`s, so a journal whose writer's futures can't move between
 /// threads can implement it too; a caller whose future must be `Send` gets that from the

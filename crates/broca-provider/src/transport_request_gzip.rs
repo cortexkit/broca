@@ -8,7 +8,7 @@
 //!
 //! The encoding exists only on the wire. The transport compresses at send time, after the
 //! family has rendered the body, so the rendered bytes, request dumps, digests, attempt
-//! records, the WAL and resume all keep seeing the uncompressed body.
+//! records, the session's log and resume all keep seeing the uncompressed body.
 
 use std::{
     io::Write,

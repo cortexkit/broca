@@ -1,6 +1,6 @@
 //! Render-edge normalization for model-visible tool names.
 //!
-//! Canonical tool names stay unchanged in manifests, WAL records, prompts, and dispatch. A
+//! Canonical tool names stay unchanged in manifests, log records, prompts, and dispatch. A
 //! provider request may need a stricter name grammar, so this module builds a per-render map from
 //! canonical names to valid wire names and maps echoed names back before the loop sees them.
 

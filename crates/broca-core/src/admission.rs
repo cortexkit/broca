@@ -1,7 +1,8 @@
-//! Compact durable facts needed by admission before replaying a WAL tail.
+//! Compact durable facts needed by admission before replaying a log tail.
 //!
-//! The checkpoint is a projection of the WAL, never an authority independent of it. Callers
-//! accept it only at the store watermark and then fold every durable record through the WAL head.
+//! The checkpoint is a projection of the session's log, never an authority independent of it.
+//! Callers accept it only at the store watermark and then fold every durable record through the
+//! log head.
 
 use std::sync::Arc;
 
@@ -42,7 +43,7 @@ pub fn submission_difference(
         staged_uploads: _,
         content: existing_content,
         directives: existing_directives,
-        project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
+        project_id: _, // Record the bind in the log, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
         on_restart: existing_on_restart,
@@ -76,7 +77,7 @@ pub fn submission_difference(
         staged_uploads: _,
         content: requested_content,
         directives: requested_directives,
-        project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
+        project_id: _, // Record the bind in the log, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
         on_restart: requested_on_restart,
@@ -230,8 +231,8 @@ struct SubmissionIdentityDigestV1 {
     /// compared against it here, and a display row (once broca serves `history_display`) will
     /// read it back from here. Absent when the send carried
     /// none, so every digest stored before the member existed, and every send without one, is
-    /// unchanged. A record holding a digest with it requires the WAL feature
-    /// `client-message-id/v1` (`WalRecord::required_features`).
+    /// unchanged. A record holding a digest with it requires the storage feature
+    /// `client-message-id/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -291,7 +292,7 @@ fn identity_digest_v1(
         staged_uploads: _,
         content,
         directives,
-        project_id: _, // Record the bind in the WAL, but Some/None must not change send-id identity.
+        project_id: _, // Record the bind in the log, but Some/None must not change send-id identity.
         principal: _,  // Same send from two principals is one send; the principal is only recorded.
         scope: _, // The route's scope stamp: checked against the session's owner, never part of send identity.
         on_restart,
@@ -484,7 +485,7 @@ pub use crate::budget_kernel::{BudgetReplayStateV1, BUDGET_REPLAY_STATE_VERSION}
 /// only its scope's owner, an unscoped one may adopt a scope only when every earlier episode
 /// recorded that owner as its principal, and an unscoped one otherwise accepts only the
 /// principal of its first send. Those rules read the WHOLE history, and the materialized fast
-/// path at admission reads only a WAL tail, so the history is summarised here rather than
+/// path at admission reads only a log tail, so the history is summarised here rather than
 /// re-read on every send.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOwnershipV1 {
@@ -520,23 +521,23 @@ pub struct SessionOwnershipV1 {
     /// Older summaries also omit it because their episodes shared the first manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_manifest: Option<Arc<broca_records::record::PlanManifest>>,
-    /// Whether the WAL contains session-change facts. False is omitted so unrefreshed logs
+    /// Whether the log contains session-change facts. False is omitted so unrefreshed logs
     /// retain their old checkpoint bytes and admission need not probe for change records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_change_recorded: bool,
     /// Versioned sender-policy fold, present only for histories with session-change records.
-    /// Missing on an older refreshed checkpoint means the complete WAL must be folded again.
+    /// Missing on an older refreshed checkpoint means the complete log must be folded again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_admission: Option<SenderAdmissionV1>,
     /// Whether this summary was folded by a build that records the first episode's frozen
     /// plan manifest (`FirstEpisodeV1::manifest`). A summary stored by an older build, or
     /// re-stored by one after a rollback, lacks it and may have dropped a manifest, so it is
-    /// treated like a summary that does not exist: admission folds the session's whole WAL
+    /// treated like a summary that does not exist: admission folds the session's whole log
     /// instead of building on it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan_manifest_folded: bool,
     /// The scope (owner and `ref`) whose `route.bind` first reserved the session's storage
-    /// address, read from the session inventory, never from the WAL. Admission fills it in only
+    /// address, read from the session inventory, never from the log. Admission fills it in only
     /// while the session has no episode, and only then does it apply: until a first send is
     /// admitted the history names no owner, so without it any route naming the same harness and
     /// session could become the session's first principal and lock the reserving owner out.

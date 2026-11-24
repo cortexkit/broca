@@ -889,7 +889,7 @@ async fn report_routed_terminal_error(
 
 /// The reportable wire-auth status of a terminal error: an Auth-class `401` or `403` only.
 /// A Permanent 403 is an authorization denial, not a dead credential, and must not be
-/// reported to the vault. Pure, so the class and status filter is unit-tested without WAL
+/// reported to the vault. Pure, so the class and status filter is unit-tested without log
 /// plumbing.
 fn wire_auth_status(err: &ProviderError) -> Option<u16> {
     if err.class != ErrorClass::Auth {
@@ -2201,7 +2201,7 @@ pub struct LiveLoopExecutor {
     /// resumed to decide (or refuse) the value it runs under.
     context_management: broca_module_serve::context_management::ContextManagementConfig,
     /// Prompt-cache defaults loaded once at boot. Resolution is pure and runs only when a
-    /// fresh episode is admitted; resumes reuse the policy already frozen in the WAL.
+    /// fresh episode is admitted; resumes reuse the policy already frozen in the log.
     cache_table: CacheTtlTable,
     /// The routing module broca asks which provider account a new run uses, and reports
     /// each run's account evidence to. `None` without the vault credential source.
@@ -2410,7 +2410,7 @@ impl LiveLoopExecutor {
         // saved in that episode's RunConfig. This session's persisted checkpoint contains
         // its latest episode's conversation key. A new episode inherits that key, or uses
         // the legacy session-derived fallback if the latest episode predates key recording,
-        // without scanning older WAL history. If this job executes a previously queued
+        // without scanning older log history. If this job executes a previously queued
         // send, its saved key arrives in job.conversation_key and takes precedence.
         let inherited_key = history
             .last_config
@@ -2894,7 +2894,7 @@ impl LiveLoopExecutor {
             Ok(r) => r,
             Err(e) => {
                 // Pre-loop resolution failure → fire the admission ack with the error and
-                // return WITHOUT touching the WAL (no RunStarted, no ghost run).
+                // return WITHOUT touching the log (no RunStarted, no ghost run).
                 return Err(e.into());
             }
         };
@@ -2985,7 +2985,7 @@ impl LiveLoopExecutor {
         control.account_limit_pause = self.max_same_account_wait.enabled();
         control.hook_plane = self.hook_plane();
         // Module subscribers source ordinary AssistantMessage/ToolCall/ToolResult units from
-        // the durable WAL projector. The actor's live-output task discards those same units,
+        // the durable log projector. The actor's live-output task discards those same units,
         // so suppress their payload clones while retaining display, lifecycle, pause, and
         // error controls needed by the actor and direct loop consumers.
         control.emit_control_payloads = false;
@@ -3036,7 +3036,7 @@ impl LiveLoopExecutor {
             .clone()
             .map(|reporter| reporter as Arc<dyn broca_core::AccountReporter>);
         // Freeze the context limit onto a fresh run's RunStarted. A fresh run prefers the
-        // caller override over the catalog; a resume uses only the WAL value.
+        // caller override over the catalog; a resume uses only the log value.
         control.admitted_context_limit = frozen_context_limit;
         control.served_provider = served_provider;
         (control, account_reporter)
@@ -3327,7 +3327,7 @@ impl LiveLoopExecutor {
             // model call waits for it first, and a request whose media can't be rendered is
             // refused by name before anything is sent.
             let media = media.ok_or_else(|| {
-                StoreRunError::Admission(RunError::Wal(
+                StoreRunError::Admission(RunError::Log(
                     "store_media_unavailable: the run was started without its media index".into(),
                 ))
             })?;
@@ -3716,7 +3716,7 @@ impl LiveLoopExecutor {
     /// re-resolved from config (config/router could have drifted → a different method → a
     /// different family → a cache bust). `None` ⇒ a fresh run, which resolves a caller pin
     /// before config and freezes the result. `fresh_episode` distinguishes a fresh run from a
-    /// resume of an old WAL that has no selection; the latter must not be retro-stamped.
+    /// resume of an old log that has no selection; the latter must not be retro-stamped.
     // Tests drive auth resolution without a routing decision through this form.
     #[cfg(test)]
     async fn decide_auth(
@@ -3942,7 +3942,7 @@ impl LiveLoopExecutor {
         let expires_at_ms = outcome.as_ref().ok().and_then(|t| t.expires_at_ms);
         // Freeze the resolved id on a fresh run (the loop writes it only on a fresh
         // RunStarted). A resume with a frozen selection reuses it; an older resume without
-        // one keeps None rather than retro-stamping its WAL.
+        // one keeps None rather than retro-stamping its log.
         let selection = (fresh_episode || frozen_credential_id.is_some()).then(|| {
             broca_core::AuthSelection {
                 billing_vault_facts: None,
@@ -4593,8 +4593,8 @@ impl RunExecutor for LiveLoopExecutor {
     }
 
     /// Runs a session kept in the session store: the same admission decisions as
-    /// `execute`, read from the session's folds instead of the WAL, then the new run loop
-    /// (`broca_session_loop`) writing through the store actor.
+    /// `execute`, read from the session's folds instead of the session's log, then the new run
+    /// loop (`broca_session_loop`) writing through the store actor.
     async fn execute_on_store(
         &self,
         job: broca_module::executor::StoreRunJob,

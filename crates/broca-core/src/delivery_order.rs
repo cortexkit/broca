@@ -227,13 +227,15 @@ pub fn system_messages(send: &OrderedSend) -> Vec<Message> {
     input
 }
 
-/// What became of the queued send whose submission is `sub-<run_id>`, read from the WAL alone.
+/// What became of the queued send whose submission is `sub-<run_id>`, read from the
+/// session's log alone.
 ///
 /// A queued send's reply names only its submission id, and the run it would start takes the
-/// run id that submission id was minted from. Callers poll `run.status` on that run id, so the
-/// id must keep answering after the send went somewhere other than its own run: delivered into
-/// a run that was already going, replaced, expired or withdrawn. Every answer here comes from
-/// durable records, so it is the same before and after the session's actor restarts.
+/// run id that submission id was minted from. Callers poll `run.status` on that run id, so
+/// the id must keep answering after the send went somewhere other than its own run: delivered
+/// into a run that was already going, replaced, expired or withdrawn. Every answer here
+/// comes from durable records, so it is the same before and after the session's actor
+/// restarts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueuedSendFate {
     /// Queued and still waiting for a boundary that can deliver it.

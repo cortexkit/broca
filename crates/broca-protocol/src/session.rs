@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// It must never be interpreted as an absolute checkout path on any platform.
 pub const UNSCOPED_SESSION_ROOT: &str = "broca-unscoped-v1";
 
-/// A durable, resumable conversation identity — the unit the WAL/store key on,
+/// A durable, resumable conversation identity — the unit the session's log/store key on,
 /// and the per-session single-writer lease scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BindIdentity {
@@ -35,7 +35,7 @@ impl BindIdentity {
 
     /// Reject identities that cannot be mapped to one unambiguous durable partition.
     ///
-    /// Existing WAL, lease, store, and idempotency keys join these three fields with U+001F.
+    /// Existing log, lease, store, and idempotency keys join these three fields with U+001F.
     /// Allowing that separator inside a field makes the tuple encoding non-injective, so one
     /// identity can silently open another identity's state. Rejecting the separator preserves
     /// every existing valid session's stable keys instead of changing the encoding and requiring
@@ -69,16 +69,16 @@ impl BindIdentity {
 
 /// Who opened the route a send arrived on, as the subc daemon attested it on `route.bind`.
 ///
-/// Mirrors `subc_protocol::Principal` and serializes to the same JSON, so a WAL record keeps
+/// Mirrors `subc_protocol::Principal` and serializes to the same JSON, so a log record keeps
 /// the daemon's value exactly as it was stamped: `{"kind":"reserved","module_id":"…"}`,
 /// `{"kind":"direct"}` or `{"kind":"unverified"}`. Like [`BindIdentity`] it is broca's own
-/// type so that the loop and WAL crates do not depend on subc's wire crate.
+/// type so that the loop and log crates do not depend on subc's wire crate.
 ///
 /// A bind that carried no principal is recorded as no principal at all (`Option::None`, no
 /// bytes on the record), never as one of these values: absence is what an older daemon sends,
 /// and it must stay distinguishable from any attested caller.
 ///
-/// THIS SITS ON WAL RECORDS (`RunStarted`, `Queued`), so it must decode whatever a later build
+/// THIS SITS ON LOG RECORDS (`RunStarted`, `Queued`), so it must decode whatever a later build
 /// writes. A rolled-back build that refused a principal kind it did not know would fail to
 /// decode `RunStarted` and lose the whole session. Any JSON value therefore decodes, and one
 /// that is not exactly a shape this build knows is kept verbatim as [`BindPrincipal::Unknown`].

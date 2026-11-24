@@ -1259,7 +1259,7 @@ fn wire_auth_wal_check_is_limited_to_auth_capable_outcomes() {
         ),
         (
             "infrastructure error",
-            Err(RunError::Wal("disk unavailable".into())),
+            Err(RunError::Log("disk unavailable".into())),
             false,
         ),
     ];

@@ -18,8 +18,8 @@
 //!
 //! ## The render-edge-only invariant (load-bearing for resume byte-identity)
 //! The alias exists ONLY in the rendered request bytes. The canonical id is the SOLE
-//! persisted form (WAL, materialized store, the in-memory `Message`). The alias map is
-//! built from a read-only scan of the prompt and never mutates a `Message`. If the alias
+//! persisted form (the session's log, materialized store, the in-memory `Message`). The alias map
+//! is built from a read-only scan of the prompt and never mutates a `Message`. If the alias
 //! ever leaked into a persisted `Message` (e.g. a stored `tool_result` carrying the aliased
 //! id), the stored id would no longer be canonical and a later render would alias the
 //! already-aliased id — breaking reproducible resume renders. So aliasing is strictly a

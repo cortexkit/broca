@@ -189,7 +189,8 @@ pub struct FrozenRenderConfig {
     /// The family render ABI version. A change means a resume can't reproduce the
     /// original bytes, so resume must stop for review rather than re-render.
     pub renderer_version: u32,
-    /// Concrete operator aliases frozen at admission. Empty maps retain legacy request and WAL bytes.
+    /// Concrete operator aliases frozen at admission. Empty maps retain request bytes and
+    /// stored bytes.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tool_name_aliases: std::collections::BTreeMap<String, String>,
     /// New episodes label multipart image notices; absent in recorded configurations,
@@ -536,8 +537,8 @@ pub struct CodeAssistIdentity {
     pub session_id: String,
     pub agent_id: String,
     pub trajectory_id: String,
-    /// WAL sequence at admission plus one. Together with the run-local step index this
-    /// gives increasing session-wide request steps, with gaps for non-request WAL records.
+    /// Log sequence at admission plus one. Together with the run-local step index this
+    /// gives increasing session-wide request steps, with gaps for non-request log records.
     pub step_offset: u64,
     /// Admission time, not render time: retries and resume must reproduce the same bytes.
     pub admitted_at_ms: u64,

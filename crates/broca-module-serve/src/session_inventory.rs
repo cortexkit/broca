@@ -10,7 +10,7 @@ use broca_module::registry::SessionInventoryReadiness;
 use broca_store::session_address::{InventoryUnavailable, SessionAddressError};
 use tokio::sync::watch;
 
-// Revalidating a production-sized session inventory with a completed WAL
+// Revalidating a production-sized session inventory with a completed session-log
 // census measured 2.77 seconds.
 // Use twenty times that duration, rounded up to a minute, as a bounded allowance
 // for colder disks and foreground writers, not a worst-case census estimate.

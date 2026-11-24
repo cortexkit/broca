@@ -99,7 +99,7 @@ pub const ROUTE_FACT_PUBLISH_BUDGET: Duration = Duration::from_secs(2);
 /// How often a pending attempt report checks whether its record has become durable.
 const DURABILITY_POLL: Duration = Duration::from_millis(20);
 /// How long an attempt report waits for its record to become durable before giving up. An
-/// attempt record rides the next WAL barrier, which a running step reaches within its own
+/// attempt record rides the next log barrier, which a running step reaches within its own
 /// step; a record still not durable after this long belongs to a writer that has stopped.
 const DURABILITY_MAX_WAIT: Duration = Duration::from_secs(300);
 /// A cached vault listing older than this is refreshed in the background.
@@ -1157,7 +1157,7 @@ pub fn admission_id(run_id: &str) -> String {
 }
 
 /// The `conversation_key` routing keeps account affinity under: one per broca session, spelled
-/// with the session digest that also names the session's WAL file rather than with the session's
+/// with the session digest that also names the session's log file rather than with the session's
 /// project path, so the path is never sent to routing.
 pub fn conversation_key(session: &BindIdentity) -> String {
     format!(
@@ -2967,7 +2967,7 @@ pub fn report_scoped_not_found<F>(
 {
     client.counters.bump("scoped_not_found");
     tokio::spawn(async move {
-        // No WAL record names a refused admission, so the event is named by the admission and
+        // No log record names a refused admission, so the event is named by the admission and
         // the moment; each occurrence is a distinct report.
         let id = format!(
             "{admission_id}:scoped_not_found:{}",

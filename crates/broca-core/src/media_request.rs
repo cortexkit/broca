@@ -1,9 +1,9 @@
-//! Session-scoped render inputs. Bytes are read only after an exact WAL-derived capture
+//! Session-scoped render inputs. Bytes are read only after an exact log-derived capture
 //! match; membership in the shared object store alone never authorizes a render.
 //!
 //! Fold durable records once on resume, then only the newly durable tail. Call `bindings`
 //! on the post-compaction-view prompt, not on the stored transcript. No media decisions or
-//! bytes are written to the WAL by this projection.
+//! bytes are written to the session's log by this projection.
 
 use std::collections::{BTreeMap, HashMap};
 

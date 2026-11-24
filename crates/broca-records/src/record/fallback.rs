@@ -1,7 +1,7 @@
 //! Storage shapes for content-filter fallback on Anthropic runs: the server-side fallback a
 //! response reports (`provider-fallback-block/v1`) and the client-side refusal fallback the run
 //! loop drives (`refusal-fallback/v1`). The schedule's transitions live in broca-core; these
-//! are only the values the WAL records.
+//! are only the values the log records.
 
 use broca_protocol::request::ModelHandle;
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ impl StepFallback {
 }
 
 /// One entry of an Anthropic response's `usage.iterations`, kept as reported so a later split of
-/// one step's usage across the models that ran can be computed from the WAL alone.
+/// one step's usage across the models that ran can be computed from the log alone.
 pub use broca_protocol::usage::UsageIteration;
 
 /// Which model a step was sent to when it was not the episode's own model.

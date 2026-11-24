@@ -1,4 +1,4 @@
-//! Late-result eligibility comes from the session's own durable records, not a WAL projection.
+//! Late-result eligibility comes from the session's own durable records, not a log projection.
 
 use super::*;
 use broca_session_store::backend::SessionBackend;

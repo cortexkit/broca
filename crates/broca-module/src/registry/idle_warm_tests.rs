@@ -113,7 +113,7 @@ async fn idle_timer_cancellation_and_wal_storage_never_dispatch_warm() {
     tokio::time::advance(std::time::Duration::from_millis(100)).await;
     assert_eq!(opens.load(Ordering::SeqCst), 0);
     handle.arm_idle_warm(&key, 200, 100);
-    broca_test_support::wait_until("WAL storage refuses idle warm", || async {
+    broca_test_support::wait_until("a session with no stored log refuses idle warm", || async {
         if !handle.has_idle_warm(&key) {
             Ok(())
         } else {

@@ -19,15 +19,15 @@ of its session. A known run returns:
 {"run_id":"…","session_class":"sidekick","started_at_ms":123,"storage":"store","fetches":[{"provider":"aft","declarations_frozen":{"late_results":true}}],"scope":{"owner":{"kind":"reserved","module_id":"core"},"ref":"worker-1","epoch":1,"principal":{"kind":"reserved","module_id":"core"}}}
 ```
 
-`storage` is always `store` (`wal` named the old log format and is no longer produced). `session_class` and each fetch's
-`declarations_frozen` are omitted when absent in the recorded admission; absence
-is not replaced by an empty value. `fetches` contains only provider names and
-their frozen declarations, not tools, messages, system text or credentials. A
-run admitted without a fetch plan has an empty `fetches` array. An unknown run
-returns `{"state":"unknown"}`, as `run.status` does. The required `run_id` is
-scoped to the bound session; unknown parameter keys are refused.
-An older start without a recorded timestamp is unreadable through this query,
-not assigned a fabricated start time.
+`storage` is always `store` (the session's log format is no longer produced).
+`session_class` and each fetch's `declarations_frozen` are omitted when absent in the recorded
+admission; absence is not replaced by an empty value. `fetches` contains only provider names and
+ their frozen declarations, not tools, messages, system text or credentials. A run admitted
+without a fetch plan has an empty `fetches` array. An unknown run returns `{"state":"unknown"}`,
+as `run.status` does. The required `run_id` is scoped to the bound session; unknown parameter
+keys are refused.
+An older start without a recorded timestamp is unreadable through this query, not assigned a
+fabricated start time.
 
 `scope` is omitted for an unscoped start, preserving its existing reply bytes. For a
 scoped start, `scope.owner`, `scope.ref` and `scope.epoch` project the recorded scope's

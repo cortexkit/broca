@@ -131,7 +131,7 @@ pub enum ControlUnit {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
         /// The provider finish reason recorded on the last model step in this run.
-        /// Absent when the run produced no model step or the WAL predates this metadata.
+        /// Absent when the run produced no model step or the log predates this metadata.
         #[serde(
             default,
             deserialize_with = "crate::content::deserialize_optional_caller_finish_reason",
@@ -163,7 +163,7 @@ pub enum ControlUnit {
 /// class. A missing provider code is derived from that caller-facing class at this boundary;
 /// existing codes and provider-owned diagnostics are preserved. The wrapper prevents a
 /// caller-facing schema from accidentally embedding a raw
-/// [`ProviderError`], while durable WAL records continue to use that raw type. On a caller read,
+/// [`ProviderError`], while durable log records continue to use that raw type. On a caller read,
 /// an unfamiliar class stays available through `class_wire`; `as_inner` uses `permanent` only as
 /// a non-retrying compatibility fallback.
 #[derive(Debug, Clone, PartialEq)]
@@ -355,7 +355,7 @@ pub enum RunFinishReason {
     /// - `session.read`: `lineage_state.error`, alongside `lineage_state.state`.
     /// - `run.status`: see [`RunFinishReason`]'s note on the status surface -- the terminal
     ///   is reported and the cause is not yet.
-    /// - the durable WAL: `WalRecord::RunFinished.error`, which is the authority all of the
+    /// - the durable log: `WalRecord::RunFinished.error`, which is the authority all of the
     ///   above are projected from.
     Error,
     /// The prompt-reduction transform module was unreachable (after its own retry +
@@ -367,7 +367,7 @@ pub enum RunFinishReason {
 }
 
 impl RunFinishReason {
-    /// The spelling the WAL and every caller-facing surface use.
+    /// The spelling the log and every caller-facing surface use.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
@@ -384,7 +384,7 @@ impl RunFinishReason {
 
 /// Why a run is PAUSED (non-terminal, resumable) rather than finished. The shared
 /// vocabulary for a resumable pause — used both on the caller-facing control surface
-/// (`ControlUnit::Paused`) and in the durable WAL (`WalRecord::RunPaused`), so the two
+/// (`ControlUnit::Paused`) and in the durable log (`WalRecord::RunPaused`), so the two
 /// can't drift. Both credential refresh and graceful restart preserve the episode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -430,8 +430,8 @@ impl PauseReason {
 /// run reached a state this build cannot interpret, and it must handle that as its own case.
 ///
 /// A known value is written exactly as the closed enum writes it, and an unknown one as its
-/// received string, so for the run finish and pause reasons both are bare strings. Durable WAL records keep the closed enums and still refuse a value
-/// they do not know.
+/// received string, so for the run finish and pause reasons both are bare strings. Durable log
+/// records keep the closed enums and still refuse a value they do not know.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OpenState<T> {
     /// A value from this build's vocabulary.
@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn durable_reason_enums_stay_closed_to_unknown_values() {
-        // WAL records decode these enums directly. A record a newer runner wrote with a reason
+        // Log records decode these enums directly. A record a newer runner wrote with a reason
         // this build does not know must be refused, not read as some other recorded outcome.
         assert!(serde_json::from_str::<RunFinishReason>("\"future_finish\"").is_err());
         assert!(serde_json::from_str::<PauseReason>("\"future_pause\"").is_err());
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn tool_held_pause_reason_is_spelled_tool_held() {
-        // The WAL, the control stream and run status all carry this exact spelling.
+        // The log, the control stream and run status all carry this exact spelling.
         assert_eq!(PauseReason::ToolHeld.as_str(), "tool_held");
         assert_eq!(
             serde_json::to_string(&PauseReason::ToolHeld).unwrap(),

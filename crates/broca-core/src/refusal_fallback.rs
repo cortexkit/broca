@@ -1,5 +1,5 @@
 //! The client-side refusal-fallback schedule for Anthropic runs, as pure transitions over the
-//! values the WAL records (`RefusalFallbackSchedule`). No I/O: replay folds the same transitions
+//! values the log records (`RefusalFallbackSchedule`). No I/O: replay folds the same transitions
 //! from the records that the run loop applies live, so a restart or resume reaches the same
 //! schedule.
 //!
@@ -33,7 +33,7 @@ pub enum StepRoute {
     Fallback,
 }
 
-/// Refusal state at a materialized WAL boundary. The outer store value is optional:
+/// Refusal state at a materialized log boundary. The outer store value is optional:
 /// absent metadata means an older writer did not record it, not an empty schedule.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RefusalReplayState {

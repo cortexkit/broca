@@ -29,7 +29,7 @@ pub struct StepId(pub u64);
 #[serde(transparent)]
 pub struct ToolCallId(pub String);
 
-/// Id for one tool BATCH — the set of tool calls in one assistant turn. The WAL
+/// Id for one tool BATCH — the set of tool calls in one assistant turn. The session's log
 /// brackets a batch with start/finish markers, and resume only reconstructs the
 /// prompt from batches that finished — so a half-written batch is never replayed
 /// as a (provider-invalid) partial turn.

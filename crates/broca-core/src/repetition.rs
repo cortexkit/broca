@@ -23,9 +23,10 @@ pub(crate) fn append_repetition_guidance(result: &mut ToolResult, guidance: &str
     }
 }
 
-/// Recreate guidance that an uninterrupted run retained in its in-memory prompt. Replay deliberately
-/// reconstructs only the tool-owned output from the WAL, so this folds raw result copies in source
-/// order and decorates those copies without changing durable history.
+/// Recreate guidance that an uninterrupted run retained in its in-memory prompt. Replay
+/// deliberately reconstructs only the tool-owned output from the log, so this folds raw
+/// result copies in source order and decorates those copies without changing durable
+/// history.
 ///
 /// Pass one episode's model-step messages, excluding other episodes' messages and the
 /// episode's initial input. Each call starts fresh repetition counters. The slice must

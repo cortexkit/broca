@@ -209,8 +209,8 @@ fn alias_render_is_deterministic_across_passes() {
 
 #[test]
 fn alias_survives_message_serde_round_trip() {
-    // THE RESUME PATH: the source messages are persisted as JSON (WAL/store) and rebuilt on
-    // resume. The canonical id round-trips through serde unchanged, so the re-render
+    // THE RESUME PATH: the source messages are persisted as JSON (session log/store) and rebuilt
+    // on resume. The canonical id round-trips through serde unchanged, so the re-render
     // recomputes the IDENTICAL alias → byte-identical request. This is the C7 proof that
     // fits the alias (it is render-edge, recomputed from the durable canonical id), in place
     // of the merge-invariant gate (which exercises the stub family, not this alias).

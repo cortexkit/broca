@@ -20,9 +20,9 @@
 //! provider → model → final text — streaming the control units back over the subscribe route.
 //!
 //! ANTI-FALSE-GREEN: the proof keys on BOTH the client's streamed wire events (RUN_STARTED →
-//! TOOL_CALL → TOOL_RESULT → RUN_FINISHED) AND the on-disk durable state (the module's WAL
+//! TOOL_CALL → TOOL_RESULT → RUN_FINISHED) AND the on-disk durable state (the module's log
 //! exists for the session). A hung loop that merely times out can't produce the terminal
-//! event, and a run that didn't persist leaves no WAL — neither can read as a pass.
+//! event, and a run that didn't persist leaves no log — neither can read as a pass.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -931,8 +931,8 @@ impl Daemon {
 
         // The module's state root is named explicitly and lives under the rig. Left unset, it
         // would default to the data home, which the daemon spawn below also pins into the rig;
-        // naming it here keeps the WAL where the on-disk anti-false-green check reads it back
-        // and where the catalog LKG above is seeded.
+        // naming it here keeps the session's log where the on-disk anti-false-green check
+        // reads it back and where the catalog LKG above is seeded.
         let mut config = json!({
             "version": 1,
             "modules": {
@@ -1531,7 +1531,7 @@ impl ConcurrencyProbe {
 // Used only by the unix-only aimock tests.
 #[cfg_attr(not(unix), allow(dead_code))]
 /// Run the broca-session client binary to completion against the daemon.
-/// Poll a module's WAL directory until every marker appears in one file, or time out.
+/// Poll a module's session store until every marker appears in one file, or time out.
 ///
 /// The durable record is the barrier rather than a wire line: a client can report a state the
 /// session has not yet stored, and a test that proceeds on the report races the write it
@@ -2236,7 +2236,7 @@ async fn concurrent_mixed_family_sessions_through_the_real_module_are_isolated()
     let project_root = daemon.dir.join("mixed-project");
     std::fs::create_dir_all(&project_root).unwrap();
     // subc canonicalizes bind identities before handing them to the module, including macOS's
-    // /private prefix. Use the same canonical path when deriving the expected WAL names.
+    // /private prefix. Use the same canonical path when deriving the expected log names.
     let project_root = std::fs::canonicalize(project_root).unwrap();
     let probe = Arc::new(ConcurrencyProbe::new(slots.len()));
 

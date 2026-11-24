@@ -1,4 +1,4 @@
-//! The durable WAL record set (the authoritative semantics are in
+//! The durable log record set (the authoritative semantics are in
 //! `docs/durability-contract.md`). These are the assembled UNITS the runner
 //! persists — never token deltas. Bodies reuse `broca-protocol` canonical types.
 
@@ -590,9 +590,9 @@ impl<'de> Deserialize<'de> for StoredViewEdit {
     }
 }
 
-/// Cancellation points recorded in the WAL. The run.cancel endpoint rejects all other strings
+/// Cancellation points recorded in the log. The run.cancel endpoint rejects all other strings
 /// before writing, rather than interpreting an unknown point as immediate cancellation.
-/// The failed request boundary and selection retained by an account-limit pause. The WAL
+/// The failed request boundary and selection retained by an account-limit pause. The log
 /// sequence identifies its failed physical attempt even when no billing reservation is recorded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountLimitPause {
@@ -675,12 +675,12 @@ pub struct DispatchSchemaPin {
     pub major: Option<u64>,
 }
 
-/// Who executes a held call once a human approves it ([`WalRecord::ToolCallDeferred`]).
+/// Who executes a held call once a human approves it ([`WalRecord::ToolCallDeferred`])?
 ///
 /// Serialized as a bare string. Only `broca` is written today; other values are reserved for
 /// calls a tool provider executes itself, which share the `deferred-call/v1` feature. So a value
 /// this build does not know still decodes, is KEPT verbatim and re-serializes to the string it
-/// was read from, instead of failing the WAL as corrupt.
+/// was read from, instead of failing the log as corrupt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeferredExecutor {
     /// broca re-validates the saved arguments and dispatches them itself.
@@ -716,7 +716,7 @@ impl<'de> Deserialize<'de> for DeferredExecutor {
     }
 }
 
-/// The question an approve hook asked about a held call, as the WAL keeps it: the step-transform
+/// The question an approve hook asked about a held call, as the log keeps it: the step-transform
 /// role's `ApprovalAsk`, field for field and in its wire order. Owned here rather than borrowed
 /// from the role crate so a change to that crate can never change the bytes of a record already
 /// on disk.
@@ -909,7 +909,7 @@ pub struct RunConfig {
     /// The deterministic provider-request renderer version — a renderer change
     /// means a resume can't reproduce the original bytes.
     pub renderer_version: u32,
-    /// The provider's frozen render config, stored as an OPAQUE blob. The WAL and
+    /// The provider's frozen render config, stored as an OPAQUE blob. The session's log and
     /// the loop never interpret it — only the provider deserializes it on resume to
     /// rebuild the exact renderer that produced this run's request bytes. Kept
     /// opaque so the durability core stays provider-agnostic; it only needs to
@@ -1021,7 +1021,7 @@ pub struct SetupViewDue {
 /// The credential a run resolved at start, frozen for resume. A struct (not a bare string)
 /// so a later frozen field (e.g. a display name) has a home without another `RunConfig`
 /// field. Carries NO secret — the credential id is an opaque routing key; the bearer handle
-/// it maps to lives only in the 0600 handle map, never in the WAL.
+/// it maps to lives only in the 0600 handle map, never in the log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthSelection {
     /// The credential id to re-`get` on resume. Without [`AuthSelection::auth_method`] it is a
@@ -1147,7 +1147,7 @@ pub struct AccountDecision {
     pub routed_ref: Option<String>,
 }
 
-/// Origin of an admission's routing affinity. Unknown strings survive WAL replay.
+/// Origin of an admission's routing affinity. Unknown strings survive log replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum ConversationKeySource {
@@ -1232,7 +1232,7 @@ pub struct VaultRequest {
 /// The vault read operation a [`VaultRequest`] was sent as. Serialized as a bare string:
 /// `"get"`, `"get_scoped"`, or, for [`VaultReadOp::Unknown`], the string it was read from.
 ///
-/// THIS SITS ON A WAL RECORD (`RunStarted`, through `AuthSelection.vault_request`), so it must
+/// THIS SITS ON A LOG RECORD (`RunStarted`, through `AuthSelection.vault_request`), so it must
 /// decode values a later build writes. Production rolls back, and a rolled-back build that
 /// refused an operation name it did not know would fail to decode `RunStarted` and leave the
 /// whole session unreadable. So any string decodes, and an unrecognised one is KEPT verbatim:
@@ -1359,7 +1359,7 @@ pub enum ResumeRedo {
     /// process before the crash.
     ToolDispatch { tool_call_id: ToolCallId },
     /// A kind a later build writes. Decoding it here keeps the whole record readable instead
-    /// of failing the WAL as corrupt; it is never written.
+    /// of failing the log as corrupt; it is never written.
     #[serde(other, skip_serializing)]
     Unknown,
 }

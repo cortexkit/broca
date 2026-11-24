@@ -1,4 +1,4 @@
-//! Inline imports use the same validation and transcript normalization as the WAL importer,
+//! Inline imports use the same validation and transcript normalization as the log importer,
 //! then commit their provider-free episode as one store batch.
 
 use super::*;
@@ -12,7 +12,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         match result {
             Ok(outcome) => (outcome, false),
             Err(error) => (
-                ImportOutcome::Error(ImportError::Wal(format!("{error:?}"))),
+                ImportOutcome::Error(ImportError::Log(format!("{error:?}"))),
                 self.running().is_none(),
             ),
         }
@@ -64,7 +64,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 outcome.already_imported = true;
                 return Ok(ImportOutcome::Imported(outcome));
             }
-            // The WAL importer only treats another completed import under this run id as reuse.
+            // The log importer only treats another completed import under this run id as reuse.
             if start.seeded == Some(true) && recorded.is_some() {
                 return Ok(ImportOutcome::Error(ImportError::ImportIdReuse));
             }

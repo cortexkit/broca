@@ -55,7 +55,7 @@ pub struct Message {
     /// byte-identity (no renderer reads it; it is absent from the canonical bytes).
     ///
     /// DURABLE ONLY UNDER AN APPEND-ONLY PROMPT: the position is stable because the lineage
-    /// prompt only ever grows at the end (the WAL is append-only; an incomplete turn is held
+    /// prompt only ever grows at the end (the log is append-only; an incomplete turn is held
     /// out only at the tail; a fork copies the prefix verbatim). A FUTURE feature that edits
     /// or removes a mid-lineage message (a doctor-edit of an indeterminate turn, redaction,
     /// history surgery) would shift every later position and silently mis-key the transform's
@@ -65,7 +65,7 @@ pub struct Message {
     pub ordinal: Option<u64>,
     /// The runner tags of this message's parts (see [`crate::tags`]). In-memory
     /// only, like `ordinal`: never serialized, so it never enters a rendered request or the
-    /// bytes of a stored message, and ignored by equality. Replay attaches it from the WAL
+    /// bytes of a stored message, and ignored by equality. Replay attaches it from the log
     /// records that carry the tags, and reads from the store attach it from the row beside the
     /// message.
     #[serde(skip)]
@@ -133,9 +133,9 @@ impl Message {
     /// fleet's prefix-claim contract (2026-09-20) sends `{heldFloorMessageId, sinceMessageId,
     /// heldVersion}` and expects one of three positive replies: matched-with-turns,
     /// matched-empty, or diverged. Broca can answer `matched` without inspecting content
-    /// SOLELY because mutation is inexpressible at its durability surface -- `trait Wal` is
-    /// append/sync/replay/tail_after_seq/last_seq, with no update, remove or replace verb at
-    /// any layer -- so the classifier reduces to "did the lineage change". Every other harness
+    /// SOLELY because mutation is inexpressible at its durability surface -- a session's log
+    /// only appends, with no update, remove or replace verb at any layer -- so the classifier
+    /// reduces to "did the lineage change". Every other harness
     /// on that contract must classify seven kinds of mutation event; broca classifies none,
     /// and that difference IS this property.
     ///
@@ -258,7 +258,8 @@ pub enum TextProviderFormat {
     GoogleCodeAssist,
 }
 
-/// Opaque, format-owned metadata. Core and WAL retain these bytes without interpreting them.
+/// Opaque, format-owned metadata. Core and the session's log retain these bytes without
+/// interpreting them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextProviderState {
     pub format: TextProviderFormat,
@@ -421,7 +422,7 @@ pub enum ContentBlock {
     /// Anthropic's server-side fallback handoff: the server switched the response from
     /// `from_model` to `to_model` part-way through, at this position in the message. Neither
     /// signed nor reasoning. Only an Anthropic request whose frozen config opted into
-    /// server-side fallback may echo it back; every other renderer drops it. A WAL record
+    /// server-side fallback may echo it back; every other renderer drops it. A log record
     /// carrying it requires the `provider-fallback-block/v1` feature, because an older build's
     /// closed content decoder cannot read it.
     ProviderFallback {
@@ -818,7 +819,7 @@ pub enum FinishReason {
 ///
 /// An unfamiliar reason reads as [`FinishReason::Other`], the bucket this vocabulary already
 /// keeps for a provider reason that matches none of the named ones, so no named reason is
-/// claimed for it. Durable WAL records and provider events keep the derived, closed decoding.
+/// claimed for it. Durable log records and provider events keep the derived, closed decoding.
 pub fn deserialize_caller_finish_reason<'de, D>(deserializer: D) -> Result<FinishReason, D::Error>
 where
     D: serde::Deserializer<'de>,

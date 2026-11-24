@@ -14,7 +14,7 @@
 use broca_protocol::{canonical_json_bytes, CallOptions};
 use sha2::{Digest, Sha256};
 
-/// Version of the shared canonical renderer. Recorded in the WAL `run_config`
+/// Version of the shared canonical renderer. Recorded in the session's log `run_config`
 /// (`renderer_version`); a renderer change is a resume BUST. A provider with its
 /// own renderer carries its OWN version.
 pub const CANONICAL_RENDERER_VERSION: u32 = 1;

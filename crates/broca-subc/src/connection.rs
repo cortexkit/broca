@@ -4819,7 +4819,7 @@ pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> 
 /// AFT is the exception: it accepts `broca` so completion notices can address the real session.
 ///
 /// Broca's own `BindIdentity.harness` cannot simply be that value: it is an opaque key component,
-/// joined into WAL, lease, store and idempotency keys, so it partitions durable state and broca
+/// joined into the log, lease, store and idempotency keys, so it partitions durable state and broca
 /// validates nothing about it beyond rejecting the key separator. Forwarding it verbatim would make
 /// each caller's private key choice a bind-compatibility question with a module it never named.
 ///
@@ -4903,7 +4903,7 @@ fn to_subc_bind(
         //
         // THIS ARM RE-KEYED BROCA'S OWN MANAGEMENT SESSIONS AND I DID NOT CHECK FOR IT.
         // I asked whether claustrum and mc key on harness and never asked whether BROCA does
-        // -- and broca is the consumer that keys its WAL FILENAME on it, via
+        // -- and broca is the consumer that keys its log address on it, via
         // session_addr = FNV-1a(project_root U+241F harness U+241F session). Before this
         // change every management bind arrived as `runner`, so an unchanged `broca-session`
         // invocation now addresses a DIFFERENT lineage than it did on v0.3.105. The old data
@@ -4927,7 +4927,7 @@ fn to_subc_bind(
     // TRANSLATE, never forward. Presenting the constant here rather than asking callers to
     // revert their spelling is the only fix that does not RE-KEY SESSIONS: harness is part
     // of broca's durable key, so changing an inbound bind strands that lineage under a new
-    // WAL name with nothing recording the move. Measured when this was chosen: 395 live
+    // log name with nothing recording the move. Measured when this was chosen: 395 live
     // sessions would have been stranded by the caller-side revert.
     //
     // Project attribution travels only through the route's scope selector. A storage key

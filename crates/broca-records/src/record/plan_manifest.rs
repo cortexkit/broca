@@ -4,7 +4,7 @@
 //! later episode and every resume renders from exactly those bytes and never fetches again.
 //!
 //! The plan itself is stored as the opaque JSON it arrived as, never as fields of this record:
-//! the plan's layout belongs to the caller that writes it, and may grow without a WAL change.
+//! the plan's layout belongs to the caller that writes it, and may grow without a log change.
 //!
 //! Nothing here decides how a manifest is fetched, joined or checked; `broca-fetch-plan` builds
 //! it at admission and the run loop records it. A reader must carry every value through
@@ -29,7 +29,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[serde(transparent)]
 pub struct OpaqueJson(String);
 
-/// The reply declaration stored in a frozen plan. The WAL owns this wire shape so a
+/// The reply declaration stored in a frozen plan. The log owns this wire shape so a
 /// provider role's serde changes cannot silently change durable record bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenReply {
@@ -38,7 +38,7 @@ pub struct FrozenReply {
     pub hold_argument: Option<FrozenHoldArgument>,
 }
 
-/// The provider's own result-format declaration for one tool, frozen with the plan. The WAL
+/// The provider's own result-format declaration for one tool, frozen with the plan. The log
 /// treats it as an open string so a contract's later format is stored verbatim rather than
 /// refused; only the surface that reads it decides which names it understands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -317,7 +317,7 @@ impl<'de> Deserialize<'de> for ProviderFetch {
 /// Everything a send or refresh fetched and froze: the plan as received, each provider's
 /// answer, the tools offered to the model, the joined system text, and the versions that decided
 /// how they were combined. Each `RunStarted` carries its own manifest so replay keeps that
-/// episode's tools and text even after a session refresh or a WAL fold archives earlier episodes.
+/// episode's tools and text even after a session refresh or a log fold archives earlier episodes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanManifest {
     /// The agreed stamp from the fetched system-text answers, not from the caller's plan.

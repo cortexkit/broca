@@ -135,10 +135,11 @@ pub struct SendParams {
     )]
     pub conversation_key: Option<String>,
     /// A human-readable title for the work this send carries, shown by dashboards and logs in
-    /// place of the bare session name. Accepted on every delivery mode and recorded on the WAL
-    /// record the send writes. INFORMATIONAL ONLY: it is never rendered into a provider request
-    /// and is not part of routing, cache keys or the send's identity, so a retry under the same
-    /// `send_id` with a different title gets the recorded answer and keeps the first title.
+    /// place of the bare session name. Accepted on every delivery mode and recorded on the
+    /// log record the send writes. INFORMATIONAL ONLY: it is never rendered into a provider
+    /// request and is not part of routing, cache keys or the send's identity, so a retry under
+    /// the same `send_id` with a different title gets the recorded answer and keeps the first
+    /// title.
     /// The VALUE is strict: at most 200 Unicode scalar values, not blank, and no control
     /// characters (newlines and tabs included). A violation is refused, naming the field; a title
     /// is never truncated.
@@ -228,11 +229,11 @@ pub struct SendParams {
     )]
     pub service_tier: Option<broca_protocol::request::ServiceTier>,
     /// Explicitly marks a send as single-turn so its transcript need not be projected into the
-    /// materialized session store. The WAL remains authoritative and available to `session.read`.
+    /// materialized session store. The log remains authoritative and available to `session.read`.
     ///
     /// The name describes THIS turn; the cost lands on every LATER read of the session. Skipping
     /// projection leaves the store watermark where it was, so a subsequent `session.read` merges
-    /// the store prefix with a WAL tail that grows with each turn. A 23k-message session whose
+    /// the store prefix with a log tail that grows with each turn. A 23k-message session whose
     /// projection had stalled read at ~127ms per page against ~13ms for one projected normally,
     /// with no error and nothing at the call site to attribute it to.
     ///
@@ -399,7 +400,7 @@ fn names_media_inline(part: &serde_json::Value) -> bool {
 }
 
 /// Refuse a caller-supplied transcript (a `session.import`'s `messages`) that names media
-/// directly, as a `media` block or a `Parts` media part. A `MediaRef` enters a WAL record only
+/// directly, as a `media` block or a `Parts` media part. A `MediaRef` enters a log record only
 /// from broca's own capture path (an upload commit or a tool capture), which publishes bytes broca
 /// holds; an inline reference holds no bytes and could name an object the session never
 /// captured. The error is `(field, message)`, naming the offending member's path.
@@ -928,7 +929,6 @@ pub struct RunAdmissionParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunAdmissionStorage {
-    Wal,
     Store,
 }
 
@@ -1108,7 +1108,7 @@ pub struct ReadParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
     /// Opt in to `tools` and `tools_run_id` on the response: the tool list the session's latest
-    /// episode was admitted with. Off by default because it can cost a WAL read beyond the page,
+    /// episode was admitted with. Off by default because it can cost a log read beyond the page,
     /// and omitted from the request when false so existing request bytes are unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_tools: bool,
@@ -1779,7 +1779,7 @@ pub struct SessionReadLineageState {
 ///
 /// `head` is the last durable control unit covered by the same snapshot as this page. A fresh or
 /// empty lineage omits it. `session.subscribe` with `from: head` starts strictly after it, so the
-/// handoff has neither a gap nor a duplicate. `lineage_id` is the opaque durable WAL identity;
+/// handoff has neither a gap nor a duplicate. `lineage_id` is the opaque durable log identity;
 /// legacy lineages omit it until their next write.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionReadResponse {
@@ -2172,7 +2172,7 @@ pub struct PausedRunAuth {
     pub routing_code: Option<String>,
 }
 
-/// A run-keyed status response resolved from the live actor, durable index, or WAL.
+/// A run-keyed status response resolved from the live actor, durable index, or the session's log.
 /// `auth_selection` is the credential id frozen at admission, never a current routing
 /// decision. It is absent when no credential was frozen or the frozen config is unavailable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2193,15 +2193,15 @@ pub enum RunStatusResponse {
             skip_serializing_if = "Option::is_none"
         )]
         usage: Option<broca_protocol::usage::RunUsage>,
-        /// Snapshot of the live actor's in-flight model step; never read from WAL.
+        /// Snapshot of the live actor's in-flight model step; never read from the session's log.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         step: Option<broca_protocol::provider::InFlightStep>,
-        /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
+        /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
         /// The pending list contains only durably Deferred calls; an older `awaiting_approval`
-        /// WAL marker may supply filing IDs but cannot keep an approved or closed call pending.
+        /// log marker may supply filing IDs but cannot keep an approved or closed call pending.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         awaiting_approval: Option<AwaitingApproval>,
         /// Open provider-held calls are a runner-owned wait, independent of `reason`.
@@ -2240,7 +2240,7 @@ pub enum RunStatusResponse {
         /// Only open provider-held calls are reported; an empty list is omitted.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         held_calls: Vec<cortexkit_role_llm_runner::run::HeldCall>,
-        /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
+        /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -2263,8 +2263,8 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
-        /// step, in WAL order. A present empty list means WAL replay found none;
-        /// the field is omitted when no WAL was read.
+        /// step, in the session's log order. A present empty list means log replay found none;
+        /// the field is omitted when no session log was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2277,7 +2277,7 @@ pub enum RunStatusResponse {
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
-        /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
+        /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -2300,8 +2300,8 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
-        /// step, in WAL order. A present empty list means WAL replay found none;
-        /// the field is omitted when no WAL was read.
+        /// step, in the session's log order. A present empty list means log replay found none;
+        /// the field is omitted when no session log was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(
@@ -2312,7 +2312,7 @@ pub enum RunStatusResponse {
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
-        /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
+        /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -2333,8 +2333,8 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
-        /// step, in WAL order. A present empty list means WAL replay found none;
-        /// the field is omitted when no WAL was read.
+        /// step, in the session's log order. A present empty list means log replay found none;
+        /// the field is omitted when no session log was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(
@@ -2345,7 +2345,7 @@ pub enum RunStatusResponse {
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
-        /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
+        /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -2422,8 +2422,8 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
-        /// step, in WAL order. A present empty list means WAL replay found none;
-        /// the field is omitted when no WAL was read.
+        /// step, in the session's log order. A present empty list means log replay found none;
+        /// the field is omitted when no session log was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(
@@ -2434,7 +2434,7 @@ pub enum RunStatusResponse {
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
-        /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
+        /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -2457,8 +2457,8 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
-        /// step, in WAL order. A present empty list means WAL replay found none;
-        /// the field is omitted when no WAL was read.
+        /// step, in the session's log order. A present empty list means log replay found none;
+        /// the field is omitted when no session log was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(
@@ -2473,7 +2473,7 @@ pub enum RunStatusResponse {
         /// `lineage_state.error`. Absent when the terminal record carries none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<SharedProviderError>,
-        /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
+        /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
@@ -2494,8 +2494,8 @@ pub enum RunStatusResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<cortexkit_role_llm_runner::finish::Finish>,
         /// Steer send ids durable in this episode whose input was not included in a model
-        /// step, in WAL order. A present empty list means WAL replay found none;
-        /// the field is omitted when no WAL was read.
+        /// step, in the session's log order. A present empty list means log replay found none;
+        /// the field is omitted when no session log was read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         undelivered_steers: Option<Vec<String>>,
         #[serde(
@@ -2506,7 +2506,7 @@ pub enum RunStatusResponse {
         usage: Option<broca_protocol::usage::RunUsage>,
         #[serde(default)]
         retries_used: u32,
-        /// The title the run's send carried, as its WAL record holds it. Absent (never empty)
+        /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,

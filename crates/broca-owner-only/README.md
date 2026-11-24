@@ -41,8 +41,8 @@ The pinned commons dependencies are unchanged. Daemon logging enters
 `cortexkit-log 0.3.5` prepares its Windows log directory and calls the pinned lease
 crate's protection path for segments. The daemon constructs `FileLeaseStore` in the
 same startup function. `broca-core/src/lease.rs` reexports that store from
-`cortexkit-lease 0.1.2`, and `broca-module/src/opener.rs` acquires it before WAL recovery
-and transfers its handle to the actor. Those dependencies own their file ACLs; this
+`cortexkit-lease 0.1.2`, and `broca-module/src/opener.rs` acquires it before session-log
+recovery and transfers its handle to the actor. Those dependencies own their file ACLs; this
 crate does not fork or reimplement them.
 
 ## Verification boundary

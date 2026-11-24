@@ -20,7 +20,7 @@ pub fn resolve_session_address(root: &Path, claim: &BindIdentity) -> Result<Bind
         }
         Some(_) => Err("the inventory reference names a different harness/session".into()),
         None if snapshot.complete => {
-            Err("session is not inventoried; bind it through serving before reading its WAL".into())
+            Err("session is not inventoried; bind it through serving before reading its log".into())
         }
         None => {
             Err("session is absent from an incomplete inventory; its address is unknown".into())
@@ -28,7 +28,7 @@ pub fn resolve_session_address(root: &Path, claim: &BindIdentity) -> Result<Bind
     }
 }
 
-/// Enroll an authored legacy seed before writing or moving its WAL.
+/// Enroll an authored seed before writing or moving its session log.
 /// The inventory preserves that exact identity even when the file is later `.deleting`,
 /// or when a fixture adds a seed after the daemon's startup census has finished.
 pub fn register_legacy_session(root: &Path, seed: &BindIdentity) -> Result<BindIdentity, String> {

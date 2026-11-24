@@ -133,11 +133,11 @@ impl RunExecutor for CoreExec {
 /// It won on macOS and Linux for weeks and lost on Windows, which is the failure mode of every
 /// assertion that depends on losing a race being unlikely rather than impossible.
 async fn registry_with_hold(dir: &Path, hold: Arc<tokio::sync::Notify>) -> Arc<LineageRegistry> {
-    registry_and_wal_inner(dir, Some(hold)).await.0
+    registry_and_sessions_inner(dir, Some(hold)).await.0
 }
 
-async fn registry_and_wal(dir: &Path) -> (Arc<LineageRegistry>, Sessions) {
-    registry_and_wal_inner(dir, None).await
+async fn registry_and_sessions(dir: &Path) -> (Arc<LineageRegistry>, Sessions) {
+    registry_and_sessions_inner(dir, None).await
 }
 
 /// The sessions of a test registry, as the session store keeps them.
@@ -199,7 +199,7 @@ impl Sessions {
     }
 }
 
-async fn registry_and_wal_inner(
+async fn registry_and_sessions_inner(
     dir: &Path,
     hold: Option<Arc<tokio::sync::Notify>>,
 ) -> (Arc<LineageRegistry>, Sessions) {
@@ -227,7 +227,7 @@ async fn registry_and_wal_inner(
 }
 
 async fn registry(dir: &Path) -> Arc<LineageRegistry> {
-    registry_and_wal(dir).await.0
+    registry_and_sessions(dir).await.0
 }
 
 async fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_store::SqliteStore>) {
@@ -272,8 +272,8 @@ async fn registry_with_export(dir: &Path) -> (Arc<LineageRegistry>, Arc<broca_st
 
 /// True when the session holds no records: it doesn't exist (the usual result of a refusal,
 /// which writes nothing) or holds none.
-async fn no_durable_records(wal: &Sessions, session: &BindIdentity) -> bool {
-    wal.read_records(session).await.unwrap().is_empty()
+async fn no_durable_records(sessions: &Sessions, session: &BindIdentity) -> bool {
+    sessions.read_records(session).await.unwrap().is_empty()
 }
 
 struct BlockingSendHandler {
@@ -411,7 +411,7 @@ async fn read_one<R: AsyncRead + Unpin>(r: &mut R) -> Frame {
 /// The name carries a per-call sequence number, not just the tag, because a helper that
 /// several tests use passes the same tag for all of them. With a tag-only name, those tests
 /// running in parallel got one directory: each setup deleted it and rebuilt it under the
-/// others, so a test failed opening its store, appending to its WAL, or read another test's
+/// others, so a test failed opening its store, appending to its log, or read another test's
 /// session markers. The scratch root is already private to this process, so a unique name
 /// needs no clean-up of a previous directory before use.
 fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -832,11 +832,11 @@ async fn retired_usage_export_is_unknown_and_terminal_facts_remain() {
 /// and nothing recorded who installed a cap, so any local module could remove a cap or report
 /// spend against one. A call to either name, with the params the operations used to accept, must
 /// get the same unknown-method refusal as any other name broca does not serve, open no session
-/// actor, write nothing to the session's WAL, and create no `caps.db`.
+/// actor, write nothing to the session's log, and create no `caps.db`.
 #[tokio::test]
 async fn removed_spend_cap_operations_are_unknown_methods_that_write_nothing() {
     let dir = tmpdir("removed-cap-ops");
-    let (reg, wal) = registry_and_wal(&dir).await;
+    let (reg, sessions) = registry_and_sessions(&dir).await;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -953,8 +953,8 @@ async fn removed_spend_cap_operations_are_unknown_methods_that_write_nothing() {
 
     assert_eq!(reg.slot_counts().open, 0, "a refused call opens no session");
     assert!(
-        no_durable_records(&wal, &session).await,
-        "a refused call writes nothing to the session's WAL"
+        no_durable_records(&sessions, &session).await,
+        "a refused call writes nothing to the session's log"
     );
     assert!(
         !dir.join("caps.db").exists(),
@@ -1123,7 +1123,7 @@ async fn separator_collision_bind_is_rejected_before_any_durable_state() {
     let bind_reply = read_one(&mut creader).await;
 
     // Keep the test non-vacuous: without the serve-side validation, the bind is acknowledged;
-    // this status request then opens the actor and creates the colliding WAL before the failure.
+    // this status request then opens the actor and creates the colliding log before the failure.
     if bind_reply.header.ty == FrameType::Response {
         write_req_epoch(
             &mut cwriter,
@@ -1254,7 +1254,7 @@ async fn wait_for_session_idle<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 #[tokio::test]
 async fn hello_bind_send_with_system_writes_leading_system_message() {
     let dir = tmpdir("system");
-    let (reg, wal) = registry_and_wal(&dir).await;
+    let (reg, sessions) = registry_and_sessions(&dir).await;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -1329,7 +1329,7 @@ async fn hello_bind_send_with_system_writes_leading_system_message() {
     assert_eq!(v["result"]["state"], "active");
 
     // The run's input as its records keep it: the send's system text leads, then its prompt.
-    let run_started: Vec<Message> = wal
+    let run_started: Vec<Message> = sessions
         .read_records(&session)
         .await
         .unwrap()
@@ -1366,7 +1366,7 @@ async fn hello_bind_send_with_system_writes_leading_system_message() {
 #[tokio::test]
 async fn session_send_rejects_reserved_seed_from_before_starting_a_run() {
     let dir = tmpdir("seed-from-rejected");
-    let (registry, wal) = registry_and_wal(&dir).await;
+    let (registry, sessions) = registry_and_sessions(&dir).await;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -1442,7 +1442,7 @@ async fn session_send_rejects_reserved_seed_from_before_starting_a_run() {
     assert_eq!(response.header.ty, FrameType::Error);
     let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(error.code, "unsupported_seed_from");
-    assert!(no_durable_records(&wal, &session).await);
+    assert!(no_durable_records(&sessions, &session).await);
 
     drop(cwriter);
     drop(creader);
@@ -1458,7 +1458,7 @@ async fn session_send_rejects_reserved_seed_from_before_starting_a_run() {
 #[tokio::test]
 async fn session_send_refuses_an_unknown_context_management_value_before_starting_a_run() {
     let dir = tmpdir("context-management-unknown");
-    let (registry, wal) = registry_and_wal(&dir).await;
+    let (registry, sessions) = registry_and_sessions(&dir).await;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -1547,7 +1547,7 @@ async fn session_send_refuses_an_unknown_context_management_value_before_startin
         );
     }
     assert!(
-        no_durable_records(&wal, &session).await,
+        no_durable_records(&sessions, &session).await,
         "a refused value writes nothing durable"
     );
 
@@ -1563,7 +1563,7 @@ async fn session_send_refuses_an_unknown_context_management_value_before_startin
 #[tokio::test]
 async fn session_send_refuses_an_unknown_service_tier_before_starting_a_run() {
     let dir = tmpdir("service-tier-unknown");
-    let (registry, wal) = registry_and_wal(&dir).await;
+    let (registry, sessions) = registry_and_sessions(&dir).await;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -1654,7 +1654,7 @@ async fn session_send_refuses_an_unknown_service_tier_before_starting_a_run() {
         );
     }
     assert!(
-        no_durable_records(&wal, &session).await,
+        no_durable_records(&sessions, &session).await,
         "a refused value writes nothing durable"
     );
 
@@ -1983,7 +1983,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         // never held a call needs no rebuild, scans nothing, and has no failed or pending
         // withdrawal.
         "provider_held",
-        // This process's WAL fsyncs by cause. Asserted below: its four counters exist, and a
+        // This process's log fsyncs by cause. Asserted below: its four counters exist, and a
         // writer that lost its channel without a shutdown (`disconnect`) never happens here.
         // Cached tool routes and the route Goodbyes sent when sessions close. Asserted below:
         // no route outlives its session, and no Goodbye failed, was dropped or is still owed.
@@ -3405,7 +3405,7 @@ async fn subscribe_streams_then_egress_close_tears_down_cleanly() {
 #[tokio::test]
 async fn serve_returns_on_daemon_eof_so_the_seal_can_run() {
     let dir = tmpdir("serve-eof");
-    let (registry, _wal) = registry_and_wal(&dir).await;
+    let (registry, _wal) = registry_and_sessions(&dir).await;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -3452,7 +3452,7 @@ async fn serve_returns_on_daemon_eof_so_the_seal_can_run() {
         returned.is_ok(),
         "serve_connection must RETURN when the daemon's connection closes; it did not within 5s. \
          If it reconnects or waits instead, the production seal (main.rs, the `serving` arm) \
-         never runs and every in-flight run is left to WAL recovery on the next open."
+         never runs and every in-flight run is left to log recovery on the next open."
     );
     let end = returned
         .unwrap()
@@ -3473,7 +3473,7 @@ async fn serve_returns_on_daemon_eof_so_the_seal_can_run() {
 #[tokio::test]
 async fn serve_returns_on_channel0_goodbye_with_cause_goodbye() {
     let dir = tmpdir("serve-goodbye");
-    let (registry, _wal) = registry_and_wal(&dir).await;
+    let (registry, _wal) = registry_and_sessions(&dir).await;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -3547,7 +3547,7 @@ async fn serve_returns_on_channel0_goodbye_with_cause_goodbye() {
 #[tokio::test]
 async fn serve_ends_ok_when_the_daemon_resets_the_socket() {
     let dir = tmpdir("serve-reset");
-    let (registry, _wal) = registry_and_wal(&dir).await;
+    let (registry, _wal) = registry_and_sessions(&dir).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let module_side = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -3865,7 +3865,7 @@ impl RunExecutor for GatedCoreExec {
 }
 
 /// One serve connection over a real registry and core loop, with helpers to bind channels
-/// under a principal and to read what reached the WAL.
+/// under a principal and to read what reached the log.
 struct PrincipalRig {
     dir: std::path::PathBuf,
     reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
@@ -4355,7 +4355,7 @@ fn scope_adoption_refused_golden_bodies_are_subc_error_bodies() {
     }
 }
 
-// ── The send key: recorded on the WAL record that carries the message ──
+// ── The send key: recorded on the log record that carries the message ──
 
 #[tokio::test]
 async fn undecodable_control_request_errors_and_keeps_connection_alive() {
@@ -4455,7 +4455,7 @@ async fn undecodable_control_request_errors_and_keeps_connection_alive() {
 #[tokio::test]
 async fn session_send_invalid_on_restart_matches_golden_and_writes_nothing() {
     let dir = tmpdir("restart-policy-invalid");
-    let (registry, wal) = registry_and_wal(&dir).await;
+    let (registry, sessions) = registry_and_sessions(&dir).await;
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (mut creader, mut cwriter) = tokio::io::split(client);
     let (sreader, swriter) = tokio::io::split(server);
@@ -4546,7 +4546,7 @@ async fn session_send_invalid_on_restart_matches_golden_and_writes_nothing() {
         }
     }
     assert!(
-        no_durable_records(&wal, &session).await,
+        no_durable_records(&sessions, &session).await,
         "a refused value writes nothing durable"
     );
 

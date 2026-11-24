@@ -2,13 +2,13 @@
 //!
 //! Under the stored-ledger rules (`runner-tags/v1`) every part broca stored got a number when
 //! its record was appended: the session's [`WalHandle`](crate::WalHandle) assigned them under
-//! the lock that orders the record's sequence number, so they increase in WAL order, and the
+//! the lock that orders the record's sequence number, so they increase in log order, and the
 //! next number is the highest any record holds, plus one. Retention deletion records the next
 //! number on its tombstone so a lineage created after it keeps counting from there.
 //!
 //! Under the computed rules (`runner-tags/v2`, llm-runner 0.4.0 §9.6) no record stores a
 //! number. A run frozen under them numbers the parts that count, in the order a request
-//! renders the transcript, after its checkpoint ([`TagNumbering`]): the replay of the WAL and
+//! renders the transcript, after its checkpoint ([`TagNumbering`]): the replay of the log and
 //! the live loop drive the same numbering, so a read, a resume and the live request agree. The
 //! first such run on a session the ledger numbered takes the ledger's high-water as its
 //! checkpoint, so nothing a reader has seen is renumbered. A run keeps the rules it was frozen
@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// What a lineage's records say about tags, as folded from its WAL.
+/// What a lineage's records say about tags, as folded from the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LineageTags {
@@ -89,7 +89,7 @@ pub fn plan_renders_tags(manifest: &broca_records::record::PlanManifest) -> bool
 
 /// What numbering needs to know about the transcript before a stretch it numbers: the
 /// highest number shown so far, and the computed rules of the run the stretch continues, when
-/// the stretch starts inside a run whose start lies before it (a WAL tail after materialized
+/// the stretch starts inside a run whose start lies before it (a log tail after materialized
 /// rows).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TagSeed {
@@ -116,9 +116,10 @@ impl TagSeed {
 }
 
 /// Numbers a transcript under the computed rules as it grows, in the order it is rendered:
-/// the replay of a WAL and the live run loop both drive one, over the same messages in the
-/// same order, so both give each counted part the same number. Messages written under the stored-ledger
-/// rules keep the numbers their records stored; numbering continues above the highest of them.
+/// the replay of the session's log and the live run loop both drive one, over the same
+/// messages in the same order, so both give each counted part the same number. Messages
+/// written under the stored-ledger rules keep the numbers their records stored; numbering
+/// continues above the highest of them.
 #[derive(Debug, Clone)]
 pub struct TagNumbering {
     high: u64,

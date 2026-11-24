@@ -128,7 +128,7 @@ async fn reserved_reader_same_triple_gets_written_lineage() {
         );
 
         // Tool-provider routes present the synthetic harness `runner`, but transcript reads must
-        // use the session's own harness. The other harness addresses a different WAL.
+        // use the session's own harness. The other harness addresses a different session's log.
         let other = broca_protocol::BindIdentity::new(&subject.project_root, "runner", session);
         let other_route = subject.open(&reader, &other).await.unwrap();
         let never_written = request(

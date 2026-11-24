@@ -46,12 +46,12 @@ pub const SESSION_IN_TWO_CLASSES: &str = "session_in_two_classes";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageClass {
-    /// Backed up: `wal-durable/`, [`SESSION_STORAGE_DURABLE_DIR`].
+    /// Backed up: [`SESSION_STORAGE_DURABLE_DIR`].
     Durable,
-    /// Not backed up, because its callers relaunch rather than restore it: `wal/`,
+    /// Not backed up, because its callers relaunch rather than restore it:
     /// [`SESSION_STORAGE_DIR`].
     Ordinary,
-    /// Not backed up, because the session has a retention policy: `wal-ephemeral/`,
+    /// Not backed up, because the session has a retention policy:
     /// [`SESSION_STORAGE_EPHEMERAL_DIR`].
     Ephemeral,
 }

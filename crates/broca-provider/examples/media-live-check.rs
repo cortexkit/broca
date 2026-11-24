@@ -692,7 +692,7 @@ async fn run_live(
     let mut resolved = frozen.clone();
     if route.is_anthropic_oauth() {
         let state = resolve_state_root().map_err(|_| "install_identity_unavailable")?;
-        let install_id = claude_code_identity::load_or_create_install_id(&state.path)
+        let install_id = claude_code_identity::load_or_create_install_id(&state)
             .map_err(|_| "install_identity_unavailable")?;
         resolved = oauth_config(
             route,

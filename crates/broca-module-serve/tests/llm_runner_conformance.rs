@@ -2,7 +2,7 @@
 //! The suite comes from the pinned cortexkit/commons repository.
 //!
 //! Each temporary directory owns a private `ck-subc` daemon, the supervised runner's
-//! WAL and index, and a stand-in module that supplies a second caller identity. The
+//! log and index, and a stand-in module that supplies a second caller identity. The
 //! HTTP model and SDK tool/compaction providers stay in this test process, so their
 //! observations survive killing and restarting the runner.
 //!
@@ -10,7 +10,7 @@
 //! number of emitted answers to choose their scripted turn. Legacy requests identify
 //! their session by a system marker and count assistant messages already in the input.
 //!
-//! Before SIGKILL, the harness verifies the WAL records required by the named crash
+//! Before SIGKILL, the harness verifies the log records required by the named crash
 //! checkpoint. CompactionApplied and FoldRecorded pause inside the runner before HTTP
 //! can receive the corresponding model input. Older checkpoints hold the subsequent
 //! model or tool operation. StepRecorded additionally truncates away dispatch intents
@@ -2090,7 +2090,7 @@ impl BrocaSubject {
     /// the session's last `RunStarted` on. A scenario may run earlier turns on the same session
     /// first (the StepRecorded crash case runs one finished turn to read its lineage before the
     /// kill), and those runs must each have ended before the cut one started. The compaction
-    /// points keep counting the whole WAL, as their scenarios run one turn per session.
+    /// points keep counting the whole log, as their scenarios run one turn per session.
     async fn holds_point(&self, live: &Live, session: &str, point: &str) -> Result<(), String> {
         use Record as R;
         let all = self.records(live, session).await;
@@ -3350,7 +3350,7 @@ impl LlmRunnerSubject for BrocaSubject {
         _created_at_ms: u64,
     ) -> Result<bool, HarnessError> {
         // Broca has no operation to rewrite an existing host acceptance/request stamp.
-        // Editing the rebuildable read cache would fabricate a fact not backed by WAL.
+        // Editing the rebuildable read cache would fabricate a fact not backed by the log.
         eprintln!("seed_host_created_at unavailable: recorded host facts are immutable; no independent host-creation write path exists, and cache-only edits are not host facts");
         Ok(false)
     }
@@ -5931,7 +5931,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
 }
 
 /// Attach one private NATS bus to every daemon the kit starts, as production runs with a bus.
-/// The kit reads compaction advance notices captured at the bus, never rebuilt from the WAL,
+/// The kit reads compaction advance notices captured at the bus, never rebuilt from the log,
 /// so without a bus its notice cases could only fail. A missing `nats-server` therefore fails
 /// the suite here, naming the cause, instead of failing those cases with a misleading reason.
 #[cfg(feature = "test-clock")]

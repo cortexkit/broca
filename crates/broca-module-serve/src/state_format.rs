@@ -36,7 +36,7 @@ mod tests {
             std::fs::write(root.join("state-format"), marker).unwrap();
             std::fs::write(root.join("broca.db"), b"old staging data").unwrap();
             // Even an invalid log directory must not hide the unsupported format's name.
-            std::fs::write(root.join("wal"), b"not a log directory").unwrap();
+            std::fs::write(root.join("session-store"), b"not a log directory").unwrap();
             let error = match prepare(&root) {
                 Ok(_) => panic!("broca-state/2 must not run as today's format"),
                 Err(error) => error,
@@ -50,7 +50,7 @@ mod tests {
                 b"old staging data"
             );
             assert_eq!(
-                std::fs::read(root.join("wal")).unwrap(),
+                std::fs::read(root.join("session-store")).unwrap(),
                 b"not a log directory"
             );
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), 3);

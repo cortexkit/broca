@@ -65,7 +65,7 @@ pub struct SendSpec<'a> {
     pub cache: Option<cortexkit_role_llm_runner::cache::Cache>,
     pub budget: Option<broca_protocol::BudgetConfig>,
     pub auth: Option<AuthParams>,
-    /// `Some(true)` skips transcript materialization while keeping the WAL readable.
+    /// `Some(true)` skips transcript materialization while keeping the log readable.
     pub one_shot: Option<bool>,
     /// `None` omits the wire field: inherit the session's value, or take the process default
     /// on its first episode.

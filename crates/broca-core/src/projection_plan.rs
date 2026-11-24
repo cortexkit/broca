@@ -1,4 +1,4 @@
-//! Semantic planning for materialized WAL projections. Stores load a consistent
+//! Semantic planning for materialized log projections. Stores load a consistent
 //! snapshot and atomically apply the batch only if its expected state still matches.
 
 use crate::ReplayError;

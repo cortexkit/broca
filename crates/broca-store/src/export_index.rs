@@ -370,7 +370,7 @@ impl ExportStore {
     }
 
     /// Compute and append only the segments belonging to `run_id`.  The input
-    /// is the complete session WAL so refreeze boundaries and terminal metadata
+    /// is the complete session's log so refreeze boundaries and terminal metadata
     /// are interpreted by the same pure billing function used elsewhere.
     pub fn emit_export_run(
         &self,
@@ -626,7 +626,7 @@ enum CollisionKind {
 ///
 /// `charge_basis_mapping_version` is the measured instance. The shipped constant went 3 -> 4 on
 /// 2026-09-18 and the stamp is resolved from the CURRENT table at close_segment
-/// (`billing.rs:208`), not restored from the frozen WAL config -- so re-deriving any fact older
+/// (`billing.rs:208`), not restored from the frozen log config -- so re-deriving any fact older
 /// than that change produces a difference here. Measured on production: 38,201 of 39,290 facts
 /// (97.2%) carry a version other than the shipped one.
 ///
@@ -637,7 +637,7 @@ enum CollisionKind {
 ///   charge_basis_mapping_version   4 distinct (1,2,3,4) vs shipped 4   <- MOVES, whitelisted
 ///   usage_policy_version           derived from the FROZEN config at run start, so an old
 ///                                  fact re-derives to its own recorded value   <- stable
-///   pricing_at_ms / _precision     from `freeze_ts_ms.or(terminal_ts_ms)`, both WAL facts
+///   pricing_at_ms / _precision     from `freeze_ts_ms.or(terminal_ts_ms)`, both log facts
 ///   occurred_at_precision          one distinct value across the whole corpus
 ///
 /// That matters because a second moving constant outside this list would take the loud arm and

@@ -1030,7 +1030,7 @@ use tokio::{
 /// while broca reported nothing wrong.
 ///
 /// The alternative fix -- asking callers to change their bind -- would RE-KEY their sessions,
-/// because harness is joined into the WAL, lease and store keys. That is why the translation
+/// because harness is joined into the log, lease and store keys. That is why the translation
 /// lives here and must not be "simplified" back to a clone.
 #[test]
 fn tool_module_bind_presents_the_contract_harness_not_the_callers_key_component() {

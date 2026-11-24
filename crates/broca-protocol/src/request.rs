@@ -26,7 +26,7 @@ use crate::content::Message;
 
 /// A concrete model handle — the runner is GIVEN this (model selection is the
 /// caller's job). `{provider_module_id, model_id}` identifies which provider
-/// module + model a run is bound to; recorded in the WAL `run_config` so a
+/// module + model a run is bound to; recorded in the log `run_config` so a
 /// model/provider change between a run and its resume is detected as a mismatch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelHandle {
@@ -208,7 +208,7 @@ pub struct AuthRequest {
 
 /// The run identity for ONE step — the run this step belongs to, and which step it is.
 /// Both values are DETERMINISTIC across a resume (the run id is fixed for the run; the step
-/// index is reconstructed as `completed_steps + 1` from the WAL), so a render that derives
+/// index is reconstructed as `completed_steps + 1` from the log), so a render that derives
 /// body bytes from them reproduces identical bytes live-vs-resume. Carried on `CallOptions`
 /// (rebuilt per step from run state) rather than the frozen render config, so run identity
 /// never enters the config-drift hash — the frozen config stays "how to render", not "which
@@ -220,7 +220,7 @@ pub struct StepContext {
     pub run_id: String,
     /// The 1-based step index within the run.
     pub step_index: u64,
-    /// The session's WAL address, passed only to transport diagnostics and never rendered.
+    /// The session's log address, passed only to transport diagnostics and never rendered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_address: Option<String>,
     /// The frozen credential identity, passed only to transport diagnostics.
@@ -232,8 +232,8 @@ pub struct StepContext {
     /// This step's output-token cap, when the run lowered it below the frozen render config's
     /// cap so that the estimated input plus the output reservation stays inside the model's
     /// context window. `None` renders the frozen cap unchanged. The runner records the lowered
-    /// value in the WAL (`output_reservation_clamped`) before sending, so a resume and every
-    /// request rebuilt from the WAL render the same cap.
+    /// value in the session's log (`output_reservation_clamped`) before sending, so a resume and
+    /// every request rebuilt from the log render the same cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
 }
@@ -361,7 +361,7 @@ pub struct CallOptions {
     /// Used only by marker renderers; excluded from canonical request serialization.
     #[serde(skip)]
     pub marker_order_version: Option<u32>,
-    /// Frozen episode boundaries/configs reconstructed from WAL; never canonical content.
+    /// Frozen episode boundaries/configs reconstructed from the log; never canonical content.
     #[serde(skip)]
     pub render_episodes: Arc<RenderHistory>,
     /// Setup's frozen ranks, addressed by native rendered-prompt position, never ordinal.
@@ -676,8 +676,8 @@ pub struct SubmissionRequest {
     /// rendered and never part of the message body. It is part of the send's identity, and it
     /// is stored only there: the identity digest (`submission_identity_digest` in broca-core)
     /// carries the value itself, and the `RunStarted`, `Steered` or `Queued` record that holds
-    /// the digest then requires the WAL feature `client-message-id/v1`. Never serialized with
-    /// the request, so a queued record's request bytes do not change.
+    /// the digest then requires the session's log feature `client-message-id/v1`. Never serialized
+    /// with the request, so a queued record's request bytes do not change.
     #[serde(skip)]
     pub client_message_id: Option<String>,
 }
@@ -838,7 +838,7 @@ pub enum ContextManagement {
     None,
     /// A transform module named by id. broca does not serve this value: admission, resume and
     /// boot refuse it by name with `context_management_unavailable`. It still decodes because
-    /// older `RunStarted` and `Queued` records carry it, and a WAL holding them must stay
+    /// older `RunStarted` and `Queued` records carry it, and a session's log holding them must stay
     /// readable rather than fail to decode.
     Transform(String),
     /// broca-native summarise-and-continue. Parsed so a caller can name it, but refused at

@@ -5,7 +5,7 @@ use broca_protocol::content::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Half the maximum session-read page size, and well below the WAL frame limit.
+/// Half the maximum session-read page size, and well below the log frame limit.
 pub const MAX_REPLACEMENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// A half-open range of the original transcript's ordinals; an empty range is an insertion.

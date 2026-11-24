@@ -682,7 +682,7 @@ fn admitted_agent_run_sender(principal: Option<&BindPrincipal>, scope: &SessionS
 }
 
 /// A model-only automation must not fetch or declare tools, even through a planned send.
-/// Returns the offending request field so serve can refuse before admission or WAL opening.
+/// Returns the offending request field so serve can refuse before admission or log opening.
 pub fn model_only_scope_tool_field(
     send: &SendScope,
     tools: bool,

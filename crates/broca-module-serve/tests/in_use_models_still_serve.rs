@@ -107,9 +107,7 @@ fn days_since((y, m, d): (i64, i64, i64)) -> i64 {
 /// about a catalog the daemon never serves. Read-only: this opens the operator's catalog on
 /// purpose, and never writes under it.
 fn live_catalog_path() -> Option<std::path::PathBuf> {
-    let root = broca_module_serve::state_root::resolve_state_root()
-        .ok()?
-        .path;
+    let root = broca_module_serve::state_root::resolve_state_root().ok()?;
     let path = root.join("catalog/fusiform-lkg.json");
     path.exists().then_some(path)
 }

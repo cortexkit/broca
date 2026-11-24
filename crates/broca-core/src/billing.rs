@@ -1,11 +1,11 @@
-//! Pure billing-segment derivation from the durable WAL.
+//! Pure billing-segment derivation from a session's durable records.
 //!
 //! A segment is opened by a `RunStarted`, `RunConfigRefrozen`, or `RunAuthRefrozen` record,
 //! or by a model call answered by another model than the open segment's (a step routed to the
 //! refusal-fallback model, or one an Anthropic server-side fallback served), and is closed only
 //! when the run reaches a durable terminal record or one of those opens the next segment. This module
 //! deliberately has no clock or filesystem access: rebuilding an export from
-//! the same WAL must reproduce the same facts byte-for-byte.
+//! the same records must reproduce the same facts byte-for-byte.
 
 use broca_protocol::{
     caller::RunFinishReason, request::ModelHandle, BindIdentity, RunId, StepId, Usage,
@@ -124,7 +124,7 @@ where
     }
 }
 
-/// One maximal WAL slice with a homogeneous billing identity.
+/// One maximal run of records with a homogeneous billing identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendSegment {
     pub run_id: RunId,
@@ -219,7 +219,7 @@ pub struct SpendSegment {
     /// answer for a row that cannot support one.
     ///
     /// The undateable rows are a closed set: the one-time backfill that re-derived facts for
-    /// runs predating `ts_ms` on the WAL envelope. Bounded and historical, so the share shrinks
+    /// runs predating `ts_ms` on the record envelope. Bounded and historical, so the share shrinks
     /// as traffic accumulates -- but it is 17% of facts and a tenth of all recorded output
     /// tokens today, which is enough for a time-bucketed total to be quietly wrong rather than
     /// visibly incomplete.
@@ -229,8 +229,8 @@ pub struct SpendSegment {
     /// `true` only on the fact for one cache warm attempt, priced from its own reported usage.
     /// Legacy facts describe successful refreshes; new facts with `bill-attempts/v1` evidence
     /// carry `warm_outcome` so a failed attempt is not mistaken for a refreshed cache.
-    /// Each fact uses its own WAL record: its
-    /// `segment_ordinal` is that record's WAL sequence and its `fact_id` is taken over that
+    /// Each fact uses its own record: its
+    /// `segment_ordinal` is that record's sequence and its `fact_id` is taken over that
     /// sequence, so it never moves the ids or ordinals of the run's ordinary segments. Absent on
     /// every other fact, which keeps their bytes and ids exactly what they were.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -561,7 +561,7 @@ impl OpenRun {
 
 /// Compute billing-homogeneous segments from one run or a complete session lineage.
 ///
-/// The input must be in WAL order. The function is intentionally pure: terminal
+/// The input must be in log order. The function is intentionally pure: terminal
 /// and freeze timestamps come only from fields present in the records. Records that
 /// lack those fields therefore produce `None` rather than using a rebuild-time clock.
 pub fn compute_segments<R: ChargeBasisResolver>(
@@ -778,7 +778,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                 ..
             } => {
                 // A warm is billed under the run whose request it re-sent. A warm naming a run
-                // this WAL holds no start of has no config to bill it with, and yields no fact.
+                // this log holds no start of has no config to bill it with, and yields no fact.
                 if let Some((session, config, scope)) = episodes.get(run_id) {
                     if target_run.is_none_or(|target| target == run_id) {
                         // A late manual source warm historically followed its step's committed

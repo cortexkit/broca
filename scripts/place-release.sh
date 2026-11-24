@@ -21,7 +21,8 @@
 #   scripts/place-release.sh --restart-only [--dest <path>] [--live-approved]
 # --live-approved permits a restart with known live runs, logging the invoking OS user.
 # It never bypasses an unreadable gate or the new-pid/placed-inode wait.
-# --report FILE writes the rollback path, restart pid and pre-restart live WAL names as JSON.
+# --report FILE writes the rollback path, restart pid and pre-restart live session-log names as
+# JSON.
 # The client defaults to broca-session with the staged module's suffix. Rollback
 # commands use --session-staged, or --remove-session to restore
 # an installation that had no placed client.
@@ -41,10 +42,12 @@
 # only if the placement succeeded AND a second live-run check, taken just before the restart,
 # is still clear. Without it the operator types the restart by hand, creating a race window:
 # if a run starts in the seconds after placement, a hand-typed restart cuts the run to reload
-# the same binary. A later restart must check the gate again, even when the bytes are already on disk.
+# the same binary. A later restart must check the gate again, even when the bytes are already
+# on disk.
 #
 # --restart-only rechecks the live-run gate and loads bytes already at --dest, without placing.
-# Before either restart, save private health JSON in ~/.local/state/cortexkit/broca/health-before-restart (newest 50; failures only warn).
+# Before either restart, save private health JSON in
+# ~/.local/state/cortexkit/broca/health-before-restart (newest 50; failures only warn).
 # Exit codes: 0 placed or restarted, 1 refused on a checked condition,
 # 2 cannot compare / bad invocation, 3 placed but NOT restarted because a run went live after
 # the first check (use --restart-only when the gate is clear; the new bytes are on disk),
@@ -54,7 +57,7 @@
 # code means 0 clear / 1 live / other cannot tell), PLACE_RELEASE_CK replaces the `ck` binary.
 # PLACE_RELEASE_WAIT_SECONDS and PLACE_RELEASE_POLL_SECONDS shorten the wait in tests.
 # PLACE_RELEASE_RUN_SECONDS bounds each run of the candidate binary (default 30).
-# BROCA_STATE_ROOT moves the state root, and with it the WAL feature floor file.
+# BROCA_STATE_ROOT moves the state root, and with it the session-log feature floor file.
 #
 # THE PLACEMENT GATE refuses, naming the check and the file it read, unless the signed temp copy
 # (the exact bytes the rename will publish) passes all of:

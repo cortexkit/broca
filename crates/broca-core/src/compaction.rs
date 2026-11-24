@@ -7,14 +7,14 @@
 //! rendered before.
 //!
 //! Runner state lost (compaction-provider/v1 §5.3) cannot happen to broca on its own: tags,
-//! the Setup answer, applied views and notices all live in the same write-ahead log as the
+//! the Setup answer, applied views and notices all live in the same session's log as the
 //! transcript, so none of them can be lost or restored separately from it. The next tag is the
-//! WAL's own high-water plus one, and retention deletion carries a tag floor to the next
+//! log's own high-water plus one, and retention deletion carries a tag floor to the next
 //! lineage. A new lineage starts with no compaction state at all: it runs Setup again,
 //! renders Setup's initial message, and its notices carry no `descends_from` and no
 //! `applied_view_version` until a view of that lineage applies. Its notice numbers continue
 //! from the deleted lineage's, which retention deletion records on its tombstone beside the tag
-//! floor. Restoring an older copy of a session's WAL by hand is not detected.
+//! floor. Restoring an older copy of a session's log by hand is not detected.
 
 use broca_protocol::{ContentBlock, Message, Role, Usage};
 use broca_records::{
@@ -43,7 +43,7 @@ pub mod view;
 pub const COMPACTION_CALL_BUDGET_MS: u64 = 2_000;
 
 /// Absent checkpoint field means not captured; `None` and `Captures` precede Setup; `State`
-/// carries everything needed to continue without consulting the provider or the old WAL.
+/// carries everything needed to continue without consulting the provider or the old log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub enum CompactionCheckpoint {
@@ -60,7 +60,7 @@ pub struct AppliedCompaction {
     pub replacement: Arc<Vec<Message>>,
     pub sha256: Box<str>,
     /// Number of canonical messages present when this replacement was applied.
-    /// Derived from WAL record order, not written into the WAL. Older materialized
+    /// Derived from log record order, not written into the log. Older materialized
     /// caches lack this field and must be rebuilt from canonical replay before reuse.
     #[serde(default = "unknown_thinking_boundary")]
     pub thinking_prefix_len: u64,
@@ -116,7 +116,7 @@ pub struct CompactionState {
     #[serde(default)]
     pub announced: Option<view::Announced>,
     /// Event tokens owed to the next notice: companion edits of views applied since the
-    /// newest notice. Folded from the WAL, so a crash between a view record and its notice
+    /// newest notice. Folded from the log, so a crash between a view record and its notice
     /// still reports the companion edit.
     #[serde(default)]
     pub unannounced: Vec<String>,
@@ -143,14 +143,14 @@ pub struct CompactionState {
     /// names a subscription account with a vault-served account id. `None` when broca has
     /// no account fact (no routing selection, or an unrouted credential). Updated when a
     /// run starts and when its auth refreezes; folded from `RunStarted` and
-    /// `RunAuthRefrozen` so a restart rebuilds it from the WAL instead of memory.
+    /// `RunAuthRefrozen` so a restart rebuilds it from the log instead of memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_account: Option<String>,
     /// The account label the newest recorded notice attributed, `None` before the first
     /// notice with a known account. Set when a notice is recorded from the run that wrote
     /// it when that run's account is known; left in place when that run's account is
     /// unknown, so a later known run compares against the last known account. Durable
-    /// through the WAL (folded from notices) and checkpoints, so a restart neither rides
+    /// through the log (folded from notices) and checkpoints, so a restart neither rides
     /// spuriously nor misses a change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announced_account: Option<String>,

@@ -1,5 +1,5 @@
-//! Counter carryover follows the legacy WAL's expiry tombstones under `wal-ephemeral/`,
-//! not the current projection's numbering.
+//! Counter carryover follows the session's expiry tombstones, not the current projection's
+//! numbering.
 
 use broca_session_store::record::{Placement, Record};
 

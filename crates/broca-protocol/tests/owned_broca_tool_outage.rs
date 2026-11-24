@@ -68,7 +68,7 @@ fn rendered_text_matches_the_captured_display_rows() {
     );
 }
 
-/// The stored record was captured from broca's write-ahead log (WAL): the outage result broca builds today
+/// The stored record was captured from broca's session log: the outage result broca builds today
 /// equals the captured output, and encodes to the same JSON.
 #[test]
 fn the_outage_result_matches_the_captured_record() {

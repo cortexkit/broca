@@ -25,7 +25,7 @@
 //! control + display share one route's egress, a display flood can fill the FIFO and close
 //! the client route, taking live control down with it — which is fine ONLY because control
 //! reliability is durable+replayable (the client resubscribes from its last durable cursor
-//! and replays the WAL projection), never guaranteed-live. The egress-closed → clean
+//! and replays the log projection), never guaranteed-live. The egress-closed → clean
 //! subscriber teardown → client-resubscribes path IS the reliability mechanism. (v-next, if
 //! display-flood-disrupting-live-control ever measures as a real problem, the fix is
 //! splitting display onto its own route; v1 keeps the unified stream + replay-covers-it.)
@@ -397,10 +397,10 @@ pub fn process_launch_id() -> &'static str {
 
 /// Mint a globally-unique run_id for a fresh send. `run-<session>-<launch-nonce>-<seq>`:
 /// unique across connections (process-global seq) and restarts (per-launch nonce), so a
-/// new run NEVER collides with an old finished run's id — which would otherwise let the
+/// new run NEVER collides with a finished run's id — which would otherwise let the
 /// durable run index clobber a terminal row, or `run.cancel` target the wrong run. A
-/// RESUME reuses its OWN original run_id (the coordinator reads it from the WAL); only a
-/// FRESH send mints here, so re-indexing the same id on resume stays correct.
+/// RESUME reuses its OWN original run_id (the coordinator reads it from the session's log);
+/// only a FRESH send mints here, so re-indexing the same id on resume stays correct.
 fn mint_run_id(session: &str) -> broca_protocol::RunId {
     use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -627,7 +627,7 @@ struct Routes {
     llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
     // The bind observations (project id, principal) stay beside the session key rather than
     // inside it: BindIdentity also keys the actor registry, so folding them in would give one
-    // session WAL a separate actor per distinct observation, all writing the same file.
+    // session's log a separate actor per distinct observation, all writing the same file.
     by_channel: std::collections::HashMap<u16, (u32, BrocaBindIdentity, BindObservation)>,
     pending_binds: std::collections::HashMap<u16, (u32, CancellationToken)>,
     bind_tasks: JoinSet<BindCompletion>,
@@ -2010,7 +2010,7 @@ async fn handle_control_request(
                 role_refusal: None,
             };
             // Keep the bind unacknowledged until its history authorizes the stamp. The read
-            // runs off ingress so a slow WAL/store cannot hide health probes or GOODBYE.
+            // runs off ingress so a slow session log/store cannot hide health probes or GOODBYE.
             if !completed.bind.agent_data && !completed.bind.role.is_sessionless() {
                 let registry = health_registry.clone();
                 routes
@@ -2021,7 +2021,7 @@ async fn handle_control_request(
             finish_bind(completed, writer, routes).await
         }
         // Health probes read only in-memory gauges stamped by normal dependency calls. A probe
-        // must never add catalog, vault, WAL, lease, or store IO to an already degraded daemon.
+        // must never add catalog, vault, log, lease, or store IO to an already degraded daemon.
         ModuleControlRequest::HealthCheck {} => {
             stall::method_context(2);
             let counts = health_registry.slot_counts();
@@ -2144,15 +2144,15 @@ async fn handle_control_request(
             let detail = (!details.is_empty()).then(|| details.join("; "));
             let (stale_epoch_drops, unmatched_terminal_drops) = broca_subc::FRAME_DROPS.counts();
             // EVERY FIGURE BELOW IS THIS PROCESS DESCRIBING ITSELF: in-memory counters and
-            // gauges this same process wrote. That is what makes the probe cheap, and it bounds what
-            // a green reading can mean -- it says the process believes it is
+            // gauges this same process wrote. That is what makes the probe cheap, and it bounds
+            // what a green reading can mean -- it says the process believes it is
             // healthy, not that the work landed. The failure it structurally cannot see is one
             // where the process is wrong about its own state, and a peer lost four days to
             // exactly that: their health read green throughout because it asked the process
             // about itself while the durable store held the cause the whole time.
             //
             // So do not add a field here that a caller might read as an assertion about durable
-            // state. Anything of that kind has to be derived from the store or the WAL by a
+            // state. Anything of that kind has to be derived from the store or the log by a
             // reader that did not write them -- scripts/live-runs.py is that shape deliberately.
             let mut metrics = serde_json::json!({
                     "agent_data_ops": crate::agent_data::health_counts(routes.agent_data.as_deref()),
@@ -2568,7 +2568,7 @@ async fn finish_bind(
         .await;
     }
     // The whole bind triple, not only the session: a caller that reads back under the wrong
-    // harness or root addresses a different (often empty) WAL, and only this line shows it.
+    // harness or root addresses a different (often empty) log, and only this line shows it.
     tracing::debug!(target: "wire.ingress", stage = "bound", channel = completed.channel,
         epoch = completed.epoch, session = %completed.identity.session,
         harness = %completed.identity.harness, project_root = %completed.identity.project_root.display(),
@@ -3474,7 +3474,7 @@ where
             }
             // Deliveries that can join an episode take omitted runner parameters from its
             // frozen config, so they render the session's own request prefix. Admission resolves
-            // them against its history snapshot; this preflight only classifies WAL presence.
+            // them against its history snapshot; this preflight only classifies log presence.
             // Deliveries that can only start a new run take defaults and must name a model.
             let mut inherit_frozen: std::collections::BTreeSet<
                 broca_protocol::request::InheritedParam,
@@ -3510,8 +3510,8 @@ where
             let session_written = if inherit_frozen.is_empty() && params.model.is_some() {
                 false
             } else {
-                // The presence probe can stat the live WAL and read archive containers, so it
-                // runs on the blocking pool rather than on this request's runtime worker.
+                // The presence probe can stat the live session log and read archive containers,
+                // so it runs on the blocking pool rather than on this request's runtime worker.
                 let probe_handler = Arc::clone(handler);
                 let probe_session = session.clone();
                 let probed = broca_diagnostics::spawn_blocking(
@@ -3553,7 +3553,7 @@ where
                 }
                 // An empty placeholder, replaced with the session's frozen model before the send
                 // is recorded as a queued send or admitted (`InheritedParam::Model`), so it is
-                // never rendered and never written to the WAL.
+                // never rendered and never written to the log.
                 params.model = Some(crate::wire::ModelParams {
                     provider: String::new(),
                     model: String::new(),
@@ -3588,7 +3588,7 @@ where
             }
             // A send carrying a fetch plan is checked before it reaches the session and, for a
             // session with no episode yet, every provider the plan names is fetched now. A
-            // refusal here is answered before anything is written to the session's WAL. The
+            // refusal here is answered before anything is written to the session's log. The
             // session's actor checks the plan again against the session's history as it admits
             // the send, in case an episode was written in between.
             if !handler.hook_plane_available() && handler.frozen_plan_requires_hooks(session).await
@@ -6096,7 +6096,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     }
     // Filing an approval question and executing its tool call must use the scope
     // identity supplied by the daemon on the inbound route, never a caller's payload.
-    // Check before fetching providers or opening an actor, so refusal writes no WAL.
+    // Check before fetching providers or opening an actor, so refusal writes no log record.
     if scope.is_none()
         && parsed.step_items.iter().any(|item| {
             item.subscriptions.iter().any(|subscription| {
@@ -6108,7 +6108,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
         return Err(SendPlanRefusal::ApproveRequiresScope);
     }
     // A worker's tools are confined by the scope on its route. Without one, a provider would
-    // run them under head defaults, so refuse before any fetch or WAL write instead of trusting
+    // run them under head defaults, so refuse before any fetch or log write instead of trusting
     // the caller never to send that combination.
     if scope.is_none()
         && parsed
@@ -6118,7 +6118,7 @@ async fn admit_send_plan<H: ServeHandler + ?Sized>(
     {
         return Err(SendPlanRefusal::WorkerPresetRequiresScope);
     }
-    // A reader build must not admit a plan it cannot execute, even when its WAL decoder
+    // A reader build must not admit a plan it cannot execute, even when its log decoder
     // understands hook records. Refuse before fetching providers or allocating a lineage.
     if !parsed.step_items.is_empty() && !handler.hook_plane_available() {
         return Err(broca_fetch_plan::Refusal::InvalidParams {

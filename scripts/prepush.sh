@@ -55,13 +55,13 @@ queue_lane windows windows 8
 queue_lane linux-integration-3 linux 8
 # Shard 1 took 399s at eight workers; its archive still uses the full workspace graph.
 queue_lane linux-integration-1 linux 8
-# Operator/WAL took 316s at two workers and can backfill a partially released reservation.
+# Operator/session-log took 316s at two workers and can backfill a partially released reservation.
 queue_lane linux-small linux 2
 # Deployment took 228s at eight workers, including its required native fixture build.
 queue_lane linux-deploy linux 8
 # Native and Windows-target clippy took 73s + 88s at eight workers; tests run in their CI lanes.
 queue_lane linux-lint linux 8
-# Native macOS's targeted contention/WAL checks took 114s; two workers under nice -n 10.
+# Native macOS's targeted contention/session-log checks took 114s; two workers under nice -n 10.
 queue_lane macos macos 2
 # Minimum supported Rust version (MSRV) checking took 81s at eight workers.
 queue_lane linux-msrv linux 8

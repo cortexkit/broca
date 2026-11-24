@@ -1,6 +1,6 @@
 //! Tool-set assembly + the approval seam. Capability ≠ approval: the per-run
 //! manifest = `requested ∩ harness-policy`, resolved ONCE and immutable for the
-//! run (and persisted in the WAL, so a resume can't silently change the admitted
+//! run (and persisted in the session's log, so a resume can't silently change the admitted
 //! tools — avoids a time-of-check/time-of-use gap). Approval may NARROW a call,
 //! never widen it.
 
@@ -88,7 +88,7 @@ impl ToolManifest {
         }
     }
 
-    /// Use only the plan frozen in the WAL manifest, not a later send or configuration.
+    /// Use only the plan frozen in the session's log manifest, not a later send or configuration.
     pub fn with_plan_manifest(
         mut self,
         manifest: &broca_records::record::PlanManifest,
@@ -257,7 +257,7 @@ impl ToolManifest {
     }
 }
 
-/// Runtime deadline arithmetic uses the role's types; durable bytes use the WAL's types.
+/// Runtime deadline arithmetic uses the role's types; durable bytes use the log's types.
 fn reply_from_frozen(
     saved: &broca_records::record::FrozenReply,
 ) -> cortexkit_role_tool_provider::catalog::Reply {

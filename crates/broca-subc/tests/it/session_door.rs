@@ -258,7 +258,7 @@ async fn direct_consumers_are_refused_before_opening_or_reading() {
 #[tokio::test]
 async fn admit_chunks_at_the_broca_cap_and_resumes_from_the_durable_end() {
     // Literal lengths make this test independent of the client's cap constant.
-    let wal: Vec<u8> = (0..1_048_581).map(|index| (index % 256) as u8).collect();
+    let log_bytes: Vec<u8> = (0..1_048_581).map(|index| (index % 256) as u8).collect();
     let door = FakeDoor::start(vec![
         offsets(2, 1),
         offsets(1_048_578, 5),
@@ -267,13 +267,19 @@ async fn admit_chunks_at_the_broca_cap_and_resumes_from_the_durable_end() {
     ])
     .await;
     let client = door.client(true).await;
-    let result = client.admit(SESSION_REF, &wal, deadline()).await.unwrap();
-    assert_eq!(result.durable_offset, wal.len() as u64);
+    let result = client
+        .admit(SESSION_REF, &log_bytes, deadline())
+        .await
+        .unwrap();
+    assert_eq!(result.durable_offset, log_bytes.len() as u64);
     assert_eq!(
         result.cloud_offset, 5,
         "durable admission is not cloud coverage"
     );
-    client.admit(SESSION_REF, &wal, deadline()).await.unwrap();
+    client
+        .admit(SESSION_REF, &log_bytes, deadline())
+        .await
+        .unwrap();
     let sent = door.sent();
     assert_eq!(
         sent.len(),
@@ -283,8 +289,8 @@ async fn admit_chunks_at_the_broca_cap_and_resumes_from_the_durable_end() {
     assert_eq!(sent[1]["params"]["fromOffset"], 2);
     assert_eq!(sent[2]["params"]["fromOffset"], 1_048_578);
     for (request, expected) in [
-        (&sent[1], &wal[2..1_048_578]),
-        (&sent[2], &wal[1_048_578..]),
+        (&sent[1], &log_bytes[2..1_048_578]),
+        (&sent[2], &log_bytes[1_048_578..]),
     ] {
         assert_eq!(request["method"], "session.admit");
         assert_eq!(request["params"].as_object().unwrap().len(), 3);

@@ -1,6 +1,7 @@
 //! The media profile is an optional frozen render field: absent configs keep their exact
-//! serialized shape and request bytes, a recorded profile requires the media-content/v1 WAL feature,
-//! and the profile a run froze is the one it keeps while the catalog moves underneath it.
+//! serialized shape and request bytes, a recorded profile requires the media-content/v1
+//! session log feature, and the profile a run froze is the one it keeps while the catalog
+//! moves underneath it.
 
 use broca_protocol::{
     content::{ContentBlock, MediaKind, Message, Role},

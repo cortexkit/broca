@@ -27,16 +27,16 @@ pub enum ErrorClass {
     Permanent,
     /// 401 after refresh failed → a credential must be re-established by a human.
     /// Wire spelling is `auth_required` (contract vocabulary); `auth` is accepted on
-    /// read indefinitely so WAL records written before the rename replay clean.
+    /// read indefinitely so log records written before the rename replay clean.
     #[serde(rename = "auth_required", alias = "auth")]
     Auth,
     /// The prompt exceeded the model's context window. Remedy is a bounded
     /// reduce-and-retry via the store seam, NOT a loop-owned compaction.
     ContextOverflow,
     /// The provider transport became unavailable before the step completed. The transport
-    /// resets the display and re-issues the same rendered request within the step's bounded retry
-    /// budget (attempt count and wall time); exhaustion surfaces the last failure as the terminal step error. Re-issuing is
-    /// safe because the model leg has no WAL record.
+    /// resets the display and re-issues the same rendered request within the step's bounded
+    /// retry budget (attempt count and wall time); exhaustion surfaces the last failure as the
+    /// terminal step error. Re-issuing is safe because the model leg has no log record.
     ///
     /// NOT part of the shared contract vocabulary: its generic consumer decision is
     /// Transient's, so it maps to `transient` at shared boundaries (see
@@ -125,7 +125,7 @@ mod open_error_class_tests {
 
 impl ErrorClass {
     /// Whether the transport may re-issue the model step for this class (the model
-    /// leg writes no WAL record, so re-running it is safe).
+    /// leg writes no log record, so re-running it is safe).
     pub fn step_reissuable(self) -> bool {
         matches!(
             self,
@@ -323,7 +323,7 @@ pub struct ProviderError {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affordable_max_tokens: Option<u32>,
     /// Google quota detail fields, copied from typed RPC details before the provider message is
-    /// truncated. WAL records carrying this field require `google-rpc-error-details/v1`.
+    /// truncated. Log records carrying this field require `google-rpc-error-details/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_details: Option<Box<GoogleRpcErrorDetails>>,
     /// Why the run did not move to another account at this limit: routing's answer when the
@@ -502,7 +502,7 @@ mod tests {
         assert_eq!(spell(ErrorClass::ContextOverflow), "context_overflow");
     }
 
-    /// WAL records written before the auth→auth_required rename carry "auth"; the
+    /// Log records written before the auth→auth_required rename carry "auth"; the
     /// read-side alias must accept both spellings indefinitely so old sessions replay.
     #[test]
     fn auth_read_alias_accepts_both_spellings() {

@@ -128,9 +128,9 @@ impl SignedFloor {
 /// What a replay or a run knows about its lineage's floor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum FloorFold {
-    /// The fold didn't start at the lineage's first run (a replay of a WAL tail), so the tool
-    /// sets of earlier runs are unknown. Never read as "no floor": a run on a route that binds
-    /// reasoning to its prefix replays the whole WAL instead.
+    /// The fold didn't start at the lineage's first run (a replay of a log tail), so the tool
+    /// sets of earlier runs are unknown. Never read as "no floor": a run on a route that
+    /// binds reasoning to its prefix replays the whole log instead.
     #[default]
     Unknown,
     Known(SignedFloor),
@@ -138,10 +138,11 @@ pub enum FloorFold {
 
 impl FloorFold {}
 
-/// The tool-set facts an admission checkpoint folds from its lineage's run starts, so an append
-/// admitted from the checkpoint knows the floor without replaying the WAL. The checkpoint counts
-/// no transcript messages, so it can't hold the floor's ordinal. It holds the newest run's set
-/// and whether any run ever changed it, which is all an unchanged lineage needs.
+/// The tool-set facts an admission checkpoint folds from its lineage's run starts, so an
+/// append admitted from the checkpoint knows the floor without replaying the log. The
+/// checkpoint counts no transcript messages, so it can't hold the floor's ordinal. It holds
+/// the newest run's set and whether any run ever changed it, which is all an unchanged
+/// lineage needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSetHistoryV1 {
     /// The newest run's [`tool_set_digest`]; absent before the first run.
@@ -159,8 +160,8 @@ pub struct ToolSetHistoryV1 {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "Option<ToolSetHistoryV1>", into = "Option<ToolSetHistoryV1>")]
 pub enum ToolSetHistory {
-    /// A checkpoint stored before the member existed, or folded from a WAL tail. Admission
-    /// treats the checkpoint as incomplete and folds the complete WAL.
+    /// A checkpoint stored before the member existed, or folded from a log tail. Admission
+    /// treats the checkpoint as incomplete and folds the complete log.
     #[default]
     Unknown,
     Known(ToolSetHistoryV1),

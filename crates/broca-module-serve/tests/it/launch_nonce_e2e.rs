@@ -275,7 +275,8 @@ impl Rig {
                 .env("XDG_RUNTIME_DIR", &runtime_dir)
                 .env("XDG_DATA_HOME", &data_home)
                 // broca's state root defaults to the data home pinned above; an inherited
-                // BROCA_STATE_ROOT would override it and put this rig's WAL in the operator's state.
+                // BROCA_STATE_ROOT would override it and put this rig's session log in the
+                // operator's state.
                 .env_remove("BROCA_STATE_ROOT")
                 .env("SUBC_PORT", "0")
                 .env_remove("SUBC_LAUNCH_NONCE")

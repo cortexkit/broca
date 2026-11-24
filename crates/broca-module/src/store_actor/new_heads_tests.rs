@@ -202,7 +202,7 @@ fn sent_by(
     sent
 }
 
-/// A head's creating send starts the session in the session store's durable root, with no WAL and
+/// A head's creating send starts the session in the session store's durable root, with no log and
 /// the feature floor raised, though the module creates no other session there. Its actor closes
 /// when idle, and the head's next send reopens it from that root.
 #[tokio::test]
@@ -315,10 +315,9 @@ async fn a_head_created_by_an_ordered_send_an_interrupt_or_a_sign_in_resume_answ
 }
 
 /// A later `session.send` from another module to a head its reserving owner already started is
-/// answered by the session's history, through the serve layer, exactly as the WAL storage
-/// answers it, and never with the reservation's "nobody started this yet" refusal. A head in the
-/// session store (`broca-session-store`) has no WAL however many runs it has, so the serve
-/// layer's first-send precheck must not read the missing WAL as "no run yet".
+/// answered by the session's history, through the serve layer, and never with the reservation's
+/// "nobody started this yet" refusal: the serve layer's first-send precheck must read a head the
+/// session store holds as started, however it finds it.
 #[tokio::test]
 async fn a_started_head_answers_later_sends_from_its_history_not_its_reservation() {
     use crate::serve::{SendRequest, ServeError, ServeHandler};

@@ -152,7 +152,7 @@ fn a_second_broca_on_a_held_root_exits_at_once_and_writes_nothing() {
     let machine = Machine::new("second");
     let root = machine.state_root();
     // A root that has served before: the state a racing boot recovery would touch.
-    std::fs::create_dir_all(root.join("wal")).unwrap();
+    std::fs::create_dir_all(root.join("session-store")).unwrap();
     std::fs::write(root.join("run-index.db"), b"index").unwrap();
     let holder = state_root_lock::acquire(&root).expect("lock the root as a running broca");
     let before = tree(&root);

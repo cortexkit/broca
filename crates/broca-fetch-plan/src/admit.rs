@@ -1003,7 +1003,7 @@ fn session_tool(provider: &str, tool: &cortexkit_role_tool_provider::catalog::Ca
     }
 }
 
-/// Copy validated catalog fields into the WAL's independently owned storage shape.
+/// Copy validated catalog fields into the log's independently owned storage shape.
 fn freeze_reply(
     reply: &cortexkit_role_tool_provider::catalog::Reply,
 ) -> broca_records::record::FrozenReply {

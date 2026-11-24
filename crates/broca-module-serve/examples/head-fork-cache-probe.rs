@@ -709,7 +709,7 @@ fn configuration(
         } else {
             let root = broca_module_serve::state_root::resolve_state_root()
                 .map_err(|_| "installation state root unavailable")?;
-            claude_code_identity::load_or_create_install_id(&root.path)
+            claude_code_identity::load_or_create_install_id(&root)
                 .map_err(|_| "installation identity unavailable")?
         };
         let bind = BindIdentity::new(std::env::current_dir()?, "head-fork-cache-probe", scope);

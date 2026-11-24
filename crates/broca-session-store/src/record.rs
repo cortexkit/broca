@@ -816,8 +816,8 @@ message! {
         2 req step_id: u64,
         /// The id of the assistant message this step writes, decided here so a live subscriber
         /// can name the message from the step's start. The new loop mints it from its writer
-        /// generation and this record's seq; a step converted from a WAL log keeps the id the
-        /// WAL projection gives the message at that position. The message's `EntryFacts`
+        /// generation and this record's seq; a step converted into the session store keeps the id
+        /// the conversion gave the message at that position. The message's `EntryFacts`
         /// carries the same id, and a fold refuses one that doesn't. A step that writes no
         /// message leaves it unused. Absent on steps written before it was recorded.
         3 opt mid: String,
@@ -1250,7 +1250,7 @@ message! {
         1 req move_id: String,
         /// When the session last changed, as the current `session.head` serves it (`updated_at`).
         2 req source_activity_ms: u64,
-        /// The source WAL's lineage, retained as the session's output-reference namespace.
+        /// The source log's lineage, retained as the session's output-reference namespace.
         /// Readers must preserve it so references handed out before conversion still resolve.
         3 opt [must] source_lineage: String,
     }

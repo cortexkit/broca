@@ -586,7 +586,7 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
     )
     .trust_tier(Some(TrustTier::FirstParty))
     .bindings(Some(Bindings {
-        // broca owns the per-session WAL + materialized store (its own schema).
+        // broca owns the per-session log + materialized store (its own schema).
         storage: StorageBinding {
             kind: StorageKind::Sqlite,
             scope: StorageScope::Project,
@@ -600,17 +600,17 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
             },
     }))
     .protocol_ver(PROTOCOL_VERSION)
-    // CATALOG REFRESH IS ALWAYS DECLARED, and this field was WRONGLY ABSENT until the daemon began serving it
-    // from catalog.list, at which point the absence became a fleet-visible claim rather than a
-    // local omission.
+    // CATALOG REFRESH IS ALWAYS DECLARED, and this field was WRONGLY ABSENT until the daemon
+    // began serving it from catalog.list, at which point the absence became a fleet-visible
+    // claim rather than a local omission.
     //
-    // The prior comment here said broca had nothing to declare yet, and named the WAL append
+    // The comment here said broca had nothing to declare yet, and named the log append
     // and the store projection as the eventual first entries. That was wrong on the field's own
     // definition -- "a declared PERIODIC or event-driven behavior that shapes an EXTERNAL
     // surface". Both of those are caller-triggered and internal: they happen because a caller
     // sent a prompt, and they touch broca's own storage. Neither is a self-signal.
     //
-    // The behavior that actually qualifies is the one the old comment overlooked: broca calls
+    // The behavior that actually qualifies is the one the comment overlooked: broca calls
     // fusiform's `catalog.get` every 30 minutes (CATALOG_POLL_INTERVAL) with NO CALLER ASKING.
     // From fusiform's side that is unattributed periodic load, and an analyst reading their
     // request log without this declaration has to reverse-engineer where it comes from.
@@ -700,19 +700,20 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
     .provides(vec![ProviderRole::ManagementSurface {
             // Concurrent ACROSS sessions, FIFO WITHIN one: the registry fans requests out to
             // per-session lineage actors, and each actor processes its own commands in order
-            // behind the single-writer WAL lease. That is ModuleManaged rather than Serial --
-            // declaring Serial would tell subc to gate every session behind one in-flight call
-            // and serialise a fleet that already schedules itself.
+            // behind the single-writer lease for the session's log. That is ModuleManaged rather
+            // than Serial -- declaring Serial would tell subc to gate every session behind one
+            // in-flight call and serialise a fleet that already schedules itself.
             //
             // Both halves are covered by runtime tests:
             //
             // WITHIN-SESSION ORDERING --
             // `delayed_terminal_send_retry_does_not_queue_behind_active_run`.
             //
-            // CROSS-SESSION OVERLAP -- `concurrent_sessions_sharing_one_tool_module_are_isolated`
-            // drives five sessions through one shared tool route, and its ConcurrencyProbe fails
-            // if ANY run finishes before all five are admitted. So a global lock that made this surface
-            // secretly Serial would be caught, which is what the declaration actually asserts.
+            // CROSS-SESSION OVERLAP --
+            // `concurrent_sessions_sharing_one_tool_module_are_isolated` drives five sessions
+            // through one shared tool route, and its ConcurrencyProbe fails if ANY run finishes
+            // before all five are admitted. So a global lock that made this surface secretly
+            // Serial would be caught, which is what the declaration actually asserts.
             //
             // Run the cross-session test with BROCA_REQUIRE_AIMOCK=1 and BROCA_REQUIRE_SUBC=1.
             // Without these guards, a missing dependency can return early without testing overlap.

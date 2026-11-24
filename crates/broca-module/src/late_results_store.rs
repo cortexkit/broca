@@ -119,7 +119,7 @@ impl Disposition {
 /// Whether a registered call still needs its feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegistrationState {
-    /// Written before the call's key was sent; the call has not been seen in its WAL yet.
+    /// Written before the call's key was sent; the call has not been seen in its log yet.
     Registered,
     /// A terminal was written for the call, or its batch commit barrier or seal was recorded, so
     /// the feed no longer has to wait for it. The row is kept so a later entry is still classed.
@@ -335,7 +335,7 @@ impl LateResultsStore {
         self.unpruned_registration_rows()
     }
 
-    /// A bounded maintenance page, without probing every registration's WAL or tombstone.
+    /// A bounded maintenance page, without probing every registration's log or tombstone.
     /// The cursor is process-local; deleting settled rows cannot skip a surviving key.
     pub fn registration_page(
         &self,

@@ -1,8 +1,8 @@
 //! One `ck-broca` process per state root.
 //!
 //! Boot recovery assumes it is alone on its state root: it rebuilds the fence index, reconciles
-//! cuts, seals crash-orphaned WALs and releases System One batches whose owners died. Two
-//! processes doing that at once race each other, and a reader in one can see the other's
+//! cuts, seals crash-orphaned session logs and releases System One batches whose owners died.
+//! Two processes doing that at once race each other, and a reader in one can see the other's
 //! half-rebuilt fence index and admit a send to a session that is mid-move. The daemon reaps an
 //! old broca before it starts a new one, but overlap still happens: a restart whose boot sweep
 //! could not verify a recorded child and left it running, descendants a kill did not reach, a
@@ -10,7 +10,7 @@
 //!
 //! So `ck-broca` takes an exclusive OS advisory lock on [`LOCK_FILE`] at the top of the state
 //! root before anything else touches the root, and keeps it until the process exits. The lock
-//! is the same kind the System One owner-lifetime lock and the WAL feature floor use
+//! is the same kind the System One owner-lifetime lock and the session log feature floor use
 //! (`std::fs::File::try_lock`: `flock` on Unix, `LockFileEx` on Windows), so the kernel frees it
 //! when the process dies, however it dies, and no stale lock can outlive its holder.
 //!
@@ -156,7 +156,7 @@ fn create_root_if_missing(root: &Path) -> Result<(), StateRootLockError> {
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
     // Directory handles can be synced on Unix only, the same choice the state-format marker
-    // and the WAL directory sync make.
+    // and the session-log directory sync make.
     #[cfg(unix)]
     {
         File::open(dir)?.sync_all()

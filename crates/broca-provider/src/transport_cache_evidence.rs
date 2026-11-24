@@ -288,7 +288,7 @@ impl Pending {
         let mut pending = self.0.lock().unwrap();
         if !pending.prepared {
             // Remove the predecessor while a request is in flight. An aborted task must not
-            // let a later run silently skip over it; that run reconstructs the WAL instead.
+            // let a later run silently skip over it; that run reconstructs the log instead.
             let mut state = session.0.lock().unwrap();
             if !state.seeded && state.previous.is_none() {
                 pending.loader = state.loader.take();

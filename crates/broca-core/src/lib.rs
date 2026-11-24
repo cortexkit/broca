@@ -58,7 +58,6 @@ pub mod seal;
 pub mod served_history;
 
 pub use context::state_for_terminal;
-pub use context::StorePageReadError;
 pub use replay::RunAttribution;
 pub mod resume;
 pub mod run;

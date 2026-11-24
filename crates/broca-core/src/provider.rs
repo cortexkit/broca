@@ -317,7 +317,7 @@ pub trait Provider: Send + Sync {
     }
 
     /// This provider's frozen render config, serialized to an OPAQUE blob for the
-    /// WAL. The loop stores it verbatim and never interprets it; on resume the
+    /// session's log. The loop stores it verbatim and never interprets it; on resume the
     /// provider is reconstructed FROM this blob so it renders byte-identical bytes.
     /// Providers with no configurable render state use a non-null stateless marker.
     /// The blob only needs to round-trip losslessly; it is NOT the cache-hash domain
@@ -346,7 +346,7 @@ pub trait Provider: Send + Sync {
     /// Whether this provider sends a `ProviderControl::AttemptFinished` for every attempt,
     /// INCLUDING the in-flight one when its step is cancelled, and then closes its stream
     /// promptly. When true, the loop keeps reading a cancelled step's stream for a short grace
-    /// period so that last attempt record reaches the WAL before the run's terminal. When
+    /// period so that last attempt record reaches the session's log before the run's terminal. When
     /// false (the default, for in-process providers that may hold their stream open after a
     /// cancel), the loop stops reading at once, exactly as before attempt records existed.
     fn reports_attempt_evidence(&self) -> bool {

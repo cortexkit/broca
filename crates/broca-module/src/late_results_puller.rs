@@ -11,10 +11,10 @@
 //! - a registration per dispatched call, written before that call's key was sent, so an entry's
 //!   lineage is found from the store and never from the rebuildable run index.
 //!
-//! A puller runs only while the module still needs its feed: a registered call with an open held
-//! record or an owed batch commit barrier, an entry no ack covers yet, or a registered WAL the
-//! intake cannot read (which may hide a hold). Ordinary calls to a provider that can settle late
-//! never start one.
+//! A puller runs only while the module still needs its feed: a registered call with an open
+//! held record or an owed batch commit barrier, an entry no ack covers yet, or a registered
+//! session's log the intake cannot read (which may hide a hold). Ordinary calls to a provider
+//! that can settle late never start one.
 //!
 //! This module deliberately enables nothing itself. The tool plane declares the held-reply
 //! capabilities on its routes, and the run holds a batch open; this module is the store, the
@@ -54,7 +54,7 @@ pub const PIN_WARN_AFTER: Duration = Duration::from_secs(5 * 60);
 pub const DELIVERY_STUCK_AFTER: u32 = 3;
 /// Bound each reply while allowing later entries to progress behind an unresolved prefix.
 pub const FEED_PAGE_SIZE: u32 = 128;
-/// Limit WAL reads for old registrations to one small page per maintenance pass.
+/// Limit log reads for old registrations to one small page per maintenance pass.
 pub const REGISTRATION_SWEEP_LIMIT: usize = 64;
 /// The bind a feed's route is opened under. The custodian comes from the connection's consumer
 /// identity, so this only names the route; it is fixed so one feed keeps one route open.
@@ -282,7 +282,7 @@ pub struct LateResultsIntake {
     /// The running pullers, one per provider module. The claim lives only in this process: a
     /// puller never survives its process, so nothing durable may say one is running.
     pullers: Mutex<HashMap<String, Arc<Puller>>>,
-    /// Set while the store is being rebuilt from the WALs. Until the rebuild completes, no
+    /// Set while the store is being rebuilt from the session logs. Until the rebuild completes, no
     /// registration can be trusted to be missing, so every entry is Blocked and nothing is acked.
     rebuilding: std::sync::atomic::AtomicBool,
     sweep_after: tokio::sync::Mutex<Option<(String, String)>>,
@@ -370,7 +370,7 @@ impl LateResultsIntake {
         modules
     }
 
-    /// In-memory only: health checks never open a WAL or the registration store.
+    /// In-memory only: health checks never open a session's log or the registration store.
     pub fn overdue_pins(&self) -> usize {
         self.pullers
             .lock()
@@ -493,8 +493,9 @@ impl LateResultsIntake {
     }
 
     /// Whether the module's feed is still needed, decided from the store's registrations and the
-    /// WALs they name: an owed ack, a registered call whose WAL has an open held call or an owed
-    /// batch commit barrier, or a registered WAL that cannot be read (which may hide a hold).
+    /// session logs they name: an owed ack, a registered call whose session's log has an open
+    /// held call or an owed batch commit barrier, or a registered session's log that cannot be
+    /// read (which may hide a hold).
     ///
     /// The same pass prunes the registrations that are settled for good, so a registration
     /// never outlives the commit of the batch that settled its call.
@@ -1030,11 +1031,11 @@ impl LateResultsIntake {
                 .deliver(&row.call, &held_call_id, entry)
                 .await?;
             // Later entries in this round share the snapshot. Remember the durable terminal
-            // without re-reading the WAL, so a second event cannot deliver the same call twice.
+            // without re-reading the log, so a second event cannot deliver the same call twice.
             if let Some(view) = views.get_mut(&row.call.bind) {
                 view.delivered.insert(entry.call_key.clone());
             }
-            // The batch synced the call's terminal before `deliver` returned, so the WAL now
+            // The batch synced the call's terminal before `deliver` returned, so the log now
             // answers any re-read of this entry as already settled; the receipt only spares the
             // re-read until the ack lands.
             self.store
@@ -1210,9 +1211,9 @@ fn settles_a_call(entry: &LateEntry) -> bool {
 /// How far the rebuild scanned, for the operator's log and for the measurement test.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RebuildReport {
-    /// WAL files looked at.
+    /// Log files looked at.
     pub files: usize,
-    /// WAL files decoded, including logs with no held reply yet.
+    /// Log files decoded, including logs with no held reply yet.
     pub decoded: usize,
     /// Session-store inventory entries examined.
     pub sessions: usize,
@@ -1220,8 +1221,8 @@ pub struct RebuildReport {
     pub registered: usize,
     /// WALs or session heads that could not be read or registered; any one keeps the fence tripped.
     pub unreadable: Vec<std::path::PathBuf>,
-    /// The state root's WAL feature floor shows no provider-held frame was ever written here,
-    /// so no WAL was looked at.
+    /// The state root's log feature floor shows no provider-held frame was ever written here,
+    /// so no log was looked at.
     pub skipped_by_floor: bool,
 }
 

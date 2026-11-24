@@ -52,7 +52,7 @@ pub enum NormalizedEvent {
     Control(ProviderControl),
 }
 
-/// Argument-free evidence of a locally rejected call. This is not a WAL field or record.
+/// Argument-free evidence of a locally rejected call. It is never stored as a field or record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolArgsTrailingGarbage {
     pub tool_call_id: crate::ToolCallId,
@@ -131,7 +131,7 @@ pub enum ProviderControl {
     },
     /// Evidence for ONE HTTP attempt of the current step, sent as that attempt ends and
     /// before the step's terminal `Finished`/`Error`. NOT a terminal and not part of the
-    /// assembled step: the runner only records it (as a WAL `model_attempt_finished`), so a
+    /// assembled step: the runner only records it (as a log `model_attempt_finished`), so a
     /// provider that never sends one changes nothing about the step.
     AttemptFinished { attempt: ModelAttempt },
 }
@@ -221,8 +221,8 @@ pub struct ModelAttempt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_account_ref: Option<String>,
     /// What this attempt saw about its provider account, for the run's reports to the routing
-    /// module. NEVER RECORDED: it is skipped by serde, so the WAL record's bytes do not depend
-    /// on it, and an attempt read back from the WAL always carries it empty.
+    /// module. NEVER RECORDED: it is skipped by serde, so the log record's bytes do not depend
+    /// on it, and an attempt read back from the log always carries it empty.
     /// Boxed because it is empty on most attempts and every provider event carries this type.
     #[serde(skip)]
     pub account_observation: Box<AttemptAccountObservation>,
@@ -531,7 +531,7 @@ impl InputTransformation {
 
 /// How one provider HTTP attempt ended. Serialized as a bare string.
 ///
-/// THIS SITS ON A WAL RECORD, so it must decode values a later build writes: production rolls
+/// THIS SITS ON A LOG RECORD, so it must decode values a later build writes: production rolls
 /// back, and a rolled-back build that refused an outcome name it did not know would fail to
 /// decode the record. Any string therefore decodes, and an unrecognised one is KEPT verbatim in
 /// [`AttemptOutcome::Unknown`], so re-serializing it writes back exactly the string that was

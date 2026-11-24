@@ -1,4 +1,4 @@
-//! Session-change operations through the real serve loop, WAL writer and episode executor.
+//! Session-change operations through the real serve loop, log writer and episode executor.
 mod delivery_rig;
 #[path = "session_change/interrupt_cancel.rs"]
 mod interrupt_cancel;

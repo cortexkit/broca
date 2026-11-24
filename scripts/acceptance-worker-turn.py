@@ -62,7 +62,7 @@ def store_summary(admission, status, after_ms):
         reason = None
     elif not isinstance(reason, str) or reason not in FINISH_REASONS:
         reason = "unclassified_terminal"
-    # The store has a record schema rather than WAL feature requirements or a WAL sequence.
+    # The store has a record schema rather than log feature requirements or a log sequence.
     return {"ts_ms": timestamp, "seq": "store", "class": session_class,
             "candidate": bool(aft), "reason": reason, "error": error}
 
@@ -87,7 +87,7 @@ def scan_store_workers(state_root, after_ms, session_bin, subc, deadline):
                 project, harness, session = binds[0]
                 base = [str(session_bin), "--subc", str(subc), "--project-root", project,
                         "--harness", harness, "--session", session]
-                # The run index is a WAL projection; new-storage runs never appear in it. Ask the
+                # The run index is a log projection; new-storage runs never appear in it. Ask the
                 # daemon for the session's latest run instead. A log also changes without a new
                 # run (idle warm-ups, seals, cleanup), and run.admission's start time then rules
                 # that run out as a candidate.

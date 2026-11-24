@@ -10,7 +10,7 @@
 //!
 //! The test, as the owner, opens broca's management surface under the synced scope and sends.
 //! Broca must read the daemon's stamp and freeze `(owner, ref, scope_epoch)` on the first
-//! `RunStarted`, in a gated frame requiring `scope/v1`, after the WAL feature floor lists it.
+//! `RunStarted`, in a gated frame requiring `scope/v1`, after the log feature floor lists it.
 //! The carrier's send over the same scope is refused `scope_owner_mismatch`. And a session an
 //! unscoped (direct) caller already drove cannot be adopted: the owner's scoped `route.open` is
 //! answered with broca's `scope_adoption_refused`, relayed by the daemon from the bind.
@@ -78,7 +78,7 @@ impl subc_client_rs::ModuleHandler for AcceptanceCatalog {
             }]
         });
         // A provider release between preflight and admission must recompose the plan, not
-        // rotate models or bypass the WAL feature checks.
+        // rotate models or bypass the log feature checks.
         if self.fetched.swap(true, std::sync::atomic::Ordering::SeqCst) {
             answer["catalog_digest"] = serde_json::json!(format!(
                 "{:x}",
