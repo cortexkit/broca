@@ -228,7 +228,9 @@ async fn a_steer_into_a_run_paused_for_a_restart_freezes_its_storage_policy() {
 
 /// A steer into a run paused for a restart, on a session kept by the older retention seconds, is
 /// accepted at the retention clock's time, as a steer into a running run is: that time is the
-/// session's activity its deadline counts from.
+/// session's activity its deadline counts from. The state root's clock file is read only in
+/// builds with the test clock; without it the clock is the wall clock.
+#[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn a_steer_into_a_run_paused_for_a_restart_is_stamped_by_the_retention_clock() {
     const NOW: u64 = 1_700_000_000_000;
