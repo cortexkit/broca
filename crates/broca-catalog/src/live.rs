@@ -993,6 +993,9 @@ fn resolve_provider_inner(
             WireFamilyId::OpenAiChat => {
                 broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types)
             }
+            WireFamilyId::GoogleCodeAssist => {
+                broca_provider::families::google_codeassist_renderer_version(&frozen.wire_model_id)
+            }
             _ => renderer_version_for(family),
         };
         let base_url = frozen
@@ -1478,6 +1481,11 @@ fn resolve_provider_inner(
     if family == WireFamilyId::OpenAiChat {
         frozen.renderer_version =
             broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types);
+    }
+    // And a Code Assist config freezes v8 only for a Claude model.
+    if family == WireFamilyId::GoogleCodeAssist {
+        frozen.renderer_version =
+            broca_provider::families::google_codeassist_renderer_version(&frozen.wire_model_id);
     }
     apply_auth_method_quirks(provider_id, auth_method, &mut frozen);
     frozen.max_output_tokens = max_tokens;

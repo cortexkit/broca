@@ -367,6 +367,8 @@ fn convert_contents_with_provenance<'a>(
     let mut out: Vec<Node<'a>> = Vec::new();
     let non_system: Vec<&Message> = prompt.iter().filter(|m| m.role != Role::System).collect();
     let mut current_tool_call_names = BTreeMap::new();
+    // Claude through Antigravity takes no replayed reasoning and no thought signatures.
+    let replays_signed_parts = !super::google_codeassist::sends_claude_shape(frozen);
 
     let mut i = 0;
     while i < non_system.len() {
@@ -389,15 +391,19 @@ fn convert_contents_with_provenance<'a>(
             }
             Role::Assistant => {
                 current_tool_call_names = tool_call_names_in_message(m, name_map);
-                let echo_safe =
-                    crate::families::signed_reasoning_is_echo_safe(m.origin.as_ref(), target_model);
+                let echo_safe = replays_signed_parts
+                    && crate::families::signed_reasoning_is_echo_safe(
+                        m.origin.as_ref(),
+                        target_model,
+                    );
                 let parts = convert_model_parts(
                     &m.content,
                     frozen.tool_id,
                     echo_safe,
                     name_map,
                     |format| {
-                        frozen.provider_text_state
+                        replays_signed_parts
+                            && frozen.provider_text_state
                             && super::text_state_is_echo_safe(
                                 m,
                                 target_model,

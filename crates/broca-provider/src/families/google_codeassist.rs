@@ -70,6 +70,21 @@ const ENVELOPE_REQUEST_TYPE: &str = "agent";
 
 pub struct GoogleCodeAssist;
 
+/// Whether Antigravity serves `wire_model_id` from Claude rather than Gemini.
+pub fn is_claude_wire_model(wire_model_id: &str) -> bool {
+    wire_model_id.starts_with("claude-")
+}
+
+/// Whether this request goes to a Claude model through Antigravity in the shape Antigravity's own
+/// client sends one. Antigravity refuses a replayed Claude turn that keeps its thought part
+/// (`INVALID_ARGUMENT`), so the turn goes without it and without thought signatures, and the
+/// labels mark the conversation as using Claude. A config frozen before v8 keeps its old bytes.
+pub(crate) fn sends_claude_shape(frozen: &FrozenRenderConfig) -> bool {
+    frozen.family_id == crate::spec::WireFamilyId::GoogleCodeAssist
+        && frozen.renderer_version >= 8
+        && is_claude_wire_model(&frozen.wire_model_id)
+}
+
 fn build_envelope<'a>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
@@ -93,11 +108,16 @@ fn build_envelope<'a>(
     let request_id = if let Some(identity) = &frozen.codeassist_identity {
         let index = identity.step_offset.saturating_add(step.step_index);
         inner["sessionId"] = json!(identity.session_id);
+        let used_claude = if sends_claude_shape(frozen) {
+            "true"
+        } else {
+            "false"
+        };
         inner["labels"] = json!({
             "last_step_index": index.saturating_sub(1).to_string(),
             "trajectory_id": identity.trajectory_id,
-            "used_claude": "false",
-            "used_claude_conservative": "false",
+            "used_claude": used_claude,
+            "used_claude_conservative": used_claude,
         });
         // Real clients use wall-clock millis per call. Pin the time at admission and
         // advance it per step so rendering a retry or a resumed step never reads a clock.
@@ -674,6 +694,132 @@ mod tests {
             first["requestId"].as_str().unwrap().split('/').nth(3),
             second["requestId"].as_str().unwrap().split('/').nth(3)
         );
+    }
+
+    /// A history whose model turn carries everything Antigravity signs: thinking with text, a
+    /// thought known only by its signature, a signed text part and a signed tool call.
+    fn signed_history() -> CallOptions {
+        let model = broca_protocol::ModelHandle::new("google", "antigravity-claude-sonnet-5-5");
+        let mut opts = CallOptions::new(vec![
+            user("summarize"),
+            Message::assistant_from(
+                vec![
+                    ContentBlock::Reasoning {
+                        text: "thinking aloud".into(),
+                        signature: Some("reasoning-signature".into()),
+                    },
+                    ContentBlock::RedactedReasoning {
+                        data: "bare-thought-signature".into(),
+                        provider_format: None,
+                    },
+                    ContentBlock::TextWithState {
+                        text: "partial answer".into(),
+                        provider_state: broca_protocol::content::TextProviderState {
+                            format: broca_protocol::content::TextProviderFormat::GoogleCodeAssist,
+                            data: json!({"thoughtSignature": "text-signature"}).to_string(),
+                        },
+                    },
+                    ContentBlock::ToolCall(ToolCall {
+                        tool_call_id: ToolCallId("call-1".into()),
+                        tool_name: "read".into(),
+                        input: json!({"path": "a.rs"}).into(),
+                        thought_signature: Some("call-signature".into()),
+                        provider_state: None,
+                    }),
+                ],
+                model.clone(),
+            ),
+            user("again"),
+        ]);
+        opts.target_model = Some(model);
+        opts.step_context = Some(step("run-1", 2));
+        opts
+    }
+
+    fn claude_frozen() -> FrozenRenderConfig {
+        let mut frozen = identity_frozen();
+        frozen.wire_model_id = "claude-sonnet-5-5-high".into();
+        frozen.renderer_version =
+            crate::families::google_codeassist_renderer_version(&frozen.wire_model_id);
+        frozen.provider_text_state = true;
+        frozen
+    }
+
+    #[test]
+    fn only_a_claude_model_freezes_v8() {
+        assert_eq!(
+            crate::families::google_codeassist_renderer_version("claude-sonnet-5-5-high"),
+            8
+        );
+        assert_eq!(
+            crate::families::google_codeassist_renderer_version("gemini-3.5-flash-low"),
+            7
+        );
+        assert_eq!(
+            crate::families::google_codeassist_frozen_config("claude-opus-5-5-thinking")
+                .renderer_version,
+            8
+        );
+        assert_eq!(
+            crate::families::google_codeassist_frozen_config("gemini-2.5-flash").renderer_version,
+            7
+        );
+    }
+
+    #[test]
+    fn a_claude_turn_is_replayed_without_reasoning_or_thought_signatures() {
+        let body = GoogleCodeAssist.shape(&claude_frozen(), &signed_history());
+        let contents = &body["request"]["contents"];
+        assert_eq!(
+            contents[1],
+            json!({"role": "model", "parts": [
+                {"text": "partial answer"},
+                {"functionCall": {"name": "read", "args": {"path": "a.rs"}}},
+            ]}),
+            "{body}"
+        );
+        assert!(!body.to_string().contains("signature"), "{body}");
+        assert_eq!(body["request"]["labels"]["used_claude"], json!("true"));
+        assert_eq!(
+            body["request"]["labels"]["used_claude_conservative"],
+            json!("true")
+        );
+    }
+
+    #[test]
+    fn a_claude_config_frozen_at_v7_keeps_its_old_bytes() {
+        let mut v7 = claude_frozen();
+        v7.renderer_version = 7;
+        let body = GoogleCodeAssist.shape(&v7, &signed_history());
+        let model_parts = body["request"]["contents"][1]["parts"].as_array().unwrap();
+        assert!(
+            model_parts
+                .iter()
+                .any(|part| part.get("thought") == Some(&json!(true))),
+            "{body}"
+        );
+        assert_eq!(body["request"]["labels"]["used_claude"], json!("false"));
+    }
+
+    #[test]
+    fn a_gemini_turn_still_replays_its_signed_parts() {
+        let mut frozen = identity_frozen();
+        frozen.provider_text_state = true;
+        let mut opts = signed_history();
+        let gemini = broca_protocol::ModelHandle::new("google", "gemini-2.5-flash");
+        opts.prompt[1].origin = Some(gemini.clone());
+        opts.target_model = Some(gemini);
+        let rendered = GoogleCodeAssist.shape(&frozen, &opts).to_string();
+        for signature in [
+            "reasoning-signature",
+            "bare-thought-signature",
+            "call-signature",
+        ] {
+            assert!(
+                rendered.contains(signature),
+                "{signature} missing: {rendered}"
+            );
+        }
     }
 
     #[test]

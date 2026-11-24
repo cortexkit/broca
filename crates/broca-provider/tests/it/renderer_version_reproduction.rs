@@ -198,6 +198,12 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/google_codeassist_v6.json"))
             .expect("Code Assist v6 pins are JSON"),
     );
+    // A Claude model's config frozen at v7, with session labels, pinned before v8 changed what
+    // a Claude model's v8 config sends.
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/google_codeassist_v7.json"))
+            .expect("Code Assist v7 pins are JSON"),
+    );
     pins.extend(
         serde_json::from_str::<Vec<Value>>(include_str!(
             "../fixtures/pre_chat_reasoning_policy.json"
@@ -456,7 +462,7 @@ mod live {
     };
     use serde_json::Value;
 
-    use super::{legacy_pins, renderer_version_for};
+    use super::legacy_pins;
 
     fn provider(frozen: FrozenRenderConfig) -> Box<dyn Provider> {
         fn live<F: WireFamily + 'static>(
@@ -502,7 +508,9 @@ mod live {
     fn live_provider_accepts_a_declared_version_and_states_its_recorded_blob() {
         for case in legacy_pins() {
             let pin: FrozenRenderConfig = serde_json::from_value(case["frozen"].clone()).unwrap();
-            let current = renderer_version_for(pin.family_id);
+            // The version the current code freezes for the pin's model, which for Code Assist
+            // depends on the model.
+            let current = current_config(&pin, false).renderer_version;
             assert_ne!(pin.renderer_version, current);
 
             let restored = provider(current_config(&pin, false));

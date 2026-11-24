@@ -181,6 +181,9 @@ mod tests {
                     crate::families::anthropic_renderer_version(false)
                 }
                 WireFamilyId::OpenAiChat => crate::families::openai_chat_renderer_version(false),
+                WireFamilyId::GoogleCodeAssist => {
+                    crate::families::google_codeassist_renderer_version("m")
+                }
                 _ => renderer_version_for(family),
             };
             assert_eq!(provider.renderer_version(), expected);

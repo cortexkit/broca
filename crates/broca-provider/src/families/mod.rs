@@ -443,6 +443,9 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
             (5, Reproducible),
             // v7 applies the model bound only to newly frozen requests.
             (6, Reproducible),
+            // v8 changes a request only when its config was frozen at v8, which a v7 config was
+            // not, even one for a Claude model.
+            (7, Reproducible),
         ],
         WireFamilyId::OpenAiResponsesChatgpt => &[
             (
@@ -713,6 +716,7 @@ fn frozen_from_family_defaults(
     aws_region: Option<String>,
 ) -> FrozenRenderConfig {
     let q = default_quirks(family);
+    let wire_model_id = wire_model_id.into();
     FrozenRenderConfig {
         tool_name_aliases: Default::default(),
         anthropic_turn_system: false,
@@ -721,10 +725,11 @@ fn frozen_from_family_defaults(
         // default sets.
         renderer_version: match family {
             WireFamilyId::OpenAiChat => openai_chat_renderer_version(q.moonshot_schema_types),
+            WireFamilyId::GoogleCodeAssist => google_codeassist_renderer_version(&wire_model_id),
             _ => renderer_version_for(family),
         },
         image_notice_labels: false,
-        wire_model_id: wire_model_id.into(),
+        wire_model_id,
         base_url: None,
         max_output_tokens: DEFAULT_HELPER_MAX_OUTPUT_TOKENS,
         caller_max_output_tokens: None,
@@ -989,7 +994,23 @@ pub fn frozen_config_for_family(
 /// v6: retain signed text parts through the shared Gemini codec. Session identity is an opt-in
 /// frozen field within v6: its absence keeps all earlier bytes.
 /// v7: explicit output limits also retain admission's catalog bound; older versions replay unchanged.
-pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 7;
+/// v8: a request to a Claude model leaves out replayed reasoning and every thought signature, and
+/// its labels say `used_claude`, as Antigravity's own client sends them. Only a Claude model's
+/// config freezes v8 ([`google_codeassist_renderer_version`]).
+pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 8;
+
+/// The Code Assist render ABI version a config for `wire_model_id` freezes: v8 for a Claude
+/// model, v7 otherwise.
+///
+/// v8 changes only a Claude model's requests, so recording v8 for any other model would make a
+/// later rollback refuse to resume runs whose bytes are unchanged.
+pub fn google_codeassist_renderer_version(wire_model_id: &str) -> u32 {
+    if google_codeassist::is_claude_wire_model(wire_model_id) {
+        GOOGLE_CODEASSIST_RENDERER_VERSION
+    } else {
+        7
+    }
+}
 
 /// Build the frozen render config for Google Antigravity / Code-Assist. The inner request
 /// body follows Gemini's rendering rules; the cloud project id is not known when reading the
