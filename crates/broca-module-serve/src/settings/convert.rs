@@ -60,6 +60,10 @@ const REMOVED: &[(&str, &str)] = &[
         "compaction_signals",
         "notice prices and cache-chain resets are always sent; nothing read the switch",
     ),
+    (
+        "classifier_routing",
+        "decision requests without a model always use routing",
+    ),
 ];
 
 /// `document` in the schema's shapes.

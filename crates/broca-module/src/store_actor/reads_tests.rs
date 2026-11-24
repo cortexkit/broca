@@ -1734,6 +1734,89 @@ async fn in_memory_reads_refuse_only_where_they_did_before() {
     m.ended("r3", "completed").await;
 }
 
+/// While a run streams, a read its actor can't answer from memory loads the session as stored at
+/// the actor's position, which the run's next append moves past. That view isn't kept among the
+/// views of closed sessions, where it would push out views a later read can still use, and its
+/// control stream's head is the one the actor holds, not one projected from the log again.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn a_running_sessions_stored_read_keeps_no_view_and_projects_no_stream_head() {
+    let m = module(vec![
+        read_step("a1"),
+        text_step("a2", "one"),
+        text_step("b1", "two"),
+    ])
+    .await;
+    let keyed = |key: &str| SendKey::SendId(key.into());
+    active(m.send_keyed("r1", "first", keyed("k1")).await);
+    m.in_step("r1", 1).await;
+    m.gate.notify_one();
+    m.in_step("r1", 2).await;
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+    active(m.send_keyed("r2", "second", keyed("k2")).await);
+    m.in_step("r2", 1).await;
+    let runtime = m.runtime();
+    let loads = |reason: &str| {
+        runtime
+            .views()
+            .memory(|_| 0)
+            .loads_by_reason
+            .unwrap_or_default()
+            .get(reason)
+            .map_or(0, |loads| loads.loads)
+    };
+    // A sender polling its sends' status while the run streams, and that poll's authorization,
+    // are answered by the actor from what it holds: no view of the session is loaded.
+    for (run, key) in [("r1", "k1"), ("r2", "k2")] {
+        let poll = StoreReadRequest::SendStatus {
+            own_run: RunId(run.into()),
+            send_id: key.into(),
+            principal: None,
+        };
+        assert_eq!(shape(m.served(&poll).await), shape(m.fresh(&poll).await));
+        crate::serve::ServeHandler::authorize_session_read(
+            &m.registry,
+            &m.key,
+            &crate::reader_admission::ReadAccess {
+                principal: None,
+                op: "send.status".into(),
+                send: Some((RunId(run.into()), key.into())),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!((loads("send_status"), loads("authorization")), (0, 0));
+    let request = StoreReadRequest::RunToolCalls(
+        cortexkit_role_llm_runner::tool_calls::ToolCallsRequest::new("r1"),
+    );
+    assert!(matches!(
+        m.ask_actor(request.clone()).await,
+        StoreReadOutcome::Stored { .. }
+    ));
+    runtime.checkpoint_frame_reads.store(0, Ordering::Relaxed);
+    let served = shape(m.served(&request).await);
+    assert_eq!(
+        runtime.views().usage().0,
+        0,
+        "no view of the running session is kept"
+    );
+    assert_eq!(
+        runtime.checkpoint_frame_reads.load(Ordering::Relaxed),
+        0,
+        "the actor's stream head is used, not projected again"
+    );
+    assert_eq!(
+        loads("run.tool_calls"),
+        1,
+        "the load is counted, kept or not"
+    );
+    assert_eq!(served, shape(m.fresh(&request).await));
+    m.gate.notify_one();
+    m.ended("r2", "completed").await;
+}
+
 /// The reads `in_memory_reads_refuse_only_where_they_did_before` saw come back as the session's
 /// position on the code before the open id index kept positions, in its order: the status and
 /// tool calls of the runs before the latest, whose records the actor keeps only for its latest

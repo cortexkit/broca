@@ -38,6 +38,43 @@ impl Counts {
     pub fn family_id(&self) -> Option<&str> {
         self.facts.as_ref().map(|facts| facts.id.as_str())
     }
+
+    /// What these counts hold, estimated: each counted part's table slot, its key and digest
+    /// strings, and the configured facts' key and id. Counts kept between reads grow with every
+    /// part read and are only cleared when the configuration changes, so a holder that bounds its
+    /// memory counts them too.
+    pub fn held_bytes(&self) -> usize {
+        let slot = std::mem::size_of::<((String, String, String), Cached)>() + 1;
+        let strings = self
+            .parts
+            .iter()
+            .map(|((mid, part, family), cached)| {
+                mid.capacity() + part.capacity() + family.capacity() + cached.digest.capacity()
+            })
+            .sum::<usize>();
+        let facts = self
+            .facts
+            .as_ref()
+            .map_or(0, |facts| facts.key.capacity() + facts.id.capacity());
+        self.parts.capacity() * slot + strings + facts
+    }
+
+    /// Counts `parts` made-up parts, as reading that many parts would, so a holder's accounting
+    /// can be tested without building entries.
+    #[cfg(feature = "test-clock")]
+    pub fn count_parts_for_test(&mut self, parts: usize) {
+        for n in 0..parts {
+            self.parts.insert(
+                (format!("mid-{n}"), "0".to_owned(), "family".to_owned()),
+                Cached {
+                    digest: format!("digest-{n}"),
+                    tag: None,
+                    input: None,
+                    tokens: None,
+                },
+            );
+        }
+    }
     /// Freeze count inputs once for an unchanged run configuration. A new model or render
     /// surface invalidates derived counts, even when it happens to use the same tokenizer.
     pub fn configure(

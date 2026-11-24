@@ -654,14 +654,14 @@ async fn classifier_replies_carry_no_spend_member() {
         status: 429,
         retry_after_ms: None,
     });
-    let classifier = Arc::new(SystemOne::new(
+    let classifier = Arc::new(crate::system_one::with_test_routing(SystemOne::new(
         Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
         "classifier",
         Arc::new(Catalog),
         vec![ModelPin::jev(rig.provider.clone())],
         Config::default(),
         Arc::default(),
-    ));
+    )));
     let params = json!({"batch_id":"classifier","model":crate::system_one::JEV_1_13_0,
         "questions":{"q":{"type":"noul","instructions":"Flag?"}},"items":[{"state":"a"},{"state":"b"}]});
     let reply = classifier

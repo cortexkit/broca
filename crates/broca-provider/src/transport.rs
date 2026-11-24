@@ -75,18 +75,8 @@ use crate::{
 use crate::attempt_policy::{MAX_RETRY_AFTER_DELAY, RETRY_WALL_BUDGET};
 
 #[cfg(test)]
-mod websocket_tests {
-    include!("transport_websocket_tests.rs");
-    mod codex_error_code_regressions {
-        include!("transport/codex_error_code_regressions.rs");
-    }
-    mod attempt_equivalence {
-        include!("transport/attempt_equivalence_websocket.rs");
-    }
-    mod attempt_effect_boundaries {
-        include!("transport/attempt_effect_boundaries.rs");
-    }
-}
+#[path = "transport/websocket_tests.rs"]
+mod websocket_tests;
 
 #[cfg(test)]
 #[path = "transport/attempt_test_hooks.rs"]
@@ -573,6 +563,8 @@ struct AttemptTrace {
     defer_failure_warning: bool,
     chunk_warning: Option<ChunkWarning>,
     served_account_ref: Option<String>,
+    /// Given to the step's shutdown seal once this attempt's request reaches a server.
+    sent_note: Option<SentNote>,
     /// When the request was handed to the HTTP client; see `ModelAttempt::sent_at_ms`.
     sent_at_ms: Option<u64>,
     sent_at: Option<std::time::Instant>,
@@ -612,6 +604,14 @@ struct AttemptTrace {
 }
 
 impl AttemptTrace {
+    /// The request reached a server, as far as this side can tell: the step's seal learns of
+    /// the send, dated by the attempt's send stamp.
+    fn note_reached_server(&self) {
+        if let (Some(note), Some(sent_at_ms)) = (&self.sent_note, self.sent_at_ms) {
+            note.note(sent_at_ms);
+        }
+    }
+
     async fn reserve_send(
         &mut self,
         request: &PreparedHttpRequest,
@@ -766,8 +766,8 @@ impl<F: WireFamily + 'static> RenderJob<F> {
         let mut tools = std::borrow::Cow::Borrowed(self.opts.tools.as_slice());
         if let Some(so) = &self.frozen.structured_output {
             if so.mode == broca_protocol::structured_output::Mode::SubmitTool {
-                // Family renderers append this declaration too. The reverse map must see the
-                // same names before the runner recognizes a structured-output submission.
+                // The renderer and response restoration both receive this map, so the
+                // structured-output declaration is allocated exactly once with the other tools.
                 tools
                     .to_mut()
                     .push(crate::structured_output::submit_tool(so.schema()));
@@ -779,6 +779,7 @@ impl<F: WireFamily + 'static> RenderJob<F> {
             &self.opts.prompt,
         ));
         let body = if let Some(renderer) = &self.media_renderer {
+            // A media render builds its own tool-name map: this callback API carries no shared map.
             renderer(
                 &serde_json::to_value(&*self.frozen).expect("frozen render config serializes"),
                 &self.opts,
@@ -787,8 +788,12 @@ impl<F: WireFamily + 'static> RenderJob<F> {
                 Some(&mut provenance),
             )?
         } else {
-            self.family
-                .render_with_provenance(&self.frozen, &self.opts, Some(&mut provenance))
+            self.family.render_with_shared_name_map(
+                &self.frozen,
+                &self.opts,
+                Some(&mut provenance),
+                &name_map,
+            )
         };
         let endpoint = self.family.endpoint(&self.frozen, &self.auth, body);
         self.credential_hosts.check(&self.auth, &endpoint.url)?;
@@ -927,21 +932,33 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
         .await
     }
 
+    /// The account the served credential now belongs to, when it is not the one the session
+    /// froze; a step and a warm both refuse to send then. Unknown account metadata on either
+    /// side cannot establish a mismatch. ChatGPT also carries an account in its token's own
+    /// `chatgpt-account-id` header, and a re-login can replace that account behind an
+    /// unchanged vault record, so the header must match as well.
+    fn changed_served_account<'a>(&self, served: &'a ServedAuth) -> Option<&'a str> {
+        let frozen = self.frozen_account_ref.as_deref()?;
+        let changed = |account: Option<&'a str>| account.filter(|account| *account != frozen);
+        changed(served.account_ref.as_deref()).or_else(|| {
+            (self.frozen.family_id == crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
+                .then(|| changed(chatgpt_account(&served.auth)))
+                .flatten()
+        })
+    }
+
     fn prepare_warm_request(
         &self,
         base: &[u8],
         policy: Option<&mut broca_core::cache_warm::WarmSendPolicy>,
     ) -> Result<(HttpRequest, Option<String>), broca_core::WarmFailure> {
         let served = self.current_auth();
-        if account_changed_error(
-            self.frozen_account_ref.as_deref(),
-            served.account_ref.as_deref(),
-        )
-        .is_some()
-        {
+        // The same refusal a step makes: a warm sends the session's prompt with the held token,
+        // so a token now belonging to another account must not carry it either.
+        if let Some(served_account) = self.changed_served_account(&served) {
             return Err(broca_core::WarmFailure::AccountChanged {
                 frozen: self.frozen_account_ref.clone(),
-                served: served.account_ref,
+                served: Some(served_account.to_owned()),
             });
         }
         // Reuse the route of the request being warmed, including a refusal fallback.
@@ -977,6 +994,16 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             .family
             .warm_body(&warm_frozen, base)
             .map_err(broca_core::WarmFailure::Unsupported)?;
+        // A warm only refreshes the cache if it repeats the step's prefix exactly, so it is
+        // encoded the way the transport sends a step over HTTPS: a Codex identity puts the
+        // backend's routing fields first (see `send_attempt`).
+        let body = if warm_frozen.chatgpt_wire.is_some() {
+            crate::chatgpt_wire::request_bytes(&body).ok_or_else(|| {
+                broca_core::WarmFailure::Unsupported("the warm body is not a JSON object".into())
+            })?
+        } else {
+            body
+        };
         // A zero-output cache read must stay on the addressed model, even when generation
         // opted into server-side fallback. The warm body has already removed that opt-in;
         // derive headers without the server-side fallback beta opt-in as well, leaving prompt bytes alone.
@@ -1199,20 +1226,11 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             .definite_auth_failure = None;
         let (tx, rx) = mpsc::channel::<NormalizedEvent>(256);
         let served = self.current_auth();
-        let error = account_changed_error(
-            self.frozen_account_ref.as_deref(),
-            served.account_ref.as_deref(),
-        )
-        .or_else(|| {
-            (self.frozen.family_id == crate::spec::WireFamilyId::OpenAiResponsesChatgpt)
-                .then(|| {
-                    account_changed_error(
-                        self.frozen_account_ref.as_deref(),
-                        chatgpt_account(&served.auth),
-                    )
-                })
-                .flatten()
-        });
+        let error = self
+            .changed_served_account(&served)
+            .and_then(|served_account| {
+                account_changed_error(self.frozen_account_ref.as_deref(), Some(served_account))
+            });
         if let Some(mut error) = error {
             redact_chatgpt_account_error(&mut error, Some(self.frozen.family_id));
             tokio::spawn(async move {
@@ -2285,7 +2303,7 @@ const DUMP_SWEEP_MIN_INTERVAL_MS: u64 = 30_000;
 const MAX_HTTP_ERROR_BODY_READ_BYTES: usize = 1024 * 1024;
 /// Maximum provider error-body bytes retained in the diagnostic message.
 const MAX_ERROR_BODY_BYTES: usize = 512;
-/// Maximum aggregate response bytes accepted during one provider step.
+/// Maximum aggregate response bytes accepted during one provider attempt.
 const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
 /// Deadline for establishing a provider connection; streaming requests have no total deadline.
 const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2920,6 +2938,13 @@ fn spawn_transport_task<F: WireFamily + 'static>(
     // The credential this step's request is rendered with, kept so a 401 can be compared
     // against whatever the refresher serves next.
     let sent_auth = Arc::clone(&render_job.auth);
+    // A passed deadline stops the step by cancelling a token of the step's own. The caller's
+    // token is cancelled only by its owner: a run loop reads it as an explicit cancel, and a
+    // step that ran out of time was not cancelled by anyone.
+    let cancel = match deadline {
+        Some(_) => cancel.child_token(),
+        None => cancel,
+    };
     tokio::spawn(async move {
         struct StepTransportGuard<'a> {
             websocket: &'a responses_websocket::Session,
@@ -3175,6 +3200,8 @@ where
     let use_codex = codex_retry::applies(request.family);
     let mut attempts = AttemptState::new(use_codex);
     let mut use_escape_client = false;
+    // Every attempt sends the same body, so its cache-evidence fingerprint is computed once.
+    let step_fingerprint = cache_runtime::StepFingerprint::default();
     // `credential_refresh` is the evidence the next attempt's record carries when it goes out
     // with a token refreshed inside this step, by either the 401 path or the pre-send check.
     let mut credential_refresh: Option<CredentialRefresh> = None;
@@ -3291,8 +3318,9 @@ where
             return Ok((Vec::new(), 0));
         }
         number_attempt(&mut request.headers, attempt_index);
-        step_seal.note_sent(&request.body, request_digest);
         let mut trace = AttemptTrace {
+            sent_note: step_seal.sent_note(&request.body, request_digest),
+            cache_work: cache_runtime::Pending::for_step(&step_fingerprint),
             attempt_hook: request.attempt_hook.clone(),
             quota_observer: request.quota_observer.clone(),
             auth_refreshed: request.attempt_hook.is_some()
@@ -3343,10 +3371,19 @@ where
         }
         // Sample the network retry budget before joining diagnostics for the terminal record.
         let attempt_elapsed = retry_clock.attempt_elapsed(attempt_started);
-        trace.cache_evidence = trace
-            .cache_work
-            .finish(&request, trace.sent_at_ms, trace.served_account_ref.clone())
-            .await;
+        // A caller's cancel must not wait for request hashing or a store load.
+        trace.cache_evidence = if matches!(stop, AttemptStop::Cancelled) {
+            trace.cache_work.finish_without_waiting(
+                &request,
+                trace.sent_at_ms,
+                trace.served_account_ref.clone(),
+            )
+        } else {
+            trace
+                .cache_work
+                .finish(&request, trace.sent_at_ms, trace.served_account_ref.clone())
+                .await
+        };
         let result = match stop {
             AttemptStop::Cancelled => {
                 if let Some(websocket) = websocket {
@@ -3909,6 +3946,34 @@ enum AttemptStop {
     Ended(Box<Result<Vec<NormalizedEvent>, AttemptFailure>>),
 }
 
+/// What an attempt tells the step's shutdown seal once its request has reached a server (see
+/// [`StepSeal::sent_note`]). A connection that never opened put no bytes anywhere: it refreshed
+/// no provider cache, so it must not restart the session's cache clock.
+#[derive(Clone)]
+struct SentNote {
+    seal: ShutdownSeal,
+    step_id: StepId,
+    body: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    sha256: String,
+    route: broca_core::refusal_fallback::StepRoute,
+    cache_ttl_ms: Option<u64>,
+}
+
+impl SentNote {
+    fn note(&self, sent_at_ms: u64) {
+        self.seal.note_sent(
+            broca_core::SentRequest {
+                step_id: self.step_id,
+                body: Arc::clone(&self.body),
+                sha256: self.sha256.clone(),
+                sent_at_ms,
+                route: self.route,
+            },
+            self.cache_ttl_ms,
+        );
+    }
+}
+
 /// The shutdown seal for one step, if the caller supplied one, plus the step id the seal's
 /// record needs. Without a seal every method is a no-op and `tripped` never resolves.
 #[derive(Clone, Copy)]
@@ -3929,21 +3994,18 @@ impl StepSeal<'_> {
         self.seal.is_none_or(ShutdownSeal::begin_attempt)
     }
 
-    /// Hand the seal the exact bytes an attempt is starting to send, so a cache warm during the
-    /// run re-sends them and the session's cache clock restarts now.
-    fn note_sent(&self, body: &Bytes, digest: &RequestDigest) {
-        if let Some(seal) = self.seal {
-            seal.note_sent(
-                broca_core::SentRequest {
-                    step_id: self.step_id,
-                    body: Arc::new(body.clone()),
-                    sha256: digest.sha256.clone(),
-                    sent_at_ms: now_millis(),
-                    route: self.route,
-                },
-                self.cache_ttl_ms,
-            );
-        }
+    /// The note an attempt gives the seal once its bytes have reached a server: the exact
+    /// bytes, so a cache warm during the run re-sends them, and when they went, which restarts
+    /// the session's cache clock.
+    fn sent_note(&self, body: &Bytes, digest: &RequestDigest) -> Option<SentNote> {
+        self.seal.map(|seal| SentNote {
+            seal: seal.clone(),
+            step_id: self.step_id,
+            body: Arc::new(body.clone()),
+            sha256: digest.sha256.clone(),
+            route: self.route,
+            cache_ttl_ms: self.cache_ttl_ms,
+        })
     }
 
     fn end_attempt(&self) {
@@ -4443,6 +4505,10 @@ async fn send_attempt(
     trace.sent_at = Some(std::time::Instant::now());
     trace.content_gaps.start();
     let response = tokio::time::timeout(header_timeout, builder.body(body).send()).await;
+    // A connect error put no bytes on any server; anything else may have reached one.
+    if !matches!(&response, Ok(Err(error)) if error.is_connect()) {
+        trace.note_reached_server();
+    }
     trace.cache_work.start(request);
     let response = response
         .map_err(|_| {
@@ -4948,7 +5014,7 @@ where
         if chunk.len() > max_stream_bytes.saturating_sub(stream_bytes) {
             return Err(AttemptFailure::decode(
                 stream_limit_error(&format!(
-                    "provider stream exceeds the {max_stream_bytes}-byte per-step limit"
+                    "provider stream exceeds the {max_stream_bytes}-byte per-attempt limit"
                 )),
                 AttemptOutcome::ByteLimit,
             ));
@@ -6585,476 +6651,8 @@ mod stream_floor_tests;
 /// controls carry the same truncated arguments without a ceiling stop reason and must keep
 /// the ordinary transient parse failure, including its single retry.
 #[cfg(test)]
-mod output_ceiling_tests {
-    use std::sync::{Arc, Mutex};
-
-    use broca_protocol::{
-        AttemptOutcome, CallOptions, ErrorClass, NormalizedEvent, ProviderControl, ProviderError,
-        StepId,
-    };
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-    use tokio_util::sync::CancellationToken;
-
-    use super::LiveProvider;
-    use crate::{
-        families::{
-            anthropic_frozen_config, bedrock_converse::test_event_stream_message,
-            bedrock_frozen_config, openai_chat_frozen_config,
-            openai_responses_chatgpt_frozen_config, openai_responses_frozen_config,
-            AnthropicMessages, BedrockConverse, OpenAiChat, OpenAiResponses,
-            OpenAiResponsesChatgpt,
-        },
-        wire::{AuthHandle, FrozenRenderConfig, WireFamily},
-    };
-
-    /// The cap the requests are rendered with, which the ceiling error must name.
-    const CAP: u32 = 4096;
-    /// A tool-argument buffer cut mid-object, as a ceiling leaves it.
-    const CUT_ARGS: &str = r#"{"path":"a.txt","content":"hel"#;
-    const TOOL: &str = "write_file";
-
-    /// JSON-escape the cut arguments so they can sit inside a JSON string field.
-    fn args_json() -> String {
-        serde_json::to_string(CUT_ARGS).unwrap()
-    }
-
-    struct Outcome {
-        events: Vec<NormalizedEvent>,
-        requests: usize,
-    }
-
-    impl Outcome {
-        fn error(&self) -> &ProviderError {
-            self.events
-                .iter()
-                .find_map(|event| match event {
-                    NormalizedEvent::Control(ProviderControl::Error { error, .. }) => Some(error),
-                    _ => None,
-                })
-                .expect("the step must end in a provider error")
-        }
-
-        fn attempt_outcomes(&self) -> Vec<AttemptOutcome> {
-            self.events
-                .iter()
-                .filter_map(|event| match event {
-                    NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) => {
-                        Some(attempt.outcome.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
-    }
-
-    /// Serve `body` as a 200 to every request (so a retry, if the transport makes one, is
-    /// observed rather than failing differently) and drive one step through the live transport.
-    async fn run_step<F: WireFamily + 'static>(
-        family: F,
-        mut frozen: FrozenRenderConfig,
-        content_type: &'static str,
-        body: Vec<u8>,
-    ) -> Outcome {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let requests = Arc::new(Mutex::new(0usize));
-        let seen = requests.clone();
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                read_request(&mut socket).await;
-                *seen.lock().unwrap() += 1;
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                socket.write_all(head.as_bytes()).await.unwrap();
-                socket.write_all(&body).await.unwrap();
-            }
-        });
-        frozen.base_url = Some(format!("http://{address}"));
-        frozen.max_output_tokens = CAP;
-        let mut provider = LiveProvider::new(family, frozen, AuthHandle::None);
-        provider.retry_clock = super::RetryClock {
-            virtual_waits: Some(Arc::new(Mutex::new(Vec::new()))),
-            ..super::RetryClock::default()
-        };
-        // The ceiling fixture is an HTTP body, not a socket upgrade; its assertions stay unchanged.
-        broca_core::Provider::set_chatgpt_https_policy(&provider, Arc::new(|| true));
-        let mut rx = provider.start_step(
-            StepId(1),
-            Arc::new(CallOptions::new(Vec::new())),
-            CancellationToken::new(),
-            None,
-        );
-        let mut events = Vec::new();
-        while let Some(event) = rx.recv().await {
-            events.push(event);
-        }
-        server.abort();
-        let requests = *requests.lock().unwrap();
-        Outcome { events, requests }
-    }
-
-    async fn read_request(socket: &mut tokio::net::TcpStream) {
-        let mut request = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let header_end = loop {
-            let read = socket.read(&mut chunk).await.unwrap();
-            assert_ne!(
-                read, 0,
-                "client disconnected before request headers completed"
-            );
-            request.extend_from_slice(&chunk[..read]);
-            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                break index + 4;
-            }
-        };
-        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
-        let content_length = headers
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .map(|value| value.trim().parse::<usize>().unwrap())
-            .unwrap_or(0);
-        while request.len() < header_end + content_length {
-            let read = socket.read(&mut chunk).await.unwrap();
-            assert_ne!(read, 0, "client disconnected before request body completed");
-            request.extend_from_slice(&chunk[..read]);
-        }
-    }
-
-    /// The ceiling case: one attempt, a permanent class, and a message that names the
-    /// ceiling, the cap, the tool, and how much of its arguments arrived.
-    fn assert_ceiling_cut(outcome: &Outcome, cap: &str, decode_outcome: AttemptOutcome) {
-        let error = outcome.error();
-        assert_eq!(
-            error.class,
-            ErrorClass::Permanent,
-            "a proven ceiling cut must not be retried: {}",
-            error.message
-        );
-        let expected_lead = format!(
-            "output ceiling reached mid tool call: finish=length, max_output_tokens={cap} (tool {TOOL}, {} argument bytes received",
-            CUT_ARGS.len()
-        );
-        assert!(
-            error.message.starts_with(&expected_lead),
-            "the error must name the ceiling, got: {}",
-            error.message
-        );
-        assert!(
-            !error.message.contains("EOF while parsing"),
-            "the ceiling error must not read as a parse failure: {}",
-            error.message
-        );
-        assert_eq!(
-            outcome.requests, 1,
-            "exactly one attempt reaches the provider"
-        );
-        assert_eq!(outcome.attempt_outcomes(), vec![decode_outcome]);
-    }
-
-    /// The control case: a parse failure classified as transient, with one decode retry.
-    fn assert_parse_failure(outcome: &Outcome, decode_outcome: AttemptOutcome) {
-        let error = outcome.error();
-        assert_eq!(error.class, ErrorClass::Transient, "{}", error.message);
-        assert!(
-            error.message.starts_with(
-                "normalize response: normalize: invalid terminal tool arguments: EOF while parsing"
-            ),
-            "without a ceiling stop reason the parse failure stands, got: {}",
-            error.message
-        );
-        assert!(!error.message.contains("output ceiling"));
-        assert_eq!(
-            outcome.requests, 2,
-            "the unexplained parse failure keeps its one deterministic-decode retry"
-        );
-        assert_eq!(
-            outcome.attempt_outcomes(),
-            vec![decode_outcome.clone(), decode_outcome]
-        );
-    }
-
-    // ───────────── anthropic_messages ─────────────
-
-    fn anthropic_body(message_delta: Option<&str>) -> Vec<u8> {
-        let mut body = String::new();
-        let mut record = |data: String| body.push_str(&format!("data: {data}\n\n"));
-        record(r#"{"type":"message_start","message":{"id":"msg_cut","usage":{"input_tokens":10,"output_tokens":1}}}"#.into());
-        record(format!(
-            r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"toolu_1","name":"{TOOL}","input":{{}}}}}}"#
-        ));
-        record(format!(
-            r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":{}}}}}"#,
-            args_json()
-        ));
-        record(r#"{"type":"content_block_stop","index":0}"#.into());
-        if let Some(stop_reason) = message_delta {
-            record(format!(
-                r#"{{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}"}},"usage":{{"output_tokens":4096}}}}"#
-            ));
-        }
-        record(r#"{"type":"message_stop"}"#.into());
-        body.into_bytes()
-    }
-
-    #[tokio::test]
-    async fn anthropic_ceiling_cut_is_permanent_and_named() {
-        let outcome = run_step(
-            AnthropicMessages,
-            anthropic_frozen_config("claude-test"),
-            "text/event-stream",
-            anthropic_body(Some("max_tokens")),
-        )
-        .await;
-        assert_ceiling_cut(&outcome, "4096", AttemptOutcome::DecodeError);
-        assert!(outcome
-            .error()
-            .message
-            .contains("provider stop reason max_tokens"));
-        assert!(outcome.error().message.contains("output_tokens=4096"));
-    }
-
-    #[tokio::test]
-    async fn anthropic_cut_without_ceiling_stop_keeps_the_parse_failure() {
-        for stop in [None, Some("tool_use"), Some("end_turn")] {
-            let outcome = run_step(
-                AnthropicMessages,
-                anthropic_frozen_config("claude-test"),
-                "text/event-stream",
-                anthropic_body(stop),
-            )
-            .await;
-            assert_parse_failure(&outcome, AttemptOutcome::DecodeError);
-        }
-    }
-
-    // ───────────── openai_chat ─────────────
-
-    fn openai_chat_body(finish_reason: Option<&str>) -> Vec<u8> {
-        let mut body = String::new();
-        let mut record = |data: String| body.push_str(&format!("data: {data}\n\n"));
-        record(format!(
-            r#"{{"id":"c1","choices":[{{"index":0,"delta":{{"role":"assistant","tool_calls":[{{"index":0,"id":"call_1","type":"function","function":{{"name":"{TOOL}","arguments":""}}}}]}},"finish_reason":null}}]}}"#
-        ));
-        record(format!(
-            r#"{{"id":"c1","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"function":{{"arguments":{}}}}}]}},"finish_reason":null}}]}}"#,
-            args_json()
-        ));
-        if let Some(finish_reason) = finish_reason {
-            record(format!(
-                r#"{{"id":"c1","choices":[{{"index":0,"delta":{{}},"finish_reason":"{finish_reason}"}}]}}"#
-            ));
-        }
-        record("[DONE]".into());
-        body.into_bytes()
-    }
-
-    // OpenAI Chat assembles at EOF in `finish()`, so its decode failures record as
-    // `eof_before_completion` today; the ceiling cut keeps that attempt outcome.
-    #[tokio::test]
-    async fn openai_chat_ceiling_cut_is_permanent_and_named() {
-        let outcome = run_step(
-            OpenAiChat,
-            openai_chat_frozen_config("gpt-test"),
-            "text/event-stream",
-            openai_chat_body(Some("length")),
-        )
-        .await;
-        assert_ceiling_cut(&outcome, "4096", AttemptOutcome::EofBeforeCompletion);
-        assert!(outcome
-            .error()
-            .message
-            .contains("provider stop reason length"));
-    }
-
-    #[tokio::test]
-    async fn openai_chat_cut_without_ceiling_stop_keeps_the_parse_failure() {
-        for finish in [None, Some("tool_calls"), Some("stop")] {
-            let outcome = run_step(
-                OpenAiChat,
-                openai_chat_frozen_config("gpt-test"),
-                "text/event-stream",
-                openai_chat_body(finish),
-            )
-            .await;
-            assert_parse_failure(&outcome, AttemptOutcome::EofBeforeCompletion);
-        }
-    }
-
-    // ───────────── openai_responses and openai_responses_chatgpt ─────────────
-
-    /// `terminal` is the terminal response object's status and incomplete_details fields.
-    fn responses_body(terminal: &str) -> Vec<u8> {
-        let mut body = String::new();
-        let mut record = |data: String| body.push_str(&format!("data: {data}\n\n"));
-        record(r#"{"type":"response.created","response":{"id":"resp_1"}}"#.into());
-        record(format!(
-            r#"{{"type":"response.output_item.added","output_index":0,"item":{{"type":"function_call","call_id":"call_1","name":"{TOOL}","arguments":""}}}}"#
-        ));
-        record(format!(
-            r#"{{"type":"response.function_call_arguments.delta","output_index":0,"delta":{}}}"#,
-            args_json()
-        ));
-        let kind = if terminal.contains("\"completed\"") {
-            "response.completed"
-        } else {
-            "response.incomplete"
-        };
-        record(format!(
-            r#"{{"type":"{kind}","response":{{"id":"resp_1",{terminal},"usage":{{"input_tokens":10,"output_tokens":4096}}}}}}"#
-        ));
-        body.into_bytes()
-    }
-
-    const RESPONSES_CEILING: &str =
-        r#""status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}"#;
-    /// Controls: a bare `incomplete` status does not say why, a content filter is a different
-    /// reason, and `completed` is no stop at the ceiling at all.
-    const RESPONSES_CONTROLS: [&str; 3] = [
-        r#""status":"incomplete""#,
-        r#""status":"incomplete","incomplete_details":{"reason":"content_filter"}"#,
-        r#""status":"completed""#,
-    ];
-
-    #[tokio::test]
-    async fn openai_responses_ceiling_cut_is_permanent_and_named() {
-        let outcome = run_step(
-            OpenAiResponses,
-            openai_responses_frozen_config("gpt-test"),
-            "text/event-stream",
-            responses_body(RESPONSES_CEILING),
-        )
-        .await;
-        assert_ceiling_cut(&outcome, "4096", AttemptOutcome::DecodeError);
-        assert!(outcome
-            .error()
-            .message
-            .contains("provider stop reason max_output_tokens"));
-    }
-
-    #[tokio::test]
-    async fn openai_responses_cut_without_ceiling_stop_keeps_the_parse_failure() {
-        for terminal in RESPONSES_CONTROLS {
-            let outcome = run_step(
-                OpenAiResponses,
-                openai_responses_frozen_config("gpt-test"),
-                "text/event-stream",
-                responses_body(terminal),
-            )
-            .await;
-            assert_parse_failure(&outcome, AttemptOutcome::DecodeError);
-        }
-    }
-
-    // The codex backend rejects `max_output_tokens` in the body, so no cap is sent and the
-    // error says the cap is unknown rather than naming one the provider never saw.
-    #[tokio::test]
-    async fn openai_responses_chatgpt_ceiling_cut_is_permanent_and_named() {
-        let outcome = run_step(
-            OpenAiResponsesChatgpt,
-            openai_responses_chatgpt_frozen_config("gpt-test"),
-            "text/event-stream",
-            responses_body(RESPONSES_CEILING),
-        )
-        .await;
-        assert_ceiling_cut(&outcome, "unknown", AttemptOutcome::DecodeError);
-        assert!(outcome.error().message.contains("output_tokens=4096"));
-    }
-
-    #[tokio::test]
-    async fn openai_responses_chatgpt_cut_without_ceiling_stop_keeps_the_parse_failure() {
-        for terminal in RESPONSES_CONTROLS {
-            let outcome = run_step(
-                OpenAiResponsesChatgpt,
-                openai_responses_chatgpt_frozen_config("gpt-test"),
-                "text/event-stream",
-                responses_body(terminal),
-            )
-            .await;
-            assert_parse_failure(&outcome, AttemptOutcome::DecodeError);
-        }
-    }
-
-    // ───────────── bedrock_converse ─────────────
-
-    fn bedrock_body(message_stop: &str) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend(test_event_stream_message(
-            "messageStart",
-            br#"{"role":"assistant"}"#,
-        ));
-        body.extend(test_event_stream_message(
-            "contentBlockStart",
-            format!(
-                r#"{{"contentBlockIndex":0,"start":{{"toolUse":{{"toolUseId":"tooluse_1","name":"{TOOL}"}}}}}}"#
-            )
-            .as_bytes(),
-        ));
-        body.extend(test_event_stream_message(
-            "contentBlockDelta",
-            format!(
-                r#"{{"contentBlockIndex":0,"delta":{{"toolUse":{{"input":{}}}}}}}"#,
-                args_json()
-            )
-            .as_bytes(),
-        ));
-        body.extend(test_event_stream_message(
-            "contentBlockStop",
-            br#"{"contentBlockIndex":0}"#,
-        ));
-        body.extend(test_event_stream_message(
-            "messageStop",
-            message_stop.as_bytes(),
-        ));
-        body.extend(test_event_stream_message(
-            "metadata",
-            br#"{"usage":{"inputTokens":10,"outputTokens":4096}}"#,
-        ));
-        body
-    }
-
-    // The Bedrock normalizer does not see the per-step generation cap the body may render,
-    // so it names the cap as unknown; the stop reason and reported output count prove the cut.
-    #[tokio::test]
-    async fn bedrock_ceiling_cut_is_permanent_and_named() {
-        let outcome = run_step(
-            BedrockConverse,
-            bedrock_frozen_config("anthropic.claude-test"),
-            "application/vnd.amazon.eventstream",
-            bedrock_body(r#"{"stopReason":"max_tokens"}"#),
-        )
-        .await;
-        assert_ceiling_cut(&outcome, "unknown", AttemptOutcome::DecodeError);
-        assert!(outcome
-            .error()
-            .message
-            .contains("provider stop reason max_tokens"));
-        assert!(outcome.error().message.contains("output_tokens=4096"));
-    }
-
-    #[tokio::test]
-    async fn bedrock_cut_without_ceiling_stop_keeps_the_parse_failure() {
-        for message_stop in [
-            "{}",
-            r#"{"stopReason":"tool_use"}"#,
-            r#"{"stopReason":"end_turn"}"#,
-        ] {
-            let outcome = run_step(
-                BedrockConverse,
-                bedrock_frozen_config("anthropic.claude-test"),
-                "application/vnd.amazon.eventstream",
-                bedrock_body(message_stop),
-            )
-            .await;
-            assert_parse_failure(&outcome, AttemptOutcome::DecodeError);
-        }
-    }
-}
+#[path = "transport/output_ceiling_tests.rs"]
+mod output_ceiling_tests;
 
 /// Render only event discriminators and their bounded counts, never wire payloads.
 fn format_event_type_counts(counts: Option<&[(String, u64)]>) -> String {

@@ -1,6 +1,21 @@
 //! Shared tool-name allocation and provider-specific admission validation.
 pub use broca_protocol::tool_name_alias::*;
 
+#[cfg(test)]
+thread_local! {
+    static MAP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_map_builds() {
+    MAP_BUILDS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn map_builds() -> usize {
+    MAP_BUILDS.with(std::cell::Cell::get)
+}
+
 /// The tool-name map a request rendered under `frozen` uses, for the tools `tools` and the calls
 /// in `prompt`: the operator's aliases, then names allocated under the family's grammar. The
 /// renderer and the transport, which restores echoed names, both take it from here, so they
@@ -10,6 +25,8 @@ pub fn map_for(
     tools: &[broca_protocol::request::Tool],
     prompt: &[broca_protocol::content::Message],
 ) -> ToolNameMap {
+    #[cfg(test)]
+    MAP_BUILDS.with(|count| count.set(count.get() + 1));
     ToolNameMap::build_with_aliases_in(
         tools,
         prompt,

@@ -405,47 +405,13 @@ fn disk_rig(label: &str) -> (PathBuf, RoutedRig) {
 }
 
 #[tokio::test]
-async fn audit_exit_disabled_validation_precedes_broken_store_lookup() {
-    let (path, mut rig) = disk_rig("disabled-order");
-    Arc::get_mut(&mut rig.service).unwrap().config.routed_models = false;
-    let sql = rusqlite::Connection::open(path.join("system-one.db")).unwrap();
-    sql.execute_batch("ALTER TABLE batch RENAME TO unavailable_batch;")
-        .unwrap();
-    let no_model = call(&rig, &routed_request(&["x"])).await.unwrap_err();
-    assert_eq!(no_model["code"], "invalid_params");
-    assert_eq!(
-        no_model["detail"]["field"], "model",
-        "base parser refuses before the unavailable batch table can be read"
-    );
-    let mut unknown: Value = serde_json::from_str(&pinned(&["x"])).unwrap();
-    unknown["model"] = json!("unknown/model");
-    let unknown = call(&rig, &unknown.to_string()).await.unwrap_err();
-    assert_eq!(
-        unknown["code"], "model_unknown",
-        "base catalog validation precedes its claim"
-    );
-    let valid = call(&rig, &pinned(&["x"])).await.unwrap_err();
-    assert_eq!(valid["code"], "internal_error");
-    assert_eq!(
-        valid["message"], "the batch store is unavailable; re-send the batch",
-        "store failure occurs at the base claim boundary"
-    );
-    assert!(rig.router.calls.lock().unwrap().is_empty());
-    assert_eq!(rig.provider.calls("x"), 0);
-    drop(sql);
-    drop(rig);
-    broca_test_support::remove_rig_dir(&path);
-}
-
-#[tokio::test]
-async fn audit_exit_disabled_malformed_legacy_scope_keeps_base_refusal_bytes() {
-    let (path, mut rig) = disk_rig("disabled-scope");
+async fn audit_exit_malformed_legacy_scope_keeps_original_refusal_bytes() {
+    let (path, rig) = disk_rig("legacy-scope");
     rig.provider
         .script("x", vec![Script::Answer(answered(Some(7)))]);
     call(&rig, &pinned(&["x"])).await.unwrap();
     let sql = rusqlite::Connection::open(path.join("system-one.db")).unwrap();
     sql.execute_batch("UPDATE batch SET scope_json='invalid JSON', routing_choice=NULL, routing_runs=NULL, routing_pending=NULL;").unwrap();
-    Arc::get_mut(&mut rig.service).unwrap().config.routed_models = false;
     let refusal = rig
         .service
         .clone()

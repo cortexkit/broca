@@ -8,7 +8,7 @@
 //! sent it, its title and its identity digest.
 
 use broca_protocol::request::SubmissionRequest;
-use broca_session_store::record::{PartKind, QueuedSend, Steer};
+use broca_session_store::record::{PartKind, PartRef, QueuedSend, Steer};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -37,6 +37,18 @@ pub struct Receipt {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks: Option<Box<broca_records::record::Hooks>>,
+    /// The scope an ordered send was admitted under, when its admission froze the session's
+    /// scope or reopened it at a later epoch: the run it starts records that scope, even when
+    /// the process stops between this record and the run's start. Absent when the send runs
+    /// under the scope the session already froze. A reader looks it up by name, so one that
+    /// predates it drains the send under the frozen scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<broca_protocol::SessionScope>,
+    /// The plan manifest an ordered send was admitted with on a session no run has frozen one
+    /// for yet, as [`receipt_manifest`] stores it: the run it starts freezes it, as a send
+    /// starting the session's first run does. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<Value>,
 }
 
 /// Where a queued send sits in time and how it asked to be delivered.
@@ -191,6 +203,79 @@ pub fn receipt_field(send: &QueuedSend, name: &str) -> Option<Value> {
         .parse()
         .get_mut(name)
         .map(Value::take)
+}
+
+/// `manifest` as a queued send's receipt keeps it: stored as setup parts in `parts`, as a run's
+/// start stores the manifest it froze, and named by each part's kind and digest beside the rest
+/// of its members. The plan's text is never inlined.
+pub fn receipt_manifest(
+    manifest: &broca_records::record::PlanManifest,
+    parts: &mut dyn Parts,
+) -> Result<Value, String> {
+    let mut setup = Vec::new();
+    let rest = crate::run::manifest_parts(manifest, parts, &mut setup)
+        .map_err(|error| format!("a queued send's manifest: {error:?}"))?;
+    Ok(serde_json::json!({ "parts": setup, "rest": rest }))
+}
+
+/// The manifest `send` was admitted with, as its receipt keeps it ([`receipt_manifest`]),
+/// rebuilt from its setup parts in `parts`; `None` when its receipt keeps none.
+pub fn queued_manifest(
+    send: &QueuedSend,
+    parts: &dyn Parts,
+) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, String> {
+    let Some(kept) = receipt_field(send, "manifest") else {
+        return Ok(None);
+    };
+    let refs = kept
+        .get("parts")
+        .and_then(Value::as_array)
+        .ok_or("a queued send's manifest names no parts")?
+        .iter()
+        .map(part_ref)
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest = broca_session_store::fold::operations::ManifestRef {
+        parts: refs,
+        rest: kept.get("rest").filter(|rest| !rest.is_null()).cloned(),
+    };
+    crate::run::stored_manifest(&manifest, parts)
+        .map(Some)
+        .map_err(|error| format!("a queued send's manifest: {error:?}"))
+}
+
+/// A setup part's reference as [`receipt_manifest`] writes it: its kind as the kind serializes,
+/// and its digest in hex.
+fn part_ref(value: &Value) -> Result<PartRef, String> {
+    let unnamed = || format!("a queued send's manifest names the part {value}");
+    let kind = [
+        PartKind::Tools,
+        PartKind::ProviderAnswer,
+        PartKind::SystemText,
+        PartKind::Plan,
+        PartKind::Declarations,
+        PartKind::ResponseFormat,
+        PartKind::GlobalSystem,
+        PartKind::RenderConfig,
+    ]
+    .into_iter()
+    .find(|kind| serde_json::to_value(kind).ok().as_ref() == value.get("kind"))
+    .ok_or_else(unnamed)?;
+    let hex = value
+        .get("digest")
+        .and_then(Value::as_str)
+        .filter(|hex| hex.len() == 64)
+        .ok_or_else(unnamed)?;
+    let mut digest = [0; 32];
+    for (byte, pair) in digest.iter_mut().zip(hex.as_bytes().chunks(2)) {
+        *byte = std::str::from_utf8(pair)
+            .ok()
+            .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            .ok_or_else(unnamed)?;
+    }
+    Ok(PartRef {
+        kind,
+        digest: broca_session_store::codec::Digest(digest),
+    })
 }
 
 #[cfg(test)]

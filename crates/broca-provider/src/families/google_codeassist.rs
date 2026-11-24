@@ -163,7 +163,7 @@ impl WireFamily for GoogleCodeAssist {
     }
 
     fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
-        with_request_body(frozen, opts, None, None, |body| {
+        with_request_body(frozen, None, opts, None, None, |body| {
             build_envelope(frozen, opts, body).canonical_len()
         })
     }
@@ -174,7 +174,7 @@ impl WireFamily for GoogleCodeAssist {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        with_request_body(frozen, opts, None, provenance, |body| {
+        with_request_body(frozen, None, opts, None, provenance, |body| {
             build_envelope(frozen, opts, body).to_value()
         })
     }
@@ -185,7 +185,19 @@ impl WireFamily for GoogleCodeAssist {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        with_request_body(frozen, opts, None, provenance, |body| {
+        with_request_body(frozen, None, opts, None, provenance, |body| {
+            build_envelope(frozen, opts, body).canonical_bytes()
+        })
+    }
+
+    fn render_with_shared_name_map(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+        name_map: &crate::tool_name_alias::ToolNameMap,
+    ) -> Vec<u8> {
+        with_request_body(frozen, Some(name_map), opts, None, provenance, |body| {
             build_envelope(frozen, opts, body).canonical_bytes()
         })
     }
@@ -209,6 +221,7 @@ impl WireFamily for GoogleCodeAssist {
         let media = MediaRender { frozen, payloads };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -226,6 +239,7 @@ impl WireFamily for GoogleCodeAssist {
         let media = MediaRender { frozen, payloads };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -257,9 +271,6 @@ impl WireFamily for GoogleCodeAssist {
             }
             AuthHandle::ApiKeyHeader { header, value } => {
                 headers.push((header.clone(), value.clone()));
-            }
-            AuthHandle::SigV4 { signed_headers, .. } => {
-                headers.extend(signed_headers.iter().cloned());
             }
             AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
             AuthHandle::None => {}
@@ -533,14 +544,12 @@ impl StreamNormalizer for CodeAssistNormalizer {
     }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
-        for payload in self.sse.push(chunk)? {
-            if payload.trim() == "[DONE]" {
+        for payload in self.sse.push_parsed(chunk)? {
+            if payload.raw().trim() == "[DONE]" {
                 continue;
             }
-            let parsed: Value = serde_json::from_str(&payload)
-                .map_err(|e| NormalizeError::Invalid(e.to_string()))?;
             self.inner
-                .handle_response_value(response_body(&parsed), &mut out)?;
+                .handle_response_value(response_body(payload.value()?), &mut out)?;
         }
         Ok(out)
     }
@@ -567,14 +576,12 @@ impl StreamNormalizer for CodeAssistNormalizer {
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
-        for payload in self.sse.flush()? {
-            if payload.trim() == "[DONE]" {
+        for payload in self.sse.flush_parsed()? {
+            if payload.raw().trim() == "[DONE]" {
                 continue;
             }
-            let parsed: Value = serde_json::from_str(&payload)
-                .map_err(|e| NormalizeError::Invalid(e.to_string()))?;
             self.inner
-                .handle_response_value(response_body(&parsed), &mut out)?;
+                .handle_response_value(response_body(payload.value()?), &mut out)?;
         }
         out.extend(self.inner.finish()?);
         Ok(out)

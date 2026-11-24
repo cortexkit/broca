@@ -148,9 +148,39 @@ impl RunFacts {
 pub struct SettledRuns {
     inner: Mutex<SettledInner>,
     admissions: Mutex<KeptAdmissions>,
+    media: Mutex<KeptMedia>,
     capacity: usize,
     max_bytes: usize,
 }
+
+/// Media `session.media_read` found, under the session's address, incarnation and history version
+/// and the medium's digest: the medium as the first record that stored it names it, and its
+/// bytes once read and checked against it. A client reads a medium in chunks, and each chunk
+/// used to find the medium among every record of the session and read, open and hash its whole
+/// object to serve a slice of it; an object is sealed and checked whole, so no part of it can be
+/// read alone. A medium a record stored under a history version stays the first stored under it,
+/// since records are only appended until the version moves, and its object never changes. Oldest
+/// first in `order`.
+#[derive(Default)]
+struct KeptMedia {
+    media: HashMap<SettledKey, KeptMedium>,
+    order: VecDeque<SettledKey>,
+    /// The bytes of every medium kept.
+    bytes: usize,
+}
+
+/// A medium found by its digest, and its checked bytes when they fit [`MEDIA_MAX_BYTES`].
+type KeptMedium = (
+    broca_session_store::session::NamedMedium,
+    Option<Arc<Vec<u8>>>,
+);
+
+/// How many media are kept: those a few clients are reading in chunks at once.
+const MEDIA_KEPT: usize = 64;
+
+/// What the kept media's bytes hold together: 64 MiB, a few large media read at once. A medium
+/// larger than that alone keeps only where it is stored, and each of its chunks reads its object.
+const MEDIA_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Runs' `run.admission` answers, oldest first in `order`.
 #[derive(Default)]
@@ -188,7 +218,9 @@ struct Settled {
 }
 
 /// What one kept entry holds, walked (see `broca_session_store::held`): its key and its slot in
-/// the order, the heap its facts own, and its final message as the serde walk sizes it.
+/// the order, the heap its facts own, and its final message, its state's detail and its wait as
+/// the serde walk sizes them. A run that ended in error keeps its error text in its state, and a
+/// paused or waiting one its wait, so those count as a final message does.
 fn settled_bytes(key: &SettledKey, facts: &RunFacts) -> usize {
     use broca_session_store::held::HeldBytes;
     let (address, _, _, run_id) = key;
@@ -203,6 +235,28 @@ fn settled_bytes(key: &SettledKey, facts: &RunFacts) -> usize {
         + 2 * key_heap
         + facts.interrupt_reason.heap_bytes()
         + message
+        + state_heap_bytes(&facts.state)
+        + facts.wait.heap_bytes()
+}
+
+/// What a run state's detail holds on the heap, walked as values its records carry.
+fn state_heap_bytes(state: &ReconciledRunState) -> usize {
+    use broca_session_store::held::{serde_heap_bytes, HeldBytes};
+    fn walked<T: serde::Serialize>(value: &Option<T>) -> usize {
+        value.as_ref().map_or(0, serde_heap_bytes)
+    }
+    walked(&state.finish)
+        + walked(&state.account_limit_pause)
+        + walked(&state.budget_detail)
+        + walked(&state.context_ceiling)
+        + walked(&state.structured_output)
+        + walked(&state.live_step)
+        + serde_heap_bytes(&state.held_calls)
+        + state.undelivered_steers.heap_bytes()
+        + state.indeterminate_tool_calls.heap_bytes()
+        + walked(&state.error)
+        + walked(&state.auth_selection)
+        + state.title.heap_bytes()
 }
 
 /// The session's address, its incarnation, its history version, and the run id.
@@ -236,6 +290,7 @@ impl SettledRuns {
         Self {
             inner: Mutex::new(SettledInner::default()),
             admissions: Mutex::new(KeptAdmissions::default()),
+            media: Mutex::new(KeptMedia::default()),
             capacity: capacity.max(1),
             max_bytes,
         }
@@ -257,6 +312,45 @@ impl SettledRuns {
                 break;
             };
             kept.answers.remove(&oldest);
+        }
+    }
+
+    /// The medium kept under `key` (see [`KeptMedia`]), now the most recently used.
+    pub(crate) fn medium(&self, key: &SettledKey) -> Option<KeptMedium> {
+        let mut kept = self.media.lock().ok()?;
+        let medium = kept.media.get(key)?.clone();
+        if let Some(at) = kept.order.iter().position(|kept| kept == key) {
+            if let Some(used) = kept.order.remove(at) {
+                kept.order.push_back(used);
+            }
+        }
+        Some(medium)
+    }
+
+    /// Keeps `medium`, which a record stored, under `key`, with its checked `bytes` when they
+    /// fit.
+    pub(crate) fn keep_medium(
+        &self,
+        key: SettledKey,
+        medium: broca_session_store::session::NamedMedium,
+        bytes: Option<Arc<Vec<u8>>>,
+    ) {
+        let Ok(mut kept) = self.media.lock() else {
+            return;
+        };
+        let bytes = bytes.filter(|bytes| bytes.len() <= MEDIA_MAX_BYTES);
+        kept.bytes += bytes.as_ref().map_or(0, |bytes| bytes.len());
+        match kept.media.insert(key.clone(), (medium, bytes)) {
+            Some((_, replaced)) => kept.bytes -= replaced.map_or(0, |bytes| bytes.len()),
+            None => kept.order.push_back(key),
+        }
+        while kept.order.len() > MEDIA_KEPT || kept.bytes > MEDIA_MAX_BYTES {
+            let Some(oldest) = kept.order.pop_front() else {
+                break;
+            };
+            if let Some((_, dropped)) = kept.media.remove(&oldest) {
+                kept.bytes -= dropped.map_or(0, |bytes| bytes.len());
+            }
         }
     }
 
@@ -309,12 +403,14 @@ impl SettledRuns {
                 })
                 .sum::<usize>()
         });
+        let media = self.media.lock().map_or(0, |kept| kept.bytes);
         broca_wire::MemoryCache {
             entries: inner.facts.len() as u64,
             max_entries: self.capacity as u64,
             counted_bytes: Some(inner.bytes as u64),
             max_bytes: Some(self.max_bytes as u64),
-            estimated_bytes: (inner.bytes + spare + admissions) as u64,
+            // The kept media count toward the estimate only: they have their own caps.
+            estimated_bytes: (inner.bytes + spare + admissions + media) as u64,
             ..Default::default()
         }
     }

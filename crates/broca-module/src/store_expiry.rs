@@ -28,7 +28,7 @@ impl StoreRuntime {
         run: Option<&str>,
         now_ms: u64,
     ) -> Result<Option<u64>, OpenError> {
-        self.expiry_with_view(key, run, now_ms, false, None)
+        self.expiry_with_view(key, run, now_ms, false, None, None)
             .await
             .map(|(deadline, _)| deadline)
     }
@@ -38,7 +38,8 @@ impl StoreRuntime {
     /// `actor_open` says the session's actor is open: its retention timer then decides the
     /// session's deadline and deletes the session when it comes (`store_actor::expiry`), so only
     /// the expiry markers of an earlier session at the address are read here. `retention` keeps
-    /// the deadlines it already knows (see [`Self::deadline_of`]).
+    /// the deadlines it already knows (see [`Self::deadline_of`]). `known_class` is the root the
+    /// session is kept in when the caller already found it (`Some(None)`: no root holds it).
     pub(crate) async fn expiry_with_view(
         &self,
         key: &BindIdentity,
@@ -46,6 +47,7 @@ impl StoreRuntime {
         now_ms: u64,
         actor_open: bool,
         retention: Option<&crate::retention::RetentionService>,
+        known_class: Option<Option<StorageClass>>,
     ) -> Result<(Option<u64>, Option<crate::store_read::StoredLocalView>), OpenError> {
         let markers = self.expiry_markers(key)?;
         if now_ms == 0 && markers.is_empty() {
@@ -70,14 +72,24 @@ impl StoreRuntime {
         // and loading the whole view here cost each read, subscribe or send of a running
         // session a full read of its log, which its actor then answered anyway. A running
         // session's log moves on between two operations, so each load was a new one.
-        if actor_open
-            || self
-                .class_of(key)?
-                .is_some_and(|class| class != StorageClass::Ephemeral)
-        {
+        if actor_open {
             return Ok((None, None));
         }
-        let Some(view) = self.current_view_for(key, "expiry").await? else {
+        let class = match known_class {
+            Some(class) => class,
+            None => self.class_of(key)?,
+        };
+        if class.is_some_and(|class| class != StorageClass::Ephemeral) {
+            return Ok((None, None));
+        }
+        let view = match class {
+            Some(class) => self
+                .current_view_in(key, class, "expiry")
+                .await
+                .map_err(view_error)?,
+            None => None,
+        };
+        let Some(view) = view else {
             let newest = markers.iter().max_by_key(|m| m.seq);
             if newest.is_some_and(|marker| marker.policy_deleted == Some(true)) {
                 return Err(OpenError::UnknownSession);

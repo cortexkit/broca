@@ -1,7 +1,9 @@
 use broca_protocol::request::SubmissionRequest;
 use broca_protocol::BindPrincipal;
 
-use super::{queued_send, request_of, Queued, Receipt};
+use super::{
+    queued_manifest, queued_send, receipt_field, receipt_manifest, request_of, Queued, Receipt,
+};
 use crate::parts::MemoryParts;
 
 fn request() -> SubmissionRequest {
@@ -93,4 +95,102 @@ fn a_queued_send_keeps_its_receipt_and_marks() {
         );
         assert_eq!(send.named_speaker, named_speaker);
     }
+}
+
+/// A plan manifest as a send's admission fetched it: a plan, a tool and system text.
+fn manifest() -> broca_records::record::PlanManifest {
+    broca_records::record::PlanManifest {
+        rich_ui: None,
+        plan: broca_records::record::OpaqueJson::from_json_text(
+            serde_json::json!({"senders": [{"module": "aft"}]}).to_string(),
+        )
+        .unwrap(),
+        plan_identity: "plan-1".into(),
+        composition_digest: "composition".into(),
+        tools: std::sync::Arc::new(vec![serde_json::from_value(serde_json::json!({
+            "name": "read",
+            "description": "reads a file",
+            "input_schema": {"type": "object"},
+        }))
+        .unwrap()]),
+        system_text: "you are a worker".into(),
+        system_digest: "system".into(),
+        join_version: 1,
+        role_versions: Default::default(),
+        fetches: vec![],
+        declarations: vec![],
+    }
+}
+
+/// A receipt that keeps the scope and the manifest an ordered send was admitted with reads as
+/// before through every field a reader predating those keys knows: readers look each receipt
+/// field up by name (`receipt_field`), so the request and every older field read back as from
+/// the same receipt without them. The manifest is kept as setup parts named by digest, never
+/// as the plan's text, and reads back whole.
+#[test]
+fn a_receipt_keeping_a_scope_and_a_manifest_reads_as_before_by_its_older_fields() {
+    let mut parts = MemoryParts::default();
+    let scope = broca_protocol::SessionScope {
+        owner: BindPrincipal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        agent_id_frozen: false,
+        scope_ref: "head-1".into(),
+        scope_epoch: 2,
+        flow_id: None,
+        sender: None,
+        agent_id: None,
+        run_id: None,
+    };
+    let kept = Receipt {
+        scope: Some(scope.clone()),
+        manifest: Some(receipt_manifest(&manifest(), &mut parts).unwrap()),
+        ..receipt()
+    };
+    let queued = |receipt: &Receipt, parts: &mut MemoryParts| {
+        queued_send(
+            "sub-r1",
+            Some("k1"),
+            &request(),
+            receipt,
+            Queued::default(),
+            None,
+            parts,
+        )
+        .unwrap()
+    };
+    let old = queued(&receipt(), &mut parts);
+    let new = queued(&kept, &mut parts);
+    assert_eq!(
+        serde_json::to_value(request_of(&new, &parts).unwrap()).unwrap(),
+        serde_json::to_value(request_of(&old, &parts).unwrap()).unwrap()
+    );
+    for name in [
+        "session_class",
+        "sent_by",
+        "retention",
+        "keep_warm",
+        "conversation_key",
+        "request_identity_digest",
+        "principal",
+        "title",
+        "hooks",
+    ] {
+        assert_eq!(
+            receipt_field(&new, name),
+            receipt_field(&old, name),
+            "{name}"
+        );
+    }
+    let stored = receipt_field(&new, "manifest").unwrap().to_string();
+    assert!(!stored.contains("senders"), "the plan is inlined: {stored}");
+    assert_eq!(
+        receipt_field(&new, "scope"),
+        Some(serde_json::to_value(&scope).unwrap())
+    );
+    assert_eq!(
+        queued_manifest(&new, &parts).unwrap().as_deref(),
+        Some(&manifest())
+    );
+    assert_eq!(queued_manifest(&old, &parts).unwrap(), None);
 }

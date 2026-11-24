@@ -375,13 +375,25 @@ impl Side {
         request: SubmissionRequest,
         order: Value,
     ) -> SendOutcome {
+        self.send_ordered_as(run_id, request, order, SendKey::Minted)
+            .await
+    }
+
+    /// [`Side::send_ordered`] under `key`.
+    async fn send_ordered_as(
+        &self,
+        run_id: &str,
+        request: SubmissionRequest,
+        order: Value,
+        key: SendKey,
+    ) -> SendOutcome {
         self.registry
             .route_submission_with_order(
                 &self.key,
                 RunId(run_id.into()),
-                self.caller.shape(run_id, &SendKey::Minted, request),
+                self.caller.shape(run_id, &key, request),
                 RunKind::FreshOrResume,
-                SendKey::Minted,
+                key,
                 false,
                 broca_protocol::Delivery::Queue,
                 Some(planned("plan-1", None)),
@@ -1144,7 +1156,24 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
         Detail::Full,
     );
     capped.max_bytes = Some(600);
-    requests.push(capped);
+    requests.push(capped.clone());
+    // Byte caps that cut the page anywhere, from any start, in either detail, without a count
+    // limit: such a read loads a growing prefix of what follows its start until the page stops
+    // short of it, and must serve the page paging the whole transcript serves.
+    for after in [None, Some(1), Some(len / 2), Some(len)] {
+        for max_bytes in [1, 600, 1_500, 4_000, 1_000_000] {
+            for detail in [Detail::Full, Detail::Compact] {
+                let mut request = capped.clone();
+                request.select = Select::After {
+                    after_ordinal: after,
+                    limit: None,
+                };
+                request.detail = detail;
+                request.max_bytes = Some(max_bytes);
+                requests.push(request);
+            }
+        }
+    }
     requests.push(ReadRequest::new(
         Select::Mids {
             mids: vec![
@@ -1206,6 +1235,48 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
         );
         let _: ReadPage = serde_json::from_value(served).unwrap();
     }
+}
+
+/// A byte-capped `session.entries` read with no count limit projects about as many entries as its
+/// page holds, not every entry after where it starts: a compaction provider paging a long
+/// session by bytes paid a read, a projection and a token count of the whole rest of the
+/// transcript for each page.
+#[tokio::test]
+async fn a_byte_capped_entries_read_projects_about_what_its_page_holds() {
+    const RUNS: usize = 20;
+    let more = (0..RUNS)
+        .map(|n| text_step(&format!("m{n}"), "more"))
+        .collect();
+    let store = contract_sessions_with(false, more, IDLE).await;
+    for n in 0..RUNS {
+        let run = format!("more-{n}");
+        assert!(matches!(
+            store
+                .send_request(&run, untooled("again"), Some(planned("plan-1", None)))
+                .await,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ));
+        store.settled(&run).await;
+    }
+    let total = entry_mids(&store).await.len();
+    assert!(total > 2 * RUNS, "{total} entries");
+    crate::store_entries::PROJECTED.with(|projected| projected.set(0));
+    let page = store
+        .compaction(
+            Some("ck-mc"),
+            "session.entries",
+            json!({"select": {"by": "after"}, "detail": "full", "max_bytes": 600}),
+        )
+        .await
+        .unwrap();
+    let projected = crate::store_entries::PROJECTED.with(std::cell::Cell::get);
+    let served = page["entries"].as_array().unwrap().len();
+    assert!(served >= 1 && served < total, "{served} of {total} served");
+    assert!(page["next_after"].is_u64(), "{page}");
+    assert!(
+        projected < total / 2,
+        "projected {projected} of {total} entries for a page of {served}"
+    );
 }
 
 /// A store session's reads clean part-number notation out of a reply wherever its entry facts
@@ -2887,6 +2958,196 @@ async fn a_part_tag_template_renders_the_number_the_next_request_shows_alike(
             slot: "part".into()
         }
     );
+}
+
+/// A session on the compaction contract whose plan gives its owner the [`pointer`] template,
+/// after its two runs (`r1`, then `r2` with a tool turn), with `more` steps scripted after
+/// theirs.
+async fn pointer_session(more: Vec<Vec<NormalizedEvent>>) -> Side {
+    let mut manifest = compacting_manifest(true);
+    manifest.plan = broca_records::record::OpaqueJson::from_json_text(
+        json!({
+            "compaction_item": {"provider": "ck-mc", "preset": "default"},
+            "render_tags": true,
+            "senders": [{"module": "prefrontal-core", "templates": [pointer()]}],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut steps = vec![
+        text_step("a1", "Done."),
+        tool_step("a2"),
+        text_step("a3", "It says file contents."),
+    ];
+    steps.extend(more);
+    let side = side_idling(steps, false, true, Duration::from_secs(60)).await;
+    let first = side
+        .send_request(
+            "r1",
+            owned("first"),
+            Some(planned("plan-1", Some(manifest))),
+        )
+        .await;
+    assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
+    side.settled("r1").await;
+    let second = side
+        .send_request("r2", owned("read a"), Some(planned("plan-1", None)))
+        .await;
+    assert!(
+        matches!(
+            second,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ),
+        "{second:?}"
+    );
+    side.settled("r2").await;
+    side
+}
+
+/// An order delivering the [`pointer`] template in `modes`, naming the part `part` of the
+/// message `mid`.
+fn pointer_order(modes: Value, mid: &str, part: &str) -> Value {
+    let digest = cortexkit_role_llm_runner::delivery_order::template_digest(&pointer());
+    json!({
+        "modes": modes,
+        "template": {"id": "pointer", "digest": digest, "slots": {"part": {"mid": mid, "part": part}}},
+    })
+}
+
+/// A send of the owner's that carries no text of its own, only a template's.
+fn untexted() -> SubmissionRequest {
+    let mut request = owned("");
+    request.input = Vec::new();
+    request
+}
+
+/// A keyed template send's retry is answered from the send it repeats, though the part its
+/// template names has since been cut from the next request: the send was already made, so the
+/// template isn't rendered again against today's view.
+#[tokio::test]
+async fn a_keyed_template_sends_retry_is_answered_after_its_part_is_cut() {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    let side = pointer_session(vec![text_step("a4", "seen")]).await;
+    // The first run's reply, entry 2.
+    let (mid, part, _) = numbered_part(&side, 2).await;
+    let order = pointer_order(json!(["idle_start"]), &mid, &part);
+    let key = || SendKey::SendId("k1".into());
+    let outcome = side
+        .send_ordered_as("t1", untexted(), order.clone(), key())
+        .await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    side.settled("t1").await;
+    side.assert_completed("t1").await;
+    let view = View::seal(
+        1,
+        vec![Edit::new(
+            1,
+            EditOp::Drop {
+                mid: mid.clone(),
+                part: None,
+            },
+        )],
+    );
+    let applied = side
+        .compaction(Some("ck-mc"), "session.apply_view", json!({ "view": view }))
+        .await;
+    assert_eq!(applied, Ok(json!({"answer": "accepted"})));
+    let retry = side.send_ordered_as("t1", untexted(), order, key()).await;
+    assert!(
+        matches!(
+            &retry,
+            SendOutcome::Finished { run_id, reason: broca_protocol::RunFinishReason::Completed, .. }
+                if run_id.0 == "t1"
+        ),
+        "{retry:?}"
+    );
+}
+
+/// A template naming a part of a session sealed behind a cut reads the window and the messages
+/// the views name, as the next request shows them, never the whole transcript: the sealed
+/// history of a long session is far too long to decode on the actor for one send.
+#[tokio::test]
+async fn a_template_on_a_sealed_session_reads_no_whole_transcript() {
+    use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+    let side = pointer_session(vec![text_step("a4", "sealed behind the cut")]).await;
+    let mids = entry_mids(&side).await;
+    let cut = View::seal(
+        1,
+        vec![Edit::new(
+            1,
+            EditOp::Cut {
+                through: mids[&2].clone(),
+            },
+        )],
+    );
+    let applied = side
+        .compaction(Some("ck-mc"), "session.apply_view", json!({ "view": cut }))
+        .await;
+    assert_eq!(applied, Ok(json!({"answer": "accepted"})));
+    // r3's first step applies the view and seals the history before its cut.
+    let third = side
+        .send_request("r3", owned("again"), Some(planned("plan-1", None)))
+        .await;
+    assert!(
+        matches!(
+            third,
+            SendOutcome::Active { .. } | SendOutcome::Pending { .. }
+        ),
+        "{third:?}"
+    );
+    side.settled("r3").await;
+    let window_start = side
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .conversation
+        .window_start();
+    assert_eq!(window_start, 3, "the seal kept entries from 3 on open");
+    // r2's reply, entry 6, in the window.
+    let (mid, part, number) = numbered_part(&side, 6).await;
+    let before = crate::store_entries::WHOLE_READS.with(std::cell::Cell::get);
+    // A list without `idle_start` waits in the queue: the send renders and starts no run.
+    let outcome = side
+        .send_ordered(
+            "t1",
+            untexted(),
+            pointer_order(json!(["tool_result"]), &mid, &part),
+        )
+        .await;
+    assert!(
+        matches!(outcome, SendOutcome::Pending { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        crate::store_entries::WHOLE_READS.with(std::cell::Cell::get) - before,
+        0,
+        "the template read the whole transcript"
+    );
+    // It still renders the number the next request shows.
+    let session = side
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap();
+    let queued = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, record)| match record {
+            broca_session_store::record::Record::QueuedSend(send) => Some(send),
+            _ => None,
+        })
+        .expect("the template send is queued");
+    let text = serde_json::to_string(&queued.input).unwrap();
+    assert!(text.contains(&number.to_string()), "{text}");
 }
 
 /// `session.tag_map` over the sessions these scenarios build.

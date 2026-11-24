@@ -246,28 +246,56 @@ pub async fn serve_compaction<B: SessionBackend>(
             let mut full_request = request.clone();
             full_request.detail = broca_core::compaction_v2::protocol::read::Detail::Full;
             full_request.max_bytes = None;
-            let mut page = entries_page(session, &full_request)
-                .await
-                .map_err(internal)?;
             let local = std::sync::Mutex::new(broca_core::compaction_v2::tokens::Counts::default());
             let cache = token_counts.unwrap_or(&local);
-            if let Some(start) = session
+            let admission = session
                 .operations
                 .run
                 .as_ref()
                 .and_then(|run| run.start.as_ref())
-            {
-                let admission =
-                    broca_session_loop::run::admission_of_start(start, parts).map_err(|error| {
-                        internal(format!("token count run configuration: {error:?}"))
-                    })?;
-                let mut counts = cache.lock().unwrap_or_else(|error| error.into_inner());
-                counts.configure(
-                    &broca_session_loop::compaction::frozen(&admission),
-                    admission.manifest.as_deref(),
-                );
-                page = counts.finish_page(page, &request);
-            }
+                .map(|start| broca_session_loop::run::admission_of_start(start, parts))
+                .transpose()
+                .map_err(|error| internal(format!("token count run configuration: {error:?}")))?;
+            let finish = |page: ReadPage| match &admission {
+                Some(admission) => {
+                    let mut counts = cache.lock().unwrap_or_else(|error| error.into_inner());
+                    counts.configure(
+                        &broca_session_loop::compaction::frozen(admission),
+                        admission.manifest.as_deref(),
+                    );
+                    counts.finish_page(page, &request)
+                }
+                None => page,
+            };
+            let mut page = match (&request.select, request.max_bytes) {
+                // With no count limit, only the byte cap bounds the page, and reading, projecting
+                // and counting every entry after the start to keep the few that fit cost the whole
+                // rest of the transcript per page. Read a growing prefix instead, until the page
+                // stops short of what was read or nothing follows it. Paging stops at the first
+                // entry that doesn't fit, and each entry is counted alone, so the page is the one
+                // the whole rest would have made.
+                (Select::After { limit: None, .. }, Some(_)) => {
+                    let mut count = CAPPED_ENTRIES_FIRST;
+                    loop {
+                        let mut bounded = full_request.clone();
+                        if let Select::After { limit, .. } = &mut bounded.select {
+                            *limit = Some(count);
+                        }
+                        let read = entries_page(session, &bounded).await.map_err(internal)?;
+                        let (read_len, exhausted) = (read.entries.len(), read.next_after.is_none());
+                        let page = finish(read);
+                        if exhausted || page.entries.len() < read_len {
+                            break page;
+                        }
+                        count = count.saturating_mul(4);
+                    }
+                }
+                _ => finish(
+                    entries_page(session, &full_request)
+                        .await
+                        .map_err(internal)?,
+                ),
+            };
             // Admission let only the provider the plan in force names through, so the caller
             // is that provider.
             let declared = match caller {
@@ -316,6 +344,11 @@ pub async fn serve_compaction<B: SessionBackend>(
         _ => Err(Refusal::unknown_method(method)),
     }
 }
+
+/// How many entries a byte-capped `session.entries` read with no count limit reads first; each
+/// further read takes four times as many (see `serve_compaction`). Small in tests, so a short
+/// session exercises the reads that follow the first.
+const CAPPED_ENTRIES_FIRST: u64 = if cfg!(test) { 1 } else { 64 };
 
 /// The route's admission, as every method of it is admitted: only the compaction provider the
 /// plan in force names, on a session on the current compaction contract. The session, once
@@ -392,17 +425,34 @@ pub async fn apply_view(
 
 /// A stored message as the compaction entry `session.entries` serves.
 fn project(stored: &StoredEntry) -> Result<Entry, String> {
+    #[cfg(test)]
+    PROJECTED.with(|projected| projected.set(projected.get() + 1));
     broca_session_loop::entries::project(stored)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many entries this thread projected, so a test can count what a read cost.
+    pub(crate) static PROJECTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Every compaction entry of the session, oldest first: what a view is checked against.
 pub async fn all_entries<B: SessionBackend>(session: &Session<B>) -> Result<Vec<Entry>, String> {
+    #[cfg(test)]
+    WHOLE_READS.with(|reads| reads.set(reads.get() + 1));
     crate::store_read::served_compaction_entries(session, 1, usize::MAX)
         .await
         .map_err(|error| format!("{error:?}"))?
         .iter()
         .map(project)
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`all_entries`] ran on this thread, for tests pinning that a path reads
+    /// only part of a long session.
+    pub static WHOLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A `session.entries` page over the whole transcript (`broca_core::compaction_v2::views::page`)
@@ -440,7 +490,8 @@ pub async fn entries_page<B: SessionBackend>(
         Select::Tags { tags } => {
             crate::store_read::served_compaction_entries_by_tag(session, tags).await
         }
-        _ => crate::store_read::served_compaction_entries(session, 1, usize::MAX).await,
+        // Paging matches no entry for any other selection, so none is read.
+        _ => Ok(Vec::new()),
     }
     .map_err(|error| format!("{error:?}"))?;
     let entries = stored.iter().map(project).collect::<Result<Vec<_>, _>>()?;

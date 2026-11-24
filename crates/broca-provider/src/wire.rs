@@ -693,20 +693,13 @@ pub enum AuthHandle {
     Bearer(String),
     /// A named API-key header.
     ApiKeyHeader { header: String, value: String },
-    /// AWS SigV4 request signing. The transport/auth layer computes these signed
-    /// headers after render from the method, URL, headers, and body.
-    SigV4 {
-        region: String,
-        service: String,
-        signed_headers: Vec<(String, String)>,
-    },
     /// A complete, pre-computed header set to attach verbatim (name/value pairs in
     /// order), including the `Authorization` header. The auth-resolution layer builds
     /// this when a credential needs more than one header derived from runtime context —
     /// e.g. the ChatGPT codex backend wants `Authorization` plus a `ChatGPT-Account-Id`
-    /// decoded from the token's JWT and a per-session `session-id`. Like `SigV4`'s
-    /// `signed_headers`, the derivation happens in the auth layer (off the rendered/hashed
-    /// bytes); `endpoint` just attaches what it's given.
+    /// decoded from the token's JWT and a per-session `session-id`. Their derivation
+    /// happens in the auth layer (off the rendered/hashed bytes); `endpoint` just attaches
+    /// what it's given.
     Headers(Vec<(String, String)>),
     /// No credential.
     None,
@@ -720,13 +713,6 @@ impl std::fmt::Debug for AuthHandle {
                 .debug_struct("ApiKeyHeader")
                 .field("header", header)
                 .field("value", &"<redacted>")
-                .finish(),
-            AuthHandle::SigV4 {
-                region, service, ..
-            } => f
-                .debug_struct("SigV4")
-                .field("region", region)
-                .field("service", service)
                 .finish(),
             AuthHandle::Headers(headers) => {
                 let headers: Vec<(&str, &str)> = headers
@@ -787,6 +773,18 @@ pub trait WireFamily: Send + Sync {
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
         broca_protocol::canonical_json_bytes(&self.shape_with_provenance(frozen, opts, provenance))
+    }
+
+    /// Render with the transport's tool-name map, which is also used to restore names in the
+    /// response. Built-in families share that map; other families retain their existing renderer.
+    fn render_with_shared_name_map(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+        _name_map: &crate::tool_name_alias::ToolNameMap,
+    ) -> Vec<u8> {
+        self.render_with_provenance(frozen, opts, provenance)
     }
 
     /// Low-level shaping with explicit verified payloads. `opts.prompt` is the prepared,
@@ -1342,11 +1340,6 @@ mod tests {
             AuthHandle::ApiKeyHeader {
                 header: "x-api-key".to_string(),
                 value: secret.to_string(),
-            },
-            AuthHandle::SigV4 {
-                region: "us-east-1".to_string(),
-                service: "bedrock".to_string(),
-                signed_headers: vec![("authorization".to_string(), secret.to_string())],
             },
             AuthHandle::Headers(vec![("authorization".to_string(), secret.to_string())]),
             AuthHandle::None,

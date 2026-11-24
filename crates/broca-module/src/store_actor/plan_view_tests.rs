@@ -136,6 +136,7 @@ async fn ask(commands: &Harness, request: StoreReadRequest) -> StoreReadReply {
             position,
             live_step,
             entry_speaks_for,
+            ..
         } => {
             let view = Session::view_at(
                 commands.backend,

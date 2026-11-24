@@ -104,22 +104,21 @@ async fn synthetic_usage_is_never_copied_for_envelopes_on_legacy_normalizers() {
         families::*, normalize::SharedResponseEvidence, spec::WireFamilyId, wire::WireFamily,
     };
     use serde_json::json;
-    // Measured against the pre-envelope normalizers at 452151dc3 with these exact
-    // fixtures. SSE type inference and content telemetry already parse usage strings;
-    // an envelope must not add any allocation to that legacy profile.
+    // Allocation baselines for these exact fixtures. SSE event naming, response-content
+    // observation, and family decoding share one tree; an envelope adds only its raw-usage copy.
     let cases: [(WireFamilyId, &dyn WireFamily, [usize; 4]); 5] = [
         (
             WireFamilyId::AnthropicMessages,
             &AnthropicMessages,
-            [49, 3, 0, 0],
+            [26, 1, 0, 0],
         ),
-        (WireFamilyId::OpenAiChat, &OpenAiChat, [38, 3, 0, 0]),
+        (WireFamilyId::OpenAiChat, &OpenAiChat, [22, 1, 0, 0]),
         (
             WireFamilyId::OpenAiResponses,
             &OpenAiResponses,
-            [37, 2, 0, 0],
+            [25, 1, 0, 0],
         ),
-        (WireFamilyId::Gemini, &Gemini, [28, 3, 0, 0]),
+        (WireFamilyId::Gemini, &Gemini, [18, 1, 0, 0]),
         (
             WireFamilyId::BedrockConverse,
             &BedrockConverse,
@@ -159,13 +158,9 @@ async fn synthetic_usage_is_never_copied_for_envelopes_on_legacy_normalizers() {
             let (result, copies) = count(async { normalizer.push(&bytes) }).await;
             result.unwrap();
             if journaled {
-                // Responses also builds a generic usage DOM when raw evidence is wanted;
-                // its legacy terminal parser skips unknown usage keys without owning them.
-                let extra = if id == WireFamilyId::OpenAiResponses {
-                    2
-                } else {
-                    1
-                };
+                // Raw evidence retains its own copy of the unknown usage text but reads the
+                // SSE decoder's tree instead of adding another generic parse.
+                let extra = 1;
                 assert_eq!(
                     copies[1],
                     baseline[1] + extra,

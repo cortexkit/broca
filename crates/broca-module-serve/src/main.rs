@@ -192,9 +192,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     settings.log_conversion();
     let service_tier = broca_module_serve::config::ServiceTierConfig::from_settings(&settings)
         .map_err(ServeIoError)?;
-    let classifier_routing =
-        broca_module_serve::config::ClassifierRoutingConfig::from_settings(&settings)
-            .map_err(ServeIoError)?;
     broca_protocol::configure_service_tier(service_tier.enabled)
         .map_err(|error| ServeIoError(error.into()))?;
     // Before any session opens: every sync the session store makes follows it.
@@ -602,7 +599,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             &vault_bind,
             VAULT_READY_TIMEOUT,
         ));
-        // Owed reports still describe real runs after routed admission is switched off.
         classifier_router = Some(broca_module_serve::system_one::Routing {
             client: routing.clone(),
             credentials: Arc::new(broca_module_serve::system_one::VaultRoutingCredentials(
@@ -800,10 +796,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             broca_store::SystemOneStore::open(state_root.join("system-one.db"))
                 .map_err(|e| ServeIoError(format!("open System One batch store: {e}")))?,
         );
-        let config = broca_module_serve::system_one::Config {
-            routed_models: classifier_routing.enabled,
-            ..Default::default()
-        };
+        let config = broca_module_serve::system_one::Config::default();
         let openai_decisions =
             broca_module_serve::system_one::openai_decisions::OpenAiDecisions::new(
                 openai_decisions_base_url.as_deref(),

@@ -318,10 +318,23 @@ impl AnthropicNormalizer {
         if self.completed {
             return Ok(Vec::new());
         }
-        let v: Value = serde_json::from_str(json).map_err(NormalizeError::Json)?;
-        let out = self.push(&v)?;
+        let v = crate::json_parse::value_from_str(json).map_err(NormalizeError::Json)?;
+        self.push_parsed_json(json, &v)
+    }
+
+    /// Push an event whose JSON tree the SSE decoder has already shared with its other readers.
+    /// The original text is still needed for the exact raw fallback block retained on replay.
+    pub(crate) fn push_parsed_json(
+        &mut self,
+        json: &str,
+        v: &Value,
+    ) -> Result<Vec<NormalizedEvent>, NormalizeError> {
+        if self.completed {
+            return Ok(Vec::new());
+        }
+        let out = self.push(v)?;
         if v.get("type").and_then(Value::as_str) == Some("content_block_start") {
-            if let Some(BlockBuf::Fallback { raw, .. }) = self.blocks.get_mut(&block_index(&v)) {
+            if let Some(BlockBuf::Fallback { raw, .. }) = self.blocks.get_mut(&block_index(v)) {
                 #[derive(serde::Deserialize)]
                 struct Start<'a> {
                     #[serde(borrow)]

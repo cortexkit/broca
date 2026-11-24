@@ -1353,6 +1353,7 @@ async fn drive_socket(
             AttemptOutcome::ChunkError,
         ));
     }
+    trace.note_reached_server();
     trace.cache_work.start(request);
     let completed_id = Mutex::new(None);
     let mut recv = socket.recv.lock().await;
@@ -1482,17 +1483,25 @@ pub(super) fn warn_failure_decision(
 // metadata, not a second Responses decoder; ordinary event errors stay with the normalizer.
 pub(super) fn wrapped_error(raw: &[u8], trace: &mut AttemptTrace) -> Option<AttemptFailure> {
     if crate::quota::frame_candidate(raw) {
-        if let Ok(frame) = serde_json::from_slice::<Value>(raw) {
+        if let Ok(frame) = crate::json_parse::value_from_slice(raw) {
             if frame.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
                 trace.chatgpt_frame_window = Some(super::chatgpt_frame_window(&frame));
                 return None;
             }
         }
     }
-    let value: Value = serde_json::from_slice(raw).ok()?;
-    if value.get("type")?.as_str()? != "error" {
+    #[derive(serde::Deserialize)]
+    struct FrameType<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: Option<Cow<'a, str>>,
+    }
+    let frame_type = serde_json::from_slice::<FrameType<'_>>(raw).ok()?.kind?;
+    if frame_type != "error" {
         return None;
     }
+    // Only an actual transport error needs its full tree. Ordinary model deltas borrow the
+    // discriminator above and are decoded once by the SSE normalizer below.
+    let value: Value = crate::json_parse::value_from_slice(raw).ok()?;
     let journaled_headers = trace
         .attempt_hook
         .as_ref()
@@ -1823,6 +1832,19 @@ pub(super) fn frame_record(raw: &[u8]) -> Vec<u8> {
 mod pump_tests {
     use super::*;
     use crate::wire::HttpMethod;
+
+    #[test]
+    fn ordinary_socket_error_probe_does_not_build_json_tree() {
+        crate::json_parse::reset_value_parses();
+        let raw = br#"{"type":"response.output_text.delta","delta":"hello"}"#;
+
+        assert!(wrapped_error(raw, &mut AttemptTrace::default()).is_none());
+        assert_eq!(
+            crate::json_parse::value_parses(),
+            0,
+            "an ordinary frame needs only its borrowed discriminator, not a decoded tree"
+        );
+    }
 
     #[test]
     fn observation_borrows_unescaped_strings_and_skips_unneeded_output() {

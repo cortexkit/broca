@@ -41,9 +41,7 @@ mod routed;
 const JEV: &str = "typesafe/jev-1.13.0";
 const CLEF: &str = "cloudflare-workers-ai/@cf/cloudflare/clef";
 const CLEF_FLASH: &str = "cloudflare-workers-ai/@cf/cloudflare/clef-flash";
-/// Where broca sends a Workers AI item on the mock provider path, where no vault is opened and
-/// so no credential names an account.
-const WORKERS_AI_RUN_PREFIX: &str = "/client/v4/accounts/no-credential/ai/run/@cf/cloudflare/";
+const WORKERS_AI_RUN_PREFIX: &str = "/client/v4/accounts/";
 const CHAT_ROW: &str = "openai/conformance-chat";
 const KINDLESS_ROW: &str = "openai/conformance-kindless";
 
@@ -280,15 +278,6 @@ async fn start_rig_with_references(
     served: Served,
     surface: Option<PathBuf>,
 ) -> Option<Rig> {
-    start_rig_options(name, served, surface, false).await
-}
-
-async fn start_rig_options(
-    name: &str,
-    served: Served,
-    surface: Option<PathBuf>,
-    routing: bool,
-) -> Option<Rig> {
     let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
     if !subc.exists() {
         assert!(
@@ -318,9 +307,9 @@ async fn start_rig_options(
     std::fs::create_dir_all(&project_root).unwrap();
     let state_root = root.join("broca-state");
     seed_catalog(&state_root, served);
-    let routing_state = routing.then(|| Arc::new(routed::State::default()));
+    let routing_state = Arc::new(routed::State::new(served));
     let state = Arc::new(StandIn {
-        routing: routing_state.clone(),
+        routing: Some(routing_state.clone()),
         ..Default::default()
     });
     let stand_in = start_stand_in(state.clone()).await;
@@ -333,7 +322,8 @@ async fn start_rig_options(
     std::fs::write(
         &broca_config,
         serde_json::to_vec(
-            &json!({"llm_tools":{"image_references":surface.is_some()},"providers": {
+            &json!({"account_selection":{"routing_module":routed::ROUTER},
+                "llm_tools":{"image_references":surface.is_some()},"providers": {
                 "typesafe": {"base_url": format!("{stand_in}/v1")},
                 "cloudflare-workers-ai": {"base_url": format!("{stand_in}/client/v4")},
             }}),
@@ -341,9 +331,6 @@ async fn start_rig_options(
         .unwrap(),
     )
     .unwrap();
-    if routing {
-        routed::configure(&broca_config);
-    }
     let connection_file = runtime_dir.join("subc-connection.json");
     let stub = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
     assert!(
@@ -389,10 +376,6 @@ async fn start_rig_options(
                 "env": {
                     "BROCA_STATE_ROOT": state_root,
                     "XDG_DATA_HOME": data_home,
-                    "BROCA_CONFIG_PATH": broca_config,
-                    // Legacy rigs bypass vault auth. The routed rig removes this override
-                    // before writing the daemon config so its real credential routes are used.
-                    "BROCA_PROVIDER_BASE_URL": format!("{stand_in}/v1"),
                     "CK_LOG": "info",
                 },
                 "enabled": true
@@ -413,7 +396,11 @@ async fn start_rig_options(
         });
         fixtures
     });
-    routed::write_daemon_config(config_home.join("cortexkit/subc.jsonc"), config, routing);
+    std::fs::write(
+        config_home.join("cortexkit/subc.jsonc"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
     let daemon = broca_test_support::retry_executable_file_busy(|| {
         broca_test_support::tokio_rig_command(
             broca_test_support::ckdev_binary(&subc, broca_test_support::scratch_root()),
@@ -425,6 +412,8 @@ async fn start_rig_options(
         .env("XDG_DATA_HOME", &data_home)
         .env("HOME", &home)
         .env_remove("BROCA_STATE_ROOT")
+        .env_remove("BROCA_CONFIG_PATH")
+        .env_remove("BROCA_PROVIDER_BASE_URL")
         .env("SUBC_PORT", "0")
         .env_remove("SUBC_LAUNCH_NONCE")
         .env_remove("SUBC_LAUNCH_NONCE_FD")
@@ -467,11 +456,7 @@ async fn start_rig_options(
         .await;
     }
     Some(Rig {
-        routed: if let Some(state) = routing_state {
-            Some(routed::register(&connection_file, state).await)
-        } else {
-            None
-        },
+        routed: Some(routed::register(&connection_file, routing_state).await),
         _daemon: daemon,
         served,
         connection_file,
@@ -803,28 +788,8 @@ async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
     else {
         return;
     };
-    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
-    assert_eq!(
-        report.verdict,
-        SuiteVerdict::PassedExceptNotApplicable {
-            not_applicable: ROUTED_CASES.to_vec()
-        },
-        "{:#?}",
-        report.checks
-    );
-    for check in report
-        .checks
-        .iter()
-        .filter(|check| !ROUTED_CASES.contains(&check.check))
-    {
-        assert_eq!(check.outcome, CheckOutcome::Passed, "{check:?}");
-    }
-    for check in report.checks.iter().filter(|check| {
-        check.check.starts_with("image_reference_")
-            || check.check == "image_source_down_refused_transient"
-    }) {
-        assert_eq!(check.outcome, CheckOutcome::Passed, "{check:?}");
-    }
+    let report = run_suite(&Subject { rig: &rig }).await;
+    assert_workers_ai_conformance(&report, true);
     let received = rig.state.received.lock().unwrap();
     assert!(
         received
@@ -846,29 +811,14 @@ const ROUTED_CASES: [&str; 9] = [
     "routed_initial_account_failure_bounded",
 ];
 
-fn legacy_suite_report(
-    mut report: cortexkit_role_classifier_conformance::SuiteReport,
-) -> cortexkit_role_classifier_conformance::SuiteReport {
-    for check in &mut report.checks {
-        if ROUTED_CASES.contains(&check.check) {
-            let CheckOutcome::NotApplicable { reason } = &mut check.outcome else {
-                panic!("legacy route must not declare routed_models: {check:?}");
-            };
-            assert_eq!(reason, "provider does not declare routed_models");
-            *reason = "routed_models not declared".into();
-        }
-    }
-    report
-}
-
-fn assert_legacy_conformance(
+fn assert_workers_ai_conformance(
     report: &cortexkit_role_classifier_conformance::SuiteReport,
-    images: bool,
+    image_references: bool,
 ) {
     assert_eq!(report.checks.len(), CHECKS.len());
-    for check in &report.checks {
-        // The opt-in cases are inapplicable on legacy routes; every pre-existing check must
-        // still pass. Image-capable legacy routes also test the unsupported-reference refusal.
+    let mut not_applicable = Vec::new();
+    for (check, spec) in report.checks.iter().zip(CHECKS) {
+        assert_eq!(check.check, spec.name);
         let reference_only = matches!(
             check.check,
             "image_reference_resolved_and_answered"
@@ -876,16 +826,17 @@ fn assert_legacy_conformance(
                 | "image_source_down_refused_transient"
                 | "image_reference_identity_is_its_handle"
         );
-        if ROUTED_CASES.contains(&check.check) {
+        if let Some(reason) = routed::fixed_account_only_reason(check.check) {
+            not_applicable.push(check.check);
             assert_eq!(
                 check.outcome,
                 CheckOutcome::NotApplicable {
-                    reason: "routed_models not declared".into()
-                }
+                    reason: reason.into()
+                },
+                "{check:?}"
             );
-        } else if reference_only
-            || (!images && check.check == "image_reference_follows_declaration")
-        {
+        } else if reference_only && !image_references {
+            not_applicable.push(check.check);
             assert!(
                 matches!(check.outcome, CheckOutcome::NotApplicable { .. }),
                 "{check:?}"
@@ -894,6 +845,10 @@ fn assert_legacy_conformance(
             assert_eq!(check.outcome, CheckOutcome::Passed, "{check:?}");
         }
     }
+    assert_eq!(
+        report.verdict,
+        SuiteVerdict::PassedExceptNotApplicable { not_applicable }
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -901,11 +856,11 @@ async fn classifier_conformance_suite_passes_against_the_real_serve_path() {
     let Some(rig) = start_rig("suite", Served::Jev).await else {
         return;
     };
-    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
+    let report = run_suite(&Subject { rig: &rig }).await;
     for check in &report.checks {
         println!("{}: {:?}", check.check, check.outcome);
     }
-    assert_legacy_conformance(&report, false);
+    routed::validate_report(&report).unwrap_or_else(|failures| panic!("{failures}"));
     // The batch store is broca's own file, beside (never inside) the run index.
     assert!(rig.state_root.join("system-one.db").exists());
 }
@@ -919,16 +874,18 @@ async fn classifier_conformance_suite_passes_through_workers_ai() {
     let Some(rig) = start_rig("workers-ai", Served::WorkersAi).await else {
         return;
     };
-    let report = legacy_suite_report(run_suite(&Subject { rig: &rig }).await);
+    let report = run_suite(&Subject { rig: &rig }).await;
     for check in &report.checks {
         println!("{}: {:?}", check.check, check.outcome);
     }
-    assert_legacy_conformance(&report, true);
+    assert_workers_ai_conformance(&report, false);
     let received = rig.state.received.lock().unwrap().clone();
     assert!(!received.is_empty(), "the suite reached the stand-in");
     for (path, body) in &received {
         let model = path
             .strip_prefix(WORKERS_AI_RUN_PREFIX)
+            .and_then(|suffix| suffix.split_once("/ai/run/@cf/cloudflare/"))
+            .map(|(_, model)| model)
             .unwrap_or_else(|| panic!("a call outside the Workers AI run endpoint: {path}"));
         assert!(
             matches!(model, "clef" | "clef-flash"),

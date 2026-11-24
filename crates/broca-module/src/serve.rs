@@ -2623,6 +2623,11 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<(), ServeError> {
         use crate::store_reads::{StoreReadReply, StoreReadRequest};
         if let Some(store) = self.store_holding(session)? {
+            // A closed session whose head is kept is admitted from that head's read policy,
+            // without loading the session.
+            if let Some(decided) = store.admit_by_kept_head(self, session, access).await {
+                return decided;
+            }
             return match store
                 .read(
                     self,

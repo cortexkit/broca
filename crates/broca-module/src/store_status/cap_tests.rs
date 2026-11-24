@@ -65,6 +65,63 @@ fn settled_run_facts_hold_no_more_than_their_byte_cap() {
     assert!(memory.entries > 1 && (memory.entries as usize) < RUNS);
 }
 
+/// The facts of a run that ended in error, whose error message and undelivered steer ids hold
+/// `text`.
+fn errored(text: String) -> RunFacts {
+    let mut state = fresh_state(RunIndexState::Error);
+    state.error = Some(
+        serde_json::from_value(serde_json::json!({"class": "permanent", "message": text})).unwrap(),
+    );
+    state.undelivered_steers = Some(vec![text]);
+    RunFacts {
+        wait: Default::default(),
+        state,
+        interrupt_reason: None,
+        wake_directive: false,
+        final_message: None,
+    }
+}
+
+/// Settled facts of runs that ended in error, whose detail lives in their state rather than a
+/// final message, hold no more than the byte cap either: the cache counts the state's detail.
+#[test]
+fn errored_run_facts_hold_no_more_than_their_byte_cap() {
+    assert!(
+        installed(),
+        "the crate's tests count with the counting allocator"
+    );
+    const CAP: usize = 1024 * 1024;
+    const MESSAGE: usize = 32 * 1024;
+    const RUNS: usize = 80;
+    const _: () = assert!(RUNS * 2 * MESSAGE > 4 * CAP);
+    let settled = SettledRuns::with_bytes(SettledRuns::CAPACITY, CAP);
+    let key = |n: usize| {
+        (
+            "b0d9e7b0d9e7b0d9".to_owned(),
+            [1; 16],
+            0,
+            format!("run-{n}"),
+        )
+    };
+    for n in 0..RUNS {
+        settled.put(key(n), errored("x".repeat(MESSAGE)));
+    }
+    let memory = settled.memory();
+    let ((), counts) = measure(|| drop(settled));
+    let held = counts.held.unsigned_abs();
+    eprintln!(
+        "filled {}, held {held}, counted {:?}, entries {}",
+        RUNS * 2 * MESSAGE,
+        memory.counted_bytes,
+        memory.entries
+    );
+    assert!(
+        held <= CAP,
+        "the settled facts hold {held} bytes, over their cap of {CAP}"
+    );
+    assert!(memory.entries > 1 && (memory.entries as usize) < RUNS);
+}
+
 /// A run's admission is kept under its session's incarnation and history version, so a revert
 /// or a session created again under the same id asks again, and only the newest
 /// [`SettledRuns::CAPACITY`] runs' admissions are kept.

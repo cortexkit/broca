@@ -71,3 +71,55 @@ fn a_selected_model_shows_the_latest_runs_default_only_when_it_is_that_model() {
     let unselected = head(None);
     assert_eq!(unselected.default_variant.as_deref(), Some("medium"));
 }
+
+/// Kept heads forget the least recently used first: a head read or kept again since stays while
+/// heads kept after it fill the table.
+#[test]
+fn kept_heads_forget_the_least_recently_used_first() {
+    use broca_session_store::codec::Id128;
+    use broca_session_store::session::Position;
+    let heads = KeptHeads::default();
+    let head = StoreHead {
+        reply: Default::default(),
+        input: InputSource::Unknown,
+        ownership: serde_json::from_value(json!({})).unwrap(),
+        senders: Vec::new(),
+        read_policy: None,
+    };
+    let at = |n: u64| Position {
+        version: n,
+        log: Id128([1; 16]),
+        len: n,
+    };
+    heads.keep("read".into(), at(1), &head, "read");
+    heads.keep("kept again".into(), at(1), &head, "read");
+    for n in 0..HEADS_KEPT - 2 {
+        heads.keep(format!("s{n}"), at(1), &head, "read");
+    }
+    assert!(heads.get("read", at(1)).is_some());
+    heads.keep("kept again".into(), at(2), &head, "read");
+    heads.keep("new 1".into(), at(1), &head, "read");
+    heads.keep("new 2".into(), at(1), &head, "read");
+    assert!(
+        heads.get("read", at(1)).is_some(),
+        "a head read since stays"
+    );
+    assert!(
+        heads.get("kept again", at(2)).is_some(),
+        "a head kept again since stays"
+    );
+    assert!(heads.get("s0", at(1)).is_none());
+    assert!(heads.get("s1", at(1)).is_none());
+    assert!(heads.get("s2", at(1)).is_some());
+    // The memory report counts them and what they hold.
+    let memory = heads.memory();
+    assert_eq!(
+        (memory.entries, memory.max_entries),
+        (HEADS_KEPT as u64, HEADS_KEPT as u64)
+    );
+    assert!(memory.estimated_bytes > HEADS_KEPT as u64 * std::mem::size_of::<StoreHead>() as u64);
+    // Beside the counts of how heads were kept and served.
+    let counts = heads.counts();
+    assert_eq!(counts.held, memory);
+    assert_eq!(counts.kept.get("read"), Some(&(HEADS_KEPT as u64 + 3)));
+}

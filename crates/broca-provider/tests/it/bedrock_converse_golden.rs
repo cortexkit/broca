@@ -1,5 +1,5 @@
 //! Golden-byte test for the AWS Bedrock ConverseStream render. Pins the UNSIGNED
-//! JSON request body; SigV4 timestamps, credentials, and signatures are attached by
+//! JSON request body; bearer credentials are attached by
 //! `endpoint` after render and must never enter this hash domain.
 
 use crate::render_golden_support;
@@ -272,23 +272,13 @@ fn bedrock_finalize_renderer_versions_refuse_only_old_finalize_reproduction() {
 }
 
 #[test]
-fn bedrock_endpoint_attaches_sigv4_headers_after_render() {
+fn bedrock_endpoint_attaches_bearer_after_render() {
     let frozen =
         bedrock_frozen_config_with_region("anthropic.claude-3-5-sonnet-20240620-v1:0", "us-west-2");
     let body = BedrockConverse.render(&frozen, &fixed_request());
     let request = BedrockConverse.endpoint(
         &frozen,
-        &AuthHandle::SigV4 {
-            region: "us-west-2".into(),
-            service: "bedrock-runtime".into(),
-            signed_headers: vec![
-                ("x-amz-date".into(), "20260102T030405Z".into()),
-                (
-                    "authorization".into(),
-                    "AWS4-HMAC-SHA256 Credential=AKIA...".into(),
-                ),
-            ],
-        },
+        &AuthHandle::Bearer("bedrock-api-key".into()),
         body.clone(),
     );
 
@@ -301,7 +291,7 @@ fn bedrock_endpoint_attaches_sigv4_headers_after_render() {
     assert!(request
         .headers
         .iter()
-        .any(|(name, _)| name == "authorization"));
+        .any(|(name, value)| name == "authorization" && value == "Bearer bedrock-api-key"));
 }
 
 fn cache_marker_request() -> CallOptions {

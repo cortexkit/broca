@@ -1836,6 +1836,30 @@ async fn a_retraction_waits_for_a_drained_runs_start() {
     assert_eq!(texts(&session).await, ["first", "hello", "queued", "again"]);
 }
 
+/// A run whose start can't be written never started, though the session folds a batch before
+/// writing it: its sender hears the failure, never `active`, and the session stays poisoned.
+/// Told `active`, the caller would hold a run id no reopened session can find.
+#[tokio::test]
+async fn a_send_whose_start_write_fails_is_never_answered_active() {
+    let (commands, served, backend) = actor(executor(vec![text_step("a1", "hello")], None)).await;
+    // The actor serves before the disk fails, so the failing write is the send's own.
+    assert_eq!(status(&commands).await, LineageStatus::Idle);
+    backend.crash_after(Some(0));
+    let outcome = send(&commands, "r1", "first").await;
+    assert!(
+        matches!(&outcome, SendOutcome::Error(error) if error.contains("crashed")),
+        "{outcome:?}"
+    );
+    drop(commands);
+    let session = served.await.unwrap();
+    assert!(session.poisoned());
+    backend.crash_after(None);
+    let reopened = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    assert_eq!(starts(&reopened).await, 0);
+}
+
 /// A process that crashed while `r1` ran (its first model call in flight) and with `r2` queued
 /// behind it: the actor's task is dropped without ending the run, as a killed process leaves
 /// it. Returns the backend holding the session and its setup parts store.
@@ -2030,6 +2054,81 @@ async fn a_send_left_queued_behind_an_ended_run_drains_on_open() {
     assert_eq!(texts(&session).await, ["first", "hello", "second", "again"]);
 }
 
+/// A queued send that can't be read back into a run, its record or its order, ends with a
+/// retraction naming why, and the queue drains on past it. Left queued, it would never run, and
+/// every later send would wait behind it for good, again at every open.
+#[tokio::test]
+async fn a_queued_send_that_cannot_be_read_back_ends_and_the_queue_drains_past_it() {
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let (commands, served, backend) = actor_with(
+        executor(vec![text_step("a1", "hello")], None),
+        parts.clone(),
+    )
+    .await;
+    assert!(matches!(
+        send(&commands, "r1", "first").await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    let mut session = served.await.unwrap();
+    // Two sends as an older writer could have left them: one whose order doesn't decode, and
+    // one whose marks don't.
+    let mut unreadable = request("unreadable");
+    unreadable.tools = None;
+    let queued = |id: &str| {
+        broca_session_loop::queue::queued_send(
+            id,
+            None,
+            &unreadable,
+            &Default::default(),
+            Default::default(),
+            None,
+            &mut MemoryParts::default(),
+        )
+        .unwrap()
+    };
+    let mut bad_marks = queued("sub-bad-marks");
+    bad_marks.message_marks = Some(serde_json::json!(42));
+    session
+        .append(
+            &[
+                Record::DeliveryOrdered(broca_session_store::record::DeliveryOrdered {
+                    submission_id: "sub-bad-order".into(),
+                    order: serde_json::json!("no order"),
+                    sent_by: None,
+                }),
+                Record::QueuedSend(queued("sub-bad-order")),
+                Record::QueuedSend(bad_marks),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    drop(session);
+    let executor = Arc::new(executor(vec![text_step("a3", "third")], None));
+    let (commands, served) = reopen(backend, executor, &parts).await;
+    // Nothing is left queued ahead of a new send, which runs at once.
+    let outcome = send(&commands, "r3", "next").await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert!(session.operations().queue.is_empty());
+    assert_eq!(session.operations().run.as_ref().unwrap().run_id, "r3");
+    let records = session.open_log_records().await.unwrap();
+    for id in ["sub-bad-order", "sub-bad-marks"] {
+        assert!(
+            records.iter().any(|(_, record)| matches!(
+                record,
+                Record::Retraction(retraction)
+                    if retraction.submission_id == id && retraction.failure.is_some()
+            )),
+            "{id} ended with its failure"
+        );
+    }
+}
+
 /// A fetch plan's manifest for these tests, with `plan` as the plan the caller sent: the tools
 /// `read` and `edit`, and a system text.
 pub(super) fn plan_manifest(
@@ -2206,6 +2305,164 @@ async fn a_planned_session_runs_on_the_manifests_tools_and_system_text() {
             start.run_id
         );
     }
+}
+
+/// Sends `request` exactly as given as `run_id`, ordered to start its run on an idle session,
+/// carrying the plan `manifest` when given. Returns the channel its answer comes on.
+fn send_idle_start(
+    commands: &mpsc::UnboundedSender<LineageCmd>,
+    run_id: &str,
+    request: SubmissionRequest,
+    manifest: Option<broca_records::record::PlanManifest>,
+) -> oneshot::Receiver<SendOutcome> {
+    let (reply, answer) = oneshot::channel();
+    commands
+        .send(LineageCmd::Send {
+            session_class: None,
+            retention: None,
+            stop_sequences_named: false,
+            conversation_key: None,
+            title: None,
+            run_id: RunId(run_id.into()),
+            request: Box::new(request),
+            kind: RunKind::FreshOrResume,
+            key: SendKey::Minted,
+            skip_materialization: false,
+            delivery: broca_protocol::Delivery::Queue,
+            plan: manifest.map(|manifest| {
+                Box::new(crate::actor::SendPlan {
+                    identity: manifest.plan_identity.clone(),
+                    manifest: Some(Arc::new(manifest)),
+                    model_check: None,
+                })
+            }),
+            order: Some(Box::new(
+                serde_json::from_value(serde_json::json!({"modes": ["idle_start"]})).unwrap(),
+            )),
+            reply,
+        })
+        .unwrap();
+    answer
+}
+
+/// The session's creating send, ordered to start its run at once, freezes the plan it carries
+/// as a plain creating send does: the run is sent the manifest's tools and opens with its system
+/// text, and its start records the manifest. So does the run a reopened session starts for it
+/// when the process stopped between the send's record and its run's start.
+#[tokio::test]
+async fn an_ordered_creating_send_runs_on_its_plan() {
+    for crash in [false, true] {
+        let reached = Arc::new(Notify::new());
+        let mut first = executor(vec![text_step("a1", "hello")], None);
+        if crash {
+            first.drain_gate = Some((Arc::clone(&reached), Arc::new(Notify::new())));
+        }
+        let mut provider = first.provider.inner.clone();
+        let parts = SharedParts::new(Box::new(MemoryParts::default()));
+        let (commands, served, backend) = actor_with(first, parts.clone()).await;
+        let manifest = plan_manifest("plan-1", serde_json::json!({}));
+        let answer = send_idle_start(&commands, "r1", untooled("first"), Some(manifest.clone()));
+        let served = if crash {
+            reached.notified().await;
+            served.abort();
+            let _ = served.await;
+            let again = executor(vec![text_step("a1", "hello")], None);
+            provider = again.provider.inner.clone();
+            let (commands, served) = reopen(backend, Arc::new(again), &parts).await;
+            idle(&commands).await;
+            served
+        } else {
+            let outcome = answer.await.unwrap();
+            assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+            idle(&commands).await;
+            drop(commands);
+            served
+        };
+        let session = served.await.unwrap();
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1, "crash: {crash}");
+        let names: Vec<_> = calls[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, ["read", "edit"], "crash: {crash}");
+        assert_eq!(
+            calls[0].prompt[0].content,
+            [ContentBlock::Text {
+                text: "you are a worker".into()
+            }],
+            "crash: {crash}"
+        );
+        let start = session.operations().owner.first_start.as_ref().unwrap();
+        let admission = broca_session_loop::run::admission_of_start(start, &parts).unwrap();
+        assert_eq!(
+            admission.manifest.as_deref(),
+            Some(&manifest),
+            "crash: {crash}"
+        );
+    }
+}
+
+/// An owner's send reopening the session's scope at a later epoch, ordered to start its run at
+/// once, runs under that epoch, though the process stopped between the send's record and its
+/// run's start: the reopened session's run records the epoch the send was admitted under, not
+/// the one it replaced.
+#[tokio::test]
+async fn an_ordered_reopen_keeps_its_epoch_across_a_stop_before_its_run() {
+    let core = broca_protocol::BindPrincipal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let scoped = |text: &str, epoch: u64| {
+        let mut request = untooled(text);
+        request.principal = Some(core.clone());
+        request.scope = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+            scope: broca_protocol::SessionScope {
+                owner: core.clone(),
+                agent_id_frozen: false,
+                scope_ref: "head-1".into(),
+                scope_epoch: epoch,
+                flow_id: None,
+                sender: None,
+                agent_id: None,
+                run_id: None,
+            },
+            owner_authorized: true,
+            kind: broca_protocol::ScopeKind::Head,
+            parent: None,
+            parent_state: None,
+        });
+        request
+    };
+    let reached = Arc::new(Notify::new());
+    let mut first = executor(vec![text_step("a1", "hello")], None);
+    first.drain_gate = Some((Arc::clone(&reached), Arc::new(Notify::new())));
+    let parts = SharedParts::new(Box::new(MemoryParts::default()));
+    let (commands, served, backend) = actor_with(first, parts.clone()).await;
+    let outcome = send_exactly(
+        &commands,
+        "r1",
+        scoped("first", 1),
+        SendKey::Minted,
+        broca_protocol::Delivery::Queue,
+        None,
+    )
+    .await;
+    assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
+    idle(&commands).await;
+    let _answer = send_idle_start(&commands, "r2", scoped("reopening", 2), None);
+    reached.notified().await;
+    served.abort();
+    let _ = served.await;
+    let again = Arc::new(executor(vec![text_step("a2", "again")], None));
+    let (commands, served) = reopen(backend, again, &parts).await;
+    idle(&commands).await;
+    drop(commands);
+    let session = served.await.unwrap();
+    let run = session.operations().run.as_ref().unwrap();
+    assert_eq!(run.run_id, "r2");
+    let scope = serde_json::to_value(&run.start.as_ref().unwrap().scope).unwrap();
+    assert_eq!(scope["scope_epoch"], 2, "{scope}");
 }
 
 /// A later send's plan must be the one the session froze: the same plan runs as an ordinary

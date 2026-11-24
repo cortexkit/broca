@@ -48,6 +48,13 @@ decision batches and `grants.db` holds consent grants. `broca-module` owns
 `late-results.db` for held calls and late-result intake. None of these stores holds
 a session's records; where they derive something from them, the records win.
 
+**Decision batches** (`broca-module-serve`). System One's `classifier/v1` route
+serves batches without a session. Routing chooses the model when the caller
+omits it, using the minimum decision grade (`iq: 1`) to select the cheapest
+eligible graded model. A supplied model is a strict pin. The `llm_classify`
+tool requires a pin so it knows the provider before checking consent. See
+[System One routing](system-one.md).
+
 State roots without a `state-format` marker keep today's format. The staging-only
 `broca-state/2` redesign has been removed: a root whose marker names it refuses
 startup, rather than being read as today's format. Start with a fresh state root.

@@ -339,7 +339,7 @@ fn params(batch: &str, model: &str, states: &[&str]) -> String {
 
 async fn admitted(rig: &Rig, params: String) -> String {
     match Arc::clone(&rig.service)
-        .spawn_call(params, test_scope())
+        .spawn_legacy_call_for_test(params, test_scope())
         .await
     {
         Ok(reply) => reply.get().to_owned(),
@@ -349,7 +349,7 @@ async fn admitted(rig: &Rig, params: String) -> String {
 
 async fn refused(rig: &Rig, params: String) -> Value {
     match Arc::clone(&rig.service)
-        .spawn_call(params, test_scope())
+        .spawn_legacy_call_for_test(params, test_scope())
         .await
     {
         Ok(reply) => panic!("admitted: {}", reply.get()),

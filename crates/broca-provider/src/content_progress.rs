@@ -178,6 +178,17 @@ impl ContentObserver {
         self.record(name, payload, Some(bytes as u64), None);
     }
 
+    /// Observe the SSE decoder's shared parse result. Invalid JSON has the same null
+    /// classification as the former observer-local failed parse, without parsing it again.
+    pub(crate) fn observe_parsed(&mut self, name: &str, payload: Option<&Value>, bytes: usize) {
+        self.record(
+            name,
+            payload.unwrap_or(&Value::Null),
+            Some(bytes as u64),
+            None,
+        );
+    }
+
     pub(crate) fn observe_unmeasured_keepalive(&mut self) {
         self.observe_bytes("keepalive", None, None);
     }
@@ -205,7 +216,7 @@ impl ContentObserver {
                 {
                     self.text_payloads_parsed += 1;
                 }
-                serde_json::from_str::<Value>(payload).unwrap_or(Value::Null)
+                crate::json_parse::value_from_str(payload).unwrap_or(Value::Null)
             }
         };
         self.record(name, &parsed, bytes, now_ms);

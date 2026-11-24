@@ -1468,3 +1468,38 @@ async fn only_the_persons_own_steer_hands_calls_back() {
     pair.release();
     pair.idle().await;
 }
+
+/// On an idle session each ordered send that waits for a run reads back at most the order
+/// queued just before it, however many wait: whether a queued order starts a run is kept once
+/// read, and a send without a dedupe key supersedes nothing, so it reads no order to find one.
+/// Reading every queued order on every send made a backlog of N sends cost about N squared
+/// reads.
+#[tokio::test]
+async fn a_backlog_of_ordered_sends_costs_each_send_a_bounded_number_of_reads() {
+    let pair = Pair::new(hello(), false, Cipher::None).await;
+    let first = pair
+        .send("r1", from(core(), "first"), None, Some(plan()), None)
+        .await;
+    assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
+    pair.idle().await;
+    let reads = || super::super::ordered::ORDER_READS.with(std::cell::Cell::get);
+    let mut each = Vec::new();
+    for n in 0..20 {
+        let before = reads();
+        let outcome = pair
+            .send(
+                &format!("q{n}"),
+                from(module(AFT), "a file changed"),
+                Some(json!({"modes": ["tool_result"]})),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(outcome, SendOutcome::Pending { .. }),
+            "{outcome:?}"
+        );
+        each.push(reads() - before);
+    }
+    assert!(each.iter().all(|&read| read <= 1), "orders read: {each:?}");
+}

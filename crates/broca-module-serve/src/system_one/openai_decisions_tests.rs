@@ -362,7 +362,10 @@ async fn out_of_credit_is_the_permanent_account_refusal() {
         // Met on the call's first provider call, it refuses the whole call at admission.
         let (_, client) = start(vec![(429, body, None)]).await;
         let service = service(client, Some("decision"));
-        let refusal = service.spawn_call(params(), scope()).await.unwrap_err();
+        let refusal = service
+            .spawn_legacy_call_for_test(params(), scope())
+            .await
+            .unwrap_err();
         let refusal: Value = serde_json::from_slice(&refusal).unwrap();
         assert_eq!(refusal["code"], "account_not_entitled", "{openai_code}");
     }
@@ -415,7 +418,10 @@ async fn http_errors_are_classified_at_source_and_keep_codes_and_retry_after() {
     )])
     .await;
     let service = service(client, Some("decision"));
-    let refusal = service.spawn_call(params(), scope()).await.unwrap_err();
+    let refusal = service
+        .spawn_legacy_call_for_test(params(), scope())
+        .await
+        .unwrap_err();
     let refusal: Value = serde_json::from_slice(&refusal).unwrap();
     assert_eq!(refusal["code"], "auth_failed");
     assert_eq!(refusal["detail"]["class"], "auth_required");
@@ -460,7 +466,10 @@ async fn missing_catalog_row_and_nondecision_row_refuse_without_http() {
         let service = service(client, kind);
         let describe = serde_json::to_value(service.describe()).unwrap();
         assert!(describe["models"].as_array().unwrap().is_empty());
-        let error = service.spawn_call(params(), scope()).await.unwrap_err();
+        let error = service
+            .spawn_legacy_call_for_test(params(), scope())
+            .await
+            .unwrap_err();
         assert_eq!(
             serde_json::from_slice::<Value>(&error).unwrap()["code"],
             code
@@ -546,7 +555,7 @@ async fn question_bound_is_400_and_invalid_images_keep_module_validation() {
     );
     let error = service
         .clone()
-        .spawn_call(request.to_string(), scope())
+        .spawn_legacy_call_for_test(request.to_string(), scope())
         .await
         .unwrap_err();
     let error: Value = serde_json::from_slice(&error).unwrap();
@@ -555,7 +564,7 @@ async fn question_bound_is_400_and_invalid_images_keep_module_validation() {
     let mut request: Value = serde_json::from_str(&params()).unwrap();
     request["items"][0]["images"] = json!(["data:image/png;base64,not-base64"]);
     let error = service
-        .spawn_call(request.to_string(), scope())
+        .spawn_legacy_call_for_test(request.to_string(), scope())
         .await
         .unwrap_err();
     let error: Value = serde_json::from_slice(&error).unwrap();
@@ -620,7 +629,7 @@ const ALL_ANSWERS: &str = r#"{"model":"gpt-6-luna","answers":[{"name":"a_predica
 async fn admitted(service: &Arc<SystemOne>, params: String) -> String {
     service
         .clone()
-        .spawn_call(params, scope())
+        .spawn_legacy_call_for_test(params, scope())
         .await
         .unwrap_or_else(|error| panic!("{}", String::from_utf8_lossy(&error)))
         .get()

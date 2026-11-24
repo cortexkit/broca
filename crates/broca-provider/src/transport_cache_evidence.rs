@@ -58,6 +58,8 @@ pub(super) struct Session(
 #[derive(Default)]
 pub(super) struct Gate {
     pub(super) entered: AtomicBool,
+    /// How many fingerprint workers have reached the gate.
+    pub(super) entries: AtomicUsize,
     open: Mutex<bool>,
     wake: std::sync::Condvar,
 }
@@ -65,6 +67,7 @@ pub(super) struct Gate {
 #[cfg(test)]
 impl Gate {
     fn wait(&self) {
+        self.entries.fetch_add(1, Ordering::SeqCst);
         self.entered.store(true, Ordering::Release);
         let (open, _) = self
             .wake
@@ -270,17 +273,139 @@ fn note_accepted(
 }
 
 type Work = tokio::task::JoinHandle<Result<RequestFingerprint, String>>;
+
+/// The fingerprint of one step's request, shared by every attempt of the step. Each attempt
+/// sends the same body, so hashing it again, possibly megabytes on a long session, would only
+/// repeat work whose answer is already known.
+#[derive(Clone, Default)]
+pub(super) struct StepFingerprint(Arc<Mutex<Option<Fingerprinting>>>);
+
+enum Fingerprinting {
+    Running(Work),
+    Done(Result<RequestFingerprint, String>),
+}
+
+impl StepFingerprint {
+    fn start(&self, request: &PreparedHttpRequest, frozen: &FrozenRenderConfig) {
+        let mut state = self.0.lock().unwrap();
+        if state.is_some() {
+            return;
+        }
+        let body = request.body.clone();
+        let family = frozen.family_id;
+        let provenance = request.cache_provenance.clone();
+        // No fingerprint work runs before the transport has accepted the request. Even
+        // small requests use the blocking pool so hashing cannot postpone stream polling.
+        #[cfg(test)]
+        let gate = request
+            .cache_session
+            .as_ref()
+            .and_then(|(session, _)| session.1.lock().unwrap().clone());
+        *state = Some(Fingerprinting::Running(tokio::task::spawn_blocking(
+            move || {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.wait();
+                }
+                fingerprint(family, &body).map(|fingerprint| match provenance {
+                    Some(provenance) => fingerprint.with_provenance(&provenance),
+                    None => fingerprint,
+                })
+            },
+        )));
+    }
+
+    /// The result if it is already known, without waiting for the hashing.
+    fn ready(&self) -> Option<Result<RequestFingerprint, String>> {
+        match self.0.lock().unwrap().as_ref()? {
+            Fingerprinting::Done(result) => Some(result.clone()),
+            Fingerprinting::Running(_) => None,
+        }
+    }
+
+    async fn result(&self) -> Result<RequestFingerprint, String> {
+        let work = {
+            let mut state = self.0.lock().unwrap();
+            match state.take() {
+                Some(Fingerprinting::Running(work)) => work,
+                Some(Fingerprinting::Done(result)) => {
+                    *state = Some(Fingerprinting::Done(result.clone()));
+                    return result;
+                }
+                None => return Err("fingerprint was never started".into()),
+            }
+        };
+        let result = work
+            .await
+            .unwrap_or_else(|_| Err("fingerprint worker failed".into()));
+        *self.0.lock().unwrap() = Some(Fingerprinting::Done(result.clone()));
+        result
+    }
+}
+
 #[derive(Default)]
 struct InFlight {
     loader: Option<Arc<dyn broca_core::provider::CachePredecessorLoader>>,
-    work: Option<Work>,
     previous: Option<Previous>,
     prepared: bool,
 }
 #[derive(Clone, Default)]
-pub(super) struct Pending(Arc<Mutex<InFlight>>);
+pub(super) struct Pending(Arc<Mutex<InFlight>>, StepFingerprint);
+
+/// One attempt's evidence inputs, taken out of its [`Pending`] so they can be finished away
+/// from the attempt.
+struct Finishing {
+    session: Arc<Session>,
+    frozen: Arc<FrozenRenderConfig>,
+    model: String,
+    fingerprint: StepFingerprint,
+    previous: Option<Previous>,
+    loader: Option<Arc<dyn broca_core::provider::CachePredecessorLoader>>,
+    sent: Option<u64>,
+    account: Option<String>,
+}
+
+impl Finishing {
+    async fn complete(self) -> Option<Box<Value>> {
+        let Self {
+            session,
+            frozen,
+            model,
+            fingerprint,
+            mut previous,
+            loader,
+            sent,
+            account,
+        } = self;
+        if let Some(loader) = loader {
+            match loader.load().await {
+                Ok(Some(recorded)) => {
+                    let locator = recorded.locator.clone();
+                    previous = tokio::task::spawn_blocking(move || rebuild_predecessor(recorded))
+                        .await
+                        .ok()
+                        .flatten();
+                    if previous.is_some() {
+                        session.recorded(Some(locator));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(target: "provider", error, "cold cache predecessor is unknown")
+                }
+            }
+        }
+        let result = fingerprint.result().await;
+        session.finish(previous, result, &frozen, &model, sent, account)
+    }
+}
 
 impl Pending {
+    /// An attempt's evidence work that shares `fingerprint` with the step's other attempts.
+    pub(super) fn for_step(fingerprint: &StepFingerprint) -> Self {
+        Self(Arc::default(), fingerprint.clone())
+    }
+
     pub(super) fn prepare(&self, request: &PreparedHttpRequest) {
         let Some((session, _)) = &request.cache_session else {
             return;
@@ -300,30 +425,36 @@ impl Pending {
     }
 
     pub(super) fn start(&self, request: &PreparedHttpRequest) {
-        let Some((_session, frozen)) = &request.cache_session else {
+        let Some((_, frozen)) = &request.cache_session else {
             return;
         };
         self.prepare(request);
+        self.1.start(request, frozen);
+    }
+
+    fn finishing(
+        &self,
+        request: &PreparedHttpRequest,
+        sent: Option<u64>,
+        account: Option<String>,
+    ) -> Option<Finishing> {
+        let (session, frozen) = request.cache_session.as_ref()?;
+        self.start(request);
         let mut pending = self.0.lock().unwrap();
-        if pending.work.is_none() {
-            let body = request.body.clone();
-            let family = frozen.family_id;
-            let provenance = request.cache_provenance.clone();
-            // No fingerprint work runs before the transport has accepted the request. Even
-            // small requests use the blocking pool so hashing cannot postpone stream polling.
-            #[cfg(test)]
-            let gate = _session.1.lock().unwrap().clone();
-            pending.work = Some(tokio::task::spawn_blocking(move || {
-                #[cfg(test)]
-                if let Some(gate) = gate {
-                    gate.wait();
-                }
-                fingerprint(family, &body).map(|fingerprint| match provenance {
-                    Some(provenance) => fingerprint.with_provenance(&provenance),
-                    None => fingerprint,
-                })
-            }));
-        }
+        pending.prepared = false;
+        Some(Finishing {
+            session: Arc::clone(session),
+            frozen: Arc::clone(frozen),
+            model: request
+                .cache_model
+                .clone()
+                .unwrap_or_else(|| frozen.wire_model_id.clone()),
+            fingerprint: self.1.clone(),
+            previous: pending.previous.take(),
+            loader: pending.loader.take(),
+            sent,
+            account,
+        })
     }
 
     pub(super) async fn finish(
@@ -332,46 +463,34 @@ impl Pending {
         sent: Option<u64>,
         account: Option<String>,
     ) -> Option<Box<Value>> {
-        let (session, frozen) = request.cache_session.as_ref()?;
-        self.start(request);
-        let (work, mut previous, loader) = {
-            let mut pending = self.0.lock().unwrap();
-            let work = pending.work.take()?;
-            pending.prepared = false;
-            (work, pending.previous.take(), pending.loader.take())
-        };
-        if let Some(loader) = loader {
-            match loader.load().await {
-                Ok(Some(recorded)) => {
-                    let locator = recorded.locator.clone();
-                    previous = tokio::task::spawn_blocking(move || rebuild_predecessor(recorded))
-                        .await
-                        .ok()
-                        .flatten();
-                    if previous.is_some() {
-                        session.recorded(Some(locator));
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::debug!(target: "provider", error, "cold cache predecessor is unknown")
-                }
+        self.finishing(request, sent, account)?.complete().await
+    }
+
+    /// [`Self::finish`] for an attempt the caller cancelled, which must not wait for hashing or
+    /// a store load. Evidence whose inputs are already known is returned at once. Otherwise the
+    /// work finishes in the background, still moving the session's predecessor on, and this
+    /// attempt records no evidence: it was never measured.
+    pub(super) fn finish_without_waiting(
+        &self,
+        request: &PreparedHttpRequest,
+        sent: Option<u64>,
+        account: Option<String>,
+    ) -> Option<Box<Value>> {
+        let finishing = self.finishing(request, sent, account)?;
+        match finishing.fingerprint.ready() {
+            Some(result) if finishing.loader.is_none() => finishing.session.finish(
+                finishing.previous,
+                result,
+                &finishing.frozen,
+                &finishing.model,
+                finishing.sent,
+                finishing.account,
+            ),
+            _ => {
+                tokio::spawn(finishing.complete());
+                None
             }
         }
-        let result = work
-            .await
-            .unwrap_or_else(|_| Err("fingerprint worker failed".into()));
-        session.finish(
-            previous,
-            result,
-            frozen,
-            request
-                .cache_model
-                .as_deref()
-                .unwrap_or(&frozen.wire_model_id),
-            sent,
-            account,
-        )
     }
 }
 

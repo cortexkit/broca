@@ -3212,15 +3212,20 @@ impl LineageRegistry {
         key: &LineageKey,
         run: Option<&str>,
     ) -> Result<(), OpenError> {
-        self.check_expired_with_view(key, run).await.map(|_| ())
+        self.check_expired_with_view(key, run, None)
+            .await
+            .map(|_| ())
     }
 
     /// Check the same expiry barrier as every operation, retaining its stored snapshot so a
-    /// read can serve it without loading an over-budget view again.
+    /// read can serve it without loading an over-budget view again. `class` is the root the
+    /// session is kept in when the caller already found it (`Some(None)`: no root holds it), so
+    /// it isn't looked for again.
     pub(crate) async fn check_expired_with_view(
         &self,
         key: &LineageKey,
         run: Option<&str>,
+        class: Option<Option<broca_records::session_storage::StorageClass>>,
     ) -> Result<Option<crate::store_read::StoredLocalView>, OpenError> {
         let Some(runtime) = self.store_runtime() else {
             return Ok(None);
@@ -3238,6 +3243,7 @@ impl LineageRegistry {
                 now_ms,
                 actor_open,
                 self.inner.retention.get().map(|service| service.as_ref()),
+                class,
             )
             .await?;
         if let Some(expired_at_ms) = expired_at_ms {

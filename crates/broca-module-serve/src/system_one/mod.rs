@@ -85,9 +85,6 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// The limits this build serves under.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Opt in only after the router serves the classifier consumer. Missing configuration
-    /// keeps legacy pinned requests and fixed credentials unchanged.
-    pub routed_models: bool,
     /// Most items in one batch. A call is synchronous, so a batch has to fit the caller's call
     /// deadline: items are sent one after another; each provider attempt is bounded by
     /// `attempt_timeout`, and a retry the provider asked for adds its attempts and wait.
@@ -110,7 +107,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            routed_models: false,
             max_items: 16,
             max_request_bytes: 1024 * 1024,
             process_calls: 16,
@@ -852,7 +848,7 @@ impl SystemOne {
     /// enough evidence to offer model-less calls after its route has closed.
     pub async fn describe_live(&self) -> RoleDescribe {
         let describe = self.describe();
-        if self.config.routed_models && self.routing_ready(None).await.is_ok() {
+        if self.routing_ready(None).await.is_ok() {
             describe.with_routed_models()
         } else {
             describe
@@ -906,15 +902,8 @@ impl SystemOne {
                     refusal_body(&e)
                 })?;
                 let stored = if self.image_references() {
-                    let request = if self.config.routed_models {
-                        cortexkit_role_classifier::request::parse_request(params)
-                    } else {
-                        cortexkit_role_classifier::request::parse_request_for(
-                            params,
-                            &self.describe(),
-                        )
-                    }
-                    .map_err(|e| refusal_body(&e))?;
+                    let request = cortexkit_role_classifier::request::parse_request(params)
+                        .map_err(|e| refusal_body(&e))?;
                     self.stored_batch(&request.batch_id)
                         .await
                         .map_err(|_| {
@@ -955,16 +944,8 @@ impl SystemOne {
         images: images::PreparedImages,
         consumer: String,
     ) -> Result<Box<RawValue>, Vec<u8>> {
-        // Raised here and lowered by the task itself, so a caller that stops waiting (its
-        // route closed) does not hide a call that is still running.
-        let gauge = Arc::clone(&self.in_flight);
-        gauge.fetch_add(1, Ordering::Relaxed);
-        let lowered = GaugeGuard(gauge);
-        let service = Arc::clone(&self);
-        let task = tokio::spawn(async move {
-            let _lowered = lowered;
-            let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
-            if service.config.routed_models && service.role == STORE_ROLE {
+        self.spawn_batch_task(move |service| async move {
+            if service.role == STORE_ROLE {
                 if let Some(reply) = routed::run(
                     &service,
                     &params,
@@ -996,6 +977,27 @@ impl SystemOne {
                 .await
                 .map_err(|error| refusal_body(&error))
             }
+        })
+        .await
+    }
+
+    async fn spawn_batch_task<F>(
+        self: Arc<Self>,
+        run: impl FnOnce(Arc<Self>) -> F + Send + 'static,
+    ) -> Result<Box<RawValue>, Vec<u8>>
+    where
+        F: std::future::Future<Output = Result<Box<RawValue>, Vec<u8>>> + Send + 'static,
+    {
+        // Raised here and lowered by the task itself, so a caller that stops waiting (its
+        // route closed) does not hide a call that is still running.
+        let gauge = Arc::clone(&self.in_flight);
+        gauge.fetch_add(1, Ordering::Relaxed);
+        let lowered = GaugeGuard(gauge);
+        let service = Arc::clone(&self);
+        let task = tokio::spawn(async move {
+            let _lowered = lowered;
+            let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
+            run(service).await
         });
         let result = match task.await {
             Ok(Ok(reply)) => Ok(reply),
@@ -1079,6 +1081,9 @@ fn error_body(code: &str, message: &str) -> Vec<u8> {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::with_test_routing;
 
 #[cfg(test)]
 #[path = "workers_ai_tests.rs"]

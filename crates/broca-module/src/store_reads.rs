@@ -244,7 +244,7 @@ pub enum StoreReadReply {
 #[derive(Debug)]
 pub struct StoredMedia {
     pub reference: broca_protocol::MediaRef,
-    pub bytes: Result<Vec<u8>, String>,
+    pub bytes: Result<Arc<Vec<u8>>, String>,
 }
 
 /// The plan identities a later send's plan is checked against once the session took a refresh:
@@ -266,6 +266,13 @@ pub enum StoreReadOutcome {
         live_step: Option<LiveStep>,
         /// The actor's `ReadContext::entry_speaks_for`, which the read keeps.
         entry_speaks_for: crate::store_entries::EntryAttribution,
+        /// The cursor of the session's last control unit at `position`, as the actor's live
+        /// projection holds it (`ReadContext::stream_head`), so the read needn't project it from
+        /// the stored log again.
+        stream_head: Option<Option<broca_core::Cursor>>,
+        /// The compaction state whose token counts the actor's own reads count with, which a
+        /// read of the session as stored counts with too, so they aren't counted afresh per read.
+        compaction: Option<Arc<broca_core::compaction_v2::session::Session>>,
     },
     /// The read can't be answered now. Transient.
     Refused(ServeError),
@@ -451,7 +458,7 @@ pub async fn execute<B: SessionBackend>(
             crate::store_entries::history_head_of(session, mid.as_deref()).await,
         ),
         StoreReadRequest::Media { sha256 } => {
-            StoreReadReply::Media(stored_media(session, sha256).await)
+            StoreReadReply::Media(stored_media(session, sha256, ctx.settled).await)
         }
         StoreReadRequest::TagLocation(tag) => StoreReadReply::TagLocation(
             crate::store_output_refs::tag_location(session, ctx.parts, *tag)
@@ -506,22 +513,53 @@ pub async fn execute<B: SessionBackend>(
     }
 }
 
-/// The medium with digest `sha256` that a record of `session` names, with its bytes.
+/// The medium with digest `sha256` that a record of `session` names, with its bytes. A medium a
+/// record stored is kept in `settled`, under the session's address there, once found, with its
+/// bytes once read and checked, so the next chunk of it reads neither the session's records nor
+/// its object again (see `store_status::SettledRuns::medium`).
 async fn stored_media<B: SessionBackend>(
     session: &Session<B>,
     sha256: &str,
+    settled: Option<(&SettledRuns, &str)>,
 ) -> Result<Option<StoredMedia>, ServeError> {
-    let Some(medium) = session
-        .named_media(sha256)
-        .await
-        .map_err(crate::store_read::read_failed)?
-    else {
-        return Ok(None);
+    let key = settled.map(|(_, addr)| {
+        (
+            addr.to_owned(),
+            session.head().incarnation.0,
+            session.head().history_version,
+            sha256.to_owned(),
+        )
+    });
+    let kept = settled
+        .zip(key.as_ref())
+        .and_then(|((settled, _), key)| settled.medium(key));
+    let (medium, bytes) = match kept {
+        Some((medium, Some(bytes))) => (medium, Ok(bytes)),
+        found => {
+            let medium = match found {
+                Some((medium, None)) => medium,
+                _ => match session
+                    .named_media(sha256)
+                    .await
+                    .map_err(crate::store_read::read_failed)?
+                {
+                    Some(medium) => medium,
+                    None => return Ok(None),
+                },
+            };
+            let bytes = session
+                .named_media_bytes(&medium)
+                .await
+                .map(Arc::new)
+                .map_err(|error| format!("{error:?}"));
+            // Only a medium a record stored is kept: a later record may yet store one named
+            // without its bytes, and the read then serves that one.
+            if let (Some((settled, _)), Some(key), true) = (settled, key, medium.stored()) {
+                settled.keep_medium(key, medium.clone(), bytes.as_ref().ok().cloned());
+            }
+            (medium, bytes)
+        }
     };
-    let bytes = session
-        .named_media_bytes(&medium)
-        .await
-        .map_err(|error| format!("{error:?}"));
     Ok(Some(StoredMedia {
         reference: medium.reference,
         bytes,
@@ -588,6 +626,8 @@ pub async fn answer_in_memory<B: SessionBackend>(
             position: session.position(),
             live_step: ctx.live_step.cloned(),
             entry_speaks_for: ctx.entry_speaks_for.clone(),
+            stream_head: ctx.stream_head,
+            compaction: None,
         },
     }
 }
@@ -605,7 +645,8 @@ pub async fn answer_in_memory<B: SessionBackend>(
 /// **Shared loads.** Readers of the same session at the same position share one load.
 ///
 /// **Bounded** by [`ViewCache::MAX_ENTRIES`] views and [`ViewCache::MAX_BYTES`] of their walked
-/// size (see [`CachedBytes`]); the least recently used view goes first.
+/// size (see [`CachedBytes`]) and the token counts kept beside each; the least recently used view
+/// goes first.
 pub struct ViewCache<V = SessionView<LocalBackend>> {
     inner: Mutex<CacheInner<V>>,
     max_entries: usize,
@@ -618,7 +659,8 @@ struct CacheInner<V> {
     clock: u64,
     /// Views loaded and not kept because each alone was larger than the byte cap.
     over_cap: u64,
-    /// Views loaded since the cache was made, and their walked bytes.
+    /// Views loaded since the cache was made, kept or not (see [`ViewCache::count_unkept`]),
+    /// and their walked bytes.
     loads: u64,
     loaded_bytes: u64,
     /// Of those loads, the ones that replaced a view of the same session at an older position:
@@ -668,10 +710,12 @@ struct CacheEntry<V> {
     token_counts: Arc<Mutex<broca_core::compaction_v2::tokens::Counts>>,
     position: Position,
     cell: Arc<tokio::sync::OnceCell<Arc<V>>>,
-    /// The view's walked size when it loaded, once loaded.
+    /// The view's walked size when it loaded, once counted; 0 until then.
     loaded: u64,
-    /// What the view counts against the byte cap: its walked size when it loaded, and what its
-    /// reads have kept since, as of the last time it was served.
+    /// What `token_counts` held the last time the entry was counted.
+    token_bytes: u64,
+    /// What the view counts against the byte cap: its walked size when it loaded, what its reads
+    /// have kept since, and its token counts, as of the last time it was served.
     bytes: u64,
     used: u64,
     /// Whether it replaced a view of its session at an older position.
@@ -767,13 +811,11 @@ impl<V: CachedBytes> ViewCache<V> {
                 Some(entry) if entry.position == position => {
                     entry.used = clock;
                     let cell = Arc::clone(&entry.cell);
-                    // A kept view's reads may have kept sealed entries since it was last served.
-                    let recounted = cell.get().map(|view| {
-                        let bytes = entry.loaded + view.grown_bytes();
-                        (std::mem::replace(&mut entry.bytes, bytes), bytes)
-                    });
-                    if let Some((before, after)) = recounted {
-                        inner.bytes = inner.bytes - before + after;
+                    // A kept view's reads may have kept sealed entries and token counts since it
+                    // was last served. A view whose load filled the cell but whose loader hasn't
+                    // counted it yet is counted here, in full, and the loader then counts nothing.
+                    if let Some(view) = cell.get() {
+                        inner.count(addr, view.as_ref());
                     }
                     cell
                 }
@@ -792,6 +834,7 @@ impl<V: CachedBytes> ViewCache<V> {
                             position,
                             cell: Arc::clone(&cell),
                             loaded: 0,
+                            token_bytes: 0,
                             bytes: 0,
                             used: clock,
                             replaced_older,
@@ -805,28 +848,34 @@ impl<V: CachedBytes> ViewCache<V> {
                 }
             }
         };
-        let view = cell
+        let view = match cell
             .get_or_try_init(|| async { load.await.map(Arc::new) })
-            .await?
-            .clone();
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(entry) = inner.entries.get_mut(addr) {
-            if Arc::ptr_eq(&entry.cell, &cell) && entry.bytes == 0 {
-                // Walked once, by the reader whose load filled the cell's entry first; at least
-                // one byte, so a counted entry is never taken for an unloaded one.
-                entry.loaded = view.loaded_bytes().max(1);
-                entry.bytes = entry.loaded + view.grown_bytes();
-                let (loaded, reload, reason) = (entry.loaded, entry.replaced_older, entry.reason);
-                inner.bytes += entry.bytes;
-                inner.loads += 1;
-                inner.loaded_bytes += loaded;
-                inner.reloads += u64::from(reload);
-                let by_reason = inner.by_reason.entry(reason).or_default();
-                by_reason.loads += 1;
-                by_reason.loaded_bytes += loaded;
-                by_reason.reloads += u64::from(reload);
-                inner.count_session(addr, loaded, reload, reason);
+            .await
+        {
+            Ok(view) => view.clone(),
+            Err(error) => {
+                // Eviction runs only after a load, so an entry left for a failed load would stay
+                // past the entry cap: reading many sessions that each fail to load would grow
+                // the map without bound.
+                let mut inner = self.inner.lock().unwrap();
+                let unfilled = inner.entries.get(addr).is_some_and(|entry| {
+                    Arc::ptr_eq(&entry.cell, &cell) && entry.cell.get().is_none()
+                });
+                if unfilled {
+                    if let Some(entry) = inner.entries.remove(addr) {
+                        inner.bytes -= entry.bytes;
+                    }
+                }
+                return Err(error);
             }
+        };
+        let mut inner = self.inner.lock().unwrap();
+        if inner
+            .entries
+            .get(addr)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.cell, &cell))
+        {
+            inner.count(addr, view.as_ref());
         }
         for (addr, bytes) in inner.evict(self.max_entries, self.max_bytes) {
             inner.over_cap += 1;
@@ -850,15 +899,14 @@ impl<V: CachedBytes> ViewCache<V> {
         let estimated = inner
             .entries
             .values()
-            .filter_map(|entry| entry.cell.get())
-            .map(|view| estimate(view))
-            .sum::<usize>();
+            .filter_map(|entry| Some(estimate(entry.cell.get()?) as u64 + entry.token_bytes))
+            .sum::<u64>();
         broca_wire::MemoryCache {
             entries: inner.entries.len() as u64,
             max_entries: self.max_entries as u64,
             counted_bytes: Some(inner.bytes),
             max_bytes: Some(self.max_bytes),
-            estimated_bytes: estimated as u64,
+            estimated_bytes: estimated,
             views_over_cap: Some(inner.over_cap),
             loads: Some(inner.loads),
             loaded_bytes: Some(inner.loaded_bytes),
@@ -872,6 +920,36 @@ impl<V: CachedBytes> ViewCache<V> {
             ),
             top_sessions: Some(inner.top_sessions()),
         }
+    }
+
+    /// The view kept for the session at `addr` at `position`, if one is, without loading or
+    /// keeping one: for a read whose view is of no use to the next one, which still takes a view
+    /// loaded at the same position by an earlier read.
+    pub fn kept(&self, addr: &str, position: Position) -> Option<Arc<V>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.clock += 1;
+        let clock = inner.clock;
+        let entry = inner
+            .entries
+            .get_mut(addr)
+            .filter(|entry| entry.position == position)?;
+        let view = Arc::clone(entry.cell.get()?);
+        entry.used = clock;
+        Some(view)
+    }
+
+    /// Counts `view` of the session at `addr`, loaded for `reason` and not kept (see
+    /// [`kept`](Self::kept)), among the loads the memory report counts, so a load that kept
+    /// nothing still shows there.
+    pub fn count_unkept(&self, addr: &str, reason: &'static str, view: &V) {
+        let loaded = view.loaded_bytes().max(1);
+        let mut inner = self.inner.lock().unwrap();
+        inner.loads += 1;
+        inner.loaded_bytes += loaded;
+        let by_reason = inner.by_reason.entry(reason).or_default();
+        by_reason.loads += 1;
+        by_reason.loaded_bytes += loaded;
+        inner.count_session(addr, loaded, false, reason);
     }
 
     pub(crate) fn token_counts(
@@ -891,6 +969,43 @@ impl<V: CachedBytes> ViewCache<V> {
 impl Default for ViewCache {
     fn default() -> Self {
         Self::new(Self::MAX_ENTRIES, Self::MAX_BYTES)
+    }
+}
+
+impl<V: CachedBytes> CacheInner<V> {
+    /// Counts `view`, the loaded view of the entry at `addr`, against the byte cap: in full the
+    /// first time, as a load (walked once; at least one byte, so a counted entry is never taken
+    /// for an uncounted one), and after that only what its reads kept since. Either the loader
+    /// or a reader that found the cell filled first may count it, so the load is counted once
+    /// whichever of them takes the lock first.
+    fn count(&mut self, addr: &str, view: &V) {
+        let Some(entry) = self.entries.get_mut(addr) else {
+            return;
+        };
+        let first = entry.loaded == 0;
+        if first {
+            entry.loaded = view.loaded_bytes().max(1);
+        }
+        // Token counts are kept beside the view and grow with each part a read counts. A count
+        // in progress holds them locked: keep its last size rather than wait for it under the
+        // cache's lock.
+        if let Ok(counts) = entry.token_counts.try_lock() {
+            entry.token_bytes = counts.held_bytes() as u64;
+        }
+        let bytes = entry.loaded + view.grown_bytes() + entry.token_bytes;
+        let before = std::mem::replace(&mut entry.bytes, bytes);
+        let (loaded, reload, reason) = (entry.loaded, entry.replaced_older, entry.reason);
+        self.bytes = self.bytes - before + bytes;
+        if first {
+            self.loads += 1;
+            self.loaded_bytes += loaded;
+            self.reloads += u64::from(reload);
+            let by_reason = self.by_reason.entry(reason).or_default();
+            by_reason.loads += 1;
+            by_reason.loaded_bytes += loaded;
+            by_reason.reloads += u64::from(reload);
+            self.count_session(addr, loaded, reload, reason);
+        }
     }
 }
 
@@ -935,8 +1050,6 @@ impl<V> CacheInner<V> {
         top.truncate(SESSIONS_REPORTED);
         top
     }
-
-    /// Drops the least recently used views until the cache is within its bounds.
     /// Drops views until the cache fits its caps, and returns the views dropped because each
     /// alone was larger than the byte cap, with their counted bytes. Such a view goes first, so
     /// it never pushes the views that fit out of the cache.
@@ -998,6 +1111,113 @@ mod tests {
             log: Id128([1; 16]),
             len,
         }
+    }
+
+    /// A test view that holds `loaded` bytes when it loads and has kept `grown` since.
+    struct Grown {
+        loaded: u64,
+        grown: u64,
+    }
+
+    impl CachedBytes for Grown {
+        fn loaded_bytes(&self) -> u64 {
+            self.loaded
+        }
+
+        fn grown_bytes(&self) -> u64 {
+            self.grown
+        }
+    }
+
+    /// A failed load keeps no entry: reading many sessions that each fail to load leaves the
+    /// cache empty, rather than one entry per session past the entry cap.
+    #[tokio::test]
+    async fn failed_loads_keep_no_entry() {
+        let cache: ViewCache<u64> = ViewCache::new(4, u64::MAX);
+        for n in 0..16 {
+            let failed = cache
+                .view(&format!("s{n}"), at(1, 1), "test", async {
+                    Err::<u64, ()>(())
+                })
+                .await;
+            assert!(failed.is_err());
+        }
+        assert_eq!(cache.usage(), (0, 0));
+    }
+
+    /// A reader that finds a view loaded before its loader counted it counts the load in full,
+    /// once: the view counts its loaded bytes against the cap, not only what it grew since.
+    #[tokio::test]
+    async fn a_view_found_before_its_loader_counts_it_is_counted_in_full_once() {
+        let cache: ViewCache<Grown> = ViewCache::new(4, u64::MAX);
+        // The cache as a load leaves it between filling the view's cell and counting the view.
+        let first = cache
+            .view("s", at(1, 1), "test", async {
+                Ok::<_, ()>(Grown {
+                    loaded: 100,
+                    grown: 5,
+                })
+            })
+            .await
+            .unwrap();
+        {
+            let mut inner = cache.inner.lock().unwrap();
+            let entry = inner.entries.get_mut("s").unwrap();
+            let bytes = std::mem::take(&mut entry.bytes);
+            entry.loaded = 0;
+            inner.bytes -= bytes;
+            inner.loads = 0;
+            inner.loaded_bytes = 0;
+            inner.by_reason.clear();
+        }
+        let found = cache
+            .view("s", at(1, 1), "test", async {
+                Ok::<_, ()>(Grown {
+                    loaded: 1,
+                    grown: 1,
+                })
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &found));
+        assert_eq!(cache.usage(), (1, 105));
+        assert_eq!(cache.memory(|_| 0).loads, Some(1));
+        assert_eq!(cache.memory(|_| 0).loaded_bytes, Some(100));
+        // The loader then takes the lock and counts nothing more.
+        cache.inner.lock().unwrap().count("s", &first);
+        assert_eq!(cache.usage(), (1, 105));
+        assert_eq!(cache.memory(|_| 0).loads, Some(1));
+    }
+
+    /// The token counts kept beside a view count against the byte cap, as they grow with the
+    /// parts its reads count.
+    #[cfg(feature = "test-clock")]
+    #[tokio::test]
+    async fn a_views_token_counts_count_against_the_byte_cap() {
+        let cache: ViewCache<u64> = ViewCache::new(4, u64::MAX);
+        let load = |value: u64| async move { Ok::<_, ()>(value) };
+        cache.view("s", at(1, 1), "test", load(10)).await.unwrap();
+        cache
+            .token_counts("s")
+            .lock()
+            .unwrap()
+            .count_parts_for_test(1_000);
+        cache.view("s", at(1, 1), "test", load(9)).await.unwrap();
+        let (_, bytes) = cache.usage();
+        assert!(
+            bytes > 10 + 1_000 * 64,
+            "a thousand counted parts count against the cap: {bytes} bytes"
+        );
+        // A view too large with its counts is dropped, counts and all.
+        let small: ViewCache<u64> = ViewCache::new(4, 10_000);
+        small.view("s", at(1, 1), "test", load(10)).await.unwrap();
+        small
+            .token_counts("s")
+            .lock()
+            .unwrap()
+            .count_parts_for_test(1_000);
+        small.view("s", at(1, 1), "test", load(9)).await.unwrap();
+        assert_eq!(small.usage(), (0, 0));
     }
 
     /// Readers of one session at one position share one load; the next read is served from the
@@ -1071,21 +1291,24 @@ mod tests {
             3
         );
         assert_eq!(cache.usage().0, 1);
-        // A failed load keeps nothing, and the next reader loads.
+        // A failed load keeps nothing, not even the view it was to replace, and the next reader
+        // loads.
         assert!(cache
             .view("s", at(3, 1), "test", async { Err(()) })
             .await
             .is_err());
+        assert_eq!(cache.usage(), (0, 0));
         assert_eq!(
             *cache.view("s", at(3, 1), "test", load(4)).await.unwrap(),
             4
         );
-        // The memory report counts each load that succeeded and its bytes, and the three that
-        // replaced a view of the session at an older position.
+        // The memory report counts each load that succeeded and its bytes, and the two that
+        // replaced a view of the session at an older position: the last replaced none, the
+        // failed load having dropped the view it was to replace.
         let memory = cache.memory(|view| *view as usize);
         assert_eq!(memory.loads, Some(4));
         assert_eq!(memory.loaded_bytes, Some(1 + 2 + 3 + 4));
-        assert_eq!(memory.reloads, Some(3));
+        assert_eq!(memory.reloads, Some(2));
         // And the same counts by the reason of the reader whose load filled the view.
         let by = |loads, loaded_bytes, reloads| broca_wire::ViewLoads {
             loads,
@@ -1097,7 +1320,7 @@ mod tests {
             Some(
                 [
                     ("run.result".to_owned(), by(1, 2, 1)),
-                    ("test".to_owned(), by(3, 1 + 3 + 4, 2)),
+                    ("test".to_owned(), by(3, 1 + 3 + 4, 1)),
                 ]
                 .into()
             )

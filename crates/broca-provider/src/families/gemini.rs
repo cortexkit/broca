@@ -60,7 +60,7 @@ impl WireFamily for Gemini {
     }
 
     fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
-        with_request_body(frozen, opts, None, None, |body| {
+        with_request_body(frozen, None, opts, None, None, |body| {
             body.into_node().canonical_len()
         })
     }
@@ -71,7 +71,7 @@ impl WireFamily for Gemini {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        with_request_body(frozen, opts, None, provenance, |body| {
+        with_request_body(frozen, None, opts, None, provenance, |body| {
             body.into_node().to_value()
         })
     }
@@ -82,7 +82,19 @@ impl WireFamily for Gemini {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        with_request_body(frozen, opts, None, provenance, |body| {
+        with_request_body(frozen, None, opts, None, provenance, |body| {
+            body.into_node().canonical_bytes()
+        })
+    }
+
+    fn render_with_shared_name_map(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+        name_map: &crate::tool_name_alias::ToolNameMap,
+    ) -> Vec<u8> {
+        with_request_body(frozen, Some(name_map), opts, None, provenance, |body| {
             body.into_node().canonical_bytes()
         })
     }
@@ -106,6 +118,7 @@ impl WireFamily for Gemini {
         let media = MediaRender { frozen, payloads };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -123,6 +136,7 @@ impl WireFamily for Gemini {
         let media = MediaRender { frozen, payloads };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -153,9 +167,6 @@ impl WireFamily for Gemini {
             }
             AuthHandle::ApiKeyHeader { header, value } => {
                 headers.push((header.clone(), value.clone()));
-            }
-            AuthHandle::SigV4 { signed_headers, .. } => {
-                headers.extend(signed_headers.iter().cloned());
             }
             AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
             AuthHandle::None => {}
@@ -213,6 +224,7 @@ impl<'a> GeminiBody<'a> {
 /// from `opts` live in this call, so the body is used here.
 pub(crate) fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
+    shared_name_map: Option<&crate::tool_name_alias::ToolNameMap>,
     opts: &CallOptions,
     media: Option<&MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
@@ -226,12 +238,19 @@ pub(crate) fn with_request_body<R>(
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
-    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+    let owned_name_map;
+    let name_map = match shared_name_map {
+        Some(name_map) => name_map,
+        None => {
+            owned_name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+            &owned_name_map
+        }
+    };
     let contents = convert_contents_with_provenance(
         &opts.prompt,
         frozen,
         opts.target_model.as_ref(),
-        &name_map,
+        name_map,
         media,
         provenance,
     );
@@ -281,10 +300,10 @@ pub(crate) fn with_request_body<R>(
             "functionDeclarations": opts
                 .tools
                 .iter()
-                .map(|tool| convert_tool(tool, &name_map))
+                .map(|tool| convert_tool(tool, name_map))
                 .collect::<Vec<_>>()
         }]);
-        body["toolConfig"] = convert_tool_config(&opts.tool_choice, &opts.tools, &name_map);
+        body["toolConfig"] = convert_tool_config(&opts.tool_choice, &opts.tools, name_map);
     }
 
     // The caller's service tier (`flex` or `priority`; the default sends nothing). Google
@@ -1103,12 +1122,10 @@ impl GeminiNormalizer {
 
     fn handle_chunk(
         &mut self,
-        payload: &str,
+        v: &Value,
         out: &mut Vec<NormalizedEvent>,
     ) -> Result<(), NormalizeError> {
-        let v: Value =
-            serde_json::from_str(payload).map_err(|e| NormalizeError::Invalid(e.to_string()))?;
-        self.handle_response_value(&v, out)
+        self.handle_response_value(v, out)
     }
 
     /// Decode one already-parsed `GenerateContentResponse` chunk. Code-Assist unwraps its
@@ -1444,11 +1461,11 @@ impl StreamNormalizer for GeminiNormalizer {
     }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
-        for payload in self.sse.push(chunk)? {
-            if payload.trim() == "[DONE]" {
+        for payload in self.sse.push_parsed(chunk)? {
+            if payload.raw().trim() == "[DONE]" {
                 continue;
             }
-            self.handle_chunk(&payload, &mut out)?;
+            self.handle_chunk(payload.value()?, &mut out)?;
         }
         Ok(out)
     }
@@ -1475,11 +1492,11 @@ impl StreamNormalizer for GeminiNormalizer {
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
-        for payload in self.sse.flush()? {
-            if payload.trim() == "[DONE]" {
+        for payload in self.sse.flush_parsed()? {
+            if payload.raw().trim() == "[DONE]" {
                 continue;
             }
-            self.handle_chunk(&payload, &mut out)?;
+            self.handle_chunk(payload.value()?, &mut out)?;
         }
         if self.emitted_final || !self.started {
             return Ok(out);

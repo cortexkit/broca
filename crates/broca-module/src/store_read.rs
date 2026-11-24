@@ -486,9 +486,22 @@ impl<B: SessionBackend> StoredView<B> {
         view: Box<broca_session_store::session::SessionView<B>>,
         position: broca_session_store::session::Position,
     ) -> Self {
-        // Head projection walks records through several large folds. Keep that future off
-        // the caller's stack while a stored read is also loading its view.
-        let stream_head = Box::pin(ViewHead::new(&view)).await;
+        Self::with_stream_head(view, position, None).await
+    }
+
+    /// [`new`](Self::new), with the control stream's head at `position` when the caller knows
+    /// it (an open session's actor holds it), so it isn't projected from the view again.
+    pub async fn with_stream_head(
+        view: Box<broca_session_store::session::SessionView<B>>,
+        position: broca_session_store::session::Position,
+        known: Option<Option<broca_core::Cursor>>,
+    ) -> Self {
+        let stream_head = match known {
+            Some(head) => ViewHead(Ok(head)),
+            // Head projection walks records through several large folds. Keep that future off
+            // the caller's stack while a stored read is also loading its view.
+            None => Box::pin(ViewHead::new(&view)).await,
+        };
         Self {
             view,
             stream_head,

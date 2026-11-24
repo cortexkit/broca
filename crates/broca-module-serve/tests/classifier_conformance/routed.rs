@@ -1,4 +1,4 @@
-//! Real-route routing and vault fixtures for the opt-in classifier conformance run.
+//! Real-route routing and vault fixtures for classifier conformance.
 
 use super::*;
 use cortexkit_role_classifier_conformance::{RoutedDecision, RoutingObservations, RoutingOutcome};
@@ -8,7 +8,7 @@ use cortexkit_role_routing::{
 };
 use subc_client_rs::{BindDecision, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest};
 
-const ROUTER: &str = "classifier-routing";
+pub(super) const ROUTER: &str = "classifier-routing";
 const POOL: &str = "classifier-keys";
 const ACCOUNTS: [&str; 2] = ["account-1", "account-2"];
 
@@ -63,10 +63,19 @@ struct Inner {
     calls: Vec<Value>,
 }
 
-#[derive(Default)]
-pub(super) struct State(Mutex<Inner>);
+pub(super) struct State(Mutex<Inner>, Served);
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new(Served::Jev)
+    }
+}
 
 impl State {
+    pub(super) fn new(served: Served) -> Self {
+        Self(Mutex::default(), served)
+    }
+
     pub(super) fn script(&self, outcomes: Vec<RoutingOutcome>) {
         assert!(!outcomes.is_empty());
         let mut inner = self.0.lock().unwrap();
@@ -138,7 +147,6 @@ impl State {
     }
 
     pub(super) fn provider_request(&self, head: &str, path: &str, request: &Value) {
-        assert_eq!(path, "/v1/systemone", "routed fixture only serves TypeSafe");
         let token = head
             .lines()
             .find_map(|line| line.strip_prefix("authorization: bearer "))
@@ -146,33 +154,39 @@ impl State {
         let credential = token
             .strip_prefix("synthetic-classifier-key-")
             .expect("unknown provider token");
+        let provider_model = request["model"]
+            .as_str()
+            .expect("HTTP request names its model");
+        let model = if path == "/v1/systemone" {
+            format!("typesafe/{provider_model}")
+        } else {
+            assert_eq!(
+                path,
+                format!(
+                    "{WORKERS_AI_RUN_PREFIX}{credential}/ai/run/@cf/cloudflare/{provider_model}"
+                ),
+                "Workers AI URL must name the credential's account and the requested model"
+            );
+            format!("cloudflare-workers-ai/@cf/cloudflare/{provider_model}")
+        };
         let mut inner = self.0.lock().unwrap();
-        let mut admitted = inner
-            .admissions
-            .values()
-            .filter(|admission| !admission.finished && admission.choice.account == credential);
+        let mut admitted = inner.admissions.values().filter(|admission| {
+            !admission.finished
+                && admission.choice.account == credential
+                && admission.choice.model == model
+        });
         let choice = admitted
             .next()
             .expect("provider sent without an active admitted credential")
             .choice
             .clone();
-        assert!(
-            admitted.all(|admission| admission.choice == choice),
-            "HTTP credential ambiguously names multiple decisions"
-        );
-        let model = format!(
-            "typesafe/{}",
-            request["model"]
-                .as_str()
-                .expect("HTTP request names its model")
-        );
-        assert_eq!(
-            model, choice.model,
-            "HTTP model differs from the credential's admitted decision"
-        );
         // Count every HTTP request, including the single same-account authentication
         // retry permitted by classifier §6.8. Replay must add no request to this log.
         if inner.script.is_some() {
+            assert!(
+                admitted.all(|admission| admission.choice == choice),
+                "HTTP credential ambiguously names multiple scripted decisions"
+            );
             inner.observations.provider_requests.push(RoutedDecision {
                 model,
                 account: credential.into(),
@@ -211,7 +225,10 @@ impl State {
                 } else {
                     inner.next_decision += 1;
                     RoutingOutcome::Selected(RoutedDecision {
-                        model: query.pin.clone().unwrap_or_else(|| JEV.into()),
+                        model: query.pin.clone().unwrap_or_else(|| match self.1 {
+                            Served::WorkersAi => CLEF.into(),
+                            Served::Jev | Served::All => JEV.into(),
+                        }),
                         account: ACCOUNTS[0].into(),
                         decision_id: format!("normal-{}", inner.next_decision),
                     })
@@ -269,11 +286,9 @@ impl State {
                     .get(decision)
                     .expect("admission must name an existing decision")
                     .clone();
-                assert_eq!(params["provider"], "typesafe");
-                assert_eq!(
-                    params["model"],
-                    choice.model.strip_prefix("typesafe/").unwrap()
-                );
+                let (provider, model) = choice.model.split_once('/').unwrap();
+                assert_eq!(params["provider"], provider);
+                assert_eq!(params["model"], model);
                 let renewing = params["mode"] == "renew";
                 if renewing {
                     if let Some(refusal) = &inner.renewal_refusal {
@@ -317,7 +332,7 @@ impl State {
                     inner.renewal_due = Some(admitted_at + lease_ms);
                 }
                 let answer = json!({"admission":{"id":id,"state":"admitted"},
-                    "account":{"provider":"typesafe","method":"apikey","account_id":choice.account,"credential_id":choice.account},
+                    "account":{"provider":provider,"method":"apikey","account_id":choice.account,"credential_id":choice.account},
                     "pin":{"id":pin_id,"generation":generation,"affinity_expires_at_ms":admitted_at+3_600_000,"admission_valid_until_ms":admitted_at+120_000,"lease_valid_until_ms":admitted_at+lease_ms,"mode":if renewing {"renew"} else {"admit"}},
                     "reason":{"code":if renewing {"renewed"} else {"headroom"},"decision_id":decision,"policy_version":"fixture","quota_age_band":"fresh"}});
                 let _: cortexkit_role_routing::account::AccountForAnswer =
@@ -406,25 +421,6 @@ enum FixtureReply {
     Response(Value),
     Error { code: String, message: String },
     Unavailable,
-}
-
-pub(super) fn write_daemon_config(path: PathBuf, mut config: Value, routing: bool) {
-    if routing {
-        assert!(config["modules"]["broca"]["env"]
-            .as_object_mut()
-            .unwrap()
-            .remove("BROCA_PROVIDER_BASE_URL")
-            .is_some());
-    }
-    std::fs::write(path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-}
-
-pub(super) fn configure(path: &Path) {
-    let mut config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    config["classifier_routing"] = json!({"enabled":true});
-    config["account_selection"] = json!({"routing_module":ROUTER});
-    config["auth_methods"] = json!({"defaults":{"typesafe":"apikey"}});
-    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
 }
 
 pub(super) struct Services {
@@ -527,18 +523,23 @@ impl ModuleHandler for Router {
     }
 }
 
-fn credentials() -> Vec<Value> {
-    ACCOUNTS.iter().map(|id| json!({"id":id,"categories":["llm-provider"],"type":"apikey","serves":["typesafe"],
-        "provider_ids":["typesafe"],"auth_method":"apikey","state":"active","record_version":1,"operations":["read"]})).collect()
-}
-
-struct Vault;
+struct Vault(Served);
 
 impl Vault {
-    fn request(request: &Value) -> Value {
+    fn credentials(&self) -> Vec<Value> {
+        let providers = match self.0 {
+            Served::Jev => vec!["typesafe"],
+            Served::WorkersAi => vec!["cloudflare-workers-ai"],
+            Served::All => vec!["typesafe", "cloudflare-workers-ai"],
+        };
+        ACCOUNTS.iter().map(|id| json!({"id":id,"categories":["llm-provider"],"type":"apikey","serves":providers,
+            "provider_ids":providers,"auth_method":"apikey","state":"active","record_version":1,"operations":["read"]})).collect()
+    }
+
+    fn request(&self, request: &Value) -> Value {
         match request["method"].as_str().unwrap() {
             "credential.list_scoped" => {
-                json!({"credentials":credentials(),"grants":1,"grant_tuples":[],"view":"classifier-fixture"})
+                json!({"credentials":self.credentials(),"grants":1,"grant_tuples":[],"view":"classifier-fixture"})
             }
             "credential.get_scoped" => {
                 let id = request["params"]["credential_id"].as_str().unwrap();
@@ -551,7 +552,8 @@ impl Vault {
                     ACCOUNTS.contains(&id),
                     "vault asked for {id}; accounts {ACCOUNTS:?}"
                 );
-                json!({"payload":format!("synthetic-classifier-key-{id}").as_bytes(),"expires_at_ms":null,"record_version":1,"credential_id":id,"account_id":null,"hosts":["127.0.0.1", "localhost"]})
+                let account_id = matches!(self.0, Served::WorkersAi | Served::All).then_some(id);
+                json!({"payload":format!("synthetic-classifier-key-{id}").as_bytes(),"expires_at_ms":null,"record_version":1,"credential_id":id,"account_id":account_id,"hosts":["127.0.0.1", "localhost"]})
             }
             method => panic!("unsupported classifier vault method {method}"),
         }
@@ -570,12 +572,13 @@ impl ModuleHandler for Vault {
     }
 
     async fn handle(&self, _: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        let result = Self::request(&serde_json::from_slice(&body).unwrap());
+        let result = self.request(&serde_json::from_slice(&body).unwrap());
         HandlerOutcome::Response(serde_json::to_vec(&json!({"result":result})).unwrap())
     }
 }
 
 pub(super) async fn register(connection: &Path, state: Arc<State>) -> Services {
+    let vault = Vault(state.1);
     let mut services = Services {
         state: state.clone(),
         tasks: vec![],
@@ -603,7 +606,7 @@ pub(super) async fn register(connection: &Path, state: Arc<State>) -> Services {
             connection,
             "claustrum",
             &["credential.list_scoped", "credential.get_scoped"],
-            Vault,
+            vault,
         )
         .await,
     );
@@ -866,36 +869,9 @@ mod tests {
     }
 
     #[test]
-    fn routed_fixture_writes_real_auth_config_and_preserves_legacy_bytes() {
-        let root = broca_test_support::scratch_root();
-        std::fs::create_dir_all(&root).unwrap();
-        let temp = root.join(format!("classifier-routing-config-{}", std::process::id()));
-        broca_test_support::remove_rig_dir(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
-        let legacy = temp.join("legacy.json");
-        let routed = temp.join("routed.json");
-        let config =
-            json!({"modules":{"broca":{"env":{"BROCA_PROVIDER_BASE_URL":"http://fixture/v1"}}}});
-        let captured = b"{\n  \"modules\": {\n    \"broca\": {\n      \"env\": {\n        \"BROCA_PROVIDER_BASE_URL\": \"http://fixture/v1\"\n      }\n    }\n  }\n}";
-        write_daemon_config(legacy.clone(), config.clone(), false);
-        assert_eq!(std::fs::read(legacy).unwrap(), captured);
-        write_daemon_config(routed.clone(), config, true);
-        let stored: Value = serde_json::from_slice(&std::fs::read(routed).unwrap()).unwrap();
-        assert!(stored["modules"]["broca"]["env"]
-            .get("BROCA_PROVIDER_BASE_URL")
-            .is_none());
-        let broca = temp.join("broca.json");
-        std::fs::write(&broca, b"{}").unwrap();
-        configure(&broca);
-        let stored: Value = serde_json::from_slice(&std::fs::read(broca).unwrap()).unwrap();
-        assert_eq!(stored["classifier_routing"]["enabled"], true);
-        assert_eq!(stored["account_selection"]["routing_module"], ROUTER);
-        broca_test_support::remove_rig_dir(&temp);
-    }
-
-    #[test]
     fn routed_fixture_vault_lists_only_explicit_readable_api_keys() {
-        let listing = Vault::request(&json!({"method":"credential.list_scoped","params":{}}));
+        let vault = Vault(Served::Jev);
+        let listing = vault.request(&json!({"method":"credential.list_scoped","params":{}}));
         let rows = listing["credentials"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         for row in rows {
@@ -905,7 +881,7 @@ mod tests {
                 row.get("account_id").is_none(),
                 "pool uses public credential ids"
             );
-            let loaded = Vault::request(
+            let loaded = vault.request(
                 &json!({"method":"credential.get_scoped","params":{"credential_id":row["id"]}}),
             );
             let bytes: Vec<u8> = serde_json::from_value(loaded["payload"].clone()).unwrap();
@@ -917,14 +893,22 @@ mod tests {
     }
 }
 
-fn expected_inapplicability(name: &str) -> Option<&'static str> {
+pub(super) fn fixed_account_only_reason(name: &str) -> Option<&'static str> {
     match name {
         "auth_failure_stops_the_call_unstored" => Some("routed_models stores account failures; covered by routed_partial_failure_keeps_model"),
         "auth_failure_on_first_call_refused" => Some("routed_models stores account failures; covered by routed_initial_account_failure_bounded"),
-        "image_reference_follows_declaration" => Some("no served model takes images"),
-        "image_reference_resolved_and_answered" | "image_reference_oversized_refused_like_inline"
-            | "image_source_down_refused_transient" | "image_reference_identity_is_its_handle" => Some("no served model takes images"),
         _ => None,
+    }
+}
+
+fn expected_inapplicability(name: &str) -> Option<&'static str> {
+    match name {
+        "image_reference_follows_declaration" => Some("no served model takes images"),
+        "image_reference_resolved_and_answered"
+        | "image_reference_oversized_refused_like_inline"
+        | "image_source_down_refused_transient"
+        | "image_reference_identity_is_its_handle" => Some("no served model takes images"),
+        _ => fixed_account_only_reason(name),
     }
 }
 
@@ -938,7 +922,7 @@ fn expected_verdict() -> SuiteVerdict {
     }
 }
 
-fn validate_report(
+pub(super) fn validate_report(
     report: &cortexkit_role_classifier_conformance::SuiteReport,
 ) -> Result<(), String> {
     if report.checks.len() != CHECKS.len() {
@@ -973,8 +957,8 @@ fn validate_report(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn classifier_conformance_suite_passes_with_routing_enabled() {
-    let rig = start_rig_options("routing", Served::Jev, None, true)
+async fn classifier_conformance_suite_reaches_routing_over_the_real_daemon() {
+    let rig = start_rig("routing", Served::Jev)
         .await
         .expect("the routing conformance run requires the real daemon; it must not silently skip");
     let report = run_suite(&Subject { rig: &rig }).await;
@@ -982,7 +966,7 @@ async fn classifier_conformance_suite_passes_with_routing_enabled() {
         println!("{}: {:?}", check.check, check.outcome);
     }
     validate_report(&report)
-        .unwrap_or_else(|failures| panic!("routing-enabled classifier conformance:\n{failures}"));
+        .unwrap_or_else(|failures| panic!("routed classifier conformance:\n{failures}"));
     assert_eq!(report.verdict, expected_verdict());
     let services = rig.routed.as_ref().unwrap();
     let calls = &services.state.0.lock().unwrap().calls;

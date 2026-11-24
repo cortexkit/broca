@@ -71,7 +71,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             entry_speaks_for,
             class: self.class_placement.as_ref().map(|(class, _)| *class),
         };
-        crate::store_reads::answer_in_memory(&mut self.session, &context, request).await
+        let mut outcome =
+            crate::store_reads::answer_in_memory(&mut self.session, &context, request).await;
+        if let crate::store_reads::StoreReadOutcome::Stored { compaction, .. } = &mut outcome {
+            *compaction = Some(Arc::clone(&self.compaction_session));
+        }
+        outcome
     }
 
     /// Keeps the session's head where `session.head` of a closed session looks first (see

@@ -17,7 +17,8 @@ use tokio::sync::{Notify, Semaphore};
 
 use super::*;
 use crate::system_one::{
-    BatchCatalog, ClassifierProvider, Config, ModelPin, ProviderReply, SystemOne, JEV_1_13_0,
+    with_test_routing, BatchCatalog, ClassifierProvider, Config, ModelPin, ProviderReply,
+    SystemOne, JEV_1_13_0,
 };
 
 /// A session handler that answers reads and sends at once, counting each.
@@ -214,7 +215,7 @@ async fn start_with_basis(table: crate::billing_routing::ChargeBasisTable) -> Ri
         )
         .unwrap();
     let export = Arc::new(broca_store::SqliteStore::open(&export_path).unwrap());
-    let system_one = Arc::new(
+    let system_one = Arc::new(with_test_routing(
         SystemOne::new(
             store.clone(),
             "test",
@@ -225,7 +226,7 @@ async fn start_with_basis(table: crate::billing_routing::ChargeBasisTable) -> Ri
         )
         .with_export(export.clone(), Arc::new(table))
         .with_clock(Arc::new(|| 1792772000000)),
-    );
+    ));
     let serve = tokio::spawn(serve_connection_with_services(
         reader,
         writer,
@@ -958,7 +959,7 @@ async fn a_clef_fact_names_the_provider_and_its_slashed_model_id_apart() {
         .join(format!("classifier-export-clef-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let export = Arc::new(broca_store::SqliteStore::open(root.join("run-index.db")).unwrap());
-    let system_one = Arc::new(
+    let system_one = Arc::new(with_test_routing(
         SystemOne::new(
             Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
             "test",
@@ -971,7 +972,7 @@ async fn a_clef_fact_names_the_provider_and_its_slashed_model_id_apart() {
             export.clone(),
             Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
         ),
-    );
+    ));
     let mut params = classify_params("clef");
     params["model"] = json!("cloudflare-workers-ai/@cf/cloudflare/clef");
     system_one
@@ -1013,14 +1014,14 @@ async fn a_routed_key_without_a_provider_split_is_refused_before_any_call() {
     let store = Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap());
     let mut pin = ModelPin::clef(Arc::new(ClefAnswers));
     pin.catalog_id = "clef".into();
-    let system_one = Arc::new(SystemOne::new(
+    let system_one = Arc::new(with_test_routing(SystemOne::new(
         store.clone(),
         "test",
         Arc::new(AnyRow),
         vec![pin],
         Config::default(),
         Arc::new(AtomicUsize::new(0)),
-    ));
+    )));
     let mut params = classify_params("bare");
     params["model"] = json!("clef");
     let refused = system_one

@@ -208,7 +208,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &self,
         view: &ProviderView,
     ) -> Result<Vec<v2::protocol::read::Entry>, String> {
-        use v2::protocol::view::{EditOp, InsertAt};
+        use v2::protocol::view::EditOp;
         let window_start = self.session.conversation.window_start();
         let cut = view.edits.iter().find_map(|edit| match &edit.op {
             EditOp::Cut { through } => Some(through),
@@ -217,19 +217,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(cut) = cut.filter(|_| window_start > 1) else {
             return crate::store_entries::all_entries(&self.session).await;
         };
-        let named: Vec<String> = view
-            .edits
+        let entries = self.window_and_named(named_mids([view])).await?;
+        if entries
             .iter()
-            .filter_map(|edit| match &edit.op {
-                EditOp::Drop { mid, .. } | EditOp::Replace { mid, .. } => Some(mid.clone()),
-                EditOp::Cut { through } => Some(through.clone()),
-                EditOp::Insert {
-                    at: InsertAt::Before(mid),
-                    ..
-                } => Some(mid.clone()),
-                _ => None,
-            })
-            .collect();
+            .any(|entry| &entry.mid == cut && entry.ordinal < window_start)
+        {
+            return crate::store_entries::all_entries(&self.session).await;
+        }
+        Ok(entries)
+    }
+
+    /// The window's entries, after the earlier entries among `named`, in ordinal order: a
+    /// session sealed behind a cut keeps only these in the transcript its next step reads
+    /// (`broca_session_loop::compaction::transcript`), when `named` are the messages its views
+    /// name. Each is read alone, so the sealed history isn't decoded whole.
+    pub(super) async fn window_and_named(
+        &self,
+        named: Vec<String>,
+    ) -> Result<Vec<v2::protocol::read::Entry>, String> {
+        let window_start = self.session.conversation.window_start();
         let project = |stored: Vec<broca_session_store::session::StoredEntry>| {
             stored
                 .iter()
@@ -242,12 +248,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .await
                 .map_err(read_error)?,
         )?;
-        if entries
-            .iter()
-            .any(|entry| &entry.mid == cut && entry.ordinal < window_start)
-        {
-            return crate::store_entries::all_entries(&self.session).await;
-        }
         entries.retain(|entry| entry.ordinal < window_start);
         entries.extend(project(
             crate::store_read::served_compaction_entries(&self.session, window_start, usize::MAX)
@@ -297,6 +297,25 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         );
         Ok(())
     }
+}
+
+/// Every message `views` name, each cut's target and each message an edit drops, replaces or
+/// inserts before: the sealed entries a transcript keeps in front of the window.
+pub(super) fn named_mids<'a>(views: impl IntoIterator<Item = &'a ProviderView>) -> Vec<String> {
+    use v2::protocol::view::{EditOp, InsertAt};
+    views
+        .into_iter()
+        .flat_map(|view| &view.edits)
+        .filter_map(|edit| match &edit.op {
+            EditOp::Drop { mid, .. } | EditOp::Replace { mid, .. } => Some(mid.clone()),
+            EditOp::Cut { through } => Some(through.clone()),
+            EditOp::Insert {
+                at: InsertAt::Before(mid),
+                ..
+            } => Some(mid.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The longest session a test build cross-checks each apply on.

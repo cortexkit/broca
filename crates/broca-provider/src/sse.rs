@@ -99,6 +99,29 @@ pub(crate) fn record_data(record: &str) -> Option<String> {
     (!data_lines.is_empty()).then(|| data_lines.join("\n"))
 }
 
+/// One decoded SSE data record. The raw text remains available for raw observers and the few
+/// provider fields whose exact JSON spelling is retained; every other reader shares `parsed`.
+pub(crate) struct SsePayload {
+    raw: String,
+    parsed: serde_json::Result<serde_json::Value>,
+}
+
+impl SsePayload {
+    pub(crate) fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub(crate) fn value(&self) -> Result<&serde_json::Value, NormalizeError> {
+        self.parsed
+            .as_ref()
+            .map_err(|error| NormalizeError::Invalid(error.to_string()))
+    }
+
+    pub(crate) fn into_parts(self) -> (String, serde_json::Result<serde_json::Value>) {
+        (self.raw, self.parsed)
+    }
+}
+
 /// Incremental byte-oriented SSE record splitter.
 ///
 /// HTTP chunk boundaries may divide either a UTF-8 code point or any record-separator
@@ -161,6 +184,14 @@ impl SseDecoder {
     /// Append raw response bytes and return the data payloads from every newly
     /// completed record. Invalid UTF-8 in a complete record is a wire error.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, NormalizeError> {
+        Ok(self
+            .push_parsed(chunk)?
+            .into_iter()
+            .map(|payload| payload.raw)
+            .collect())
+    }
+
+    pub(crate) fn push_parsed(&mut self, chunk: &[u8]) -> Result<Vec<SsePayload>, NormalizeError> {
         if !self.bom_checked {
             let mut prefix = std::mem::take(&mut self.bom_probe);
             prefix.extend_from_slice(chunk);
@@ -188,6 +219,14 @@ impl SseDecoder {
     /// At end of stream, a pending trailing carriage return cannot be followed by a line feed,
     /// so it is treated as a valid bare CR line end per the WHATWG SSE specification.
     pub fn flush(&mut self) -> Result<Vec<String>, NormalizeError> {
+        Ok(self
+            .flush_parsed()?
+            .into_iter()
+            .map(|payload| payload.raw)
+            .collect())
+    }
+
+    pub(crate) fn flush_parsed(&mut self) -> Result<Vec<SsePayload>, NormalizeError> {
         if !self.bom_checked {
             self.bom_checked = true;
             let prefix = std::mem::take(&mut self.bom_probe);
@@ -201,7 +240,7 @@ impl SseDecoder {
         self.decode_records(true)
     }
 
-    fn decode_records(&mut self, is_eof: bool) -> Result<Vec<String>, NormalizeError> {
+    fn decode_records(&mut self, is_eof: bool) -> Result<Vec<SsePayload>, NormalizeError> {
         let mut payloads = Vec::new();
         let mut record_start = 0usize;
         let mut consumed = 0usize;
@@ -252,13 +291,19 @@ impl SseDecoder {
                 self.last_event_type = Some(name.to_owned());
             }
             let data = record_data(record);
+            let parsed = data
+                .as_deref()
+                .filter(|payload| !payload.is_empty() && *payload != "[DONE]")
+                .map(crate::json_parse::value_from_str);
             let telemetry_name = if data.as_deref() == Some("[DONE]") {
                 "[DONE]".to_owned()
-            } else if let Some(payload) = data.as_deref().filter(|s| !s.is_empty()) {
+            } else if data.as_deref().is_some_and(|payload| !payload.is_empty()) {
                 event_name
                     .map(str::to_owned)
                     .or_else(|| {
-                        serde_json::from_str::<serde_json::Value>(payload)
+                        parsed
+                            .as_ref()?
+                            .as_ref()
                             .ok()?
                             .get("type")?
                             .as_str()
@@ -274,6 +319,12 @@ impl SseDecoder {
                 // The socket pump exposes ping/pong as empty records, not their payloads.
                 // Count the observed event but never measure the synthetic SSE comment's bytes.
                 self.content.observe_unmeasured_keepalive();
+            } else if let Some(parsed) = parsed.as_ref() {
+                self.content.observe_parsed(
+                    &telemetry_name,
+                    parsed.as_ref().ok(),
+                    data.as_deref().map_or(record.len(), str::len),
+                );
             } else {
                 self.content.observe(
                     &telemetry_name,
@@ -285,18 +336,16 @@ impl SseDecoder {
             }
             if let Some(payload) = data {
                 if event_name.is_none() && !payload.is_empty() {
-                    // Deserialize only the envelope discriminator, never retain response content
-                    // in diagnostics. Untyped SSE data has the standard event name `message`.
-                    #[derive(serde::Deserialize)]
-                    struct EnvelopeType {
-                        #[serde(rename = "type")]
-                        kind: Option<String>,
-                    }
+                    // Untyped SSE data has the standard event name `message`. Reuse the decoded
+                    // envelope rather than retaining any response content in diagnostics.
                     self.last_event_type = Some(
-                        serde_json::from_str::<EnvelopeType>(&payload)
-                            .ok()
-                            .and_then(|envelope| envelope.kind)
-                            .unwrap_or_else(|| "message".into()),
+                        parsed
+                            .as_ref()
+                            .and_then(|parsed| parsed.as_ref().ok())
+                            .and_then(|value| value.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("message")
+                            .to_owned(),
                     );
                 }
                 if !payload.is_empty() {
@@ -319,7 +368,10 @@ impl SseDecoder {
                     if payload == "[DONE]" {
                         self.saw_done = true;
                     } else if !self.saw_done {
-                        payloads.push(payload);
+                        payloads.push(SsePayload {
+                            raw: payload,
+                            parsed: parsed.expect("non-sentinel data is decoded above"),
+                        });
                     }
                 } else if record_has_comment(record) {
                     self.comment_records = self.comment_records.saturating_add(1);

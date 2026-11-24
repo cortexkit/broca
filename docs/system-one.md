@@ -4,25 +4,11 @@ The `classifier/v1` route serves sessionless batches of decision-model requests.
 Its contract is `cortexkit-role-classifier` 0.6.3, using the shared model-batch
 0.3.4 rules; routed operations use `cortexkit-role-routing` 0.7.6.
 
-## Rollout switch
+## Routing readiness
 
-The `broca.jsonc` setting below is **off by default**. Keep it off until routing's
-classifier consumer is deployed and a live model/account check succeeds:
-
-```json
-{
-  "classifier_routing": { "enabled": false }
-}
-```
-
-Off, describe has no `routed_models` group, callers must name a model, and broca
-uses the existing fixed credential for that adapter. Pinned request identities,
-provider bodies, replies and immutable measurement facts keep their existing
-format. A missing-model refusal uses the classifier contract's wording:
-`model is required without routed_models`.
-
-On, describe declares `routed_models: {}` only after a live routing describe lists
-consumer `classifier`. An unavailable or unready router gives `routing_unavailable`
+Routing picks the decision model whenever a new `classify.run` batch names none.
+Describe declares `routed_models: {}` only after a live routing describe lists
+consumer `broca.classifier`. An unavailable or unready router gives `routing_unavailable`
 (transient), never fixed-credential fallback. An answered routing refusal uses
 routing's `refusals::retry_class`: Permanent gives `routing_refused` (permanent),
 Transient or RetryAt gives `routing_deferred` (transient). Both preserve routing's
@@ -30,23 +16,16 @@ code, reason and the caller's pin. A timed refusal includes `detail.retry_after_
 the retry timestamp minus the current Unix time in milliseconds, saturating at zero.
 An untimed refusal omits that delay. A refused selection writes no batch and sends
 no report.
-OpenAI Decisions also requires its independent serving gate; enabling routing
-does not enable that adapter.
-
-Switching routing off restores the base validation order before any batch lookup.
-A request without a model therefore refuses even when that id names a routed batch.
-An originally pinned, final routed batch can replay with its model and decision id at
-that same legacy claim boundary. An unfinished routed batch refuses without provider
-dispatch; turning routing back on continues its frozen decision. Adding a model to
-an originally unpinned batch still changes its immutable body identity. Reports and
-release obligations keep draining while admission is switched off.
+OpenAI Decisions still requires its independent adapter serving gate.
 
 ## Selection and storage
 
-Each new batch selects once with consumer `classifier` and only broca in `runners`.
-The routing intelligence-demand hint `iq` is `0`: classification has explicit
-question and context requirements rather than a conversational reasoning tier.
-A caller-supplied model becomes `pin`, without `pin_fallback`. Routing
+Each new batch selects with only broca in `runners` and consumer
+`broca.classifier.<caller module id>` (or `broca.classifier.direct` for a direct
+opener). Without a model pin, broca sends `iq: 1`, the minimum decision grade,
+so routing can pick the cheapest eligible graded model rather than an ungraded
+one. A caller-supplied model becomes `pin`, without `pin_fallback` or a grade
+requirement. Routing
 requirements use the spend guard's existing estimates: question count, the largest
 single-request context, estimated batch input, the caller's cost cap, and image
 modality when needed. Only advertised requirement fields are sent.
@@ -154,8 +133,8 @@ Each report body is durable before sending. Recovery retries the same body and i
 after a lost acknowledgement; it never invents a replacement body. Delivery is ordered
 and stops at the first unknown outcome, including an invalid acknowledgement. Definitive
 routing refusals such as `unknown_decision` and `report_conflict` close the entry; a
-conflict is logged as a bug. Cleanup runs at boot and every 30 seconds on every root,
-independently of the admission switch. One broken batch does not stop other batches.
+conflict is logged as a bug. Cleanup runs at boot and every 30 seconds. One
+broken batch does not stop other batches.
 
 On legacy roots, seven-day expiry atomically removes item content, answers, request
 identity and diagnostics. Only owed routing bodies, their stable cleanup ids, and
@@ -170,10 +149,8 @@ System One service. Live snapshots and claims on supported roots refuse expired
 routed rows, so cleanup timing never exposes content past retention.
 
 `llm.classify/v1` results include the model used, as required by llm-tools 0.3.2.
-That tool still requires a pin to identify the provider before checking consent
-to send content or spend money. Routing an unpinned tool call would need to bind
-that consent to the selected provider; the classifier routing switch does not
-enable such tool admission.
+Unlike `classify.run`, `llm_classify` requires a model pin: the tool must know
+the provider before checking consent to send content or spend money.
 
 ## `llm.complete/v1`
 

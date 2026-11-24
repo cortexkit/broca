@@ -348,9 +348,6 @@ fn attach_auth(headers: &mut Vec<(String, String)>, auth: &AuthHandle) {
             // AuthHandle also supports compatible hosts with nonstandard key headers.
             headers.push((header.clone(), value.clone()));
         }
-        AuthHandle::SigV4 { signed_headers, .. } => {
-            headers.extend(signed_headers.iter().cloned());
-        }
         AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
         AuthHandle::None => {}
     }
@@ -368,7 +365,7 @@ impl WireFamily for AnthropicMessages {
     }
 
     fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
-        with_request_body(frozen, opts, None, None, |body| body.canonical_len())
+        with_request_body(frozen, None, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -377,7 +374,7 @@ impl WireFamily for AnthropicMessages {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        with_request_body(frozen, opts, None, provenance, |body| body.to_value())
+        with_request_body(frozen, None, opts, None, provenance, |body| body.to_value())
     }
 
     fn shape_with_media(
@@ -402,6 +399,7 @@ impl WireFamily for AnthropicMessages {
         };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -431,6 +429,7 @@ impl WireFamily for AnthropicMessages {
         };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -450,7 +449,19 @@ impl WireFamily for AnthropicMessages {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        with_request_body(frozen, opts, None, provenance, |body| {
+        with_request_body(frozen, None, opts, None, provenance, |body| {
+            render_body(frozen, opts, body)
+        })
+    }
+
+    fn render_with_shared_name_map(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+        name_map: &crate::tool_name_alias::ToolNameMap,
+    ) -> Vec<u8> {
+        with_request_body(frozen, Some(name_map), opts, None, provenance, |body| {
             render_body(frozen, opts, body)
         })
     }
@@ -579,6 +590,20 @@ fn asks_for_input_transformations(frozen: &FrozenRenderConfig) -> bool {
     })
 }
 
+impl AnthropicStreamNormalizer {
+    fn push_payload(
+        &mut self,
+        payload: crate::sse::SsePayload,
+    ) -> Result<Vec<NormalizedEvent>, crate::wire::NormalizeError> {
+        let (raw, parsed) = payload.into_parts();
+        let value =
+            parsed.map_err(|error| crate::normalize::NormalizeError::Json(error).into_wire())?;
+        self.inner
+            .push_parsed_json(&raw, &value)
+            .map_err(crate::normalize::NormalizeError::into_wire)
+    }
+}
+
 impl StreamNormalizer for AnthropicStreamNormalizer {
     fn observe_error_response(&mut self, response: &Value) {
         self.inner.observe_error_response(response);
@@ -591,12 +616,8 @@ impl StreamNormalizer for AnthropicStreamNormalizer {
     }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
-        for payload in self.sse.push(chunk)? {
-            let events = self
-                .inner
-                .push_json(&payload)
-                .map_err(crate::normalize::NormalizeError::into_wire)?;
-            out.extend(events);
+        for payload in self.sse.push_parsed(chunk)? {
+            out.extend(self.push_payload(payload)?);
         }
         Ok(out)
     }
@@ -631,12 +652,8 @@ impl StreamNormalizer for AnthropicStreamNormalizer {
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
-        for payload in self.sse.flush()? {
-            let events = self
-                .inner
-                .push_json(&payload)
-                .map_err(crate::normalize::NormalizeError::into_wire)?;
-            out.extend(events);
+        for payload in self.sse.flush_parsed()? {
+            out.extend(self.push_payload(payload)?);
         }
         Ok(out)
     }
@@ -648,7 +665,7 @@ impl StreamNormalizer for AnthropicStreamNormalizer {
 /// a JSON value. A pure function of its inputs. The render paths don't build it: they write
 /// bytes from [`with_request_body`] directly.
 fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value {
-    with_request_body(frozen, opts, None, None, |body| body.to_value())
+    with_request_body(frozen, None, opts, None, None, |body| body.to_value())
 }
 
 /// Hands `use_body` the request body, written as a [`Node`] that borrows the prompt's content:
@@ -657,6 +674,7 @@ fn build_request_body(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Value 
 /// step's preparations derive from `opts` live here too.
 fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
+    shared_name_map: Option<&crate::tool_name_alias::ToolNameMap>,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
@@ -673,7 +691,16 @@ fn with_request_body<R>(
     // message rendered empty (a reply holding only reasoning that can't be echoed) is left out,
     // so placing against the whole prompt first could turn into a user note a template whose
     // real neighbours Anthropic accepts, and a user note is never placed again.
-    render_placed(frozen, view.as_ref(), media, provenance, use_body)
+    let opts = view.as_ref();
+    let owned_name_map;
+    let name_map = match shared_name_map {
+        Some(name_map) => name_map,
+        None => {
+            owned_name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+            &owned_name_map
+        }
+    };
+    render_placed(frozen, opts, name_map, media, provenance, use_body)
 }
 
 /// The rest of [`with_request_body`]. Templates are placed against the messages that render:
@@ -682,6 +709,7 @@ fn with_request_body<R>(
 fn render_placed<R>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
+    name_map: &crate::tool_name_alias::ToolNameMap,
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     use_body: impl FnOnce(&Node<'_>) -> R,
@@ -722,7 +750,6 @@ fn render_placed<R>(
     // the arc still pairs. This is render-edge ONLY: the map is built from a read-only scan
     // and the canonical id stays the sole persisted form.
     let id_map = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
-    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
     // The index of the first message whose thinking may be echoed, computed in ONE place
     // (`first_echoed_message`) so the request body and the tests' reference renderer read the
     // same positional cutoff and cannot drift.
@@ -751,7 +778,7 @@ fn render_placed<R>(
                     positional && echo_safe,
                     frozen.server_side_fallback,
                     &id_map,
-                    &name_map,
+                    name_map,
                     media,
                 ),
                 m.cache_prefix_blocks,
@@ -773,7 +800,7 @@ fn render_placed<R>(
     {
         // Each pass turns at least one more template into a user note, so this ends.
         drop(rendered_messages);
-        return render_placed(frozen, &replaced, media, provenance, use_body);
+        return render_placed(frozen, &replaced, name_map, media, provenance, use_body);
     }
     // Each later run's effort change, when the run keeps the cache across it, goes in as an
     // empty system message that sets the effort (see `effort_change`): after the run's first
@@ -908,10 +935,10 @@ fn render_placed<R>(
         rest["tools"] = Value::Array(
             opts.tools
                 .iter()
-                .map(|tool| convert_tool(tool, &name_map))
+                .map(|tool| convert_tool(tool, name_map))
                 .collect(),
         );
-        rest["tool_choice"] = convert_tool_choice(&opts.tool_choice, &name_map);
+        rest["tool_choice"] = convert_tool_choice(&opts.tool_choice, name_map);
     }
     apply_generation_controls(
         rest.as_object_mut()

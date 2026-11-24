@@ -2,7 +2,7 @@
 //!
 //! Bedrock ConverseStream is a JSON request grammar over a binary AWS event-stream
 //! response (`application/vnd.amazon.eventstream`). The request renderer remains a
-//! pure canonical-JSON function; SigV4 material is attached later by `endpoint` via
+//! pure canonical-JSON function; credentials are attached later by `endpoint` via
 //! `AuthHandle`, outside the cache/resume hash domain.
 
 use std::collections::BTreeMap;
@@ -45,7 +45,7 @@ impl WireFamily for BedrockConverse {
     }
 
     fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
-        with_request_body(frozen, opts, None, None, |body| body.canonical_len())
+        with_request_body(frozen, None, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -54,7 +54,7 @@ impl WireFamily for BedrockConverse {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        with_request_body(frozen, opts, None, provenance, |body| body.to_value())
+        with_request_body(frozen, None, opts, None, provenance, |body| body.to_value())
     }
 
     fn render_with_provenance(
@@ -63,7 +63,19 @@ impl WireFamily for BedrockConverse {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        with_request_body(frozen, opts, None, provenance, |body| {
+        with_request_body(frozen, None, opts, None, provenance, |body| {
+            body.canonical_bytes()
+        })
+    }
+
+    fn render_with_shared_name_map(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+        name_map: &crate::tool_name_alias::ToolNameMap,
+    ) -> Vec<u8> {
+        with_request_body(frozen, Some(name_map), opts, None, provenance, |body| {
             body.canonical_bytes()
         })
     }
@@ -90,6 +102,7 @@ impl WireFamily for BedrockConverse {
         };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -110,6 +123,7 @@ impl WireFamily for BedrockConverse {
         };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -125,12 +139,10 @@ impl WireFamily for BedrockConverse {
     ) -> HttpRequest {
         // Use the region from the frozen endpoint data (`frozen`) for the request host.
         // This keeps a resumed request pointed at the same Bedrock region it was
-        // originally created with, even if the SigV4 signing data in `auth` was built
-        // for a different region. The SigV4 region is used only for request signing.
-        // An absent OR empty region falls back to the default. The catalog path supplies
-        // `Some("")` for a Bedrock provider resolved with no explicit region (the auth kind
-        // carries an empty region string), so filtering empty here keeps the host
-        // well-formed instead of `bedrock-runtime..amazonaws.com`.
+        // originally created with. An absent OR empty region falls back to the default.
+        // The catalog path supplies `Some("")` for a Bedrock provider resolved with no explicit
+        // region (the auth kind carries an empty region string), so filtering empty here keeps
+        // the host well-formed instead of `bedrock-runtime..amazonaws.com`.
         let region = frozen
             .aws_region
             .as_deref()
@@ -143,8 +155,7 @@ impl WireFamily for BedrockConverse {
         // A base_url override (a mock server in tests, or a VPC/proxy endpoint)
         // replaces the default origin and may include a path prefix; otherwise the host is
         // derived from the AWS region. base_url lives in the endpoint, not the rendered body,
-        // so it never changes a golden. The `host` header carries only the target authority
-        // because SigV4 signs over it.
+        // so it never changes a golden. The `host` header carries only the target authority.
         let (url, host) = match frozen.base_url.as_deref() {
             Some(base) => {
                 let trimmed = base.trim_end_matches('/');
@@ -162,17 +173,11 @@ impl WireFamily for BedrockConverse {
             ("accept".to_string(), EVENT_STREAM_CONTENT_TYPE.to_string()),
         ];
         // Auth is attached HERE, after render — never on the rendered/hashed bytes.
-        // Bedrock accepts two credential forms: a long-term BEARER api key
-        // (`Authorization: Bearer <key>`, the newer AWS Bedrock API key) OR classic
-        // SigV4 request signing (the transport/auth layer computes the signed headers
-        // over method+URL+headers+body). The bearer form needs no signing, so the host
-        // header it rides with is the literal target host above.
+        // Bedrock's long-term bearer api key rides in `Authorization`; the host header is
+        // the literal target host above.
         match auth {
             AuthHandle::Bearer(token) => {
                 headers.push(("authorization".to_string(), format!("Bearer {token}")));
-            }
-            AuthHandle::SigV4 { signed_headers, .. } => {
-                headers.extend(signed_headers.iter().cloned());
             }
             AuthHandle::ApiKeyHeader { header, value } => {
                 headers.push((header.clone(), value.clone()));
@@ -211,6 +216,7 @@ impl WireFamily for BedrockConverse {
 /// borrows, are local to this call too.
 fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
+    shared_name_map: Option<&crate::tool_name_alias::ToolNameMap>,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
@@ -227,7 +233,14 @@ fn with_request_body<R>(
     let marker_policy = bedrock_marker_policy(frozen);
     let mut body = Map::new();
 
-    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+    let owned_name_map;
+    let name_map = match shared_name_map {
+        Some(name_map) => name_map,
+        None => {
+            owned_name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+            &owned_name_map
+        }
+    };
     let id_map = crate::tool_id_alias::ToolIdMap::build(
         &opts.prompt,
         &crate::tool_id_alias::IdGrammar::bedrock(),
@@ -242,7 +255,7 @@ fn with_request_body<R>(
     });
     let system = convert_system(frozen, &opts.prompt, marker_policy.is_some());
     let messages =
-        convert_messages_with_provenance(frozen, opts, &name_map, &id_map, media, provenance);
+        convert_messages_with_provenance(frozen, opts, name_map, &id_map, media, provenance);
 
     body.insert(
         "inferenceConfig".to_string(),
@@ -250,7 +263,7 @@ fn with_request_body<R>(
     );
 
     if let Some(tool_config) =
-        convert_tool_config(&opts.tools, &opts.tool_choice, &name_map, has_tool_history)
+        convert_tool_config(&opts.tools, &opts.tool_choice, name_map, has_tool_history)
     {
         body.insert("toolConfig".to_string(), tool_config);
     }
@@ -964,12 +977,13 @@ impl BedrockEventStreamDecoder {
                     "event-stream headers exceed message length".into(),
                 ));
             }
+            validate_event_stream_prelude_crc(prelude)?;
             if self.buf.len() < total_len {
                 break;
             }
 
             let message = self.buf.split_to(total_len).freeze();
-            validate_event_stream_crc(&message)?;
+            validate_event_stream_message_crc(&message)?;
             let headers_start = 12;
             let headers_end = headers_start + headers_len;
             let payload_end = total_len - 4;
@@ -1040,15 +1054,18 @@ impl HeaderValue {
     }
 }
 
-fn validate_event_stream_crc(message: &[u8]) -> Result<(), NormalizeError> {
-    let expected_prelude_crc = read_u32(&message[8..12]);
-    let actual_prelude_crc = crc32(&message[0..8]);
+fn validate_event_stream_prelude_crc(prelude: &[u8]) -> Result<(), NormalizeError> {
+    let expected_prelude_crc = read_u32(&prelude[8..12]);
+    let actual_prelude_crc = crc32(&prelude[0..8]);
     if expected_prelude_crc != actual_prelude_crc {
         return Err(NormalizeError::Invalid(
             "event-stream prelude CRC mismatch".into(),
         ));
     }
+    Ok(())
+}
 
+fn validate_event_stream_message_crc(message: &[u8]) -> Result<(), NormalizeError> {
     let expected_message_crc = read_u32(&message[message.len() - 4..]);
     let actual_message_crc = crc32(&message[..message.len() - 4]);
     if expected_message_crc != actual_message_crc {
@@ -1155,17 +1172,33 @@ fn read_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(out)
 }
 
+const CRC32_TABLE: [u32; 256] = make_crc32_table();
+
+const fn make_crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+}
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            if crc & 1 == 1 {
-                crc = (crc >> 1) ^ 0xedb8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
+        let index = ((crc ^ u32::from(*byte)) & 0xff) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[index];
     }
     !crc
 }
@@ -1895,18 +1928,14 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_uses_frozen_region_for_bedrock_host_when_sigv4_region_differs() {
+    fn endpoint_uses_frozen_region_for_bedrock_host() {
         let frozen = bedrock_frozen_config_with_region(
             "anthropic.claude-3-5-sonnet-20240620-v1:0",
             "us-west-2",
         );
         let request = BedrockConverse.endpoint(
             &frozen,
-            &AuthHandle::SigV4 {
-                region: "us-east-1".into(),
-                service: BEDROCK_RUNTIME_SERVICE.into(),
-                signed_headers: vec![("x-amz-date".into(), "20260102T030405Z".into())],
-            },
+            &AuthHandle::Bearer("bedrock-api-key".into()),
             b"{}".to_vec(),
         );
 
@@ -1921,7 +1950,7 @@ mod tests {
         assert!(request
             .headers
             .iter()
-            .any(|(name, value)| name == "x-amz-date" && value == "20260102T030405Z"));
+            .any(|(name, value)| name == "authorization" && value == "Bearer bedrock-api-key"));
     }
 
     /// The blocks a tool output renders, as JSON values.
@@ -2035,6 +2064,11 @@ mod tests {
     }
 
     #[test]
+    fn crc32_matches_standard_check_vector() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
     fn event_stream_decoder_rejects_corrupt_crcs() {
         let message = test_event_stream_message("contentBlockDelta", br#"{"delta":{"text":"x"}}"#);
 
@@ -2057,6 +2091,22 @@ mod tests {
         assert!(matches!(
             error,
             NormalizeError::Invalid(message) if message == "event-stream message CRC mismatch"
+        ));
+    }
+
+    #[test]
+    fn event_stream_decoder_checks_prelude_before_waiting_for_claimed_body() {
+        let mut message =
+            test_event_stream_message("contentBlockDelta", br#"{"delta":{"text":"x"}}"#);
+        let claimed_len = message.len() + 64;
+        message[0..4].copy_from_slice(&(claimed_len as u32).to_be_bytes());
+
+        let error = BedrockEventStreamDecoder::new()
+            .push(&message[..12])
+            .expect_err("a corrupt length prelude must fail without its claimed body");
+        assert!(matches!(
+            error,
+            NormalizeError::Invalid(message) if message == "event-stream prelude CRC mismatch"
         ));
     }
 

@@ -254,6 +254,46 @@ async fn every_family_keeps_direct_render_bytes_when_offloaded() {
 }
 
 #[tokio::test]
+async fn render_job_builds_tool_name_map_once() {
+    let opts = comprehensive_render_options();
+    macro_rules! check_family {
+        ($family:expr, $id:expr) => {{
+            let job = super::RenderJob {
+                credential_hosts: Default::default(),
+                quota_observer: None,
+                cache_session: None,
+                cache_provider: None,
+                subscription_auth: false,
+                media_renderer: None,
+                media_render_tags: false,
+                auth_revision: 0,
+                family: Arc::new($family),
+                frozen: Arc::new(frozen_for_render_job($id)),
+                auth: Arc::new(AuthHandle::None),
+                opts: Arc::new(opts.clone()),
+                step_id: StepId(7),
+            };
+            let builds = tokio::task::spawn_blocking(move || {
+                crate::tool_name_alias::reset_map_builds();
+                job.render().expect("render job succeeds");
+                crate::tool_name_alias::map_builds()
+            })
+            .await
+            .expect("render job joins");
+            assert_eq!(builds, 1, "{:?} rebuilt its tool-name map", $id);
+        }};
+    }
+
+    check_family!(AnthropicMessages, WireFamilyId::AnthropicMessages);
+    check_family!(OpenAiChat, WireFamilyId::OpenAiChat);
+    check_family!(OpenAiResponses, WireFamilyId::OpenAiResponses);
+    check_family!(Gemini, WireFamilyId::Gemini);
+    check_family!(BedrockConverse, WireFamilyId::BedrockConverse);
+    check_family!(GoogleCodeAssist, WireFamilyId::GoogleCodeAssist);
+    check_family!(OpenAiResponsesChatgpt, WireFamilyId::OpenAiResponsesChatgpt);
+}
+
+#[tokio::test]
 async fn render_panic_is_reported_as_a_provider_error() {
     let provider = LiveProvider::new(
         GoogleCodeAssist,
@@ -5377,7 +5417,7 @@ async fn other_families_keep_the_capped_retry_after_and_retry_a_plain_429() {
 }
 
 #[tokio::test]
-async fn elapsed_deadline_cancels_step_before_first_send() {
+async fn elapsed_deadline_stops_step_before_first_send_without_cancelling_the_callers_token() {
     let server = ScriptedServer::start(vec![ScriptResponse::Http {
         status: 200,
         headers: Vec::new(),
@@ -5394,9 +5434,194 @@ async fn elapsed_deadline_cancels_step_before_first_send() {
     )
     .await;
     assert!(events.is_empty());
-    assert!(cancel.is_cancelled());
+    assert!(
+        !cancel.is_cancelled(),
+        "a deadline is not the caller's cancel; only the token's owner may cancel it"
+    );
     assert_eq!(server.request_bodies().len(), 0);
     assert_eq!(provider.escape_client_builds.load(Ordering::SeqCst), 0);
+}
+
+/// A retry-test provider aimed at `url`, which may have no server behind it.
+fn retry_test_provider_at(url: String) -> LiveProvider<RetryTestFamily> {
+    let mut frozen = openai_chat_frozen_config("retry-test");
+    frozen.base_url = Some(url);
+    let provider = LiveProvider::new(RetryTestFamily::new(0), frozen, AuthHandle::None);
+    broca_core::Provider::set_chatgpt_https_policy(&provider, Arc::new(|| true));
+    provider
+}
+
+fn attempt_records(events: &[NormalizedEvent]) -> Vec<&ModelAttempt> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt }) => Some(attempt),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An attempt whose connection never opened put no bytes on any server, so it refreshed no
+/// provider cache: the seal neither learns of it as a send nor restarts the session's cache
+/// clock. A request that does reach a server is noted, dated by its own send stamp.
+#[tokio::test]
+async fn a_connect_failure_does_not_restart_the_seal_cache_clock() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut provider = retry_test_provider_at(format!("http://{address}"));
+    let _waits = use_virtual_retry_waits(&mut provider);
+    let clock = broca_core::cache_warm::CacheClock::default();
+    let seal = broca_core::ShutdownSeal::with_cache_clock(clock.clone());
+    let mut rx = broca_core::Provider::step_with_shutdown_seal(
+        &provider,
+        StepId(1),
+        Arc::new(CallOptions::new(Vec::new())),
+        CancellationToken::new(),
+        None,
+        seal.clone(),
+    )
+    .await;
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let attempts = attempt_records(&events);
+    assert!(!attempts.is_empty());
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.outcome == AttemptOutcome::ConnectFailed),
+        "{attempts:?}"
+    );
+    assert!(seal.last_sent().is_none(), "no request reached a server");
+    assert_eq!(clock.read(), None, "the cache clock never started");
+
+    let server = ScriptedServer::start(vec![ScriptResponse::Http {
+        status: 200,
+        headers: Vec::new(),
+        body: b"successful-generation",
+    }])
+    .await;
+    let provider = retry_test_provider(&server, 0);
+    let mut rx = broca_core::Provider::step_with_shutdown_seal(
+        &provider,
+        StepId(2),
+        Arc::new(CallOptions::new(Vec::new())),
+        CancellationToken::new(),
+        None,
+        seal.clone(),
+    )
+    .await;
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let attempts = attempt_records(&events);
+    assert_eq!(attempts.len(), 1);
+    let sent = seal
+        .last_sent()
+        .expect("a request that reached a server is noted");
+    assert_eq!(sent.step_id, StepId(2));
+    assert_eq!((*sent.body).as_ref(), server.request_bodies()[0].as_slice());
+    assert_eq!(attempts[0].sent_at_ms, Some(sent.sent_at_ms));
+    assert_eq!(
+        clock.read().map(|reading| reading.last_sent_at_ms),
+        Some(sent.sent_at_ms)
+    );
+}
+
+/// Every attempt of a step sends the same body, so the body's cache-evidence fingerprint is
+/// computed once for the step, not once per attempt.
+#[tokio::test]
+async fn a_retried_step_fingerprints_its_request_once() {
+    let server = ScriptedServer::start(vec![
+        ScriptResponse::Http {
+            status: 503,
+            headers: Vec::new(),
+            body: br#"{"error":{"message":"retry me"}}"#,
+        },
+        ScriptResponse::Http {
+            status: 200,
+            headers: Vec::new(),
+            body: b"successful-generation",
+        },
+    ])
+    .await;
+    let mut provider = retry_test_provider(&server, 0);
+    let _waits = use_virtual_retry_waits(&mut provider);
+    broca_core::Provider::bind_run_transport(
+        &provider,
+        &broca_protocol::BindIdentity::new("/project", "harness", "fingerprint-once"),
+    );
+    let session = provider.cache_session.lock().unwrap().clone().unwrap();
+    let gate = Arc::new(super::cache_runtime::Gate::default());
+    gate.release();
+    *session.1.lock().unwrap() = Some(Arc::clone(&gate));
+    let events = collect_step_events(&provider, CancellationToken::new(), None).await;
+    assert!(terminal_error_if_any(&events).is_none(), "{events:?}");
+    assert_eq!(attempt_records(&events).len(), 2);
+    assert_eq!(server.request_bodies().len(), 2);
+    assert_eq!(
+        gate.entries.load(Ordering::SeqCst),
+        1,
+        "two attempts of one body share one fingerprint"
+    );
+}
+
+/// A caller's cancel ends the step without waiting for the in-flight attempt's request to
+/// be fingerprinted. The cancelled attempt records no cache evidence, since none was
+/// measured.
+#[tokio::test]
+async fn a_cancel_does_not_wait_for_the_cache_evidence_fingerprint() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let received = Arc::new(tokio::sync::Notify::new());
+    // A server that reads the request and never answers it.
+    let server = {
+        let received = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            received.notify_one();
+            std::future::pending::<()>().await;
+            drop(socket);
+        })
+    };
+    let provider = retry_test_provider_at(format!("http://{address}"));
+    broca_core::Provider::bind_run_transport(
+        &provider,
+        &broca_protocol::BindIdentity::new("/project", "harness", "cancel-fingerprint"),
+    );
+    let session = provider.cache_session.lock().unwrap().clone().unwrap();
+    let gate = Arc::new(super::cache_runtime::Gate::default());
+    *session.1.lock().unwrap() = Some(Arc::clone(&gate));
+    let cancel = CancellationToken::new();
+    let mut rx = provider.start_step(
+        StepId(1),
+        Arc::new(CallOptions::new(Vec::new())),
+        cancel.clone(),
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(5), received.notified())
+        .await
+        .expect("the request reaches the server");
+    cancel.cancel();
+    let events = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    })
+    .await;
+    gate.release();
+    server.abort();
+    let events = events.expect("the cancel must not wait for the fingerprint");
+    let attempts = attempt_records(&events);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].outcome, AttemptOutcome::Cancelled);
+    assert!(attempts[0].cache_evidence.is_none());
 }
 
 #[tokio::test]
@@ -6172,8 +6397,9 @@ async fn response_size_limits_return_transient_provider_errors() {
         10,
     )
     .await
-    .expect_err("aggregate stream above the per-step limit must be rejected");
+    .expect_err("aggregate stream above the per-attempt limit must be rejected");
     assert_eq!(error.error.class, ErrorClass::Transient);
+    assert!(error.error.message.contains("per-attempt limit"));
 }
 
 #[test]

@@ -109,78 +109,58 @@ impl ToolIdMap {
     /// can never displace a valid canonical id that appears later in the prompt.
     pub fn build(prompt: &[Message], grammar: &IdGrammar) -> Self {
         let mut map: BTreeMap<String, String> = BTreeMap::new();
-        let mut canonicals = Vec::new();
-        let mut seen = BTreeSet::new();
-        // wire id -> the canonical it came from, used both for allocation and the final
-        // injectivity check.
-        let mut used: BTreeMap<String, String> = BTreeMap::new();
+        let mut invalid = Vec::new();
+        let mut seen_invalid = BTreeSet::new();
+        // Valid canonical ids reserve their wire bytes by reference. Only an id that needs an
+        // alias gets an owned map entry; identity lookups fall through to the canonical string.
+        let mut valid: BTreeSet<&str> = BTreeSet::new();
+        let mut aliases = BTreeSet::new();
 
-        // Pass one reserves every already-valid id regardless of where it appears. Keep the
-        // unique canonical sequence for deterministic prompt-order allocation in pass two.
+        // Pass one reserves every already-valid id regardless of where it appears. Keep only the
+        // unique invalid sequence for deterministic prompt-order allocation in pass two.
         for m in prompt {
             for b in &m.content {
                 let canonical = match b {
-                    ContentBlock::ToolCall(tc) => &tc.tool_call_id.0,
-                    ContentBlock::ToolResult(tr) => &tr.tool_call_id.0,
+                    ContentBlock::ToolCall(tc) => tc.tool_call_id.0.as_str(),
+                    ContentBlock::ToolResult(tr) => tr.tool_call_id.0.as_str(),
                     _ => continue,
                 };
-                if !seen.insert(canonical.clone()) {
-                    continue;
-                }
-                canonicals.push(canonical.clone());
                 if grammar.is_valid(canonical) {
-                    let previous = used.insert(canonical.clone(), canonical.clone());
-                    assert!(
-                        previous.is_none(),
-                        "distinct valid canonical ids unexpectedly shared wire bytes"
-                    );
-                    map.insert(canonical.clone(), canonical.clone());
+                    valid.insert(canonical);
+                } else if seen_invalid.insert(canonical) {
+                    invalid.push(canonical);
                 }
             }
         }
 
         // Pass two gives invalid ids their legacy alias when free. A collision probes a
         // platform-stable salted seed, preserving determinism without changing the common path.
-        for canonical in canonicals
-            .into_iter()
-            .filter(|canonical| !grammar.is_valid(canonical))
-        {
+        for canonical in invalid {
             let mut attempt = 0u64;
             let wire = loop {
                 let candidate = if attempt == 0 {
-                    grammar.alias(&canonical)
+                    grammar.alias(canonical)
                 } else {
-                    grammar.alias_for_attempt(&canonical, attempt)
+                    grammar.alias_for_attempt(canonical, attempt)
                 };
-                if !used.contains_key(&candidate) {
+                if !valid.contains(candidate.as_str()) && !aliases.contains(candidate.as_str()) {
                     break candidate;
                 }
                 attempt = attempt
                     .checked_add(1)
                     .expect("tool-call-id alias probe space exhausted");
             };
-            let previous = used.insert(wire.clone(), canonical.clone());
             assert!(
-                previous.is_none(),
+                aliases.insert(wire.clone()),
                 "tool-call-id alias allocator selected an occupied wire id"
             );
-            map.insert(canonical, wire);
-        }
-
-        // Impossible-case backstop: every canonical must have exactly one distinct wire id,
-        // and the reverse allocation table must describe the same bijection.
-        assert_eq!(
-            map.len(),
-            used.len(),
-            "tool-call-id alias map lost injectivity"
-        );
-        for (canonical, wire) in &map {
-            assert_eq!(
-                used.get(wire),
-                Some(canonical),
-                "tool-call-id alias reverse map is inconsistent"
+            let previous = map.insert(canonical.to_owned(), wire);
+            assert!(
+                previous.is_none(),
+                "tool-call-id alias map contains a duplicate canonical id"
             );
         }
+
         Self { map }
     }
 
@@ -284,6 +264,34 @@ mod tests {
         assert!(g.is_valid(wire));
         // Both the call and the result resolve to the SAME wire id → the arc still pairs.
         assert_eq!(map.wire_id(&foreign), wire);
+    }
+
+    #[test]
+    fn valid_ids_do_not_build_identity_entries() {
+        let id = "call_valid_123".to_owned();
+        let prompt = vec![Message::assistant_from(
+            vec![ContentBlock::ToolCall(ToolCall {
+                thought_signature: None,
+                provider_state: None,
+                tool_call_id: ToolCallId(id.clone()),
+                tool_name: "lookup".into(),
+                input: json!({}).into(),
+            })],
+            broca_protocol::request::ModelHandle::new("openai", "gpt"),
+        )];
+
+        let map = ToolIdMap::build(&prompt, &anthropic());
+
+        assert!(
+            map.map.is_empty(),
+            "an already-valid id needs no owned identity entry"
+        );
+        let wire = map.wire_id(&id);
+        assert_eq!(wire, id);
+        assert!(
+            std::ptr::eq(wire.as_ptr(), id.as_ptr()),
+            "an already-valid id should be returned from the canonical string"
+        );
     }
 
     #[test]

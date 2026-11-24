@@ -66,7 +66,7 @@ impl WireFamily for OpenAiResponses {
     }
 
     fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
-        with_platform_body(frozen, opts, None, None, |body| body.canonical_len())
+        with_platform_body(frozen, None, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -75,7 +75,7 @@ impl WireFamily for OpenAiResponses {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        with_platform_body(frozen, opts, None, provenance, |body| body.to_value())
+        with_platform_body(frozen, None, opts, None, provenance, |body| body.to_value())
     }
 
     fn render_with_provenance(
@@ -84,7 +84,19 @@ impl WireFamily for OpenAiResponses {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        with_platform_body(frozen, opts, None, provenance, |body| {
+        with_platform_body(frozen, None, opts, None, provenance, |body| {
+            body.canonical_bytes()
+        })
+    }
+
+    fn render_with_shared_name_map(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+        name_map: &crate::tool_name_alias::ToolNameMap,
+    ) -> Vec<u8> {
+        with_platform_body(frozen, Some(name_map), opts, None, provenance, |body| {
             body.canonical_bytes()
         })
     }
@@ -108,6 +120,7 @@ impl WireFamily for OpenAiResponses {
         let media = crate::media_render::MediaRender { frozen, payloads };
         with_platform_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -125,6 +138,7 @@ impl WireFamily for OpenAiResponses {
         let media = crate::media_render::MediaRender { frozen, payloads };
         with_platform_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -151,9 +165,6 @@ impl WireFamily for OpenAiResponses {
             }
             AuthHandle::ApiKeyHeader { header, value } => {
                 headers.push((header.clone(), value.clone()));
-            }
-            AuthHandle::SigV4 { signed_headers, .. } => {
-                headers.extend(signed_headers.iter().cloned());
             }
             AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
             AuthHandle::None => {}
@@ -209,23 +220,31 @@ impl<'a> ResponsesBody<'a> {
 /// hints.
 fn with_platform_body<R>(
     frozen: &FrozenRenderConfig,
+    shared_name_map: Option<&crate::tool_name_alias::ToolNameMap>,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     use_body: impl FnOnce(&Node<'_>) -> R,
 ) -> R {
-    with_prepared_request_body(frozen, opts, media, provenance, |prepared, _| {
-        let mut body = prepared.body;
-        finish_platform_body(frozen, &mut body.rest);
-        // A session whose effort changed sends the first run's effort here; the later runs'
-        // efforts went into the input as configuration updates.
-        if let Some(anchor) = prepared.effort_anchor {
-            if body.rest["reasoning"].is_object() {
-                body.rest["reasoning"]["effort"] = Value::String(anchor);
+    with_prepared_request_body(
+        frozen,
+        shared_name_map,
+        opts,
+        media,
+        provenance,
+        |prepared, _| {
+            let mut body = prepared.body;
+            finish_platform_body(frozen, &mut body.rest);
+            // A session whose effort changed sends the first run's effort here; the later runs'
+            // efforts went into the input as configuration updates.
+            if let Some(anchor) = prepared.effort_anchor {
+                if body.rest["reasoning"].is_object() {
+                    body.rest["reasoning"]["effort"] = Value::String(anchor);
+                }
             }
-        }
-        use_body(&body.into_node())
-    })
+            use_body(&body.into_node())
+        },
+    )
 }
 
 fn finish_platform_body(frozen: &FrozenRenderConfig, body: &mut Value) {
@@ -253,6 +272,7 @@ pub(crate) struct PreparedRequestBody<'a> {
 /// `opts` lives only in this call, so the body is used here rather than returned.
 pub(crate) fn with_prepared_request_body<R>(
     frozen: &FrozenRenderConfig,
+    shared_name_map: Option<&crate::tool_name_alias::ToolNameMap>,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
@@ -272,9 +292,19 @@ pub(crate) fn with_prepared_request_body<R>(
             None => (None, Vec::new()),
         };
     let view = crate::families::compaction_view(frozen.family_id, prepared.as_ref());
+    let opts = view.as_ref();
+    let owned_name_map;
+    let name_map = match shared_name_map {
+        Some(name_map) => name_map,
+        None => {
+            owned_name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+            &owned_name_map
+        }
+    };
     let body = render_prepared_body(
         frozen,
-        view.as_ref(),
+        opts,
+        name_map,
         &updates,
         media,
         provenance.as_deref_mut(),
@@ -292,11 +322,11 @@ pub(crate) fn with_prepared_request_body<R>(
 fn render_prepared_body<'a>(
     frozen: &FrozenRenderConfig,
     opts: &'a CallOptions,
+    name_map: &crate::tool_name_alias::ToolNameMap,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> ResponsesBody<'a> {
-    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
     let instructions = instructions_from_policy(&opts.prompt, frozen.system_prompt.clone());
     let developer_message = frozen.system_prompt == SystemPromptPolicy::DeveloperMessage;
     let mut provenance = provenance;
@@ -315,7 +345,7 @@ fn render_prepared_body<'a>(
     let mut input = convert_input_items_with_provenance(
         &opts.prompt,
         frozen.system_prompt.clone(),
-        &name_map,
+        name_map,
         EffortUpdates {
             per_run: updates,
             answer: answer_update.as_ref(),
@@ -380,10 +410,10 @@ fn render_prepared_body<'a>(
         body["tools"] = Value::Array(
             opts.tools
                 .iter()
-                .map(|tool| convert_tool(tool, &name_map, frozen.responses_tools_non_strict))
+                .map(|tool| convert_tool(tool, name_map, frozen.responses_tools_non_strict))
                 .collect(),
         );
-        body["tool_choice"] = convert_tool_choice(&opts.tool_choice, &name_map);
+        body["tool_choice"] = convert_tool_choice(&opts.tool_choice, name_map);
     }
     // `/v1/responses` accepts `temperature` + `top_p`, but no stop field, so
     // `stop_sequences` stay absent on this wire shape.
@@ -1231,9 +1261,10 @@ impl OpenAiResponsesNormalizer {
 
     fn handle_event(
         &mut self,
-        payload: &str,
+        event: &crate::sse::SsePayload,
         out: &mut Vec<NormalizedEvent>,
     ) -> Result<(), NormalizeError> {
+        let payload = event.raw();
         if self.completed {
             return Ok(());
         }
@@ -1260,8 +1291,7 @@ impl OpenAiResponsesNormalizer {
             }
         }
 
-        let v: Value =
-            serde_json::from_str(payload).map_err(|e| NormalizeError::Invalid(e.to_string()))?;
+        let v = event.value()?;
         let event_type = v.get("type").and_then(Value::as_str).unwrap_or_default();
         if event_type == "response.created" {
             if let (Some(evidence), Some(response)) = (&self.response_evidence, v.get("response")) {
@@ -1308,13 +1338,13 @@ impl OpenAiResponsesNormalizer {
         match event_type {
             "error" => {
                 out.push(NormalizedEvent::Control(ProviderControl::Error {
-                    error: response_stream_error(&v, false, self.private_error_diagnostics),
+                    error: response_stream_error(v, false, self.private_error_diagnostics),
                     retries_used: 0,
                 }));
             }
             "response.failed" => {
                 out.push(NormalizedEvent::Control(ProviderControl::Error {
-                    error: response_stream_error(&v, true, self.private_error_diagnostics),
+                    error: response_stream_error(v, true, self.private_error_diagnostics),
                     retries_used: 0,
                 }));
             }
@@ -2074,9 +2104,9 @@ impl StreamNormalizer for OpenAiResponsesNormalizer {
     }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
-        for payload in self.sse.push(chunk)? {
+        for payload in self.sse.push_parsed(chunk)? {
             if let Some(observer) = &self.raw_sse_observer {
-                observer(&payload);
+                observer(payload.raw());
             }
             self.handle_event(&payload, &mut out)?;
         }
@@ -2109,9 +2139,9 @@ impl StreamNormalizer for OpenAiResponsesNormalizer {
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
-        for payload in self.sse.flush()? {
+        for payload in self.sse.flush_parsed()? {
             if let Some(observer) = &self.raw_sse_observer {
-                observer(&payload);
+                observer(payload.raw());
             }
             self.handle_event(&payload, &mut out)?;
         }
@@ -2516,6 +2546,26 @@ mod tests {
             }
         }
         panic!("no AssistantMessage found in events: {events:?}");
+    }
+
+    #[test]
+    fn ordinary_delta_uses_one_json_tree() {
+        crate::json_parse::reset_value_parses();
+        let mut normalizer = OpenAiResponsesNormalizer::new(StepId(1));
+
+        normalizer
+            .push(
+                br#"data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}
+
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            crate::json_parse::value_parses(),
+            1,
+            "telemetry, content observation, and normalization must share the decoded delta"
+        );
     }
 
     #[test]

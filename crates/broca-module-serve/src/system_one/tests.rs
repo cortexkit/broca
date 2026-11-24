@@ -18,6 +18,24 @@ const JEV: &str = JEV_1_13_0;
 #[path = "tests/routed.rs"]
 mod routed;
 
+pub(crate) use routed::with_test_routing;
+
+impl SystemOne {
+    /// Exercise the fixed adapter path used by pre-routing batches, without selecting a route.
+    pub(crate) async fn spawn_legacy_call_for_test(
+        self: Arc<Self>,
+        params: String,
+        scope: broca_store::system_one::BatchScope,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
+        self.spawn_batch_task(move |service| async move {
+            classify::run(&service, &params, &scope, None)
+                .await
+                .map_err(|error| refusal_body(&error))
+        })
+        .await
+    }
+}
+
 /// What the stand-in answers for one item, by its state.
 #[derive(Clone)]
 enum Script {
@@ -329,7 +347,7 @@ fn unchanged_empty_usage_outbox_is_not_rescanned() {
 }
 
 #[tokio::test]
-async fn classifier_switch_off_captured_bytes() {
+async fn legacy_pinned_batch_replays_captured_bytes_on_the_classifier() {
     let rig = rig();
     rig.stand_in.script(
         "legacy",
@@ -339,16 +357,16 @@ async fn classifier_switch_off_captured_bytes() {
         ))],
     );
     let describe = serde_json::to_string(&rig.service.describe()).unwrap();
-    let reply = admitted(&rig, params("legacy", JEV, &["legacy"], None)).await;
-    let mut missing: Value =
-        serde_json::from_str(&params("missing", JEV, &["legacy"], None)).unwrap();
-    missing.as_object_mut().unwrap().remove("model");
-    let refusal = rig
+    let request = params("legacy", JEV, &["legacy"], None);
+    let reply = admitted(&rig, request.clone()).await;
+    let replay = rig
         .service
         .clone()
-        .spawn_call(missing.to_string(), test_scope())
+        .spawn_call(request, test_scope())
         .await
-        .unwrap_err();
+        .unwrap();
+    assert_eq!(replay.get(), reply);
+    assert_eq!(rig.stand_in.calls("legacy"), 1);
     let stored = rig.store.lookup(STORE_ROLE, "legacy").unwrap().unwrap();
     let row = serde_json::to_string(&json!({
         "model": stored.model, "identity": stored.identity,
@@ -364,17 +382,6 @@ async fn classifier_switch_off_captured_bytes() {
     assert_eq!(
         reply,
         r#"{"batch_id":"legacy","model":"typesafe/jev-1.13.0","items":[{"index":0,"answers":{"q":{"type":"noul","noul":0.50}},"usage":{"input_tokens":10,"output_tokens":0}}],"usage":{"input_tokens":10,"output_tokens":0},"cost_usd":4.2e-7}"#
-    );
-    let refusal: Value = serde_json::from_slice(&refusal).unwrap();
-    assert_eq!(refusal["code"], "invalid_params");
-    assert_eq!(
-        refusal["detail"],
-        json!({"class":"permanent","field":"model"})
-    );
-    // The missing-model message moved to the contract's wording in 0.6.0.
-    assert_eq!(
-        refusal["message"],
-        "model is required without routed_models"
     );
     assert_eq!(
         row,
@@ -403,7 +410,7 @@ fn params(batch: &str, model: &str, states: &[&str], max_cost_usd: Option<f64>) 
 /// The reply text of an admitted call.
 async fn admitted(rig: &Rig, params: String) -> String {
     match Arc::clone(&rig.service)
-        .spawn_call(params, test_scope())
+        .spawn_legacy_call_for_test(params, test_scope())
         .await
     {
         Ok(reply) => reply.get().to_owned(),
@@ -413,7 +420,7 @@ async fn admitted(rig: &Rig, params: String) -> String {
 
 async fn refused(rig: &Rig, params: String) -> Value {
     match Arc::clone(&rig.service)
-        .spawn_call(params, test_scope())
+        .spawn_legacy_call_for_test(params, test_scope())
         .await
     {
         Ok(reply) => panic!("admitted: {}", reply.get()),
@@ -606,7 +613,7 @@ async fn a_resend_after_an_interrupted_call_asks_only_unanswered_items() {
     let mut reply = None;
     for _ in 0..1000 {
         match Arc::clone(&rig.service)
-            .spawn_call(body.clone(), test_scope())
+            .spawn_legacy_call_for_test(body.clone(), test_scope())
             .await
         {
             Ok(text) => {
@@ -729,7 +736,9 @@ async fn a_concurrent_call_for_a_held_batch_is_refused_at_once() {
         vec![Script::Held(Arc::clone(&gate), noul("0.4", None))],
     );
     let body = params("flight", JEV, &["a"], None);
-    let first = tokio::spawn(Arc::clone(&rig.service).spawn_call(body.clone(), test_scope()));
+    let first = tokio::spawn(
+        Arc::clone(&rig.service).spawn_legacy_call_for_test(body.clone(), test_scope()),
+    );
     while rig.stand_in.held.load(Ordering::SeqCst) == 0 {
         rig.stand_in.entered.notified().await;
     }
@@ -1082,7 +1091,7 @@ async fn a_panic_answers_its_call_and_releases_the_batch() {
     let mut reply = None;
     for _ in 0..1000 {
         if let Ok(text) = Arc::clone(&rig.service)
-            .spawn_call(params("panic", JEV, &["a"], None), test_scope())
+            .spawn_legacy_call_for_test(params("panic", JEV, &["a"], None), test_scope())
             .await
         {
             reply = Some(text);
@@ -1169,7 +1178,7 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
     );
     stand_in.script("a", vec![Script::Answer(noul("0.1", None))]);
     Arc::clone(&service)
-        .spawn_call(params("old", JEV, &["a"], None), test_scope())
+        .spawn_legacy_call_for_test(params("old", JEV, &["a"], None), test_scope())
         .await
         .unwrap();
     now.fetch_add(broca_store::system_one::RETENTION_MS - 1, Ordering::SeqCst);
@@ -1177,7 +1186,7 @@ async fn retention_deletes_a_batch_seven_days_after_its_first_admission() {
     now.fetch_add(1, Ordering::SeqCst);
     assert_eq!(service.sweep().await.unwrap(), 1);
     Arc::clone(&service)
-        .spawn_call(params("old", JEV, &["a"], None), test_scope())
+        .spawn_legacy_call_for_test(params("old", JEV, &["a"], None), test_scope())
         .await
         .unwrap();
     assert_eq!(
@@ -1366,8 +1375,9 @@ async fn a_tool_call_and_a_classifier_batch_with_one_batch_id_both_execute() {
     let classifier_body = params(&d, JEV, &["classifier-item"], None);
     let tool_call =
         tokio::spawn(Arc::clone(&tool).spawn_call(tool_body.clone(), tool_scope.clone()));
-    let classifier_call =
-        tokio::spawn(Arc::clone(&classifier).spawn_call(classifier_body.clone(), test_scope()));
+    let classifier_call = tokio::spawn(
+        Arc::clone(&classifier).spawn_legacy_call_for_test(classifier_body.clone(), test_scope()),
+    );
     // Both provider calls are in flight together: neither call was refused or queued behind
     // the other.
     wait_held(&stand_in, 2).await;
@@ -1453,7 +1463,10 @@ async fn a_tool_call_and_a_classifier_batch_with_one_batch_id_both_execute() {
 }
 
 async fn admitted_by(service: &Arc<SystemOne>, params: String) -> String {
-    match Arc::clone(service).spawn_call(params, test_scope()).await {
+    match Arc::clone(service)
+        .spawn_legacy_call_for_test(params, test_scope())
+        .await
+    {
         Ok(reply) => reply.get().to_owned(),
         Err(body) => panic!("refused: {}", String::from_utf8_lossy(&body)),
     }
@@ -1496,7 +1509,7 @@ async fn a_stuck_tool_call_leaves_classifier_calls_their_own_slots() {
 
     let classified = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        Arc::clone(&classifier).spawn_call(
+        Arc::clone(&classifier).spawn_legacy_call_for_test(
             params("classified", JEV, &["classified"], None),
             test_scope(),
         ),

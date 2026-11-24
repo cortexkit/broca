@@ -4,6 +4,53 @@
 use super::*;
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
+    /// The submission id of the first queued send that starts a run on an idle session: a plain
+    /// send, or an ordered one whose list names `idle_start`. An ordered send whose order can't
+    /// be read back is returned as the error, with why.
+    pub(super) async fn first_to_drain(&self) -> Result<Option<String>, (String, String)> {
+        // By position, without copying the queue: nothing here writes, so it doesn't change.
+        for index in 0..self.session.operations().queue.len() {
+            let pending = &self.session.operations().queue[index];
+            let starts = !pending.ordered
+                || self
+                    .order_starts_runs(&pending.submission_id)
+                    .await
+                    .map_err(|error| (pending.submission_id.clone(), error))?;
+            if starts {
+                return Ok(Some(pending.submission_id.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Ends the queued send `submission_id`, whose record or order can't be read back into a
+    /// run, with a retraction carrying `error`, then drains the next send. Left queued it would
+    /// never run, and every later send would queue behind it, again at every open.
+    pub(super) async fn end_unreadable_drain(
+        &mut self,
+        submission_id: String,
+        error: String,
+        waiting: &mut Option<(broca_protocol::SubmissionId, oneshot::Sender<SendOutcome>)>,
+    ) {
+        let submission = broca_protocol::SubmissionId(submission_id);
+        let run_id = crate::actor::run_id_of_queued(&submission);
+        let refusal = broca_core::RunError::Config(format!(
+            "the queued send could not be read back to start its run: {error}"
+        ));
+        match self.end_refused_drain(&submission, &run_id, refusal).await {
+            Ok(()) => Box::pin(self.drain_once(waiting)).await,
+            // The send stays queued, and the queue waits for the next drain.
+            Err(ended) => tracing::error!(
+                target: "broca.store_actor",
+                session = %self.key.session,
+                submission_id = %submission.0,
+                %error,
+                %ended,
+                "a queued send that could not be read back could not be ended",
+            ),
+        }
+    }
+
     /// Queues `start` behind the latest run, whether running or paused: the queue entry is
     /// durable before the reply, which is `pending`. A retry of a send still queued is compared
     /// with its record. A steer is queued with its mode, which the queued record keeps; a plain

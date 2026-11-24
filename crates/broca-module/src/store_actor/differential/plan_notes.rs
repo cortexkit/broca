@@ -348,6 +348,9 @@ async fn a_note_with_unchanged_system_text_is_accepted_and_ignored() {
             "{accepted:?}"
         );
     }
+    // Read once the actor has closed: loading the session while it is open would fence the
+    // actor's writer, and r2's start could not be written.
+    module.closed().await;
     let refreshes: Vec<_> = records(&module)
         .await
         .into_iter()

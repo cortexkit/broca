@@ -49,10 +49,6 @@ const READERS: &[Reader] = &[
     reader!(["bus_run_events_enabled"], crate::bus_events::Config),
     reader!(["cache"], crate::CacheTtlTable),
     reader!(
-        ["classifier_routing"],
-        crate::config::ClassifierRoutingConfig
-    ),
-    reader!(
         ["context_management"],
         crate::context_management::ContextManagementConfig
     ),

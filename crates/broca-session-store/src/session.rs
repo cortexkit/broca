@@ -1004,6 +1004,12 @@ impl<B: SessionBackend> Session<B> {
         Ok(first)
     }
 
+    /// Whether an append failed after folding its records: the state in memory may then hold
+    /// records the log never got, and the writer refuses every later write.
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// [`Session::append`], returning what the batch's records handed over to the image engine.
     async fn append_folding(
         &mut self,

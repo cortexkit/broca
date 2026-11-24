@@ -980,7 +980,7 @@ async fn serve_claimed(
         .await?
     };
     let (fresh, frozen, ceiling, mut spent, stored) = match claimed {
-        Claimed::Expired => return Err(super::routed::disabled_unavailable(
+        Claimed::Expired => return Err(super::routed::unavailable_refusal(
             "batch content has expired; routing cleanup must finish before this id can be reused",
         )),
         Claimed::ScopeMismatch => {
@@ -1006,13 +1006,6 @@ async fn serve_claimed(
         Claimed::Fresh => (true, live_frozen, sent_ceiling, 0u64, Vec::new()),
         Claimed::Resumed(record) => {
             hold.stored = true;
-            if !service.config.routed_models && service.role == super::STORE_ROLE {
-                if let Some(reply) =
-                    super::routed::replay_when_disabled(service, request, &record).await?
-                {
-                    return Ok(reply);
-                }
-            }
             (
                 false,
                 serde_json::from_str(&record.frozen_row).unwrap_or_default(),

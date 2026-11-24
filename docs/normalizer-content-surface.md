@@ -39,7 +39,7 @@ The ChatGPT/Codex variant (`openai_responses_chatgpt.rs`) wraps this normalizer 
 | `response.output_item.done` (`function_call`) | full call (id/name/arguments) | read | `openai_responses.rs:672` |
 | `response.output_item.done` (`reasoning`) | whole raw item → `RedactedReasoning` | read | `openai_responses.rs:687` |
 | `response.output_item.done` (`message`) | content array: `output_text` + `refusal` parts (fallback) | read | `openai_responses.rs:695` |
-| `response.completed` / `response.incomplete` | usage / status / incomplete_details (no content) | read | `openai_responses.rs:526` (fast path `:743`), `:719` (generic) |
+| `response.completed` / `response.incomplete` | usage / status / incomplete_details; `response.output` can carry complete function calls, reasoning items, and message text/refusal parts missing from the streamed deltas | read | `openai_responses.rs:526` (fast path `:743`), `:719` (generic) |
 | `response.created` | response id only (control) | n/a | `openai_responses.rs:539` |
 | `response.in_progress` | nothing — `response.output` is empty, `status: in_progress` | n/a | no handler; verified empty in both captured fixtures |
 | `error` / `response.failed` | error (control) | n/a | `openai_responses.rs:557` |

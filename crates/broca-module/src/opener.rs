@@ -228,7 +228,7 @@ impl<L: LeaseStore + 'static> DefaultOpener<L> {
         if let (Some(store), Some(service)) = (&held, registry.retention_service()) {
             let now_ms = service.clock.now_ms();
             let (expired, view) = store
-                .expiry_with_view(key, None, now_ms, false, Some(service.as_ref()))
+                .expiry_with_view(key, None, now_ms, false, Some(service.as_ref()), None)
                 .await?;
             if let Some(expired_at_ms) = expired {
                 if status {

@@ -42,6 +42,13 @@ fn now_ms() -> u64 {
     broca_core::clock::epoch_millis().unwrap_or(0)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many queued orders this thread read back from their records, for tests pinning how
+    /// many a send reads.
+    pub(super) static ORDER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The `SendEnded` record ending `submission_id` undelivered for `reason`.
 fn ended(submission_id: &str, reason: &SendEndReason) -> Result<Record, String> {
     Ok(Record::SendEnded(SendEnded {
@@ -257,6 +264,42 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         frozen_principal(&ownership).map(Some)
     }
 
+    /// Places the text of the send's template in its input. A keyed send whose key already
+    /// names a recorded send takes the text that send rendered at its admission, which its
+    /// queued record keeps: the retry is compared with, and answered from, that send. Rendered
+    /// again against today's view, a part a compaction has cut since would refuse the retry as
+    /// gone, and a part shown under another number would change the text, though the send was
+    /// already made. `run_id` is the run id the send's key derives.
+    pub(super) async fn ordered_template_input(
+        &self,
+        request: &mut SubmissionRequest,
+        template: &role::TemplateUse,
+        run_id: &broca_protocol::RunId,
+        key: &crate::actor::SendKey,
+    ) -> Result<(), SendOutcome> {
+        if key.is_keyed() {
+            let run_id = self
+                .sender_run_id(run_id, key, request.principal.as_ref())
+                .await
+                .map_err(SendOutcome::Error)?;
+            let records = self
+                .session
+                .find_id(IdKind::SubmissionId, &format!("sub-{}", run_id.0))
+                .await
+                .map_err(|error| SendOutcome::Error(format!("{error:?}")))?;
+            if let Some(send) = records.iter().find_map(|(_, record)| match record {
+                Record::QueuedSend(send) => Some(send),
+                _ => None,
+            }) {
+                request.input = queue::request_of(send, &self.parts)
+                    .map_err(SendOutcome::Error)?
+                    .input;
+                return Ok(());
+            }
+        }
+        self.render_ordered_template(request, template).await
+    }
+
     /// Renders the send's template once, at admission, from the attested sender's plan entry.
     /// The queued request carries the text, so a later boundary places those bytes without
     /// rendering the slots again. A `part_tag` slot renders the number the session's next
@@ -316,6 +359,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// `session.apply_view` reads it; the entries are the session's own. A session with no
     /// compaction provider has no views, and its next request shows every part's number.
     ///
+    /// A session sealed behind a cut shows only its window and the earlier messages its views
+    /// name, so only those are read: the sealed history can hold hundreds of thousands of
+    /// entries, and this runs on the actor, which serves nothing else meanwhile.
+    ///
     /// Only a session on the current compaction contract numbers its parts: off it, its
     /// requests render no part numbers, so none is shown and every `part_tag` slot's part is
     /// gone.
@@ -337,7 +384,42 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         let config = broca_session_loop::run::run_config_of_start(start, &self.parts)
             .map_err(|error| format!("{error:?}"))?;
-        let entries = crate::store_entries::all_entries(&self.session).await?;
+        let state = if crate::store_entries::frozen_provider(&self.parts, &self.session)?.is_none()
+        {
+            v2::state::State::default()
+        } else {
+            // Restored as a run would, since a state installed here is the one the session's
+            // later views are accepted and applied against.
+            let restored = || async {
+                broca_session_loop::compaction::restore_live(&self.session, &self.key)
+                    .await
+                    .map_err(|error| format!("{error:?}"))
+            };
+            let compaction = std::sync::Arc::clone(&self.compaction_session);
+            if !compaction.is_initialized() {
+                compaction.restore(restored().await?).await;
+            }
+            let held = compaction
+                .state
+                .try_lock()
+                .ok()
+                .map(|state| v2::state::State::clone(&state));
+            match held {
+                Some(state) => state,
+                // A run holds the state while it writes a view of its own through this actor,
+                // and the run waits for this actor to serve that write: until it does, the
+                // session's records hold the same views as the state.
+                None => restored().await?,
+            }
+        };
+        let entries = if self.session.conversation.window_start() > 1 {
+            self.window_and_named(super::apply_view::named_mids(
+                state.latest().into_iter().chain(state.applied()),
+            ))
+            .await?
+        } else {
+            crate::store_entries::all_entries(&self.session).await?
+        };
         let floor = broca_session_loop::run::signed_floor(
             &self.session,
             &self.parts,
@@ -349,28 +431,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .await
             .map_err(|error| format!("{error:?}"))?;
         let conditions = v2::host::conditions(&config, &entries, false, None, floor.as_deref())?;
-        if crate::store_entries::frozen_provider(&self.parts, &self.session)?.is_none() {
-            return v2::shown::next_request(&Default::default(), &entries, &conditions);
-        }
-        // Restored as a run would, since a state installed here is the one the session's later
-        // views are accepted and applied against.
-        let restored = || async {
-            broca_session_loop::compaction::restore_live(&self.session, &self.key)
-                .await
-                .map_err(|error| format!("{error:?}"))
-        };
-        let compaction = std::sync::Arc::clone(&self.compaction_session);
-        if !compaction.is_initialized() {
-            compaction.restore(restored().await?).await;
-        }
-        let numbers = match compaction.state.try_lock() {
-            Ok(state) => v2::shown::next_request(&state, &entries, &conditions),
-            // A run holds the state while it writes a view of its own through this actor, and
-            // the run waits for this actor to serve that write: until it does, the session's
-            // records hold the same views as the state.
-            Err(_) => v2::shown::next_request(&restored().await?, &entries, &conditions),
-        };
-        numbers
+        v2::shown::next_request(&state, &entries, &conditions)
     }
 
     /// The ordered send `submission_id` while it waits in the queue, read from its records.
@@ -378,6 +439,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &self,
         submission_id: &str,
     ) -> Result<Option<QueuedOrder>, String> {
+        #[cfg(test)]
+        ORDER_READS.with(|reads| reads.set(reads.get() + 1));
         let records = self
             .session
             .find_id(IdKind::SubmissionId, submission_id)
@@ -435,26 +498,68 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Whether the queue holds a send that starts a run once the session is idle: every plain
     /// send does, and an ordered one only when its list names `idle_start`.
     pub(super) async fn queue_starts_runs(&self) -> Result<bool, String> {
-        for pending in self.session.operations().queue.clone() {
-            if !pending.ordered {
-                return Ok(true);
-            }
-            if self
-                .queued_order(&pending.submission_id)
-                .await?
-                .is_some_and(|queued| queued.order.starts_runs())
-            {
+        // By position, without copying the queue: nothing here writes, so it doesn't change.
+        for index in 0..self.session.operations().queue.len() {
+            let pending = &self.session.operations().queue[index];
+            if !pending.ordered || self.order_starts_runs(&pending.submission_id).await? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
+    /// Whether the queued ordered send `submission_id` names `idle_start`, read from its records
+    /// the first time it is asked and kept: an order never changes, and every send on an idle
+    /// session asks it of each ordered send queued before it, which would read each of a long
+    /// backlog again on every send.
+    pub(super) async fn order_starts_runs(&self, submission_id: &str) -> Result<bool, String> {
+        let known = self
+            .ordered_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(submission_id)
+            .copied();
+        if let Some(starts) = known {
+            return Ok(starts);
+        }
+        let starts = self
+            .queued_order(submission_id)
+            .await?
+            .is_some_and(|queued| queued.order.starts_runs());
+        let mut kept = self
+            .ordered_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Sends that left the queue are dropped once they outnumber those still in it.
+        let queue = &self.session.operations().queue;
+        if kept.len() >= 2 * queue.len() + 16 {
+            let queued: std::collections::HashSet<&str> = queue
+                .iter()
+                .map(|pending| pending.submission_id.as_str())
+                .collect();
+            kept.retain(|id, _| queued.contains(id.as_str()));
+        }
+        kept.insert(submission_id.to_owned(), starts);
+        Ok(starts)
+    }
+
     /// Ends every queued ordered send whose expiry has passed, durably, before the queue drains.
+    /// A send whose order can't be read back is left for the drain, which ends it naming why.
     pub(super) async fn expire_ordered(&mut self) -> Result<(), String> {
         let now = now_ms();
         let mut records = Vec::new();
-        for queued in self.queued_orders().await? {
+        let ids: Vec<String> = self
+            .session
+            .operations()
+            .queue
+            .iter()
+            .filter(|pending| pending.ordered)
+            .map(|pending| pending.submission_id.clone())
+            .collect();
+        for id in ids {
+            let Ok(Some(queued)) = self.queued_order(&id).await else {
+                continue;
+            };
             if queued.order.expired_at(now) {
                 records.push(ended(&queued.submission_id, &SendEndReason::Expired)?);
             }
@@ -517,6 +622,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             session_class,
             message_marks,
             prepared: run_prepared,
+            scope,
             ..
         } = start;
         let submission_id = SubmissionId(format!("sub-{}", run_id.0));
@@ -572,24 +678,43 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return Err(SendOutcome::PreUserUnavailable { provider });
         }
         request.staged_uploads = None;
+        // What the send was admitted with that the session doesn't hold yet: a scope it froze or
+        // reopened, and, on a session no run has frozen a plan for, the plan's manifest. Its
+        // record keeps them, so the run it starts records them even when the process stops
+        // between that record and the run's start.
+        let frozen_scope = self.ownership().map_err(SendOutcome::Transient)?.scope;
+        let manifest_kept = match manifest
+            .as_deref()
+            .filter(|_| self.session.operations().owner.needs_admission())
+        {
+            Some(manifest) => Some(
+                queue::receipt_manifest(manifest, &mut self.parts).map_err(SendOutcome::Error)?,
+            ),
+            None => None,
+        };
         // Whose dedupe key this is: the plan-named sender, or the owner sending as itself.
         let sender = ordered_by.clone().or_else(|| request.principal.clone());
-        let superseded = self
-            .queued_orders()
-            .await
-            .map_err(SendOutcome::Error)?
-            .into_iter()
-            .find(|queued| {
-                broca_core::delivery_order::OrderedSend {
-                    admitted_at_ms: None,
-                    submission_id: SubmissionId(queued.submission_id.clone()),
-                    order: queued.order.clone(),
-                    principal: queued.principal.clone(),
-                    input: Vec::new(),
-                }
-                .replaced_by(sender.as_ref(), order.dedupe_key.as_deref())
-            })
-            .map(|queued| queued.submission_id);
+        // Only a send with a dedupe key supersedes one, so only its admission reads the queue's
+        // orders back.
+        let superseded = match order.dedupe_key.as_deref() {
+            None => None,
+            Some(dedupe_key) => self
+                .queued_orders()
+                .await
+                .map_err(SendOutcome::Error)?
+                .into_iter()
+                .find(|queued| {
+                    broca_core::delivery_order::OrderedSend {
+                        admitted_at_ms: None,
+                        submission_id: SubmissionId(queued.submission_id.clone()),
+                        order: queued.order.clone(),
+                        principal: queued.principal.clone(),
+                        input: Vec::new(),
+                    }
+                    .replaced_by(sender.as_ref(), Some(dedupe_key))
+                })
+                .map(|queued| queued.submission_id),
+        };
         let receipt = queue::Receipt {
             session_class: session_class.filter(|_| self.frozen_session_class().is_none()),
             conversation_key,
@@ -601,6 +726,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             title,
             hooks: prepared.queued_hooks(),
             retention: run_prepared.retention,
+            scope: scope.filter(|scope| frozen_scope.as_ref() != Some(scope)),
+            manifest: manifest_kept,
             ..queue::Receipt::default()
         };
         let at = queue::Queued {

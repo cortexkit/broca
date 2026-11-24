@@ -70,7 +70,7 @@ fn bedrock_honors_base_url_for_url_and_host() {
         req.url,
         "http://127.0.0.1:8801/model/anthropic.claude-3-sonnet/converse-stream"
     );
-    // The host header must track the overridden host (SigV4 signs over it).
+    // The host header must track the overridden target authority.
     let host = req
         .headers
         .iter()
@@ -149,12 +149,10 @@ fn bedrock_empty_region_falls_back_to_default_host() {
     assert_eq!(host, Some("bedrock-runtime.us-east-1.amazonaws.com"));
 }
 
-/// Bedrock accepts a long-term BEARER api key (the newer AWS Bedrock API key), not
-/// only SigV4. The Bearer arm must attach `Authorization: Bearer <key>`, and the
-/// SigV4 arm must still attach its signed headers — so the live bearer-key path works
-/// without breaking the existing signing path.
+/// Bedrock's long-term bearer api key is attached after rendering, independently of the
+/// request body's canonical bytes.
 #[test]
-fn bedrock_attaches_bearer_and_still_supports_sigv4() {
+fn bedrock_attaches_bearer() {
     let f = bedrock_frozen_config("anthropic.claude-3-5-sonnet-20240620-v1:0");
 
     // Bearer → Authorization: Bearer <key>.
@@ -174,31 +172,10 @@ fn bedrock_attaches_bearer_and_still_supports_sigv4() {
         "Bearer arm attaches the Authorization header"
     );
 
-    // SigV4 → its signed headers are still attached (unchanged).
-    let sigv4 = BedrockConverse.endpoint(
-        &f,
-        &AuthHandle::SigV4 {
-            region: "us-east-1".into(),
-            service: "bedrock-runtime".into(),
-            signed_headers: vec![("x-amz-date".into(), "20250101T000000Z".into())],
-        },
-        b"{}".to_vec(),
-    );
-    assert!(
-        sigv4
-            .headers
-            .iter()
-            .any(|(k, v)| k == "x-amz-date" && v == "20250101T000000Z"),
-        "SigV4 arm still attaches signed headers"
-    );
-    // The bearer path must NOT have leaked a signed header, and vice versa.
+    // The bearer path must not invent another credential header.
     assert!(
         !bearer.headers.iter().any(|(k, _)| k == "x-amz-date"),
         "Bearer path carries no SigV4 signed headers"
-    );
-    assert!(
-        !sigv4.headers.iter().any(|(k, _)| k == "authorization"),
-        "SigV4 path carries no bearer Authorization header"
     );
 }
 

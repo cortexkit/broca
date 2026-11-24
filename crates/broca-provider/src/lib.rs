@@ -27,6 +27,7 @@ pub mod credential_refresh;
 pub mod effort_change;
 pub mod families;
 pub mod hash;
+mod json_parse;
 mod json_text;
 pub mod media_profile;
 pub mod media_render;

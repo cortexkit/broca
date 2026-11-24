@@ -101,6 +101,9 @@ pub struct StoreHead {
     pub input: InputSource,
     ownership: broca_core::SessionOwnershipV1,
     senders: Vec<PlanSender>,
+    /// What admits a read of the session, as `reader_admission::admit` reads it; `None` when
+    /// it couldn't be read.
+    read_policy: Option<crate::reader_admission::ReadPolicy>,
 }
 
 /// The delivery modes a head's sender grants are drawn from: every mode the serve layer offers.
@@ -262,8 +265,9 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         .map(|latest| frozen_manifest(latest, parts))
         .transpose()?
         .flatten();
-    let senders = broca_session_loop::plan::sender_manifest(operations, parts)
-        .map_err(StoreHeadError::Setup)?
+    let accepted = broca_session_loop::plan::sender_manifest(operations, parts)
+        .map_err(StoreHeadError::Setup)?;
+    let senders = accepted
         .as_deref()
         .map(broca_core::head::head_senders)
         .unwrap_or_default();
@@ -271,6 +275,17 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         broca_session_loop::plan::selection(operations, parts).map_err(StoreHeadError::Setup)?;
     let ownership =
         broca_session_loop::owner::ownership(&operations.owner).map_err(StoreHeadError::Owner)?;
+    // What a read's admission reads, kept with the head so a kept head admits reads too. A
+    // policy that can't be read here leaves admission to a load of the session, which reports
+    // why.
+    let read_policy = crate::reader_admission::ReadPolicy::new(
+        session,
+        parts,
+        ownership.clone(),
+        latest_manifest.clone(),
+        accepted,
+    )
+    .ok();
     let interrupt_reason = match (latest, state.state) {
         (Some(run), SessionReadStateKind::Interrupted)
             if run.finished == Some(RunFinishReason::Interrupted) =>
@@ -376,6 +391,7 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         input,
         ownership,
         senders,
+        read_policy,
     })
 }
 
@@ -392,7 +408,7 @@ pub(crate) async fn serve_head(
     use crate::store_reads::{StoreReadReply, StoreReadRequest};
     let addr = broca_core::session_addr(key);
     let closed = store.closed_position(registry, key).await;
-    let built = match closed.and_then(|position| store.heads().get(&addr, position)) {
+    let built = match closed.and_then(|(_, position)| store.heads().get(&addr, position)) {
         Some(built) => {
             store.heads().count_hit();
             built
@@ -413,17 +429,24 @@ pub(crate) async fn serve_head(
                     "no_position"
                 });
             }
-            let built = match store.read(registry, key, StoreReadRequest::Head).await? {
-                Some(StoreReadReply::Head(built)) => *built?,
-                Some(_) => return Err(crate::store_reads::mismatched()),
+            // The read starts from this probe rather than probing the session again.
+            let (reply, served_at) = match store
+                .read_probed(registry, key, StoreReadRequest::Head, closed)
+                .await?
+            {
+                Some(served) => served,
                 // The session's creation never committed, so it holds nothing: this is the
                 // answer for a session never written.
                 None => return Ok(broca_wire::HeadResponse::default()),
             };
-            // Kept only when the session is still where it was before the read, so the head
-            // is the one that position holds, built from the session as stored.
-            if let Some(position) = closed {
-                if store.closed_position(registry, key).await == Some(position) {
+            let built = match reply {
+                StoreReadReply::Head(built) => *built?,
+                _ => return Err(crate::store_reads::mismatched()),
+            };
+            // Kept only when it was built from the session as stored at the position probed,
+            // with no actor holding it, so the head is the one that position holds.
+            if let (Some((_, position)), Some(served_at)) = (closed, served_at) {
+                if served_at == position {
                     store.heads().keep(addr, position, &built, "read");
                 }
             }
@@ -457,18 +480,34 @@ pub(crate) async fn serve_head(
 /// MB of them kept. So the head is kept instead. Only a head that stays true while the session
 /// stays put is kept: one whose latest run has ended and waits on nothing, or that has no run (a
 /// running or paused run's head reports waits that change with time). At most [`HEADS_KEPT`]
-/// sessions, the oldest forgotten first.
+/// sessions, the least recently kept or read forgotten first, so a head polled all along stays
+/// however many others are kept after it. A kept head also admits reads of its session (see
+/// `reader_admission::ReadPolicy`).
 #[derive(Default)]
 pub(crate) struct KeptHeads(std::sync::Mutex<KeptHeadsInner>);
 
+/// How many sessions' heads are kept. Bounded by count, not bytes, because a head's size hardly
+/// varies with its session: it holds no transcript, only the latest run's state, the model, usage
+/// and the plans in force, which sessions of one plan share. The count is far above the closed
+/// chats an app lists and polls at once, so polling never pushes a polled head out; the memory
+/// report's `kept_heads.held` shows what the kept heads hold.
 const HEADS_KEPT: usize = 4096;
 
 #[derive(Default)]
 struct KeptHeadsInner {
-    heads: std::collections::HashMap<String, (broca_session_store::session::Position, StoreHead)>,
-    order: std::collections::VecDeque<String>,
+    heads: std::collections::HashMap<String, KeptHead>,
+    /// The kept addresses by when each was last kept or read, oldest first.
+    order: std::collections::BTreeMap<u64, String>,
+    clock: u64,
     /// What the memory report shows of how heads were kept and served.
     counts: broca_wire::KeptHeadCounts,
+}
+
+struct KeptHead {
+    position: broca_session_store::session::Position,
+    head: StoreHead,
+    /// When it was last kept or read, its key in `order`.
+    used: u64,
 }
 
 impl KeptHeads {
@@ -484,11 +523,18 @@ impl KeptHeads {
         addr: &str,
         position: broca_session_store::session::Position,
     ) -> Option<StoreHead> {
-        self.lock()
+        let mut kept = self.lock();
+        kept.clock += 1;
+        let clock = kept.clock;
+        let entry = kept
             .heads
-            .get(addr)
-            .filter(|(at, _)| *at == position)
-            .map(|(_, head)| head.clone())
+            .get_mut(addr)
+            .filter(|entry| entry.position == position)?;
+        let used = std::mem::replace(&mut entry.used, clock);
+        let head = entry.head.clone();
+        kept.order.remove(&used);
+        kept.order.insert(clock, addr.to_owned());
+        Some(head)
     }
 
     /// Keeps `head`, built at `position` for the session at `addr`, when no clock changes it.
@@ -511,17 +557,53 @@ impl KeptHeads {
         }
         let mut kept = self.lock();
         *kept.counts.kept.entry(source.to_owned()).or_default() += 1;
-        if kept
-            .heads
-            .insert(addr.clone(), (position, head.clone()))
-            .is_none()
-        {
-            kept.order.push_back(addr);
+        kept.clock += 1;
+        let used = kept.clock;
+        let entry = KeptHead {
+            position,
+            head: head.clone(),
+            used,
+        };
+        if let Some(replaced) = kept.heads.insert(addr.clone(), entry) {
+            kept.order.remove(&replaced.used);
         }
-        while kept.order.len() > HEADS_KEPT {
-            if let Some(oldest) = kept.order.pop_front() {
-                kept.heads.remove(&oldest);
-            }
+        kept.order.insert(used, addr);
+        while kept.heads.len() > HEADS_KEPT {
+            let Some((_, oldest)) = kept.order.pop_first() else {
+                break;
+            };
+            kept.heads.remove(&oldest);
+        }
+    }
+
+    /// What the kept heads hold, walked now (see `broca_session_store::held`), with their cap.
+    /// A plan manifest that several heads, or a head and its read policy, share is counted for
+    /// each.
+    pub(crate) fn memory(&self) -> broca_wire::MemoryCache {
+        use broca_session_store::held::{serde_heap_bytes, HeldBytes};
+        let kept = self.lock();
+        let estimated = kept
+            .heads
+            .iter()
+            .map(|(addr, entry)| {
+                let head = &entry.head;
+                std::mem::size_of::<(String, KeptHead)>()
+                    + std::mem::size_of::<(u64, String)>()
+                    + 2 * addr.heap_bytes()
+                    + serde_heap_bytes(&head.reply)
+                    + serde_heap_bytes(&head.ownership)
+                    + serde_heap_bytes(&head.senders)
+                    + head
+                        .read_policy
+                        .as_ref()
+                        .map_or(0, crate::reader_admission::ReadPolicy::heap_bytes)
+            })
+            .sum::<usize>();
+        broca_wire::MemoryCache {
+            entries: kept.heads.len() as u64,
+            max_entries: HEADS_KEPT as u64,
+            estimated_bytes: estimated as u64,
+            ..Default::default()
         }
     }
 
@@ -545,10 +627,24 @@ impl KeptHeads {
             .entry(why.to_owned())
             .or_default() += 1;
     }
-
-    /// What the memory report shows of kept heads.
+    /// What the memory report shows of kept heads: how they were kept and served, and what they
+    /// hold now.
     pub(crate) fn counts(&self) -> broca_wire::KeptHeadCounts {
-        self.lock().counts.clone()
+        let mut counts = self.lock().counts.clone();
+        counts.held = self.memory();
+        counts
+    }
+
+    /// Whether the kept head of the session at `addr`, at `position`, admits `access`: `None`
+    /// when no head is kept there, or its policy can't decide without the session's records.
+    pub(crate) fn admit(
+        &self,
+        addr: &str,
+        position: broca_session_store::session::Position,
+        access: &crate::reader_admission::ReadAccess,
+    ) -> Option<Result<(), crate::serve::ServeError>> {
+        let head = self.get(addr, position)?;
+        crate::reader_admission::decide(head.read_policy.as_ref()?, access, None)
     }
 }
 

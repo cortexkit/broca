@@ -190,6 +190,31 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok(Keyed::Answered(outcome))
     }
 
+    /// The run id a send under `key` takes, from the run id `base` its key derives: a keyed send
+    /// by a plan-named module (`sender`) takes `base` only while no other sender's send holds
+    /// it (`crate::store_status::sender_send_run_id`); every other send takes `base`.
+    pub(super) async fn sender_run_id(
+        &self,
+        base: &RunId,
+        key: &SendKey,
+        sender: Option<&broca_protocol::BindPrincipal>,
+    ) -> Result<RunId, String> {
+        match (sender, key.send_id()) {
+            (Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }), Some(send_id)) => {
+                crate::store_status::sender_send_run_id(
+                    &self.session,
+                    &self.parts,
+                    base,
+                    send_id,
+                    sender,
+                )
+                .await
+                .map(|(run_id, _)| run_id)
+            }
+            _ => Ok(base.clone()),
+        }
+    }
+
     /// A keyed send that did not start a run, whose key the session's records already hold
     /// (`holders`) and whose send no longer waits in the queue, is answered in this order:
     /// - a send whose earlier order differs (a plain send retried as an ordered one, the reverse,

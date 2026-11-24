@@ -579,3 +579,45 @@ async fn a_store_sessions_media_survives_a_restart_and_stays_its_own(cipher: Cip
     assert_eq!(own["data"], json!(base64(&other_image)));
     assert!(restarted.stop_and_seal().await);
 }
+
+/// A medium read in chunks has its object read and checked once: the chunks after the first
+/// are served from the checked bytes kept for the session, without finding the medium among the
+/// session's records again or reading its object again. Each chunk used to walk every record of
+/// the session and read, open and hash the whole medium to serve a slice of it.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn a_medium_read_in_chunks_reads_its_object_once() {
+    use std::sync::atomic::Ordering;
+    let store = side(Vec::new(), Cipher::XChaCha20Poly1305).await;
+    let image = bytes_of(PNG);
+    import_with(&store, &image).await;
+    assert!(store.registry.stop_and_seal().await);
+    let restarted = registry_at(&store.dir, Vec::new(), Cipher::XChaCha20Poly1305).await;
+    let runtime = restarted.store_runtime().unwrap();
+    const CHUNK: usize = 16;
+    for offset in (0..image.len()).step_by(CHUNK) {
+        let reply = ServeHandler::media_read(
+            &restarted,
+            &store.key,
+            json!({"sha256": digest(&image), "offset": offset, "length": CHUNK}),
+        )
+        .await
+        .unwrap();
+        let end = image.len().min(offset + CHUNK);
+        assert_eq!(
+            reply["data"],
+            json!(base64(&image[offset..end])),
+            "{offset}"
+        );
+        if offset == 0 {
+            assert!(runtime.object_reads.swap(0, Ordering::Relaxed) > 0);
+        }
+    }
+    assert!(image.len() > 2 * CHUNK);
+    assert_eq!(
+        runtime.object_reads.load(Ordering::Relaxed),
+        0,
+        "the chunks after the first read no object"
+    );
+    assert!(restarted.stop_and_seal().await);
+}

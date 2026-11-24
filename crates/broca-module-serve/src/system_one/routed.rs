@@ -34,6 +34,10 @@ use crate::llm_tools::spend::{ItemSpend, MarkedItemError};
 /// name to its nearest configured entry, so settings on this root cover every caller.
 pub const CONSUMER_ROOT: &str = "broca.classifier";
 
+// A positive IQ sets a minimum decision grade. The lowest positive value lets routing pick
+// the cheapest eligible graded model without considering ungraded models.
+const MIN_DECISION_GRADE: u8 = 1;
+
 /// The routing consumer for a `classify.run` from `principal`: the module the daemon stamped on
 /// the route's bind, or `direct` for a direct opener. Never anything the request body says, so a
 /// caller can't ask for another caller's routing policy.
@@ -364,6 +368,9 @@ pub(super) fn pinned_entry(
     let pin = service
         .pin(model)
         .ok_or_else(|| Refusal::model_unavailable(model))?;
+    if super::catalog_key_parts(model).is_none() {
+        return Err(Refusal::model_unavailable(model));
+    }
     Ok(Some(service.model_entry(pin, &row)))
 }
 
@@ -417,7 +424,11 @@ fn requirements(
             .iter()
             .any(|field| field == name)
     };
-    let mut requirements = Requirements::iq(0);
+    let mut requirements = Requirements::iq(if request.model.is_none() {
+        MIN_DECISION_GRADE
+    } else {
+        0 // A pin is an explicit model choice, regardless of its grade.
+    });
     if advertised("context_window") {
         requirements.context_window = estimates.iter().map(|estimate| estimate.input_tokens).max();
     }
@@ -1163,7 +1174,7 @@ async fn recover_claimed(
 }
 
 impl SystemOne {
-    /// Drain routing work independently of content retention and the admission switch.
+    /// Drain routing work even after its batch content has expired.
     pub async fn recover_routing(self: &Arc<Self>) -> Result<(), String> {
         let service = self.clone();
         let now = (self.clock)();
@@ -1179,8 +1190,7 @@ impl SystemOne {
         Ok(())
     }
 
-    /// Run once at boot, then periodically on every state-root format. Routing reports
-    /// describe real dispatches, so disabling new routed admissions cannot stop delivery.
+    /// Run once at boot, then periodically, so owed reports can reach routing after a restart.
     pub fn spawn_routing_recovery(
         self: &Arc<Self>,
         stop: tokio_util::sync::CancellationToken,
@@ -1365,15 +1375,21 @@ pub(super) async fn run(
             request.batch_id
         )));
     }
-    let snapshot = service
-        .stored_batch(&request.batch_id)
-        .await
-        .map_err(|_| internal_refusal("batch replay is unavailable"))?;
+    let snapshot = if routing.is_none() {
+        // Legacy claims compare stored scope bytes and do not need to decode them first.
+        service
+            .stored_batch_for_routing_cleanup(&request.batch_id)
+            .await
+    } else {
+        service.stored_batch(&request.batch_id).await
+    }
+    .map_err(|_| internal_refusal("batch replay is unavailable"))?;
     let snapshot = snapshot.filter(|batch| {
         (service.clock)().saturating_sub(batch.admitted_at_ms)
             < broca_store::system_one::RETENTION_MS
     });
     if snapshot.is_some() && routing.is_none() {
+        // Batches admitted before routing have no decision or account to resume.
         return Ok(None);
     }
     // A caller-pinned model has known question, item and image limits before routing.
@@ -1576,68 +1592,7 @@ async fn flush_facts(service: &Arc<SystemOne>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Legacy parsing, catalog checks and the scope/identity claim have already succeeded.
-/// Only routed rows take this branch; legacy rows continue without decoding their scope.
-pub(super) async fn replay_when_disabled(
-    service: &Arc<SystemOne>,
-    request: &ClassifyRequest,
-    record: &broca_store::system_one::BatchRecord,
-) -> Result<Option<Box<RawValue>>, Refusal> {
-    let (store, role, id) = (
-        service.store.clone(),
-        service.role.clone(),
-        request.batch_id.clone(),
-    );
-    let Some(row) = classify::blocking(move || store.routing(&role, &id)).await? else {
-        return Ok(None);
-    };
-    let journal: Journal = serde_json::from_str(&row.runs)
-        .map_err(|_| internal_refusal("stored routing journal does not decode"))?;
-    if journal.expired {
-        return Err(disabled_unavailable(
-            "batch has an owed routing report; retry after report delivery",
-        ));
-    }
-    let choice: Option<Choice> = serde_json::from_str(&row.choice)
-        .map_err(|_| internal_refusal("stored routing choice does not decode"))?;
-    if let Some(choice) = choice {
-        let any_answer = record
-            .outcomes
-            .iter()
-            .any(|item| matches!(item.outcome, Outcome::Answered(_)));
-        if record.outcomes.len() == request.items.len()
-            && record.outcomes.iter().all(retained)
-            && !pending_reselection(&journal)
-            && !journal.admission_refusal_pending
-            && journal
-                .reselection
-                .as_ref()
-                .is_none_or(|selection| selection.error.is_none())
-            && !reselection_due(&journal, any_answer)
-        {
-            let mut answered = request.clone();
-            answered.model = Some(choice.model);
-            return classify::reply_decision(
-                &answered,
-                &choice.frozen,
-                record
-                    .outcomes
-                    .iter()
-                    .cloned()
-                    .map(|item| Some(Slot::Stored(item)))
-                    .collect(),
-                false,
-                Some(&choice.select.decision_id),
-            )
-            .map(Some);
-        }
-    }
-    Err(disabled_unavailable(
-        "routed classifier admission is disabled; the unfinished batch cannot dispatch",
-    ))
-}
-
-pub(super) fn disabled_unavailable(message: impl Into<String>) -> Refusal {
+pub(super) fn unavailable_refusal(message: impl Into<String>) -> Refusal {
     let mut refusal = Refusal::new(errors::ROUTING_UNAVAILABLE, message);
     refusal.detail.class = cortexkit_role_classifier::errors::ErrorClass::Transient;
     refusal

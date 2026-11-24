@@ -40,14 +40,15 @@ pub struct MemoryReport {
     /// one per storage class and mode.
     #[serde(default)]
     pub setup_stores: Vec<MemorySetupStore>,
-    /// How `session.head` of closed sessions was answered from kept heads, and why heads weren't
-    /// kept. Absent from a broca that keeps no heads.
+    /// How `session.head` of closed sessions was answered from kept heads, why heads weren't
+    /// kept, and what the kept heads hold. Absent from a broca that keeps no heads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_heads: Option<KeptHeadCounts>,
 }
 
 /// `session.head` reads of sessions no actor holds since broca started: those a kept head
-/// answered, those that loaded the session's view, and why heads weren't kept.
+/// answered, those that loaded the session's view, and why heads weren't kept; and the heads kept
+/// now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptHeadCounts {
     /// Reads a kept head answered.
@@ -64,6 +65,10 @@ pub struct KeptHeadCounts {
     /// durable), `pending` (the head needed to wait on something), `storage` (it needed records
     /// not in memory), `failed`.
     pub not_kept: std::collections::BTreeMap<String, u64>,
+    /// The heads kept now: how many, their cap, and their estimated bytes, walked when the
+    /// report is asked for.
+    #[serde(default)]
+    pub held: MemoryCache,
 }
 
 /// One session open in the session store (`broca-session-store`).

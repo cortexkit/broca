@@ -176,9 +176,9 @@ pub struct StoreActor<B: SessionBackend> {
     warm: Option<warm::PendingStoreWarm>,
     step_event_warm_stops: crate::step_events::WarmStops,
     step_message_ids: Option<broca_session_loop::entries::MessageIds>,
-    /// The scope the ordered send being admitted was admitted under, set only while it is: the
-    /// run it starts at once, if it does, records it (see `drained_start`).
-    ordered_scope: Option<broca_protocol::SessionScope>,
+    /// Whether each queued ordered send names `idle_start`, as `ordered::order_starts_runs`
+    /// read it from its records.
+    ordered_starts: std::sync::Mutex<std::collections::HashMap<String, bool>>,
     /// The seq the next record would have taken when this actor created the session, set only
     /// when it did. A session it created that still has it when the actor closes holds nothing
     /// anyone sent, and is deleted (see [`StoreActor::created_here`]).
@@ -521,7 +521,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             warm: None,
             step_event_warm_stops: Default::default(),
             step_message_ids: None,
-            ordered_scope: None,
+            ordered_starts: Default::default(),
             created: None,
             collect_due: false,
             admission: Default::default(),
@@ -1383,7 +1383,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     let admitted = match self.ordered_sender(&request, order, &key) {
                         Ok(owner) => match &order.template {
                             Some(template) => self
-                                .render_ordered_template(&mut request, template)
+                                .ordered_template_input(&mut request, template, &run_id, &key)
                                 .await
                                 .map(|()| owner),
                             None => Ok(owner),
@@ -1405,31 +1405,19 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 // A plan-named module's keyed send takes the run id its `send_id` derives only
                 // while no other sender's send holds it; another sender's send under the same
                 // `send_id` is a different send.
-                let run_id = match (
-                    ordered_by.clone().or_else(|| request.principal.clone()),
-                    key.send_id(),
-                ) {
-                    (
-                        Some(sender @ broca_protocol::BindPrincipal::Reserved { .. }),
-                        Some(send_id),
-                    ) => {
-                        match crate::store_status::sender_send_run_id(
-                            &self.session,
-                            &self.parts,
-                            &run_id,
-                            send_id,
-                            &sender,
-                        )
-                        .await
-                        {
-                            Ok((run_id, _)) => run_id,
-                            Err(error) => {
-                                let _ = reply.send(SendOutcome::Error(error));
-                                return false;
-                            }
-                        }
+                let run_id = match self
+                    .sender_run_id(
+                        &run_id,
+                        &key,
+                        ordered_by.as_ref().or(request.principal.as_ref()),
+                    )
+                    .await
+                {
+                    Ok(run_id) => run_id,
+                    Err(error) => {
+                        let _ = reply.send(SendOutcome::Error(error));
+                        return false;
                     }
-                    _ => run_id,
                 };
                 // Whether the queue holds work that starts a run on its own, which a send that
                 // would freeze the session's scope, or start a run now, has to wait behind.
@@ -1872,12 +1860,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     message_marks,
                 };
                 if let Some(order) = order {
-                    // A run the ordered send starts at once records the scope the send was
-                    // admitted under, so a scope the send freezes or reopens is recorded on its
-                    // start.
-                    self.ordered_scope.clone_from(&start.scope);
                     self.queue_ordered(start, order, ordered_by, reply).await;
-                    self.ordered_scope = None;
                 } else if steering && self.run.is_some() {
                     let outcome = self.steer(start, stop_sequences_named, &mut reply).await;
                     let _ = reply.send(outcome);
@@ -3292,13 +3275,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let Some(active) = self.run.as_mut() else {
             return;
         };
-        let started = self
-            .session
-            .operations()
-            .run
-            .as_ref()
-            .and_then(|run| run.start.as_ref())
-            .is_some_and(|start| start.run_id == active.run_id.0);
+        // The session folds a batch before writing it, so a start whose write failed is in its
+        // state too; the failed write leaves the session poisoned. Such a run never started: its
+        // sender hears the run's failure when the run ends (`finish_run`), never `active`.
+        let started = !self.session.poisoned()
+            && self
+                .session
+                .operations()
+                .run
+                .as_ref()
+                .and_then(|run| run.start.as_ref())
+                .is_some_and(|start| start.run_id == active.run_id.0);
         if started {
             active.started = true;
             // The hints are kept only while they can still be read: a one-shot run while it is
@@ -3713,42 +3700,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             );
             return;
         }
-        let mut first = None;
-        for pending in self.session.operations().queue.clone() {
-            if !pending.ordered {
-                first = Some(pending);
-                break;
-            }
-            match self.queued_order(&pending.submission_id).await {
-                Ok(Some(queued)) if queued.order.starts_runs() => {
-                    first = Some(pending);
-                    break;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::error!(
-                        target: "broca.store_actor",
-                        session = %self.key.session,
-                        submission_id = %pending.submission_id,
-                        error = %error,
-                        "a queued ordered send could not be read back",
-                    );
-                    return;
-                }
-            }
-        }
-        let Some(first) = first else {
-            return;
+        let first = match self.first_to_drain().await {
+            Ok(Some(first)) => first,
+            Ok(None) => return,
+            Err((first, error)) => return self.end_unreadable_drain(first, error, waiting).await,
         };
         // An interrupt is first in the queue (`Operations::queue` keeps interrupts ahead of every
         // plain send), so it drains first.
-        let own_admission = waiting
-            .as_ref()
-            .is_some_and(|(id, _)| id.0 == first.submission_id);
-        match self
-            .drained_start(&first.submission_id, own_admission)
-            .await
-        {
+        let own_admission = waiting.as_ref().is_some_and(|(id, _)| id.0 == first);
+        match self.drained_start(&first, own_admission).await {
             Ok((mut start, mut drained)) => match self
                 .session_class(start.session_class.as_deref())
                 .and_then(|class| {
@@ -3787,13 +3747,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     }
                 }
             },
-            Err(error) => tracing::error!(
-                target: "broca.store_actor",
-                session = %self.key.session,
-                submission_id = %first.submission_id,
-                error = %error,
-                "a queued send could not be read back to start its run",
-            ),
+            Err(error) => self.end_unreadable_drain(first, error, waiting).await,
         }
     }
 
@@ -3856,14 +3810,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             sent_by: principal("sent_by")?,
             request,
             // A drained send is broca's own, so it carries the scope the session already
-            // froze (`SendScope::Internal`). An ordered send drained by its own admission
-            // carries the scope under which it was admitted (`ordered_scope`).
-            scope: if own_admission {
-                self.ordered_scope.clone()
-            } else {
-                self.ownership()?.scope
+            // froze (`SendScope::Internal`), or the one its admission froze or reopened, which
+            // an ordered send's record keeps (`ordered::admit_ordered`).
+            scope: match queue::receipt_field(&send, "scope") {
+                Some(scope) => Some(
+                    serde_json::from_value(scope)
+                        .map_err(|error| format!("the queued send's scope: {error}"))?,
+                ),
+                None => self.ownership()?.scope,
             },
-            manifest: self.frozen_manifest()?,
+            // The manifest an ordered send was admitted with before any run froze one.
+            manifest: match queue::queued_manifest(&send, &self.parts)? {
+                Some(manifest) => Some(manifest),
+                None => self.frozen_manifest()?,
+            },
             session_class: queue::receipt_field(&send, "session_class")
                 .as_ref()
                 .and_then(serde_json::Value::as_str)

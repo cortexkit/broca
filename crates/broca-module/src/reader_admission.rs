@@ -1,6 +1,9 @@
 //! Read admission for plans in the session store, shared by live actors and stored views.
 
+use std::sync::Arc;
+
 use broca_protocol::{BindPrincipal, RunId};
+use broca_records::record::PlanManifest;
 use broca_session_loop::parts::Parts;
 use broca_session_store::{backend::SessionBackend, session::Session};
 use cortexkit_role_llm_runner::app_readers::{self, ReadAdmission};
@@ -64,6 +67,82 @@ fn plan(
     )
 }
 
+/// What a read's admission reads from a session: its ownership, the plan in force for reads
+/// (the latest run's, else the first run's) and the latest accepted plan, whose reader list
+/// governs. A kept head holds it too, so a closed session's read can be admitted without loading
+/// the session (see `store_head::KeptHeads`).
+#[derive(Clone)]
+pub struct ReadPolicy {
+    ownership: broca_core::SessionOwnershipV1,
+    effective: Option<Arc<PlanManifest>>,
+    accepted: Option<Arc<PlanManifest>>,
+}
+
+impl ReadPolicy {
+    /// The policy from facts the caller already read: the session's `ownership`, the latest
+    /// run's frozen plan (`latest`, else the first run's, read only then) and the latest
+    /// accepted plan.
+    pub fn new<B: SessionBackend>(
+        session: &Session<B>,
+        parts: &dyn Parts,
+        ownership: broca_core::SessionOwnershipV1,
+        latest: Option<Arc<PlanManifest>>,
+        accepted: Option<Arc<PlanManifest>>,
+    ) -> Result<Self, ServeError> {
+        let effective = match latest {
+            Some(manifest) => Some(manifest),
+            None => session
+                .operations
+                .owner
+                .first_start
+                .as_ref()
+                .map(|start| broca_session_loop::run::frozen_manifest(start, parts))
+                .transpose()
+                .map_err(|error| {
+                    ServeError::Transient(format!("the first read policy: {error:?}"))
+                })?
+                .flatten(),
+        };
+        Ok(Self {
+            ownership,
+            effective,
+            accepted,
+        })
+    }
+
+    /// What the policy holds, walked as `broca_session_store::held` walks values.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use broca_session_store::held::serde_heap_bytes;
+        let manifest = |manifest: &Option<Arc<PlanManifest>>| {
+            manifest.as_deref().map_or(0, |manifest| {
+                std::mem::size_of::<PlanManifest>() + serde_heap_bytes(manifest)
+            })
+        };
+        serde_heap_bytes(&self.ownership) + manifest(&self.effective) + manifest(&self.accepted)
+    }
+}
+
+/// The read policy of `session`, as [`admit`] reads it.
+fn read_policy<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+) -> Result<ReadPolicy, ServeError> {
+    let ownership = broca_session_loop::owner::ownership(&session.operations.owner)
+        .map_err(ServeError::Transient)?;
+    let latest = session
+        .operations
+        .run
+        .as_ref()
+        .and_then(|run| run.start.as_ref())
+        .map(|start| broca_session_loop::run::frozen_manifest(start, parts))
+        .transpose()
+        .map_err(|error| ServeError::Transient(format!("the effective read policy: {error:?}")))?
+        .flatten();
+    let accepted = broca_session_loop::plan::sender_manifest(&session.operations, parts)
+        .map_err(ServeError::Transient)?;
+    ReadPolicy::new(session, parts, ownership, latest, accepted)
+}
+
 /// Runs before page, status or stream work. A stored caller supplies the same cached view its
 /// operation will use; a live actor supplies its own session, without flushing for authorization.
 pub async fn admit<B: SessionBackend>(
@@ -71,41 +150,50 @@ pub async fn admit<B: SessionBackend>(
     parts: &dyn Parts,
     access: &ReadAccess,
 ) -> Result<(), ServeError> {
-    let ownership = broca_session_loop::owner::ownership(&session.operations.owner)
-        .map_err(ServeError::Transient)?;
+    let policy = read_policy(session, parts)?;
+    if let Some(decided) = decide(&policy, access, None) {
+        return decided;
+    }
+    let own_send = match &access.send {
+        Some((run, send_id)) => {
+            crate::store_status::authorization_own_send(
+                session,
+                parts,
+                run,
+                send_id,
+                access.principal.as_ref(),
+            )
+            .await?
+        }
+        None => false,
+    };
+    decide(&policy, access, Some(own_send)).unwrap_or(Err(ServeError::ReadAccessRefused))
+}
+
+/// Admits `access` under `policy`. `own_send` says whether the send `access` names is the
+/// caller's own; `None` when it isn't known, and then the decision is `None` when it depends on
+/// it, which only the session's records tell.
+pub fn decide(
+    policy: &ReadPolicy,
+    access: &ReadAccess,
+    own_send: Option<bool>,
+) -> Option<Result<(), ServeError>> {
+    let ownership = &policy.ownership;
     let current = broca_core::scope_admission::decide_sender_access(
         access.principal.as_ref(),
         (ownership.episodes > 0).then_some(ownership.first_principal.as_ref()),
     );
-    let latest = session
-        .operations
-        .run
-        .as_ref()
-        .and_then(|run| run.start.as_ref());
-    let effective = latest
-        .map(|start| broca_session_loop::run::frozen_manifest(start, parts))
-        .transpose()
-        .map_err(|error| ServeError::Transient(format!("the effective read policy: {error:?}")))?
-        .flatten();
-    let effective = match effective {
-        Some(manifest) => Some(manifest),
-        None => session
-            .operations
-            .owner
-            .first_start
-            .as_ref()
-            .map(|start| broca_session_loop::run::frozen_manifest(start, parts))
-            .transpose()
-            .map_err(|error| ServeError::Transient(format!("the first read policy: {error:?}")))?
-            .flatten(),
+    let effective = match plan(policy.effective.as_deref()) {
+        Ok(effective) => effective,
+        Err(error) => return Some(Err(error)),
     };
-    let effective = plan(effective.as_deref())?;
-    let accepted = broca_session_loop::plan::sender_manifest(&session.operations, parts)
-        .map_err(ServeError::Transient)?;
-    let accepted = plan(accepted.as_deref())?;
+    let accepted = match plan(policy.accepted.as_deref()) {
+        Ok(accepted) => accepted,
+        Err(error) => return Some(Err(error)),
+    };
     let restricted = accepted.contains_key(app_readers::PLAN_READERS);
     if !restricted {
-        return current.map_err(ServeError::ScopeRefused);
+        return Some(current.map_err(ServeError::ScopeRefused));
     }
     let refusal = || ServeError::ReadAccessRefused;
     let owner_principal = ownership
@@ -123,7 +211,7 @@ pub async fn admit<B: SessionBackend>(
     let caller = match access.principal.as_ref() {
         Some(BindPrincipal::Reserved { module_id }) => module_id.as_str(),
         Some(BindPrincipal::Direct) => &direct_caller,
-        _ => return Err(refusal()),
+        _ => return Some(Err(refusal())),
     };
     // Only a recorded Direct owner matches a Direct caller; an empty module id cannot confer
     // owner authority on a local operator for send status.
@@ -134,19 +222,8 @@ pub async fn admit<B: SessionBackend>(
         Some(BindPrincipal::Direct) if direct => caller,
         _ => &unmatched_owner,
     };
-    let own_send = if !broca_protocol::same_module(caller, owner) {
-        if let Some((run, send_id)) = &access.send {
-            crate::store_status::authorization_own_send(
-                session,
-                parts,
-                run,
-                send_id,
-                access.principal.as_ref(),
-            )
-            .await?
-        } else {
-            false
-        }
+    let own_send = if !broca_protocol::same_module(caller, owner) && access.send.is_some() {
+        own_send?
     } else {
         false
     };
@@ -165,10 +242,10 @@ pub async fn admit<B: SessionBackend>(
     .map_err(|field| ServeError::InvalidParams {
         field: field.into(),
         message: "the stored plan's readers are malformed".into(),
-    })?;
-    if allowed {
-        Ok(())
-    } else {
-        Err(refusal())
-    }
+    });
+    Some(match allowed {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(refusal()),
+        Err(error) => Err(error),
+    })
 }

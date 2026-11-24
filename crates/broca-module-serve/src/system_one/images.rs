@@ -98,7 +98,7 @@ impl SystemOne {
                 self.config.max_request_bytes,
             ),
         )?;
-        let request = if self.config.routed_models && self.role == super::STORE_ROLE {
+        let request = if self.role == super::STORE_ROLE {
             parse_request(params)?
         } else {
             cortexkit_role_classifier::request::parse_request_for(
@@ -113,7 +113,7 @@ impl SystemOne {
             )?
         };
         let model = request.model.as_deref().unwrap_or_default();
-        let entry = if self.config.routed_models && self.role == super::STORE_ROLE {
+        let entry = if self.role == super::STORE_ROLE {
             if stored.is_none() {
                 super::routed::pinned_entry(self, &request)?
                     .unwrap_or_else(|| super::routed::validation_entry(self))
@@ -137,7 +137,7 @@ impl SystemOne {
         for (i, item) in request.items.iter().enumerate() {
             let final_item = stored.is_some_and(|batch| {
                 batch.outcomes.iter().any(|outcome| {
-                    if self.config.routed_models && self.role == super::STORE_ROLE {
+                    if self.role == super::STORE_ROLE {
                         return outcome.index == i as u64 && super::routed::retained(outcome);
                     }
                     outcome.index == i as u64 && match &outcome.outcome {

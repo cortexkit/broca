@@ -1,12 +1,12 @@
 //! The store actor's own tests for what has no comparison with today's actor: an interrupt that
-//! a process queued behind a paused run before it could end that run, a send arriving while
-//! sends wait in an idle session's queue, and the retry of a run whose executor failed.
+//! a process queued behind a paused run before it could end that run, a send arriving behind a
+//! queued send that can't be read back, and the retry of a run whose executor failed.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use broca_core::{OutputEvent, RunError};
-use broca_protocol::{Delivery, PauseReason, RunId, SubmissionId};
+use broca_protocol::{Delivery, PauseReason, RunId};
 use broca_session_loop::parts::{MemoryParts, SharedParts};
 use broca_session_loop::queue;
 use broca_session_loop::writer::Writer;
@@ -156,11 +156,11 @@ async fn an_interrupt_left_behind_a_paused_run_ends_it_on_the_next_open() {
     );
 }
 
-/// A send arriving while a send that starts a run still waits in an idle session's queue is
-/// queued behind it and answered `pending`. Here the waiting send
-/// can't be read back to start its run, so both stay queued.
+/// A queued send that can't be read back to start its run, here because its recorded transforms
+/// no build can read, no longer holds an idle session's queue: opening the session ends it with
+/// its failure, and a send arriving afterwards runs at once instead of queuing behind it.
 #[tokio::test]
-async fn a_send_behind_sends_queued_on_an_idle_session_is_queued() {
+async fn a_send_behind_an_unreadable_queued_send_runs_once_that_send_ends() {
     let parts = SharedParts::new(Box::new(MemoryParts::default()));
     let (commands, served, backend) = actor_with(
         executor(vec![text_step("a1", "hello")], None),
@@ -197,25 +197,33 @@ async fn a_send_behind_sends_queued_on_an_idle_session_is_queued() {
         .unwrap();
     drop(session);
 
-    let (commands, served) = reopen(backend, Arc::new(executor(Vec::new(), None)), &parts).await;
+    let (commands, served) = reopen(
+        backend,
+        Arc::new(executor(vec![text_step("a3", "third")], None)),
+        &parts,
+    )
+    .await;
     let sent = send_with(&commands, "r3", request("third"), SendKey::Minted).await;
-    assert_eq!(
-        sent,
-        SendOutcome::Pending {
-            submission_id: SubmissionId("sub-r3".into()),
-        }
-    );
+    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+    idle(&commands).await;
     drop(commands);
     let session = served.await.unwrap();
+    assert!(session.operations.queue.is_empty());
     assert_eq!(
-        session
-            .operations
-            .queue
-            .iter()
-            .map(|pending| pending.submission_id.as_str())
-            .collect::<Vec<_>>(),
-        ["sub-r2", "sub-r3"]
+        run_story(&session).await,
+        [
+            "start r1",
+            "end r1 Completed",
+            "start r3",
+            "end r3 Completed"
+        ]
     );
+    let records = session.open_log_records().await.unwrap();
+    assert!(records.iter().any(|(_, record)| matches!(
+        record,
+        Record::Retraction(retraction)
+            if retraction.submission_id == "sub-r2" && retraction.failure.is_some()
+    )));
 }
 
 /// An executor error after the start is admitted records a terminal instead of leaving an

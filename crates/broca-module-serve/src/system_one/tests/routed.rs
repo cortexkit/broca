@@ -43,6 +43,46 @@ impl RoutingCredentials for Keys {
     }
 }
 
+struct BindableProvider(Arc<dyn ClassifierProvider>);
+
+#[async_trait]
+impl ClassifierProvider for BindableProvider {
+    fn egress_host(&self) -> String {
+        self.0.egress_host()
+    }
+
+    fn credential_id(&self) -> Option<String> {
+        self.0.credential_id()
+    }
+
+    fn with_credential(&self, _: Arc<dyn CredentialSource>) -> Option<Arc<dyn ClassifierProvider>> {
+        Some(Arc::new(Self(self.0.clone())))
+    }
+
+    async fn call(&self, body: String) -> ProviderReply {
+        self.0.call(body).await
+    }
+}
+
+/// Give a route test a router and accounts without making its stand-in provider read a vault key.
+pub(crate) fn with_test_routing(mut service: SystemOne) -> SystemOne {
+    let mut router = Router::new(true, true);
+    Arc::get_mut(&mut router).unwrap().started_ms = (service.clock)() as u64;
+    *router.models.lock().unwrap() = service
+        .pins
+        .iter()
+        .map(|pin| pin.catalog_id.clone())
+        .collect();
+    for pin in &mut service.pins {
+        pin.provider = Arc::new(BindableProvider(pin.provider.clone()));
+    }
+    service.with_routing(Routing {
+        client: Arc::new(RoutingClient::new(router, Default::default())),
+        credentials: Arc::new(Keys),
+        module_id: "broca".into(),
+    })
+}
+
 struct Router {
     refusal_detail: Mutex<Value>,
     renewal_refusal: Mutex<Option<(&'static str, &'static str)>>,
@@ -83,6 +123,7 @@ struct Router {
     renew_times: Mutex<Vec<u64>>,
     renewed: Notify,
     started: tokio::time::Instant,
+    started_ms: u64,
 }
 
 impl Router {
@@ -147,10 +188,11 @@ impl Router {
             renew_times: Mutex::new(vec![]),
             renewed: Notify::new(),
             started: tokio::time::Instant::now(),
+            started_ms: 1_000_000,
         })
     }
     fn now(&self) -> u64 {
-        1_000_000 + self.started.elapsed().as_millis() as u64
+        self.started_ms + self.started.elapsed().as_millis() as u64
     }
     fn bodies(&self, method: &str) -> Vec<Value> {
         self.calls
@@ -507,7 +549,6 @@ fn routed_rig_with_store(store: Arc<SystemOneStore>, router: Arc<Router>) -> Rou
     });
     let clock = router.clone();
     let config = Config {
-        routed_models: true,
         max_attempts: 1,
         ..Default::default()
     };
@@ -828,7 +869,7 @@ fn audit_classifier_keys_require_explicit_provider_binding() {
 
 #[tokio::test(start_paused = true)]
 async fn audit_pending_reports_do_not_extend_item_content_retention() {
-    let mut rig = routed_rig(true, true);
+    let rig = routed_rig(true, true);
     rig.provider
         .script("private-content", vec![Script::Answer(answered(Some(7)))]);
     *rig.router.report_refused.lock().unwrap() = Some("store_error");
@@ -848,12 +889,14 @@ async fn audit_pending_reports_do_not_extend_item_content_retention() {
         rig.store.routing(STORE_ROLE, "routed").unwrap().is_some(),
         "unacknowledged report must remain"
     );
-    Arc::get_mut(&mut rig.service).unwrap().config.routed_models = false;
-    let refusal = call(&rig, &exits::pinned(&["private-content"]))
+    let refusal = call(&rig, &routed_request(&["private-content"]))
         .await
         .unwrap_err();
     assert_eq!(refusal["code"], "routing_unavailable");
-    assert!(refusal["message"].as_str().unwrap().contains("expired"));
+    assert!(refusal["message"]
+        .as_str()
+        .unwrap()
+        .contains("owed routing report"));
     let archive = rig.store.routing(STORE_ROLE, "routed").unwrap().unwrap();
     assert_eq!(archive.choice, "null");
     assert!(!archive.runs.contains("private-content"));
@@ -1211,6 +1254,18 @@ async fn a_routed_call_asks_routing_as_its_route_caller() {
 }
 
 #[tokio::test]
+async fn unpinned_classification_without_demand_requests_minimum_decision_grade() {
+    let rig = routed_rig(true, true);
+    rig.provider
+        .script("graded", vec![Script::Answer(answered(Some(10)))]);
+    call(&rig, &routed_request(&["graded"])).await.unwrap();
+    let selects = rig.router.bodies("route.select");
+    assert_eq!(selects.len(), 1);
+    assert!(selects[0].get("pin").is_none());
+    assert_eq!(selects[0]["requirements"]["iq"], 1);
+}
+
+#[tokio::test]
 async fn routed_batch_freezes_requirements_account_and_replays_bytes() {
     let rig = routed_rig(true, true);
     for state in ["first", "second"] {
@@ -1227,7 +1282,7 @@ async fn routed_batch_freezes_requirements_account_and_replays_bytes() {
     let schema = r#"{"q":{"type":"noul","instructions":"true?"}}"#.len() as u64;
     assert_eq!(
         select,
-        &json!({"consumer":"broca.classifier.direct","requirements":{"iq":0,"context_window":512+schema+8,"questions":1,"input_tokens":2*(512+schema)+7+8,"max_cost_usd":1.0},"runners":["broca"]})
+        &json!({"consumer":"broca.classifier.direct","requirements":{"iq":1,"context_window":512+schema+8,"questions":1,"input_tokens":2*(512+schema)+7+8,"max_cost_usd":1.0},"runners":["broca"]})
     );
     let accounts = rig.router.bodies("route.account_for");
     assert_eq!(accounts[0]["decision_id"], "decision-0");
@@ -1285,6 +1340,7 @@ async fn routed_pin_is_strict_and_refusal_preserves_routing_reason() {
     assert_eq!(error["detail"]["model"], JEV);
     let select = &rig.router.bodies("route.select")[0];
     assert_eq!(select["pin"], JEV);
+    assert_eq!(select["requirements"]["iq"], 0);
     assert!(select.get("pin_fallback").is_none());
     assert!(rig.store.lookup(STORE_ROLE, "routed").unwrap().is_none());
 }
@@ -2618,9 +2674,9 @@ async fn routed_identity_keeps_the_callers_pin_or_its_omission() {
 }
 
 #[tokio::test]
-async fn routed_switch_off_validates_before_claim_and_replays_only_original_pins() {
+async fn routed_replay_keeps_pinned_and_unpinned_answers_during_an_outage() {
     for pinned in [false, true] {
-        let mut rig = routed_rig(true, true);
+        let rig = routed_rig(true, true);
         rig.provider
             .script("done", vec![Script::Answer(answered(Some(10)))]);
         let params = if pinned {
@@ -2629,83 +2685,18 @@ async fn routed_switch_off_validates_before_claim_and_replays_only_original_pins
             routed_request(&["done"])
         };
         let reply = call(&rig, &params).await.unwrap();
-        Arc::get_mut(&mut rig.service).unwrap().config.routed_models = false;
         rig.router.clear();
-        if pinned {
-            assert_eq!(call(&rig, &params).await.unwrap().get(), reply.get());
-        } else {
-            rig.catalog.forbidden.store(true, Ordering::SeqCst);
-            let refusal = call(&rig, &params).await.unwrap_err();
-            assert_eq!(refusal["code"], "invalid_params");
-            assert_eq!(refusal["detail"]["field"], "model");
-            rig.catalog.forbidden.store(false, Ordering::SeqCst);
-        }
+        rig.router.unreachable.store(true, Ordering::SeqCst);
+        rig.catalog.forbidden.store(true, Ordering::SeqCst);
+        assert_eq!(call(&rig, &params).await.unwrap().get(), reply.get());
         assert!(rig.router.calls.lock().unwrap().is_empty());
         assert_eq!(rig.provider.calls("done"), 1);
-        assert!(rig.service.describe_live().await.routed_models.is_none());
-        let mut new: Value = serde_json::from_str(&params).unwrap();
-        new["batch_id"] = json!("new");
-        new.as_object_mut().unwrap().remove("model");
-        assert_eq!(
-            call(&rig, &new.to_string()).await.unwrap_err(),
-            json!({"code":"invalid_params","message":"model is required without routed_models","detail":{"class":"permanent","field":"model"}})
-        );
-        assert!(rig.store.lookup(STORE_ROLE, "new").unwrap().is_none());
-        assert!(rig.router.calls.lock().unwrap().is_empty());
     }
 }
 
 #[tokio::test]
-async fn routed_unpinned_unfinished_batch_is_untouched_while_off_and_continues_on() {
-    let directory = broca_test_support::scratch_root().join(format!(
-        "routed-switch-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join("system-one.db");
-    let mut rig = routed_rig_with_store(
-        Arc::new(SystemOneStore::open(&path).unwrap()),
-        Router::new(true, true),
-    );
-    rig.provider
-        .script("done", vec![Script::Answer(answered(Some(10)))]);
-    rig.provider.script(
-        "retry",
-        vec![Script::Unconnected, Script::Answer(answered(Some(7)))],
-    );
-    let params = routed_request(&["done", "retry"]);
-    call(&rig, &params).await.unwrap();
-    rig.router.clear();
-    Arc::get_mut(&mut rig.service).unwrap().config.routed_models = false;
-    let before = std::fs::read(&path).unwrap();
-    let error = call(&rig, &params).await.unwrap_err();
-    assert_eq!(error["code"], "invalid_params");
-    assert_eq!(error["detail"]["field"], "model");
-    assert_eq!(error["message"], "model is required without routed_models");
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert!(rig.router.calls.lock().unwrap().is_empty());
-    assert_eq!(rig.provider.calls("retry"), 1);
-    Arc::get_mut(&mut rig.service).unwrap().config.routed_models = true;
-    let reply: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
-    assert_eq!(reply["decision_id"], "decision-0");
-    assert!(reply["items"][1].get("answers").is_some());
-    assert!(rig.router.bodies("route.select").is_empty());
-    assert_eq!(
-        rig.router.bodies("route.account_for")[0]["requested_account"]["credential_id"],
-        "apikey:a"
-    );
-    assert_eq!(rig.provider.calls("done"), 1);
-    drop(rig);
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[tokio::test]
-async fn routed_pending_report_drains_with_switch_off() {
-    let mut rig = routed_rig(true, true);
+async fn routed_pending_report_drains_without_readmitting_the_batch() {
+    let rig = routed_rig(true, true);
     rig.provider
         .script("done", vec![Script::Answer(answered(Some(10)))]);
     rig.router.lose_ack.store(true, Ordering::SeqCst);
@@ -2718,7 +2709,6 @@ async fn routed_pending_report_drains_with_switch_off() {
             .unwrap()
             .pending
     );
-    Arc::get_mut(&mut rig.service).unwrap().config.routed_models = false;
     rig.router.clear();
     rig.service.recover_routing().await.unwrap();
     assert_eq!(rig.router.bodies("route.report"), vec![report]);

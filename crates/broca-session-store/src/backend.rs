@@ -825,6 +825,12 @@ pub struct LocalBackend {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     )>,
+    /// Counts of head reads through [`SessionBackend::read_head`], for tests.
+    #[cfg(feature = "fs-override")]
+    head_reads: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// Counts of whole objects read through [`SessionBackend::get_object`], for tests.
+    #[cfg(feature = "fs-override")]
+    object_reads: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 const VERSION_LEN: usize = 8;
@@ -851,6 +857,10 @@ impl LocalBackend {
             open_logs: Mutex::new(HashMap::new()),
             #[cfg(feature = "fs-override")]
             log_reads: None,
+            #[cfg(feature = "fs-override")]
+            head_reads: None,
+            #[cfg(feature = "fs-override")]
+            object_reads: None,
         }
     }
 
@@ -863,6 +873,28 @@ impl LocalBackend {
         checkpoint_frame_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         self.log_reads = Some((reads, checkpoint_frame_reads));
+        self
+    }
+
+    /// Count the session heads read through [`SessionBackend::read_head`] in `reads`, across
+    /// handles belonging to one test runtime.
+    #[cfg(feature = "fs-override")]
+    pub fn with_head_reads_for_test(
+        mut self,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.head_reads = Some(reads);
+        self
+    }
+
+    /// Count the whole objects read through [`SessionBackend::get_object`] in `reads`, across
+    /// handles belonging to one test runtime.
+    #[cfg(feature = "fs-override")]
+    pub fn with_object_reads_for_test(
+        mut self,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.object_reads = Some(reads);
         self
     }
 
@@ -1293,6 +1325,10 @@ fn prune_versions(versions: &Path, now: std::time::SystemTime) -> io::Result<usi
 
 impl SessionBackend for LocalBackend {
     async fn read_head(&self, s: &SessionAddr) -> Result<Option<(Vec<u8>, Version)>, BackendError> {
+        #[cfg(feature = "fs-override")]
+        if let Some(reads) = &self.head_reads {
+            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let head = self.read_head_file(s)?;
         if let Some((_, version)) = &head {
             self.fences.lock().unwrap().insert(s.clone(), *version);
@@ -1505,6 +1541,10 @@ impl SessionBackend for LocalBackend {
         s: &SessionAddr,
         name: &str,
     ) -> Result<Option<Vec<u8>>, BackendError> {
+        #[cfg(feature = "fs-override")]
+        if let Some(reads) = &self.object_reads {
+            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match std::fs::read(self.object_path(s, name)?) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),

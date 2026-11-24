@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use broca_module_serve::{
+    account_routing::{Candidate, Candidates, RoutingClient, RoutingTransport},
     config::LlmToolsConfig,
     llm_tools::{LlmTools, NoPrivateContent},
     system_one::*,
@@ -66,8 +67,8 @@ impl ImageResolver for Cerebellum {
     }
 }
 
-#[derive(Default)]
-struct Provider(Mutex<Vec<Value>>);
+#[derive(Clone, Default)]
+struct Provider(Arc<Mutex<Vec<Value>>>);
 
 #[async_trait]
 impl ClassifierProvider for Provider {
@@ -77,11 +78,89 @@ impl ClassifierProvider for Provider {
     fn credential_id(&self) -> Option<String> {
         None
     }
+    fn with_credential(
+        &self,
+        _: Arc<dyn typesafe::CredentialSource>,
+    ) -> Option<Arc<dyn ClassifierProvider>> {
+        Some(Arc::new(self.clone()))
+    }
     async fn call(&self, body: String) -> ProviderReply {
         let body: Value = serde_json::from_str(&body).unwrap();
         let model = body["model"].clone();
         self.0.lock().unwrap().push(body);
         ProviderReply::Answered(serde_json::to_vec(&json!({"model": model, "answers":{"q":{"type":"noul","noul":0.7}},"usage":{"input_tokens":10}})).unwrap())
+    }
+}
+
+struct ImageRouting;
+
+#[async_trait]
+impl RoutingCredentials for ImageRouting {
+    async fn candidates(&self, _: &str) -> Result<Candidates, String> {
+        Ok(Candidates {
+            accounts: vec![Candidate {
+                account_id: "image-account".into(),
+                credential_id: "image-key".into(),
+            }],
+            view_digest: "image-view".into(),
+        })
+    }
+
+    fn source(&self, _: &str) -> Arc<dyn typesafe::CredentialSource> {
+        Arc::new(typesafe::NoCredential)
+    }
+}
+
+#[async_trait]
+impl RoutingTransport for ImageRouting {
+    async fn request(&self, body: Vec<u8>) -> Result<Result<Vec<u8>, Vec<u8>>, String> {
+        use cortexkit_role_routing::{
+            describe::{ConsumerEntry, RoleDescribe},
+            select::{PinOutcome, RouteRef, RunnerAuth, RunnerRef, SelectAnswer},
+        };
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let params = &body["params"];
+        let now = now_ms() as u64;
+        let result = match body["method"].as_str().unwrap() {
+            "role.describe" => json!(RoleDescribe::new(
+                vec![ConsumerEntry {
+                    id: "broca.classifier".into(),
+                    priced_only: true,
+                }],
+                false
+            )),
+            "route.select" => {
+                assert_eq!(params["pin"], CLEF);
+                let route = RouteRef::new("cloudflare-workers-ai", "@cf/cloudflare/clef");
+                json!(SelectAnswer::new(
+                    "image-decision",
+                    route.clone(),
+                    RunnerRef::new("broca", route).with_auth(RunnerAuth {
+                        pool: Some("image-keys".into()),
+                        credential_id: Some("image-key".into())
+                    }),
+                    1,
+                    1,
+                    now + 60_000,
+                    "image fixture"
+                )
+                .with_pin_outcome(PinOutcome::Pinned))
+            }
+            "route.account_for" => json!({
+                "admission":{"id":params["admission_id"],"state":"admitted"},
+                "account":{"provider":"cloudflare-workers-ai","method":"apikey","account_id":"image-account","credential_id":"image-key"},
+                "pin":{"id":"image-pin","generation":1,"affinity_expires_at_ms":now+60_000,"admission_valid_until_ms":now+60_000,"lease_valid_until_ms":now+60_000,"mode":"admit"},
+                "reason":{"code":"headroom","decision_id":"image-decision","policy_version":"fixture","quota_age_band":"fresh"},
+            }),
+            "route.account_observe" => {
+                json!({"observation_id":params["observation_id"],"accepted":true})
+            }
+            "route.report" => {
+                json!({"decision_id":params["decision_id"],"report_id":"image-report","outcome":params["outcome"]})
+            }
+            method => panic!("unexpected image routing method {method}"),
+        };
+        Ok(Ok(serde_json::to_vec(&json!({"result":result})).unwrap()))
     }
 }
 
@@ -138,7 +217,15 @@ fn rig(enabled: bool) -> Rig {
     .with_export(
         export.clone(),
         Arc::new(broca_module_serve::ChargeBasisTable::shipped_defaults()),
-    );
+    )
+    .with_routing(Routing {
+        client: Arc::new(RoutingClient::new(
+            Arc::new(ImageRouting),
+            Default::default(),
+        )),
+        credentials: Arc::new(ImageRouting),
+        module_id: "broca".into(),
+    });
     if enabled {
         system = system.with_image_resolver(source.clone());
     }

@@ -158,6 +158,39 @@ fn removed_keys_go_with_a_note_each() {
 }
 
 #[test]
+fn removed_classifier_routing_is_rewritten_with_a_notice() {
+    let (text, notes) = super::super::rewrite::rewritten_text(
+        r#"{
+            // Settings from a build that let operators disable decision routing.
+            "classifier_routing": {"enabled": false},
+            "bus_run_events_enabled": true,
+        }"#,
+    )
+    .unwrap()
+    .expect("the old settings need conversion");
+    assert_eq!(
+        notes,
+        ["removed classifier_routing: decision requests without a model always use routing"]
+    );
+    assert!(super::super::rewrite::rewritten_text(&text)
+        .unwrap()
+        .is_none());
+    let settings = super::super::Settings::parse(&text).unwrap();
+    assert_eq!(
+        settings.keys().collect::<Vec<_>>(),
+        ["bus_run_events_enabled"]
+    );
+    let document = serde_json::from_str(settings.text()).unwrap();
+    super::super::schema()
+        .validate_layer(
+            Layer::User,
+            &document,
+            &ValidationContext::new("broca", None),
+        )
+        .unwrap();
+}
+
+#[test]
 fn import_roots_pass_through() {
     converts(
         json!({"import": {"roots": []}}),

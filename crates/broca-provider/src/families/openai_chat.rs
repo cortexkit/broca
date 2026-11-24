@@ -64,7 +64,7 @@ impl WireFamily for OpenAiChat {
     }
 
     fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
-        with_request_body(frozen, opts, None, None, |body| body.canonical_len())
+        with_request_body(frozen, None, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -73,7 +73,7 @@ impl WireFamily for OpenAiChat {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Value {
-        with_request_body(frozen, opts, None, provenance, |body| body.to_value())
+        with_request_body(frozen, None, opts, None, provenance, |body| body.to_value())
     }
 
     fn render_with_provenance(
@@ -82,7 +82,19 @@ impl WireFamily for OpenAiChat {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        with_request_body(frozen, opts, None, provenance, |body| {
+        with_request_body(frozen, None, opts, None, provenance, |body| {
+            body.canonical_bytes()
+        })
+    }
+
+    fn render_with_shared_name_map(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+        name_map: &crate::tool_name_alias::ToolNameMap,
+    ) -> Vec<u8> {
+        with_request_body(frozen, Some(name_map), opts, None, provenance, |body| {
             body.canonical_bytes()
         })
     }
@@ -106,6 +118,7 @@ impl WireFamily for OpenAiChat {
         let media = crate::media_render::MediaRender { frozen, payloads };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -123,6 +136,7 @@ impl WireFamily for OpenAiChat {
         let media = crate::media_render::MediaRender { frozen, payloads };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -147,9 +161,6 @@ impl WireFamily for OpenAiChat {
             }
             AuthHandle::ApiKeyHeader { header, value } => {
                 headers.push((header.clone(), value.clone()));
-            }
-            AuthHandle::SigV4 { signed_headers, .. } => {
-                headers.extend(signed_headers.iter().cloned());
             }
             AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
             AuthHandle::None => {}
@@ -188,6 +199,7 @@ impl WireFamily for OpenAiChat {
 /// inside this call, because the options the step prepares from `opts` live here too.
 fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
+    shared_name_map: Option<&crate::tool_name_alias::ToolNameMap>,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
@@ -201,7 +213,14 @@ fn with_request_body<R>(
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
     let opts = view.as_ref();
-    let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+    let owned_name_map;
+    let name_map = match shared_name_map {
+        Some(name_map) => name_map,
+        None => {
+            owned_name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+            &owned_name_map
+        }
+    };
     let messages = convert_messages_with_provenance(
         &opts.prompt,
         frozen.reasoning_echo.or(frozen
@@ -209,7 +228,7 @@ fn with_request_body<R>(
             .then_some(ReasoningEchoPolicy::DEEPSEEK)),
         frozen.tool_call_content_empty_string,
         frozen.opencode_go_reasoning_signature,
-        &name_map,
+        name_map,
         media,
         provenance,
     );
@@ -248,10 +267,10 @@ fn with_request_body<R>(
         body["tools"] = Value::Array(
             opts.tools
                 .iter()
-                .map(|tool| convert_tool(tool, &name_map, frozen.moonshot_schema_types))
+                .map(|tool| convert_tool(tool, name_map, frozen.moonshot_schema_types))
                 .collect(),
         );
-        body["tool_choice"] = convert_tool_choice(&opts.tool_choice, &name_map);
+        body["tool_choice"] = convert_tool_choice(&opts.tool_choice, name_map);
     }
     apply_generation_controls(
         body.as_object_mut()
@@ -815,17 +834,15 @@ impl OpenAiChatNormalizer {
 
     fn handle_chunk(
         &mut self,
-        payload: &str,
+        v: &Value,
         out: &mut Vec<NormalizedEvent>,
     ) -> Result<(), NormalizeError> {
-        let v: Value =
-            serde_json::from_str(payload).map_err(|e| NormalizeError::Invalid(e.to_string()))?;
         if let Some(evidence) = &self.response_evidence {
-            evidence.lock().unwrap().observe_response(&v);
+            evidence.lock().unwrap().observe_response(v);
         }
 
-        if let Some(error) = openai_chat_stream_error(&v) {
-            self.observe_error_response(&v);
+        if let Some(error) = openai_chat_stream_error(v) {
+            self.observe_error_response(v);
             out.push(NormalizedEvent::Control(ProviderControl::Error {
                 error,
                 retries_used: 0,
@@ -1293,12 +1310,12 @@ impl StreamNormalizer for OpenAiChatNormalizer {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        let payloads = self.sse.push(chunk)?;
+        let payloads = self.sse.push_parsed(chunk)?;
         if self.sse.saw_done() {
             self.terminal_observed = true;
         }
         for payload in payloads {
-            self.handle_chunk(&payload, &mut out)?;
+            self.handle_chunk(payload.value()?, &mut out)?;
             if self.arguments_guard.fired() {
                 self.terminal_observed = true;
                 self.finish_reason = Some(FinishReason::ToolCalls);
@@ -1339,8 +1356,8 @@ impl StreamNormalizer for OpenAiChatNormalizer {
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let mut out = Vec::new();
         if !self.arguments_guard.fired() {
-            for payload in self.sse.flush()? {
-                self.handle_chunk(&payload, &mut out)?;
+            for payload in self.sse.flush_parsed()? {
+                self.handle_chunk(payload.value()?, &mut out)?;
             }
         }
         if self.sse.saw_done() {

@@ -424,6 +424,68 @@ async fn codex_profile_https_orders_wire_without_changing_canonical_digest() {
     );
 }
 
+/// A warm must resend the cache prefix of the step it warms byte for byte. Over HTTPS a Codex
+/// step goes out with its routing fields first, so the warm must too: it is the step's own wire
+/// bytes with only the output cap added, never the sorted canonical form.
+#[tokio::test]
+async fn codex_https_warm_resends_the_step_wire_bytes_with_only_the_output_cap() {
+    let mock = Mock::start(vec![text_events(), text_events()], false, true).await;
+    let provider = codex_provider(&mock);
+    let events = step(&provider, 1, &opts()).await;
+    assert!(attempts(&events)
+        .iter()
+        .all(|a| a.outcome == AttemptOutcome::Complete));
+    let base = provider.render_request(&opts());
+    let sent = provider.warm(&base).await.expect("the warm is answered");
+    let observed = mock.observed.lock().unwrap();
+    assert_eq!(observed.http_bodies.len(), 2, "one step, then one warm");
+    let step_body = String::from_utf8(observed.http_bodies[0].clone()).unwrap();
+    let warm_body = String::from_utf8(observed.http_bodies[1].clone()).unwrap();
+    assert!(step_body.starts_with("{\"model\":\"m\",\"stream\":true,\"input\":"));
+    let cap = "\"max_output_tokens\":16";
+    assert_eq!(warm_body.matches(cap).count(), 1, "{warm_body}");
+    let uncapped = warm_body
+        .replacen(&format!("{cap},"), "", 1)
+        .replacen(&format!(",{cap}"), "", 1);
+    assert_eq!(uncapped, step_body);
+    assert_eq!(
+        sent.warm_body_sha256,
+        RequestDigest::of(warm_body.as_bytes()).sha256,
+        "the warm reports the digest of the bytes the server received"
+    );
+}
+
+/// A ChatGPT token whose own account header no longer matches the account the session froze
+/// is refused by a warm exactly as by a step, even when the vault record names no account.
+#[tokio::test]
+async fn chatgpt_warm_refuses_a_token_whose_account_header_changed() {
+    let mock = Mock::start(Vec::new(), false, true).await;
+    let provider = provider(&mock).with_account_refs(Some("frozen-account".into()), None);
+    let events = step(&provider, 1, &opts()).await;
+    let refused = events.iter().find_map(|event| match event {
+        NormalizedEvent::Control(ProviderControl::Error { error, .. }) => Some(error),
+        _ => None,
+    });
+    assert_eq!(
+        refused.and_then(|error| error.provider_code.as_deref()),
+        Some("account_changed"),
+        "the step refuses: {events:?}"
+    );
+    let base = provider.render_request(&opts());
+    assert_eq!(
+        provider.warm(&base).await,
+        Err(broca_core::WarmFailure::AccountChanged {
+            frozen: Some("frozen-account".into()),
+            served: Some("account".into()),
+        })
+    );
+    let observed = mock.observed.lock().unwrap();
+    assert!(
+        observed.http_bodies.is_empty() && observed.requests.is_empty(),
+        "nothing may reach the provider"
+    );
+}
+
 #[tokio::test]
 async fn codex_profile_refresh_preserves_frozen_identity() {
     let mock = Mock::start(vec![text_events(), text_events()], false, false).await;

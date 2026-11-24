@@ -48,6 +48,28 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl RunWait {
+    /// What the wait holds on the heap, estimated as `broca_session_store::held` walks values:
+    /// its auth selection, await message and label, the held calls' keys, and the end's error.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use broca_session_store::held::{serde_heap_bytes, HeldBytes};
+        let held = self
+            .held
+            .keys()
+            .map(|(a, b)| {
+                std::mem::size_of::<((String, String), u64)>() + a.heap_bytes() + b.heap_bytes()
+            })
+            .sum::<usize>();
+        self.selection.as_ref().map_or(0, serde_heap_bytes)
+            + self.message.as_ref().map_or(0, serde_heap_bytes)
+            + self.label.heap_bytes()
+            + held
+            + self
+                .end
+                .as_ref()
+                .and_then(|(_, _, error)| error.as_ref())
+                .map_or(0, serde_heap_bytes)
+    }
+
     pub(crate) fn set_labels(&mut self, labels: Labels) {
         self.labels = labels;
     }

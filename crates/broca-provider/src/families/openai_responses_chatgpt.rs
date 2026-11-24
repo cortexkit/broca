@@ -217,6 +217,7 @@ pub(crate) fn effort_plan(
 /// backend's adjustments.
 fn with_request_body<R>(
     frozen: &FrozenRenderConfig,
+    shared_name_map: Option<&crate::tool_name_alias::ToolNameMap>,
     opts: &CallOptions,
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
@@ -227,6 +228,7 @@ fn with_request_body<R>(
     // platform /responses API:
     super::openai_responses::with_prepared_request_body(
         frozen,
+        shared_name_map,
         opts,
         media,
         provenance,
@@ -300,7 +302,7 @@ impl WireFamily for OpenAiResponsesChatgpt {
     }
 
     fn rendered_len(&self, frozen: &FrozenRenderConfig, opts: &CallOptions) -> usize {
-        with_request_body(frozen, opts, None, None, |body| body.canonical_len())
+        with_request_body(frozen, None, opts, None, None, |body| body.canonical_len())
     }
 
     fn shape_with_provenance(
@@ -309,7 +311,7 @@ impl WireFamily for OpenAiResponsesChatgpt {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> serde_json::Value {
-        with_request_body(frozen, opts, None, provenance, |body| body.to_value())
+        with_request_body(frozen, None, opts, None, provenance, |body| body.to_value())
     }
 
     fn render_with_provenance(
@@ -318,7 +320,19 @@ impl WireFamily for OpenAiResponsesChatgpt {
         opts: &CallOptions,
         provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
     ) -> Vec<u8> {
-        with_request_body(frozen, opts, None, provenance, |body| {
+        with_request_body(frozen, None, opts, None, provenance, |body| {
+            body.canonical_bytes()
+        })
+    }
+
+    fn render_with_shared_name_map(
+        &self,
+        frozen: &FrozenRenderConfig,
+        opts: &CallOptions,
+        provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+        name_map: &crate::tool_name_alias::ToolNameMap,
+    ) -> Vec<u8> {
+        with_request_body(frozen, Some(name_map), opts, None, provenance, |body| {
             body.canonical_bytes()
         })
     }
@@ -342,6 +356,7 @@ impl WireFamily for OpenAiResponsesChatgpt {
         let media = crate::media_render::MediaRender { frozen, payloads };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -359,6 +374,7 @@ impl WireFamily for OpenAiResponsesChatgpt {
         let media = crate::media_render::MediaRender { frozen, payloads };
         with_request_body(
             frozen,
+            None,
             opts,
             frozen.media.as_ref().map(|_| &media),
             provenance,
@@ -387,9 +403,6 @@ impl WireFamily for OpenAiResponsesChatgpt {
             }
             AuthHandle::ApiKeyHeader { header, value } => {
                 headers.push((header.clone(), value.clone()));
-            }
-            AuthHandle::SigV4 { signed_headers, .. } => {
-                headers.extend(signed_headers.iter().cloned());
             }
             AuthHandle::Headers(hs) => headers.extend(hs.iter().cloned()),
             AuthHandle::None => {}

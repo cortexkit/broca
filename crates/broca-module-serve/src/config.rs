@@ -1,63 +1,6 @@
 //! Operator policy for model tools. Missing configuration is deliberately conservative:
 //! private content stays within the explicitly trusted provider set.
 
-/// The routed classifier rollout is independent of LLM account selection. Enabling it never
-/// permits fixed-credential fallback when routing is unavailable.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ClassifierRoutingConfig {
-    pub enabled: bool,
-}
-
-impl ClassifierRoutingConfig {
-    /// Its section of broca's settings.
-    pub fn from_settings(settings: &crate::settings::Settings) -> Result<Self, String> {
-        Self::parse(settings.text())
-    }
-
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let text = crate::cache_routing::strip_trailing_commas(
-            &crate::cache_routing::strip_jsonc_comments(text),
-        );
-        let mut file: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
-            .map_err(|error| format!("parse classifier_routing.enabled: {error}"))?;
-        match file.remove("classifier_routing") {
-            None => Ok(Self::default()),
-            Some(value) => serde_json::from_value(value)
-                .map_err(|error| format!("classifier_routing.enabled: {error}")),
-        }
-    }
-}
-
-#[cfg(test)]
-mod classifier_routing_config_tests {
-    use super::ClassifierRoutingConfig;
-    #[test]
-    fn classifier_routing_is_explicit_and_defaults_off() {
-        for text in [
-            "{}",
-            r#"{"classifier_routing":{}}"#,
-            r#"{"classifier_routing":{"enabled":false}}"#,
-        ] {
-            assert!(!ClassifierRoutingConfig::parse(text).unwrap().enabled);
-        }
-        assert!(
-            ClassifierRoutingConfig::parse(r#"{"classifier_routing":{"enabled":true}}"#)
-                .unwrap()
-                .enabled
-        );
-        for text in [
-            r#"{"classifier_routing":null}"#,
-            r#"{"classifier_routing":{"enabled":1}}"#,
-            r#"{"classifier_routing":{"typo":true}}"#,
-        ] {
-            assert!(ClassifierRoutingConfig::parse(text)
-                .unwrap_err()
-                .contains("classifier_routing"));
-        }
-    }
-}
-
 /// How the session store makes its writes durable (`storage_sync` in broca.jsonc). Off by
 /// default: on macOS each sync is a plain `fsync`, which survives a broca crash, kill or restart
 /// but not a power loss or kernel panic before the drive empties its cache. `full_flush` makes

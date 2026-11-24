@@ -623,6 +623,97 @@ async fn the_expiry_check_decides_by_the_rule_retention_deletes_by() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A read of a closed session finds the root the session is kept in and reads where its head
+/// stands once, and passes both down, as does a `session.head` the kept heads can't answer: each
+/// probe is a head read and its authentication, and the root a few file checks, the floor of
+/// every poll of a closed session.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn a_closed_read_probes_the_session_once() {
+    use std::sync::atomic::Ordering;
+    let (root, runtime, registry, key) =
+        closed_read_fixture("one-probe", crate::store_reads::ViewCache::MAX_BYTES).await;
+    let page = || {
+        runtime.read(
+            &registry,
+            &key,
+            crate::store_reads::StoreReadRequest::Page(Default::default()),
+        )
+    };
+    // The first page loads the view, which the rest are served from.
+    page().await.unwrap().unwrap();
+    let probes = || {
+        (
+            runtime.class_probes.swap(0, Ordering::Relaxed),
+            runtime.head_reads.swap(0, Ordering::Relaxed),
+        )
+    };
+    probes();
+    page().await.unwrap().unwrap();
+    assert_eq!(probes(), (1, 1), "a page of a closed session");
+    let scope = broca_protocol::SendScope::default();
+    let head = || crate::store_head::serve_head(&registry, &runtime, &key, None, &scope);
+    head().await.unwrap();
+    assert_eq!(probes(), (1, 1), "a head no kept head answers");
+    head().await.unwrap();
+    assert_eq!(probes(), (1, 1), "a head a kept head answers");
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Authorizing a read of a closed session whose head is kept reads no log, as the head itself
+/// doesn't, even when the session's view is too large to keep: a UI polling a closed chat's head
+/// is authorized before every poll. The answer is the one a load of the session gives.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn authorizing_a_read_of_a_kept_head_reads_no_log() {
+    use crate::serve::ServeHandler;
+    use std::sync::atomic::Ordering;
+    // No view fits the cache, so only the kept head can spare a read.
+    let (root, runtime, registry, key) = closed_read_fixture("kept-head-auth", 1).await;
+    let accesses = [
+        crate::reader_admission::ReadAccess {
+            principal: None,
+            op: "session.head".into(),
+            send: None,
+        },
+        crate::reader_admission::ReadAccess {
+            principal: Some(broca_protocol::BindPrincipal::Direct),
+            op: "session.read".into(),
+            send: None,
+        },
+        crate::reader_admission::ReadAccess {
+            principal: Some(broca_protocol::BindPrincipal::Reserved {
+                module_id: "another".into(),
+            }),
+            op: "run.status".into(),
+            send: None,
+        },
+    ];
+    let mut loaded = Vec::new();
+    for access in &accesses {
+        loaded.push(format!(
+            "{:?}",
+            registry.authorize_session_read(&key, access).await
+        ));
+    }
+    let scope = broca_protocol::SendScope::default();
+    registry.head_for(&key, None, &scope).await.unwrap();
+    runtime.log_reads.store(0, Ordering::Relaxed);
+    for (access, loaded) in accesses.iter().zip(&loaded) {
+        assert_eq!(
+            &format!("{:?}", registry.authorize_session_read(&key, access).await),
+            loaded,
+            "{access:?}"
+        );
+    }
+    assert_eq!(runtime.log_reads.load(Ordering::Relaxed), 0);
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn stored_read_future_stays_small() {
@@ -638,6 +729,7 @@ async fn stored_read_future_stays_small() {
             &registry,
             &key,
             crate::store_reads::StoreReadRequest::Page(Default::default()),
+            None,
             None,
         )
     });

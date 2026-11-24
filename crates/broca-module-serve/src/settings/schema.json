@@ -5,28 +5,6 @@
   "type": "object",
   "unevaluatedProperties": false,
   "properties": {
-    "classifier_routing": {
-      "type": "object",
-      "title": "Decision model routing",
-      "description": "Routed decision models.",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "title": "Let routing choose the decision model",
-          "description": "Let routing choose the decision model for classify requests.",
-          "default": false,
-          "x-ck-apply": "module_restart",
-          "x-ck-layers": [
-            "user"
-          ]
-        }
-      },
-      "unevaluatedProperties": false,
-      "x-ck-apply": "module_restart",
-      "x-ck-layers": [
-        "user"
-      ]
-    },
     "storage_sync": {
       "type": "object",
       "title": "Storage durability",
