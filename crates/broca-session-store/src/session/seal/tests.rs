@@ -17,6 +17,7 @@ cipher_tests!(
     a_cut_seals_below_it_and_the_session_loads_back_the_same,
     sealed_records_read_back_and_finished_runs_lose_their_opaque_reasoning,
     a_ledger_seal_keeps_the_whole_transcript_open,
+    a_live_writer_releases_copied_messages_after_a_seal,
     a_cut_that_does_not_start_an_entry_refuses_and_changes_nothing,
     the_replaced_log_is_deleted_only_after_the_grace_period,
     a_session_no_writer_holds_is_collected_once_each_grace_is_over,
@@ -24,6 +25,7 @@ cipher_tests!(
     a_crash_at_any_point_of_a_seal_loads_to_before_or_after_it,
     a_seal_carries_ledger_records_into_the_new_log,
     a_seal_at_an_entry_cuts_where_that_entry_is_placed,
+    a_seal_at_an_entry_reads_the_open_log_once,
     a_seal_preserves_unmoved_activity_when_ledger_times_leave_the_log,
     a_seal_preserves_a_move_boundary_and_later_activity,
     a_moved_namespace_survives_a_sealed_history_checkpoint,
@@ -290,6 +292,31 @@ fn a_cut_seals_below_it_and_the_session_loads_back_the_same(cipher: Cipher) {
         assert!(loaded.operations.run.as_ref().unwrap().finished.is_some());
         assert_ne!(state(&loaded), written, "run c ended after the seal");
         assert!(loaded.append(&[start("d")], true).await.unwrap() > next);
+    });
+}
+
+fn a_live_writer_releases_copied_messages_after_a_seal(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let (mut session, cut) = history(&backend, cipher).await;
+        session.seal(Some(cut), 1_000).await.unwrap();
+        let first = session.conversation.window_start();
+        let released = session.conversation.release(first, &[0]);
+        assert!(!session.conversation.release(first + 1, &[0]));
+        assert_eq!(
+            texts(&[session.window_message_whole(first).await.unwrap()]),
+            ["ask c"]
+        );
+        session.close().await.unwrap();
+
+        let mut loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        assert!(loaded.conversation.release(first, &[0]));
+        assert!(
+            released,
+            "the copied message should release before reopening"
+        );
     });
 }
 
@@ -797,5 +824,19 @@ fn a_seal_at_an_entry_cuts_where_that_entry_is_placed(cipher: Cipher) {
             .seal_at_entry(99, &Carry::default(), 1_000)
             .await
             .is_err());
+    });
+}
+
+fn a_seal_at_an_entry_reads_the_open_log_once(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let (mut session, _) = history(&backend, cipher).await;
+        let before = backend.log_reads();
+        assert!(session
+            .seal_at_entry(5, &Carry::default(), 1_000)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(backend.log_reads() - before, 1, "reads for one cut");
     });
 }

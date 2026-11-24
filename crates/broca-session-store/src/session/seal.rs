@@ -148,14 +148,15 @@ impl<B: SessionBackend> Session<B> {
         // A seal holds the open log's records and the state it builds across its writes, tens of
         // kilobytes in a debug build. Boxed, so every future that awaits a seal (a store actor's,
         // a run's) carries one pointer for it.
-        Box::pin(self.seal_carrying_boxed(cut, carry, now_ms)).await
+        Box::pin(self.seal_carrying_boxed(cut, carry, None, now_ms)).await
     }
 
-    /// The work of [`Session::seal_carrying`], which boxes it.
+    /// The work of sealing, with the decoded log already available for a cut by ordinal.
     async fn seal_carrying_boxed(
         &mut self,
         cut: Option<u64>,
         carry: &Carry<'_>,
+        open: Option<OpenLogRead>,
         now_ms: u64,
     ) -> Result<Sealed, SessionError> {
         if self.poisoned {
@@ -174,7 +175,10 @@ impl<B: SessionBackend> Session<B> {
             ));
         }
         self.check_views_carried(carry)?;
-        let open = self.read_open_log().await?;
+        let open = match open {
+            Some(open) => open,
+            None => self.read_open_log().await?,
+        };
         if let Some(cut) = cut {
             self.check_cut(&open.0, &open.2, cut)?;
         }
@@ -202,19 +206,21 @@ impl<B: SessionBackend> Session<B> {
         carry: &Carry<'_>,
         now_ms: u64,
     ) -> Result<Option<Sealed>, SessionError> {
-        let cut = {
-            // Dropped before the seal, which reads the open log again itself.
-            let (records, _, checkpoint) = self.read_open_log().await?;
-            let cut = placing_seq(&checkpoint, &records, ordinal)?;
+        Box::pin(async move {
+            let open = self.read_open_log().await?;
+            let (records, _, checkpoint) = &open;
+            let cut = placing_seq(checkpoint, records, ordinal)?;
             let places_before_cut = records.iter().any(|(seq, record)| {
                 *seq < cut && matches!(record, Record::Input(_) | Record::Assistant(_))
             });
             if !places_before_cut {
                 return Ok(None);
             }
-            cut
-        };
-        self.seal_carrying(Some(cut), carry, now_ms).await.map(Some)
+            self.seal_carrying_boxed(Some(cut), carry, Some(open), now_ms)
+                .await
+                .map(Some)
+        })
+        .await
     }
 
     /// Every seal moves the ledger out of the open log, and with it the `View` records the
@@ -552,6 +558,7 @@ impl<B: SessionBackend> Session<B> {
         let mut conversation = at_cut;
         let mut window =
             OpenLogIndex::from_checkpoint(self.window.newest_activity_ms, self.encoder.next_seq());
+        let mut open_ids = OpenIds::new(idindex::hash_key(&self.key));
         for batch in batches {
             let kept: Vec<(u64, Record)> = records[batch.clone()]
                 .iter()
@@ -571,19 +578,21 @@ impl<B: SessionBackend> Session<B> {
             if kept.is_empty() {
                 continue;
             }
-            for (seq, record) in &kept {
-                conversation
-                    .apply(record)
-                    .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
-                window.note(*seq, record);
-            }
+            let encoded = encoder.copy_batch(&kept)?;
             sealed.kept_records += kept.len();
-            bytes.extend(encoder.copy_batch(&kept)?.into_written(&mut encoder));
+            // The window can release copied content now that it knows where to read it back.
+            for ((seq, record), place) in kept.into_iter().zip(encoded.places(encoder.offset())) {
+                conversation
+                    .apply_at(Some(seq), record)
+                    .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
+                window.note(seq, record);
+                open_ids.place_transcript(seq, record, place);
+            }
+            bytes.extend(encoded.into_written(&mut encoder));
         }
         // The carried ledger records follow as one batch with fresh seqs, above every record the
         // seal read, and fold into the state the change installs.
         let mut settled_after = settled_after;
-        let mut open_ids = OpenIds::new(idindex::hash_key(&self.key));
         let carried = carry.records;
         if !carried.is_empty() {
             let first = encoder.next_seq();
