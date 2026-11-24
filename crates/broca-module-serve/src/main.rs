@@ -777,6 +777,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     registry.set_tool_route_health(Arc::new(move |open| {
         tool_route_health_plane.tool_routes_health(open)
     }));
+    retention.set_withdraw_before_delete(held_runtime.withdraw_before_delete());
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
     // is its own file; `run-index.db` is a rebuildable projection and cannot hold an authority.

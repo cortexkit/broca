@@ -431,6 +431,7 @@ impl HeldWithdrawals {
             None if retry_failed => 0,
             None => durable_attempts,
         };
+        let given = known.is_some();
         // Live callers arrive only after sync. Recovery reads the same sealed log: an open
         // hold, a shutdown pause, or an interrupted restart is never a withdrawal intent.
         let identity = match known {
@@ -478,6 +479,10 @@ impl HeldWithdrawals {
             _ => None,
         };
         if let Some(error) = retry {
+            // A retry asks with the identity this attempt used when it was given rather than
+            // read: the session it came from may be gone by then (see
+            // [`Self::withdraw_before_delete`]).
+            let given = given.then_some(session_identity);
             self.store
                 .record_withdrawal(&call, "pending", attempts, &raw)?;
             self.refresh_health();
@@ -487,7 +492,7 @@ impl HeldWithdrawals {
             let delay = Duration::from_millis(
                 cortexkit_role_tool_provider::errors::withdraw_retry_delay_ms(error, backoff_ms),
             );
-            self.retry_later(call, attempts, delay, stopping.clone());
+            self.retry_later(call, attempts, given, delay, stopping.clone());
             return Ok(1);
         }
         let failed = matches!(
@@ -508,6 +513,7 @@ impl HeldWithdrawals {
         &self,
         call: LateResultRegistration,
         attempts: u32,
+        session_identity: Option<bool>,
         delay: Duration,
         stopping: tokio_util::sync::CancellationToken,
     ) {
@@ -530,7 +536,8 @@ impl HeldWithdrawals {
                 .expect("withdrawal waiting")
                 .remove(&key);
             if !stopping.is_cancelled() {
-                if let Err(error) = this.drive(call, Some(attempts)).await {
+                let known = session_identity.map(|identity| Ok(Some(identity)));
+                if let Err(error) = this.drive_with(call, Some(attempts), known).await {
                     this.health.lock().expect("withdrawal health")["error"] = json!(error);
                 }
             }
@@ -583,6 +590,31 @@ impl Drop for Active<'_> {
             .lock()
             .expect("withdrawal active")
             .remove(&self.key);
+    }
+}
+
+#[async_trait]
+impl crate::retention::WithdrawBeforeDelete for HeldWithdrawals {
+    /// Sends one withdrawal for each of `calls` at once, each bounded by the attempt timeout,
+    /// with the identity read from the session's plan before it is deleted. A call already
+    /// withdrawn, or never registered here, is skipped. One the provider asks to ask again is
+    /// retried later with that same identity, since the session can't be read any more.
+    async fn withdraw_before_delete(&self, calls: Vec<crate::retention::HeldAtDeletion>) {
+        let attempts = calls.into_iter().map(|held| async move {
+            let call = match self.store.withdrawal_call(&held.module, &held.call_key) {
+                Ok(Some(call)) => call,
+                Ok(None) => return,
+                Err(error) => {
+                    self.health.lock().expect("withdrawal health")["error"] = json!(error);
+                    return;
+                }
+            };
+            let known = Some(Ok(Some(held.session_identity)));
+            if let Err(error) = self.drive_with(call, None, known).await {
+                self.health.lock().expect("withdrawal health")["error"] = json!(error);
+            }
+        });
+        futures::future::join_all(attempts).await;
     }
 }
 

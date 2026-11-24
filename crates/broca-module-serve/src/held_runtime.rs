@@ -290,6 +290,11 @@ impl HeldRuntime {
             .expect("held runtime health") = Arc::downgrade(self);
     }
 
+    /// What withdraws a session's held calls before retention or an operator deletes it.
+    pub fn withdraw_before_delete(&self) -> Arc<dyn broca_module::retention::WithdrawBeforeDelete> {
+        self.withdrawals.clone()
+    }
+
     pub fn bind_stopping_signal(&self, stopping: tokio_util::sync::CancellationToken) {
         self.withdrawals.bind_stopping_signal(stopping);
     }

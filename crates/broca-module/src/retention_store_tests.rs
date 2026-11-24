@@ -932,3 +932,122 @@ async fn the_operator_deletes_a_session_that_holds_no_work() {
     }
     assert_eq!(delete(rig.key("never")).await, OperatorDeletion::Absent);
 }
+
+/// Records what a deletion asked it to withdraw, and whether the session was still there then.
+struct SeenWithdrawals {
+    runtime: Arc<StoreRuntime>,
+    key: BindIdentity,
+    seen: std::sync::Mutex<Vec<(crate::retention::HeldAtDeletion, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::retention::WithdrawBeforeDelete for SeenWithdrawals {
+    async fn withdraw_before_delete(&self, calls: Vec<crate::retention::HeldAtDeletion>) {
+        let there = self.runtime.class_of(&self.key).unwrap().is_some();
+        self.seen
+            .lock()
+            .unwrap()
+            .extend(calls.into_iter().map(|call| (call, there)));
+    }
+}
+
+/// A provider keeps running a held call after the session's routes close, and nothing collects
+/// its result once the session is gone, so a deletion first withdraws every call a provider
+/// still holds, while the ledger still names it. A held call that completed owes nothing.
+#[tokio::test]
+async fn a_deletion_withdraws_the_calls_a_provider_still_holds_first() {
+    use broca_protocol::ToolCallId;
+    use broca_session_store::record::{CallOutcome, ToolHeld, ToolIntent, ToolOutcome};
+    let rig = Rig::new("withdraw-first", Duration::from_secs(600)).await;
+    let key = rig.key("held");
+    let intent = |id: &str| {
+        Record::ToolIntent(ToolIntent {
+            run_id: "r1".into(),
+            batch_id: "b".into(),
+            tool_call_id: ToolCallId(id.into()),
+            tool_name: Some("ask".into()),
+            module_id: Some("tools".into()),
+            args_digest: broca_session_store::codec::Digest([0; 32]),
+            args: None,
+            call_key: Some(format!("lineage:{id}")),
+            approval_digest: None,
+            dispatched_at_ms: Some(STARTED_MS),
+            schema_pin: None,
+            hooks: None,
+            key_derived: None,
+        })
+    };
+    let held = |id: &str| {
+        Record::ToolHeld(ToolHeld {
+            batch_id: "b".into(),
+            tool_call_id: ToolCallId(id.into()),
+            call_key: format!("lineage:{id}"),
+            module: "tools".into(),
+            reason: "running".into(),
+            detail_digest: None,
+            held_at_ms: STARTED_MS,
+            sequential: false,
+        })
+    };
+    let outcome = |id: &str, outcome: CallOutcome| {
+        Record::ToolOutcome(ToolOutcome {
+            yielded_by: None,
+            run_id: "r1".into(),
+            batch_id: "b".into(),
+            tool_call_id: ToolCallId(id.into()),
+            outcome,
+            result_digest: broca_session_store::codec::Digest([0; 32]),
+            is_error: false,
+            reason: Some("provider_held_cancelled".into()),
+            finished_at_ms: Some(ENDED_MS),
+            detail: None,
+            hooks: None,
+            call_key: None,
+        })
+    };
+    let records = [
+        store_start("r1", None, STARTED_MS),
+        intent("done"),
+        intent("open"),
+        held("done"),
+        held("open"),
+        outcome("done", CallOutcome::Completed),
+        outcome("open", CallOutcome::Interrupted),
+        Record::RunEnd(RunEnd {
+            reason: RunFinishReason::Cancelled,
+            ..match store_end("r1", ENDED_MS) {
+                Record::RunEnd(end) => end,
+                _ => unreachable!(),
+            }
+        }),
+        store_billed("r1"),
+    ];
+    rig.seed_in(StorageClass::Durable, &key, &records, false)
+        .await;
+    let seen = Arc::new(SeenWithdrawals {
+        runtime: rig.runtime.clone(),
+        key: key.clone(),
+        seen: Default::default(),
+    });
+    rig.service.set_withdraw_before_delete(seen.clone());
+    let deleted = rig
+        .service
+        .delete_store_session_for_operator(&rig.runtime, &key, DEADLINE_MS, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, crate::retention::store::OperatorDeletion::Deleted);
+    assert!(!rig.holds(&key) && rig.runtime.class_of(&key).unwrap().is_none());
+    assert_eq!(
+        *seen.seen.lock().unwrap(),
+        [(
+            crate::retention::HeldAtDeletion {
+                module: "tools".into(),
+                call_key: "lineage:open".into(),
+                // The run's plan names no session identity for any module.
+                session_identity: false,
+            },
+            true,
+        )],
+        "only the call still held is withdrawn, before the session is deleted"
+    );
+}

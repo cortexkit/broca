@@ -1507,6 +1507,91 @@ async fn a_deleted_sessions_held_calls_are_settled_on_recovery() {
     assert_eq!(store.withdrawal_state("tools", "lineage:4").unwrap(), None);
 }
 
+/// Answers the first withdrawal that the provider is unreachable, and every later one that the
+/// call was withdrawn, recording each call key with whether it named the session.
+#[derive(Default)]
+struct FlakyWithdrawalRoute {
+    seen: Mutex<Vec<(String, bool)>>,
+}
+
+#[async_trait]
+impl crate::held_withdrawals::WithdrawTransport for FlakyWithdrawalRoute {
+    async fn withdraw(
+        &self,
+        call: &LateResultRegistration,
+        session_identity: bool,
+    ) -> (
+        cortexkit_role_tool_provider::withdraw::WithdrawVerdict,
+        Value,
+    ) {
+        use cortexkit_role_tool_provider::withdraw::caller_verdict;
+        let mut seen = self.seen.lock().unwrap();
+        seen.push((call.call_key.clone(), session_identity));
+        if seen.len() == 1 {
+            let error = serde_json::from_value(
+                json!({"code": "target_unavailable", "message": "withdraw route refused"}),
+            )
+            .unwrap();
+            (
+                caller_verdict(Err(&error)),
+                serde_json::to_value(error).unwrap(),
+            )
+        } else {
+            let raw = json!({"answer": "withdrawn"});
+            (caller_verdict(Ok(&raw)), raw)
+        }
+    }
+}
+
+/// A deletion withdraws a held call with the identity read from the session's plan before the
+/// session went. When the provider asks to be asked again, the retry comes after the session is
+/// gone, so it must carry that identity: read again, the deleted session would say the call
+/// owes nothing, and the provider would keep running it.
+#[tokio::test]
+async fn a_withdrawal_before_deletion_is_retried_after_the_session_is_gone() {
+    let bind = session("deleted-retry");
+    let root = rig_root("withdraw-before-delete-retry");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // No root keeps the session any more.
+    let runtime = session_store(&root).await;
+    let store = Arc::new(review_store(&root));
+    store
+        .register_calls(&[registration("lineage:4", "tools", &bind)])
+        .unwrap();
+    let route = Arc::new(FlakyWithdrawalRoute::default());
+    let service = withdrawals(store.clone(), &runtime, route.clone(), Default::default());
+    crate::retention::WithdrawBeforeDelete::withdraw_before_delete(
+        service.as_ref(),
+        vec![crate::retention::HeldAtDeletion {
+            module: "tools".into(),
+            call_key: "lineage:4".into(),
+            session_identity: true,
+        }],
+    )
+    .await;
+    assert_eq!(
+        store.withdrawal_state("tools", "lineage:4").unwrap(),
+        Some(("pending".into(), 1))
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while store.withdrawal_state("tools", "lineage:4").unwrap() != Some(("done".into(), 2)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the retry never came: {:?}",
+            route.seen.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        *route.seen.lock().unwrap(),
+        [
+            ("lineage:4".to_string(), true),
+            ("lineage:4".to_string(), true)
+        ]
+    );
+}
+
 struct DrainWithdrawalRoute {
     seen: std::sync::atomic::AtomicUsize,
     stopping: tokio_util::sync::CancellationToken,

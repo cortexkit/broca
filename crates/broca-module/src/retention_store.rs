@@ -33,6 +33,8 @@ use crate::store_open::StoreRuntime;
 
 #[path = "retention_store_counters.rs"]
 pub(crate) mod counters;
+#[path = "retention_store_held.rs"]
+mod held;
 #[path = "retention_store_deadlines.rs"]
 mod kept;
 #[path = "retention_store_marks.rs"]
@@ -756,9 +758,8 @@ impl RetentionService {
 
     /// Deletes the session `key` at `addr` for the operator, when it holds no work a deletion
     /// would lose: no run active or paused, no queued send, no spend still to export. With
-    /// `paused_run`, a paused run is deleted too, unless it waits on calls a provider holds.
-    /// broca still owes such a provider a `tool.withdraw` telling it to stop each call, and
-    /// deleting the session would lose that duty. It may be
+    /// `paused_run`, a paused run is deleted too, unless it waits on calls a provider holds:
+    /// that run is still waiting for their results, which the provider may yet deliver. It may be
     /// kept in either storage class, with or without a retention policy. Deletion is
     /// retention's: the expiry marker first (dated `now_ms`), so reads of its runs answer expired
     /// and a session created at the address later carries its counter floors, then what a move
@@ -855,6 +856,17 @@ impl RetentionService {
     ) -> Result<(), String> {
         let state_root = runtime.state_root();
         let deployment = runtime.deployment();
+        // While the ledger still names them, so each withdrawal can say whose call it is.
+        if let Some(withdraw) = self.withdraw.get() {
+            let class = runtime
+                .class_of(key)
+                .map_err(|error| error.to_string())?
+                .ok_or("the deleted session has no storage class")?;
+            let calls = held::held_at_deletion(runtime, class, view.head().cipher(), records);
+            if !calls.is_empty() {
+                withdraw.withdraw_before_delete(calls).await;
+            }
+        }
         let next_tag = counters::next_tag(records)?.unwrap_or(1);
         let next_notice_seq = records
             .iter()

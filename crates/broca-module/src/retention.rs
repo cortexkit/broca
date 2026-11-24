@@ -117,11 +117,32 @@ type EvictCaches = dyn Fn(&BindIdentity) + Send + Sync;
 type AcquireLease = dyn Fn(&BindIdentity) -> Result<Box<dyn LeaseHandle>, String> + Send + Sync;
 
 /// Shared by actors and the registry. A deletion holds the session's lease.
+/// A call a provider still holds for a session about to be deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldAtDeletion {
+    pub module: String,
+    pub call_key: String,
+    /// Whether the withdrawal names the session, as the call's run plan declared for `module`.
+    pub session_identity: bool,
+}
+
+/// Withdraws the held calls of a session about to be deleted, while its ledger still names
+/// them. A provider keeps running a held call after its route closes (tool-provider contract,
+/// custody of keyed calls), and once the session is gone nothing would ever collect the result,
+/// so each is withdrawn first. The deletion waits for one attempt per call, bounded, and goes
+/// ahead whatever the answer; a withdrawal still owed is retried after the deletion.
+#[async_trait::async_trait]
+pub trait WithdrawBeforeDelete: Send + Sync {
+    async fn withdraw_before_delete(&self, calls: Vec<HeldAtDeletion>);
+}
+
 pub struct RetentionService {
     /// Addresses of sessions whose records couldn't be read to decide their expiry.
     unreadable: Mutex<HashSet<String>>,
     pub clock: Clock,
     evict: std::sync::OnceLock<Arc<EvictCaches>>,
+    /// Withdraws the calls a provider still holds for a session about to be deleted.
+    withdraw: std::sync::OnceLock<Arc<dyn WithdrawBeforeDelete>>,
     acquire: Arc<AcquireLease>,
     store: store::StoreRetention,
 }
@@ -134,6 +155,7 @@ impl RetentionService {
             unreadable: Mutex::default(),
             clock: Clock::for_state_root(state_root)?,
             evict: std::sync::OnceLock::new(),
+            withdraw: std::sync::OnceLock::new(),
             acquire: Arc::new(move |session| {
                 leases
                     .acquire(&broca_core::lease_key_for(session))
@@ -145,6 +167,12 @@ impl RetentionService {
 
     pub(crate) fn set_evictor(&self, evict: Arc<EvictCaches>) {
         let _ = self.evict.set(evict);
+    }
+
+    /// Installs what withdraws a session's held calls before the session is deleted. Without
+    /// it, a session is deleted without withdrawing them.
+    pub fn set_withdraw_before_delete(&self, withdraw: Arc<dyn WithdrawBeforeDelete>) {
+        let _ = self.withdraw.set(withdraw);
     }
 
     pub(crate) fn lease(&self, key: &BindIdentity) -> Result<Box<dyn LeaseHandle>, String> {
