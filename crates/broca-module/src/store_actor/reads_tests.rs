@@ -1361,6 +1361,41 @@ async fn session_head_serves_the_cursor_a_read_page_serves() {
     );
     assert_eq!(closed_head, head, "closing moved nothing");
 }
+/// A run's part-number rules (whether its requests showed the model numbered parts, and whether
+/// its replies are cleaned of those numbers) are decoded from its render config once: every later
+/// read of the same run's rules, as each page showing the run's messages asks for them, decodes
+/// nothing.
+#[tokio::test]
+async fn a_runs_part_number_rules_are_decoded_once() {
+    let m = module(vec![text_step("a1", "one")]).await;
+    active(m.send("r1", "first").await);
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+    m.close().await;
+    let view = Session::view(m.backend(), m.addr(), &m.triple(), &deployment_key())
+        .await
+        .expect("the session loads");
+    let runtime = m.runtime();
+    let parts = runtime.parts_for(
+        broca_records::session_storage::StorageClass::Ordinary,
+        broca_session_store::keys::Cipher::XChaCha20Poly1305,
+    );
+    let rules = || crate::store_output_refs::run_rules(&view, &*parts, "r1");
+    let before = broca_session_loop::parts::decodes_on_this_thread();
+    let first = rules().await.unwrap();
+    assert!(
+        broca_session_loop::parts::decodes_on_this_thread() > before,
+        "the first read decodes the run's render config"
+    );
+    let after_first = broca_session_loop::parts::decodes_on_this_thread();
+    assert_eq!(rules().await.unwrap(), first);
+    assert_eq!(
+        broca_session_loop::parts::decodes_on_this_thread(),
+        after_first,
+        "a later read of the same run's rules decodes nothing"
+    );
+}
+
 /// Every llm-runner surface serves a store session's history version one above the version its
 /// head stores (`store_exposure::EXPOSURE_EPOCH`), from the session's first read on, and takes a
 /// caller's version back the same way: a page asked for at the served version is served, and one

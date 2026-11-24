@@ -23,15 +23,66 @@ pub async fn run_rules<B: SessionBackend>(
     run_id: &str,
 ) -> Result<Option<broca_protocol::tags::ComputedRules>, String> {
     use broca_session_loop::writer::Writer;
-    let Some(start) = Writer::run_start(session, run_id)
+    let key = (session.head().session_id, run_id.to_owned());
+    if let Some(rules) = RUN_RULES.get(&key) {
+        return Ok(rules);
+    }
+    let rules = match Writer::run_start(session, run_id)
         .await
         .map_err(|error| format!("run {run_id}'s start: {error:?}"))?
-    else {
-        return Ok(None);
+    {
+        None => None,
+        Some(start) => broca_session_loop::run::run_frozen_facts(&start, parts)
+            .map_err(|error| format!("run {run_id}'s config: {error:?}"))?
+            .computed_rules(),
     };
-    let facts = broca_session_loop::run::run_frozen_facts(&start, parts)
-        .map_err(|error| format!("run {run_id}'s config: {error:?}"))?;
-    Ok(facts.computed_rules())
+    RUN_RULES.put(key, rules);
+    Ok(rules)
+}
+
+/// The runs' rules [`run_rules`] read last, by session (its id, minted when it is created, so a
+/// session deleted and created again under the same name is another) and run. A run's start freezes
+/// its rules and nothing changes them, but reading them decodes the run's whole render config, and
+/// a page read asks for the rules of every run on the page: apps reading long histories asked for
+/// thousands of runs' rules again and again (23,392 render config decodes, 625 MB, in the ten
+/// minutes after one restart). Holds at most [`RUN_RULES_KEPT`] runs, the oldest forgotten first.
+static RUN_RULES: std::sync::LazyLock<KeptRules> = std::sync::LazyLock::new(Default::default);
+
+const RUN_RULES_KEPT: usize = 16_384;
+
+type RulesKey = (broca_session_store::codec::Id128, String);
+
+#[derive(Default)]
+struct KeptRules(std::sync::Mutex<KeptRulesInner>);
+
+#[derive(Default)]
+struct KeptRulesInner {
+    rules: std::collections::HashMap<RulesKey, Option<broca_protocol::tags::ComputedRules>>,
+    order: std::collections::VecDeque<RulesKey>,
+}
+
+impl KeptRules {
+    fn lock(&self) -> std::sync::MutexGuard<'_, KeptRulesInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn get(&self, key: &RulesKey) -> Option<Option<broca_protocol::tags::ComputedRules>> {
+        self.lock().rules.get(key).copied()
+    }
+
+    fn put(&self, key: RulesKey, rules: Option<broca_protocol::tags::ComputedRules>) {
+        let mut kept = self.lock();
+        if kept.rules.insert(key.clone(), rules).is_none() {
+            kept.order.push_back(key);
+        }
+        while kept.order.len() > RUN_RULES_KEPT {
+            if let Some(oldest) = kept.order.pop_front() {
+                kept.rules.remove(&oldest);
+            }
+        }
+    }
 }
 
 /// Where part number `tag` sits as the run that numbered it showed it: the message whose
