@@ -3,12 +3,15 @@
 use super::*;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::fold::operations::{Resolution, Run};
-use broca_session_store::record::{CallOutcome, Record, ToolHeld, ToolIntent};
+use broca_session_store::record::{CallOutcome, Record, RunStart, ToolHeld, ToolIntent};
 use broca_session_store::session::{Session, SessionError};
 
 /// Extend a lost-database rebuild with every backup class's `broca-session-store` inventory.
-/// Only the latest open batch can still accept an answer; read its durable dispatch records
-/// back to the run's start, which also retains the frozen scope.
+/// The latest open batch can still accept an answer; read its durable dispatch records back to
+/// the run's start, which also retains the frozen scope. Runs started within
+/// [`REBUILD_WINDOW`] are read too, for what they still owe a provider after they finished (see
+/// [`rebuild_registrations`]); a session whose latest run started before it is not read at all
+/// unless that run is still open.
 /// The caller must keep intake fenced until this scan succeeds.
 pub async fn rebuild_store_from_sessions_with_progress(
     store: &LateResultsStore,
@@ -56,7 +59,7 @@ pub async fn rebuild_store_from_sessions_with_progress(
                 .await
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or("inventoried session disappeared")?;
-            let calls = rebuild_registrations(&view, &bind).await?;
+            let calls = rebuild_registrations(&view, &bind, crate::actor::epoch_ms()).await?;
             for call in &calls {
                 store.ensure_feed(&call.module, true)?;
             }
@@ -78,75 +81,129 @@ pub async fn rebuild_store_from_sessions_with_progress(
     Ok(())
 }
 
+/// How far back a lost-database rebuild looks for what a finished run still owes a provider: the
+/// terminal of a call handed back for the person's steer, which is delivered as a notice, and the
+/// withdrawal of a held call its run cancelled or ended around. The normal paths keep both for as
+/// long as they are owed, but a rebuild has only the sessions' records to find them in, and
+/// reading every session's whole history would make its cost grow with that history.
+///
+/// The provider contract keeps a settled result unacked for 24 hours after it settled
+/// (tool-provider `CONTRACT.md` §7, "Retention"). It bounds neither how long a held call may run
+/// nor how long a withdrawal may stay owed, and broca puts no bound of its own on a hold
+/// (`docs/module-surface.md`, "Ack guarantee, narrowed"). Seven days covers that day with a wide
+/// margin for a provider slow to settle a call or to answer a withdrawal. An obligation of a run
+/// started earlier is lost with the database: a handed-back call's late entry is then acked
+/// without a notice, and a withdrawal owed for a call cancelled that long ago is not sent again,
+/// so its provider's work runs to its end and its result is acked without delivery. A run still
+/// open is rebuilt however long ago it started, since its batch waits for its answer.
+pub(crate) const REBUILD_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The registrations a lost database held for the session `view` at `bind`, rebuilt from its
+/// records as of `now_ms`: every call of its open batch still waiting on its provider; and, of
+/// the runs started within [`REBUILD_WINDOW`], every call handed back for the person's steer
+/// whose notice isn't in the session yet, and every held call its provider never answered,
+/// which may still be owed a withdrawal. Each comes with its withdrawal watch, as a registration
+/// made at dispatch does, so the intake and withdrawal recovery treat it as they would have:
+/// the intake retires the registration of a call whose run ended and keeps its watch, and
+/// recovery withdraws the call if the session shows it was cancelled while held.
 async fn rebuild_registrations(
     view: &broca_session_store::session::SessionView<broca_session_store::backend::LocalBackend>,
     bind: &BindIdentity,
+    now_ms: u64,
 ) -> Result<Vec<LateResultRegistration>, String> {
-    let Some(run) = view
-        .operations
-        .run
-        .as_ref()
-        .filter(|run| run.finished.is_none() && run.cancel.is_none())
-    else {
+    let Some(latest) = view.operations.run.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(batch) = &run.open_batch else {
-        return Ok(Vec::new());
+    let since_ms = now_ms.saturating_sub(REBUILD_WINDOW.as_millis() as u64);
+    // A start that records no time can't be shown to be old, so its run is read.
+    let recent = |start: &RunStart| {
+        start
+            .written_at_ms
+            .or(start.ts_ms)
+            .is_none_or(|at| at >= since_ms)
     };
-    if batch
-        .calls
-        .iter()
-        .any(|call| call.held_reply.is_some() && (!call.intent || call.key.is_none()))
-    {
-        return Err("open held call has no intent or call key".into());
+    let open = (latest.finished.is_none() && latest.cancel.is_none())
+        .then_some(latest.open_batch.as_ref())
+        .flatten();
+    if let Some(batch) = open {
+        if batch
+            .calls
+            .iter()
+            .any(|call| call.held_reply.is_some() && (!call.intent || call.key.is_none()))
+        {
+            return Err("open held call has no intent or call key".into());
+        }
     }
-    let keys: Vec<_> = batch
-        .calls
+    let waiting: Vec<&String> = open
         .iter()
+        .flat_map(|batch| &batch.calls)
         .filter(|call| call.intent && call.terminal.is_none())
         .filter_map(|call| call.key.as_ref())
         .collect();
-    if keys.is_empty() {
+    if waiting.is_empty() && !latest.start.as_ref().is_none_or(&recent) {
         return Ok(Vec::new());
     }
+    // Back to the oldest run started within the window, or to the open run's start, whichever
+    // is further.
     let mut records = view
-        .ledger_tail_until(
-            |record| matches!(record, Record::RunStart(start) if start.run_id == run.run_id),
-        )
+        .ledger_tail_until(|record| matches!(record, Record::RunStart(start) if !recent(start)))
         .await
         .map_err(|error| format!("{error:?}"))?;
     records.reverse();
-    let start = records
+    let open_run = open.map(|_| latest.run_id.as_str());
+    // The frozen scope of each run whose calls are rebuilt, decoded only for a call registered.
+    let scopes: HashMap<String, Option<serde_json::Value>> = records
         .iter()
-        .find_map(|(_, record)| match record {
-            Record::RunStart(start) if start.run_id == run.run_id => Some(start),
+        .filter_map(|(_, record)| match record {
+            Record::RunStart(start) if recent(start) || Some(start.run_id.as_str()) == open_run => {
+                Some((start.run_id.clone(), start.scope.clone()))
+            }
             _ => None,
         })
-        .ok_or("open run has no durable start")?;
-    let scope: Option<broca_protocol::SessionScope> = start
-        .scope
-        .clone()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| format!("invalid frozen run scope: {error}"))?;
+        .collect();
+    if open_run.is_some_and(|run| !scopes.contains_key(run)) {
+        return Err("open run has no durable start".into());
+    }
+    let keys: Vec<String> = records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            Record::ToolIntent(intent) if scopes.contains_key(&intent.run_id) => {
+                intent.call_key.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    if waiting.iter().any(|key| !keys.contains(*key)) {
+        return Err("open call has no durable intent".into());
+    }
     let lineage = StoredLineage::Readable {
         records,
-        run: Some(Box::new(run.clone())),
+        run: Some(Box::new(latest.clone())),
+        foreign: Vec::new(),
     };
     let mut registrations = Vec::new();
-    for key in keys {
-        let call = lineage.call(key).ok_or("open call has no durable intent")?;
-        if call.intent.run_id != run.run_id || call.intent.batch_id != batch.batch_id {
+    for key in &keys {
+        let call = lineage
+            .call(key)
+            .ok_or("rebuilt call has no durable intent")?;
+        if waiting.contains(&key)
+            && open.is_some_and(|batch| {
+                call.intent.run_id != latest.run_id || call.intent.batch_id != batch.batch_id
+            })
+        {
             return Err("open call intent belongs to another run or batch".into());
         }
-        if call.terminal || call.run_ended || call.closing {
+        let waits = waiting.contains(&key) && !call.terminal && !call.run_ended && !call.closing;
+        let unnoticed = call.yielded_by.is_some() && !call.noticed;
+        let withdrawable = call.held.is_some() && (!call.terminal || call.held_closed);
+        if !(waits || unnoticed || withdrawable) {
             continue;
         }
         let module = call
             .held
-            .as_ref()
-            .map(|held| &held.module)
-            .or(call.intent.module_id.as_ref());
+            .map(|held| held.module.as_str())
+            .or(call.yielded_by)
+            .or(call.intent.module_id.as_deref());
         let Some(module) = module else {
             continue;
         };
@@ -164,12 +221,19 @@ async fn rebuild_registrations(
         let (lineage, _) = key
             .rsplit_once(':')
             .ok_or("registered call key has no lineage")?;
+        let scope: Option<broca_protocol::SessionScope> = scopes
+            .get(&call.intent.run_id)
+            .cloned()
+            .flatten()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| format!("invalid frozen run scope: {error}"))?;
         registrations.push(LateResultRegistration {
             lineage: lineage.into(),
             call_key: key.clone(),
-            module: module.clone(),
+            module: module.to_owned(),
             bind: bind.clone(),
-            scope: scope.clone(),
+            scope,
         });
     }
     Ok(registrations)
@@ -179,6 +243,9 @@ pub(super) enum StoredLineage {
     Readable {
         records: Vec<(u64, Record)>,
         run: Option<Box<Run>>,
+        /// Registered keys an earlier session at this triple minted: that session was deleted,
+        /// so nothing of theirs can be delivered any more.
+        foreign: Vec<String>,
     },
     Unreadable,
 }
@@ -222,16 +289,55 @@ pub fn is_notice_send_id(send_id: &str) -> bool {
 pub struct HeldCallRecords {
     records: Vec<(u64, Record)>,
     run: Option<Box<Run>>,
+    /// The keys that belong to an earlier session at this triple (see [`held_call_records`]).
+    foreign: Vec<String>,
 }
 
 /// The [`HeldCallRecords`] of the calls `call_keys` names in `session`. The read walks the ledger
 /// back from its newest record and stops at the run start of the oldest call's run: it holds
 /// every record of the runs the calls were made in, and nothing earlier.
+///
+/// A key that names neither this session's id nor the lineage it was converted from, and whose
+/// intent this session doesn't hold, was minted by a session deleted from this triple before
+/// this one was created there. Such a key is set apart, not looked for: the walk would never
+/// find it, and would read the whole ledger looking.
 pub async fn held_call_records<B: SessionBackend>(
     session: &Session<B>,
     call_keys: &[String],
 ) -> Result<HeldCallRecords, SessionError> {
-    let mut keys: HashSet<&str> = call_keys.iter().map(String::as_str).collect();
+    let own = broca_session_store::codec::hex(&session.head().session_id.0);
+    let converted = session.operations.source_lineage.as_deref();
+    let mut foreign = Vec::new();
+    for key in call_keys {
+        let lineage = key.rsplit_once(':').map(|(lineage, _)| lineage);
+        if lineage.is_some_and(|lineage| lineage == own || Some(lineage) == converted) {
+            continue;
+        }
+        // A key this session's lineage didn't mint may still be its own: a converted session's
+        // keys made before its source lineage was recorded name only the old log. Its intent
+        // says so, found through the id index rather than the walk.
+        let named = session
+            .find_id(broca_session_store::idindex::IdKind::CallKey, key)
+            .await?;
+        if !named
+            .iter()
+            .any(|(_, record)| matches!(record, Record::ToolIntent(_)))
+        {
+            foreign.push(key.clone());
+        }
+    }
+    let mut keys: HashSet<&str> = call_keys
+        .iter()
+        .map(String::as_str)
+        .filter(|key| !foreign.iter().any(|foreign| foreign == key))
+        .collect();
+    if keys.is_empty() {
+        return Ok(HeldCallRecords {
+            records: Vec::new(),
+            run: session.operations.run.clone().map(Box::new),
+            foreign,
+        });
+    }
     let mut oldest_run = None;
     let mut records = session
         .ledger_tail_until(|record| match record {
@@ -254,6 +360,7 @@ pub async fn held_call_records<B: SessionBackend>(
     Ok(HeldCallRecords {
         records,
         run: session.operations.run.clone().map(Box::new),
+        foreign,
     })
 }
 
@@ -274,10 +381,17 @@ impl StoredLineage {
                 Some(Self::Readable {
                     records: held.records,
                     run: held.run,
+                    foreign: held.foreign,
                 })
             }
             Ok(Some(_)) | Err(_) => Some(Self::Unreadable),
         }
+    }
+
+    /// Whether the call `key` names was made in a session deleted from this triple before the
+    /// one there now was created.
+    fn foreign(&self, key: &str) -> bool {
+        matches!(self, Self::Readable { foreign, .. } if foreign.iter().any(|foreign| foreign == key))
     }
 
     fn call(&self, key: &str) -> Option<Call<'_>> {
@@ -373,9 +487,12 @@ impl StoredLineage {
         // A missing intent or unreadable store may hide a hold. A readable ordinary dispatch
         // starts no feed; its held-record callback starts one if the provider later holds it. A
         // call handed back for the person's steer needs the feed until its notice is in the
-        // session, since its provider's own terminal for it is still owed.
-        self.call(key)
-            .is_none_or(|call| call.held.is_some() || (call.yielded_by.is_some() && !call.noticed))
+        // session, since its provider's own terminal for it is still owed. A call of a deleted
+        // session needs nothing more.
+        !self.foreign(key)
+            && self.call(key).is_none_or(|call| {
+                call.held.is_some() || (call.yielded_by.is_some() && !call.noticed)
+            })
     }
 
     /// Whether the call finished without its provider holding it. A handed-back call didn't:
@@ -388,13 +505,19 @@ impl StoredLineage {
     /// Whether no withdrawal can ever be owed for the call: its provider answered it, or no
     /// provider ever held it. A held call the run closed itself (a cancel or stop wrote its
     /// terminal), or one left unfinished when its run ended, may be owed one, since a closed
-    /// hold is withdrawn, so its watch stays for withdrawal to settle.
+    /// hold is withdrawn, so its watch stays for withdrawal to settle. A deleted session's call
+    /// was withdrawn, if it was owed, before the session went.
     pub(super) fn withdrawal_never_owed(&self, key: &str) -> bool {
-        self.call(key)
-            .is_some_and(|call| call.held.is_none() || (call.terminal && !call.held_closed))
+        self.foreign(key)
+            || self
+                .call(key)
+                .is_some_and(|call| call.held.is_none() || (call.terminal && !call.held_closed))
     }
 
     pub(super) fn retirement_reason(&self, key: &str) -> Option<&'static str> {
+        if self.foreign(key) {
+            return Some("session_deleted");
+        }
         let call = self.call(key)?;
         // A handed-back call's registration lives until its notice is in the session, however
         // its run ended: a Stop ends the turn only.
@@ -419,6 +542,10 @@ impl StoredLineage {
         let Self::Readable { run, .. } = self else {
             return Classified::Blocked("session_store_unreadable".into());
         };
+        // As for a session no root holds any more: nothing of a deleted session can be delivered.
+        if self.foreign(&entry.call_key) {
+            return settled_without_delivery(module, entry, "session_deleted");
+        }
         let Some(call) = self.call(&entry.call_key) else {
             return Classified::Blocked("intent_missing".into());
         };

@@ -104,8 +104,31 @@ async fn closed_read_fixture(
     name: &str,
     max_bytes: u64,
 ) -> (PathBuf, Arc<StoreRuntime>, LineageRegistry, BindIdentity) {
+    closed_read_fixture_in(name, max_bytes, StorageClass::Ordinary, None, Vec::new()).await
+}
+
+/// The retention clock's time in [`closed_read_fixture_in`]'s state root: later than every
+/// record the fixture writes.
+#[cfg(feature = "test-clock")]
+const FIXTURE_NOW_MS: u64 = 1_800_000_000_000;
+
+/// [`closed_read_fixture`], kept in the root of `class`, whose runs start with `retention_secs`,
+/// with `extra` appended. The retention clock reads [`FIXTURE_NOW_MS`].
+#[cfg(feature = "test-clock")]
+async fn closed_read_fixture_in(
+    name: &str,
+    max_bytes: u64,
+    class: StorageClass,
+    retention_secs: Option<u64>,
+    extra: Vec<broca_session_store::record::Record>,
+) -> (PathBuf, Arc<StoreRuntime>, LineageRegistry, BindIdentity) {
     use broca_session_store::record::Record;
     let root = state_root(name);
+    std::fs::write(
+        root.join("test-clock"),
+        serde_json::json!({"now_ms": FIXTURE_NOW_MS}).to_string(),
+    )
+    .unwrap();
     let key = key(&root, name);
     let memory = broca_session_store::backend::MemoryBackend::default();
     let addr = SessionAddr(broca_core::session_addr(&key));
@@ -124,6 +147,10 @@ async fn closed_read_fixture(
                 "tools": [], "tool_choice": {"type": "auto"}, "generation": {},
                 "response_format": {"type": "text"}, "context_epoch": 0
             }}));
+            if retention_secs.is_some() {
+                start.retention_secs = retention_secs;
+                start.ts_ms = Some(1_700_000_000_000);
+            }
         }
         if let Record::EntryFacts(facts) = record {
             if facts.native {
@@ -132,7 +159,7 @@ async fn closed_read_fixture(
         }
     }
     let mut session = Session::create(
-        LocalBackend::new(StorageClass::Ordinary.store_root(&root)),
+        LocalBackend::new(class.store_root(&root)),
         addr,
         triple(&key),
         &deployment(),
@@ -145,6 +172,7 @@ async fn closed_read_fixture(
             &records
                 .into_iter()
                 .map(|(_, record)| record)
+                .chain(extra)
                 .collect::<Vec<_>>(),
             true,
         )
@@ -278,6 +306,156 @@ async fn a_closed_sessions_head_reads_its_log_once_per_position() {
     let moved = registry.head_for(&key, None, &scope).await.unwrap();
     assert_eq!(moved.last_run_state.unwrap().run_id, "later");
     assert!(runtime.log_reads.load(Ordering::Relaxed) > read);
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Ten years, in seconds: retention that keeps a fixture's session well past its clock.
+#[cfg(feature = "test-clock")]
+const TEN_YEARS: u64 = 10 * 365 * 24 * 60 * 60;
+
+/// Moves the retention clock of `registry`'s module to `now_ms`.
+#[cfg(feature = "test-clock")]
+fn advance_clock(root: &Path, registry: &LineageRegistry, now_ms: u64) {
+    std::fs::write(
+        root.join("test-clock"),
+        serde_json::json!({"now_ms": now_ms}).to_string(),
+    )
+    .unwrap();
+    let retention = registry.handle().retention_service().unwrap();
+    assert!(retention.clock.refresh().unwrap());
+}
+
+/// A closed session in the ephemeral root keeps its head as one kept elsewhere does, while its
+/// deadline at its position hasn't come: asking again reads no log, even when its view is too
+/// large to keep, since its deadline there is kept too. Once the deadline comes, the kept head
+/// isn't served: the read refuses the session as expired, as every other read does.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn a_closed_ephemeral_sessions_head_reads_its_log_once_per_position() {
+    use crate::serve::ServeHandler;
+    use std::sync::atomic::Ordering;
+    // No view fits the cache, so only a kept head can spare a read.
+    let (root, runtime, registry, key) = closed_read_fixture_in(
+        "kept-ephemeral-heads",
+        1,
+        StorageClass::Ephemeral,
+        Some(TEN_YEARS),
+        Vec::new(),
+    )
+    .await;
+    let scope = broca_protocol::SendScope::default();
+    runtime.log_reads.store(0, Ordering::Relaxed);
+    let first = registry.head_for(&key, None, &scope).await.unwrap();
+    let read = runtime.log_reads.load(Ordering::Relaxed);
+    assert!(read > 0, "the first head reads the log");
+    assert_eq!(registry.head_for(&key, None, &scope).await.unwrap(), first);
+    assert_eq!(
+        runtime.log_reads.load(Ordering::Relaxed),
+        read,
+        "a repeat at the same position reads no log"
+    );
+
+    advance_clock(&root, &registry, FIXTURE_NOW_MS + 2 * TEN_YEARS * 1_000);
+    let expired = registry.head_for(&key, None, &scope).await;
+    assert!(
+        matches!(expired, Err(crate::serve::ServeError::Expired { .. })),
+        "{expired:?}"
+    );
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// The expiry check every operation makes decides a closed session's deadline by the rule
+/// retention's pass deletes it by. A storage policy its owner froze replaces the older retention
+/// seconds, so a session kept forever is still read once those seconds have passed. A release
+/// ends any policy, and a session it made due reads as not there at all, before the pass
+/// deletes it as after, while one the older seconds made due reads as expired.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn the_expiry_check_decides_by_the_rule_retention_deletes_by() {
+    use crate::registry::OpenError;
+    use broca_session_store::record::{Record, Retention, RetentionEvent};
+    use cortexkit_role_llm_runner::session_retention::{Keep, RetentionPolicy};
+    const AT_MS: u64 = 1_700_000_000_000;
+    let fixture = |name: &'static str, retention_secs: Option<u64>, extra: Vec<Record>| {
+        closed_read_fixture_in(
+            name,
+            crate::store_reads::ViewCache::MAX_BYTES,
+            StorageClass::Ephemeral,
+            retention_secs,
+            extra,
+        )
+    };
+
+    let forever = RetentionPolicy::new(Keep::forever(), 0, false, false);
+    let (root, runtime, registry, key) = fixture(
+        "expiry-forever",
+        Some(1),
+        vec![Record::Retention(Retention {
+            event: RetentionEvent::Set,
+            at_ms: AT_MS,
+            policy: Some(serde_json::to_value(forever).unwrap()),
+        })],
+    )
+    .await;
+    let kept = registry.check_expired(&key, None).await;
+    assert!(kept.is_ok(), "a session kept forever: {kept:?}");
+    assert_eq!(registry.sweep_once(FIXTURE_NOW_MS).await.unwrap(), 0);
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+
+    let days = RetentionPolicy::new(Keep::days(1), 0, false, false);
+    let ended_by = [
+        (
+            "expiry-released",
+            Retention {
+                event: RetentionEvent::Released,
+                at_ms: AT_MS,
+                policy: None,
+            },
+        ),
+        (
+            "expiry-days",
+            Retention {
+                event: RetentionEvent::Set,
+                at_ms: AT_MS,
+                policy: Some(serde_json::to_value(days).unwrap()),
+            },
+        ),
+    ];
+    for (name, retention) in ended_by {
+        let (root, runtime, registry, key) =
+            fixture(name, None, vec![Record::Retention(retention)]).await;
+        for swept in [false, true] {
+            if swept {
+                assert_eq!(registry.sweep_once(FIXTURE_NOW_MS).await.unwrap(), 1);
+            }
+            let gone = registry.check_expired(&key, None).await;
+            assert!(
+                matches!(gone, Err(OpenError::UnknownSession)),
+                "{name}, swept: {swept}: {gone:?}"
+            );
+        }
+        drop(registry);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    let (root, runtime, registry, key) = fixture("expiry-legacy", Some(1), Vec::new()).await;
+    for swept in [false, true] {
+        if swept {
+            assert_eq!(registry.sweep_once(FIXTURE_NOW_MS).await.unwrap(), 1);
+        }
+        let expired = registry.check_expired(&key, None).await;
+        assert!(
+            matches!(expired, Err(OpenError::Expired { .. })),
+            "a session past its retention seconds, swept: {swept}: {expired:?}"
+        );
+    }
     drop(registry);
     drop(runtime);
     std::fs::remove_dir_all(root).unwrap();

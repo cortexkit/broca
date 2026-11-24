@@ -1,19 +1,22 @@
 //! The last-known-good catalog on disk: read at boot, written after each accepted refresh.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use broca_owner_only::OpenOptions;
 
-use super::{loaded, CatalogRefreshError, CatalogSource, FusiformCatalogResponse, RowExclusion};
+use super::{CatalogRefreshError, FusiformCatalogResponse, RowExclusion, ServingCatalog};
 
 pub(super) fn load_lkg(path: &Path) -> Result<Option<FusiformCatalogResponse>, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let mut file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("read {}: {error}", path.display())),
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|error| format!("decode {}: {error}", path.display()))
@@ -44,7 +47,7 @@ pub(super) fn persist_bootable_lkg(
             }
         }
     }
-    loaded(&persisted, CatalogSource::LastKnownGood, None)?;
+    ServingCatalog::from_fusiform(&persisted.models, None)?;
     persist_lkg(path, &persisted)
 }
 
@@ -54,7 +57,10 @@ pub(super) fn persist_lkg(
 ) -> Result<(), CatalogRefreshError> {
     let bytes = serde_json::to_vec(response)
         .map_err(|error| CatalogRefreshError::Serialize(error.to_string()))?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let create_parent = broca_owner_only::create_dir_all(parent);
     create_parent.map_err(|error| CatalogRefreshError::Persist {
         path: path.to_path_buf(),
@@ -73,7 +79,8 @@ pub(super) fn persist_lkg(
         let mut file = options.open(&temp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, path)
+        fs::rename(&temp, path)?;
+        broca_records::fs_ops::sync_dir(parent)
     })();
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temp);

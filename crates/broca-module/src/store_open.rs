@@ -491,7 +491,7 @@ impl StoreRuntime {
 
     /// Only lower the cache cap, so a small fixture can exercise an uncached read.
     #[cfg(all(test, feature = "test-clock"))]
-    fn with_view_bytes_for_test(mut self, max_bytes: u64) -> Self {
+    pub(crate) fn with_view_bytes_for_test(mut self, max_bytes: u64) -> Self {
         assert!(max_bytes <= crate::store_reads::ViewCache::MAX_BYTES);
         self.views = crate::store_reads::ViewCache::new(
             crate::store_reads::ViewCache::MAX_ENTRIES,
@@ -585,11 +585,13 @@ impl StoreRuntime {
         &self.heads
     }
 
-    /// Where the session `key` stands now, when no actor holds it and it is kept outside the
-    /// ephemeral root: the position a kept head is matched against, read from the session's head
-    /// and its open log's length alone. `None` otherwise, and for anything this cheap read can't
-    /// settle (a session moving, moved or needing a recovery), which the full read answers. An
-    /// ephemeral session is left out because whether it has expired is read from its whole view.
+    /// Where the session `key` stands now, when no actor holds it: the position a kept head is
+    /// matched against, read from the session's head and its open log's length alone. `None`
+    /// otherwise, and for anything this cheap read can't settle (a session moving, moved or
+    /// needing a recovery), which the full read answers. A kept head skips the expiry check
+    /// every other read makes, so a session in the ephemeral root, which can expire while it
+    /// stays put, is left out once its deadline at this position has come. That deadline is
+    /// read from its records once per position (see [`Self::deadline_of`]).
     pub(crate) async fn closed_position(
         &self,
         registry: &crate::LineageRegistry,
@@ -599,13 +601,25 @@ impl StoreRuntime {
             return None;
         }
         let class = self.class_of(key).ok()??;
-        if class == StorageClass::Ephemeral {
-            return None;
-        }
         let addr = SessionAddr(broca_core::session_addr(key));
-        Session::stored_position(&self.backend(class), &addr, self.deployment())
+        let position = Session::stored_position(&self.backend(class), &addr, self.deployment())
             .await
-            .ok()?
+            .ok()??;
+        // Without retention nothing expires, as the expiry check finds.
+        let retention = registry.handle().retention_service();
+        if let (StorageClass::Ephemeral, Some(retention)) = (class, retention) {
+            let deadline = match retention.kept_deadline(&addr.0, &position) {
+                Some(deadline) => deadline,
+                None => {
+                    let view = self.view_at(key, class, position, "expiry").await.ok()?;
+                    self.deadline_of(key, &view, Some(&retention)).await.ok()?
+                }
+            };
+            if deadline.is_some_and(|deadline| deadline <= retention.clock.now_ms()) {
+                return None;
+            }
+        }
+        Some(position)
     }
 
     /// The session `key`, kept in the root of `class`, as it stood at `position`: the kept view,

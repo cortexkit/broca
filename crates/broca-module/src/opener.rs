@@ -227,10 +227,17 @@ impl<L: LeaseStore + 'static> DefaultOpener<L> {
         let mut held = slot.holding(key)?;
         if let (Some(store), Some(service)) = (&held, registry.retention_service()) {
             let now_ms = service.clock.now_ms();
-            if let Some(expired_at_ms) = store.expired_at(key, None, now_ms).await? {
+            let (expired, view) = store
+                .expiry_with_view(key, None, now_ms, false, Some(service.as_ref()))
+                .await?;
+            if let Some(expired_at_ms) = expired {
                 if status {
-                    return Err(OpenError::Expired { expired_at_ms });
+                    return Err(crate::store_open::StoreRuntime::expired_refusal(
+                        expired_at_ms,
+                        view.as_deref(),
+                    ));
                 }
+                drop(view);
                 if service
                     .delete_store_under_lease(store, key, now_ms)
                     .await

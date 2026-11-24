@@ -4094,6 +4094,38 @@ impl PrincipalRig {
 }
 
 #[tokio::test]
+async fn unknown_method_refusal_does_not_reveal_stored_sessions() {
+    let mut rig = PrincipalRig::start("unknown-method").await;
+    rig.bind(7, Some(other_agent())).await;
+    rig.bind(8, Some(prefrontal_core())).await;
+    let mut refusals = Vec::new();
+    for exists in [false, true] {
+        assert_eq!(rig.exists(), exists);
+        let corr = rig.next_corr();
+        write_req(
+            &mut rig.writer,
+            7,
+            corr,
+            serde_json::json!({"method": "session.unknown", "params": {}}),
+        )
+        .await;
+        let reply = read_one(&mut rig.reader).await;
+        assert_eq!(
+            (reply.header.ty, reply.header.corr),
+            (FrameType::Error, corr)
+        );
+        refusals.push(serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap());
+        if !exists {
+            rig.send(8, "create-session").await;
+            rig.gate.notify_one();
+        }
+    }
+    assert_eq!(refusals[0]["code"], "unknown_method");
+    assert_eq!(refusals[0], refusals[1]);
+    rig.finish().await;
+}
+
+#[tokio::test]
 async fn a_fresh_send_after_terminal_status_is_pending_until_completion_is_processed() {
     let completion = Arc::new(CompletionGate {
         held: Notify::new(),

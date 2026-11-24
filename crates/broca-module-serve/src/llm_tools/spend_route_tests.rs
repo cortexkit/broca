@@ -382,6 +382,60 @@ async fn every_provider_outcome_states_its_spend() {
     }
 }
 
+#[tokio::test]
+async fn internal_retry_does_not_send_again_when_spend_is_unknown() {
+    let attempts = AtomicUsize::new(0);
+    let rig = Rig::new(move || {
+        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            ProviderReply::Status {
+                status: 503,
+                retry_after_ms: Some(0),
+            }
+        } else {
+            ProviderReply::Unconnected("not sent".into())
+        }
+    });
+    let refusal = rig.refuse("retry-spend", arguments()).await;
+    assert_eq!(refusal["code"], "provider_error", "{refusal}");
+    assert_eq!(spend(&refusal), RefusalSpend::ChargeCeiling, "{refusal}");
+    assert_eq!(rig.provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn internal_retry_can_follow_a_proven_unbilled_attempt() {
+    let attempts = AtomicUsize::new(0);
+    let rig = Rig::new(move || {
+        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            ProviderReply::Status {
+                status: 429,
+                retry_after_ms: Some(0),
+            }
+        } else {
+            ProviderReply::Answered(ANSWER.to_vec())
+        }
+    });
+    let answer = rig.send(
+        json!({"name": CLASSIFY_TOOL_NAME, "call_key": "unbilled-retry", "arguments": arguments()}),
+        &stamped(),
+    ).await.unwrap();
+    let answer: Value = serde_json::from_str(answer.get()).unwrap();
+    assert_eq!(answer["cost_usd"], json!(0.0000042));
+    assert_eq!(rig.provider.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn unknown_spend_uses_the_charge_ceiling_on_resend() {
+    let rig = Rig::new(|| ProviderReply::Transport("timed out waiting for a reply".into()));
+    let first = rig.refuse("unknown-spend", arguments()).await;
+    assert_eq!(first["code"], "provider_error", "{first}");
+    assert_eq!(spend(&first), RefusalSpend::ChargeCeiling);
+
+    let again = rig.refuse("unknown-spend", arguments()).await;
+    assert_eq!(again["code"], "cost_exceeded", "{again}");
+    assert_eq!(spend(&again), RefusalSpend::NoSpend);
+    assert_eq!(rig.provider.calls.load(Ordering::SeqCst), 1);
+}
+
 /// A provider answer the tool's result type refuses is refused after its cost was measured,
 /// so the refusal carries that cost: the same number the answer would have carried.
 #[tokio::test]

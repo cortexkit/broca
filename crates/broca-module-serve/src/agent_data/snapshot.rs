@@ -7,15 +7,17 @@
 use std::collections::BTreeMap;
 
 use broca_module::serve::SessionReadRequest;
+use broca_module::store_read::StoredView;
 use broca_protocol::BindIdentity;
 use broca_session_loop::parts::MemoryParts;
-use broca_session_store::backend::SessionAddr;
+use broca_session_store::backend::{SessionAddr, SessionBackend};
 use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::{Input, PartKind, Placement, Record, StepStart};
 use broca_session_store::session::moves::Export;
 use broca_session_store::session::Session;
 use broca_session_store::setup::SetupStore;
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 /// Digest keys. Both machines name each answer the same, so these strings are part of the move
 /// protocol between builds: changing one makes every move refuse until both sides carry it.
@@ -42,8 +44,7 @@ const READ_MODES: [(&str, bool, bool, bool); 5] = [
 const PAGE: u64 = 7;
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-    broca_session_store::codec::hex(&sha2::Sha256::digest(bytes))
+    broca_session_store::codec::hex(&Sha256::digest(bytes))
 }
 
 /// The setup parts `record` names.
@@ -54,6 +55,43 @@ fn named_parts(record: &Record) -> &[broca_session_store::record::PartRef] {
         Record::SessionRefresh(refresh) => &refresh.setup,
         _ => &[],
     }
+}
+
+async fn read_digest<B: SessionBackend>(
+    view: &StoredView<B>,
+    parts: &MemoryParts,
+    bind: &BindIdentity,
+) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    hash.update(b"[");
+    let mut first = true;
+    for (_, display_facts, tools, rich_ui) in READ_MODES {
+        let mut from = 1;
+        loop {
+            let mut request = SessionReadRequest::new(bind.clone(), Some(from), Some(PAGE));
+            request.include_display_facts = display_facts;
+            request.include_tools = tools;
+            request.include_rich_ui = rich_ui;
+            let page = view
+                .serve_page(parts, &request)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            // The move protocol hashes an array of JSON values, not the page structs: retain
+            // the value's member order and the array delimiters, but only hold one page at a time.
+            if !first {
+                hash.update(b",");
+            }
+            first = false;
+            let value = serde_json::to_value(&page).map_err(|e| e.to_string())?;
+            hash.update(serde_json::to_vec(&value).map_err(|e| e.to_string())?);
+            match page.next_from_ordinal {
+                Some(next) if next > from => from = next,
+                _ => break,
+            }
+        }
+    }
+    hash.update(b"]");
+    Ok(broca_session_store::codec::hex(&hash.finalize()))
 }
 
 /// The digests of what `export` answers, read by the same store readers and renderer that serve
@@ -97,29 +135,10 @@ pub async fn store_snapshot(
             );
         }
     }
+    let position = view.position();
+    let view = StoredView::new(Box::new(view), position).await;
     let mut digests = BTreeMap::new();
-    let mut pages = Vec::new();
-    for (_, display_facts, tools, rich_ui) in READ_MODES {
-        let mut from = 1;
-        loop {
-            let mut request = SessionReadRequest::new(bind.clone(), Some(from), Some(PAGE));
-            request.include_display_facts = display_facts;
-            request.include_tools = tools;
-            request.include_rich_ui = rich_ui;
-            let page = broca_module::store_read::serve_view(&view, &parts, &request)
-                .await
-                .map_err(|e| format!("{e:?}"))?;
-            pages.push(serde_json::to_value(&page).map_err(|e| e.to_string())?);
-            match page.next_from_ordinal {
-                Some(next) if next > from => from = next,
-                _ => break,
-            }
-        }
-    }
-    digests.insert(
-        READ.into(),
-        sha256_hex(&serde_json::to_vec(&pages).unwrap()),
-    );
+    digests.insert(READ.into(), read_digest(&view, &parts, &bind).await?);
     let entries = broca_module::store_entries::all_entries(&view)
         .await
         .map_err(|e| format!("{e:?}"))?;
@@ -262,4 +281,97 @@ pub async fn store_snapshot(
     };
     digests.insert(NEXT_REQUEST.into(), sha256_hex(&request));
     Ok(digests)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use broca_session_store::backend::MemoryBackend;
+    use broca_session_store::codec::Digest;
+    use broca_session_store::head::SessionTriple;
+
+    fn unhex(value: &Value) -> Vec<u8> {
+        let hex = value.as_str().unwrap();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn move_read_digest_matches_the_original_array_and_projects_once() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/agent_data/fixtures/finished.json"
+        ))
+        .unwrap();
+        let bind = BindIdentity::new("/project", "runner", "move-digest");
+        let triple = SessionTriple {
+            project_root: "/project".into(),
+            harness: bind.harness.clone(),
+            session: bind.session.clone(),
+        };
+        let addr = SessionAddr(broca_core::session_addr(&bind));
+        let backend = MemoryBackend::default();
+        let deployment = DeploymentKey::new(7, &[4; 32]);
+        let parts = MemoryParts {
+            parts: fixture["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| (Digest(unhex(&part[0]).try_into().unwrap()), unhex(&part[1])))
+                .collect(),
+        };
+        let records: Vec<_> = fixture["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                Record::decode(
+                    record["kind"].as_u64().unwrap().try_into().unwrap(),
+                    &unhex(&record["body"]),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut writer =
+            Session::create(&backend, addr.clone(), triple.clone(), &deployment, false)
+                .await
+                .unwrap();
+        writer.append(&records, true).await.unwrap();
+        drop(writer);
+        let view = Session::view(&backend, addr, &triple, &deployment)
+            .await
+            .unwrap();
+
+        // Build the expected digest from the complete array. Reuse the view so each page has
+        // the same session identifiers as it does in the streaming check.
+        let mut pages = Vec::new();
+        for (display, tools, rich_ui) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let mut request = SessionReadRequest::new(bind.clone(), Some(1), Some(7));
+            request.include_display_facts = display;
+            request.include_tools = tools;
+            request.include_rich_ui = rich_ui;
+            let page = broca_module::store_read::serve_view(&view, &parts, &request)
+                .await
+                .unwrap();
+            assert!(page.next_from_ordinal.is_none());
+            pages.push(serde_json::to_value(page).unwrap());
+        }
+        let original = sha256_hex(&serde_json::to_vec(&pages).unwrap());
+        let reads = backend.checkpoint_frame_reads();
+        let position = view.position();
+        let view = StoredView::new(Box::new(view), position).await;
+        assert_eq!(read_digest(&view, &parts, &bind).await.unwrap(), original);
+        assert_eq!(
+            backend.checkpoint_frame_reads() - reads,
+            1,
+            "only the shared head projects the log"
+        );
+    }
 }

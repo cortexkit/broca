@@ -516,19 +516,39 @@ async fn an_answer_without_its_token_counts_is_withheld() {
     }
 }
 
-/// A transient failure is answered and recorded, and a repeat of the key runs the next attempt
-/// in a session of its own rather than replaying the failure.
 #[tokio::test]
-async fn a_transient_failure_is_tried_again_in_a_fresh_session() {
+async fn unknown_completion_spend_uses_the_charge_ceiling_on_resend() {
     let failed = json!({"state": "error", "usage": {"steps": 0, "unreported_steps": 0},
         "error": {"class": "transient", "message": "stream cut", "provider_code": "provider_error"}});
     let rig = rig(
         FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
         FakeSessions::ending(vec![failed, completed("Teal.", Some(1_000), Some(500))]),
     );
+    let first = refusal(&rig.call(text_call(), Some("unknown")).await.unwrap_err());
+    assert_eq!(first["detail"]["cost_unknown"], true);
+    let again = rig.call(text_call(), Some("unknown")).await;
+    assert!(
+        again.is_err(),
+        "the resend must not start another completion: {again:?}"
+    );
+    let again = refusal(&again.unwrap_err());
+    assert_eq!(again["code"], "cost_exceeded");
+    assert_eq!(again["detail"]["no_spend"], true);
+    assert_eq!(rig.sessions.sent().len(), 1);
+}
+
+/// An unbilled transient failure is recorded, but a repeat can still run in a fresh session.
+#[tokio::test]
+async fn a_transient_failure_is_tried_again_in_a_fresh_session() {
+    let failed = json!({"state": "error", "usage": {"steps": 0, "unreported_steps": 0},
+        "error": {"class": "transient", "message": "all slots occupied", "provider_code": "concurrency_full"}});
+    let rig = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        FakeSessions::ending(vec![failed, completed("Teal.", Some(1_000), Some(500))]),
+    );
     let refused = refusal(&rig.call(text_call(), Some("k1")).await.unwrap_err());
-    assert_eq!(refused["code"], "provider_error");
-    assert_eq!(refused["detail"]["cost_unknown"], true);
+    assert_eq!(refused["code"], "rate_limited");
+    assert_eq!(refused["detail"]["no_spend"], true);
     let answer = rig.call(text_call(), Some("k1")).await.unwrap();
     assert!(answer.get().contains("Teal."));
     let sent = rig.sessions.sent();

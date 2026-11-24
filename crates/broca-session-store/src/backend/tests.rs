@@ -245,3 +245,108 @@ fn new_folders_are_created_with_their_parents() {
     assert!(root.join("heads/other").is_dir());
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[cfg(unix)]
+mod namespace_barriers {
+    use super::*;
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    struct DirectorySyncs {
+        entry: PathBuf,
+        // Whether the watched entry exists when each directory barrier starts.
+        calls: Vec<(PathBuf, bool)>,
+    }
+
+    thread_local! {
+        static DIR_SYNCS: RefCell<Option<DirectorySyncs>> = const { RefCell::new(None) };
+    }
+
+    pub(in super::super) fn observe_dir_sync(dir: &Path) {
+        DIR_SYNCS.with_borrow_mut(|trace| {
+            if let Some(trace) = trace {
+                trace.calls.push((dir.to_owned(), trace.entry.exists()));
+            }
+        });
+    }
+
+    fn trace_dir_syncs(entry: PathBuf, operation: impl FnOnce()) -> Vec<(PathBuf, bool)> {
+        DIR_SYNCS.set(Some(DirectorySyncs {
+            entry,
+            calls: Vec::new(),
+        }));
+        operation();
+        DIR_SYNCS.take().unwrap().calls
+    }
+
+    #[test]
+    fn first_setup_part_syncs_the_class_root_and_setup_folder() {
+        let root = root();
+        std::fs::create_dir(&root).unwrap();
+        let backend = LocalBackend::new(&root);
+        let setup = root.join("setup-plain");
+        let calls = trace_dir_syncs(setup.join("aa"), || {
+            block_on(backend.put_setup("plain/aa", b"part")).unwrap();
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(calls, [(root, false), (setup, true)]);
+    }
+
+    #[test]
+    fn already_renamed_setup_part_syncs_its_folder_before_returning() {
+        let root = root();
+        let setup = root.join("setup");
+        std::fs::create_dir_all(&setup).unwrap();
+        // Another writer has created the folder and renamed a synced file without paying the
+        // directory barriers yet.
+        let entry = setup.join("aa");
+        let temporary = setup.join(".aa.tmp");
+        std::fs::write(&temporary, b"part").unwrap();
+        crate::durable::sync_file(&temporary).unwrap();
+        std::fs::rename(&temporary, &entry).unwrap();
+        let backend = LocalBackend::new(&root);
+        let calls = trace_dir_syncs(entry, || {
+            block_on(backend.put_setup("aa", b"part")).unwrap();
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(calls, [(root, true), (setup, true)]);
+    }
+
+    #[test]
+    fn delete_object_syncs_its_own_folder_after_unlinking() {
+        assert_delete_object_barrier(false);
+    }
+
+    #[test]
+    fn delete_object_retry_syncs_the_parent_of_an_absent_object() {
+        assert_delete_object_barrier(true);
+    }
+
+    fn assert_delete_object_barrier(unlinked_before_call: bool) {
+        let root = root();
+        let backend = LocalBackend::new(&root);
+        let addr = addr();
+        let name = format!("{}/pages/00", hex(&[7; 16]));
+        let entry = backend.object_path(&addr, &name).unwrap();
+        let dir = entry.parent().unwrap().to_owned();
+        block_on(async {
+            backend.write_head(&addr, b"head", None, 1).await.unwrap();
+            backend
+                .put_object(&addr, &name, b"object", 1)
+                .await
+                .unwrap();
+        });
+        if unlinked_before_call {
+            // The earlier collection stopped after the unlink but before the directory barrier.
+            std::fs::remove_file(&entry).unwrap();
+        }
+        let calls = trace_dir_syncs(entry, || {
+            block_on(backend.delete_object(&addr, &name, 1)).unwrap();
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(calls, [(dir, false)]);
+    }
+}
+
+#[cfg(unix)]
+pub(super) use namespace_barriers::observe_dir_sync;

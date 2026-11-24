@@ -21,6 +21,7 @@ test-support = []
 # schema is sent and what enforcement is reported) using the model's catalog support.
 broca-protocol = { path = "../broca-protocol" }
 broca-owner-only.workspace = true
+broca-records = { path = "../broca-records" }
 # Sits ABOVE the provider framework: produces the specs the framework consumes, and the
 # live resolver (`live.rs`) builds the provider's live transport from them.
 broca-provider = { path = "../broca-provider", features = ["live"] }
@@ -30,6 +31,7 @@ broca-core = { path = "../broca-core" }
 cortexkit-chatgpt-policy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 
 [build-dependencies]

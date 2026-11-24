@@ -365,6 +365,14 @@ impl<B: SessionBackend> Session<B> {
         self.kept.between(first, u64::MAX)
     }
 
+    /// The latest run's kept records from `first`, never before its start. Released content
+    /// stays released: run pauses, ends and recorded account changes don't need message bodies.
+    pub fn kept_run_tail(&self, run_id: &str, first: u64) -> Vec<(u64, Record)> {
+        self.kept_run_start(run_id)
+            .and_then(|start| self.kept.between_released(first.max(start), u64::MAX))
+            .unwrap_or_default()
+    }
+
     /// How many of the open log's records the session keeps in memory.
     pub fn kept_records(&self) -> usize {
         self.kept.len()

@@ -63,4 +63,12 @@ pub struct Reply {
     pub window_ms: i64,
     pub findings: Vec<Finding>,
     pub coverage: BTreeMap<String, Coverage>,
+    /// Findings left out because the reply would otherwise reach its size cap. Absent when
+    /// none were, so a reply with every finding keeps its earlier bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub findings_omitted: u64,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }

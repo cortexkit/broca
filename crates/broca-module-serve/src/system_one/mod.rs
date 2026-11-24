@@ -34,7 +34,7 @@ pub mod openai_decisions;
 pub mod typesafe;
 pub mod workers_ai;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -168,6 +168,7 @@ pub enum ProviderReply {
         error: cortexkit_role_classifier::errors::ItemError,
         provider_code: Option<String>,
         may_have_spent: bool,
+        reported: Option<Box<ReportedErrorUsage>>,
     },
     /// No reply: the attempt ran out of time, or the connection failed in a way that may
     /// have come after the request was sent, so the provider may have billed it.
@@ -183,6 +184,14 @@ pub enum ProviderReply {
     /// vault couldn't be reached or couldn't refresh), so nothing was sent. Nothing is known to
     /// be wrong with the credential, and a later attempt may read it.
     CredentialUnavailable(String),
+}
+
+/// Usage and attribution from a response whose answer could not be decoded.
+#[derive(Clone, Debug)]
+pub struct ReportedErrorUsage {
+    usage: cortexkit_role_classifier::reply::Usage,
+    auth_selection: Option<String>,
+    account_ref: Option<String>,
 }
 
 /// One provider's classification endpoint.
@@ -203,6 +212,12 @@ pub trait ClassifierProvider: Send + Sync {
     /// Send one provider request body (`{model, state, questions, images?}`) and return what
     /// came back.
     async fn call(&self, body: String) -> ProviderReply;
+}
+
+/// Budget hold, not a measurement: without tokens to price a possibly billed attempt,
+/// reserve its full ceiling so another send cannot use money that may already be spent.
+pub(crate) fn unknown_spend_debit(ceiling_nanos: Option<u64>) -> u64 {
+    ceiling_nanos.unwrap_or(i64::MAX as u64)
 }
 
 /// One model broca routes, pinned in code: the catalog id, the provider's own model value,
@@ -320,6 +335,14 @@ impl ModelPin {
     }
 }
 
+#[derive(Default)]
+struct FactFlush {
+    generation: Option<u64>,
+    pending: Arc<[broca_store::system_one::PendingFact]>,
+    next: usize,
+    conflicts: HashSet<String>,
+}
+
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
     routing: Option<Routing>,
@@ -341,6 +364,7 @@ pub struct SystemOne {
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     metrics: Mutex<Metrics>,
     export: Option<Arc<broca_store::SqliteStore>>,
+    fact_flush: Arc<Mutex<FactFlush>>,
     charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
     /// Tests only: when set, the next store release made from a hold's `Drop` (the fallback
     /// for a panicked or dropped call) waits until the sender side is dropped. A test holds
@@ -351,6 +375,10 @@ pub struct SystemOne {
     /// Tests hold publication after the outcome/outbox commit to expose premature replay.
     #[cfg(test)]
     pub(crate) fact_publish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    fact_scans: AtomicUsize,
+    #[cfg(test)]
+    routing_journal_writes: AtomicUsize,
 }
 
 /// Pricing accepted before private-content admission. Keeping this snapshot with a delayed
@@ -436,11 +464,16 @@ impl SystemOne {
             clock: Arc::new(now_ms),
             metrics: Mutex::new(Metrics::default()),
             export: None,
+            fact_flush: Arc::default(),
             charge_basis: Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
             #[cfg(test)]
             fallback_release_gate: Mutex::new(None),
             #[cfg(test)]
             fact_publish_hook: Mutex::new(None),
+            #[cfg(test)]
+            fact_scans: AtomicUsize::new(0),
+            #[cfg(test)]
+            routing_journal_writes: AtomicUsize::new(0),
         }
     }
 
@@ -456,10 +489,39 @@ impl SystemOne {
     }
 
     fn flush_facts(&self) -> Result<(), String> {
+        use broca_store::export_index::SystemOneFactEmission;
         let Some(export) = &self.export else {
             return Ok(());
         };
-        for pending in self.store.pending_facts().map_err(|e| e.to_string())? {
+        let state = || self.fact_flush.lock().unwrap_or_else(|p| p.into_inner());
+        let (generation, pending, next) = {
+            let mut state = state();
+            let generation = self.store.fact_generation();
+            if state.generation != Some(generation) {
+                #[cfg(test)]
+                self.fact_scans.fetch_add(1, Ordering::Relaxed);
+                state.pending = self
+                    .store
+                    .pending_facts()
+                    .map_err(|e| e.to_string())?
+                    .into();
+                state.generation = Some(generation);
+                state.next = 0;
+            }
+            (generation, state.pending.clone(), state.next)
+        };
+        for (index, pending) in pending.iter().enumerate().skip(next) {
+            let advance = || {
+                let mut state = state();
+                if state.generation == Some(generation) {
+                    state.next = state.next.max(index + 1);
+                }
+            };
+            let fact = &pending.fact;
+            if state().conflicts.contains(&fact.fact_id) {
+                advance();
+                continue;
+            }
             #[cfg(test)]
             {
                 let hook = self.fact_publish_hook.lock().unwrap().clone();
@@ -467,26 +529,46 @@ impl SystemOne {
                     hook();
                 }
             }
-            if export
+            match export
                 .emit_system_one_fact(&pending.fact)
                 .map_err(|e| e.to_string())?
             {
-                let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
-                // Health keys spend by catalog key, which the fact's bare model id alone does
-                // not name. A fact written by an older build already carries the whole key as
-                // its model and is counted under it unchanged.
-                let fact = &pending.fact;
-                let catalog_key = if fact.model.starts_with(&format!("{}/", fact.provider)) {
-                    fact.model.clone()
-                } else {
-                    format!("{}/{}", fact.provider, fact.model)
-                };
-                let spend = metrics.spend_nanos_by_model.entry(catalog_key).or_default();
-                *spend = spend.saturating_add(pending.spend_nanos);
+                SystemOneFactEmission::Inserted => {
+                    let mut metrics = self.metrics.lock().unwrap_or_else(|p| p.into_inner());
+                    // Health keys spend by catalog key, which the fact's bare model id alone does
+                    // not name. A fact written by an older build already carries the whole key as
+                    // its model and is counted under it unchanged.
+                    let catalog_key = if fact.model.starts_with(&format!("{}/", fact.provider)) {
+                        fact.model.clone()
+                    } else {
+                        format!("{}/{}", fact.provider, fact.model)
+                    };
+                    let spend = metrics.spend_nanos_by_model.entry(catalog_key).or_default();
+                    *spend = spend.saturating_add(pending.spend_nanos);
+                }
+                SystemOneFactEmission::AlreadyPresent => {}
+                SystemOneFactEmission::ConflictingBytes => {
+                    // Keep the original intent for inspection. Re-sending immutable bytes cannot
+                    // resolve an identity conflict, and must not block newer measurements.
+                    if state().conflicts.insert(fact.fact_id.clone()) {
+                        tracing::error!(target: "system_one", fact_id = %fact.fact_id,
+                        "usage export fact conflicts with stored bytes; retaining the outbox row");
+                    }
+                    advance();
+                    continue;
+                }
             }
             self.store
                 .acknowledge_fact(&pending.fact.fact_id)
                 .map_err(|e| e.to_string())?;
+            advance();
+        }
+        // The snapshot is kept across transient failures, but a settled backlog need not
+        // occupy memory. A newly committed fact may already have caused another pass to load
+        // a newer snapshot.
+        let mut state = state();
+        if state.generation == Some(generation) {
+            state.pending = Arc::default();
         }
         Ok(())
     }
@@ -534,6 +616,7 @@ impl SystemOne {
         .with_store_role(LLM_CLASSIFY_STORE_ROLE)
         .with_clock(self.clock.clone());
         service.export = self.export.clone();
+        service.fact_flush = self.fact_flush.clone();
         service.charge_basis = self.charge_basis.clone();
         service.image_resolver = self.image_resolver.clone();
         service

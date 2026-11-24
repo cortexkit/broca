@@ -277,6 +277,7 @@ async fn subscription_logs_open_and_close_not_frames() {
     let handler = Arc::new(MockSubscribeHandler {
         sink_tx,
         refuse_session: std::sync::atomic::AtomicBool::new(false),
+        read_checks: Default::default(),
     });
     let (writer, mut frames) = broca_diagnostics::channel(8, Arc::default());
     let identity = BrocaBindIdentity::new("/private/project", "runner", "subscribe");
@@ -1099,6 +1100,7 @@ async fn retracted_send_error_uses_retracted_wire_code() {
 struct MockSubscribeHandler {
     sink_tx: mpsc::Sender<mpsc::Sender<Delivery>>,
     refuse_session: std::sync::atomic::AtomicBool,
+    read_checks: std::sync::atomic::AtomicUsize,
 }
 
 #[test]
@@ -1107,6 +1109,7 @@ fn route_request_future_stays_small() {
     let handler = Arc::new(MockSubscribeHandler {
         sink_tx,
         refuse_session: std::sync::atomic::AtomicBool::new(false),
+        read_checks: Default::default(),
     });
     let (writer, _) = broca_diagnostics::channel(4, Default::default());
     let session = BrocaBindIdentity::new("/project", "runner", "session");
@@ -1132,6 +1135,16 @@ fn route_request_future_stays_small() {
 
 #[async_trait::async_trait]
 impl ServeHandler for MockSubscribeHandler {
+    async fn authorize_session_read(
+        &self,
+        session: &BrocaBindIdentity,
+        access: &broca_module::reader_admission::ReadAccess,
+    ) -> Result<(), ServeError> {
+        self.read_checks.fetch_add(1, Ordering::Relaxed);
+        self.authorize_session(session, access.principal.as_ref())
+            .await
+    }
+
     async fn authorize_session(
         &self,
         _session: &BrocaBindIdentity,
@@ -1201,6 +1214,7 @@ async fn subscribe_transport_terminals_keep_stream_sequence_and_event() {
         let handler = Arc::new(MockSubscribeHandler {
             sink_tx,
             refuse_session: std::sync::atomic::AtomicBool::new(false),
+            read_checks: Default::default(),
         });
         let (writer, mut written) = broca_diagnostics::channel::<Frame>(8, Arc::default());
         start_subscribe_stream(
@@ -1260,6 +1274,7 @@ async fn test_subscribe_forward_task_cancel_while_blocked() {
     let handler = Arc::new(MockSubscribeHandler {
         sink_tx,
         refuse_session: std::sync::atomic::AtomicBool::new(false),
+        read_checks: Default::default(),
     });
 
     // Bounded channel of size 1 for the writer.
@@ -1544,6 +1559,7 @@ impl BindIngress {
             handler: Arc::new(MockSubscribeHandler {
                 sink_tx,
                 refuse_session: std::sync::atomic::AtomicBool::new(false),
+                read_checks: Default::default(),
             }),
             writer,
             written,
@@ -1634,6 +1650,12 @@ impl BindIngress {
     }
 
     async fn subscribe(&mut self, epoch: u32, corr: u64) -> mpsc::Sender<Delivery> {
+        let sink = self.subscribe_sink(epoch, corr).await;
+        self.assert_delivery(&sink, epoch, corr).await;
+        sink
+    }
+
+    async fn subscribe_sink(&mut self, epoch: u32, corr: u64) -> mpsc::Sender<Delivery> {
         self.frame(
             Frame::build(
                 FrameType::Request,
@@ -1650,12 +1672,10 @@ impl BindIngress {
             .unwrap(),
         )
         .await;
-        let sink = tokio::time::timeout(std::time::Duration::from_secs(5), self.sinks.recv())
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.sinks.recv())
             .await
             .expect("subscription did not reach the handler")
-            .unwrap();
-        self.assert_delivery(&sink, epoch, corr).await;
-        sink
+            .unwrap()
     }
 
     async fn assert_delivery(&mut self, sink: &mpsc::Sender<Delivery>, epoch: u32, corr: u64) {
@@ -1900,6 +1920,134 @@ async fn superseded_bind_late_authorization_preserves_replacement() {
         "superseded bind acknowledged"
     );
     ingress.assert_delivery(&sink, 2, 20).await;
+}
+
+#[tokio::test]
+async fn subscribe_display_deltas_do_not_recheck_read_admission() {
+    let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+        RefusingOpener,
+    ))));
+    let mut ingress = BindIngress::new(registry);
+    ingress.bind(1, "stored", false).await;
+    next_written(&mut ingress.written).await;
+    let sink = ingress.subscribe(1, 10).await;
+    let boundary = |step| {
+        Delivery::Control(Arc::new((
+            broca_core::Cursor::new(step, 0),
+            broca_protocol::caller::ControlUnit::StepStarted {
+                step_id: broca_protocol::StepId(step),
+            },
+            None,
+        )))
+    };
+    sink.send(boundary(1)).await.unwrap();
+    assert_eq!(
+        next_written(&mut ingress.written).await.header.ty,
+        FrameType::StreamData
+    );
+    let delta = Delivery::Display(Arc::new(broca_protocol::display::DisplayEvent::TextDelta {
+        mid: None,
+        part: None,
+        message_id: broca_protocol::MessageId("reply".into()),
+        tool_call_id: None,
+        delta: "text".into(),
+    }));
+    for _ in 0..64 {
+        sink.send(delta.clone()).await.unwrap();
+        assert_eq!(
+            next_written(&mut ingress.written).await.header.ty,
+            FrameType::StreamData
+        );
+    }
+    sink.send(boundary(2)).await.unwrap();
+    assert_eq!(
+        next_written(&mut ingress.written).await.header.ty,
+        FrameType::StreamData
+    );
+    assert_eq!(
+        ingress.handler.read_checks.load(Ordering::Relaxed),
+        4,
+        "admission, first display, and two control boundaries"
+    );
+}
+
+#[tokio::test]
+async fn subscribe_ends_on_read_access_revocation() {
+    let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+        RefusingOpener,
+    ))));
+    let mut ingress = BindIngress::new(registry);
+    ingress.bind(1, "stored", false).await;
+    next_written(&mut ingress.written).await;
+    let sink = ingress.subscribe(1, 10).await;
+    ingress
+        .handler
+        .refuse_session
+        .store(true, Ordering::Relaxed);
+    sink.send(Delivery::AdmissionChanged).await.unwrap();
+    let terminal = next_written(&mut ingress.written).await;
+    assert_eq!(
+        (terminal.header.ty, terminal.header.corr),
+        (FrameType::Error, 10)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&terminal.body).unwrap()["code"],
+        "sender_not_owner"
+    );
+    broca_test_support::wait_for(
+        "revoked subscribe drops its delivery sink",
+        sink.closed(),
+        || "still open".into(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn subscribe_rechecks_access_before_its_first_display() {
+    let registry = Arc::new(test_registry(LineageRegistry::new(Arc::new(
+        RefusingOpener,
+    ))));
+    let mut ingress = BindIngress::new(registry);
+    ingress.bind(1, "stored", false).await;
+    next_written(&mut ingress.written).await;
+    let sink = ingress.subscribe_sink(1, 10).await;
+    assert_eq!(ingress.handler.read_checks.load(Ordering::Relaxed), 1);
+    // The read policy changed between the open check and attachment, so no policy marker is
+    // visible to this subscriber. Its first display must not be forwarded under the old policy.
+    ingress
+        .handler
+        .refuse_session
+        .store(true, Ordering::Relaxed);
+    sink.send(Delivery::Display(Arc::new(
+        broca_protocol::display::DisplayEvent::DisplayReset,
+    )))
+    .await
+    .unwrap();
+    let terminal = next_written(&mut ingress.written).await;
+    assert_eq!(
+        (terminal.header.ty, terminal.header.corr),
+        (FrameType::Error, 10)
+    );
+    assert_eq!(
+        serde_json::from_slice::<ErrorBody>(&terminal.body)
+            .unwrap()
+            .code,
+        "sender_not_owner"
+    );
+}
+
+#[test]
+fn refused_send_logs_history_rewrite_and_context_ceiling_classes() {
+    let history = ServeError::HistoryRewriting;
+    let ceiling = ServeError::ContextCeiling(broca_protocol::ContextCeilingDetail::new(
+        100,
+        90,
+        "view_timeout",
+    ));
+    assert_eq!(
+        [refused_send_class(&history), refused_send_class(&ceiling)],
+        ["transient", "context_overflow"]
+    );
 }
 
 #[tokio::test]

@@ -75,6 +75,11 @@ pub enum Request {
     OpenLogRecords {
         reply: Reply<Vec<(u64, Record)>>,
     },
+    OpenRunTail {
+        run_id: String,
+        first: u64,
+        reply: Reply<Vec<(u64, Record)>>,
+    },
     AcceptedSend {
         account: String,
         since_ms: u64,
@@ -417,6 +422,19 @@ impl Writer for ActorWriter {
         self.ask(|reply| Request::OpenLogRecords { reply }).await
     }
 
+    async fn open_run_tail(
+        &self,
+        run_id: &str,
+        first: u64,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
+        self.ask(|reply| Request::OpenRunTail {
+            run_id: run_id.to_owned(),
+            first,
+            reply,
+        })
+        .await
+    }
+
     async fn run_start(&self, run_id: &str) -> Result<Option<RunStart>, SessionError> {
         self.ask(|reply| Request::RunStart {
             run_id: run_id.to_owned(),
@@ -612,6 +630,13 @@ impl RunLink {
             }
             Request::OpenLogRecords { reply } => {
                 let _ = reply.send(session.open_log_records().await);
+            }
+            Request::OpenRunTail {
+                run_id,
+                first,
+                reply,
+            } => {
+                let _ = reply.send(session.open_run_tail(&run_id, first).await);
             }
             Request::AcceptedSend {
                 account,

@@ -1,0 +1,26 @@
+{
+  "result": {
+    "coverage": {},
+    "findings": [
+      {
+        "check": "run_errors",
+        "count": 12,
+        "first_seen_ms": 199997000,
+        "hint": "Inspect the run errors log for the sampled runs.",
+        "key": "permanent:request_invalid",
+        "last_seen_ms": 199999000,
+        "samples": [
+          {
+            "at_ms": 199999000,
+            "run_id": "run-1"
+          }
+        ],
+        "severity": "error",
+        "summary": "Provider calls failed permanently with request_invalid."
+      }
+    ],
+    "findings_omitted": 37,
+    "generated_at_ms": 200000000,
+    "window_ms": 21600000
+  }
+}

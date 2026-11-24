@@ -21,6 +21,7 @@ mod routed;
 /// What the stand-in answers for one item, by its state.
 #[derive(Clone)]
 enum Script {
+    Unconnected,
     Credential,
     CredentialUnavailable,
     AccountError,
@@ -93,6 +94,7 @@ impl ClassifierProvider for StandIn {
                 .map(|list| list[(n - 1).min(list.len() - 1)].clone())
         };
         match script {
+            Some(Script::Unconnected) => ProviderReply::Unconnected("could not connect".into()),
             Some(Script::Credential) => ProviderReply::Credential("needs a new sign-in".into()),
             Some(Script::CredentialUnavailable) => {
                 ProviderReply::CredentialUnavailable("the vault couldn't be reached".into())
@@ -104,6 +106,7 @@ impl ClassifierProvider for StandIn {
                 ),
                 provider_code: Some("insufficient_quota".into()),
                 may_have_spent: false,
+                reported: None,
             },
             Some(Script::AccountLimit(wait)) => ProviderReply::WorkersAiError {
                 status: 429,
@@ -218,6 +221,111 @@ fn rig() -> Rig {
         Arc::new(SystemOneStore::open_in_memory().unwrap()),
         Config::default(),
     )
+}
+
+#[tokio::test]
+async fn usage_fact_conflict_does_not_block_classify_or_later_facts() {
+    let mut rig = rig();
+    let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+    let scoped = test_scope();
+    let service = Arc::get_mut(&mut rig.service).unwrap();
+    let fact = broca_store::system_one::FactContext {
+        source_instance_id: export.source_instance_id().into(),
+        provider: "typesafe".into(),
+        model: "jev-1.13.0".into(),
+        auth_selection: None,
+        account_ref: None,
+        charge_basis: broca_core::ChargeBasis::MeteredApi,
+        charge_basis_mapping_version: 1,
+        charge_basis_overrides: "{}".into(),
+        spend_nanos: 42,
+    };
+    assert!(matches!(
+        rig.store
+            .claim(&broca_store::system_one::BatchClaim {
+                role: STORE_ROLE,
+                batch_id: "old",
+                model: JEV,
+                identity: "{}",
+                body_digest: "old",
+                frozen_row: "{}",
+                scope: &scoped,
+                ceiling_nanos: None,
+                owner: &service.owner,
+                now_ms: 1,
+            })
+            .unwrap(),
+        broca_store::system_one::Claimed::Fresh
+    ));
+    assert!(rig
+        .store
+        .record_paid(
+            STORE_ROLE,
+            "old",
+            &service.owner,
+            &broca_store::system_one::StoredOutcome {
+                index: 0,
+                outcome: broca_store::system_one::Outcome::Answered("{}".into()),
+                input_tokens: Some(1),
+                output_tokens: None,
+            },
+            &broca_store::system_one::PaidRecord {
+                spend_nanos: 42,
+                now_ms: 1,
+                fact: Some(&fact)
+            },
+        )
+        .unwrap());
+    let pending = rig.store.pending_facts().unwrap().pop().unwrap().fact;
+    let mut conflicting = pending.clone();
+    conflicting.usage.input_tokens = Some(2);
+    assert_eq!(
+        export.emit_system_one_fact(&conflicting).unwrap(),
+        broca_store::export_index::SystemOneFactEmission::Inserted
+    );
+    service.export = Some(export.clone());
+    rig.stand_in.script(
+        "new",
+        vec![Script::Answer(noul("0.5", Some(r#"{"input_tokens":10}"#)))],
+    );
+    let request = params("new", JEV, &["new"], None);
+    let (_, events) = broca_test_support::capture_logs(async {
+        rig.service.flush_facts().unwrap();
+        rig.service.flush_facts().unwrap();
+    })
+    .await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.message().contains("usage export fact conflicts"))
+            .count(),
+        1
+    );
+    let first = admitted(&rig, request.clone()).await;
+    let replay = admitted(&rig, request).await;
+    assert_eq!(first, replay);
+    assert_eq!(
+        rig.service.fact_scans.load(Ordering::Relaxed),
+        2,
+        "scan the initial outbox and once after the new fact, but not on replay"
+    );
+    assert_eq!(rig.stand_in.calls("new"), 1);
+    assert_eq!(export.high_water(), 2);
+    let remaining = rig.store.pending_facts().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].fact.fact_id, pending.fact_id);
+}
+
+#[test]
+fn unchanged_empty_usage_outbox_is_not_rescanned() {
+    let mut rig = rig();
+    let service = Arc::get_mut(&mut rig.service).unwrap();
+    service.export = Some(Arc::new(
+        broca_store::SqliteStore::open_in_memory().unwrap(),
+    ));
+    service.flush_facts().unwrap();
+    service.flush_facts().unwrap();
+    assert_eq!(service.fact_scans.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
@@ -693,16 +801,16 @@ async fn a_tighter_resend_is_recorded_before_anything_is_sent() {
     rig.stand_in.script(
         "a",
         vec![
-            Script::Status(503, None),
-            Script::Status(503, None),
+            Script::Unconnected,
+            Script::Unconnected,
             Script::Answer(noul("0.7", Some(&costing(2.0)))),
         ],
     );
     rig.stand_in.script(
         "x",
         vec![
-            Script::Status(503, None),
-            Script::Status(503, None),
+            Script::Unconnected,
+            Script::Unconnected,
             Script::Answer(noul("0.7", None)),
         ],
     );

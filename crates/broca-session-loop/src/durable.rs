@@ -175,6 +175,14 @@ impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
         self.writer.open_log_records().await
     }
 
+    async fn open_run_tail(
+        &self,
+        run_id: &str,
+        first: u64,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
+        self.writer.open_run_tail(run_id, first).await
+    }
+
     async fn enrollment(
         &self,
     ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {

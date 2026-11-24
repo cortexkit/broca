@@ -43,8 +43,9 @@ message text. Counts do not shrink when samples or findings are trimmed.
 The entire compact response body, including `result`, stays strictly below
 65,536 bytes. Findings sort by severity, descending count, check and key. Whole
 findings are retained until the next would reach the cap; the remaining tail is
-omitted. Summaries are limited to 400 Unicode characters. A bounded reply is not
-a complete inventory or a pagination cursor.
+omitted, and `result.findings_omitted` gives how many findings were left out. It is
+absent when the reply holds every finding. Summaries are limited to 400 Unicode
+characters. A bounded reply is not a complete inventory or a pagination cursor.
 
 ## Checks and coverage
 

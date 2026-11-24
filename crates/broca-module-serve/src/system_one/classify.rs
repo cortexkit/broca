@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
-use super::{internal_refusal, ModelPin, ProviderReply, SystemOne, ToolAdmission};
+use super::{
+    internal_refusal, ModelPin, ProviderReply, ReportedErrorUsage, SystemOne, ToolAdmission,
+};
 use crate::llm_tools::spend::{ItemSpend, MarkedItemError, Spend};
 
 /// A bound on the tokens TypeSafe adds to each request around the state and questions (its
@@ -444,7 +446,7 @@ pub(super) fn map_reply(
     }
 }
 
-/// What a final attempt that failed may have cost, under the model tools' refusal-spend rule.
+/// What an attempt that failed may have cost, under the model tools' refusal-spend rule.
 /// An error the provider answered with a status or code it does not bill (authentication, a
 /// missing model, a rate limit, an item it rejected, the account's limits) and a failure before
 /// anything was sent (no credential, no connection) spent nothing. Every other failure may have
@@ -474,14 +476,18 @@ pub(super) fn reply_spend(reply: &ProviderReply) -> ItemSpend {
     }
 }
 
-/// Whether an attempt's refusal is one the provider marked retryable: an overload or rate
-/// status that names a wait short enough to sit out inside the call. A Workers AI refusal is
-/// retried only when its code maps to a rate limit or a provider error: a 429 for the daily
-/// allocation (3036) names the account, and waiting cannot clear it.
+/// An unbilled refusal can be retried if it names a wait short enough to sit out inside the
+/// call. A Workers AI 429 for the daily allocation (3036) is not a rate limit: waiting inside
+/// this call cannot clear it.
 pub(super) fn retry_wait(
     reply: &ProviderReply,
     service: &SystemOne,
 ) -> Option<std::time::Duration> {
+    // A second attempt must not spend another call's ceiling or conceal a charge the
+    // first attempt may already have incurred.
+    if reply_spend(reply) != ItemSpend::Nothing {
+        return None;
+    }
     let wait = match reply {
         ProviderReply::ClassifiedError { error, .. }
             if error.class == errors::ErrorClass::Transient =>
@@ -489,34 +495,28 @@ pub(super) fn retry_wait(
             error.retry_after_ms?
         }
         ProviderReply::Status {
-            status: 429 | 503 | 529,
+            status: 429 | 529,
             retry_after_ms: Some(wait),
         } => *wait,
         ProviderReply::WorkersAiError {
             status: status @ (429 | 503),
             code,
             retry_after_ms: Some(wait),
-        } if matches!(
-            workers_ai_item_code(*status, *code),
-            Some(errors::RATE_LIMITED | errors::PROVIDER_ERROR)
-        ) =>
-        {
-            *wait
-        }
+        } if workers_ai_item_code(*status, *code) == Some(errors::RATE_LIMITED) => *wait,
         _ => return None,
     };
     Some(std::time::Duration::from_millis(wait))
         .filter(|wait| *wait <= service.config.max_retry_wait)
 }
 
-/// One item's provider call, retried only where the provider marked its refusal retryable.
-/// The item's spend check ran once before this; a refused attempt bills nothing, so retries
-/// stay inside it. A failure comes with what its final attempt may have cost.
+/// One item's provider call, retried only after a proven-unbilled failure the provider
+/// marked retryable. Only the terminal attempt can have spent anything.
 async fn call_provider(
     service: &SystemOne,
     pin: &ModelPin,
     body: String,
-) -> Result<PaidAnswer, (ItemError, ItemSpend)> {
+    frozen: &FrozenRow,
+) -> Result<PaidAnswer, FailedAnswer> {
     let slot = service.model_slot(&pin.catalog_id);
     let mut attempt = 0;
     loop {
@@ -558,11 +558,73 @@ async fn call_provider(
                 tokio::time::sleep(wait).await;
             }
             _ => {
-                let spend = reply_spend(&reply);
-                return paid_answer(reply, pin).map_err(|error| (error, spend));
+                let (spend, reported) = error_spend(&reply, frozen);
+                return paid_answer(reply, pin).map_err(|error| FailedAnswer {
+                    error,
+                    spend,
+                    reported,
+                });
             }
         }
     }
+}
+
+pub(super) struct FailedAnswer {
+    pub(super) error: ItemError,
+    pub(super) spend: ItemSpend,
+    pub(super) reported: Option<Box<ReportedErrorUsage>>,
+}
+
+pub(super) fn error_spend(
+    reply: &ProviderReply,
+    frozen: &FrozenRow,
+) -> (ItemSpend, Option<Box<ReportedErrorUsage>>) {
+    let reported = match reply {
+        ProviderReply::ClassifiedError { reported, .. } => reported.clone(),
+        _ => None,
+    };
+    let spend = reported
+        .as_ref()
+        .and_then(|r| batch_cost(frozen, &[(r.usage.input_tokens, r.usage.output_tokens)]))
+        .map_or_else(|| reply_spend(reply), ItemSpend::Measured);
+    (spend, reported)
+}
+
+pub(super) fn budget_debit(spend: ItemSpend, ceiling: Option<u64>) -> u64 {
+    match spend {
+        ItemSpend::Nothing => 0,
+        ItemSpend::Unknown => super::unknown_spend_debit(ceiling),
+        ItemSpend::Measured(nanos) => nanos,
+    }
+}
+
+pub(super) fn fact_context(
+    service: &SystemOne,
+    model: &str,
+    auth_selection: Option<String>,
+    account_ref: Option<String>,
+    spend_nanos: u64,
+) -> Option<broca_store::system_one::FactContext> {
+    use broca_core::ChargeBasisResolver;
+    let export = service.export.as_ref()?;
+    let (provider, model) = super::catalog_key_parts(model)?;
+    let method = auth_selection
+        .as_deref()
+        .and_then(|id| id.split(':').next())
+        .unwrap_or("apikey");
+    let (charge_basis, charge_basis_mapping_version) =
+        service.charge_basis.resolve_charge_basis(provider, method);
+    Some(broca_store::system_one::FactContext {
+        source_instance_id: export.source_instance_id().into(),
+        provider: provider.into(),
+        model: model.into(),
+        auth_selection,
+        account_ref,
+        charge_basis,
+        charge_basis_mapping_version,
+        charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
+        spend_nanos,
+    })
 }
 
 pub(super) struct PaidAnswer {
@@ -1076,10 +1138,10 @@ async fn serve_claimed(
             raw.items[index].state.get(),
         );
         *dispatched = true;
-        let answer = call_provider(service, pin, body).await;
+        let answer = call_provider(service, pin, body, &frozen).await;
         if first_provider_call {
             first_provider_call = false;
-            if let Err((error, _)) = &answer {
+            if let Err(FailedAnswer { error, spend, .. }) = &answer {
                 if errors::is_batch_level(&error.code) {
                     // §14: a batch-level code on the call's first provider call is an
                     // admission refusal. A batch this call created is removed; a recorded one
@@ -1093,10 +1155,8 @@ async fn serve_claimed(
                         request.model.as_deref().unwrap_or_default(),
                         pin,
                     );
-                    // Every batch-level code is an answer the provider does not bill (or a
-                    // credential that was never sent), so the call spent nothing.
                     return Err(if is_tool {
-                        Spend::Nothing.mark(refusal)
+                        Spend::from(*spend).mark(refusal)
                     } else {
                         refusal
                     });
@@ -1117,11 +1177,13 @@ async fn serve_claimed(
                     tool_answer_cut().await;
                 }
                 let cost = spend_of(&frozen, usage.as_ref(), &estimates[index]);
-                let measured = usage
-                    .as_ref()
-                    .and_then(|usage| usage.input_tokens)
-                    .is_some();
-                let result = if is_tool && !measured {
+                let (input_tokens, output_tokens) = (
+                    usage.and_then(|u| u.input_tokens),
+                    usage.and_then(|u| u.output_tokens),
+                );
+                let measured = batch_cost(&frozen, &[(input_tokens, output_tokens)]);
+                let debit = measured.unwrap_or_else(|| super::unknown_spend_debit(ceiling));
+                let result = if is_tool && measured.is_none() {
                     let refusal = crate::llm_tools::unmeasured_cost_refusal();
                     Outcome::Failed(item_error_json(&ItemError::new(
                         refusal.code,
@@ -1134,49 +1196,42 @@ async fn serve_claimed(
                 let outcome = StoredOutcome {
                     index: index as u64,
                     outcome: result,
-                    input_tokens: usage.and_then(|u| u.input_tokens),
-                    output_tokens: usage.and_then(|u| u.output_tokens),
+                    input_tokens,
+                    output_tokens,
                 };
-                // `run_inner` refused a key without both ids before the call, so the split
-                // always succeeds here.
-                let fact = service
-                    .export
-                    .as_ref()
-                    .zip(super::catalog_key_parts(
-                        request.model.as_deref().unwrap_or_default(),
-                    ))
-                    .map(|(export, (provider, model))| {
-                        use broca_core::ChargeBasisResolver;
-                        let method = auth_selection
-                            .as_deref()
-                            .and_then(|id| id.split(':').next())
-                            .unwrap_or("apikey");
-                        let (charge_basis, charge_basis_mapping_version) =
-                            service.charge_basis.resolve_charge_basis(provider, method);
-                        broca_store::system_one::FactContext {
-                            source_instance_id: export.source_instance_id().into(),
-                            provider: provider.to_owned(),
-                            model: model.to_owned(),
-                            auth_selection,
-                            account_ref,
-                            charge_basis,
-                            charge_basis_mapping_version,
-                            charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
-                        }
-                    });
-                record_paid(service, &request.batch_id, &outcome, cost, fact).await?;
-                spent = spent.saturating_add(cost);
+                let fact =
+                    fact_context(service, &pin.catalog_id, auth_selection, account_ref, cost);
+                record_paid(service, &request.batch_id, &outcome, debit, fact).await?;
+                spent = spent.saturating_add(debit);
                 slots[index] = Some(Slot::Stored(outcome));
             }
-            Err((error, spend)) => {
+            Err(FailedAnswer {
+                error,
+                spend,
+                reported,
+            }) => {
                 if error.is_stored() {
+                    let usage = reported.as_ref().map(|r| r.usage);
                     let outcome = StoredOutcome {
                         index: index as u64,
                         outcome: Outcome::Failed(stored_error_json(&error, mark(spend))),
-                        input_tokens: None,
-                        output_tokens: None,
+                        input_tokens: usage.and_then(|u| u.input_tokens),
+                        output_tokens: usage.and_then(|u| u.output_tokens),
                     };
-                    record(service, &request.batch_id, &outcome, 0).await?;
+                    let debit = budget_debit(spend, ceiling);
+                    let fact = reported
+                        .filter(|_| !error.is_retried_on_resend())
+                        .and_then(|r| {
+                            fact_context(
+                                service,
+                                &pin.catalog_id,
+                                r.auth_selection,
+                                r.account_ref,
+                                spend_of(&frozen, Some(&r.usage), &estimates[index]),
+                            )
+                        });
+                    record_paid(service, &request.batch_id, &outcome, debit, fact).await?;
+                    spent = spent.saturating_add(debit);
                     slots[index] = Some(Slot::Stored(outcome));
                 } else {
                     slots[index] = Some(Slot::Unsent(MarkedItemError::new(

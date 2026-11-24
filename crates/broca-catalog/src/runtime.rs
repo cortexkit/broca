@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use broca_provider::spec::{
@@ -11,6 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(test)]
 use serde_json::Map;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::family::{resolve_provider_family, FamilyResolution};
 #[cfg(any(test, feature = "test-support"))]
@@ -139,55 +140,16 @@ impl CatalogSource {
     }
 }
 
+#[derive(Clone)]
 struct LoadedCatalog {
-    carries_temperature_facts: [bool; 3],
-    carries_routing_facts: bool,
-    // Arc-wrapped so an equal-version refresh can republish the existing index with fresh
-    // metadata instead of rebuilding ~6,300 models to produce the same answer.
+    // The incoming model facts, before rejected rows were replaced by their last-known-good rows.
+    // Only fusiform responses have a digest; legacy fixtures do not.
+    model_facts_digest: Option<[u8; 32]>,
     catalog: Arc<ServingCatalog>,
     model_identities: Arc<BTreeSet<String>>,
     resolved_at_ms: i64,
     catalog_version: i64,
     source: CatalogSource,
-    /// Whether any row of the source document carried `limit.output`. The equal-version fast
-    /// path reuses this index on the premise that equal versions mean equal facts, which stops
-    /// holding when broca starts requesting a fact it did not request before: an LKG written
-    /// before `limit.output` was requested has the same version as the next poll and none of
-    /// the new fact. Without this bit that poll would republish an index with no output limits,
-    /// and it would stay that way until fusiform happened to mint a new version.
-    carries_output_limits: bool,
-    /// An equal-version poll must replace an older LKG that did not request image counts.
-    carries_image_counts: bool,
-    /// An equal-version poll must replace an older LKG that did not request pixel bounds.
-    carries_image_dimensions: bool,
-    /// Whether any row of the source document carried a mode rate. Same reason as
-    /// `carries_output_limits`: an LKG fetched before broca requested mode rates has the same
-    /// version as the next poll and none of them, and reusing its index would keep every tier
-    /// refused until fusiform happened to mint a new version.
-    carries_mode_rates: bool,
-    /// A poll requesting prices must replace an equal-version last-known-good catalog snapshot
-    /// that was fetched without prices.
-    carries_warm_rates: bool,
-    /// Whether any row of the source document carried `model.kind`. Same reason as
-    /// `carries_output_limits`: an LKG fetched before broca requested the kind has the same
-    /// version as the next poll and no kinds, and reusing its index would keep admitting a
-    /// non-chat model to `session.send` until fusiform happened to mint a new version.
-    carries_model_kinds: bool,
-    /// An equal-version poll can add modalities that an older prefix list did not request.
-    carries_input_modalities: bool,
-    /// A same-version poll can add names omitted by the previous prefix list.
-    carries_display_names: bool,
-    /// Whether any row of the source document carried `capability.server_side_fallback`. Same
-    /// reason as `carries_output_limits`: fusiform serves the fact on current reads, so a
-    /// last-known-good catalog written before broca requested it has the same version as the
-    /// next poll and none of the fact. Reusing its index would leave every row reading "no
-    /// server-side fallback" until fusiform happened to mint a new version.
-    carries_server_side_fallback: bool,
-    /// Refresh equal-version last-known-good data fetched before `mid_conversation_system` was requested.
-    carries_mid_conversation_system: bool,
-    /// Refresh equal-version last-known-good data fetched before `effort_change_cache` was
-    /// requested, so its rows don't keep reading "no fact" until fusiform mints a new version.
-    carries_effort_change_cache: bool,
     /// Present rows this catalog left out or kept from the catalog it replaced, because their
     /// facts could not be used. Shared with an equal-version republish, which reuses the index
     /// these describe.
@@ -200,64 +162,13 @@ const TEMPERATURE_FACTS: [&str; 3] = [
     "limit.temperature_max",
 ];
 
-fn response_carries_temperature_facts(response: &FusiformCatalogResponse) -> [bool; 3] {
-    TEMPERATURE_FACTS.map(|key| {
-        response
-            .models
-            .values()
-            .any(|facts| facts.contains_key(key))
-    })
-}
-
-/// Whether a response's model rows carry `model.kind`. Stops at the first row that has it.
-fn response_carries_model_kinds(response: &FusiformCatalogResponse) -> bool {
-    response
-        .models
-        .values()
-        .any(|facts| facts.contains_key("model.kind"))
-}
-
-fn response_carries_input_modalities(response: &FusiformCatalogResponse) -> bool {
-    response
-        .models
-        .values()
-        .any(|facts| facts.contains_key("capability.input_modalities"))
-}
-
-fn response_carries_display_names(response: &FusiformCatalogResponse) -> bool {
-    response
-        .models
-        .values()
-        .any(|facts| facts.contains_key("model.name") || facts.contains_key("provider.name"))
-}
-
-fn response_carries_server_side_fallback(response: &FusiformCatalogResponse) -> bool {
-    response
-        .models
-        .values()
-        .any(|facts| facts.contains_key(SERVER_SIDE_FALLBACK_FACT))
-}
-
-fn response_carries_mid_conversation_system(response: &FusiformCatalogResponse) -> bool {
-    response
-        .models
-        .values()
-        .any(|facts| facts.contains_key(MID_CONVERSATION_SYSTEM_FACT))
-}
-
-fn response_carries_effort_change_cache(response: &FusiformCatalogResponse) -> bool {
-    response
-        .models
-        .values()
-        .any(|facts| facts.contains_key(EFFORT_CHANGE_CACHE_FACT))
-}
-
-fn response_carries_routing_facts(response: &FusiformCatalogResponse) -> bool {
-    response.models.values().any(|facts| {
-        facts
-            .keys()
-            .any(|key| key.starts_with("wire.") || key.starts_with("route."))
-    })
+fn model_facts_digest(response: &FusiformCatalogResponse) -> [u8; 32] {
+    // Timestamps and diagnostics do not shape the serving index. Hash just the ordered model
+    // map, so even a value change within a prefix we already know about invalidates the index.
+    let mut hash = Sha256::new();
+    serde_json::to_writer(&mut hash, &response.models)
+        .expect("an in-memory JSON map can be serialized into the digest");
+    hash.finalize().into()
 }
 
 impl LoadedCatalog {
@@ -268,40 +179,6 @@ impl LoadedCatalog {
             row.warn();
         }
     }
-}
-
-/// Whether a response's model rows carry any mode rate. Stops at the first one.
-fn response_carries_mode_rates(response: &FusiformCatalogResponse) -> bool {
-    response.models.values().any(|facts| {
-        facts.keys().any(|key| {
-            key.starts_with(MODE_RATE_INPUT_PREFIX) || key.starts_with(MODE_RATE_OUTPUT_PREFIX)
-        })
-    })
-}
-
-/// Whether a response's model rows carry `limit.output`. Stops at the first row that has it, so
-/// on a current document this reads one or two rows rather than thousands.
-fn response_carries_output_limits(response: &FusiformCatalogResponse) -> bool {
-    response
-        .models
-        .values()
-        .any(|facts| facts.contains_key("limit.output"))
-}
-
-fn response_carries_image_counts(response: &FusiformCatalogResponse) -> bool {
-    response
-        .models
-        .values()
-        .any(|facts| facts.contains_key("limit.images_per_request"))
-}
-
-fn response_carries_image_dimensions(response: &FusiformCatalogResponse) -> bool {
-    response.models.values().any(|facts| {
-        facts.contains_key("limit.image_long_edge_px")
-            || facts
-                .keys()
-                .any(|key| key.starts_with("limit.image_long_edge_px.above_images."))
-    })
 }
 
 /// The bounded provider facts retained for admission. `raw` is always null, so cloning this spec
@@ -751,9 +628,8 @@ impl CatalogSnapshot {
 
     /// Whether two snapshots share one serving index rather than holding equal copies.
     ///
-    /// Test-facing, and it asserts the thing that matters: an equal-version poll is supposed to
-    /// REPUBLISH the existing index, not rebuild an identical one. Comparing contents cannot
-    /// tell those apart, and the difference is the entire 2.96ms / 1.38 MB saving.
+    /// An unchanged poll can republish the same serving index with a new timestamp. This
+    /// distinguishes reuse from rebuilding an identical index for the snapshot.
     #[doc(hidden)]
     pub fn shares_index_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0.catalog, &other.0.catalog)
@@ -825,7 +701,7 @@ impl CatalogSnapshot {
             .is_some_and(|(provider, model)| {
                 provider.spec.as_ref().is_some_and(|spec| {
                     broca_provider::turn_system::catalog_support(
-                        spec.wire_family,
+                        model.wire_family.unwrap_or(spec.wire_family),
                         &spec.id,
                         &model.to_spec(model_id),
                     )
@@ -874,7 +750,7 @@ impl CatalogSnapshot {
     /// Whether the catalog serves `provider_id` itself: it has a wire family and rows for it. A
     /// provider it doesn't serve may still be reachable by borrowing another provider's rows.
     pub fn serves_provider(&self, provider_id: &str) -> bool {
-        self.0.catalog.providers.contains_key(provider_id)
+        self.contains_provider(provider_id)
     }
 
     /// Resolve a model using a previously recorded family instead of the current overlay pin.
@@ -974,7 +850,7 @@ impl ServingCatalog {
         let mut model_identities = BTreeSet::new();
         let mut excluded_rows = Vec::new();
         let mut batch_rows = BTreeMap::new();
-        let routing: BTreeMap<_, _> = models
+        let mut routing: BTreeMap<_, _> = models
             .iter()
             .map(|(id, facts)| (id.clone(), crate::routing::RoutingFacts::decode(facts)))
             .collect();
@@ -1000,6 +876,26 @@ impl ServingCatalog {
 
             match facts.get("existence") {
                 Some(Value::String(value)) if value == "present" => {
+                    let removed = overlay.removes(&provider_id, &model_id);
+                    let parsed = (!removed).then(|| serving_model_from_facts(identity, facts));
+                    let kept = match parsed {
+                        Some(Err(_)) => previous.and_then(|catalog| {
+                            let (_, model) = catalog.provider_and_model(&provider_id, &model_id)?;
+                            Some((catalog, model))
+                        }),
+                        _ => None,
+                    };
+                    if let Some((kept, _)) = kept {
+                        // Provider defaults and per-model routing must both use the retained row.
+                        match kept.routing.get(identity) {
+                            Some(route) => routing.insert(identity.clone(), route.clone()),
+                            None => routing.remove(identity),
+                        };
+                        if let Some(row) = kept.batch_rows.get(identity) {
+                            batch_rows.insert(identity.clone(), row.clone());
+                        }
+                    }
+                    let route = routing.get(identity);
                     // Creating the provider before applying a model removal matches the old base:
                     // a provider remains a valid overlay patch target even if removal empties it.
                     let provider = providers.entry(provider_id.clone()).or_insert_with(|| {
@@ -1011,16 +907,11 @@ impl ServingCatalog {
                                 FamilyResolution::Supported { family, .. } => Some(family),
                                 FamilyResolution::Pending { .. } => None,
                             };
-                        let family = routing[identity]
-                            .npm
-                            .as_ref()
-                            .and_then(|npm| {
+                        let family = route
+                            .and_then(|route| {
                                 crate::family::wire_family(
-                                    &npm.value,
-                                    routing[identity]
-                                        .shape
-                                        .as_ref()
-                                        .map(|shape| shape.value.as_str()),
+                                    &route.npm.as_ref()?.value,
+                                    route.shape.as_ref().map(|shape| shape.value.as_str()),
                                 )
                             })
                             .or_else(|| {
@@ -1035,19 +926,21 @@ impl ServingCatalog {
                         )
                     });
 
-                    if overlay.removes(&provider_id, &model_id) {
-                        overlay_removed_models
-                            .entry(provider_id.clone())
-                            .or_default()
-                            .insert(model_id.clone());
-                    } else {
-                        match serving_model_from_facts(identity, facts) {
+                    if let Some(parsed) = parsed {
+                        let model_route = route.and_then(|route| route.route().ok());
+                        if let Some((family, api)) = &model_route {
+                            if provider.spec.is_none() && (parsed.is_ok() || kept.is_some()) {
+                                provider.spec =
+                                    Some(serving_provider_spec(&provider_id, *family, api.clone()));
+                            }
+                        }
+                        match parsed {
                             Ok(mut model) => {
                                 batch_rows.insert(identity.clone(), batch_row_of(&model, facts));
                                 if let Some(patch) = overlay.model_patch(&provider_id, &model_id) {
                                     patch.apply(&mut model);
                                 }
-                                if let Ok((family, api)) = routing[identity].route() {
+                                if let Some((family, api)) = model_route {
                                     model.wire_family = Some(family);
                                     if let Some(override_family) = overlay
                                         .model_patch(&provider_id, &model_id)
@@ -1058,32 +951,27 @@ impl ServingCatalog {
                                     {
                                         model.wire_family = Some(override_family);
                                     }
-                                    model.base_url = Some(api.clone());
-                                    if provider.spec.is_none() {
-                                        provider.spec =
-                                            Some(serving_provider_spec(&provider_id, family, api));
-                                    }
+                                    model.base_url = Some(api);
                                 }
                                 provider.models.insert(model_id.clone(), model);
                             }
                             Err(error) => {
-                                // The previous model already had the overlay applied when it
-                                // was assembled, so it is reinstated as it was served.
-                                let kept = previous
-                                    .and_then(|catalog| {
-                                        catalog.provider_and_model(&provider_id, &model_id)
-                                    })
-                                    .map(|(_, model)| model.clone());
                                 excluded_rows.push(RowExclusion::from_error(
                                     identity,
                                     error,
                                     kept.is_some(),
                                 ));
-                                if let Some(model) = kept {
-                                    provider.models.insert(model_id.clone(), model);
+                                if let Some((_, model)) = kept {
+                                    // The previous model already has its overlay applied.
+                                    provider.models.insert(model_id.clone(), model.clone());
                                 }
                             }
                         }
+                    } else {
+                        overlay_removed_models
+                            .entry(provider_id.clone())
+                            .or_default()
+                            .insert(model_id.clone());
                     }
                 }
                 Some(Value::String(value))
@@ -2058,6 +1946,7 @@ impl From<CatalogError> for CatalogRefreshError {
 /// of fusiform and the filesystem.
 pub struct CatalogCache {
     current: RwLock<Option<Arc<LoadedCatalog>>>,
+    refresh_writer: Mutex<()>,
     lkg_path: Option<PathBuf>,
     lkg_load_error: Option<String>,
     /// How many refreshes in a row have been refused, and why the last one was.
@@ -2106,6 +1995,7 @@ impl CatalogCache {
         };
         Self {
             current: RwLock::new(current),
+            refresh_writer: Mutex::new(()),
             lkg_path: Some(lkg_path),
             lkg_load_error,
             consecutive_refusals: RwLock::new((0, None)),
@@ -2118,6 +2008,7 @@ impl CatalogCache {
     pub fn empty() -> Self {
         Self {
             current: RwLock::new(None),
+            refresh_writer: Mutex::new(()),
             lkg_path: None,
             lkg_load_error: None,
             consecutive_refusals: RwLock::new((0, None)),
@@ -2266,27 +2157,8 @@ impl CatalogCache {
         &self,
         mut response: FusiformCatalogResponse,
     ) -> Result<(), CatalogRefreshError> {
-        // WHEN THIS CAN ACTUALLY FIRE, per fusiform's serve predicates rather than observation:
-        // `uncertain` needs an era with `boundary_at_ms > at`, and `withheld` needs a correction
-        // window with `affected_until_ms >= at`. A boundary is stamped when the poll that detected
-        // the change ran, so it is always in the past, and `plan_correction` refuses unless the
-        // era in force begins at or after the window ends. Broca's poller omits at_ms, so it always
-        // asks `at = now` and both predicates are false by construction.
-        //
-        // TWO EXCEPTIONS, and the second is why this guard is not decoration. A read landing on the
-        // exact millisecond where a correction's `affected_until` equals the current era's boundary
-        // is a real but negligible coincidence. A BACKWARD CLOCK STEP is not: both predicates
-        // compare stored timestamps against the system clock, so an NTP correction or a VM restore
-        // moving time backward puts `now` before boundaries already written and re-arms both arms
-        // for the length of the skew. Fusiform derives catalog_version as max(now_ms, current + 1)
-        // precisely because backward steps happen here -- which keeps VERSIONS monotonic, so the
-        // equal-version fast path below keeps firing and would route a qualified response straight
-        // through the exit that used to have no guard.
-        //
-        // The invariant this defends is not "reject bad input". It is that REFRESH AND `open` MUST
-        // AGREE ON WHAT A VALID CATALOG IS: `loaded` rejects qualified facts on every LKG load, so
-        // any path here that persists one writes a file the next restart cannot read, and a
-        // degraded poll becomes an empty catalog with every model-backed send failing.
+        // A backward clock step can re-arm withheld or uncertain facts. Refuse them even on
+        // equal versions: a poll must not write a file that boot would reject.
         if !response.withheld.is_empty() || !response.uncertain.is_empty() {
             return Err(CatalogError::FusiformQualifiedFacts {
                 withheld: response.withheld.len(),
@@ -2295,176 +2167,39 @@ impl CatalogCache {
             .into());
         }
 
+        // One writer at a time, from the version check through the disk and memory installs.
+        // Admissions use `current` alone and need not wait for the write to disk.
+        let _writer = self
+            .refresh_writer
+            .lock()
+            .expect("catalog refresh lock poisoned");
         let installed = self
             .current
             .read()
             .expect("catalog cache lock poisoned")
             .as_ref()
             .cloned();
+        #[cfg(test)]
+        if let Some(hook) = tests::AFTER_REFRESH_SNAPSHOT.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
 
-        // Decide on the version BEFORE materializing. Rebuilding the compact index for all
-        // ~6,300 models costs 2.96ms and 1.38 MB of transient allocation (measured, release,
-        // 100 fresh processes); comparing two integers costs 84ns. Building first and then
-        // discovering the response is stale or unchanged pays the former to learn the latter.
-        //
-        // Ordering, not logic: the guards below are the same ones, moved ahead of the work they
-        // gate. I put them after materialization when I added the version check, because that
-        // is where the identity check already sat.
         if let Some(current) = &installed {
+            // The version is fusiform's high-water mark. Identity checks cannot stand in for
+            // it: a stale response can bring back a withdrawn row without dropping any keys.
             if response.catalog_version < current.catalog_version {
                 return Err(CatalogRefreshError::Stale {
                     installed: current.catalog_version,
                     received: response.catalog_version,
                 });
             }
-            if response.catalog_version == current.catalog_version {
-                // Equal versions cannot withdraw a published name. Preserve those facts in
-                // the persisted response too, so a nameless poll cannot erase them on restart.
-                if current.carries_display_names {
-                    for (identity, facts) in &mut response.models {
-                        if let Some(row) = current.catalog.batch_rows.get(identity) {
-                            for (key, cached) in [
-                                ("model.name", &row.model_name),
-                                ("provider.name", &row.provider_name),
-                            ] {
-                                if display_name_fact(facts, key).is_none() {
-                                    if let Some(name) = cached {
-                                        facts.insert(key.into(), Value::String(name.clone()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Same version, so the facts of the rows the index already holds are taken as
-                // unchanged and the existing index is reused — but only if the response is
-                // COMPLETE. A truncated or
-                // degraded response can carry the version of the document it was truncated
-                // from, and this path persists the LKG, so accepting one here would write a
-                // short catalog to disk for the next restart to load. The in-memory index
-                // would survive (it is reused, not rebuilt from the response) and the damage
-                // would appear only after a restart, which is the worst time to find it.
-                //
-                // Checked against the response's own keys rather than a built index: the
-                // identity set is just the map keys, so this costs a set difference and none
-                // of the 2.96ms materialization.
-                let missing: Vec<&String> = current
-                    .model_identities
-                    .iter()
-                    .filter(|identity| !response.models.contains_key(*identity))
-                    .collect();
-                if let Some(sample) = missing.first() {
-                    return Err(CatalogRefreshError::Incomplete {
-                        missing_count: missing.len(),
-                        sample: (*sample).clone(),
-                        resolved_at_ms: response.resolved_at_ms,
-                    });
-                }
-                // An equal version can still GAIN rows. Fusiform compiles some model data into
-                // its own build, and a deploy that adds such a row does not move
-                // catalog_version. Reusing the index there would leave the new model unknown, so
-                // every send naming it would be refused for lacking a row until some unrelated
-                // change minted a new version. Taken like a newly carried fact: rebuild and
-                // install. Decided on the identity set alone, like the completeness check above,
-                // so an unchanged poll still pays no materialization.
-                let gains_rows = response
-                    .models
-                    .keys()
-                    .any(|identity| !current.model_identities.contains(identity));
-                // `loaded` rejects responses with withheld or uncertain facts. Keep that check
-                // ahead of the version fast path: persisting a rejected response would leave an
-                // LKG that `open` refuses after restart, even while the in-memory catalog keeps
-                // serving its last accepted snapshot.
-                if gains_rows
-                    || response_carries_output_limits(&response) != current.carries_output_limits
-                    || response_carries_image_counts(&response) != current.carries_image_counts
-                    || response_carries_image_dimensions(&response)
-                        != current.carries_image_dimensions
-                    || response_carries_mode_rates(&response) != current.carries_mode_rates
-                    || response_carries_warm_rates(&response) != current.carries_warm_rates
-                    || response_carries_model_kinds(&response) != current.carries_model_kinds
-                    || response_carries_input_modalities(&response)
-                        != current.carries_input_modalities
-                    || response_carries_routing_facts(&response) != current.carries_routing_facts
-                    || response_carries_display_names(&response) != current.carries_display_names
-                    || response_carries_server_side_fallback(&response)
-                        != current.carries_server_side_fallback
-                    || response_carries_mid_conversation_system(&response)
-                        != current.carries_mid_conversation_system
-                    || response_carries_effort_change_cache(&response)
-                        != current.carries_effort_change_cache
-                    || response_carries_temperature_facts(&response)
-                        != current.carries_temperature_facts
-                {
-                    let rebuilt = Arc::new(loaded(
-                        &response,
-                        CatalogSource::Fusiform,
-                        Some(&current.catalog),
-                    )?);
-                    if let Some(path) = &self.lkg_path {
-                        persist_bootable_lkg(path, &response, &rebuilt.excluded_rows)?;
-                    }
-                    self.install(rebuilt);
-                    return Ok(());
-                }
-
-                // Persist even though no fact changed: the LKG carries resolved_at_ms, and a
-                // restart should recover the freshest proof that fusiform answered.
-                if let Some(path) = &self.lkg_path {
-                    persist_bootable_lkg(path, &response, &current.excluded_rows)?;
-                }
-                let refreshed = Arc::new(LoadedCatalog {
-                    carries_routing_facts: current.carries_routing_facts,
-                    catalog: Arc::clone(&current.catalog),
-                    model_identities: Arc::clone(&current.model_identities),
-                    resolved_at_ms: response.resolved_at_ms,
-                    catalog_version: current.catalog_version,
-                    source: CatalogSource::Fusiform,
-                    carries_output_limits: current.carries_output_limits,
-                    carries_image_counts: current.carries_image_counts,
-                    carries_image_dimensions: current.carries_image_dimensions,
-                    carries_mode_rates: current.carries_mode_rates,
-                    carries_warm_rates: current.carries_warm_rates,
-                    carries_model_kinds: current.carries_model_kinds,
-                    carries_input_modalities: current.carries_input_modalities,
-                    carries_display_names: current.carries_display_names,
-                    carries_server_side_fallback: current.carries_server_side_fallback,
-                    carries_mid_conversation_system: current.carries_mid_conversation_system,
-                    carries_effort_change_cache: current.carries_effort_change_cache,
-                    carries_temperature_facts: current.carries_temperature_facts,
-                    excluded_rows: Arc::clone(&current.excluded_rows),
-                });
-                self.install(refreshed);
-                return Ok(());
-            }
-        }
-
-        // The catalog being replaced, so a row that served before and now arrives malformed
-        // keeps its earlier model instead of disappearing.
-        let next = Arc::new(loaded(
-            &response,
-            CatalogSource::Fusiform,
-            installed.as_ref().map(|current| current.catalog.as_ref()),
-        )?);
-        if let Some(current) = installed {
-            // Why the version guard above exists at all: `catalog_version` is the only field
-            // fusiform documents as safe to hold as a high-water mark, derived as
-            // max(now_ms, current + 1), so it is monotonic even across a restore of their
-            // database, which `era_count` and `model_count` are not.
-            //
-            // The identity check below cannot stand in for it. With include_retired every model
-            // stays present as a row, so a snapshot that merely disagrees about whether a model
-            // EXISTS has the same identity set — an older response can flip a withdrawn model
-            // back to present and pass, putting a model the newer catalog withdrew back on the
-            // admission path.
-            //
-            // Reachable without any fusiform-side fault: pollers sharing a catalog snapshot
-            // path have no cross-process ordering, even though persist_lkg is atomic per write.
-            // An older poll can finish writing last and overwrite a newer snapshot on disk.
-            let missing = current
+            // Even an equal-version response can be truncated. Check the keys before building
+            // or persisting it so a restart cannot lose an identity known to this process.
+            let missing: Vec<_> = current
                 .model_identities
-                .difference(&next.model_identities)
-                .collect::<Vec<_>>();
+                .iter()
+                .filter(|identity| !response.models.contains_key(*identity))
+                .collect();
             if let Some(sample) = missing.first() {
                 return Err(CatalogRefreshError::Incomplete {
                     missing_count: missing.len(),
@@ -2472,7 +2207,33 @@ impl CatalogCache {
                     resolved_at_ms: response.resolved_at_ms,
                 });
             }
+            if response.catalog_version == current.catalog_version {
+                // Equal versions cannot withdraw a published name. Preserve those facts in
+                // the persisted response too, so a nameless poll cannot erase them on restart.
+                for (identity, facts) in &mut response.models {
+                    if let Some(row) = current.catalog.batch_rows.get(identity) {
+                        for (key, cached) in [
+                            ("model.name", &row.model_name),
+                            ("provider.name", &row.provider_name),
+                        ] {
+                            if display_name_fact(facts, key).is_none() {
+                                if let Some(name) = cached {
+                                    facts.insert(key.into(), Value::String(name.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        let next = Arc::new(loaded(
+            &response,
+            CatalogSource::Fusiform,
+            installed.as_deref(),
+        )?);
+        // Even an unchanged poll validates and writes the last-known-good catalog. A restart
+        // should recover the latest time fusiform answered, not the last time its facts changed.
         if let Some(path) = &self.lkg_path {
             persist_bootable_lkg(path, &response, &next.excluded_rows)?;
         }
@@ -2510,26 +2271,12 @@ impl CatalogCache {
         source: CatalogSource,
     ) {
         let next = Arc::new(LoadedCatalog {
-            carries_routing_facts: false,
+            model_facts_digest: None,
             catalog: Arc::new(ServingCatalog::from_catalog(catalog)),
             model_identities: Arc::new(BTreeSet::new()),
             resolved_at_ms,
             catalog_version: 0,
             source,
-            carries_output_limits: true,
-            carries_image_counts: true,
-            carries_image_dimensions: false,
-            carries_mode_rates: false,
-            carries_warm_rates: true,
-            // The vendored snapshot serves no `model.kind`.
-            carries_model_kinds: false,
-            carries_input_modalities: false,
-            carries_display_names: false,
-            // The vendored snapshot serves no `capability.server_side_fallback`.
-            carries_server_side_fallback: false,
-            carries_mid_conversation_system: false,
-            carries_effort_change_cache: false,
-            carries_temperature_facts: [false; 3],
             excluded_rows: Arc::from([]),
         });
         *self.current.write().expect("catalog cache lock poisoned") = Some(next);
@@ -2579,7 +2326,7 @@ pub struct CatalogHealth {
 fn loaded(
     response: &FusiformCatalogResponse,
     source: CatalogSource,
-    previous: Option<&ServingCatalog>,
+    previous: Option<&LoadedCatalog>,
 ) -> Result<LoadedCatalog, CatalogError> {
     if !response.withheld.is_empty() || !response.uncertain.is_empty() {
         return Err(CatalogError::FusiformQualifiedFacts {
@@ -2587,26 +2334,28 @@ fn loaded(
             uncertain: response.uncertain.len(),
         });
     }
-    let assembled = ServingCatalog::from_fusiform(&response.models, previous)?;
+    let model_facts_digest = Some(model_facts_digest(response));
+    if let Some(previous) = previous.filter(|previous| {
+        previous.catalog_version == response.catalog_version
+            && previous.model_facts_digest == model_facts_digest
+    }) {
+        return Ok(LoadedCatalog {
+            resolved_at_ms: response.resolved_at_ms,
+            source,
+            ..previous.clone()
+        });
+    }
+    let assembled = ServingCatalog::from_fusiform(
+        &response.models,
+        previous.map(|previous| previous.catalog.as_ref()),
+    )?;
     Ok(LoadedCatalog {
-        carries_routing_facts: response_carries_routing_facts(response),
+        model_facts_digest,
         catalog: Arc::new(assembled.catalog),
         model_identities: Arc::new(assembled.model_identities),
         resolved_at_ms: response.resolved_at_ms,
         catalog_version: response.catalog_version,
         source,
-        carries_output_limits: response_carries_output_limits(response),
-        carries_image_counts: response_carries_image_counts(response),
-        carries_image_dimensions: response_carries_image_dimensions(response),
-        carries_mode_rates: response_carries_mode_rates(response),
-        carries_warm_rates: response_carries_warm_rates(response),
-        carries_model_kinds: response_carries_model_kinds(response),
-        carries_input_modalities: response_carries_input_modalities(response),
-        carries_display_names: response_carries_display_names(response),
-        carries_server_side_fallback: response_carries_server_side_fallback(response),
-        carries_mid_conversation_system: response_carries_mid_conversation_system(response),
-        carries_effort_change_cache: response_carries_effort_change_cache(response),
-        carries_temperature_facts: response_carries_temperature_facts(response),
         excluded_rows: assembled.excluded_rows.into(),
     })
 }
@@ -2820,24 +2569,6 @@ pub fn catalog() -> Result<CatalogSnapshot, CatalogUnavailable> {
     global_catalog_cache().snapshot()
 }
 
-fn response_carries_warm_rates(response: &FusiformCatalogResponse) -> bool {
-    response.models.values().any(|facts| {
-        [
-            "rate.input",
-            "rate.output",
-            "rate.cache_read",
-            "rate.cache_write",
-        ]
-        .iter()
-        .any(|base| {
-            facts.contains_key(*base)
-                || facts
-                    .keys()
-                    .any(|key| key.starts_with(&format!("{base}.above_context.")))
-        })
-    })
-}
-
 /// Rates are independent optional facts. An unfamiliar state, currency, or malformed amount
 /// makes that price unavailable for maintenance, without preventing ordinary model admission.
 ///
@@ -2919,8 +2650,36 @@ mod tests;
 mod windows_acl_tests {
     use super::*;
     use broca_owner_only::test_support::{
-        assert_protected_private as assert_private, observe, BroadParent,
+        assert_protected_private as assert_private, broaden, observe, BroadParent,
     };
+    #[test]
+    fn windows_catalog_refuses_an_lkg_with_broad_permissions() {
+        let fixture = BroadParent::new("catalog-read");
+        let path = fixture.path.join("catalog/lkg.json");
+        let response = FusiformCatalogResponse {
+            source: "fixture".into(),
+            resolved_at_ms: 1,
+            catalog_version: 1,
+            models: BTreeMap::new(),
+            withheld: vec![],
+            uncertain: vec![],
+            wire_corrections: vec![],
+        };
+        super::lkg::persist_lkg(&path, &response).unwrap();
+        assert!(CatalogCache::open(&path).snapshot().is_ok());
+        broaden(&path);
+        assert!(
+            std::fs::read(&path).is_ok(),
+            "fixture still allows ordinary reads"
+        );
+        let cache = CatalogCache::open(&path);
+        assert!(
+            cache.snapshot().is_err(),
+            "an LKG writable by Everyone must not be served"
+        );
+        assert!(cache.lkg_load_error().is_some());
+    }
+
     #[test]
     fn windows_catalog_temporary_and_replacement_are_private() {
         let fixture = BroadParent::new("catalog");

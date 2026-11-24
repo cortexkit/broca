@@ -93,6 +93,23 @@ fn a_different_body_is_reuse_and_writes_nothing() {
 }
 
 #[test]
+fn budget_debits_saturate_without_turning_the_ledger_into_a_real() {
+    let store = SystemOneStore::open_in_memory().unwrap();
+    store.claim(&claim("b", "d1", None, "p1", 1)).unwrap();
+    let maximum = i64::MAX as u64;
+    for (index, debit) in [(0, 1), (1, maximum), (2, maximum)] {
+        let outcome = StoredOutcome {
+            index,
+            outcome: Outcome::Failed("{}".into()),
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert!(store.record(ROLE, "b", "p1", &outcome, debit, 2).unwrap());
+    }
+    assert_eq!(store.ledger(ROLE, "b").unwrap(), Some((None, maximum)));
+}
+
+#[test]
 fn a_running_batch_is_in_progress_and_untouched() {
     let store = SystemOneStore::open(scratch("running")).unwrap();
     store.claim(&claim("b", "d1", Some(100), "p1", 1)).unwrap();
@@ -343,6 +360,7 @@ fn recording_the_same_pending_usage_fact_does_not_charge_twice() {
         charge_basis: broca_core::ChargeBasis::MeteredApi,
         charge_basis_mapping_version: 5,
         charge_basis_overrides: "none".into(),
+        spend_nanos: 4200,
     };
     let paid = PaidRecord {
         spend_nanos: 4200,
@@ -371,6 +389,18 @@ fn recording_the_same_pending_usage_fact_does_not_charge_twice() {
             &paid
         )
         .is_err());
+    // The fact's own spend is what the outbox keeps, so a replay naming another is a conflict.
+    let other_spend = FactContext {
+        source_instance_id: context.source_instance_id.clone(),
+        provider: context.provider.clone(),
+        model: context.model.clone(),
+        auth_selection: None,
+        account_ref: None,
+        charge_basis: context.charge_basis,
+        charge_basis_mapping_version: context.charge_basis_mapping_version,
+        charge_basis_overrides: context.charge_basis_overrides.clone(),
+        spend_nanos: 4201,
+    };
     assert!(store
         .record_paid(
             ROLE,
@@ -379,6 +409,7 @@ fn recording_the_same_pending_usage_fact_does_not_charge_twice() {
             &outcome,
             &PaidRecord {
                 spend_nanos: 4201,
+                fact: Some(&other_spend),
                 ..paid
             }
         )
@@ -411,6 +442,7 @@ fn paid_outcome_and_outbox_survive_reopen_and_publish_only_once() {
         charge_basis: broca_core::ChargeBasis::MeteredApi,
         charge_basis_mapping_version: 5,
         charge_basis_overrides: "none".into(),
+        spend_nanos: 4200,
     };
     {
         let store = SystemOneStore::open(&path).unwrap();
@@ -440,12 +472,19 @@ fn paid_outcome_and_outbox_survive_reopen_and_publish_only_once() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].fact.run_id.as_deref(), Some("run"));
     assert_eq!(pending[0].fact.usage.input_tokens, Some(100));
-    assert!(export.emit_system_one_fact(&pending[0].fact).unwrap());
+    use crate::export_index::SystemOneFactEmission;
+    assert_eq!(
+        export.emit_system_one_fact(&pending[0].fact).unwrap(),
+        SystemOneFactEmission::Inserted
+    );
     drop(export);
     // A crash after export committed but before the outbox was acknowledged replays the same
     // bytes. The unique export identity, not an in-memory sent flag, makes that replay harmless.
     let export = crate::SqliteStore::open(&export_path).unwrap();
-    assert!(!export.emit_system_one_fact(&pending[0].fact).unwrap());
+    assert_eq!(
+        export.emit_system_one_fact(&pending[0].fact).unwrap(),
+        SystemOneFactEmission::AlreadyPresent
+    );
     let page = export.read_export_page(None, 100).unwrap();
     assert_eq!(page.facts.len(), 1);
     assert_eq!(page.high_water, 1);
@@ -477,7 +516,10 @@ fn paid_outcome_and_outbox_survive_reopen_and_publish_only_once() {
             &PaidRecord {
                 spend_nanos: 9000,
                 now_ms: RETENTION_MS + 4,
-                fact: Some(&context)
+                fact: Some(&FactContext {
+                    spend_nanos: 9000,
+                    ..context
+                })
             }
         )
         .unwrap());
@@ -485,6 +527,9 @@ fn paid_outcome_and_outbox_survive_reopen_and_publish_only_once() {
     assert_eq!(next.len(), 1);
     assert_ne!(next[0].fact.fact_id, pending[0].fact.fact_id);
     assert_eq!(next[0].fact.usage.input_tokens, None);
-    assert!(export.emit_system_one_fact(&next[0].fact).unwrap());
+    assert_eq!(
+        export.emit_system_one_fact(&next[0].fact).unwrap(),
+        SystemOneFactEmission::Inserted
+    );
     assert_eq!(export.read_export_page(None, 100).unwrap().facts.len(), 2);
 }

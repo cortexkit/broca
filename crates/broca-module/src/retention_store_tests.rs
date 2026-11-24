@@ -502,6 +502,121 @@ async fn a_deletion_a_crash_cut_short_is_finished_by_the_next_sweep_or_a_new_ses
     }
 }
 
+/// A deletion a crash cut short in the durable root is finished by the next pass too. No pass
+/// lists that root's sessions, so the session's mark is what finds it: the mark stays until the
+/// rest of the session is gone, and goes with it.
+#[tokio::test]
+async fn a_deletion_a_crash_cut_short_outside_the_ephemeral_root_is_finished() {
+    let rig = Rig::new("cut-short-durable", Duration::from_secs(600)).await;
+    let key = rig.key("cut-short-durable");
+    rig.seed_in(
+        StorageClass::Durable,
+        &key,
+        &[
+            store_start("r1", None, STARTED_MS),
+            store_end("r1", ENDED_MS),
+            store_billed("r1"),
+        ],
+        true,
+    )
+    .await;
+    let root = StorageClass::Durable.store_root(&rig.root);
+    super::marks::mark(&root, &addr(&key)).unwrap();
+    // Where a crash right after the head's deletion mark leaves a session.
+    let heads = root.join("heads").join(addr(&key).0);
+    std::fs::rename(heads.join("head"), heads.join("head.deleting")).unwrap();
+    let owned: Vec<PathBuf> = ["heads", "logs", "objects"]
+        .into_iter()
+        .map(|folder| root.join(folder).join(addr(&key).0))
+        .collect();
+    assert!(
+        owned[1].exists(),
+        "the deleted session's logs are still on disk"
+    );
+
+    assert!(rig
+        .service
+        .sweep_store(&rig.runtime, DEADLINE_MS)
+        .await
+        .is_empty());
+    for path in &owned {
+        assert!(!path.exists(), "{} is left", path.display());
+    }
+    assert!(
+        !root.join("retained").join(addr(&key).0).exists(),
+        "the mark outlived the session"
+    );
+}
+
+/// A pass leaves the mark of a session in the durable root alone while a writer holds the
+/// session's lease, even when the session as stored needs none: the writer marks the session
+/// before the batch that gives it a deadline, so the pass may be reading it from before that
+/// batch. Once that batch lands, the mark finds the session when it comes due.
+#[tokio::test]
+async fn a_pass_keeps_the_mark_of_a_session_a_writer_holds() {
+    use broca_session_store::record::{Retention, RetentionEvent};
+    use cortexkit_role_llm_runner::session_retention::{Keep, RetentionPolicy};
+    let rig = Rig::new("mark-held", Duration::from_secs(600)).await;
+    let key = rig.key("mark-held");
+    rig.seed_in(
+        StorageClass::Durable,
+        &key,
+        &[
+            store_start("r1", None, STARTED_MS),
+            store_end("r1", ENDED_MS),
+            store_billed("r1"),
+        ],
+        false,
+    )
+    .await;
+    let root = StorageClass::Durable.store_root(&rig.root);
+    let mark = root.join("retained").join(addr(&key).0);
+    let leases = FileLeaseStore::new(rig.root.join("leases"));
+    let lease = broca_core::LeaseStore::acquire(&leases, &broca_core::lease_key_for(&key)).unwrap();
+    // The writer marks the session, then a pass runs before its batch.
+    super::marks::mark(&root, &addr(&key)).unwrap();
+    assert!(rig
+        .service
+        .sweep_store(&rig.runtime, DEADLINE_MS)
+        .await
+        .is_empty());
+    assert!(
+        mark.exists(),
+        "the pass removed the mark of a session a writer holds"
+    );
+
+    let mut writer = Session::load(
+        LocalBackend::new(&root),
+        addr(&key),
+        &triple(&key),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let policy = RetentionPolicy::new(Keep::days(1), 0, true, false);
+    writer
+        .append(
+            &[Record::Retention(Retention {
+                event: RetentionEvent::Set,
+                at_ms: ENDED_MS,
+                policy: Some(serde_json::to_value(policy).unwrap()),
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+    drop(lease);
+
+    let due = ENDED_MS + 2 * 24 * 60 * 60 * 1_000;
+    assert_eq!(
+        rig.service.sweep_store(&rig.runtime, due).await,
+        vec![key.clone()],
+        "the session came due unmarked"
+    );
+    assert!(!mark.exists());
+}
+
 /// A session whose policy hasn't expired is kept until its deadline; one whose lease is held is
 /// kept by the sweep past it, and so is one whose run's spend isn't exported yet, since only
 /// the session records it; one with a run still going, or whose first run set no retention,

@@ -84,8 +84,8 @@ crate::message! {
         4 req first_seq: u64,
         5 req last_seq: u64,
         6 req created_at_ms: u64,
-        /// The changes whose append-time objects (media, oversized bodies) the records name, so
-        /// the segment's lifetime keeps those objects alive.
+        /// Reserved change IDs in the stored format. Current writers leave this empty;
+        /// collection does not use it to keep append-time objects alive.
         7 rep prefixes: Id128,
     }
 }

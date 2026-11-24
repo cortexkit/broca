@@ -113,6 +113,55 @@ async fn ending_read_access_ends_the_stream_with_the_refusal_and_nothing_after()
     assert!(deliveries.recv().await.is_none(), "the stream ended");
 }
 
+#[tokio::test]
+async fn queued_access_changes_precede_ready_display_deltas() {
+    let mut session = session().await;
+    let mut fanout = fanout(&mut session);
+    let (sink, mut deliveries) = mpsc::channel(8);
+    fanout.attach(&session, AttachFrom::Live, sink);
+    broca_test_support::wait_for(
+        "fanout attached",
+        async {
+            let Some(Delivery::Display(event)) = deliveries.recv().await else {
+                panic!("expected the attach display reset");
+            };
+            assert!(matches!(
+                *event,
+                broca_protocol::display::DisplayEvent::DisplayReset
+            ));
+        },
+        || "waiting for display reset".into(),
+    )
+    .await;
+
+    // Queue all three before letting this task yield to the forwarder.
+    fanout
+        .display()
+        .0
+        .send(Arc::new(
+            broca_protocol::display::DisplayEvent::DisplayGap { dropped: 1 },
+        ))
+        .unwrap();
+    fanout.recheck_read_access();
+    fanout.end_read_access(broca_core::ScopeRefusal::SenderNotOwner);
+    broca_test_support::wait_for(
+        "fanout ends before displaying another delta",
+        async {
+            assert!(matches!(
+                deliveries.recv().await,
+                Some(Delivery::AdmissionChanged)
+            ));
+            assert!(matches!(
+                deliveries.recv().await,
+                Some(Delivery::AccessEnded(_))
+            ));
+            assert!(deliveries.recv().await.is_none());
+        },
+        || "waiting for access change and close".into(),
+    )
+    .await;
+}
+
 async fn before_reset(deliveries: &mut mpsc::Receiver<Delivery>) -> Vec<Arc<ControlEvent>> {
     let mut controls = Vec::new();
     loop {

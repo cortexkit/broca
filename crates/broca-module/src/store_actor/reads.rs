@@ -90,22 +90,31 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             store.heads().count_not_kept("unsynced");
             return;
         }
-        // A session that expires is left out, as `StoreRuntime::closed_position` leaves it out:
-        // whether it has expired is read from its whole view.
+        // A kept head skips the expiry check every other read of a closed session makes, so a
+        // session in the ephemeral root, which can expire while it stays put, keeps its head only
+        // with the deadline it has here, which `StoreRuntime::closed_position` checks; one whose
+        // deadline this actor doesn't already know, or that has come, keeps nothing.
         let class = match store.class_of(&self.key) {
-            Ok(Some(class)) if class != broca_records::session_storage::StorageClass::Ephemeral => {
-                class
-            }
-            Ok(Some(_)) => {
-                store.heads().count_not_kept("ephemeral");
-                return;
-            }
+            Ok(Some(class)) => class,
             _ => {
                 store.heads().count_not_kept("failed");
                 return;
             }
         };
         let addr = broca_core::session_addr(&self.key);
+        if class == broca_records::session_storage::StorageClass::Ephemeral {
+            if let Some(retention) = registry.retention_service() {
+                let Some(deadline) = self.retention_timer.known(&self.session) else {
+                    store.heads().count_not_kept("ephemeral");
+                    return;
+                };
+                if deadline.is_some_and(|deadline| deadline <= retention.clock.now_ms()) {
+                    store.heads().count_not_kept("ephemeral");
+                    return;
+                }
+                retention.keep_deadline(&addr, self.session.position(), deadline);
+            }
+        }
         let context = crate::store_reads::ReadContext {
             labels: crate::store_awaits::Labels(Some(self.executor.clone())),
             token_counts: None,

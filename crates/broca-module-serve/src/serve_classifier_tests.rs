@@ -841,6 +841,7 @@ async fn startup_replays_committed_measurement_intents_before_serving() {
         charge_basis: broca_core::ChargeBasis::MeteredApi,
         charge_basis_mapping_version: 5,
         charge_basis_overrides: "none".into(),
+        spend_nanos: 4200,
     };
     rig.store
         .record_paid(

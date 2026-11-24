@@ -112,6 +112,7 @@ pub struct StoreActor<B: SessionBackend> {
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     account_limit_timer: Option<account_limit_pause::TimedPause>,
     /// The session's retention deadline and the older retention seconds its sends are held to.
+    /// A closing actor keeps the deadline with its head (see `keep_closing_head`).
     retention_timer: expiry::Timer,
     sign_in_check: Option<account_limit_pause::SignInCheck>,
     sign_in_in_flight: Option<account_limit_pause::TimedPause>,

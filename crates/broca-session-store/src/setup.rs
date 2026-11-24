@@ -51,9 +51,8 @@ const AAD_CONTEXT: &[u8] = b"broca-setup-part-v1";
 /// What the names of plain sessions' parts start with: their name space.
 pub const PLAIN_PREFIX: &str = "plain/";
 
-/// Parts the in-memory cache holds before it starts over. The parts most sessions share number
-/// in the hundreds, but each older session read adds its own render config (see the module
-/// header), so this bounds a cache that would otherwise grow without limit.
+/// Bounds how many parts one `SetupStore` keeps for reuse: a bulk read can visit thousands
+/// of distinct parts even in a single operation.
 const CACHE_CAP: usize = 4096;
 
 /// The deployment's setup-store keys for one cipher mode: one to name parts, one to seal them.
@@ -137,8 +136,8 @@ fn aad(name: &str) -> Vec<u8> {
     aad
 }
 
-/// Reads and writes the deployment's setup parts, through a cache shared by every session in
-/// the process: most runs name the same few parts.
+/// Reads and writes the deployment's setup parts, caching them only for this instance.
+/// The run loop creates stores per operation and shares parts through `DeploymentParts`.
 pub struct SetupStore<'a, B: SessionBackend> {
     backend: &'a B,
     key: &'a SetupKey,

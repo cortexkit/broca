@@ -22,6 +22,7 @@ fn reply(findings: Vec<Finding>) -> Reply {
         window_ms: DEFAULT_WINDOW_MS,
         findings,
         coverage: BTreeMap::new(),
+        findings_omitted: 0,
     }
 }
 

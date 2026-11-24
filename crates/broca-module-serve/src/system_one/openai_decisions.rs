@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
 
 use super::credential::CredentialSource;
-use super::{ClassifierProvider, ProviderReply};
+use super::{ClassifierProvider, ProviderReply, ReportedErrorUsage};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const PROVIDER_ID: &str = "openai";
@@ -298,7 +298,23 @@ fn map_response(request: &Request, body: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&response).map_err(|e| e.to_string())
 }
 
-fn mapping_error(message: String) -> ProviderReply {
+fn reported_usage(body: &[u8]) -> Option<cortexkit_role_classifier::reply::Usage> {
+    #[derive(Deserialize)]
+    struct Reported {
+        usage: Option<cortexkit_role_classifier::reply::Usage>,
+    }
+    // Decode usage independently: the provider can meter an answer broca cannot translate.
+    serde_json::from_slice::<Reported>(body)
+        .ok()?
+        .usage
+        .filter(|usage| !usage.is_empty())
+}
+
+fn mapping_error(
+    message: String,
+    may_have_spent: bool,
+    reported: Option<ReportedErrorUsage>,
+) -> ProviderReply {
     let mut error = ItemError::for_code(
         errors::PROVIDER_REFUSED,
         format!("OpenAI Decisions unmappable answer: {message}"),
@@ -307,7 +323,8 @@ fn mapping_error(message: String) -> ProviderReply {
     ProviderReply::ClassifiedError {
         error,
         provider_code: None,
-        may_have_spent: true,
+        may_have_spent,
+        reported: reported.map(Box::new),
     }
 }
 
@@ -339,6 +356,7 @@ fn http_error(status: u16, retry_after_ms: Option<u64>, body: &[u8]) -> Provider
         // model, so only then may the call have cost money; every other refusal came before any
         // model ran.
         may_have_spent: code == errors::PROVIDER_ERROR,
+        reported: None,
     }
 }
 
@@ -379,11 +397,13 @@ impl ClassifierProvider for OpenAiDecisions {
     async fn call(&self, body: String) -> ProviderReply {
         let request: Request = match serde_json::from_str(&body) {
             Ok(request) => request,
-            Err(error) => return mapping_error(format!("request did not decode: {error}")),
+            Err(error) => {
+                return mapping_error(format!("request did not decode: {error}"), false, None)
+            }
         };
         let body = match request_body(&request) {
             Ok(body) => body,
-            Err(error) => return mapping_error(error),
+            Err(error) => return mapping_error(error, false, None),
         };
         let secret = match self.credential.secret().await {
             Ok(secret) => secret,
@@ -400,8 +420,14 @@ impl ClassifierProvider for OpenAiDecisions {
             }
             call = call.bearer_auth(&secret.token);
         }
+        let request_to_send = match call.build() {
+            Ok(request) => request,
+            Err(_) => {
+                return mapping_error("the HTTP request could not be built".into(), false, None)
+            }
+        };
         let attempt = async {
-            let response = call.send().await?;
+            let response = self.http.execute(request_to_send).await?;
             let status = response.status().as_u16();
             let retry_after = retry_after_ms(response.headers(), super::now_ms());
             let body = response.bytes().await?;
@@ -422,7 +448,15 @@ impl ClassifierProvider for OpenAiDecisions {
                     auth_selection: secret.as_ref().and_then(|s| s.auth_selection.clone()),
                     account_ref: secret.and_then(|s| s.account_id),
                 },
-                Err(message) => mapping_error(message),
+                Err(message) => mapping_error(
+                    message,
+                    true,
+                    reported_usage(&body).map(|usage| ReportedErrorUsage {
+                        usage,
+                        auth_selection: secret.as_ref().and_then(|s| s.auth_selection.clone()),
+                        account_ref: secret.and_then(|s| s.account_id),
+                    }),
+                ),
             },
             Ok(Ok((status, retry_after_ms, body))) => http_error(status, retry_after_ms, &body),
         }

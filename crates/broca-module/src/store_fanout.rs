@@ -1120,6 +1120,8 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
     let mut display_open = true;
     loop {
         tokio::select! {
+            // A queued read-policy change must reach the forwarder before another display delta.
+            biased;
             _ = cancel.cancelled() => return,
             _ = sink.closed() => return,
             item = rx.recv() => match item {

@@ -87,6 +87,12 @@ replays byte-identically without provider calls. A retryable non-account item er
 can be dispatched again only on the frozen model and credential; it never selects
 again. Account errors are retained rather than retried under a new account.
 
+An internal provider retry follows only an attempt known not to have billed. An
+attempt that may have billed but did not report priceable usage reserves its full
+ceiling in the batch's budget, without recording that amount as a measurement.
+An uncapped attempt with unknown spend reserves the largest amount the ledger can
+represent, so a later resend cannot use a new finite cap to ignore it.
+
 One exception is allowed before any answer: out-of-credit or credential-refused
 failure may select once more and restart the whole batch. The replacement choice
 is stored before dispatch, and a caller's pin still applies. After any answer,

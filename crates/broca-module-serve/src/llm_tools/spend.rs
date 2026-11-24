@@ -102,13 +102,14 @@ pub(crate) fn declares(refusal: &Refusal) -> bool {
         || refusal.detail.no_spend.is_some()
 }
 
-/// How an item error in a model-tool batch was spent, kept with the stored error so a replay
-/// of the call answers the same mark as its first answer did. Item errors are never measured:
-/// a measured item is an answered one.
+/// An item error's spend classification, kept with the error so a replay returns the same
+/// classification as the first answer. A provider can report usage
+/// even when its answer was unusable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ItemSpend {
     Nothing,
     Unknown,
+    Measured(u64),
 }
 
 impl From<ItemSpend> for Spend {
@@ -116,6 +117,7 @@ impl From<ItemSpend> for Spend {
         match spend {
             ItemSpend::Nothing => Spend::Nothing,
             ItemSpend::Unknown => Spend::Unknown,
+            ItemSpend::Measured(nanos) => Spend::Measured(nanos as f64 / 1_000_000_000.0),
         }
     }
 }
@@ -132,6 +134,8 @@ pub(crate) struct MarkedItemError {
     pub no_spend: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_unknown: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 impl MarkedItemError {
@@ -143,6 +147,10 @@ impl MarkedItemError {
             error,
             no_spend: (spend == Some(ItemSpend::Nothing)).then_some(true),
             cost_unknown: (spend == Some(ItemSpend::Unknown)).then_some(true),
+            cost_usd: match spend.map(Spend::from) {
+                Some(Spend::Measured(cost)) => Some(cost),
+                _ => None,
+            },
         }
     }
 
@@ -158,6 +166,7 @@ impl MarkedItemError {
         refusal.detail.retry_after_ms = self.error.retry_after_ms;
         refusal.detail.no_spend = self.no_spend;
         refusal.detail.cost_unknown = self.cost_unknown;
+        refusal.detail.cost_usd = self.cost_usd;
         refusal
     }
 }

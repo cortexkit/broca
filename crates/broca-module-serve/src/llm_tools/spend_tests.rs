@@ -160,6 +160,7 @@ fn item_errors_keep_their_mark_and_unmarked_ones_keep_their_bytes() {
     for (spend, want) in [
         (ItemSpend::Nothing, RefusalSpend::NoSpend),
         (ItemSpend::Unknown, RefusalSpend::ChargeCeiling),
+        (ItemSpend::Measured(100), RefusalSpend::Measured(0.0000001)),
     ] {
         let marked = MarkedItemError::new(error.clone(), Some(spend));
         let stored = serde_json::to_string(&marked).unwrap();

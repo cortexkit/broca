@@ -1179,11 +1179,12 @@ async fn store_history(
     // (see `moved_at_a_wall`). An unfinished run's records are all in the open log; one that
     // can't be read counts as no move, so the run keeps the account it recorded.
     let moved = match writer.operations().run.as_ref() {
-        Some(run) if run.refrozen_auth.is_some() && run.finished.is_none() => {
-            writer.open_log_records().await.is_ok_and(|records| {
+        Some(run) if run.refrozen_auth.is_some() && run.finished.is_none() => writer
+            .open_run_tail(&run.run_id, 0)
+            .await
+            .is_ok_and(|records| {
                 broca_session_loop::account_move::moved_at_a_wall(&run.run_id, &records)
-            })
-        }
+            }),
         _ => false,
     };
     let prior_run = match writer.operations().run.as_ref() {
@@ -1250,15 +1251,18 @@ async fn store_history(
 /// later seal.
 async fn store_terminal_error(
     writer: &broca_session_loop::shared::ActorWriter,
+    run_id: &str,
     execution_start_seq: u64,
 ) -> Option<ProviderError> {
     use broca_session_loop::writer::Writer as _;
     use broca_session_store::record::Record;
-    let records = writer.open_log_records().await.ok()?;
+    let records = writer
+        .open_run_tail(run_id, execution_start_seq)
+        .await
+        .ok()?;
     records
         .iter()
         .rev()
-        .take_while(|(seq, _)| *seq >= execution_start_seq)
         .find_map(|(_, record)| match record {
             Record::RunEnd(end) => Some(end.error.clone()),
             Record::Pause(pause) => Some(pause.error.clone()),
@@ -3473,7 +3477,7 @@ impl LiveLoopExecutor {
             report_selection,
             used_credential,
             in_run_refresh,
-            || store_terminal_error(reader, execution_start_seq),
+            || store_terminal_error(reader, &req.run_id.0, execution_start_seq),
             &durable_head,
             &req.session,
         )

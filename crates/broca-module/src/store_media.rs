@@ -942,6 +942,14 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
         self.session.open_log_records().await
     }
 
+    async fn open_run_tail(
+        &self,
+        run_id: &str,
+        first: u64,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
+        Ok(self.session.kept_run_tail(run_id, first))
+    }
+
     async fn enrollment(
         &self,
     ) -> Result<Option<broca_session_store::session::EnrollmentOverlay>, SessionError> {

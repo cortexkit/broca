@@ -130,6 +130,47 @@ impl Timer {
         self.at = next;
         Ok(())
     }
+
+    /// The session's deadline as retention's pass would read it from its records
+    /// (`retention::store::session_deadline`), when this timer already knows it at the session's
+    /// current state without reading anything: `None` when it doesn't, as for older retention
+    /// seconds not read since the last write, or a frozen policy that no longer decodes.
+    pub(super) fn known<B: SessionBackend>(&self, session: &Session<B>) -> Option<Option<u64>> {
+        let operations = &session.operations;
+        let legacy = || {
+            let first = operations.owner.first_start.as_ref()?;
+            if first.retention_secs.is_none() {
+                return Some(None);
+            }
+            (self.at == session.next_seq()).then(|| self.fold.decided().2)
+        };
+        if operations.retention_policy.is_none() && operations.released_at_ms.is_none() {
+            return legacy();
+        }
+        let starter = match operations.retention_policy.as_ref() {
+            Some(value) => Some(
+                cortexkit_role_llm_runner::session_retention::RetentionPolicy::from_value(value)
+                    .ok()?,
+            ),
+            None => None,
+        };
+        let legacy = match starter {
+            Some(_) => None,
+            None => legacy()?,
+        };
+        let busy = operations
+            .run
+            .as_ref()
+            .is_some_and(|run| run.finished.is_none())
+            || !operations.queue.is_empty();
+        Some(crate::retention::policy::deadline(
+            starter.as_ref(),
+            operations.released_at_ms,
+            legacy,
+            busy,
+            session.open_log_activity_ms(),
+        ))
+    }
 }
 
 pub(super) async fn wait(deadline: Option<u64>, clock: &broca_core::clock::Clock) {

@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -165,6 +166,8 @@ pub struct FactContext {
     pub charge_basis: broca_core::ChargeBasis,
     pub charge_basis_mapping_version: u32,
     pub charge_basis_overrides: String,
+    /// Nanodollars counted in health after export, independent of the batch's budget hold.
+    pub spend_nanos: u64,
 }
 
 pub struct PaidRecord<'a> {
@@ -195,6 +198,7 @@ pub struct SweepCounts {
 
 pub struct SystemOneStore {
     conn: Mutex<Connection>,
+    fact_generation: AtomicU64,
     owner_dir: Option<PathBuf>,
     owner_prefix: String,
     /// Each owner keeps its OS lock until the owning store is dropped. An executing call
@@ -306,6 +310,7 @@ impl SystemOneStore {
         };
         Ok(Self {
             conn: Mutex::new(conn),
+            fact_generation: AtomicU64::new(0),
             owner_dir,
             owner_prefix,
             owner_lifetimes: Mutex::new(HashMap::new()),
@@ -643,7 +648,8 @@ impl SystemOneStore {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let held = tx.execute(
-            "UPDATE batch SET spent_nanos = MIN(spent_nanos + ?4, 9223372036854775807)
+            "UPDATE batch SET spent_nanos = CASE WHEN spent_nanos > 9223372036854775807 - ?4
+                  THEN 9223372036854775807 ELSE spent_nanos + ?4 END
               WHERE role = ?1 AND batch_id = ?2 AND state = 'running' AND owner = ?3",
             rusqlite::params![role, batch_id, owner, to_i64(*spend_nanos)],
         )?;
@@ -729,12 +735,12 @@ impl SystemOneStore {
             let inserted = tx.execute(
                 "INSERT INTO usage_outbox (fact_id, fact_json, spend_nanos) VALUES (?1, ?2, ?3)
                  ON CONFLICT (fact_id) DO NOTHING",
-                rusqlite::params![fact.fact_id, json, to_i64(*spend_nanos)],
+                rusqlite::params![fact.fact_id, json, to_i64(context.spend_nanos)],
             )?;
             if inserted == 0 {
                 let same: bool = tx.query_row(
                     "SELECT fact_json = ?2 AND spend_nanos = ?3 FROM usage_outbox WHERE fact_id = ?1",
-                    rusqlite::params![fact.fact_id, json, to_i64(*spend_nanos)],
+                    rusqlite::params![fact.fact_id, json, to_i64(context.spend_nanos)],
                     |row| row.get(0),
                 )?;
                 if !same {
@@ -750,7 +756,15 @@ impl SystemOneStore {
             }
         }
         tx.commit()?;
+        if fact.is_some() {
+            self.fact_generation.fetch_add(1, Ordering::Release);
+        }
         Ok(true)
+    }
+
+    /// Changes only when this store commits a new usage fact to the outbox.
+    pub fn fact_generation(&self) -> u64 {
+        self.fact_generation.load(Ordering::Acquire)
     }
 
     pub fn pending_facts(&self) -> Result<Vec<PendingFact>> {

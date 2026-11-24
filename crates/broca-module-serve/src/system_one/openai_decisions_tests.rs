@@ -252,6 +252,42 @@ async fn unknown_answer_name_is_rejected_without_failing_other_items() {
 }
 
 #[tokio::test]
+async fn decisions_request_mapping_failure_spends_nothing() {
+    let (stub, client) = start(vec![]).await;
+    let mut request = simple();
+    request["questions"]["q"]["type"] = json!("unsupported");
+    let reply = client.call(request.to_string()).await;
+    assert!(stub.received.lock().unwrap().is_empty());
+    assert_eq!(
+        super::classify::reply_spend(&reply),
+        crate::llm_tools::spend::ItemSpend::Nothing
+    );
+}
+
+#[tokio::test]
+async fn decisions_unmappable_answer_retains_reported_usage() {
+    let (_stub, client) = start(vec![(
+        200,
+        r#"{"answers":[],"usage":{"input_tokens":1000000,"output_tokens":3}}"#.into(),
+        None,
+    )])
+    .await;
+    let mut service = service(client, Some("decision"));
+    let export = Arc::new(broca_store::SqliteStore::open_in_memory().unwrap());
+    Arc::get_mut(&mut service).unwrap().export = Some(export.clone());
+    let reply: Value = serde_json::from_str(&admitted(&service, params()).await).unwrap();
+    assert_eq!(
+        reply["items"][0]["error"]["code"],
+        "openai_decisions_unmappable_answer"
+    );
+    let stored = service.stored_batch("openai-batch").await.unwrap().unwrap();
+    assert_eq!(stored.spent_nanos, 100_000_000);
+    assert_eq!(stored.outcomes[0].input_tokens, Some(1_000_000));
+    assert_eq!(stored.outcomes[0].output_tokens, Some(3));
+    assert_eq!(export.high_water(), 1, "the reported usage was published");
+}
+
+#[tokio::test]
 async fn missing_fields_refusals_and_incomplete_distributions_are_named_errors() {
     let cases = [
         (
@@ -312,6 +348,7 @@ async fn out_of_credit_is_the_permanent_account_refusal() {
             error,
             provider_code,
             may_have_spent,
+            ..
         } = reply
         else {
             panic!("not a classified error: {reply:?}");

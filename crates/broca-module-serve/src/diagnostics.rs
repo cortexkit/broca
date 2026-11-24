@@ -631,6 +631,7 @@ pub fn report(mut evidence: Evidence, now: i64, window: i64) -> Reply {
         window_ms: window,
         findings,
         coverage,
+        findings_omitted: 0,
     })
 }
 
@@ -643,14 +644,20 @@ pub fn trim(mut reply: Reply) -> Reply {
             .then_with(|| a.key.cmp(&b.key))
     });
     let findings = std::mem::take(&mut reply.findings);
+    let total = findings.len();
     let mut used = serde_json::to_vec(&json!({"result":&reply}))
         .expect("reply encodes")
         .len();
-    for mut finding in findings {
+    // Room for the count of findings left out, which a cut-short reply carries so a reader
+    // knows the list is incomplete. The last finding needs none: after it nothing is left out.
+    let omitted_room = format!(",\"findings_omitted\":{total}").len();
+    for (index, mut finding) in findings.into_iter().enumerate() {
         finding.samples.truncate(5);
         finding.summary = finding.summary.chars().take(400).collect();
         let size = serde_json::to_vec(&finding).expect("finding encodes").len() + 1;
-        if used.saturating_add(size) >= REPLY_LIMIT {
+        let room = if index + 1 == total { 0 } else { omitted_room };
+        if used.saturating_add(size).saturating_add(room) >= REPLY_LIMIT {
+            reply.findings_omitted = (total - index) as u64;
             break;
         }
         used += size;

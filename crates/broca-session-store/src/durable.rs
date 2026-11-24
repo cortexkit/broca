@@ -41,8 +41,8 @@ pub fn sync_file(path: &Path) -> io::Result<()> {
     sync(&std::fs::OpenOptions::new().write(true).open(path)?)
 }
 
-/// Makes the entries of folder `path` (names created, renamed or removed in it) durable. Windows
-/// has no folder sync; a rename there is durable once it returns.
+/// Makes the entries of folder `path` (names created, renamed or removed in it) durable on Unix.
+/// This is a no-op on Windows, where the durability of directory entry changes is unproven.
 pub fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     sync(&File::open(path)?)?;

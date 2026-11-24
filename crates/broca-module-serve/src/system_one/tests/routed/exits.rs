@@ -50,7 +50,7 @@ async fn audit_exit_readmission_refusal_keeps_shared_class_and_verbatim_cause() 
         "future_account_refusal",
     ] {
         let rig = routed_rig(true, true);
-        rig.provider.script("x", vec![Script::Status(503, None)]);
+        rig.provider.script("x", vec![Script::Unconnected]);
         call(&rig, &routed_request(&["x"])).await.unwrap();
         *rig.router.admission_refused.lock().unwrap() = Some((code, "answer from router"));
         let refusal = call(&rig, &routed_request(&["x"])).await.unwrap_err();
@@ -116,8 +116,7 @@ async fn audit_exit_transient_reselection_does_not_spend_the_allowance() {
 async fn audit_exit_account_error_dominates_an_earlier_provider_error() {
     for run_reports in [false, true] {
         let rig = routed_rig(run_reports, true);
-        rig.provider
-            .script("temporary", vec![Script::Status(503, None)]);
+        rig.provider.script("temporary", vec![Script::Unconnected]);
         rig.provider.script(
             "account",
             vec![Script::AccountError, Script::Answer(answered(Some(7)))],
@@ -132,7 +131,7 @@ async fn audit_exit_account_error_dominates_an_earlier_provider_error() {
         assert_eq!(
             rig.router.selects.load(Ordering::SeqCst),
             2,
-            "the account failure, not an earlier 503, determines reselection"
+            "the account failure, not an earlier connection error, determines reselection"
         );
         assert_eq!(reply["decision_id"], "decision-1");
         let reports = rig.router.bodies("route.report");
@@ -824,8 +823,7 @@ async fn audit_exit_refused_or_invalid_replacement_admission_finishes_and_report
 async fn audit_exit_account_failure_cascades_over_earlier_unanswered_errors_immediately() {
     for run_reports in [false, true] {
         let rig = routed_rig(run_reports, true);
-        rig.provider
-            .script("temporary", vec![Script::Status(503, None)]);
+        rig.provider.script("temporary", vec![Script::Unconnected]);
         rig.provider
             .script("paid", vec![Script::Answer(answered(Some(7)))]);
         rig.provider.script("account", vec![Script::AccountError]);

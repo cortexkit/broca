@@ -609,15 +609,8 @@ impl RetentionService {
             Err(error) => return Err(self.unreadable_store_session(addr, error)),
         };
         if cached {
-            let deadlines = self
-                .store
-                .deadlines
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some((at, deadline)) = deadlines.get(&addr.0) {
-                if *at == position {
-                    return Ok(*deadline);
-                }
+            if let Some(deadline) = self.kept_deadline(&addr.0, &position) {
+                return Ok(deadline);
             }
         }
         // A writer moved the head between the probe and the read: decided on the next pass.
@@ -631,23 +624,49 @@ impl RetentionService {
                 Err(SessionError::Moved) => return Ok(None),
                 Err(error) => return Err(self.unreadable_store_session(addr, error)),
             };
+        self.keep_deadline(&addr.0, position, deadline);
+        Ok(deadline)
+    }
+
+    /// The deadline retention found for the session at `addr` when it was read at `position`:
+    /// `None` when none was found there, else whether that position gives it a deadline.
+    pub(crate) fn kept_deadline(&self, addr: &str, position: &Position) -> Option<Option<u64>> {
+        self.store
+            .deadlines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(addr)
+            .filter(|(at, _)| at == position)
+            .map(|(_, deadline)| *deadline)
+    }
+
+    /// Keeps `deadline` as the deadline the session at `addr` has at `position`, for later
+    /// passes and reads to decide it by without reading its records again. A read may keep one
+    /// from a position older than the head a pass last confirmed, so the head's stamp is
+    /// forgotten too: the next pass reads the session's position again rather than trust it.
+    pub(crate) fn keep_deadline(&self, addr: &str, position: Position, deadline: Option<u64>) {
         let previous = self
             .store
             .deadlines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(addr.0.clone(), (position, deadline));
+            .insert(addr.to_owned(), (position, deadline));
+        self.store
+            .stamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(addr);
         if previous != Some((position, deadline)) {
             self.store
                 .changed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(deadline)
     }
 
     /// Removes the mark of the session at `addr` in the root of `class`, which `backend` reads,
     /// once nothing can make it due: it is gone, or it is neither released nor kept by a
-    /// starter's policy that ends. A session not readable yet keeps its mark.
+    /// starter's policy that ends. A session not readable yet keeps its mark, and so does one
+    /// whose deletion a crash cut short, until that deletion is finished here.
     async fn unmark_settled(
         &self,
         runtime: &StoreRuntime,
@@ -657,7 +676,22 @@ impl RetentionService {
     ) -> Result<(), String> {
         let root = class.store_root(runtime.state_root());
         let Some((stored, _)) = backend.read_stored_head(addr).map_err(described)? else {
-            return marks::remove(&root, addr).map_err(|error| error.to_string());
+            // No pass lists every session outside the ephemeral root, so the mark is the only
+            // way back to what a deletion cut short there left on disk.
+            if backend.deleted_head(addr).map_err(described)?.is_some() {
+                self.finish_store_deletion(runtime, backend, addr)?;
+                if backend.deleted_head(addr).map_err(described)?.is_some() {
+                    return Ok(());
+                }
+            }
+            marks::remove(&root, addr).map_err(|error| error.to_string())?;
+            // A session created at the address since its head was read above may have been
+            // marked before that removal, ahead of the batch giving it a deadline: marked again,
+            // so it isn't left unmarked. A needless mark costs a later pass one read.
+            if backend.head_stamp(addr).map_err(described)?.is_some() {
+                marks::mark(&root, addr).map_err(|error| error.to_string())?;
+            }
+            return Ok(());
         };
         let triple = head::stored_triple(&stored).map_err(described)?;
         if head::stored_cipher(&stored).map_err(described)? != Cipher::None && !runtime.key_loaded()
@@ -665,6 +699,36 @@ impl RetentionService {
             return Ok(());
         }
         let deployment = runtime.deployment();
+        let Some(position) = Session::stored_position(backend, addr, deployment)
+            .await
+            .map_err(described)?
+        else {
+            return Ok(());
+        };
+        let view = Session::view_at(backend, addr.clone(), &triple, deployment, &position)
+            .await
+            .map_err(described)?;
+        if marks::needs_mark(class, &view.operations) {
+            return Ok(());
+        }
+        // A writer marks the session before the batch that gives it a deadline, and holds the
+        // session's lease while it writes: what was read above may be from before that batch.
+        // So the mark goes only under the lease, when the session read again still needs none.
+        // A lease held elsewhere leaves the mark to a later pass.
+        let key = BindIdentity::new(
+            triple.project_root.clone(),
+            triple.harness.clone(),
+            triple.session.clone(),
+        );
+        if broca_core::session_addr(&key) != addr.0 {
+            return Err("the session's head names a session filed under another address".into());
+        }
+        let Ok(_lease) = self.lease(&key) else {
+            return Ok(());
+        };
+        // An open meanwhile waits for the lease rather than being refused, as it does for a
+        // deletion.
+        let _held = Deleting::start(&self.store.deleting, &key);
         let Some(position) = Session::stored_position(backend, addr, deployment)
             .await
             .map_err(described)?
@@ -746,6 +810,7 @@ impl RetentionService {
         self.remove_read_session(
             runtime,
             backend,
+            class,
             addr,
             key,
             triple,
@@ -755,10 +820,6 @@ impl RetentionService {
             deadline,
         )
         .await?;
-        if class != StorageClass::Ephemeral {
-            marks::remove(&class.store_root(state_root), addr)
-                .map_err(|error| error.to_string())?;
-        }
         tracing::info!(target: "retention", session = %addr.0, expired_at_ms = deadline,
             "expired session deleted from the new storage");
         Ok(true)
@@ -827,6 +888,7 @@ impl RetentionService {
         self.remove_read_session(
             runtime,
             &backend,
+            class,
             &addr,
             key,
             &triple,
@@ -846,14 +908,15 @@ impl RetentionService {
         Ok(OperatorDeletion::Deleted)
     }
 
-    /// Deletes the session `key` at `addr`, read as `view` and `records` at head version
-    /// `version`, under its lease: the expiry marker dated `deleted_at_ms`, then any artifacts
-    /// left by a move, then the session, then what the module caches of it.
+    /// Deletes the session `key` at `addr` in the root of `class`, read as `view` and `records`
+    /// at head version `version`, under its lease: the expiry marker dated `deleted_at_ms`, then
+    /// any artifacts left by a move, then the session, then what the module caches of it.
     #[allow(clippy::too_many_arguments)]
     async fn remove_read_session(
         &self,
         runtime: &StoreRuntime,
         backend: &LocalBackend,
+        class: StorageClass,
         addr: &SessionAddr,
         key: &BindIdentity,
         triple: &SessionTriple,
@@ -917,6 +980,13 @@ impl RetentionService {
             deployment,
         )
         .map_err(described)?;
+        // Outside the ephemeral root no pass lists every session, so a deletion a crash cuts
+        // short there is found again only through the session's mark: it stays until the
+        // session is gone.
+        let marked = (class != StorageClass::Ephemeral).then(|| class.store_root(state_root));
+        if let Some(root) = &marked {
+            marks::mark(root, addr).map_err(|error| error.to_string())?;
+        }
         // The cached move stream copies the session's content, so it goes before the session: a
         // crash between the two leaves the session to be deleted again, never the copy behind.
         broca_records::move_fence::unlink(
@@ -926,6 +996,9 @@ impl RetentionService {
         Session::delete(backend, addr, version)
             .await
             .map_err(described)?;
+        if let Some(root) = &marked {
+            marks::remove(root, addr).map_err(|error| error.to_string())?;
+        }
         self.store
             .deadlines
             .lock()

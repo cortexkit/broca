@@ -1996,12 +1996,6 @@ pub trait ServeHandler: Send + Sync {
         ))
     }
 
-    /// Whether `session` is served from the session store. A session owned by the session store
-    /// but lacking a runtime here is refused before dispatch.
-    fn kept_in_new_storage(&self, _session: &LineageKey) -> Result<bool, ServeError> {
-        Ok(false)
-    }
-
     /// The applied plan, read without opening an actor. `None` means the session is kept on
     /// the old storage, which does not serve this operation.
     async fn plan_view(
@@ -3308,10 +3302,6 @@ impl ServeHandler for crate::LineageRegistry {
 
     fn import_roots(&self) -> Option<std::sync::Arc<crate::store_import::ImportRoots>> {
         self.store_runtime().map(|runtime| runtime.import_roots())
-    }
-
-    fn kept_in_new_storage(&self, session: &LineageKey) -> Result<bool, ServeError> {
-        Ok(self.store_holding(session)?.is_some())
     }
 
     async fn restore_from_backup(

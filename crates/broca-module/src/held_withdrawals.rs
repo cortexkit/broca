@@ -327,8 +327,10 @@ impl HeldWithdrawals {
     /// withdrawal names the call's identity as the session's ledger recorded it. So the calls'
     /// registrations and unattempted watches go, and a withdrawal already attempted is recorded
     /// as failed with its scope ended, which health reports apart from failures that need
-    /// attention. Before this, such rows stayed for a later sweep that could never read them, and
-    /// every sweep reported the session as a failure.
+    /// attention. That includes a withdrawal the provider refused before the deletion: with the
+    /// session gone no later start can ask it again, so left as it was it would keep health
+    /// degraded for good. Before this, such rows stayed for a later sweep that could never read
+    /// them, and every sweep reported the session as a failure.
     fn settle_deleted(
         &self,
         bind: &broca_protocol::BindIdentity,
@@ -348,7 +350,7 @@ impl HeldWithdrawals {
         };
         let gone = json!({"code": "scope_ended", "message": "the call's session was deleted"});
         for (call, state, attempts) in rows {
-            if state == "scope_gone" || state == "failed" {
+            if state == "scope_gone" {
                 continue;
             }
             // A row the removal above kept had a withdrawal attempted.

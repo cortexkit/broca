@@ -570,6 +570,7 @@ fn diagnostics_trimming_keeps_severity_counts_and_sample_cap_under_64k() {
         window_ms: DEFAULT_WINDOW_MS,
         findings,
         coverage: BTreeMap::new(),
+        findings_omitted: 0,
     });
     assert!(!reply.findings.is_empty() && reply.findings.len() < 500);
     assert!(serde_json::to_vec(&json!({"result":reply})).unwrap().len() < REPLY_LIMIT);
@@ -577,6 +578,73 @@ fn diagnostics_trimming_keeps_severity_counts_and_sample_cap_under_64k() {
         .findings
         .iter()
         .all(|f| f.count == 900 && f.samples.len() == 5 && f.severity == Severity::Error));
+}
+
+/// A reply cut short at the size cap says how many findings it left out, and stays under the
+/// cap with that count included; a reply with every finding carries no count at all.
+#[test]
+fn diagnostics_trimming_reports_how_many_findings_it_left_out() {
+    let findings: Vec<_> = (0..500)
+        .map(|i| {
+            let mut f = finding(
+                "test",
+                format!("key-{i:04}"),
+                Severity::Warn,
+                1,
+                2,
+                "Something happened.",
+                "Look at health.check.",
+            );
+            f.samples = vec![json!({"id":"x".repeat(200)}); 5];
+            f
+        })
+        .collect();
+    let reply = |findings| {
+        trim(Reply {
+            generated_at_ms: NOW,
+            window_ms: DEFAULT_WINDOW_MS,
+            findings,
+            coverage: BTreeMap::new(),
+            findings_omitted: 0,
+        })
+    };
+    let cut = reply(findings.clone());
+    assert!(!cut.findings.is_empty() && cut.findings.len() < 500);
+    assert_eq!(cut.findings_omitted, 500 - cut.findings.len() as u64);
+    let body = serde_json::to_vec(&json!({"result":cut})).unwrap();
+    assert!(body.len() < REPLY_LIMIT);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["result"]["findings_omitted"],
+        json!(500 - cut.findings.len())
+    );
+    let whole = reply(findings[..3].to_vec());
+    assert_eq!(whole.findings.len(), 3);
+    assert!(serde_json::to_value(&whole).unwrap()["findings_omitted"].is_null());
+}
+
+/// The bytes of a reply cut short at the size cap: the findings that fit, then
+/// `findings_omitted`.
+#[test]
+fn diagnostics_truncated_reply_shape() {
+    let mut kept = finding(
+        "run_errors",
+        "permanent:request_invalid".into(),
+        Severity::Error,
+        NOW - 3000,
+        NOW - 1000,
+        "Provider calls failed permanently with request_invalid.",
+        "Inspect the run errors log for the sampled runs.",
+    );
+    kept.count = 12;
+    kept.samples = vec![json!({"run_id":"run-1","at_ms":NOW - 1000})];
+    let reply = Reply {
+        generated_at_ms: NOW,
+        window_ms: DEFAULT_WINDOW_MS,
+        findings: vec![kept],
+        coverage: BTreeMap::new(),
+        findings_omitted: 37,
+    };
+    vector("reply-truncated.json", json!({"result":reply}));
 }
 
 fn vector(name: &str, value: Value) {

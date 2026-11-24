@@ -1,5 +1,6 @@
-//! Synchronous filesystem seam for durability tests. The default backend uses the same
-//! owner-only creation and platform-specific directory barriers as the session's log writer.
+//! Synchronous filesystem seam for durability tests. The default backend uses owner-only
+//! creation and `File::sync_all` for files and Unix directories. On macOS that requests
+//! `F_FULLFSYNC` regardless of the session store's `storage_sync.full_flush` setting.
 //!
 //! With the non-shipping `fs-override` feature, an override is scoped to one thread,
 //! not the process. Keep the entire synchronous program (including recovery and

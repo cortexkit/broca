@@ -3,26 +3,6 @@
 use broca_protocol::{BatchId, RunId, StepId, ToolCallId};
 use serde::{Deserialize, Serialize};
 
-pub const FEATURE: &str = "wal-recovery/v1";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CutReason {
-    UnpublishedTail,
-    PublishedRegionCorruption,
-    UnprovenCorruption,
-}
-
-impl CutReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::UnpublishedTail => "unpublished_tail",
-            Self::PublishedRegionCorruption => "published_region_corruption",
-            Self::UnprovenCorruption => "unproven_corruption",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryCall {
     pub tool_call_id: ToolCallId,
@@ -82,42 +62,7 @@ impl RecoveryCall {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecoveryOutcome {
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnownedRecoveryCall {
-    pub outcome: RecoveryOutcome,
-    /// Evidence only: a model-facing ID does not identify a later run's call.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<ToolCallId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step_id: Option<StepId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub batch_id: Option<BatchId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub call_keys: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryRun {
     pub run_id: RunId,
     pub calls: Vec<RecoveryCall>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecoveryCut {
-    pub cut_id: String,
-    pub sidecar_basename: String,
-    pub cut_offset: u64,
-    pub removed_len: u64,
-    pub removed_sha256: String,
-    pub reason: CutReason,
-    pub active_run: Option<RunId>,
-    pub runs: Vec<RecoveryRun>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unowned_calls: Vec<UnownedRecoveryCall>,
-    pub unattributed_tool_risk: bool,
 }

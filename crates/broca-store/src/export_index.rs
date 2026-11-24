@@ -29,6 +29,13 @@ pub struct ExportStore {
     export_source_epoch: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum SystemOneFactEmission {
+    Inserted,
+    AlreadyPresent,
+    ConflictingBytes,
+}
+
 impl ExportStore {
     pub(crate) fn from_shared(conn: Arc<Mutex<Connection>>, source: (String, u64, u64)) -> Self {
         Self {
@@ -161,7 +168,7 @@ impl ExportStore {
     pub fn emit_system_one_fact(
         &self,
         fact: &broca_core::system_one_fact::SystemOneFact,
-    ) -> Result<bool, ExportError> {
+    ) -> Result<SystemOneFactEmission, ExportError> {
         let json = serde_json::to_string(fact).map_err(storage)?;
         let mut conn = crate::lock_connection(&self.conn).map_err(storage)?;
         let tx = conn
@@ -179,9 +186,7 @@ impl ExportStore {
             )
             .map_err(storage)?;
         if stored != json {
-            return Err(storage(
-                "System One fact identity collided with different immutable bytes",
-            ));
+            return Ok(SystemOneFactEmission::ConflictingBytes);
         }
         let high_water: i64 = tx
             .query_row(
@@ -198,7 +203,11 @@ impl ExportStore {
         tx.commit().map_err(storage)?;
         self.export_high_water
             .fetch_max(i64_to_u64(high_water, "high_water")?, Ordering::Release);
-        Ok(inserted != 0)
+        Ok(if inserted != 0 {
+            SystemOneFactEmission::Inserted
+        } else {
+            SystemOneFactEmission::AlreadyPresent
+        })
     }
 
     /// The current export high-water mark cached from `export_meta` at open and
@@ -832,7 +841,7 @@ impl SqliteStore {
     pub fn emit_system_one_fact(
         &self,
         fact: &broca_core::system_one_fact::SystemOneFact,
-    ) -> Result<bool, ExportError> {
+    ) -> Result<SystemOneFactEmission, ExportError> {
         self.export.emit_system_one_fact(fact)
     }
 

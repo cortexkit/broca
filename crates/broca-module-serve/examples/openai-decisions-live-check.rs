@@ -305,6 +305,7 @@ async fn main() -> Result<(), String> {
                 error,
                 provider_code,
                 may_have_spent,
+                ..
             } => format!(
                 "{name}: classified error {} in {elapsed} ms, OpenAI's code {}, may have spent: {may_have_spent}; {}",
                 error.code,

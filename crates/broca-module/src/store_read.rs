@@ -452,11 +452,20 @@ pub async fn serve_view<B: SessionBackend>(
     parts: &dyn Parts,
     req: &crate::serve::SessionReadRequest,
 ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+    serve_view_with_head(session, parts, req, None).await
+}
+
+async fn serve_view_with_head<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+    req: &crate::serve::SessionReadRequest,
+    stream_head: Option<Option<broca_core::Cursor>>,
+) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
     let answer = page(
         session,
         parts,
         &crate::store_reads::PageRequest::of(req),
-        None,
+        stream_head,
     )
     .await?;
     finish(answer, req)
@@ -496,6 +505,15 @@ impl<B: SessionBackend> StoredView<B> {
         &self,
     ) -> Result<Option<broca_core::Cursor>, crate::serve::ServeError> {
         self.stream_head.get()
+    }
+
+    /// Serve a page using the snapshot's already-computed stream head.
+    pub async fn serve_page(
+        &self,
+        parts: &dyn Parts,
+        req: &crate::serve::SessionReadRequest,
+    ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+        serve_view_with_head(self, parts, req, Some(self.stream_head()?)).await
     }
 }
 

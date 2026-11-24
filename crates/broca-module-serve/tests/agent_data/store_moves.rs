@@ -541,6 +541,51 @@ async fn store_prepare_refuses_a_retention_session() {
     source.registry.check_move(&session, true).unwrap();
 }
 
+/// A backed-up session kept for days lives in the durable root, where retention finds a session
+/// only through its mark. The move doesn't carry the mark, so the receiver marks the session as
+/// it lands: without it, the deadline the session's records keep would never be acted on there.
+#[tokio::test]
+async fn a_moved_session_kept_for_days_is_marked_for_retention_where_it_lands() {
+    use broca_session_store::record::{Record, Retention, RetentionEvent};
+    let key = || DeploymentKey::new(7, &[4; 32]);
+    let door = Arc::new(FakeDoor::default());
+    let source = rig(root("store-marked-source"), door.clone(), key()).await;
+    let receiver = rig(root("store-marked-receiver"), door.clone(), key()).await;
+    let session = source.session("kept-for-days");
+    let mut seeded = seed_history(true);
+    seeded.records.push(Record::Retention(Retention {
+        event: RetentionEvent::Set,
+        at_ms: 1,
+        policy: Some(json!({
+            "keep": {"days": 30}, "archive_after_days": 0, "backup": true,
+            "request_dumps": false,
+        })),
+    }));
+    store_session_with(&source, &session, seeded, StorageClass::Durable).await;
+    broca_core::SessionRefIndex::record_session(
+        source.index.as_ref(),
+        &broca_core::session_addr(&session),
+        &session,
+    )
+    .unwrap();
+    let params = source.params(CUT, std::slice::from_ref(&session));
+    let mut from = Wire::new(&source, entorhinal(), true).await;
+    from.call("prepare", params.clone()).await.unwrap();
+    from.call("export", params.clone()).await.unwrap();
+    door.seal(CUT);
+    let mut to = Wire::new(&receiver, entorhinal(), true).await;
+    to.call("import", params.clone()).await.unwrap();
+    to.call("activate", params.clone()).await.unwrap();
+    let mark = StorageClass::Durable
+        .store_root(&receiver.root)
+        .join("retained")
+        .join(broca_core::session_addr(&session));
+    assert!(
+        mark.exists(),
+        "the moved session's deadline is never acted on here"
+    );
+}
+
 /// The agent-data service finds a stored session even when the session store opened only after the
 /// service was built: it reads the storage's runtime at each request, not once at boot.
 #[tokio::test]

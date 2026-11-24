@@ -1,6 +1,53 @@
 use super::*;
 use std::fs;
 
+thread_local! {
+    pub(super) static AFTER_REFRESH_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[test]
+fn overlapping_refresh_cannot_publish_an_older_catalog() {
+    let path = temp_lkg("overlapping-refresh");
+    let cache = Arc::new(CatalogCache::open(&path));
+    let initial = response(100);
+    cache.refresh(initial.clone()).unwrap();
+    let mut older = initial.clone();
+    older.catalog_version += 1;
+    older.resolved_at_ms = 200;
+    let mut newer = initial;
+    newer.catalog_version += 2;
+    newer.resolved_at_ms = 300;
+    let winning_version = newer.catalog_version;
+    let winning = Arc::clone(&cache);
+    let (send, receive) = std::sync::mpsc::channel();
+    AFTER_REFRESH_SNAPSHOT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let serial = winning.refresh_writer.try_lock().is_err();
+            let winner = std::thread::spawn(move || winning.refresh(newer).unwrap());
+            // Without a writer guard the other refresh can finish while this one is paused
+            // with a stale snapshot. With the guard, let both finish in publication order.
+            if serial {
+                send.send(Some(winner)).unwrap();
+            } else {
+                winner.join().unwrap();
+                send.send(None).unwrap();
+            }
+        }));
+    });
+
+    let result = cache.refresh(older);
+    if let Some(winner) = receive.recv().unwrap() {
+        winner.join().unwrap();
+    }
+    let live = cache.snapshot().unwrap().catalog_version();
+    let restarted = CatalogCache::open(&path)
+        .snapshot()
+        .unwrap()
+        .catalog_version();
+    assert_eq!((live, restarted), (winning_version, winning_version), "a slow refresh must not replace the newer catalog in memory or on disk; result: {result:?}");
+}
+
 #[test]
 fn temperature_fusiform_real_shaped_facts_decode_without_other_fields() {
     use broca_core::provider::TemperaturePolicy;
@@ -794,6 +841,81 @@ fn a_served_row_that_arrives_malformed_keeps_its_previous_model() {
     assert_eq!(kept.limits.context, Some(200_000));
 }
 
+#[test]
+fn a_kept_row_keeps_its_route_and_batch_facts_before_and_after_restart() {
+    let path = temp_lkg("kept-route-and-batch-row");
+    let cache = CatalogCache::open(&path);
+    let mut page = response(100);
+    let id = "mixed-provider/decision";
+    let mut row = chat_row(10_000);
+    row.insert("model.kind".into(), serde_json::json!("decision"));
+    row.insert(
+        "wire.npm".into(),
+        serde_json::json!({"value":"@ai-sdk/openai-compatible", "from":"curated"}),
+    );
+    row.insert(
+        "wire.api".into(),
+        serde_json::json!({"value":"https://old.example/v1", "from":"curated"}),
+    );
+    page.models.insert(id.into(), row);
+    cache.refresh(page.clone()).unwrap();
+    let before = cache.snapshot().unwrap();
+    let route = before.resolve_route("mixed-provider", "decision").unwrap();
+    let batch_row = before.model_batch_row(id).unwrap();
+    assert_eq!(batch_row.kind.as_deref(), Some("decision"));
+
+    page.catalog_version += 1;
+    let row = page.models.get_mut(id).unwrap();
+    row.insert("capability.tool_call".into(), serde_json::json!("yes"));
+    row.remove("wire.api");
+    row.remove("wire.npm");
+    cache.refresh(page).unwrap();
+
+    for snapshot in [
+        cache.snapshot().unwrap(),
+        CatalogCache::open(&path).snapshot().unwrap(),
+    ] {
+        assert_eq!(
+            (
+                snapshot.resolve_route("mixed-provider", "decision"),
+                snapshot.model_batch_row(id)
+            ),
+            (Ok(route.clone()), Some(batch_row.clone())),
+            "the rejected row must not change the previous route or batch facts"
+        );
+        assert!(snapshot.contains_model("mixed-provider", "decision"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lkg_refresh_requires_a_directory_sync_after_rename() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp_lkg("lkg-directory-sync");
+    let cache = CatalogCache::open(&path);
+    let parent = path.parent().unwrap();
+    fs::create_dir_all(parent).unwrap();
+    let old_permissions = fs::metadata(parent).unwrap().permissions();
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o300)).unwrap();
+    let cannot_open_directory = fs::File::open(parent).is_err();
+    let result = cache.refresh(response(100));
+    fs::set_permissions(parent, old_permissions).unwrap();
+    assert!(
+        cannot_open_directory,
+        "fixture requires a process without DAC override"
+    );
+    assert!(
+        path.is_file(),
+        "rename must succeed before the directory sync fails"
+    );
+    assert!(
+        matches!(result, Err(CatalogRefreshError::Persist { .. })),
+        "refresh accepted an LKG without a directory sync: {result:?}"
+    );
+    assert!(cache.snapshot().is_err());
+}
+
 /// The LKG a refresh writes is the catalog a restart serves: a row kept from the replaced
 /// catalog because it arrived malformed keeps its earlier row on disk too, and a same-version
 /// response a restart couldn't load at all is refused rather than written over a good LKG.
@@ -995,10 +1117,8 @@ fn an_incomplete_refusal_names_the_instant_the_response_resolved_to() {
     );
 }
 
-/// An unchanged equal-version poll still reuses the index, so r115's saving is intact.
-///
-/// The equal-version fast path must keep reusing the index on unchanged polls. Rebuilding it
-/// every 30 minutes would undo the measured 2.96ms / 1.38 MB saving, so this test pins reuse.
+/// An unchanged poll reuses the serving index. Validation for a disk-backed cache still
+/// assembles the document boot would load.
 #[test]
 fn an_unchanged_equal_version_poll_reuses_the_existing_index() {
     let cache = CatalogCache::empty();
@@ -1023,7 +1143,74 @@ fn an_unchanged_equal_version_poll_reuses_the_existing_index() {
     );
 }
 
-/// An equal-version poll that is the first to carry `limit.output` rebuilds the index.
+#[test]
+fn equal_version_fact_changes_are_served_before_restart() {
+    let path = temp_lkg("equal-version-facts");
+    let cache = CatalogCache::open(&path);
+    let mut page = response(100);
+    let routed_row = |wire_id: &str| {
+        let mut facts = chat_row(20_000);
+        facts.insert(
+            "wire.npm".into(),
+            serde_json::json!({"value":"@ai-sdk/openai-compatible", "from":"curated"}),
+        );
+        facts.insert(
+            "wire.api".into(),
+            serde_json::json!({"value":"https://test.example/v1", "from":"curated"}),
+        );
+        if !wire_id.is_empty() {
+            facts.insert(
+                "route.mode_wire_ids".into(),
+                serde_json::json!({"fast": wire_id}),
+            );
+        }
+        facts
+    };
+    page.models
+        .insert("openai/other".into(), routed_row("other-fast"));
+    page.models.insert("openai/updated".into(), routed_row(""));
+    cache.refresh(page.clone()).unwrap();
+    let before = cache.snapshot().unwrap();
+    assert!(before.mode_wire_ids("openai", "updated").is_empty());
+    assert_eq!(
+        before
+            .mode_wire_ids("openai", "other")
+            .get("fast")
+            .map(String::as_str),
+        Some("other-fast")
+    );
+
+    page.resolved_at_ms += 1;
+    page.models
+        .insert("openai/updated".into(), routed_row("updated-fast"));
+    page.models
+        .get_mut("openai/updated")
+        .unwrap()
+        .insert("limit.context".into(), serde_json::json!(10_000));
+    cache.refresh(page).unwrap();
+    let live = cache.snapshot().unwrap();
+    let restarted = CatalogCache::open(&path).snapshot().unwrap();
+    let facts = |snapshot: &CatalogSnapshot| {
+        (
+            snapshot.context_limit("openai", "updated"),
+            snapshot.mode_wire_ids("openai", "updated"),
+        )
+    };
+    assert_eq!(
+        facts(&restarted),
+        (
+            Some(10_000),
+            BTreeMap::from([("fast".into(), "updated-fast".into())])
+        )
+    );
+    assert_eq!(
+        facts(&live),
+        facts(&restarted),
+        "live and restarted catalogs disagree"
+    );
+}
+
+/// An equal-version poll that is the first to carry routing facts rebuilds the index.
 ///
 /// The LKG on disk was written before broca requested the fact, so the next poll arrives at
 /// the same catalog version with the fact now present. Reusing the index there would serve
@@ -1094,6 +1281,42 @@ fn an_equal_version_poll_that_newly_carries_server_side_fallback_rebuilds_the_in
     assert_eq!(
         after.server_side_fallback("anthropic", "claude-sonnet-4-5"),
         Some(true)
+    );
+}
+
+#[test]
+fn turn_system_form_follows_the_model_family_on_a_mixed_provider() {
+    let mut page = response(100);
+    for (model, npm) in [
+        ("a-chat", "@ai-sdk/openai-compatible"),
+        ("b-responses", "@ai-sdk/openai"),
+    ] {
+        let mut row = chat_row(20_000);
+        row.insert(
+            "wire.npm".into(),
+            serde_json::json!({"value":npm, "from":"curated"}),
+        );
+        row.insert(
+            "wire.api".into(),
+            serde_json::json!({"value":"https://mixed.example/v1", "from":"curated"}),
+        );
+        page.models.insert(format!("mixed-provider/{model}"), row);
+    }
+    let cache = CatalogCache::empty();
+    cache.refresh(page).unwrap();
+    let snapshot = cache.snapshot().unwrap();
+    assert_eq!(
+        snapshot.wire_family("mixed-provider", "a-chat"),
+        Some(WireFamilyId::OpenAiChat)
+    );
+    assert_eq!(
+        snapshot.wire_family("mixed-provider", "b-responses"),
+        Some(WireFamilyId::OpenAiResponses)
+    );
+    assert!(!snapshot.turn_system_form("mixed-provider", "a-chat"));
+    assert!(
+        snapshot.turn_system_form("mixed-provider", "b-responses"),
+        "the Responses model supports system notes even when the provider defaults to Chat"
     );
 }
 
@@ -1806,6 +2029,35 @@ fn unknown_provider_fact_is_ignored_without_excluding_a_served_row() {
             .unwrap()
             .model_batch_row("typesafe/jev-1.13.0"),
         Some(before)
+    );
+}
+
+#[test]
+fn pending_providers_neither_mask_nor_count_as_borrowable_catalog_routes() {
+    use broca_module_serve::auth_routing::{catalog_provider, CatalogProvider, Unresolved};
+
+    let mut page = response(100);
+    page.models.extend(curated_rows());
+    let cache = CatalogCache::empty();
+    cache.refresh(page).unwrap();
+    let snapshot = cache.snapshot().unwrap();
+    assert!(snapshot.model_batch_row("typesafe/jev-1.13.0").is_some());
+    assert!(snapshot.contains_provider("anthropic"));
+    let listing = serde_json::from_value(serde_json::json!({
+        "credentials": [
+            { "id": "key:borrow", "type": "apikey", "categories": ["llm"], "state": "active", "record_version": 1, "operations": ["read"], "auth_method": "apikey", "provider_ids": ["typesafe"], "serves": ["anthropic"] },
+            { "id": "key:pending", "type": "apikey", "categories": ["llm"], "state": "active", "record_version": 1, "operations": ["read"], "auth_method": "apikey", "provider_ids": ["gateway"], "serves": ["typesafe"] }
+        ],
+        "grants": 1, "grant_tuples": [], "view": "synthetic"
+    })).unwrap();
+    let resolve =
+        |provider| catalog_provider(&listing, provider, |id| snapshot.serves_provider(id));
+    assert_eq!(
+        (resolve("typesafe"), resolve("gateway")),
+        (
+            CatalogProvider::Borrowed("anthropic".into()),
+            CatalogProvider::Unresolved(Unresolved::NoServedProvider)
+        )
     );
 }
 

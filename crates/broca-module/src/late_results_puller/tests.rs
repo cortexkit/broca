@@ -303,6 +303,22 @@ async fn quiet_bind(name: &str, rig: &Rig) -> BindIdentity {
     bind
 }
 
+/// A session whose open run has sent `call_key` to the provider and seen nothing back yet: the
+/// call's intent is durable and its held record is not, so an entry for it waits.
+async fn dispatching_bind(name: &str, call_key: &str, rig: &Rig) -> BindIdentity {
+    let bind = BindIdentity::new("/project", "broca", name);
+    rig.seed(
+        &bind,
+        &[
+            run_start("run"),
+            batch_start("run", "b", &["a"]),
+            intent("run", "b", "a", "tools", Some(call_key)),
+        ],
+    )
+    .await;
+    bind
+}
+
 /// Register one more call with an intake a rig already holds.
 async fn register_more(store: &Arc<LateResultsStore>, calls: &[LateResultRegistration]) {
     use broca_core::tool_plane::LateResultsIntake as _;
@@ -1035,7 +1051,7 @@ async fn a_pinned_entry_pins_the_ack_but_a_later_page_is_still_delivered() {
         vec![registration(call_key, "tools", &bind)],
     )
     .await;
-    let pending = quiet_bind("late-sync", &rig).await;
+    let pending = dispatching_bind("late-sync", pending_key, &rig).await;
     register_more(&rig.store, &[registration(pending_key, "tools", &pending)]).await;
     let _puller = rig.puller("tools");
     rig.feed.replies(vec![
@@ -1073,7 +1089,7 @@ async fn a_mismatched_limit_repull_acks_nothing() {
         vec![registration(call_key, "tools", &bind)],
     )
     .await;
-    let quiet = quiet_bind("unregistered", &rig).await;
+    let quiet = dispatching_bind("unregistered", "lineage:9", &rig).await;
     register_more(&rig.store, &[registration("lineage:9", "tools", &quiet)]).await;
     let _puller = rig.puller("tools");
     rig.feed.replies(vec![
@@ -1505,6 +1521,47 @@ async fn a_deleted_sessions_held_calls_are_settled_on_recovery() {
     assert_eq!(health["scope_gone"], 1, "{health}");
     assert!(health.get("error").is_none(), "{health}");
     assert_eq!(store.withdrawal_state("tools", "lineage:4").unwrap(), None);
+}
+
+/// A withdrawal the provider refused for good stays failed only while its session lives, since
+/// the next start asks again with the call's identity read from the session. Once the session is
+/// deleted nothing can ask again, so recovery settles the row with its scope ended rather than
+/// leaving health degraded at every start with no ledger to retry from.
+#[tokio::test]
+async fn a_failed_withdrawal_of_a_deleted_session_is_settled_on_recovery() {
+    let bind = session("failed-then-deleted");
+    let root = rig_root("failed-withdrawal-deleted-session");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // No root keeps the session: it was deleted after its withdrawal failed.
+    let runtime = session_store(&root).await;
+    let store = Arc::new(review_store(&root));
+    let call = registration("lineage:4", "tools", &bind);
+    store.register_calls(std::slice::from_ref(&call)).unwrap();
+    store
+        .record_withdrawal(
+            &call,
+            "failed",
+            1,
+            &json!({"code": "scope_not_carrier", "message": "withdraw route refused"}),
+        )
+        .unwrap();
+    let route = Arc::new(WithdrawalRoute {
+        seen: Mutex::default(),
+        mode: "ok",
+    });
+    let service = withdrawals(store.clone(), &runtime, route.clone(), Default::default());
+    service.recover().await.unwrap();
+    assert!(route.seen.lock().unwrap().is_empty(), "nothing is asked");
+    let health = service.health();
+    assert_eq!(health["failed"], 0, "{health}");
+    assert_eq!(health["scope_gone"], 1, "{health}");
+    assert!(health.get("error").is_none(), "{health}");
+    assert_eq!(
+        store.withdrawal_state("tools", "lineage:4").unwrap(),
+        Some(("failed".into(), 1)),
+        "the row stays, settled with its scope ended"
+    );
 }
 
 /// Answers the first withdrawal that the provider is unreachable, and every later one that the
@@ -2497,6 +2554,114 @@ async fn a_handed_back_calls_terminal_is_delivered_as_a_notice() {
     assert_eq!(rig.feed.acks(), vec![cursor(1)]);
 }
 
+/// A session deleted while a call of it was registered, then created again at the same triple
+/// before the intake saw it gone, holds none of that call's records: the call key names the
+/// deleted session's lineage. The registration is retired as the deleted session's, so it keeps
+/// no feed running, and the call's late entry settles as a no-op instead of pinning the ack
+/// while the intake looks for its intent in the new session's ledger every round.
+#[tokio::test]
+async fn a_registration_of_a_session_deleted_and_created_again_is_retired() {
+    let call_key = "lineage:4";
+    let bind = session("created-again");
+    let rig = Rig::new(
+        "created-again",
+        None,
+        vec![registration(call_key, "tools", &bind)],
+    )
+    .await;
+    // The session at the triple now is a new one, whose finished run never made the call.
+    rig.seed(
+        &bind,
+        &[run_start("run"), run_end("run", RunFinishReason::Completed)],
+    )
+    .await;
+    let _puller = rig.puller("tools");
+    rig.feed.replies(vec![reply(
+        vec![entry(kinds::RESULT, call_key, "ev-1")],
+        1,
+        false,
+    )]);
+    rig.intake.tick("tools").await.unwrap();
+    assert!(rig.delivery.delivered.lock().unwrap().is_empty());
+    assert_eq!(rig.feed.acks(), vec![cursor(1)], "the entry pins nothing");
+    assert!(
+        !rig.intake.module_needs_feed("tools").await.unwrap(),
+        "the deleted session's call keeps no feed"
+    );
+    assert!(rig.store.registration("tools", call_key).unwrap().is_none());
+}
+
+/// A round of a running puller reads each registered session once, for both the check that the
+/// feed is still needed and the classification of the entries it pulls. A closed session is read
+/// as stored, and one too large for the view cache loads whole on every read, so a second read
+/// would load it twice every round.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn a_puller_round_reads_a_closed_session_once() {
+    use broca_core::tool_plane::LateResultsIntake as _;
+    let call_key = "lineage:4";
+    let bind = session("one-read-a-round");
+    let root = rig_root("one-read-a-round");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // A view cap no view fits, so every read of the session loads its view again.
+    let runtime = Arc::new(
+        crate::store_open::StoreRuntime::open(
+            &root,
+            broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
+            Arc::new(NoRuns),
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap()
+        .with_view_bytes_for_test(1),
+    );
+    seed_root(&root, &bind, &held_records(call_key, "tools")).await;
+    let store = Arc::new(LateResultsStore::open(&root.join("late-results.db")).unwrap());
+    store
+        .register_group(&[registration(call_key, "tools", &bind)])
+        .await
+        .unwrap();
+    let feed = Arc::new(ScriptedFeed::default());
+    let delivery = Arc::new(RecordedDelivery::default());
+    let intake = LateResultsIntake::new(
+        Arc::clone(&store),
+        "broca",
+        Arc::clone(&delivery) as Arc<dyn HeldDelivery>,
+        Arc::clone(&feed) as Arc<dyn LateResultsFeed>,
+    );
+    intake.set_session_store(Arc::clone(&runtime));
+    let loads = || {
+        runtime
+            .views()
+            .memory(|_| 0)
+            .loads_by_reason
+            .unwrap()
+            .get("held_calls")
+            .map_or(0, |loads| loads.loads)
+    };
+    feed.replies(vec![reply(
+        vec![entry(kinds::RESULT, call_key, "ev-1")],
+        1,
+        false,
+    )]);
+    let before = loads();
+    assert!(
+        intake.round("tools", &Puller::new()).await,
+        "the held call needs the feed"
+    );
+    assert_eq!(
+        *delivery.delivered.lock().unwrap(),
+        [(call_key.to_string(), "ev-1".to_string())],
+        "the round classified and delivered the entry"
+    );
+    assert_eq!(
+        loads() - before,
+        1,
+        "one load of the session for the whole round"
+    );
+}
+
 /// A provider that answers `withdraw_pending` for each of `pending` attempts, then withdraws the
 /// call, recording when each attempt arrived.
 struct PendingWithdrawalRoute {
@@ -2635,5 +2800,155 @@ async fn a_pending_withdrawal_left_at_a_stop_is_asked_again_at_the_next_start() 
     assert_eq!(
         store.withdrawal_state("tools", "lineage:4").unwrap(),
         Some(("done".into(), 2))
+    );
+}
+
+/// `run_start(run)`, written `age` before now.
+fn run_start_aged(run: &str, age: Duration) -> Record {
+    let mut record = run_start(run);
+    if let Record::RunStart(start) = &mut record {
+        let at = crate::actor::epoch_ms() - age.as_millis() as u64;
+        start.ts_ms = Some(at);
+        start.written_at_ms = Some(at);
+    }
+    record
+}
+
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A run started `age` ago whose one call, `key` in batch `batch`, was handed back to the person
+/// for their steer, then finished: the provider still owes the call its terminal.
+fn handed_back_run(run: &str, batch: &str, key: &str, age: Duration) -> Vec<Record> {
+    let mut handed_back = outcome(run, batch, "a", CallOutcome::Completed);
+    if let Record::ToolOutcome(record) = &mut handed_back {
+        record.yielded_by = Some("tools".into());
+    }
+    vec![
+        run_start_aged(run, age),
+        batch_start(run, batch, &["a"]),
+        intent(run, batch, "a", "tools", Some(key)),
+        handed_back,
+        batch_end(run, batch),
+        run_end(run, RunFinishReason::Completed),
+    ]
+}
+
+/// A run started `age` ago whose provider held its one call `key`, then was cancelled with the
+/// call still held: the provider is owed a withdrawal.
+fn cancelled_while_held(key: &str, age: Duration) -> Vec<Record> {
+    let mut records = held_records(key, "tools");
+    records[0] = run_start_aged("run", age);
+    cancelled_held(&mut records, &["a"]);
+    records
+}
+
+/// The call keys a database lost from `root` is rebuilt with from its sessions.
+async fn rebuilt_keys(
+    store: &LateResultsStore,
+    root: &Path,
+    runtime: &crate::store_open::StoreRuntime,
+) -> Vec<String> {
+    let mut report = RebuildReport::default();
+    rebuild_store_from_sessions_with_progress(store, root, Some(runtime), &mut report, |_| {})
+        .await
+        .unwrap();
+    assert!(report.unreadable.is_empty(), "{report:?}");
+    let mut keys: Vec<String> = store
+        .registrations()
+        .unwrap()
+        .into_iter()
+        .map(|call| call.call_key)
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// A call handed back for the person's steer keeps its registration after its run ends, until
+/// its provider's terminal arrives as a notice. A database rebuilt from the sessions' records
+/// keeps it too, for runs started within the rebuild's window, however many runs came after.
+/// An open batch's held call is rebuilt whenever its run started.
+#[tokio::test]
+async fn a_rebuild_keeps_the_handed_back_calls_of_recent_finished_runs() {
+    let root = rig_root("rebuild-handed-back");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let runtime = session_store(&root).await;
+    let recent = session("handed-back-recent");
+    seed_root(
+        &root,
+        &recent,
+        &handed_back_run("run", "b", "recent:7", DAY),
+    )
+    .await;
+    let old = session("handed-back-old");
+    seed_root(&root, &old, &handed_back_run("run", "b", "old:7", 8 * DAY)).await;
+    // A handed-back call two runs back, both runs within the window.
+    let earlier = session("handed-back-earlier");
+    let mut records = handed_back_run("r1", "b1", "earlier:7", 2 * DAY);
+    records.extend([
+        run_start_aged("r2", DAY),
+        run_end("r2", RunFinishReason::Completed),
+    ]);
+    seed_root(&root, &earlier, &records).await;
+    // A handed-back call of a run started before the window, behind a recent run.
+    let behind = session("handed-back-behind");
+    let mut records = handed_back_run("r1", "b1", "behind:7", 8 * DAY);
+    records.extend([
+        run_start_aged("r2", DAY),
+        run_end("r2", RunFinishReason::Completed),
+    ]);
+    seed_root(&root, &behind, &records).await;
+    // A held call still waiting in a run started long before the window.
+    let waiting = session("held-long-ago");
+    let mut records = held_records("waiting:4", "tools");
+    records[0] = run_start_aged("run", 30 * DAY);
+    seed_root(&root, &waiting, &records).await;
+    let store = LateResultsStore::open(&root.join("rebuilt.db")).unwrap();
+    assert_eq!(
+        rebuilt_keys(&store, &root, &runtime).await,
+        ["earlier:7", "recent:7", "waiting:4"]
+    );
+    let call = store
+        .registration("tools", "recent:7")
+        .unwrap()
+        .unwrap()
+        .call;
+    assert_eq!((call.lineage.as_str(), &call.bind), ("recent", &recent));
+    assert!(store.feed("tools").unwrap().unwrap().ack_owed);
+}
+
+/// A held call cancelled with its run is owed a withdrawal until its provider answers one. A
+/// database rebuilt from the sessions' records keeps its watch for runs started within the
+/// rebuild's window, and withdrawal recovery then sends the withdrawal.
+#[tokio::test]
+async fn a_rebuild_keeps_the_withdrawal_owed_for_a_held_call_cancelled_with_its_run() {
+    let root = rig_root("rebuild-cancelled-held");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let runtime = session_store(&root).await;
+    seed_root(
+        &root,
+        &session("cancelled-recent"),
+        &cancelled_while_held("recent:4", DAY),
+    )
+    .await;
+    seed_root(
+        &root,
+        &session("cancelled-old"),
+        &cancelled_while_held("old:4", 8 * DAY),
+    )
+    .await;
+    let store = Arc::new(LateResultsStore::open(&root.join("late-results.db")).unwrap());
+    assert_eq!(rebuilt_keys(&store, &root, &runtime).await, ["recent:4"]);
+    let route = Arc::new(WithdrawalRoute {
+        seen: Mutex::default(),
+        mode: "ok",
+    });
+    let service = withdrawals(store.clone(), &runtime, route.clone(), Default::default());
+    service.recover().await.unwrap();
+    assert_eq!(*route.seen.lock().unwrap(), ["recent:4"]);
+    assert_eq!(
+        store.withdrawal_state("tools", "recent:4").unwrap(),
+        Some(("done".into(), 1))
     );
 }

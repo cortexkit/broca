@@ -204,8 +204,11 @@ async fn encrypted_store_hold_survives_lost_late_results_database() {
     assert!(side.registry.stop_and_seal().await);
 }
 
+/// A completed run owes its provider nothing, so a rebuild registers none of its calls. A run
+/// cancelled while its provider held a call owes that provider a withdrawal, which the session's
+/// records can't show was sent, so a rebuild keeps the call's watch for withdrawal recovery.
 #[tokio::test]
-async fn store_rebuild_omits_completed_and_cancelled_runs() {
+async fn store_rebuild_omits_completed_runs_and_keeps_cancelled_withdrawals() {
     for cancel in [false, true] {
         let side = Side::new(
             true,
@@ -246,7 +249,18 @@ async fn store_rebuild_omits_completed_and_cancelled_runs() {
         .unwrap();
         assert_eq!(report.sessions, 1);
         assert!(report.unreadable.is_empty());
-        assert!(store.registrations().unwrap().is_empty());
+        let registrations = store.registrations().unwrap();
+        if cancel {
+            assert_eq!(registrations.len(), 1, "{registrations:?}");
+            assert_eq!(
+                store
+                    .withdrawal_state("tools", &registrations[0].call_key)
+                    .unwrap(),
+                Some(("watching".into(), 0))
+            );
+        } else {
+            assert!(registrations.is_empty(), "{registrations:?}");
+        }
         assert!(side.registry.stop_and_seal().await);
     }
 }

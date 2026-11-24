@@ -123,6 +123,7 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::CaughtUp { .. } => "caught up",
         Request::SendRecords { .. } => "send records",
         Request::OpenLogRecords { .. } => "open log records",
+        Request::OpenRunTail { .. } => "open run tail",
         Request::AcceptedSend { .. } => "accepted send",
         Request::CachePredecessor { .. } => "cache predecessor",
         Request::RunStart { .. } => "run start",
@@ -244,9 +245,11 @@ async fn a_store_session_runs_through_the_production_executor() {
         );
     }
     assert_eq!(store_texts(&session), ["hello", "done", "again", "done"]);
-    let requests = server.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2, "each run sent its request once");
-    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let second: serde_json::Value = {
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "each run sent its request once");
+        serde_json::from_slice(&requests[1].body).unwrap()
+    };
     let sent: Vec<&str> = second["messages"]
         .as_array()
         .unwrap()
@@ -258,7 +261,46 @@ async fn a_store_session_runs_through_the_production_executor() {
         ["hello", "done", "again"],
         "the second run's request carries the first run's turn"
     );
-    drop(requests);
+    use broca_session_store::record::{AuthRefrozen, Record};
+    let records = session.open_log_records().await.unwrap();
+    let mut start = records
+        .into_iter()
+        .rev()
+        .find_map(|(_, record)| match record {
+            Record::RunStart(start) => Some(start),
+            _ => None,
+        })
+        .unwrap();
+    start.run_id = "moved-at-wall".into();
+    start.send_id = None;
+    start.submission_id = None;
+    let auth = AuthRefrozen {
+        run_id: start.run_id.clone(),
+        ts_ms: None,
+        auth_selection: serde_json::json!({"credential_id": "apikey:deepseek:other"}),
+    };
+    session
+        .append(&[Record::RunStart(start), Record::AuthRefrozen(auth)], true)
+        .await
+        .unwrap();
+    let reads = session.backend().log_reads();
+    let (writer, mut link) = broca_session_loop::shared::ActorWriter::new(&session, None);
+    let (history, ()) = tokio::join!(store_history(&writer, &parts), async {
+        let request = link.next().await.unwrap();
+        link.serve(&mut session, request).await;
+    });
+    let prior = history.unwrap().prior_run.unwrap();
+    assert!(prior.moved, "the account refreeze was not part of a resume");
+    assert_eq!(
+        prior.config.auth_selection.unwrap().credential_id,
+        "apikey:deepseek:other"
+    );
+    assert_eq!(
+        session.backend().log_reads(),
+        reads,
+        "admission must not reread the open log"
+    );
+
     drop(executor);
     drop(daemon);
     let _ = std::fs::remove_dir_all(&root);
@@ -512,6 +554,27 @@ async fn a_store_run_refused_by_routing_starts_then_ends_with_the_refusal() {
         .expect("the run's end is written")
         .expect("the run's end carries routing's refusal");
     assert_eq!(error["provider_code"], "routing_decision_refused", "{error}");
+    let start = records
+        .iter()
+        .find_map(|(seq, record)| {
+            matches!(record, broca_session_store::record::Record::RunStart(_)).then_some(*seq)
+        })
+        .unwrap();
+    let reads = session.backend().log_reads();
+    let (writer, mut link) = broca_session_loop::shared::ActorWriter::new(&session, None);
+    let (reported, ()) = tokio::join!(store_terminal_error(&writer, "store-run-routed", start), async {
+        let request = link.next().await.unwrap();
+        link.serve(&mut session, request).await;
+    });
+    assert_eq!(
+        reported.unwrap().provider_code.as_deref(),
+        Some("routing_decision_refused")
+    );
+    assert_eq!(
+        session.backend().log_reads(),
+        reads,
+        "terminal reporting must not reread the open log"
+    );
     assert!(
         server.requests.lock().unwrap().is_empty(),
         "no model request is sent"

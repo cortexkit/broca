@@ -703,8 +703,7 @@ async fn audit_readmission_preserves_answered_and_contract_refusals() {
         let rig = routed_rig(true, true);
         rig.provider
             .script("first", vec![Script::Answer(answered(Some(7)))]);
-        rig.provider
-            .script("second", vec![Script::Status(503, None)]);
+        rig.provider.script("second", vec![Script::Unconnected]);
         let params = routed_request(&["first", "second"]);
         call(&rig, &params).await.unwrap();
         let before = rig.store.routing(STORE_ROLE, "routed").unwrap().unwrap();
@@ -1672,7 +1671,7 @@ async fn routed_transient_resend_uses_frozen_model_and_requested_account() {
     let rig = routed_rig(true, true);
     rig.provider.script(
         "retry",
-        vec![Script::Status(503, None), Script::Answer(answered(Some(7)))],
+        vec![Script::Unconnected, Script::Answer(answered(Some(7)))],
     );
     rig.provider
         .script("done", vec![Script::Answer(answered(Some(11)))]);
@@ -1698,6 +1697,49 @@ async fn routed_transient_resend_uses_frozen_model_and_requested_account() {
         rig.router.bodies("route.report")[0]["usage"]["input_tokens"],
         7
     );
+}
+
+#[tokio::test]
+async fn routed_resend_does_not_rewrite_settled_run_history() {
+    let rig = routed_rig(true, true);
+    rig.provider.script("retry", vec![Script::Unconnected]);
+    let params = routed_request(&["retry"]);
+    let mut writes = Vec::new();
+    for _ in 0..4 {
+        let before = rig.service.routing_journal_writes.load(Ordering::Relaxed);
+        let result: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+        assert_eq!(result["items"][0]["error"]["code"], "provider_error");
+        writes.push(rig.service.routing_journal_writes.load(Ordering::Relaxed) - before);
+    }
+    assert_eq!(rig.provider.calls("retry"), 4);
+    assert_eq!(rig.router.bodies("route.report").len(), 4);
+    assert_eq!(
+        writes[1..],
+        [writes[1]; 3],
+        "historical reports are already settled: {writes:?}"
+    );
+}
+
+#[tokio::test]
+async fn routed_unknown_spend_uses_the_charge_ceiling_on_resend() {
+    let mut rig = routed_rig(true, true);
+    Arc::get_mut(&mut rig.service).unwrap().config.max_attempts = 3;
+    rig.provider.script(
+        "retry",
+        vec![
+            Script::Status(503, Some(0)),
+            Script::Answer(answered(Some(7))),
+        ],
+    );
+    let params = routed_request(&["retry"]);
+    let first: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(first["items"][0]["error"]["code"], "provider_error");
+    let again: Value = serde_json::from_str(call(&rig, &params).await.unwrap().get()).unwrap();
+    assert_eq!(
+        again["items"][0]["error"]["code"], "cost_exceeded",
+        "{again}"
+    );
+    assert_eq!(rig.provider.calls("retry"), 1);
 }
 
 #[tokio::test]
@@ -1891,7 +1933,7 @@ async fn routed_without_run_reports_waits_for_final_and_reports_once() {
     let rig = routed_rig(false, false);
     rig.provider.script(
         "retry",
-        vec![Script::Status(503, None), Script::Answer(answered(Some(7)))],
+        vec![Script::Unconnected, Script::Answer(answered(Some(7)))],
     );
     rig.provider
         .script("done", vec![Script::Answer(answered(Some(11)))]);
@@ -2129,8 +2171,7 @@ async fn routed_answered_readmission_refusal_preserves_batch_without_run_or_pena
         let rig = routed_rig(true, true);
         rig.provider
             .script("done", vec![Script::Answer(answered(Some(10)))]);
-        rig.provider
-            .script("retry", vec![Script::Status(503, None)]);
+        rig.provider.script("retry", vec![Script::Unconnected]);
         let params = routed_request(&["done", "retry"]);
         call(&rig, &params).await.unwrap();
         let before = rig.store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
@@ -2167,8 +2208,7 @@ async fn routed_retry_outage_keeps_stored_answers_and_account_bytes_unchanged() 
     let rig = routed_rig(true, true);
     rig.provider
         .script("done", vec![Script::Answer(answered(Some(10)))]);
-    rig.provider
-        .script("retry", vec![Script::Status(503, None)]);
+    rig.provider.script("retry", vec![Script::Unconnected]);
     let params = routed_request(&["done", "retry"]);
     call(&rig, &params).await.unwrap();
     let before = rig.store.lookup(STORE_ROLE, "routed").unwrap().unwrap();
@@ -2635,7 +2675,7 @@ async fn routed_unpinned_unfinished_batch_is_untouched_while_off_and_continues_o
         .script("done", vec![Script::Answer(answered(Some(10)))]);
     rig.provider.script(
         "retry",
-        vec![Script::Status(503, None), Script::Answer(answered(Some(7)))],
+        vec![Script::Unconnected, Script::Answer(answered(Some(7)))],
     );
     let params = routed_request(&["done", "retry"]);
     call(&rig, &params).await.unwrap();
@@ -2805,8 +2845,7 @@ async fn routed_refused_reselection_account_keeps_original_choice_and_diagnostic
 #[tokio::test]
 async fn routed_refused_readmission_without_run_reports_adds_no_final_penalty() {
     let rig = routed_rig(false, true);
-    rig.provider
-        .script("retry", vec![Script::Status(503, None)]);
+    rig.provider.script("retry", vec![Script::Unconnected]);
     let params = routed_request(&["retry"]);
     call(&rig, &params).await.unwrap();
     *rig.router.admission_refused.lock().unwrap() =

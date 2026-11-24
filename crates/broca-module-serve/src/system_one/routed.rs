@@ -28,7 +28,7 @@ use super::{
     internal_refusal, ModelPin, SystemOne,
 };
 use crate::account_routing::{self, Candidates, RoutingCallError, RoutingClient};
-use crate::llm_tools::spend::MarkedItemError;
+use crate::llm_tools::spend::{ItemSpend, MarkedItemError};
 
 /// The routing consumer every classifier caller's name hangs under. Routing matches a dotted
 /// name to its nearest configured entry, so settings on this root cover every caller.
@@ -681,6 +681,10 @@ async fn save(service: &Arc<SystemOne>, batch_id: &str, journal: &Journal) -> Re
     {
         return Err(internal_refusal("the routed batch hold was lost").into());
     }
+    #[cfg(test)]
+    service
+        .routing_journal_writes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -758,7 +762,11 @@ fn finished_report(
         let answered = batch
             .outcomes
             .iter()
-            .filter(|outcome| matches!(outcome.outcome, Outcome::Answered(_)))
+            .filter(|outcome| {
+                matches!(outcome.outcome, Outcome::Answered(_))
+                    || outcome.input_tokens.is_some()
+                    || outcome.output_tokens.is_some()
+            })
             .collect::<Vec<_>>();
         usage.input_tokens = sum(&answered
             .iter()
@@ -1001,16 +1009,20 @@ fn queue_finished_run(
                 rpc.method == "route.report"
                     && rpc.params["decision_id"] == run.choice.select.decision_id
             });
-        let decision_measured = journal
-            .runs
-            .iter()
-            .filter(|other| other.choice.select.decision_id == run.choice.select.decision_id)
-            .all(|other| !other.unmeasured_attempt && other.input.len() == other.dispatched);
-        let report = finished_report(run, batch, decision_measured);
-        journal.runs[index].report_queued = true;
-        let capabilities = journal.runs[index].choice.describe.capabilities.clone();
-        let refusal = journal.runs[index].renewal_refusal.clone();
         if !already_reported {
+            let decision_measured = run.choice.describe.serves("report_usage_run_id")
+                || journal
+                    .runs
+                    .iter()
+                    .filter(|other| {
+                        other.choice.select.decision_id == run.choice.select.decision_id
+                    })
+                    .all(|other| {
+                        !other.unmeasured_attempt && other.input.len() == other.dispatched
+                    });
+            let report = finished_report(run, batch, decision_measured);
+            let capabilities = run.choice.describe.capabilities.clone();
+            let refusal = run.renewal_refusal.clone();
             journal.report(report, capabilities);
             journal
                 .outbox
@@ -1018,6 +1030,7 @@ fn queue_finished_run(
                 .expect("report queued")
                 .routing_refusal = refusal;
         }
+        journal.runs[index].report_queued = true;
     }
 }
 
@@ -1113,9 +1126,17 @@ async fn recover_claimed(
         };
         batch.outcomes.len() == identity.items.len() && batch.outcomes.iter().all(retained)
     });
+    let mut changed = journal.runs.is_empty() && journal.outbox.is_empty();
     for index in 0..journal.runs.len() {
         if journal.runs[index].renewing {
             let _ = renew(service, batch_id, journal, index).await?;
+        }
+        let run = &journal.runs[index];
+        if run.finished
+            && (run.report_queued
+                || (!final_batch && !run.choice.describe.serves("report_usage_run_id")))
+        {
+            continue;
         }
         if !journal.runs[index].finished
             && (journal.runs[index].dispatched == 0
@@ -1130,9 +1151,12 @@ async fn recover_claimed(
                 )
             });
         }
-        finish_run(service, batch_id, journal, index, final_batch).await?;
+        queue_finished_run(journal, index, final_batch, batch.as_ref());
+        changed = true;
     }
-    if journal.runs.is_empty() && journal.outbox.is_empty() {
+    // Commit every rebuilt body before any is sent, without rewriting the same journal
+    // once per historical run. The outbox still delivers and acknowledges in order.
+    if changed {
         save(service, batch_id, journal).await?;
     }
     flush(service, batch_id, journal).await
@@ -2413,34 +2437,17 @@ async fn dispatch_items(
                 let run = &mut journal.runs[run_index];
                 run.input.push(input_tokens);
                 run.output.push(output_tokens);
-                run.costs.push(classify::batch_cost(
-                    &choice.frozen,
-                    &[(input_tokens, output_tokens)],
-                ));
-                let fact = service
-                    .export
-                    .as_ref()
-                    .zip(super::catalog_key_parts(&choice.model))
-                    .map(|(export, (provider, model))| {
-                        use broca_core::ChargeBasisResolver;
-                        let method = auth_selection
-                            .as_deref()
-                            .and_then(|id| id.split(':').next())
-                            .unwrap_or("apikey");
-                        let (charge_basis, charge_basis_mapping_version) =
-                            service.charge_basis.resolve_charge_basis(provider, method);
-                        broca_store::system_one::FactContext {
-                            source_instance_id: export.source_instance_id().into(),
-                            provider: provider.into(),
-                            model: model.into(),
-                            auth_selection,
-                            account_ref,
-                            charge_basis,
-                            charge_basis_mapping_version,
-                            charge_basis_overrides: service.charge_basis.charge_basis_overrides(),
-                        }
-                    });
-                *spent = spent.saturating_add(cost);
+                let measured =
+                    classify::batch_cost(&choice.frozen, &[(input_tokens, output_tokens)]);
+                run.costs.push(measured);
+                let debit = measured.unwrap_or_else(|| super::unknown_spend_debit(ceiling));
+                let fact = classify::fact_context(
+                    service,
+                    &choice.model,
+                    auth_selection,
+                    account_ref,
+                    cost,
+                );
                 (
                     StoredOutcome {
                         index: index as u64,
@@ -2448,12 +2455,23 @@ async fn dispatch_items(
                         input_tokens,
                         output_tokens,
                     },
-                    cost,
+                    debit,
                     fact,
                 )
             }
-            Err(error) => {
+            Err(classify::FailedAnswer {
+                error,
+                spend,
+                reported,
+            }) => {
+                let usage = reported.as_ref().map(|r| r.usage);
                 journal.runs[run_index].note_error(error.clone());
+                if let ItemSpend::Measured(nanos) = spend {
+                    let run = &mut journal.runs[run_index];
+                    run.input.push(usage.and_then(|usage| usage.input_tokens));
+                    run.output.push(usage.and_then(|usage| usage.output_tokens));
+                    run.costs.push(Some(nanos));
+                }
                 if first_provider_call && error.code == errors::MODEL_UNAVAILABLE {
                     // Account failures freeze as item errors, but a missing model still
                     // refuses admission. dispatch releases and reports the run before
@@ -2466,15 +2484,26 @@ async fn dispatch_items(
                 if !account_error(&error) && !error.is_stored() {
                     unstored = Some(error.clone());
                 }
+                let fact = reported
+                    .filter(|_| !error.is_retried_on_resend())
+                    .and_then(|r| {
+                        classify::fact_context(
+                            service,
+                            &choice.model,
+                            r.auth_selection,
+                            r.account_ref,
+                            classify::spend_of(&choice.frozen, Some(&r.usage), &estimates[index]),
+                        )
+                    });
                 (
                     StoredOutcome {
                         index: index as u64,
                         outcome: Outcome::Failed(classify::item_error_json(&error)),
-                        input_tokens: None,
-                        output_tokens: None,
+                        input_tokens: usage.and_then(|usage| usage.input_tokens),
+                        output_tokens: usage.and_then(|usage| usage.output_tokens),
                     },
-                    0,
-                    None,
+                    classify::budget_debit(spend, ceiling),
+                    fact,
                 )
             }
         };
@@ -2486,6 +2515,7 @@ async fn dispatch_items(
         } else {
             // Account failures remain frozen so a resend cannot silently change accounts.
             record(service, &request.batch_id, &outcome, cost, fact, journal).await?;
+            *spent = spent.saturating_add(cost);
             slots[index] = Some(Slot::Stored(outcome));
         }
         flush(service, &request.batch_id, journal).await?;
@@ -2503,7 +2533,12 @@ async fn provider_call(
     body: String,
     journal: &mut Journal,
     run_index: usize,
-) -> Result<Result<classify::PaidAnswer, ItemError>, Error> {
+) -> Result<Result<classify::PaidAnswer, classify::FailedAnswer>, Error> {
+    let unsent = |error| classify::FailedAnswer {
+        error,
+        spend: ItemSpend::Nothing,
+        reported: None,
+    };
     let slot = service.model_slot(&pin.catalog_id);
     for attempt in 1..=service.config.max_attempts.max(2) {
         let started = std::sync::atomic::AtomicBool::new(false);
@@ -2518,10 +2553,12 @@ async fn provider_call(
                 if started.load(std::sync::atomic::Ordering::SeqCst) {
                     break provider.await;
                 }
-                return Ok(Err(journal.runs[run_index]
-                    .error
-                    .clone()
-                    .expect("failed renewal has an error")));
+                return Ok(Err(unsent(
+                    journal.runs[run_index]
+                        .error
+                        .clone()
+                        .expect("failed renewal has an error"),
+                )));
             }
             let now = (service.clock)().max(0) as u64;
             let delay = journal.runs[run_index].renew_at_ms.saturating_sub(now);
@@ -2562,7 +2599,9 @@ async fn provider_call(
         } else {
             classify::paid_answer(reply.clone(), pin)
         };
-        if mapped.is_err() {
+        let (spend, reported) =
+            classify::error_spend(&reply, &journal.runs[run_index].choice.frozen);
+        if mapped.is_err() && !matches!(spend, ItemSpend::Measured(_)) {
             journal.runs[run_index].unmeasured_attempt = true;
         }
         let retry_after = match &reply {
@@ -2626,12 +2665,17 @@ async fn provider_call(
                     | super::ProviderReply::CredentialUnavailable(_)
             )
         {
-            return Ok(mapped);
+            return Ok(mapped.map_err(|error| classify::FailedAnswer {
+                error,
+                spend,
+                reported,
+            }));
         }
         if mapped
             .as_ref()
             .is_err_and(|error| error.code == errors::AUTH_FAILED)
             && attempt == 1
+            && spend == ItemSpend::Nothing
         {
             save(service, batch_id, journal).await?;
             flush(service, batch_id, journal).await?;
@@ -2649,12 +2693,16 @@ async fn provider_call(
                 tokio::select! {
                     _ = tokio::time::sleep_until(deadline) => break,
                     _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {
-                        if let Some(error) = renew(service, batch_id, journal, run_index).await? { return Ok(Err(error)); }
+                        if let Some(error) = renew(service, batch_id, journal, run_index).await? { return Ok(Err(unsent(error))); }
                     }
                 }
             }
         } else {
-            return Ok(mapped);
+            return Ok(mapped.map_err(|error| classify::FailedAnswer {
+                error,
+                spend,
+                reported,
+            }));
         }
     }
     unreachable!("the final provider attempt returns")

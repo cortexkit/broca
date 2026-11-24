@@ -34,7 +34,11 @@ fn fixture(held: bool) -> (StoredLineage, RegistrationRow, LateEntry) {
         ));
     }
     (
-        StoredLineage::Readable { records, run: None },
+        StoredLineage::Readable {
+            records,
+            run: None,
+            foreign: Vec::new(),
+        },
         RegistrationRow {
             call: LateResultRegistration {
                 lineage: "lineage".into(),

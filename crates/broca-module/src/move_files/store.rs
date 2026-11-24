@@ -349,6 +349,16 @@ impl FileCutArtifacts {
                     &plan.session,
                 )
                 .map_err(unavailable)?;
+                // A session that can come due outside the ephemeral root is found by retention's
+                // passes only through its mark, which its actor wrote on the computer it came
+                // from and the move doesn't carry: marked here before it is published.
+                if crate::retention::store::marks::needs_mark(class, &view.operations) {
+                    crate::retention::store::marks::mark(
+                        &class.store_root(&self.state_root),
+                        &addr,
+                    )
+                    .map_err(unavailable)?;
+                }
                 export
                     .activate(
                         &self.store_staged(cut, plan),

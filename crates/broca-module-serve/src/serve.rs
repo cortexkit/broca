@@ -2867,25 +2867,6 @@ where
             )
             .await;
         }
-        // Establish storage ownership before authorization or dispatch handles the request.
-        // Without a store runtime the rollback guard refuses every op; with one, only ops
-        // implemented for the session store may proceed.
-        match handler.kept_in_new_storage(&session) {
-            Ok(true) if !served_on_new_storage(method, params) => {
-                return send_error(
-                    &writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    NOT_SERVED_ON_NEW_STORAGE,
-                    &format!("{method} isn't served yet for a session kept in the new storage"),
-                )
-                .await;
-            }
-            Ok(_) => {}
-            Err(error) => return send_serve_error(&writer, ver, channel, epoch, corr, &error).await,
-        }
         if let Err(error) = authorize_route_request(handler.as_ref(), &session, &bind, method, params).await {
             return send_serve_error(&writer, ver, channel, epoch, corr, &error).await;
         }
@@ -4996,6 +4977,7 @@ where
             async {
                 let mut next_seq = cortexkit_role_llm_runner::live::FIRST_SEQ;
                 let mut message_identity: Option<(bool, Option<String>)> = None;
+                let mut first_delivery = true;
                 loop {
                     let delivery = tokio::select! {
                         _ = cancel.cancelled() => { record_request_outcome("cancelled"); break },
@@ -5004,10 +4986,16 @@ where
                             None => break, // the coordinator's subscriber task ended (sink closed)
                         },
                     };
-                    let admission = match handler.kept_in_new_storage(&session) {
-                        Ok(true) => handler.authorize_session_read(&session, &read_access).await,
-                        Ok(false) => Ok(()),
-                        Err(error) => Err(error),
+                    // A policy change between the open check and fanout attachment may not
+                    // reach this subscriber. Check before its first unit, then at control
+                    // boundaries and on policy changes, not on every display delta.
+                    let check = matches!(delivery, Delivery::Control(_) | Delivery::AdmissionChanged)
+                        || first_delivery && matches!(delivery, Delivery::Display(_));
+                    first_delivery = false;
+                    let admission = if check {
+                        handler.authorize_session_read(&session, &read_access).await
+                    } else {
+                        Ok(())
                     };
                     if let Err(error) = admission {
                         if matches!(error, ServeError::ReadAccessRefused | ServeError::ScopeRefused(_) | ServeError::ScopeFreezeBusy { .. }) {
@@ -5507,13 +5495,22 @@ async fn send_response_bytes(
     send(writer, frame).await
 }
 
+const HISTORY_REWRITING_REFUSAL: (&str, broca_protocol::ErrorClass) = (
+    broca_core::served_history::HISTORY_REWRITING,
+    broca_protocol::ErrorClass::Transient,
+);
+const CONTEXT_CEILING_REFUSAL: (&str, broca_protocol::ErrorClass) = (
+    cortexkit_role_llm_runner::errors::CONTEXT_CEILING,
+    broca_protocol::ErrorClass::ContextOverflow,
+);
+
 fn refused_send_code(error: &ServeError) -> String {
     match error {
         // Answered on the wire as the contract's `transient` code (see `admission_refusal`).
         ServeError::CredentialsUnavailable => "transient".into(),
         ServeError::CredentialAmbiguous { .. } => "credential_ambiguous".into(),
         ServeError::Upload(error) => error.code.into(),
-        ServeError::ContextCeiling(_) => cortexkit_role_llm_runner::errors::CONTEXT_CEILING.into(),
+        ServeError::ContextCeiling(_) => CONTEXT_CEILING_REFUSAL.0.into(),
         ServeError::UnknownSend => cortexkit_role_llm_runner::errors::UNKNOWN_SEND.into(),
         ServeError::UnknownSession => cortexkit_role_llm_runner::errors::UNKNOWN_SESSION.into(),
         ServeError::SessionMoving { .. } => "session_moving".into(),
@@ -5548,7 +5545,7 @@ fn refused_send_code(error: &ServeError) -> String {
         ServeError::ImportIdReuse => "import_id_reuse".into(),
         ServeError::ImportBusy => "import_busy".into(),
         ServeError::SessionBusy(_) => "session_busy".into(),
-        ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING.into(),
+        ServeError::HistoryRewriting => HISTORY_REWRITING_REFUSAL.0.into(),
         ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED.into(),
         ServeError::CursorExpired => "cursor_expired".into(),
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID.into(),
@@ -5583,6 +5580,8 @@ fn shared_class_name(class: broca_protocol::ErrorClass) -> &'static str {
 
 fn refused_send_class(error: &ServeError) -> &'static str {
     match error {
+        ServeError::HistoryRewriting => shared_class_name(HISTORY_REWRITING_REFUSAL.1),
+        ServeError::ContextCeiling(_) => shared_class_name(CONTEXT_CEILING_REFUSAL.1),
         ServeError::Upload(error) => shared_class_name(error.error_class()),
         ServeError::Open(_, Some(class)) => shared_class_name(*class),
         ServeError::AccountSelectionRefused(refusal) => shared_class_name(refusal.class),
@@ -5641,78 +5640,6 @@ const NOT_SERVED_ON_NEW_STORAGE: &str = "not_served_on_new_storage";
 /// The refusal of an op only the session store serves, from a handler that has no session
 /// store. Only test handlers lack one.
 const NO_SESSION_STORE: &str = "no_session_store";
-
-/// Whether `method` is served for a session in the session store. Every other op is refused
-/// with `not_served_on_new_storage` for such a session. An op joins this list in the change
-/// that gives it a store implementation.
-///
-/// The list covers the session's own route. A `compaction-runner/v1` route (`bind`,
-/// `session.entries`, `session.applied_view`, `session.apply_view`) is dispatched by its role
-/// before this check, and the registry sends a store session's calls on it to the store
-/// (`LineageRegistry::route_compaction_v2`).
-pub(crate) fn served_on_new_storage(method: &str, _params: &serde_json::Value) -> bool {
-    match method {
-        // Reads served from the store (`store_read`, `store_head`).
-        OP_READ | OP_HEAD | broca_wire::plan_view::OP_SESSION_PLAN_VIEW => true,
-        cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REFS
-        | cortexkit_role_llm_runner::ops::SESSION_OUTPUT_REF_READ => true,
-        // The store actor's subscriptions (`store_fanout`).
-        OP_SUBSCRIBE => true,
-        // Run and send facts built from the store's own records (`store_status`), and a run's
-        // calls (`store_tool_calls`).
-        OP_STATUS | OP_RUN_ADMISSION | OP_RUN_RESULT | OP_SEND_STATUS | OP_SESSION_SEND_STATUS => {
-            true
-        }
-        OP_RUN_TOOL_CALLS => true,
-        // The store actor serves sends, cancels and retractions.
-        OP_SEND | OP_CANCEL | OP_RETRACT => true,
-        // Plan refreshes go through the current preflight, are decided and written by the store
-        // actor, and are checked against the baseline (`store_plan_change::baseline`).
-        OP_REFRESH | OP_REFRESH_POLICY | OP_FLUSH_PREFIX | OP_BASELINE => true,
-        // The store actor records a release and deletes its session (`retention_store`).
-        OP_RELEASE => true,
-        // Both file and inline imports write one seeded batch through the store actor.
-        OP_IMPORT => true,
-        OP_INSTALL_VIEW => true,
-        // Restore repairs the session store's own files (`store_restore`).
-        OP_RESTORE_FROM_BACKUP => true,
-        // The tag map reads the store's own entry facts (`store_tag_map`).
-        OP_TAG_MAP => true,
-        // Request dumps rebuild a run's requests from the store's records (`store_request_dump`).
-        OP_REQUEST_DUMP => true,
-        // Deletion removes a session from the session store only (`retention_store`).
-        OP_SESSION_DELETE => true,
-        // The store actor warms the request its loop would send next, dated by the store's own
-        // cache clock (`store_actor::warm`).
-        OP_WARM => true,
-        // Forks of a head read it without an actor and write only their own sessions
-        // (`broca_module::fork_answer`).
-        cortexkit_role_llm_runner::ops::SESSION_FORK_PREPARE
-        | cortexkit_role_llm_runner::ops::SESSION_FORK_ASK
-        | cortexkit_role_llm_runner::ops::SESSION_FORK_END => true,
-        // Describes the module, not the session.
-        OP_ROLE_DESCRIBE => true,
-        // Media the store's own records name, read from the objects they stored
-        // (`uploads::media_read`). Uploads are staged beside the session, whichever storage
-        // keeps it; only the owner check reads the session, from the store.
-        cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ => true,
-        "session.upload_begin"
-        | "session.upload_append"
-        | "session.upload_commit"
-        | "session.upload_status" => true,
-        // Both forms page through the store (`crate::history`): the raw form through its
-        // `session.read`, the display form with the per-call facts the store records.
-        cortexkit_role_llm_runner::ops::SESSION_HISTORY => true,
-        // A run event's body, kept in the run index's outbox for every session whichever
-        // storage keeps it (`store_run_events`), and served to the session that wrote it.
-        OP_RUN_EVENT_GET => true,
-        _ => false,
-    }
-}
-
-#[cfg(test)]
-#[path = "serve_store_gate_tests.rs"]
-mod store_gate_tests;
 
 /// Routes a command only the session store serves, and sends its answer: the reply, or its
 /// refusal under the refusal's own code.
@@ -5871,18 +5798,16 @@ async fn send_serve_error(
         }
         ServeError::TagsAwaitSetup => "transient",
         ServeError::ContextCeiling(detail) => {
-            let body = ErrorBody::new(
-                cortexkit_role_llm_runner::errors::CONTEXT_CEILING,
-                err.to_string(),
-            )
-            .with_detail(serde_json::to_value(detail).map_err(|e| ServeIoError(e.to_string()))?);
+            let body = ErrorBody::new(CONTEXT_CEILING_REFUSAL.0, err.to_string()).with_detail(
+                serde_json::to_value(detail).map_err(|e| ServeIoError(e.to_string()))?,
+            );
             return send_error_body(writer, ver, channel, epoch, corr, body).await;
         }
         ServeError::Import(_) => "import_rejected",
         ServeError::ImportIdReuse => "import_id_reuse",
         ServeError::ImportBusy => "import_busy",
         ServeError::SessionBusy(_) => "session_busy",
-        ServeError::HistoryRewriting => broca_core::served_history::HISTORY_REWRITING,
+        ServeError::HistoryRewriting => HISTORY_REWRITING_REFUSAL.0,
         ServeError::HistoryChanged => broca_wire::HISTORY_CHANGED,
         ServeError::CursorExpired => "cursor_expired",
         ServeError::UnknownMid(_) => broca_wire::UNKNOWN_MID,
@@ -5924,7 +5849,7 @@ async fn send_serve_error(
     };
     let mut body = ErrorBody::new(code, err.to_string());
     if matches!(err, ServeError::HistoryRewriting) {
-        body = body.with_detail(serde_json::json!({"class":"transient"}));
+        body = body.with_detail(serde_json::json!({"class": HISTORY_REWRITING_REFUSAL.1}));
     }
     if let ServeError::ServiceTierInvalid { reason, .. } = err {
         body = body.with_detail(serde_json::json!({"field":"service_tier", "reason":reason}));

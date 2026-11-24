@@ -319,8 +319,12 @@ impl Complete {
             owner: &self.owner,
             now_ms: now,
         };
-        match self.store.claim(&claim) {
-            Ok(Claimed::Fresh | Claimed::Resumed(_)) => {}
+        let (spent, ceiling) = match self.store.claim(&claim) {
+            Ok(Claimed::Fresh) => (0, call.ceiling_nanos),
+            Ok(Claimed::Resumed(record)) => (
+                record.spent_nanos,
+                record.ceiling_nanos.unwrap_or(call.ceiling_nanos),
+            ),
             Ok(Claimed::InProgress) => {
                 return Err(unspent(refused(
                     batch::PROVIDER_ERROR,
@@ -331,12 +335,18 @@ impl Complete {
                 return Err(unspent(key_reused()))
             }
             Err(_) => return Err(unspent(internal("the completion record is unavailable"))),
-        }
+        };
         let hold = Hold {
             store: &self.store,
             key: &call.key,
             owner: &self.owner,
         };
+        if spent > 0 && spent.saturating_add(cost_bound(&call.request, &frozen)) > ceiling {
+            return Err(unspent(refused(
+                batch::COST_EXCEEDED,
+                "answering this completion could cross the cumulative max_cost_usd",
+            )));
+        }
         let (answer, spend_nanos, tokens) =
             self.execute(call, &frozen, attempt, principal, scope).await;
         // Every attempt's end is recorded, a transient failure too: the next repeat must start
@@ -394,11 +404,7 @@ impl Complete {
             ));
         };
         let frozen = freeze(model, answer.decision_id.clone(), price)?;
-        let estimate = cost_nanos(input_tokens, frozen.input_rate)
-            .ok()
-            .zip(cost_nanos(request.max_output_tokens, frozen.output_rate).ok())
-            .and_then(|(input, output)| input.checked_add(output))
-            .unwrap_or(u64::MAX);
+        let estimate = cost_bound(request, &frozen);
         if estimate > call.ceiling_nanos {
             let mut refusal = refused(
                 batch::COST_EXCEEDED,
@@ -445,11 +451,11 @@ impl Complete {
             Err(error) => return (Err(unspent(send_refusal(&error))), 0, (None, None)),
         }
         match self.wait(&session, &run_id).await {
-            Ok((result, stop)) => finish(&call.request, frozen, &result, stop),
+            Ok((result, stop)) => finish(&call.request, frozen, &result, stop, call.ceiling_nanos),
             // The run may have reached the provider, and nothing here measured it.
             Err(refusal) => (
                 Err(serialize(Spend::Unknown.mark(refusal))),
-                0,
+                call.ceiling_nanos,
                 (None, None),
             ),
         }
@@ -644,6 +650,14 @@ fn input_bound(request: &complete::Request) -> u64 {
         .saturating_add(OVERHEAD_TOKENS)
 }
 
+fn cost_bound(request: &complete::Request, frozen: &Frozen) -> u64 {
+    cost_nanos(input_bound(request), frozen.input_rate)
+        .ok()
+        .zip(cost_nanos(request.max_output_tokens, frozen.output_rate).ok())
+        .and_then(|(input, output)| input.checked_add(output))
+        .unwrap_or(u64::MAX)
+}
+
 /// The select answer's price as integer rates, rounded up so a cost is never lowered.
 fn freeze(model: complete::Model, decision_id: String, price: &Price) -> Result<Frozen, Refusal> {
     let unpriceable = || {
@@ -736,11 +750,12 @@ fn finish(
     frozen: &Frozen,
     result: &RunResultResponse,
     stop: Option<Stop>,
+    ceiling_nanos: u64,
 ) -> (Answer, u64, (Option<u64>, Option<u64>)) {
     let usage = &result.usage;
     let tokens = (usage.input_tokens, usage.output_tokens);
     let cost = cost_of(usage, frozen);
-    let spent = cost.unwrap_or(0);
+    let spent = cost.unwrap_or(ceiling_nanos);
     if stop.is_some() || result.state != "completed" {
         let (refusal, unbilled) = match stop {
             Some(Stop::Paused(reason)) => pause_refusal(&reason),
@@ -760,7 +775,8 @@ fn finish(
             _ if unbilled && usage.steps == 0 => Spend::Nothing,
             _ => Spend::Unknown,
         };
-        return (Err(serialize(spend.mark(refusal))), spent, tokens);
+        let debit = if spend == Spend::Nothing { 0 } else { spent };
+        return (Err(serialize(spend.mark(refusal))), debit, tokens);
     }
     let spend = match cost {
         Some(nanos) => Spend::Measured(usd(nanos)),
@@ -804,7 +820,7 @@ fn finish(
             COST_UNMEASURED,
             "the provider did not report the token counts this call is priced by",
         );
-        return (Err(serialize(refusal)), 0, tokens);
+        return (Err(serialize(refusal)), spent, tokens);
     };
     let model = usage
         .by_model

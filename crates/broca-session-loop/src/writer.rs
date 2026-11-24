@@ -101,6 +101,32 @@ pub trait Writer {
     /// whole when the folds keep only a summary of it, such as the compaction views.
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError>;
 
+    /// The current run's open-log tail, bounded by both its start and `first`. Message bodies
+    /// may be released: this read is for ledger facts, not transcript reconstruction.
+    async fn open_run_tail(
+        &self,
+        run_id: &str,
+        first: u64,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
+        if self
+            .operations()
+            .run
+            .as_ref()
+            .is_none_or(|run| run.run_id != run_id)
+        {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .open_log_records()
+            .await?
+            .into_iter()
+            .skip_while(
+                |(_, record)| !matches!(record, Record::RunStart(start) if start.run_id == run_id),
+            )
+            .filter(|(seq, _)| *seq >= first)
+            .collect())
+    }
+
     /// The start record of the session's run `run_id`, sealed or in the open log, found through
     /// the session's id lookup. `None` when the session has no such run.
     async fn run_start(
@@ -326,6 +352,14 @@ impl<B: SessionBackend> Writer for Session<B> {
 
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError> {
         Session::open_log_records(self).await
+    }
+
+    async fn open_run_tail(
+        &self,
+        run_id: &str,
+        first: u64,
+    ) -> Result<Vec<(u64, Record)>, SessionError> {
+        Ok(self.kept_run_tail(run_id, first))
     }
 
     async fn enrollment(

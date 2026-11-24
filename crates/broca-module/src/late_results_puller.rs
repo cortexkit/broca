@@ -500,7 +500,17 @@ impl LateResultsIntake {
     /// The same pass prunes the registrations that are settled for good, so a registration
     /// never outlives the commit of the batch that settled its call.
     pub async fn module_needs_feed(&self, module: &str) -> Result<bool, String> {
-        let holds = self.module_holds_calls(module).await?;
+        self.needs_feed_in(module, &mut HashMap::new()).await
+    }
+
+    /// [`Self::module_needs_feed`], reading each registered session into `views` unless it is
+    /// there already, so the round that goes on to pull classifies from the same reads.
+    async fn needs_feed_in(
+        &self,
+        module: &str,
+        views: &mut HashMap<BindIdentity, LineageView>,
+    ) -> Result<bool, String> {
+        let holds = self.holds_calls_in(module, views).await?;
         Ok(holds || self.store.feed(module)?.is_some_and(|feed| feed.ack_owed))
     }
 
@@ -544,11 +554,9 @@ impl LateResultsIntake {
                     if puller.is_stopped() {
                         break;
                     }
-                    let needed = intake.module_needs_feed(&module).await.unwrap_or(true);
-                    if !needed {
+                    if !intake.round(&module, &puller).await {
                         break;
                     }
-                    intake.tick_with(&module, &puller).await;
                     if puller.is_stopped() {
                         break;
                     }
@@ -568,22 +576,43 @@ impl LateResultsIntake {
         });
     }
 
+    /// One round of the module's running puller: pull and settle its owed pages when its feed
+    /// is still needed, and say whether it was. Each registered session is read once for both:
+    /// a closed session is read as stored, and one too large to keep cached would otherwise load
+    /// whole twice every round.
+    async fn round(&self, module: &str, puller: &Puller) -> bool {
+        let mut views = HashMap::new();
+        if !self.needs_feed_in(module, &mut views).await.unwrap_or(true) {
+            return false;
+        }
+        self.tick_in(module, puller, &mut views).await;
+        true
+    }
+
     /// One pull cycle for a module whose puller runs.
     pub async fn tick(&self, module: &str) -> Result<(), String> {
         let Some(puller) = self.puller(module) else {
             return Ok(());
         };
-        self.tick_with(module, &puller).await;
+        self.tick_in(module, &puller, &mut HashMap::new()).await;
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) async fn tick_for_test(&self, module: &str) -> Result<(), FeedError> {
-        self.pull_round(module, &Puller::new()).await
+        self.pull_round(module, &Puller::new(), &mut HashMap::new())
+            .await
     }
 
-    async fn tick_with(&self, module: &str, puller: &Puller) {
-        match self.pull_round(module, puller).await {
+    /// One round of the module's puller: the next owed pages pulled and settled, each session
+    /// read into `views` unless the round already read it.
+    async fn tick_in(
+        &self,
+        module: &str,
+        puller: &Puller,
+        views: &mut HashMap<BindIdentity, LineageView>,
+    ) {
+        match self.pull_round(module, puller, views).await {
             Ok(()) => puller.reset_interval(),
             Err(FeedError::CursorIncarnationChanged) => {
                 // The provider changed incarnation. Its `event_id`s are deterministic across
@@ -592,6 +621,7 @@ impl LateResultsIntake {
                 puller.set_pinned(Vec::new());
                 puller.reset_interval();
             }
+            // Read afresh: a delivery this round may have settled a call since the round read it.
             Err(FeedError::Abandoned(reason)) => match self.module_holds_calls(module).await {
                 Ok(true) => {
                     // A module with an open held call or owed barrier keeps its backoff: its
@@ -626,8 +656,17 @@ impl LateResultsIntake {
     /// Whether the module still has a held call or an owed barrier: the condition that outranks
     /// an abandoned ack. Prunes every registration whose call is settled for good on the way.
     pub async fn module_holds_calls(&self, module: &str) -> Result<bool, String> {
+        self.holds_calls_in(module, &mut HashMap::new()).await
+    }
+
+    /// [`Self::module_holds_calls`], reading each registered session into `views` unless it is
+    /// there already.
+    async fn holds_calls_in(
+        &self,
+        module: &str,
+        views: &mut HashMap<BindIdentity, LineageView>,
+    ) -> Result<bool, String> {
         let mut holds = false;
-        let mut views = HashMap::new();
         // Calls retired here, their withdrawal watches with them where none can be owed, as in
         // the registration sweep.
         let mut settled = Vec::new();
@@ -676,8 +715,12 @@ impl LateResultsIntake {
     /// pass pins the ack where it is and never keeps a newly published entry from being
     /// delivered: the pinned entries are read from the start of the incarnation, and pages after
     /// that reply from its cursor, so no page is read twice.
-    async fn pull_round(&self, module: &str, puller: &Puller) -> Result<(), FeedError> {
-        let mut views = HashMap::new();
+    async fn pull_round(
+        &self,
+        module: &str,
+        puller: &Puller,
+        views: &mut HashMap<BindIdentity, LineageView>,
+    ) -> Result<(), FeedError> {
         let mut read_from = self
             .store
             .feed(module)
@@ -693,7 +736,7 @@ impl LateResultsIntake {
             });
             // While anything in the pinned reply is unsettled it is never acked: any ack
             // covering it would pass the pin.
-            let (settled, still) = self.settle(module, &reply.entries, &mut views).await?;
+            let (settled, still) = self.settle(module, &reply.entries, views).await?;
             if still.is_empty() {
                 // Every entry of the reply settled, so nothing pins the ack any more. The reply
                 // was read from the acked position, so its cursor covers only settled entries.
@@ -733,7 +776,7 @@ impl LateResultsIntake {
             let pinned_before_page = !puller.pinned().is_empty();
             // An entry delivered on a page is durable before anything can ack that page: a
             // delivery that could not be made pins the ack here instead.
-            let (settled, still) = self.settle(module, &reply.entries, &mut views).await?;
+            let (settled, still) = self.settle(module, &reply.entries, views).await?;
             if !still.is_empty() {
                 puller.set_pinned(still);
             }
@@ -753,7 +796,7 @@ impl LateResultsIntake {
                 // not one of these, so the ack cannot pass it.
                 let prefix: Vec<LateEntry> = reply.entries[..settled].to_vec();
                 let _ = self
-                    .ack_prefix(module, from.as_ref(), &prefix, &mut views)
+                    .ack_prefix(module, from.as_ref(), &prefix, views)
                     .await?;
             }
             if !reply.more {
@@ -1133,13 +1176,13 @@ impl LateResultsIntake {
         if !feed_row.ack_owed {
             return Ok(());
         }
-        match self.pull_round(module, &puller).await {
+        match self.pull_round(module, &puller, &mut HashMap::new()).await {
             Ok(()) => Ok(()),
             Err(FeedError::CursorIncarnationChanged) => {
                 self.store
                     .forget_cursor(module)
                     .map_err(FeedError::Retryable)?;
-                self.pull_round(module, &puller).await
+                self.pull_round(module, &puller, &mut HashMap::new()).await
             }
             Err(error) => Err(error),
         }

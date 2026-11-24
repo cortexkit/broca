@@ -1172,21 +1172,30 @@ fn read_head_at(path: &Path) -> Result<Option<(Vec<u8>, Version)>, BackendError>
 /// Makes a folder's entries durable. Windows has no folder sync; durability of renames there is
 /// unproven and is tested before the Windows backend is relied on.
 pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    // The parent of a single-component relative path is the current directory.
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    #[cfg(all(test, unix))]
+    tests::observe_dir_sync(path);
     crate::durable::sync_dir(path)
 }
 
 /// `create_dir_all` that also makes each folder it creates durable in its parent. A new
 /// session's `heads/<addr>`, `logs/<addr>` and object folders are entries in folders that
 /// already existed; syncing the new folder itself doesn't keep its entry through a power loss.
-fn create_dir_durably(dir: &Path) -> io::Result<()> {
+/// Returns whether it synced parents for directories that were missing.
+fn create_dir_durably(dir: &Path) -> io::Result<bool> {
     let mut created = Vec::new();
     let mut at = Some(dir);
-    while let Some(path) = at.filter(|path| !path.exists()) {
+    while let Some(path) = at.filter(|path| !path.as_os_str().is_empty() && !path.exists()) {
         created.push(path);
         at = path.parent();
     }
     if created.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     broca_owner_only::create_dir_all(dir)?;
     for path in created {
@@ -1194,7 +1203,7 @@ fn create_dir_durably(dir: &Path) -> io::Result<()> {
             sync_dir(parent)?;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Writes a head file, its version then its bytes, as `name` in `dir`: to the temporary file
@@ -1525,11 +1534,23 @@ impl SessionBackend for LocalBackend {
         at: Version,
     ) -> Result<(), BackendError> {
         self.fence(s, at)?;
-        match std::fs::remove_file(self.object_path(s, name)?) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        let path = self.object_path(s, name)?;
+        let dir = path
+            .parent()
+            .expect("an object lives in its change's folder");
+        match std::fs::remove_file(&path) {
+            Ok(()) => sync_dir(dir)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A previous collection may have stopped after unlinking, before the barrier.
+                match sync_dir(dir) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
+        Ok(())
     }
 
     async fn delete_change(
@@ -1568,13 +1589,18 @@ impl SessionBackend for LocalBackend {
 
     async fn put_setup(&self, name: &str, bytes: &[u8]) -> Result<(), BackendError> {
         let path = self.setup_path(name)?;
-        if path.exists() {
-            return Ok(());
-        }
         let dir = path
             .parent()
             .expect("a setup part lives in the setup folder");
-        broca_owner_only::create_dir_all(dir)?;
+        if !create_dir_durably(dir)? {
+            // Another writer may have created the folder without syncing its entry yet.
+            sync_dir(&self.root)?;
+        }
+        if path.exists() {
+            // Another writer may have renamed the part but not yet synced its name.
+            sync_dir(dir)?;
+            return Ok(());
+        }
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())

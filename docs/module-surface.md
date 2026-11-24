@@ -2355,7 +2355,12 @@ session with a registration is opened so its open-time recovery runs, then each
 module that still needs its feed gets its puller. A missing or unreadable `late-results.db` is
 rebuilt off the startup path by reading the operational state and active run records of every
 session in the session store's inventory across all backup classes, including intent-only calls whose registration may precede
-their held reply. The rebuild
+their held reply. It also reads the runs started within the last seven days, finished or not,
+for what they still owe a provider: a call handed back for the person's steer whose notice
+isn't in the session yet, and a held call its provider never answered, whose withdrawal may
+still be owed and is sent again by withdrawal recovery. Such an obligation of an older run is
+lost with the database: its late entry is acked without delivery, and its withdrawal is not
+sent again. The rebuild
 retains each episode's original scope. Until that scan completes no entry is delivered or
 acked. Only roots with no registration history may skip a rebuild scan. An existing unheld
 database starts no scan, reads no session and gains no writes; boot adds only a read-only probe
@@ -2402,17 +2407,30 @@ planned daemon shutdown preserves the hold. A finished session that retention
 deletes while its ack is still owed keeps its feed row, and entries for its lineage are then
 no-ops.
 
-For a retention session, held calls last only as long as the session. Deletion removes the
-lineage's registrations and receipts, and late entries for that lineage are acked as no-ops.
-The shared module feed row, cursor and owed ack survive so other sessions can still receive
-their results. Deletion sends no `tool.withdraw`.
+For a retention session, held calls last only as long as the session. Before retention or an
+operator deletes a session, broca sends `tool.withdraw` for every call a provider still holds
+in it: a held call with no completed terminal, one its run cancelled included. Nobody can
+collect a result once the session is gone, so the provider is asked to stop work that would
+only be thrown away. Each withdrawal carries the identity read from the session's plan while
+its ledger still says whose call it is. A call already withdrawn, or never registered for
+withdrawal, is not asked again. Deletion doesn't wait for the answers. A withdrawal the
+provider asks to repeat is retried after the deletion with that same identity, and an attempted
+withdrawal of a deleted session that can't be repeated any more counts in
+`provider_held.withdrawals.scope_gone`, not `failed`.
 
-Retention blocks deletion while a decoded held record
-or an intake registration remains. A missing intake
-store also prevents deletion after any registration history or rebuild marker; an unreadable store prevents deletion and counts in retention's unreadable-session
-health total. Before the first registration, `late-results-registered` is synced at the state
-root so losing the rebuildable database cannot erase that history. None of these guards changes
-ordinary expiry on roots that have never enabled held intake.
+Deletion leaves the session's registrations and receipts in place. The intake retires a
+registration as `session_deleted` the next time it reads it and finds no session at its triple,
+or finds a session recreated there whose call keys name another lineage. Late entries for the
+deleted calls are then acked as no-ops, and their receipts go with the acks that cover them, as
+for any other entry. The shared module feed row, cursor and owed ack survive so other sessions
+can still receive their results.
+
+The intake store doesn't hold deletion back: an intake registration, a missing or unreadable
+`late-results.db` and the rebuild fence below all leave it to proceed. What keeps a session
+with a held call is the session's own state. An operator's deletion refuses a session whose run
+is active or paused, a run paused on a held call included, and a frozen retention policy isn't
+due while a run is active or paused. Before the first registration, `late-results-registered`
+is synced at the state root so losing the rebuildable database cannot erase that history.
 Recreating a missing projection with held history leaves `late-results-rebuild-required` set.
 That fence also resumes a rebuild when a partial database exists after restart. It is removed
 and its directory synced only after the scan over the session store's inventory has succeeded

@@ -2384,10 +2384,7 @@ impl broca_module_serve::system_one::ClassifierProvider for TransientThenAnswer 
     }
     async fn call(&self, _: String) -> broca_module_serve::system_one::ProviderReply {
         if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            broca_module_serve::system_one::ProviderReply::Status {
-                status: 500,
-                retry_after_ms: None,
-            }
+            broca_module_serve::system_one::ProviderReply::Unconnected("not sent".into())
         } else {
             broca_module_serve::system_one::ProviderReply::Answered(br#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.5}},"usage":{"input_tokens":100}}"#.to_vec())
         }

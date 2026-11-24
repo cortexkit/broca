@@ -3232,10 +3232,19 @@ impl LineageRegistry {
             .map_or(0, |service| service.clock.now_ms());
         let actor_open = self.open_handle(key).is_some();
         let (expired_at_ms, view) = runtime
-            .expiry_with_view(key, run, now_ms, actor_open)
+            .expiry_with_view(
+                key,
+                run,
+                now_ms,
+                actor_open,
+                self.inner.retention.get().map(|service| service.as_ref()),
+            )
             .await?;
         if let Some(expired_at_ms) = expired_at_ms {
-            return Err(OpenError::Expired { expired_at_ms });
+            return Err(crate::store_open::StoreRuntime::expired_refusal(
+                expired_at_ms,
+                view.as_deref(),
+            ));
         }
         Ok(view)
     }
