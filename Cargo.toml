@@ -83,7 +83,7 @@ cortexkit-lease = "=0.1.2"
 cortexkit-log = "=0.3.5"
 cortexkit-role-harness = "=0.1.0"
 cortexkit-role-tool-provider = "=0.15.17"
-cortexkit-llm-tools = "=0.3.0"
+cortexkit-llm-tools = "=0.3.2"
 cortexkit-role-tool-provider-conformance = "=0.15.18"
 cortexkit-role-llm-runner = "=0.9.5"
 # Recorded v1 requests must keep the exact tag-rendering bytes of their original contract.

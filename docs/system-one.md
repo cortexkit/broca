@@ -163,8 +163,23 @@ The daemon refuses roots marked `broca-state/2`; the removed staging format has 
 System One service. Live snapshots and claims on supported roots refuse expired
 routed rows, so cleanup timing never exposes content past retention.
 
-`llm.classify/v1` results include the model used, as required by llm-tools 0.3.0.
+`llm.classify/v1` results include the model used, as required by llm-tools 0.3.2.
 That tool still requires a pin to identify the provider before checking consent
 to send content or spend money. Routing an unpinned tool call would need to bind
 that consent to the selected provider; the classifier routing switch does not
 enable such tool admission.
+
+## `llm.complete/v1`
+
+The same tool route also serves `llm_complete` (`llm.complete/v1`): one text or JSON
+completion for a program or a flow. The caller names no model: it states a demand, two
+scores from 0 to 100 (`iq`, and optionally `eq`) that routing policy reads, and routing
+picks the model. Routing is asked under the consumer `broca.complete.<caller>.<run|flow>`,
+where the caller is the module the daemon stamped on the route and the scope kind comes
+from its scope stamp, never from the arguments. When routing can place the call on a
+subscription account it does; otherwise the call runs on a per-token account. `cost_usd`
+is the per-token price of the call's usage either way (on a subscription, what the call
+would have cost per token), and `max_cost_usd` caps it before anything is sent. Unlike a classify batch, a completion runs as one run with no tools in a
+session of its own (`llm-complete:<call_key>:<attempt>`), kept 7 days. Its admission and
+answer are recorded in the System One store under the role `llm.complete`, so a repeat of
+the same `call_key` within 7 days answers the recorded result and is never billed twice.

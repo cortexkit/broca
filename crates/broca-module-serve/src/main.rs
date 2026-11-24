@@ -906,10 +906,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             llm_tools_asks,
         );
         match complete_routing {
-            Some(routing) if broca_module_serve::llm_tools::complete::SERVED => {
+            Some(routing) => {
                 tools.with_complete(Arc::new(system_one.complete(routing, registry.clone())))
             }
-            _ => tools,
+            None => tools,
         }
     };
     let llm_tools = Arc::new(llm_tools.with_held(held_calls.clone()).with_consent(

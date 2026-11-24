@@ -52,12 +52,6 @@ use crate::account_routing::RoutingCallError;
 /// identifier; the contract's tag goes in `capabilities`.
 pub const COMPLETE_TOOL_NAME: &str = "llm_complete";
 
-/// Whether broca lists and answers the tool. Off until broca pins the llm-tools release whose
-/// contract lets completion run on subscription accounts and names its routing consumer
-/// `<serving module>.complete.<caller>.<scope kind>`, as this module does; the release pinned
-/// now says per-token accounts only.
-pub const SERVED: bool = false;
-
 /// The System One store role completions are recorded under, apart from classify's batches.
 pub const STORE_ROLE: &str = "llm.complete";
 

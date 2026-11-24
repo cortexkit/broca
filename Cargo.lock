@@ -1114,9 +1114,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-llm-tools"
-version = "0.3.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c7af89cec4110babc886b34747a0de7f006cb2ffee62bfc2e9cafdf46db1cd9"
+checksum = "9e2170466d5c0df821489ec87e8764541902cdd81616e8199e110675d86e0ced"
 dependencies = [
  "cortexkit-model-batch",
  "cortexkit-role-classifier",
