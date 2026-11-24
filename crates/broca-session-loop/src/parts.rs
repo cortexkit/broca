@@ -340,7 +340,13 @@ impl StoredParts for MapSource {
 /// text), so those stay held; a part only an old session names is read from the store when that
 /// session runs again. The store holds every part ever stored, converted sessions' included:
 /// 177,000 parts and 385 MB at one count, all of which this process once held at once.
-pub const HELD_PART_BYTES: usize = 32 * 1024 * 1024;
+///
+/// 8 MiB for each setup store: one per storage class (ordinary, durable, ephemeral) and cipher
+/// mode (encrypted, plain), each with its own [`DeploymentParts`]. Most parts are read once: in the 25 minutes
+/// after one restart, 9,491 reads of the durable store held 31 MB of 8,352 parts, and only 28
+/// reads were of a part the bound had dropped. The parts a running session names again stay
+/// within a few megabytes.
+pub const HELD_PART_BYTES: usize = 8 * 1024 * 1024;
 
 /// The deployment's setup parts, shared by every session in the process. A part put here is held
 /// in memory and listed by [`Parts::unstored`] until a writer stores it: the list is the
