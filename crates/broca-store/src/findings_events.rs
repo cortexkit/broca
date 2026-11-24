@@ -105,7 +105,7 @@ impl SqliteStore {
             return Ok(None);
         };
         let subject = subject(&account)?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = crate::lock_connection(&self.conn)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let last: Option<(u64, String)> = tx
             .query_row(
@@ -143,10 +143,7 @@ impl SqliteStore {
         &self,
         event_key: &str,
     ) -> Result<Option<StoredFindingsEvent>, StoreError> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
+        Ok(crate::lock_connection(&self.conn)?
             .query_row(
                 "SELECT body,at_ms FROM findings_event_outbox WHERE event_key=?1",
                 [event_key],

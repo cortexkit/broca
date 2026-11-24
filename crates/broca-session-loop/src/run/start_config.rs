@@ -234,6 +234,18 @@ pub(super) fn tool_set_of_start(
     )))
 }
 
+/// The cache marker order `start` froze, which its record keeps beside its config; `None` for a
+/// run that froze none.
+pub fn frozen_marker_order(start: &RunStart) -> Option<u32> {
+    start
+        .run_choices
+        .as_ref()
+        .and_then(|choices| choices.get("record"))
+        .and_then(|record| record.get("marker_order_version"))
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

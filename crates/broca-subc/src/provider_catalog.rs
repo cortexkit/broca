@@ -43,12 +43,19 @@ pub fn live_module_id(catalog: &[CatalogEntry], module_id: &str) -> String {
 /// another real-harness attempt after a provider upgrade, without polling the daemon.
 #[derive(Debug)]
 pub(crate) struct ProviderCatalog {
-    entries: Vec<CatalogEntry>,
+    entries: Arc<Vec<CatalogEntry>>,
     pub(crate) aft_harness: Arc<AftHarness>,
 }
 
 impl From<Vec<CatalogEntry>> for ProviderCatalog {
     fn from(entries: Vec<CatalogEntry>) -> Self {
+        Arc::new(entries).into()
+    }
+}
+
+/// Shares a connection's catalog reply instead of copying it.
+impl From<Arc<Vec<CatalogEntry>>> for ProviderCatalog {
+    fn from(entries: Arc<Vec<CatalogEntry>>) -> Self {
         let accepts_broca = entries.iter().any(|entry| {
             entry.module_id == "aft" && catalog_entry_provides(entry, AFT_BACKGROUND_TASKS)
         });

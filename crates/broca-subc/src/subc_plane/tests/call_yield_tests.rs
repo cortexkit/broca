@@ -19,13 +19,13 @@ impl ToolPlaneConnection for Wire {
     fn took_person_yield(&self, call_key: &str) -> bool {
         self.conn.took_person_yield(call_key)
     }
-    async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
+    async fn catalog_list(&self) -> Result<Arc<Vec<CatalogEntry>>, ConnError> {
         if self.catalog.lock().unwrap().is_some() {
-            Ok(crate::subc_plane::tests::run_transport_tests::inventory(
-                "aft",
+            Ok(Arc::new(
+                crate::subc_plane::tests::run_transport_tests::inventory("aft"),
             ))
         } else {
-            Ok(Vec::new())
+            Ok(Arc::new(Vec::new()))
         }
     }
     async fn route_open(

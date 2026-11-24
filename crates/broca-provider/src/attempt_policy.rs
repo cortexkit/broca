@@ -102,6 +102,7 @@ impl AttemptState {
 pub(crate) enum EndReason {
     Authentication,
     AccountChanged,
+    CredentialHostNotAllowed,
     UnchangedCredential,
     RetryVeto,
     AttemptLimit,
@@ -332,12 +333,15 @@ pub(crate) fn note_waited(state: &mut AttemptState, slept: Duration) {
 pub(crate) enum RejectedRefreshResult {
     NoCredential,
     AccountChanged,
+    /// The refreshed credential's record doesn't list the request's host.
+    HostNotAllowed,
     UnchangedCredential,
     Refreshed,
 }
 
-/// AccountChanged asks the driver to substitute its redacted account-change error, not to
-/// return the rejected-token error. Account comparison must precede token equality.
+/// AccountChanged and HostNotAllowed ask the driver to substitute the refusal it built for the
+/// refreshed credential, not to return the rejected-token error. Account comparison must precede
+/// token equality.
 pub(crate) fn decide_rejected_refresh(
     state: &mut AttemptState,
     facts: &AttemptFacts<'_>,
@@ -346,6 +350,7 @@ pub(crate) fn decide_rejected_refresh(
     match result {
         RejectedRefreshResult::NoCredential => state.end(EndReason::Authentication),
         RejectedRefreshResult::AccountChanged => state.end(EndReason::AccountChanged),
+        RejectedRefreshResult::HostNotAllowed => state.end(EndReason::CredentialHostNotAllowed),
         RejectedRefreshResult::UnchangedCredential => state.end(EndReason::UnchangedCredential),
         RejectedRefreshResult::Refreshed => {
             state.refreshes += 1;

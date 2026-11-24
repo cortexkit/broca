@@ -13,7 +13,7 @@
 //! `ready` members may be old. Nothing broca reads from the catalog depends on them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use subc_control::{
@@ -21,13 +21,32 @@ use subc_control::{
     ClientControlResponse,
 };
 use subc_protocol::{ErrorBody, Flags, Frame, FrameType, Priority, FLAG_SUBSCRIPTION};
+use tokio::sync::mpsc;
 
-use super::{control_flags, ConnError, ConnResult, ConnToken, SubcConnection};
+use super::{control_flags, ConnError, ConnResult, ConnToken, PendingRegistration, SubcConnection};
 
 /// The first wait before watching again after a watch ended or could not start.
 const WATCH_RETRY_FIRST: Duration = Duration::from_millis(500);
 /// The longest wait between attempts, reached when the daemon keeps refusing the watch.
 const WATCH_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// The catalog a following connection serves now: the socket its watch is open on and the
+/// generation the daemon last pushed there. Two equal values name the same catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogGeneration {
+    conn: ConnToken,
+    generation: u64,
+}
+
+impl CatalogGeneration {
+    #[cfg(test)]
+    pub(crate) fn for_test(generation: u64) -> Self {
+        Self {
+            conn: ConnToken(0),
+            generation,
+        }
+    }
+}
 
 /// The last `catalog.list` reply and the generation the daemon last pushed.
 #[derive(Default)]
@@ -82,23 +101,27 @@ impl CatalogMemo {
 
 impl SubcConnection {
     /// `catalog.list`: registered providers and their tools. On a connection that follows the
-    /// catalog, the last reply while its generation is still current; otherwise read now.
-    pub async fn catalog_list(&self) -> ConnResult<Vec<CatalogEntry>> {
+    /// catalog, the last reply while its generation is still current, shared rather than
+    /// copied; otherwise read now.
+    pub async fn catalog_list(&self) -> ConnResult<Arc<Vec<CatalogEntry>>> {
         let memo = &self.shared.catalog;
         if !memo.following.load(Ordering::Acquire) {
-            return self.read_catalog().await.map(|(_, _, entries)| entries);
+            return self
+                .read_catalog()
+                .await
+                .map(|(_, _, entries)| Arc::new(entries));
         }
         if let Some(entries) = memo.current(self.current_conn()) {
-            return Ok(entries.to_vec());
+            return Ok(entries);
         }
         let _read = memo.read.lock().await;
         if let Some(entries) = memo.current(self.current_conn()) {
-            return Ok(entries.to_vec());
+            return Ok(entries);
         }
         let (read_on, generation, entries) = self.read_catalog().await?;
         let entries = Arc::new(entries);
         memo.hold(read_on, generation, Arc::clone(&entries));
-        Ok(entries.to_vec())
+        Ok(entries)
     }
 
     /// Follow the daemon's catalog generation for as long as this connection lives, so
@@ -113,11 +136,10 @@ impl SubcConnection {
         let connection = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut retry = WATCH_RETRY_FIRST;
-            loop {
-                let Some(connection) = connection.upgrade() else {
-                    return;
-                };
-                match connection.watch_catalog().await {
+            // The watch holds the connection only while it opens and while it records a push,
+            // so the connection still closes when its last owner drops it, which ends the watch.
+            while let Some(ended) = Self::watch_catalog(&connection).await {
+                match ended {
                     // A watch that delivered pushes was working: the next one starts soon.
                     Ok(true) => retry = WATCH_RETRY_FIRST,
                     Ok(false) => {}
@@ -125,7 +147,6 @@ impl SubcConnection {
                         tracing::debug!(target: "subc.catalog", %error, "catalog watch ended")
                     }
                 }
-                drop(connection);
                 tokio::time::sleep(retry).await;
                 retry = (retry * 2).min(WATCH_RETRY_MAX);
             }
@@ -133,28 +154,25 @@ impl SubcConnection {
     }
 
     /// One `catalog.watch` on the current socket, recording each pushed generation until the
-    /// feed ends. True when the feed delivered at least one push.
-    async fn watch_catalog(&self) -> ConnResult<bool> {
-        let body = serde_json::to_vec(&CatalogWatchRequest::new())
-            .map_err(|e| ConnError::Transport(e.to_string()))?;
-        let corr = self.next_corr();
-        let (runtime, _registration, mut rx) = self.register_subscription((0, 0, corr))?;
-        let on = runtime.conn;
-        let flags = Flags(Flags::new(false, Priority::Passive, false).0 | FLAG_SUBSCRIPTION);
-        let frame = Frame::build(FrameType::Request, flags, 0, 0, corr, body)
-            .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send(&runtime, frame).await?;
+    /// feed ends. True when the feed delivered at least one push; `None` once the connection is
+    /// gone.
+    async fn watch_catalog(connection: &Weak<Self>) -> Option<ConnResult<bool>> {
+        let (on, _registration, mut rx) = match connection.upgrade()?.open_catalog_watch().await {
+            Ok(opened) => opened,
+            Err(error) => return Some(Err(error)),
+        };
         let mut delivered = false;
         let ended = loop {
             // The registration is dropped with the socket, which ends this read with `None`.
             let Some(frame) = rx.recv().await else {
                 break Ok(delivered);
             };
+            let owner = connection.upgrade()?;
             match frame.header.ty {
                 FrameType::Response => {
                     match serde_json::from_slice::<CatalogWatchResponse>(&frame.body) {
                         Ok(push) => {
-                            self.shared.catalog.pushed(on, push.generation);
+                            owner.shared.catalog.pushed(on, push.generation);
                             delivered = true;
                         }
                         Err(error) => {
@@ -178,8 +196,28 @@ impl SubcConnection {
                 _ => break Ok(delivered),
             }
         };
-        self.shared.catalog.watch_ended(on);
-        ended
+        connection.upgrade()?.shared.catalog.watch_ended(on);
+        Some(ended)
+    }
+
+    /// Send `catalog.watch` on the current socket: the socket, and the registration and
+    /// receiver its pushes arrive on.
+    async fn open_catalog_watch(
+        &self,
+    ) -> ConnResult<(
+        ConnToken,
+        PendingRegistration,
+        mpsc::UnboundedReceiver<Frame>,
+    )> {
+        let body = serde_json::to_vec(&CatalogWatchRequest::new())
+            .map_err(|e| ConnError::Transport(e.to_string()))?;
+        let corr = self.next_corr();
+        let (runtime, registration, rx) = self.register_subscription((0, 0, corr))?;
+        let flags = Flags(Flags::new(false, Priority::Passive, false).0 | FLAG_SUBSCRIPTION);
+        let frame = Frame::build(FrameType::Request, flags, 0, 0, corr, body)
+            .map_err(|e| ConnError::Transport(e.to_string()))?;
+        self.send(&runtime, frame).await?;
+        Ok((runtime.conn, registration, rx))
     }
 
     /// Read `catalog.list` now, with the socket that answered and the reply's generation.
@@ -187,12 +225,17 @@ impl SubcConnection {
         let body = serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None })
             .map_err(|e| ConnError::Transport(e.to_string()))?;
         let corr = self.next_corr();
-        let (runtime, _registration, mut rx) = self.register_control((0, 0, corr), false)?;
+        let (runtime, registration, mut rx) = self.register_control((0, 0, corr), false)?;
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body)
             .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send(&runtime, frame).await?;
         let frame = self
-            .await_terminal_deadline(&runtime, &mut rx, super::RESPONSE_TIMEOUT)
+            .control_exchange(
+                &runtime,
+                registration,
+                &mut rx,
+                frame,
+                super::RESPONSE_TIMEOUT,
+            )
             .await?;
         match serde_json::from_slice::<ClientControlResponse>(&frame.body) {
             Ok(ClientControlResponse::CatalogList {
@@ -210,6 +253,21 @@ impl SubcConnection {
     /// The socket new requests go to now.
     fn current_conn(&self) -> ConnToken {
         self.shared.current.lock().unwrap().runtime.conn
+    }
+
+    /// The catalog this connection serves now: the generation its watch on the current socket
+    /// last reported. `None` when it can't tell (it doesn't follow the catalog, or no watch on
+    /// the current socket has reported yet).
+    pub(crate) fn catalog_generation(&self) -> Option<CatalogGeneration> {
+        let memo = &self.shared.catalog;
+        if !memo.following.load(Ordering::Acquire) {
+            return None;
+        }
+        let current = self.current_conn();
+        let pushed = memo.state.lock().unwrap().pushed;
+        pushed
+            .filter(|(on, _)| *on == current)
+            .map(|(conn, generation)| CatalogGeneration { conn, generation })
     }
 }
 

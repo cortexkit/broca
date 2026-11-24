@@ -113,7 +113,7 @@ pub struct SendParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_policy: Option<serde_json::Value>,
     /// The user prompt for this turn. Omit it when `prompt_blocks` supplies the prompt.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
     /// Caller-declared text blocks for one user message, in render order.
     ///
@@ -2635,8 +2635,7 @@ pub enum QueuedSendState {
 #[allow(clippy::large_enum_variant)]
 pub enum SubscribeEvent {
     Control {
-        wal_seq: u64,
-        sub_index: u32,
+        cursor: CursorWire,
         unit: broca_protocol::caller::ControlUnit,
     },
     Display(DisplayEvent),
@@ -2646,15 +2645,13 @@ pub enum SubscribeEvent {
     /// cannot say why. It is neither a failed run nor a re-authentication pause, and a caller
     /// must not report it as either.
     UnrecognizedRunState {
-        wal_seq: u64,
-        sub_index: u32,
+        cursor: CursorWire,
         state: UnrecognizedRunState,
     },
     /// A newer control-unit name, retained with its cursor and payload rather than
     /// confused with a known display reset or rejected as a broken stream.
     UnknownControlUnit {
-        wal_seq: u64,
-        sub_index: u32,
+        cursor: CursorWire,
         unit_type: String,
         unit: serde_json::Value,
     },
@@ -2726,7 +2723,7 @@ impl<'a> From<&'a UnrecognizedRunState> for UnrecognizedRunStateRef<'a> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UnrecognizedSubscribeEventRef<'a> {
     Control {
-        cursor: CursorWire,
+        cursor: &'a CursorWire,
         unit: UnrecognizedRunStateRef<'a>,
     },
 }
@@ -2805,7 +2802,7 @@ fn serialize_control_unit<S: serde::Serializer>(
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SubscribeEventRef<'a> {
     Control {
-        cursor: CursorWire,
+        cursor: &'a CursorWire,
         #[serde(serialize_with = "serialize_control_unit")]
         unit: &'a broca_protocol::caller::ControlUnit,
     },
@@ -2836,7 +2833,7 @@ enum LiveSubscribeEventRef<'a> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UnknownControlEventRef<'a> {
     Control {
-        cursor: CursorWire,
+        cursor: &'a CursorWire,
         unit: &'a serde_json::Value,
     },
 }
@@ -2860,10 +2857,7 @@ pub fn encode_live_subscribe_control_with_cursor(
     event: Option<&cortexkit_role_llm_runner::live::LiveEvent>,
 ) -> serde_json::Result<Vec<u8>> {
     if let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit {
-        let mut status =
-            status_subscribe_event(cursor.wal_seq, cursor.sub_index, run_id, status, Some(seq));
-        status.cursor = Some(serde_json::from_value(serde_json::to_value(cursor)?)?);
-        return serde_json::to_vec(&status);
+        return serde_json::to_vec(&status_subscribe_event(&cursor, run_id, status, Some(seq)));
     }
     serde_json::to_vec(&LiveSubscribeEventRef::Control {
         cursor,
@@ -2875,8 +2869,7 @@ pub fn encode_live_subscribe_control_with_cursor(
 
 /// Status changes use the shared envelope's held-call field, not a run-paused lifecycle.
 fn status_subscribe_event(
-    wal_seq: u64,
-    sub_index: u32,
+    cursor: &CursorWire,
     run_id: &broca_protocol::RunId,
     status: &cortexkit_role_llm_runner::run::RunStatus,
     seq: Option<u64>,
@@ -2899,8 +2892,8 @@ fn status_subscribe_event(
     cortexkit_role_llm_runner::subscribe::SubscribeEvent {
         kind: "control".into(),
         cursor: Some(
-            serde_json::from_value(serde_json::json!({"wal_seq":wal_seq, "sub_index":sub_index}))
-                .expect("cursor is an object"),
+            serde_json::from_value(serde_json::to_value(cursor).expect("cursor serializes"))
+                .expect("the shared envelope accepts a wire cursor"),
         ),
         body,
     }
@@ -2934,6 +2927,12 @@ mod held_status_event_tests {
                 Some(&LiveEvent::DisplayReset),
             )
             .unwrap();
+            let decoded = decode_subscribe_event(&after).unwrap();
+            let round_trip = serde_json::to_value(decoded).unwrap();
+            assert_eq!(
+                round_trip["cursor"],
+                serde_json::from_slice::<serde_json::Value>(&after).unwrap()["cursor"]
+            );
             let mut stripped = String::from_utf8(after).unwrap();
             for field in [
                 "\"incarnation\":\"lineage\"",
@@ -2982,8 +2981,7 @@ mod held_status_event_tests {
             assert_eq!(
                 decoded,
                 SubscribeEvent::Control {
-                    wal_seq: 7,
-                    sub_index: 0,
+                    cursor: CursorWire::new(7, 0),
                     unit
                 }
             );
@@ -3018,13 +3016,12 @@ pub fn encode_subscribe_control(
     sub_index: u32,
     unit: &broca_protocol::caller::ControlUnit,
 ) -> serde_json::Result<Vec<u8>> {
+    let cursor = CursorWire::new(wal_seq, sub_index);
     if let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit {
-        return serde_json::to_vec(&status_subscribe_event(
-            wal_seq, sub_index, run_id, status, None,
-        ));
+        return serde_json::to_vec(&status_subscribe_event(&cursor, run_id, status, None));
     }
     serde_json::to_vec(&SubscribeEventRef::Control {
-        cursor: CursorWire::new(wal_seq, sub_index),
+        cursor: &cursor,
         unit,
     })
 }
@@ -3072,45 +3069,23 @@ impl Serialize for SubscribeEvent {
     {
         match self {
             Self::Control {
-                wal_seq,
-                sub_index,
-                unit,
-            } if matches!(unit, broca_protocol::caller::ControlUnit::Status { .. }) => {
-                let broca_protocol::caller::ControlUnit::Status { run_id, status } = unit else {
-                    unreachable!()
-                };
-                status_subscribe_event(*wal_seq, *sub_index, run_id, status, None)
-                    .serialize(serializer)
+                cursor,
+                unit: broca_protocol::caller::ControlUnit::Status { run_id, status },
+            } => status_subscribe_event(cursor, run_id, status, None).serialize(serializer),
+            Self::Control { cursor, unit } => {
+                SubscribeEventRef::Control { cursor, unit }.serialize(serializer)
             }
-            Self::Control {
-                wal_seq,
-                sub_index,
-                unit,
-            } => SubscribeEventRef::Control {
-                cursor: CursorWire::new(*wal_seq, *sub_index),
-                unit,
-            }
-            .serialize(serializer),
             Self::Display(event) => SubscribeEventRef::Display { event }.serialize(serializer),
-            Self::UnrecognizedRunState {
-                wal_seq,
-                sub_index,
-                state,
-            } => UnrecognizedSubscribeEventRef::Control {
-                cursor: CursorWire::new(*wal_seq, *sub_index),
-                unit: state.into(),
+            Self::UnrecognizedRunState { cursor, state } => {
+                UnrecognizedSubscribeEventRef::Control {
+                    cursor,
+                    unit: state.into(),
+                }
+                .serialize(serializer)
             }
-            .serialize(serializer),
-            Self::UnknownControlUnit {
-                wal_seq,
-                sub_index,
-                unit,
-                ..
-            } => UnknownControlEventRef::Control {
-                cursor: CursorWire::new(*wal_seq, *sub_index),
-                unit,
+            Self::UnknownControlUnit { cursor, unit, .. } => {
+                UnknownControlEventRef::Control { cursor, unit }.serialize(serializer)
             }
-            .serialize(serializer),
         }
     }
 }
@@ -3165,25 +3140,19 @@ impl<'de> Deserialize<'de> for SubscribeEvent {
                                 .map(str::to_owned);
                         if let Some(unit_type) = unknown_type {
                             Ok(Self::UnknownControlUnit {
-                                wal_seq: cursor.wal_seq,
-                                sub_index: cursor.sub_index,
+                                cursor,
                                 unit_type,
                                 unit,
                             })
                         } else {
                             Ok(Self::Control {
-                                wal_seq: cursor.wal_seq,
-                                sub_index: cursor.sub_index,
+                                cursor,
                                 unit: control,
                             })
                         }
                     }
                     Err(error) => match unrecognized_run_state(&unit) {
-                        Some(state) => Ok(Self::UnrecognizedRunState {
-                            wal_seq: cursor.wal_seq,
-                            sub_index: cursor.sub_index,
-                            state,
-                        }),
+                        Some(state) => Ok(Self::UnrecognizedRunState { cursor, state }),
                         None => Err(serde::de::Error::custom(error)),
                     },
                 }
@@ -4950,8 +4919,7 @@ mod tests {
     #[test]
     fn subscribe_events_round_trip_in_the_stream_shape() {
         let control = SubscribeEvent::Control {
-            wal_seq: 8,
-            sub_index: 2,
+            cursor: CursorWire::new(8, 2),
             unit: ControlUnit::RunStarted {
                 run_id: RunId("run-1".into()),
                 submission_id: None,
@@ -5016,8 +4984,7 @@ mod tests {
         assert_eq!(
             decode_subscribe_event(&control).expect("control event decodes"),
             SubscribeEvent::Control {
-                wal_seq: 8,
-                sub_index: 2,
+                cursor: CursorWire::new(8, 2),
                 unit,
             }
         );
@@ -5265,6 +5232,8 @@ mod delivery_order_params {
                 .id,
             "t"
         );
+        let serialized = serde_json::to_value(&listed).unwrap();
+        assert_eq!(serialized.get("prompt"), None, "template-only send");
         let empty = send(serde_json::json!({"delivery": ["steer"], "dedupe_key": ""})).unwrap();
         assert_eq!(empty.delivery_order().unwrap_err().0, "dedupe_key");
     }
@@ -5310,7 +5279,7 @@ mod cache_tests {
         scope_refusal_golden::assert_golden(
             params,
             "send_params.cache_shared_prefix.json",
-            "88b2dd5ec22e75e42ee37fdbe719976e59514700fa2aacb63c6a26eff2581d66",
+            "c713fc170d6ecefbc53f94de2f1963dcc3ffe29c57347075592c24de95b4d851",
         );
     }
 }
@@ -5999,10 +5968,10 @@ mod live_subscribe_tests {
 
     #[test]
     fn unknown_control_units_keep_their_name_cursor_and_payload() {
-        let value = serde_json::json!({"kind":"control","cursor":{"wal_seq":7,"sub_index":9},"unit":{"type":"future_message_boundary","mid":"m8","future":{"kept":true}}});
+        let value = serde_json::json!({"kind":"control","cursor":{"wal_seq":7,"sub_index":9,"incarnation":"lineage","digest":"0123456789abcdef"},"unit":{"type":"future_message_boundary","mid":"m8","future":{"kept":true}}});
         let event = decode_subscribe_event(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(
-            matches!(&event, SubscribeEvent::UnknownControlUnit { wal_seq:7, sub_index:9, unit_type, unit } if unit_type == "future_message_boundary" && unit == &value["unit"])
+            matches!(&event, SubscribeEvent::UnknownControlUnit { cursor, unit_type, unit } if cursor.wal_seq == 7 && cursor.sub_index == 9 && unit_type == "future_message_boundary" && unit == &value["unit"])
         );
         assert_eq!(serde_json::to_value(&event).unwrap(), value);
     }
@@ -6112,8 +6081,7 @@ mod subscribe_caller_text_tests {
             );
             assert_eq!(
                 serde_json::to_vec(&SubscribeEvent::Control {
-                    wal_seq: 11,
-                    sub_index: 2,
+                    cursor: CursorWire::new(11, 2),
                     unit: unit.clone(),
                 })
                 .unwrap(),

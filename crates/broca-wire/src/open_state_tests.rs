@@ -1,7 +1,7 @@
 use super::{
-    decode_subscribe_event, AccountSelectionRefusedDetail, DisplayEvent, FlowPrincipalRefusal,
-    QueuedSendState, RunPaused, RunPausedDetail, RunStatusResponse, SendResult, SubscribeEvent,
-    UnrecognizedRunState,
+    decode_subscribe_event, AccountSelectionRefusedDetail, CursorWire, DisplayEvent,
+    FlowPrincipalRefusal, QueuedSendState, RunPaused, RunPausedDetail, RunStatusResponse,
+    SendResult, SubscribeEvent, UnrecognizedRunState,
 };
 use broca_protocol::{ControlUnit, OpenState, PauseReason, RunFinishReason, RunId};
 
@@ -161,8 +161,7 @@ fn subscribe_units_with_unknown_run_reasons_become_unrecognized_run_states() {
     assert_eq!(
         paused,
         SubscribeEvent::UnrecognizedRunState {
-            wal_seq: 7,
-            sub_index: 1,
+            cursor: CursorWire::new(7, 1),
             state: UnrecognizedRunState::Paused {
                 run_id: RunId("run-1".into()),
                 reason: "future_pause".into(),
@@ -170,7 +169,7 @@ fn subscribe_units_with_unknown_run_reasons_become_unrecognized_run_states() {
         }
     );
 
-    let body = br#"{"kind":"control","cursor":{"wal_seq":8,"sub_index":0},"unit":{"type":"run_finished","run_id":"run-1","reason":"future_finish","retries_used":0}}"#;
+    let body = br#"{"kind":"control","cursor":{"wal_seq":8,"sub_index":0,"incarnation":"lineage","digest":"0123456789abcdef"},"unit":{"type":"run_finished","run_id":"run-1","reason":"future_finish","retries_used":0}}"#;
     let finished = decode_subscribe_event(body).unwrap();
     let SubscribeEvent::UnrecognizedRunState { state, .. } = &finished else {
         panic!("expected an unrecognized run state, got {finished:?}");
@@ -182,7 +181,7 @@ fn subscribe_units_with_unknown_run_reasons_become_unrecognized_run_states() {
         serde_json::to_value(&finished).unwrap(),
         serde_json::json!({
             "kind": "control",
-            "cursor": {"wal_seq": 8, "sub_index": 0},
+            "cursor": {"wal_seq": 8, "sub_index": 0, "incarnation": "lineage", "digest": "0123456789abcdef"},
             "unit": {"type": "run_finished", "run_id": "run-1", "reason": "future_finish"}
         })
     );
@@ -239,11 +238,10 @@ fn unknown_lanes_and_display_reset_while_unknown_control_units_are_named() {
     assert!(matches!(
         control,
         SubscribeEvent::UnknownControlUnit {
-            wal_seq: 1,
-            sub_index: 0,
+            cursor,
             unit_type,
             unit,
-        } if unit_type == "future_control_unit" && unit["payload"] == "ignored"
+        } if cursor == CursorWire::new(1, 0) && unit_type == "future_control_unit" && unit["payload"] == "ignored"
     ));
 }
 

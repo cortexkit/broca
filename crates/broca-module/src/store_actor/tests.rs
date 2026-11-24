@@ -2672,4 +2672,144 @@ impl Inventory {
     }
 }
 
+/// Opens actors that answer only `ResumeHeld`: the first closes as the command arrives, answering
+/// it as a closing actor does, and every later one resumes.
+struct ClosesOnceOpener {
+    opens: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait]
+impl crate::registry::LineageOpener for ClosesOnceOpener {
+    /// A session store whose runtime never opens: this opener keeps no sessions.
+    fn store_slot(&self) -> &Arc<crate::store_open::StoreSlot> {
+        static SLOT: std::sync::OnceLock<Arc<crate::store_open::StoreSlot>> =
+            std::sync::OnceLock::new();
+        SLOT.get_or_init(|| {
+            Arc::new(crate::store_open::StoreSlot::awaiting_key(
+                std::path::Path::new("/nonexistent-broca-test-store"),
+                1,
+            ))
+        })
+    }
+
+    async fn open(
+        &self,
+        key: &BindIdentity,
+        gen: u64,
+        registry: crate::registry::RegistryHandle,
+    ) -> Result<crate::registry::ActorHandle, crate::registry::OpenError> {
+        let first = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let (tx, mut commands) = mpsc::channel(8);
+        let key = key.clone();
+        tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                if first {
+                    let close = registry.begin_close(&key, gen);
+                    super::reopen(command);
+                    drop(close);
+                    return;
+                }
+                if let LineageCmd::ResumeHeld { reply } = command {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+        Ok(crate::registry::ActorHandle {
+            tx,
+            gen,
+            run_in_flight: Arc::default(),
+            first_episode: Arc::default(),
+        })
+    }
+}
+
+/// A late result that reaches an actor as it closes is handed to the session's next actor, as
+/// every other command is, instead of failing back to the puller until its next pull.
+#[tokio::test]
+async fn a_held_resume_meeting_a_closing_actor_reaches_the_next_one() {
+    let opener = Arc::new(ClosesOnceOpener {
+        opens: std::sync::atomic::AtomicU64::new(0),
+    });
+    let registry = crate::LineageRegistry::new(opener.clone());
+    let result = tokio::time::timeout(
+        broca_test_support::EVENT_HANG_GUARD,
+        registry.resume_held_run(&bind()),
+    )
+    .await
+    .expect("the resume is answered");
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        opener.opens.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the session was opened again for the resume"
+    );
+}
+
 mod decoded_parts;
+
+/// A fresh run refused before it exists, here because the session's recovery registration can't
+/// be written, lets go of the attachment bytes its send staged, as a send its transforms refuse
+/// does: no run is left to store them.
+#[tokio::test]
+async fn a_run_refused_before_it_exists_lets_its_staged_media_go() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    // The registration is a file in a folder that isn't there, so writing it fails.
+    let missing = broca_test_support::scratch_root().join(format!(
+        "store-actor-no-recovery-index-{}",
+        std::process::id()
+    ));
+    let mut actor = StoreActor::new(
+        bind(),
+        session,
+        Arc::new(executor(Vec::new(), None)),
+        Box::new(SharedParts::new(Box::new(MemoryParts::default()))),
+    )
+    .with_recovery_index(missing);
+    let reference = broca_protocol::MediaRef {
+        kind: broca_protocol::content::MediaKind::Image,
+        mime: "image/png".into(),
+        byte_size: 3,
+        sha256: "0".repeat(64),
+        width: Some(1),
+        height: Some(1),
+    };
+    actor.held.hold(&reference, Arc::new(vec![1, 2, 3]));
+    let start = super::Start {
+        conversation_key: None,
+        run_id: RunId("r1".into()),
+        one_shot: false,
+        request: request("look"),
+        title: None,
+        send_id: None,
+        identity: None,
+        sent_by: None,
+        scope: None,
+        manifest: None,
+        session_class: None,
+        prepared: super::Prepared::default(),
+        message_marks: None,
+    };
+    let (reply, answer) = oneshot::channel();
+    actor
+        .start_run_under(
+            start,
+            None,
+            Some(reply),
+            StoreRunMode::Fresh,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    let refused = answer.await.unwrap();
+    assert!(matches!(refused, SendOutcome::Error(_)), "{refused:?}");
+    assert!(actor.run.is_none(), "no run started");
+    assert!(actor.held.is_empty(), "the staged media is still held");
+}

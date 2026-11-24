@@ -190,3 +190,55 @@ async fn a_refused_retry_returns_the_first_refusal() {
     };
     assert_eq!(refusal.code(), "unknown_module");
 }
+
+/// When the open under the other id answers "not yet" (the module is restarting or warming, or
+/// its re-synced scope is still syncing or changing), that answer is returned rather than the old
+/// id's terminal refusal, so the caller waits and retries instead of giving up for good.
+#[tokio::test]
+async fn a_retryable_answer_under_the_other_id_is_returned() {
+    for (module, owner, first, again) in [
+        (
+            "prefrontal-core",
+            None,
+            "unknown_module",
+            "module_reloading",
+        ),
+        ("prefrontal-core", None, "unknown_module", "module_warming"),
+        (
+            "prefrontal-core",
+            None,
+            "module_removed",
+            "target_unavailable",
+        ),
+        ("prefrontal-core", None, "unknown_module", "module_timeout"),
+        (
+            "aft",
+            Some("prefrontal-core"),
+            "scope_not_live",
+            "scope_not_synced",
+        ),
+        (
+            "aft",
+            Some("prefrontal-core"),
+            "scope_ended",
+            "scope_changed",
+        ),
+    ] {
+        let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+        let scope = owner.map(scope);
+        let (result, ()) = tokio::join!(open(&conn, module, scope.as_ref()), async {
+            let (request, _, _) = next_open(&mut daemon).await;
+            assert!(daemon.refuse(&request, first));
+            let (request, renamed, renamed_owner) = next_open(&mut daemon).await;
+            assert!(
+                renamed == "prefrontal" || renamed_owner.as_deref() == Some("prefrontal"),
+                "{first}: the second open names the other id"
+            );
+            assert!(daemon.refuse(&request, again));
+        });
+        let Err(ConnError::Rejected(refusal)) = result else {
+            panic!("{first} then {again}: expected a refusal, got {result:?}");
+        };
+        assert_eq!(refusal.code(), again, "{first} then {again}");
+    }
+}

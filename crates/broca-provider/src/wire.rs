@@ -924,6 +924,16 @@ pub trait StreamNormalizer: Send {
         None
     }
 
+    /// Whether the grammar's own end-of-step record already arrived, after which no record can
+    /// change the step, for a grammar whose last record [`Self::last_event_type`] cannot name
+    /// (OpenAI Chat's `[DONE]` sentinel, Bedrock's `messageStop` plus its `metadata` trailer).
+    /// The transport then keeps the answer when the body fails or stalls instead of ending
+    /// cleanly, calling [`Self::finish`] to close the step. `false` (the default) leaves that to
+    /// the body's clean end. A wrapping normalizer must forward this to the one it wraps.
+    fn step_ended(&self) -> bool {
+        false
+    }
+
     /// Number of SSE keepalive comments since the most recent content record.
     fn keepalives_after_content(&self) -> Option<u64> {
         None

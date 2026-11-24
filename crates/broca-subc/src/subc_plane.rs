@@ -304,7 +304,7 @@ impl RouteEnsureError {
 /// Use the raw bind fields as the route/fence identity. A formatted path string is not a sound
 /// key because `PathBuf::display()` is lossy for non-UTF-8 paths and a separator-delimited
 /// string can collide when one field contains the separator.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 struct SessionKey {
     project_root: PathBuf,
     harness: String,
@@ -331,8 +331,9 @@ fn scope_key(scope: Option<&SessionScope>) -> ScopeKey {
 /// The scope is part of the key so a route opened under one scope, or none, is never
 /// reused for a run admitted under another. The durability fence deliberately stays keyed only
 /// by `(session, tool_call_id)` so a caller re-driving the same batch cannot duplicate a tool
-/// call through another module route.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// call through another module route. Keys order by session, then scope, so one session's routes
+/// under one scope sit together in the route map ([`session_scope_routes`]).
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 struct RouteKey {
     session: SessionKey,
     scope: ScopeKey,
@@ -405,6 +406,12 @@ impl ToolRoute {
 /// in an inner map lets batch start and finish replace or remove one batch without scanning routes
 /// owned by unrelated sessions.
 type BatchRouteKey = (SessionKey, BatchId);
+/// The plane's decoded catalog, with the connection's catalog generation it was read at
+/// (`None` when the connection can't tell).
+type CatalogSnapshot = (
+    Option<crate::connection::CatalogGeneration>,
+    Arc<crate::provider_catalog::ProviderCatalog>,
+);
 type BatchRouteMap = HashMap<BatchRouteKey, HashMap<ToolCallId, ToolRoute>>;
 
 /// The at-most-once fence key. Keyed by the SESSION as well as the tool_call_id, because a
@@ -413,19 +420,21 @@ type BatchRouteMap = HashMap<BatchRouteKey, HashMap<ToolCallId, ToolRoute>>;
 /// one session's result for another's call). The session scopes it.
 type FenceKey = (SessionKey, ToolCallId);
 
-/// The at-most-once fence: a repeated `(session, tool_call_id)` returns the prior result,
-/// EVICTED at batch terminal so it stays bounded to live batches (the at-most-once
-/// guarantee only needs to hold within a batch's life — a resume re-dispatches an
-/// un-recorded call within the same batch; the session's log is the cross-batch/cross-run
-/// durability, not this in-memory map). Extracted so the keying (collision-safety) and the
+/// The at-most-once fence: a repeated `(session, tool_call_id)` within a live batch returns
+/// the prior result instead of sending the call again. It is EVICTED at batch terminal so it
+/// stays bounded to live batches. Across batches and runs the session's log is the durability:
+/// a call whose intent was recorded without an outcome is never re-sent, so nothing after the
+/// batch needs this in-memory map. Extracted so the keying (collision-safety) and the
 /// eviction (bounded growth) are unit-testable without a live connection.
 #[derive(Default)]
 struct Fence {
     /// The deduped results, keyed by `(session, tool_call_id)`.
     results: HashMap<FenceKey, ToolResult>,
     /// The keys each in-flight batch inserted, so `evict_batch` removes exactly that
-    /// batch's entries instead of letting the fence grow unbounded over many batches.
-    by_batch: HashMap<BatchId, Vec<FenceKey>>,
+    /// batch's entries instead of letting the fence grow unbounded over many batches. Keyed by
+    /// session and batch, like every other per-batch map, so one session's batch never
+    /// evicts another's.
+    by_batch: HashMap<BatchRouteKey, Vec<FenceKey>>,
 }
 
 impl Fence {
@@ -437,22 +446,22 @@ impl Fence {
     /// Record a result under its batch (so `evict_batch` can later drop it).
     fn insert(&mut self, batch_id: &BatchId, key: FenceKey, result: ToolResult) {
         self.results.insert(key.clone(), result);
-        self.by_batch.entry(batch_id.clone()).or_default().push(key);
+        self.by_batch
+            .entry((key.0.clone(), batch_id.clone()))
+            .or_default()
+            .push(key);
     }
 
     /// Evict every entry the batch inserted (called at `batch_finished`).
-    fn evict_batch(&mut self, batch_id: &BatchId) {
-        for key in self.by_batch.remove(batch_id).unwrap_or_default() {
+    fn evict_batch(&mut self, batch: &BatchRouteKey) {
+        for key in self.by_batch.remove(batch).unwrap_or_default() {
             self.results.remove(&key);
         }
     }
 
     fn evict_session(&mut self, session: &SessionKey) {
         self.results.retain(|(owner, _), _| owner != session);
-        self.by_batch.retain(|_, keys| {
-            keys.retain(|(owner, _)| owner != session);
-            !keys.is_empty()
-        });
+        self.by_batch.retain(|(owner, _), _| owner != session);
     }
 
     /// Total live fence entries (for the eviction test).
@@ -487,7 +496,14 @@ trait ToolPlaneConnection: Send + Sync {
     ) -> Result<RouteHandle, ConnError> {
         self.route_open(module_id, identity, scope).await
     }
-    async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError>;
+    async fn catalog_list(&self) -> Result<Arc<Vec<CatalogEntry>>, ConnError>;
+
+    /// The catalog the connection serves now, when it follows the daemon's catalog generation
+    /// (see [`SubcConnection::follow_catalog`]); `None` when it can't tell. The plane rebuilds
+    /// its catalog snapshot when this changes.
+    fn catalog_generation(&self) -> Option<crate::connection::CatalogGeneration> {
+        None
+    }
 
     async fn route_open(
         &self,
@@ -638,8 +654,12 @@ impl ToolPlaneConnection for SubcConnection {
         .await
     }
 
-    async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
+    async fn catalog_list(&self) -> Result<Arc<Vec<CatalogEntry>>, ConnError> {
         SubcConnection::catalog_list(self).await
+    }
+
+    fn catalog_generation(&self) -> Option<crate::connection::CatalogGeneration> {
+        SubcConnection::catalog_generation(self)
     }
 
     async fn route_open(
@@ -786,15 +806,14 @@ pub struct SubcToolPlane {
     /// Standalone callers select one provider's preset without changing daemon plan admission.
     direct_tool_item: Option<broca_fetch_plan::plan::Item>,
     direct_schema_pins: Mutex<BTreeMap<String, broca_core::tool_plane::DispatchSchemaPin>>,
-    routes: Mutex<HashMap<RouteKey, RouteState>>,
+    routes: Mutex<BTreeMap<RouteKey, RouteState>>,
     batch_routes: Mutex<BatchRouteMap>,
-    batch_presets: Mutex<HashMap<BatchRouteKey, ToolManifest>>,
     approved_args: Mutex<HashMap<BatchRouteKey, HashMap<ToolCallId, ApprovedArgs>>>,
     provider_held: Option<ProviderHeldSupport>,
     /// The frozen tool manifest of each batch in progress. It is the only source of a
     /// provider's declarations: what its result format and `late_results` capability were when
-    /// the session was admitted.
-    batch_manifests: Mutex<HashMap<BatchRouteKey, broca_core::capability::ToolManifest>>,
+    /// the session was admitted, and of its preset, reply deadlines and schema pins.
+    batch_manifests: Mutex<HashMap<BatchRouteKey, Arc<ToolManifest>>>,
     registered_keys: Mutex<RegisteredKeys>,
     /// Call keys of inline answers in batches still open, by batch. Kept per batch so the
     /// batch's end, or its session's close if the batch never ends, forgets them.
@@ -809,10 +828,12 @@ pub struct SubcToolPlane {
     /// Lives across batches for the plane's lifetime, but is reused only as the source snapshot
     /// for per-batch routing; resolved routes remain frozen and separately evicted at batch
     /// terminal. Module respawns preserve module IDs, so those routes remain meaningful while a
-    /// provider is restarted. A missing provider triggers one fresh resolution fetch, and any
-    /// learned-dead route clears this snapshot, covering the catalog changes that can affect a
-    /// later batch without polling per batch.
-    catalog_memo: Mutex<Option<Arc<crate::provider_catalog::ProviderCatalog>>>,
+    /// provider is restarted. It is kept with the connection's catalog generation it was read
+    /// at, and read again once the connection reports another, so a provider registering or
+    /// leaving changes the next batch's routing. Whatever the connection reports, a call that
+    /// does not resolve triggers one fresh resolution fetch, and any route found dead clears
+    /// this snapshot.
+    catalog_memo: Mutex<Option<CatalogSnapshot>>,
     /// The at-most-once fence (keyed by (session, tool_call_id), evicted at batch terminal).
     fence: Mutex<Fence>,
     /// Per-PROVIDER concurrency window, resolved from that provider's catalog entry at
@@ -1339,7 +1360,8 @@ impl SubcToolPlane {
                     .get(&Self::batch_route_key(ctx))
                     .and_then(|keys| keys.get(&call.tool_call_id))
                     .is_none_or(|(registered_module, registered_key)| {
-                        registered_module != module || registered_key != key
+                        !broca_protocol::same_module(registered_module, module)
+                            || registered_key != key
                     })
             })
         {
@@ -1427,9 +1449,8 @@ impl SubcToolPlane {
             direct_carrier_scope: None,
             direct_tool_item: None,
             direct_schema_pins: Mutex::new(BTreeMap::new()),
-            routes: Mutex::new(HashMap::new()),
+            routes: Mutex::new(BTreeMap::new()),
             batch_routes: Mutex::new(HashMap::new()),
-            batch_presets: Mutex::new(HashMap::new()),
             approved_args: Mutex::new(HashMap::new()),
             provider_held: None,
             batch_manifests: Mutex::new(HashMap::new()),
@@ -1478,7 +1499,7 @@ impl SubcToolPlane {
     }
 
     fn frozen_preset(&self, ctx: &BatchCtx, module_id: &str) -> Option<String> {
-        self.batch_presets
+        self.batch_manifests
             .lock()
             .unwrap()
             .get(&Self::batch_route_key(ctx))
@@ -1486,7 +1507,7 @@ impl SubcToolPlane {
             .or_else(|| {
                 self.direct_tool_item
                     .as_ref()
-                    .filter(|item| item.provider == module_id)
+                    .filter(|item| broca_protocol::same_module(&item.provider, module_id))
                     .and_then(|item| item.preset.clone())
             })
     }
@@ -1508,7 +1529,7 @@ impl SubcToolPlane {
         module_id: &str,
         call: &ToolCall,
     ) -> Option<cortexkit_role_tool_provider::catalog::Reply> {
-        let manifests = self.batch_presets.lock().unwrap();
+        let manifests = self.batch_manifests.lock().unwrap();
         // A deadline the frozen fetch plan's provider declared wins; otherwise the one the caller
         // declared on the tool when it sent it. Both go through the role's deadline arithmetic,
         // which never lowers the runner's fallback and is never lowered by it.
@@ -1545,15 +1566,23 @@ impl SubcToolPlane {
 
     /// The catalog providers + tools (so a caller can build the manifest from
     /// what's actually registered).
-    pub async fn catalog(&self) -> Result<Vec<CatalogEntry>, ToolPlaneError> {
+    pub async fn catalog(&self) -> Result<Arc<Vec<CatalogEntry>>, ToolPlaneError> {
         self.conn.catalog_list().await.map_err(conn_to_plane)
     }
 
     async fn catalog_snapshot(
         &self,
     ) -> Result<Arc<crate::provider_catalog::ProviderCatalog>, ToolPlaneError> {
-        if let Some(catalog) = self.catalog_memo.lock().unwrap().as_ref().cloned() {
-            return Ok(catalog);
+        // Read before the fetch: a change reported while it runs makes the next caller read again.
+        let generation = self.conn.catalog_generation();
+        if let Some((_, catalog)) = self
+            .catalog_memo
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(held, _)| *held == generation)
+        {
+            return Ok(Arc::clone(catalog));
         }
 
         let fetched: Arc<crate::provider_catalog::ProviderCatalog> = Arc::new(
@@ -1564,13 +1593,17 @@ impl SubcToolPlane {
                 .into(),
         );
         let mut memo = self.catalog_memo.lock().unwrap();
-        Ok(Arc::clone(memo.get_or_insert(fetched)))
+        if !matches!(memo.as_ref(), Some((held, _)) if *held == generation) {
+            *memo = Some((generation, fetched));
+        }
+        Ok(Arc::clone(&memo.as_ref().unwrap().1))
     }
 
     async fn refresh_catalog_snapshot(
         &self,
     ) -> Result<Arc<crate::provider_catalog::ProviderCatalog>, ToolPlaneError> {
         self.clear_catalog_memo();
+        let generation = self.conn.catalog_generation();
         let fetched: Arc<crate::provider_catalog::ProviderCatalog> = Arc::new(
             self.conn
                 .catalog_list()
@@ -1578,7 +1611,7 @@ impl SubcToolPlane {
                 .map_err(conn_to_plane)?
                 .into(),
         );
-        *self.catalog_memo.lock().unwrap() = Some(Arc::clone(&fetched));
+        *self.catalog_memo.lock().unwrap() = Some((generation, Arc::clone(&fetched)));
         Ok(fetched)
     }
 
@@ -1587,7 +1620,7 @@ impl SubcToolPlane {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|catalog| Arc::clone(&catalog.aft_harness))
+            .map(|(_, catalog)| Arc::clone(&catalog.aft_harness))
     }
 
     fn clear_catalog_memo(&self) {
@@ -1674,14 +1707,10 @@ impl SubcToolPlane {
         let scope = ctx.scope.as_ref()?;
         let session = Self::session_key(&ctx.bind);
         let key_scope = scope_key(Some(scope));
-        let cached: Vec<(String, RouteHandle)> = self
-            .routes
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(key, _)| key.session == session && key.scope == key_scope)
-            .map(|(key, route)| (key.module_id.clone(), route.handle))
-            .collect();
+        let cached: Vec<(String, RouteHandle)> =
+            session_scope_routes(&self.routes.lock().unwrap(), &session, &key_scope)
+                .map(|(key, route)| (key.module_id.clone(), route.handle))
+                .collect();
         let closed: Vec<(String, RouteHandle)> = cached
             .into_iter()
             .filter(|(_, handle)| !self.conn.route_is_open(handle))
@@ -1840,7 +1869,6 @@ impl SubcToolPlane {
         let Some(scope) = ctx.scope.as_ref() else {
             unreachable!("only a scoped call is resolved by describing its scope");
         };
-        self.remove_batch_call_route(ctx, &call.tool_call_id);
         self.forget_route(ctx, module_id, closed);
         let drained = |reason: &str| DispatchResult::ScopeDrained {
             reason: reason.to_owned(),
@@ -2532,6 +2560,7 @@ impl SubcToolPlane {
         if let Some(w) = self.windows.lock().unwrap().get(module_id).copied() {
             return Ok(w);
         }
+        let generation = self.conn.catalog_generation();
         let catalog: Arc<crate::provider_catalog::ProviderCatalog> = Arc::new(
             self.conn
                 .catalog_list()
@@ -2542,7 +2571,7 @@ impl SubcToolPlane {
         self.catalog_memo
             .lock()
             .unwrap()
-            .get_or_insert_with(|| Arc::clone(&catalog));
+            .get_or_insert_with(|| (generation, Arc::clone(&catalog)));
         let window = crate::provider_catalog::find_module(&catalog, module_id)
             .and_then(provider_concurrency)
             .map(|c| window_for(&c))
@@ -3084,10 +3113,6 @@ impl SubcToolPlane {
             .lock()
             .unwrap()
             .retain(|(owner, _), _| owner != &session);
-        self.batch_presets
-            .lock()
-            .unwrap()
-            .retain(|(owner, _), _| owner != &session);
         self.batch_routes
             .lock()
             .unwrap()
@@ -3211,15 +3236,13 @@ impl SubcToolPlane {
             .map(ToOwned::to_owned)
             .collect::<BTreeSet<_>>();
 
+        // One copy of the frozen manifest per batch, made before the process-wide map's lock is
+        // taken.
+        let frozen = Arc::new(manifest.clone());
         self.batch_manifests
             .lock()
             .unwrap()
-            .insert(Self::batch_route_key(ctx), manifest.clone());
-
-        self.batch_presets
-            .lock()
-            .unwrap()
-            .insert(Self::batch_route_key(ctx), manifest.clone());
+            .insert(Self::batch_route_key(ctx), frozen);
         self.batch_routes
             .lock()
             .unwrap()
@@ -3617,11 +3640,13 @@ impl SubcToolPlane {
                 )
                 .await;
         }
-        self.remove_batch_call_route(ctx, &call.tool_call_id);
-        // FORGOTTEN, NOT CLOSED, in both cases. For module_reloading the daemon still holds
-        // the route, and closing it looks tidier -- but it is not safe. A sibling call in
-        // the same batch may still be in flight on it (the drain is waiting for exactly
-        // that call), and a GOODBYE would cut its reply off, turning a restart into an
+        // The call keeps its batch route (its module), so the re-send looks up the same schema
+        // pin and preset and carries exactly the bytes the refused attempt carried.
+        //
+        // The refused route is FORGOTTEN, NOT CLOSED, in both cases. For module_reloading the
+        // daemon still holds the route, and closing it looks tidier -- but it is not safe. A
+        // sibling call in the same batch may still be in flight on it (the drain is waiting for
+        // exactly that call), and a GOODBYE would cut its reply off, turning a restart into an
         // ambiguous outcome that stops the run. Evict only the refused handle: a sibling may
         // already have cached its replacement. The drain owns the old binding's teardown.
         let _ = self.invalidate_route_for_module(&ctx.bind, scope, &module_id, route_handle);
@@ -3899,7 +3924,10 @@ impl SubcToolPlane {
         // Evict this batch's fence entries — the at-most-once guarantee only needs to hold
         // within a batch's life (the session's log is the cross-batch durability), so without
         // eviction the fence would grow unbounded over thousands of batches.
-        self.fence.lock().unwrap().evict_batch(&ctx.batch_id);
+        self.fence
+            .lock()
+            .unwrap()
+            .evict_batch(&Self::batch_route_key(ctx));
         self.batch_manifests
             .lock()
             .unwrap()
@@ -3909,10 +3937,6 @@ impl SubcToolPlane {
             .unwrap()
             .remove(&Self::batch_route_key(ctx));
         self.approved_args
-            .lock()
-            .unwrap()
-            .remove(&Self::batch_route_key(ctx));
-        self.batch_presets
             .lock()
             .unwrap()
             .remove(&Self::batch_route_key(ctx));
@@ -3941,9 +3965,11 @@ impl ToolPlane for SubcToolPlane {
 
     async fn compatible_tools(
         &self,
+        bind: &BindIdentity,
+        scope: Option<&SessionScope>,
         manifest: &broca_core::tool_plane::PlanManifest,
     ) -> Vec<broca_core::tool_plane::CompatibleTool> {
-        run_transport::compatible_tools(manifest)
+        run_transport::compatible_tools(bind, scope, manifest)
     }
 
     async fn batch_started(
@@ -3987,7 +4013,7 @@ impl ToolPlane for SubcToolPlane {
             .or_else(|| {
                 self.direct_tool_item
                     .as_ref()
-                    .filter(|item| item.provider == module)?;
+                    .filter(|item| broca_protocol::same_module(&item.provider, &module))?;
                 self.direct_schema_pins.lock().unwrap().get(tool).cloned()
             })
     }
@@ -4103,14 +4129,14 @@ struct CachedRoute {
 }
 
 fn cache_route_state(
-    routes: &mut HashMap<RouteKey, RouteState>,
+    routes: &mut BTreeMap<RouteKey, RouteState>,
     key: RouteKey,
     handle: RouteHandle,
     sem: Arc<Semaphore>,
     stamp: Option<ScopeStamp>,
 ) -> CachedRoute {
     match routes.entry(key.with_handle(handle)) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
+        std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(RouteState {
                 handle,
                 sem: Arc::clone(&sem),
@@ -4123,7 +4149,7 @@ fn cache_route_state(
                 loser_handle: None,
             }
         }
-        std::collections::hash_map::Entry::Occupied(entry) => {
+        std::collections::btree_map::Entry::Occupied(entry) => {
             let existing = entry.get();
             CachedRoute {
                 handle: existing.handle,
@@ -4134,8 +4160,28 @@ fn cache_route_state(
     }
 }
 
+/// The routes `session` has cached under `scope`, read as one range of the route map: the cost
+/// grows with that session's routes, not with every session's.
+fn session_scope_routes<'a>(
+    routes: &'a BTreeMap<RouteKey, RouteState>,
+    session: &'a SessionKey,
+    scope: &'a ScopeKey,
+) -> impl Iterator<Item = (&'a RouteKey, &'a RouteState)> + 'a {
+    // The least key of the range: the empty module id and every flag false order first.
+    let first = RouteKey {
+        session: session.clone(),
+        scope: scope.clone(),
+        module_id: String::new(),
+        shape: RouteShape::default(),
+        held_reply_v1: false,
+    };
+    routes
+        .range(first..)
+        .take_while(move |(key, _)| &key.session == session && &key.scope == scope)
+}
+
 fn route_matches(
-    routes: &HashMap<RouteKey, RouteState>,
+    routes: &BTreeMap<RouteKey, RouteState>,
     key: &RouteKey,
     handle: RouteHandle,
     sem: &Arc<Semaphore>,

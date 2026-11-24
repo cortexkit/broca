@@ -328,8 +328,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The coordinator: a registry over the session store, the file leases and the run index.
     // The module owns its state_root: the leases and the session store are its durability
-    // domain, and the session store is the system of record. The run index holds projections
-    // and export facts beside it.
+    // domain, and the session store is the system of record for runs. The run index holds
+    // session refs and export facts beside it, and is the only record of scope reservations.
     //
     // `state_root` was resolved at startup: BROCA_STATE_ROOT when set, otherwise the durable
     // data home, `<data home>/cortexkit/broca`, and never the daemon's runtime directory, whose
@@ -783,7 +783,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     retention.set_withdraw_before_delete(held_runtime.withdraw_before_delete());
     registry.set_retention_service(retention);
     // System One: decision models served in this process with no session. Its batch record
-    // is its own file; `run-index.db` is a rebuildable projection and cannot hold an authority.
+    // is kept in `system-one.db`, separate from the session inventory and its reservations.
     let llm_tools_config = broca_module_serve::config::LlmToolsConfig::from_settings(&settings)
         .map_err(ServeIoError)?;
     let llm_tools_identity = broca_protocol::BindIdentity::new(

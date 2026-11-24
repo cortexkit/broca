@@ -131,7 +131,7 @@ pub enum WarmRefusalDetail {
     /// The session's latest run is paused; nothing is warmed until it resumes or ends.
     RunPaused {
         run_id: String,
-        reason: broca_protocol::PauseReason,
+        reason: broca_protocol::OpenPauseReason,
     },
     /// The latest attempt found the provider account exhausted, and it has not reset yet.
     AccountWalled { resets_at_ms: u64 },
@@ -236,6 +236,22 @@ mod golden {
         WarmRefusal::new(detail)
     }
 
+    #[test]
+    fn a_warm_refusal_keeps_an_unknown_pause_reason() {
+        let value = serde_json::json!({
+            "code": "run_paused",
+            "message": "nothing was warmed",
+            "detail": {"kind": "run_paused", "run_id": "run-1", "reason": "future_reason"}
+        });
+        let decoded: WarmRefusal = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            &decoded.detail,
+            WarmRefusalDetail::RunPaused { reason: broca_protocol::OpenState::Unknown(reason), .. }
+                if reason == "future_reason"
+        ));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
+
     /// One golden per refusal code, each pinned by digest. A changed body fails until both the
     /// file and its digest are changed on purpose.
     #[test]
@@ -256,7 +272,7 @@ mod golden {
             (
                 refusal(WarmRefusalDetail::RunPaused {
                     run_id: "run-1".into(),
-                    reason: broca_protocol::PauseReason::AuthRequired,
+                    reason: broca_protocol::PauseReason::AuthRequired.into(),
                 }),
                 "warm_refusal.run_paused.json",
                 RUN_PAUSED_SHA256,

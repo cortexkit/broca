@@ -20,9 +20,9 @@ mod write;
 pub(crate) use batches::MigrationWriteStats;
 pub use census::{census, migrate, CensusCounts};
 pub use stored::StoredSessions;
-pub(crate) use write::insert;
 #[cfg(test)]
 pub(super) use write::REF_WAIT_HOOK;
+pub(crate) use write::{insert, CONNECTION_POISONED};
 
 pub fn init_schema(conn: &Connection) -> Result<(), StoreError> {
     init_schema_measured(conn, &mut MigrationWriteStats::default())
@@ -217,7 +217,7 @@ impl SessionInventory {
         &self,
         select: impl FnOnce(&Connection) -> Result<T, StoreError>,
     ) -> Result<(T, bool), StoreError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = crate::lock_connection(&self.conn)?;
         let root = conn
             .path()
             .map(std::path::Path::new)

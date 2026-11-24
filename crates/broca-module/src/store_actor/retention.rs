@@ -12,21 +12,23 @@ use cortexkit_role_llm_runner::session_retention::Keep;
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// The retention a send's run starts with: the one it asks for, once checked against the
-    /// session's current one, else the current one. The current one is the latest run's, which a
-    /// send that shortened it set, else the first run's.
+    /// session's current one, else the current one. The current one is the shortest any of the
+    /// session's run starts or sends set, queued sends included (`expiry::Timer::seconds`), so a
+    /// send queued behind one that shortened it can't undo that.
     pub(super) async fn send_retention(
-        &self,
+        &mut self,
         requested: Option<u64>,
     ) -> Result<Option<u64>, SendOutcome> {
-        let operations = self.session.operations();
-        let first = operations.owner.first_start.as_ref();
-        let current = operations
-            .run
-            .as_ref()
-            .and_then(|run| run.start.as_ref())
-            .and_then(|start| start.retention_secs)
-            .or_else(|| first.and_then(|start| start.retention_secs));
-        let exists = first.is_some();
+        let exists = self.session.operations().owner.first_start.is_some();
+        let current = self
+            .retention_timer
+            .seconds(&self.session)
+            .await
+            .map_err(|error| {
+                SendOutcome::Error(format!(
+                    "the session's retention could not be read: {error:?}"
+                ))
+            })?;
         crate::retention::validate_retention(requested, current, exists)
             .map_err(SendOutcome::RetentionInvalid)?;
         Ok(requested.or(current))
@@ -74,6 +76,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             serde_json::to_value(sent).map_err(|e| SendOutcome::Error(e.to_string()))
         };
         if operations.owner.first_start.is_none() {
+            // The session may already sit in a root this send didn't choose: two sends creating
+            // it at once each mark the root they want, and the open takes whichever mark is
+            // there. Its backup is then fixed by where it was created, so a send freezing the
+            // opposite choice is refused rather than frozen outside the root it asked for.
+            let backed_up = self
+                .class_placement
+                .as_ref()
+                .map(|(class, _)| *class == StorageClass::Durable);
+            if backed_up.is_some_and(|backed_up| backed_up != sent.backup) {
+                return Err(SendOutcome::RetentionRefused(Refusal::BackupFixed));
+            }
             return encoded().map(Some);
         }
         let kept = self.storage_policy().map_err(SendOutcome::Error)?;

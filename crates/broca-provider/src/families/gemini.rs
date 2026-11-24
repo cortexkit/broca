@@ -1125,6 +1125,13 @@ impl GeminiNormalizer {
                 },
                 Some(error),
             );
+            // An in-band 429 is read for Google's account quota wall exactly as an HTTP 429
+            // body is, so the wall keeps its reset and is never re-sent to the same account.
+            let error = if status == Some(429) {
+                crate::transport::google_quota_exhausted_in(v, std::time::SystemTime::now(), error)
+            } else {
+                error
+            };
             out.push(NormalizedEvent::Control(ProviderControl::Error {
                 error,
                 retries_used: 0,
@@ -1437,9 +1444,10 @@ impl StreamNormalizer for GeminiNormalizer {
             return Ok(out);
         }
         if !self.terminal_observed {
-            return Err(NormalizeError::Invalid(
-                "Gemini stream truncated: ended before a terminal chunk".into(),
-            ));
+            // A body that ended before the stream's terminal chunk was cut in transit, not
+            // decoded wrongly: assemble nothing, and the transport's completion check reports
+            // the missing step as a transport fault, as it does for every other family.
+            return Ok(out);
         }
         self.emitted_final = true;
         let message = self.assemble_message();

@@ -399,6 +399,8 @@ async fn send_signed_out_named(
     answer.await.unwrap()
 }
 
+/// Waits until the actor has nothing running, a sign-in probe's decision included: a deciding
+/// probe answers `Probing`, and dropping the actor's commands before it decides stops it.
 async fn actor_idle(commands: &Commands) {
     broca_test_support::wait_until("signed-out actor settles", || async {
         let (reply, answer) = tokio::sync::oneshot::channel();

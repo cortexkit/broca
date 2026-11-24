@@ -1317,6 +1317,13 @@ impl StreamNormalizer for OpenAiChatNormalizer {
         self.sse.last_event_type()
     }
 
+    /// `[DONE]` is the stream's last word: the SSE decoder delivers nothing after it, so the
+    /// step it ends is whole even if the body then fails instead of closing cleanly. A finish
+    /// reason alone is not enough, since a usage chunk may still follow it.
+    fn step_ended(&self) -> bool {
+        self.sse.saw_done()
+    }
+
     fn keepalives_after_content(&self) -> Option<u64> {
         Some(self.sse.keepalives_after_content())
     }
@@ -1343,9 +1350,10 @@ impl StreamNormalizer for OpenAiChatNormalizer {
             return Ok(out);
         }
         if !self.terminal_observed {
-            return Err(NormalizeError::Invalid(
-                "OpenAI chat stream truncated: ended before a terminal chunk or [DONE]".into(),
-            ));
+            // A body that ended before the stream's terminal chunk was cut in transit, not
+            // decoded wrongly: assemble nothing, and the transport's completion check reports
+            // the missing step as a transport fault, as it does for every other family.
+            return Ok(out);
         }
         self.emitted_final = true;
         let finish_reason = match self.finish_reason {
@@ -1387,12 +1395,18 @@ fn openai_chat_stream_error(envelope: &Value) -> Option<ProviderError> {
     let error = envelope.get("error")?.as_object()?;
     let code = error.get("code").and_then(Value::as_str);
     let error_type = error.get("type").and_then(Value::as_str);
+    // OpenRouter's mid-stream error puts the upstream HTTP status in a numeric `code` and its
+    // typed reason in `metadata.error_type`.
+    let metadata_type = error
+        .get("metadata")
+        .and_then(|metadata| metadata.get("error_type"))
+        .and_then(Value::as_str);
     // An exhausted prepaid balance is about the credential, not this request: relabel it so the
     // run's terminal names the credential and routing stops using it.
     let provider_code = if crate::normalize::openai_billing_exhausted(code, error_type) {
         Some(broca_protocol::error::BILLING_EXHAUSTED)
     } else {
-        code.or(error_type)
+        code.or(error_type).or(metadata_type)
     };
     let status = error_status(error, envelope);
     let retry_after_secs = retry_after_secs(error, envelope);
@@ -1401,13 +1415,23 @@ fn openai_chat_stream_error(envelope: &Value) -> Option<ProviderError> {
         .and_then(Value::as_str)
         .unwrap_or("OpenAI Chat stream reported an error")
         .to_owned();
+    // A stated status classifies the error as the same refusal over HTTP would be. Without one,
+    // a code or type the shared table knows keeps its class (an `invalid_request_error` type
+    // with an unfamiliar code is still a request fault), and any other code follows the
+    // Responses stream rule: transient unless known to be unrecoverable.
+    let class = match status {
+        Some(_) => classify_error_with_status_defaults(provider_code, status),
+        None => crate::normalize::classify_error(provider_code, None)
+            .or_else(|| crate::normalize::classify_error(error_type, None))
+            .unwrap_or_else(|| crate::normalize::openai_stream_error_class(provider_code)),
+    };
 
     Some(ProviderError {
         provider_details: None,
         cause: None,
         provider_subcode: None,
         refusal: None,
-        class: classify_error_with_status_defaults(provider_code, status),
+        class,
         message,
         status,
         retry_after_secs,
@@ -1423,17 +1447,28 @@ fn openai_chat_stream_error(envelope: &Value) -> Option<ProviderError> {
 }
 
 fn error_status(error: &serde_json::Map<String, Value>, envelope: &Value) -> Option<u16> {
-    ["status", "status_code"].into_iter().find_map(|key| {
-        error
-            .get(key)
-            .or_else(|| envelope.get(key))
-            .and_then(|value| {
-                value
-                    .as_u64()
-                    .and_then(|status| u16::try_from(status).ok())
-                    .or_else(|| value.as_str()?.parse::<u16>().ok())
-            })
-    })
+    ["status", "status_code"]
+        .into_iter()
+        .find_map(|key| {
+            error
+                .get(key)
+                .or_else(|| envelope.get(key))
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|status| u16::try_from(status).ok())
+                        .or_else(|| value.as_str()?.parse::<u16>().ok())
+                })
+        })
+        // OpenRouter's numeric `code` is the upstream HTTP status. Only the error-status range
+        // is read that way, so a provider's own numeric code is never taken for a status.
+        .or_else(|| {
+            error
+                .get("code")
+                .and_then(Value::as_u64)
+                .and_then(|code| u16::try_from(code).ok())
+                .filter(|code| (400..600).contains(code))
+        })
 }
 
 fn retry_after_secs(error: &serde_json::Map<String, Value>, envelope: &Value) -> Option<f64> {

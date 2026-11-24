@@ -3,16 +3,22 @@
 
 use super::*;
 
-/// Whether the stream has closed its step: its last record is the one the grammar ends a step
-/// with, after which no record can change it (Anthropic's `message_stop`, a Responses
-/// `response.completed` or `response.incomplete`), and the step's message and `Finished` have
-/// arrived. OpenAI Chat, Gemini and Bedrock name no such record, so their steps close only at
-/// the body's clean end.
-pub(super) fn step_closed(last_event_type: Option<&str>, completion: &[NormalizedEvent]) -> bool {
-    matches!(
-        last_event_type,
-        Some("message_stop" | "response.completed" | "response.incomplete")
-    ) && completion_holds_step(completion)
+/// Whether the stream has closed its step, so a body that then fails or stalls lost nothing:
+/// either its last record is the one the grammar ends a step with, after which no record can
+/// change it (Anthropic's `message_stop`, a Responses `response.completed` or
+/// `response.incomplete`), and the step's message and `Finished` have arrived; or the grammar
+/// reports its own end-of-step record arrived ([`StreamNormalizer::step_ended`]: OpenAI Chat's
+/// `[DONE]`, Bedrock's `messageStop` and `metadata`), and `finish` closes the step from what it
+/// holds. Gemini names no such record, so its steps close only at the body's clean end.
+pub(super) fn step_closed(
+    normalizer: &dyn StreamNormalizer,
+    completion: &[NormalizedEvent],
+) -> bool {
+    normalizer.step_ended()
+        || (matches!(
+            normalizer.last_event_type(),
+            Some("message_stop" | "response.completed" | "response.incomplete")
+        ) && completion_holds_step(completion))
 }
 
 /// Whether `completion` holds an assembled assistant message and a `Finished` control.

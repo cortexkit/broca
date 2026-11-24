@@ -389,10 +389,10 @@ async fn target_cingulate_admission(project: bool) {
             conn.catalog_list()
                 .await
                 .map_err(|error| error.to_string())?
-                .into_iter()
+                .iter()
                 .find(|entry| entry.module_id == "cingulate")
-                .and_then(|entry| entry.capabilities)
-                .map(|capabilities| capabilities.provides)
+                .and_then(|entry| entry.capabilities.as_ref())
+                .map(|capabilities| capabilities.provides.clone())
                 .ok_or_else(|| "Cingulate has not registered its capabilities".to_owned())
         })
         .await;

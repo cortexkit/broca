@@ -182,29 +182,37 @@ impl ToolManifest {
         &self,
         provider: &str,
     ) -> Option<&broca_records::record::FrozenProviderDeclarations> {
-        self.provider_declarations.get(provider)
+        by_module(&self.provider_declarations, provider)
     }
 
     /// Whether `provider` is the session's compaction provider, named by the plan's compaction
     /// item.
     pub fn is_compaction_provider(&self, provider: &str) -> bool {
-        self.compaction_provider.as_deref() == Some(provider)
+        self.compaction_provider
+            .as_deref()
+            .is_some_and(|compaction| broca_protocol::same_module(compaction, provider))
     }
 
     /// Whether another role at this provider already binds the session's own identity.
     pub fn uses_session_identity(&self, provider: &str) -> bool {
-        self.is_compaction_provider(provider) || self.hook_providers.contains(provider)
+        self.is_compaction_provider(provider)
+            || self
+                .hook_providers
+                .iter()
+                .any(|hook| broca_protocol::same_module(hook, provider))
     }
 
     /// Whether the session's plan fetch answered `provider`'s catalog at admission. False for a
     /// session admitted without a plan manifest.
     pub fn provider_fetched(&self, provider: &str) -> bool {
         self.fetched_providers.contains(provider)
+            || broca_protocol::other_module_name(provider)
+                .is_some_and(|other| self.fetched_providers.contains(other))
     }
 
     /// The frozen tool item's preset for the provider a call actually routes to.
     pub fn provider_preset(&self, provider: &str) -> Option<&str> {
-        self.provider_presets.get(provider).map(String::as_str)
+        by_module(&self.provider_presets, provider).map(String::as_str)
     }
 
     /// The selected tool owner's reply declaration, read only from the frozen plan.
@@ -213,7 +221,7 @@ impl ToolManifest {
         provider: &str,
         tool: &str,
     ) -> Option<&cortexkit_role_tool_provider::catalog::Reply> {
-        self.provider_replies.get(provider)?.get(tool)
+        by_module(&self.provider_replies, provider)?.get(tool)
     }
 
     /// The reply deadline the caller declared on the tool itself (`Tool::reply` on a
@@ -258,6 +266,14 @@ impl ToolManifest {
 }
 
 /// Runtime deadline arithmetic uses the role's types; durable bytes use the log's types.
+/// The entry a provider-keyed map holds for `provider`. The maps are keyed by the provider id the
+/// plan froze, while a call is routed to the id the module is listed under now; a module that
+/// changed its id ([`broca_protocol::RENAMED_MODULES`]) is found under either one.
+fn by_module<'a, V>(map: &'a HashMap<String, V>, provider: &str) -> Option<&'a V> {
+    map.get(provider)
+        .or_else(|| broca_protocol::other_module_name(provider).and_then(|other| map.get(other)))
+}
+
 fn reply_from_frozen(
     saved: &broca_records::record::FrozenReply,
 ) -> cortexkit_role_tool_provider::catalog::Reply {

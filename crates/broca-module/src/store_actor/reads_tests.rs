@@ -724,11 +724,12 @@ impl Module {
         .await;
     }
 
-    /// Closes the session's actor, as its idle deadline would.
+    /// Closes the session's actor at its idle deadline: the test's clock is moved past it at once,
+    /// so the actor closes as it would after that long with nothing to do.
     async fn close(&self) {
-        if let Some(handle) = self.registry.open_handle(&self.key) {
-            let _ = handle.send(LineageCmd::IdleTick).await;
-        }
+        tokio::time::pause();
+        tokio::time::advance(OPEN).await;
+        tokio::time::resume();
         broca_test_support::wait_until("the session closes", || async {
             match self.registry.slot_state(&self.key) {
                 None => Ok(()),

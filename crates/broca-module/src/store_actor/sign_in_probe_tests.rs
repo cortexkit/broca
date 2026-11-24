@@ -129,7 +129,10 @@ async fn only_a_routed_sign_in_pause_stays_registered_for_recovery() {
     }
 }
 
-#[tokio::test]
+/// How long the probe tests' actors wait idle before their idle deadline.
+const IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[tokio::test(start_paused = true)]
 async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
     let ProbeFixture {
         actor,
@@ -139,28 +142,27 @@ async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
     } = paused_probe("ready").await;
     let (tx, rx) = mpsc::unbounded_channel();
     let commands = Commands::over(tx, backend);
-    let task = tokio::spawn(actor.serve(rx));
+    let task = tokio::spawn(actor.serve_idle(rx, IDLE_TTL));
     idle(&commands).await;
     assert_eq!(
         runner.calls.load(Ordering::SeqCst),
         1,
         "opening before readiness must not resolve credentials or ask"
     );
-    commands.send(LineageCmd::IdleTick).unwrap();
+    // Two idle deadlines pass, well inside the two minutes an owed probe may hold the actor.
+    tokio::time::advance(IDLE_TTL * 2).await;
     let (reply, response) = oneshot::channel();
     commands
         .send(LineageCmd::Status { reply })
-        .expect("an idle tick must not retire an actor with an owed probe");
+        .expect("an idle deadline must not retire an actor with an owed probe");
     assert_eq!(
         response
             .await
-            .expect("an idle tick must preserve the owed probe"),
+            .expect("an idle deadline must preserve the owed probe"),
         crate::session_cmd::LineageStatus::Idle
     );
     assert!(!task.is_finished());
     registry.enable_restart_resumes();
-    commands.send(LineageCmd::IdleTick).unwrap();
-    idle(&commands).await;
     broca_test_support::wait_until("ready actor starts its owed sign-in probe", || async {
         if runner.calls.load(Ordering::SeqCst) == 2 {
             Ok(())
@@ -169,7 +171,6 @@ async fn actor_open_sign_in_probe_waits_for_dependency_readiness() {
         }
     })
     .await;
-    idle(&commands).await;
     drop(commands);
     drop(task.await.unwrap());
 }
@@ -223,10 +224,9 @@ async fn an_open_probe_readiness_hold_expires_two_minutes_after_open() {
     let before = actor.session.open_log_records().await.unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
     let commands = Commands::over(tx, backend);
-    let mut task = tokio::spawn(actor.serve(rx));
+    let mut task = tokio::spawn(actor.serve_idle(rx, IDLE_TTL));
     idle(&commands).await;
     tokio::time::advance(std::time::Duration::from_secs(119)).await;
-    commands.send(LineageCmd::IdleTick).unwrap();
     let (reply, answer) = oneshot::channel();
     commands.send(LineageCmd::Status { reply }).unwrap();
     answer
@@ -234,8 +234,7 @@ async fn an_open_probe_readiness_hold_expires_two_minutes_after_open() {
         .expect("the hold still applies before two minutes");
     assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
     tokio::time::advance(std::time::Duration::from_secs(2)).await;
-    commands.send(LineageCmd::IdleTick).unwrap();
-    let session = tokio::time::timeout(std::time::Duration::from_secs(1), &mut task)
+    let session = tokio::time::timeout(IDLE_TTL * 2, &mut task)
         .await
         .expect("an expired readiness hold must allow normal idle retirement")
         .unwrap();

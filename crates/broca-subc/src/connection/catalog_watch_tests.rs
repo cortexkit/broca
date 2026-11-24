@@ -93,8 +93,11 @@ async fn listed_without_a_read(
     names(listed)
 }
 
-fn names(entries: Vec<CatalogEntry>) -> Vec<String> {
-    entries.into_iter().map(|entry| entry.module_id).collect()
+fn names(entries: Arc<Vec<CatalogEntry>>) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.module_id.clone())
+        .collect()
 }
 
 /// Wait until the watch task has recorded `generation`.
@@ -206,4 +209,47 @@ async fn an_open_watch_never_holds_back_a_liveness_probe() {
         super::super::channel_zero_probe_blocker(&runtime, std::time::Instant::now()).is_none(),
         "the open watch held back the liveness probe"
     );
+}
+
+/// A held catalog is shared with every caller it serves, not copied for each.
+#[tokio::test]
+async fn a_held_catalog_is_served_without_a_copy() {
+    let (conn, mut write_rx, pending) = route_open_test_connection();
+    let conn = Arc::new(conn);
+    conn.follow_catalog();
+    let (watch, _) = next_request(&mut write_rx).await;
+    push(&pending, &watch, 3);
+    recorded(&conn, 3).await;
+    assert_eq!(
+        listed_after_a_read(&conn, &mut write_rx, &pending, 3, "aft").await,
+        ["aft"]
+    );
+    let first = conn.catalog_list().await.unwrap();
+    let second = conn.catalog_list().await.unwrap();
+    assert!(
+        write_rx.try_recv().is_err(),
+        "a held catalog was read again"
+    );
+    assert!(Arc::ptr_eq(&first, &second));
+}
+
+/// Following the catalog never keeps a connection alive: once its last owner drops it, the
+/// connection closes and its watch ends, though the daemon never ended the feed.
+#[tokio::test]
+async fn dropping_the_last_owner_of_a_followed_connection_ends_its_watch() {
+    let (conn, mut write_rx, pending) = route_open_test_connection();
+    let conn = Arc::new(conn);
+    conn.follow_catalog();
+    let (watch, _) = next_request(&mut write_rx).await;
+    push(&pending, &watch, 3);
+    recorded(&conn, 3).await;
+    let followed = Arc::downgrade(&conn);
+    drop(conn);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while followed.strong_count() > 0 || !pending.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the watch kept the connection alive after its last owner dropped it");
 }

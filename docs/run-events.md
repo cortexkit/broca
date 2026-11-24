@@ -188,6 +188,9 @@ whether an enabled publisher is doing its work:
 - `bus_store_batches_recorded`, `bus_store_batches_waiting` and
   `bus_store_batches_dropped`: batches of events sessions' writers handed over that reached
   the outbox, that wait for the account, and that were dropped because too many waited.
+- `bus_send_state_batches_dropped` and `bus_route_fact_batches_dropped`: batches of send
+  state notices and of route facts owed to routing that were dropped because too many waited
+  for the account.
 - `bus_loop_pass_age_ms`: milliseconds since the publisher loop began its latest
   pass. A running loop begins one every 250 ms; a value that keeps growing means a
   pass is stuck. Null when `bus_run_events_enabled` is off.

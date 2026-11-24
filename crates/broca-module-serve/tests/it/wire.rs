@@ -2203,6 +2203,8 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
             "bus_store_batches_recorded": 0,
             "bus_store_batches_waiting": 0,
             "bus_store_batches_dropped": 0,
+            "bus_send_state_batches_dropped": 0,
+            "bus_route_fact_batches_dropped": 0,
             "bus_loop_pass_age_ms": null,
         })
     );

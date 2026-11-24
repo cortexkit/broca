@@ -159,3 +159,33 @@ async fn an_idle_warm_fires_when_the_daemon_clock_reaches_it() {
     registry.handle().stop_idle_warm(&key, "shutdown");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A deleted session's stopped warming is forgotten with it: the registry keeps no entry for a
+/// session that no longer exists, and one created at the same address may warm again.
+#[tokio::test(start_paused = true)]
+async fn a_deleted_sessions_stopped_warming_is_forgotten() {
+    let (warms, _calls) = tokio::sync::mpsc::unbounded_channel();
+    let registry = LineageRegistry::new(Arc::new(Opener {
+        opens: Arc::new(AtomicU64::new(0)),
+        warms,
+        store: true,
+    }));
+    let key = LineageKey::new("/project", "test", "head");
+    let handle = registry.handle();
+    handle.arm_idle_warm(&key, 100, 0);
+    handle.stop_idle_warm(&key, "warm_refused");
+    assert!(registry
+        .inner
+        .idle_warm_stops
+        .lock()
+        .unwrap()
+        .contains(&key));
+    registry.evict_retention_caches(&key);
+    assert!(
+        registry.inner.idle_warm_stops.lock().unwrap().is_empty(),
+        "a deleted session leaves no stopped warming behind"
+    );
+    handle.arm_idle_warm(&key, 200, 100);
+    assert!(handle.has_idle_warm(&key));
+    handle.stop_idle_warm(&key, "real_run");
+}

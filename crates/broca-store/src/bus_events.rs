@@ -402,7 +402,8 @@ impl RunEventStore for SqliteStore {
         self.event_store().pending_route_fact(now_ms)
     }
     fn pending_findings_event(&self) -> Result<Option<Publication>, StoreError> {
-        crate::findings_events::pending(&self.conn.lock().unwrap())
+        let conn = crate::lock_connection(&self.conn)?;
+        crate::findings_events::pending(&conn)
     }
 }
 
@@ -455,7 +456,6 @@ impl SqliteStore {
         EventStore {
             conn: &self.conn,
             bus_events: &self.bus_events,
-            legacy: true,
         }
     }
 
@@ -471,35 +471,27 @@ impl SqliteStore {
 pub(crate) struct EventStore<'a> {
     pub(crate) conn: &'a Mutex<Connection>,
     pub(crate) bus_events: &'a State,
-    pub(crate) legacy: bool,
 }
 
 impl EventStore<'_> {
     fn write<T>(
         &self,
-        legacy_transaction: bool,
+        transaction: bool,
         write: impl FnOnce(&Connection) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        self.write_with_locked_effect(legacy_transaction, write, |_| {})
+        self.write_with_locked_effect(transaction, write, |_| {})
     }
 
     fn write_with_locked_effect<T>(
         &self,
-        legacy_transaction: bool,
+        transaction: bool,
         write: impl FnOnce(&Connection) -> Result<T, StoreError>,
         after_write: impl FnOnce(&T),
     ) -> Result<T, StoreError> {
-        let mut conn = self.conn.lock().unwrap();
-        if !self.legacy {
-            conn.pragma_update(None, "synchronous", "FULL")?;
-        }
-        let result = if legacy_transaction || !self.legacy {
-            let behavior = if self.legacy {
-                rusqlite::TransactionBehavior::Deferred
-            } else {
-                rusqlite::TransactionBehavior::Immediate
-            };
-            let tx = conn.transaction_with_behavior(behavior)?;
+        let mut conn = crate::lock_connection(self.conn)?;
+        let result = if transaction {
+            // Reserve SQLite's writer before a batch reads rows another connection can change.
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let result = write(&tx)?;
             tx.commit()?;
             Ok(result)
@@ -596,7 +588,8 @@ impl EventStore<'_> {
         let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
             return Ok(false);
         };
-        let (inserted, oversize, dropped) = self.write(true, |tx| {
+        let metrics = self.bus_metrics();
+        let (_, oversize, dropped) = self.write_with_locked_effect(true, |tx| {
             let (mut inserted, mut oversize, mut dropped) = (0, 0, 0);
             for event in events.iter_mut() {
                 match event.fit_send_ids() {
@@ -620,11 +613,10 @@ impl EventStore<'_> {
                 }
             }
             Ok((inserted, oversize, dropped))
+        }, |&(inserted, _, _)| {
+            // A drain can acknowledge the rows as soon as the connection is unlocked.
+            metrics.bus_outbox_depth.fetch_add(inserted, Ordering::Relaxed);
         })?;
-        let metrics = self.bus_metrics();
-        metrics
-            .bus_outbox_depth
-            .fetch_add(inserted, Ordering::Relaxed);
         metrics
             .bus_events_oversize
             .fetch_add(oversize, Ordering::Relaxed);
@@ -711,10 +703,7 @@ impl EventStore<'_> {
         let Some(account) = self.bus_events.account.lock().unwrap().clone() else {
             return Ok(None);
         };
-        let row: Option<(String, Vec<u8>)> = self
-            .conn
-            .lock()
-            .unwrap()
+        let row: Option<(String, Vec<u8>)> = crate::lock_connection(self.conn)?
             .query_row(
                 "SELECT fact_id,body FROM route_fact_outbox INDEXED BY route_fact_unpublished WHERE published_ms IS NULL AND at_ms<=?1 ORDER BY at_ms, rowid LIMIT 1",
                 [now_ms.saturating_sub(ROUTE_FACT_GRACE_MS)],
@@ -729,10 +718,7 @@ impl EventStore<'_> {
 
     /// The oldest send state notice not yet published.
     fn pending_send_state(&self) -> Result<Option<Publication>, StoreError> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
+        Ok(crate::lock_connection(self.conn)?
             .query_row(
                 "SELECT message_id,subject,session_ref,send_id,seq,body FROM send_state_outbox INDEXED BY send_state_unpublished WHERE published_ms IS NULL ORDER BY at_ms, rowid LIMIT 1",
                 [],
@@ -760,10 +746,7 @@ impl EventStore<'_> {
         &self,
         event_key: &str,
     ) -> Result<Option<(BindIdentity, Vec<u8>)>, StoreError> {
-        let value: Option<(String, Vec<u8>)> = self
-            .conn
-            .lock()
-            .unwrap()
+        let value: Option<(String, Vec<u8>)> = crate::lock_connection(self.conn)?
             .query_row(
                 "SELECT session,body FROM bus_event_outbox WHERE event_key=?1",
                 [event_key],
@@ -777,7 +760,7 @@ impl EventStore<'_> {
 
     pub fn pending_bus_event(&self) -> Result<Option<Publication>, StoreError> {
         // Bound to a name so the connection lock is released before a notice is looked up.
-        let lifecycle = self.conn.lock().unwrap().query_row(
+        let lifecycle = crate::lock_connection(self.conn)?.query_row(
             "SELECT event_key,subject,epoch,run_id,seq,session,body FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0 ORDER BY rowid LIMIT 1", [],
             |r| {
                 let body: Vec<u8> = r.get(6)?;
@@ -1009,7 +992,7 @@ impl EventStore<'_> {
     /// every pending row, and running it for every recorded batch would hold the shared
     /// connection for the length of that pass while every other store operation waited.
     fn resync_bus_depth(&self) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = crate::lock_connection(self.conn)?;
         let depth = conn.query_row(
             "SELECT count(*) FROM bus_event_outbox INDEXED BY bus_event_unpublished WHERE published_ms IS NULL AND best_effort=0",
             [],
@@ -1035,7 +1018,7 @@ impl EventStore<'_> {
     }
 }
 
-/// Insert one outbox row; returns its key and whether the row is new.
+/// Record one outbox row; returns its key and whether it adds to the lifecycle backlog.
 #[allow(clippy::too_many_arguments)]
 fn insert_event(
     conn: &Connection,
@@ -1054,9 +1037,32 @@ fn insert_event(
         matches!(event.detail, RunEventDetail::Progress { .. }).then_some(event.at_ms);
     let key_bytes = serde_jcs::to_vec(&(epoch, &event.run_id, event.seq, &subject, observation))?;
     let event_key = format!("{:x}", Sha256::digest(key_bytes));
-    let inserted = conn.execute("INSERT OR IGNORE INTO bus_event_outbox(event_key,run_id,seq,subject,epoch,session,body,at_ms,best_effort) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        params![event_key,event.run_id,event.seq,subject,epoch,serde_json::to_string(session)?,bytes,now_ms,best_effort])?;
-    Ok((event_key, inserted == 1))
+    let sql = if best_effort {
+        // The outbox retains only one progress sample at this sequence. Replace its key
+        // and bytes together so the new key fetches exactly what was published. The older
+        // best-effort key no longer resolves.
+        "INSERT INTO bus_event_outbox(event_key,run_id,seq,subject,epoch,session,body,at_ms,best_effort) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(epoch,run_id,seq,subject) DO UPDATE SET
+             event_key=excluded.event_key, session=excluded.session, body=excluded.body,
+             at_ms=excluded.at_ms, published_ms=NULL"
+    } else {
+        "INSERT OR IGNORE INTO bus_event_outbox(event_key,run_id,seq,subject,epoch,session,body,at_ms,best_effort) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+    };
+    let inserted = conn.execute(
+        sql,
+        params![
+            event_key,
+            event.run_id,
+            event.seq,
+            subject,
+            epoch,
+            serde_json::to_string(session)?,
+            bytes,
+            now_ms,
+            best_effort
+        ],
+    )?;
+    Ok((event_key, !best_effort && inserted == 1))
 }
 
 #[cfg(test)]
@@ -1130,6 +1136,86 @@ mod tests {
         let s = SqliteStore::open_in_memory().unwrap();
         s.enable_bus_events("box_test").unwrap();
         s
+    }
+
+    #[test]
+    fn latest_progress_at_the_same_sequence_is_readable_by_its_published_key() {
+        let store = enabled();
+        let retain = |at_ms| {
+            let beat = event(
+                1,
+                at_ms,
+                RunEventDetail::Progress {
+                    step: 1,
+                    last_content_at_ms: Some(at_ms - 5),
+                    max_content_gap_ms: Some(at_ms - 10),
+                },
+            );
+            let publication = store
+                .retain_bus_progress(&session(), "epoch", &beat, at_ms)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store.get_bus_event(&publication.event_key).unwrap(),
+                Some((session(), publication.body.clone())),
+                "the progress claim-check must resolve to the bytes it names"
+            );
+            publication.event_key
+        };
+        let previous = retain(1000);
+        let latest = retain(2000);
+        assert_ne!(previous, latest);
+        assert!(store.get_bus_event(&previous).unwrap().is_none());
+        assert_eq!(rows(&store).len(), 1);
+        assert!(store.pending_bus_event().unwrap().is_none());
+    }
+
+    #[test]
+    fn bus_outbox_depth_is_current_when_recording_releases_the_connection() {
+        let store = enabled();
+        let metrics = store.bus_metrics_arc();
+        *store.bus_events.before_write_unlock.lock().unwrap() = Some(Box::new(move |conn| {
+            let rows: u64 = conn
+                .query_row("SELECT count(*) FROM bus_event_outbox", [], |r| r.get(0))
+                .unwrap();
+            assert!(
+                conn.is_autocommit(),
+                "the new row must already be committed"
+            );
+            assert_eq!(rows, 1);
+            assert_eq!(
+                metrics.bus_outbox_depth.load(Ordering::Relaxed),
+                rows,
+                "an acknowledgement can run as soon as this lock is released"
+            );
+        }));
+        record(&store, &session(), "epoch", &[start()], 1000);
+        *store.bus_events.before_write_unlock.lock().unwrap() = None;
+        let next = store.pending_bus_event().unwrap().unwrap();
+        store
+            .acknowledge_bus_event(&next, PublishReceipt::new(1, false), 2000)
+            .unwrap();
+        assert_eq!(
+            store.bus_metrics().bus_outbox_depth.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn bus_batch_reserves_the_writer_before_reading() {
+        let dir = broca_test_support::scratch_root().join("bus-batch-writer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run-index.db");
+        let store = SqliteStore::open(&path).unwrap();
+        let keeper = Connection::open(&path).unwrap();
+        keeper.busy_timeout(std::time::Duration::ZERO).unwrap();
+        store.event_store().write(true, |tx| {
+            tx.query_row("SELECT count(*) FROM bus_event_outbox", [], |_| Ok(()))?;
+            let result = keeper.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
+            assert!(matches!(result, Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy),
+                "a keeper must not be able to invalidate the batch's read snapshot: {result:?}");
+            Ok(())
+        }).unwrap();
     }
 
     #[test]

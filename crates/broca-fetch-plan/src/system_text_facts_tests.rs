@@ -61,6 +61,54 @@ impl Fetcher for FactsProvider {
     }
 }
 
+struct UnavailableFactsProbe;
+
+#[async_trait]
+impl Fetcher for UnavailableFactsProbe {
+    async fn system_text_facts_supported(&self, _: &str) -> Result<bool, FetchError> {
+        std::future::pending().await
+    }
+
+    async fn catalog(&self, _: &str, _: &CatalogRequest) -> Result<Value, FetchError> {
+        panic!("a provider whose capability probe timed out must not be called")
+    }
+
+    async fn declare(&self, _: &str, _: &DeclareRequest) -> Result<Value, FetchError> {
+        unreachable!()
+    }
+
+    async fn describe_compaction(&self, _: &str) -> Result<DescribeAnswer, FetchError> {
+        unreachable!()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn optional_tool_and_text_are_absent_when_the_facts_probe_times_out() {
+    let mut input = plan_with(Some(facts()));
+    input["tool_items"] = json!([
+        {"provider": "persona-text", "preset": "default", "params": {}, "optional": true}
+    ]);
+    let plan = crate::parse_plan(&input, crate::CompactionSupport::Unsupported).unwrap();
+    let started = Instant::now();
+    let admitted = admit(
+        &plan,
+        &UnavailableFactsProbe,
+        &session(),
+        ADMISSION_DEADLINE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.elapsed(), Duration::from_secs(5));
+    assert!(admitted.manifest.system_text.is_empty());
+    assert_eq!(
+        json!(baseline_facts(&admitted.manifest).absent_items),
+        json!([
+            {"provider":"persona-text", "kind":"tool", "reason":"timeout"},
+            {"provider":"persona-text", "kind":"system_text", "reason":"timeout"}
+        ])
+    );
+}
+
 /// A composer's canonical facts: members and lists in UTF-8 byte order.
 fn facts() -> Value {
     json!({

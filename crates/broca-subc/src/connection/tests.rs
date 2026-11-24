@@ -831,6 +831,46 @@ async fn a_writer_queue_that_never_drains_releases_the_probe_turn_within_the_att
     );
 }
 
+/// A channel-zero read (`catalog.list`, `server.describe`) whose request can't enter a writer
+/// queue that stopped draining gives up within its reply timeout, having sent nothing and left
+/// no waiter behind. Its waiter holds back liveness probes, so one that waited for the writer
+/// with no clock running would keep the stalled socket from ever being found.
+#[tokio::test(start_paused = true)]
+async fn a_control_read_behind_a_writer_that_never_drains_gives_up_within_its_timeout() {
+    let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+    let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::new()));
+    let (write_tx, _write_rx) = mpsc::channel(1);
+    // Fill the writer queue; nothing ever reads it.
+    write_tx
+        .try_send(Frame::build(FrameType::Ping, control_flags(), 0, 0, 1_000, Vec::new()).unwrap())
+        .unwrap();
+    let conn = test_connection(write_tx, Arc::clone(&pending), routes, ConnToken(1), 1);
+    for read in ["catalog.list", "server.describe"] {
+        let start = time::Instant::now();
+        let result = time::timeout(Duration::from_secs(120), async {
+            match read {
+                "catalog.list" => conn.catalog_list().await.map(drop),
+                _ => conn.server_capabilities().await.map(drop),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("a stalled {read} must give up"));
+        assert!(
+            matches!(&result, Err(ConnError::Transport(message)) if message.contains("nothing was sent")),
+            "{read}: {result:?}"
+        );
+        assert!(
+            start.elapsed() <= RESPONSE_TIMEOUT,
+            "{read} gave up after {:?}",
+            start.elapsed()
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "{read} left a waiter that holds back the liveness probe"
+        );
+    }
+}
+
 /// The connection generation ends while a caller waits at a module's closed gate, before
 /// any replacement generation exists: the caller is released at once and its open fails
 /// like any open made during a reconnect, instead of sleeping on a gate nothing will probe

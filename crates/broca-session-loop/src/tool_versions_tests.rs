@@ -86,7 +86,12 @@ struct Tools {
 
 #[async_trait]
 impl ToolPlane for Tools {
-    async fn compatible_tools(&self, _manifest: &PlanManifest) -> Vec<CompatibleTool> {
+    async fn compatible_tools(
+        &self,
+        _bind: &broca_protocol::BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
+        _manifest: &PlanManifest,
+    ) -> Vec<CompatibleTool> {
         vec![CompatibleTool {
             provider: "aft".into(),
             tool: bash(CURRENT),

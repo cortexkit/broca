@@ -535,3 +535,40 @@ async fn an_imported_session_owes_nothing_and_a_later_run_is_billed_once() {
     assert_eq!(run_ids(&export.facts()), ["r1"]);
     assert_eq!(billed(&session).await, ["r1"]);
 }
+
+/// A queued send refused when it drains, whose end can't be written because storage failed,
+/// still lets the rest of its run's end go on: here the first run's billing, owed because its
+/// insert died with the storage, is tried again there and its facts reach the export. The
+/// `Billed` record can't follow, so the run stays owed for the next open.
+#[tokio::test]
+async fn a_refused_drain_whose_end_fails_still_bills_what_is_owed() {
+    use super::tests::{request, send_with};
+    let backend = leaked();
+    let export = Export::new(backend, &[Insert::CrashBefore]);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (commands, served) = open_billed(
+        backend,
+        executor(vec![text_step("a1", "hello")], Some(gate.clone())),
+        &parts(),
+        &export,
+        true,
+    )
+    .await;
+    let first = send(&commands, "r1", "first").await;
+    assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
+    // A send its run's admission refuses when it drains.
+    let mut refused = request("refused");
+    refused.stop_when = vec![broca_protocol::request::StopCondition::StepCount { n: 0 }];
+    let queued = send_with(&commands, "r2", refused, crate::actor::SendKey::Minted).await;
+    assert!(matches!(queued, SendOutcome::Pending { .. }), "{queued:?}");
+    gate.notify_one();
+    // Idle once the refused send's run has ended: its end was the actor's last work.
+    idle(&commands).await;
+    assert_eq!(
+        run_ids(&export.facts()),
+        ["r1"],
+        "the owed run was billed after the refused send's end failed"
+    );
+    drop(commands);
+    let _ = served.await;
+}

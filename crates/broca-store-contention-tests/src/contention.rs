@@ -75,8 +75,7 @@ fn with_regrabbing_writer<T>(tag: &str, write: impl FnOnce(Connection) -> T) -> 
         .execute_batch(
             "PRAGMA journal_mode=WAL;
          CREATE TABLE sample(id INTEGER PRIMARY KEY);
-         -- The two session-reference tables as broca-store's session_refs::init_schema
-         -- creates them. Its full schema can't be used here: its triggers name run_index.
+         -- The session-reference tables and rule row used by the production writer.
          CREATE TABLE agent_data_session_ref (
              session_ref TEXT PRIMARY KEY CHECK(length(session_ref)=32 AND session_ref NOT GLOB '*[^0-9a-f]*'),
              address TEXT NOT NULL, project_root TEXT NOT NULL, harness TEXT NOT NULL, session TEXT NOT NULL
@@ -85,6 +84,10 @@ fn with_regrabbing_writer<T>(tag: &str, write: impl FnOnce(Connection) -> T) -> 
              session_ref TEXT NOT NULL, address TEXT NOT NULL,
              PRIMARY KEY(session_ref,address)
          ) WITHOUT ROWID;
+         CREATE TABLE agent_data_session_ref_v2_rule (
+             id INTEGER PRIMARY KEY CHECK(id=1), probe TEXT NOT NULL, sessions INTEGER NOT NULL
+         );
+         INSERT INTO agent_data_session_ref_v2_rule VALUES(1, 'fixture', 0);
          BEGIN IMMEDIATE;",
         )
         .unwrap();

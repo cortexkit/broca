@@ -166,11 +166,67 @@ fn token_limit_field_policy_changes_rendered_key() {
 fn openai_chat_in_band_errors_follow_the_error_class_contract() {
     let cases = [
         (
-            "unknown code without a status fails permanent",
+            "a known request-fault code without a status fails permanent",
             json!({"message": "invalid prompt verbatim", "code": "invalid_prompt", "type": "invalid_request_error"}),
             ErrorClass::Permanent,
             None,
             Some("invalid_prompt"),
+            None,
+        ),
+        (
+            "an unfamiliar code with a request-fault type fails permanent",
+            json!({"message": "bad field", "code": "some_new_field_code", "type": "invalid_request_error"}),
+            ErrorClass::Permanent,
+            None,
+            Some("some_new_field_code"),
+            None,
+        ),
+        (
+            "an unfamiliar code without a status retries",
+            json!({"message": "try later", "code": "some_new_backend_code"}),
+            ErrorClass::Transient,
+            None,
+            Some("some_new_backend_code"),
+            None,
+        ),
+        (
+            "OpenAI's server_error type retries",
+            json!({"message": "An error occurred while processing your request.", "type": "server_error", "code": null}),
+            ErrorClass::Transient,
+            None,
+            Some("server_error"),
+            None,
+        ),
+        (
+            "OpenRouter's numeric code is the upstream status",
+            json!({"message": "provider down", "code": 502, "metadata": {"error_type": "provider_unavailable"}}),
+            ErrorClass::Transient,
+            Some(502),
+            Some("provider_unavailable"),
+            None,
+        ),
+        (
+            "OpenRouter's upstream rate limit retries",
+            json!({"message": "rate limited", "code": 429, "metadata": {"error_type": "rate_limit"}}),
+            ErrorClass::Transient,
+            Some(429),
+            Some("rate_limit"),
+            None,
+        ),
+        (
+            "OpenRouter's upstream request refusal fails permanent",
+            json!({"message": "bad request", "code": 400}),
+            ErrorClass::Permanent,
+            Some(400),
+            None,
+            None,
+        ),
+        (
+            "a numeric code outside the error-status range is not a status",
+            json!({"message": "provider detail", "code": 1301}),
+            ErrorClass::Transient,
+            None,
+            None,
             None,
         ),
         (
@@ -953,14 +1009,17 @@ fn openai_chat_clean_eof_without_terminal_marker_is_truncation() {
             ProviderControl::AssistantMessage { .. } | ProviderControl::Finished { .. }
         )
     )));
-    let error = normalizer
+    let final_events = normalizer
         .finish()
-        .expect_err("EOF without a finish reason or [DONE] must be rejected");
+        .expect("a cut body is the transport's to report, not a decode failure");
     assert!(
-        error
-            .to_string()
-            .contains("ended before a terminal chunk or [DONE]"),
-        "unexpected error: {error}"
+        !final_events.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Control(
+                ProviderControl::AssistantMessage { .. } | ProviderControl::Finished { .. }
+            )
+        )),
+        "EOF without a finish reason or [DONE] must not close the step: {final_events:?}"
     );
 }
 
@@ -1065,6 +1124,45 @@ fn openai_chat_usage_keeps_an_earlier_write_split_out() {
     );
     assert_eq!(usage.cache_write_tokens, Some(30));
     assert_eq!(usage.input_tokens, Some(70));
+}
+
+/// A later usage object that reports only a subdivision of the input total an earlier object
+/// recorded (cache reads or cache writes) takes those tokens out of fresh input: the prompt held
+/// 100 tokens, so the classes must add up to 100, however often the subdivision repeats.
+#[test]
+fn openai_chat_usage_splits_a_later_subdivision_out_of_the_recorded_total() {
+    let cached_only =
+        json!({"completion_tokens": 1, "prompt_tokens_details": {"cached_tokens": 80}});
+    let usage = chat_usage_of(
+        &[
+            json!({"prompt_tokens": 100, "completion_tokens": 1}),
+            cached_only.clone(),
+            cached_only,
+        ],
+        UsagePolicy::OpenAiUsage,
+    );
+    assert_eq!(
+        (usage.input_tokens, usage.cached_input_tokens),
+        (Some(20), Some(80))
+    );
+
+    let write_only = json!({"completion_tokens": 1, "cache_write_tokens": 30});
+    let usage = chat_usage_of(
+        &[
+            json!({"prompt_tokens": 100, "completion_tokens": 1, "prompt_tokens_details": {"cached_tokens": 50}}),
+            write_only.clone(),
+            write_only,
+        ],
+        UsagePolicy::OpenAiUsage,
+    );
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_write_tokens
+        ),
+        (Some(20), Some(50), Some(30))
+    );
 }
 
 /// xAI reports reasoning beside completion tokens; a later object with only the reasoning

@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use super::new_heads_tests::{module, send, Module, IDLE};
 use super::tests::{request, text_step};
-use crate::actor::{LineageCmd, SendOutcome, SubscribeOutcome};
+use crate::actor::{SendOutcome, SubscribeOutcome};
 use crate::fanout::{Delivery, FromCursor};
 use crate::registry::HEAD_SESSION_CLASS;
 
@@ -72,9 +72,9 @@ async fn stays_open(module: &Module, deliveries: &mut mpsc::Receiver<Delivery>, 
     }
 }
 
-/// An idle head with a subscriber stays open across several idle deadlines and an idle tick, and
-/// the registry hears that a subscriber holds it, which is what `session.restore_from_backup`
-/// tells an operator. The subscriber gets the next run's units on the stream it already holds.
+/// An idle head with a subscriber stays open across several idle deadlines, and the registry
+/// hears that a subscriber holds it, which is what `session.restore_from_backup` tells an
+/// operator. The subscriber gets the next run's units on the stream it already holds.
 /// Once it drops its stream, the head closes at an idle deadline.
 #[tokio::test]
 async fn a_subscriber_holds_an_idle_head_open_until_it_leaves() {
@@ -105,14 +105,6 @@ async fn a_subscriber_holds_an_idle_head_open_until_it_leaves() {
         })
     })
     .await;
-    stays_open(&module, &mut deliveries, 3).await;
-    let tick = module
-        .registry
-        .open_handle(&module.key)
-        .expect("the head is open")
-        .send(LineageCmd::IdleTick)
-        .await;
-    assert!(tick.is_ok(), "the actor takes the tick");
     stays_open(&module, &mut deliveries, 3).await;
 
     let mut later = request("second");

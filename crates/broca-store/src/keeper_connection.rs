@@ -1,5 +1,5 @@
 //! Existing-only connections for usage export tables and the session-address inventory.
-//! Opening these handles does not initialize the run_index or materialized message tables.
+//! Opening these handles checks only their required tables; it never creates or migrates them.
 
 use std::path::Path;
 

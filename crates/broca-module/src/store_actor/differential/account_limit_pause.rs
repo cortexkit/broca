@@ -168,6 +168,8 @@ type FrozenRequest = (
 struct Executor {
     provider: Limited,
     refuse: AtomicBool,
+    /// Refuses the next run's admission with a dependency that is only briefly unavailable.
+    refuse_transient: AtomicBool,
     signed_out: AtomicBool,
     requests: std::sync::Mutex<Vec<FrozenRequest>>,
 }
@@ -198,6 +200,9 @@ impl RunExecutor for Executor {
                 return Err(StoreRunError::Admission(RunError::Config(
                     "provider unavailable for resume".into(),
                 )));
+            }
+            if self.refuse_transient.swap(false, Ordering::SeqCst) {
+                return Err(StoreRunError::Admission(RunError::CredentialsUnavailable));
             }
             control.account_limit_pause = true;
             control.auth_selection = Some(selection());
@@ -290,6 +295,7 @@ impl Side {
                 sent: Default::default(),
             },
             refuse: AtomicBool::new(false),
+            refuse_transient: AtomicBool::new(false),
             signed_out: AtomicBool::new(false),
             requests: Default::default(),
         });
@@ -835,6 +841,24 @@ async fn account_limit_refused_resume_seals_and_drains_alike() {
     broca_test_support::pin!("alike", histories[0]);
     broca_test_support::pin!("alike", reads[0]);
     broca_test_support::pin!("alike", terminals[0]);
+}
+
+/// A resume refused because a dependency was briefly unavailable records that failure's own
+/// transient class, not a permanent fault.
+#[tokio::test]
+async fn account_limit_resume_refused_transiently_keeps_the_transient_class() {
+    let side = Side::new(true).await;
+    side.paused().await;
+    side.executor.refuse_transient.store(true, Ordering::SeqCst);
+    side.set_time(RESET);
+    let state = side.wait_state("r1", "interrupted").await;
+    assert_eq!(state["error"]["class"], "transient", "{state}");
+    assert_eq!(
+        state["error"]["provider_code"],
+        "account_limit_resume_refused"
+    );
+    side.idle().await;
+    side.stop().await;
 }
 
 #[tokio::test]

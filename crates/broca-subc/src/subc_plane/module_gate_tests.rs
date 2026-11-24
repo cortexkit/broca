@@ -15,8 +15,8 @@ struct StoppedModuleConnection {
 
 #[async_trait]
 impl ToolPlaneConnection for StoppedModuleConnection {
-    async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
-        Ok(Vec::new())
+    async fn catalog_list(&self) -> Result<Arc<Vec<CatalogEntry>>, ConnError> {
+        Ok(Arc::new(Vec::new()))
     }
 
     async fn route_open(

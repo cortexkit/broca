@@ -142,7 +142,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
         if let Some((run_id, reason)) = self.paused() {
             return refuse(Refusal::RunPaused {
                 run_id: run_id.0,
-                reason,
+                reason: reason.into(),
             });
         }
         let operations = self.session.operations();

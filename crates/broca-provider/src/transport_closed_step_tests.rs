@@ -3,7 +3,8 @@
 use super::completion::completion_holds_step;
 use super::*;
 use crate::families::{
-    anthropic_frozen_config, openai_chat_frozen_config, AnthropicMessages, OpenAiChat,
+    anthropic_frozen_config, bedrock_frozen_config, openai_chat_frozen_config, AnthropicMessages,
+    BedrockConverse, OpenAiChat,
 };
 use serde_json::json;
 
@@ -76,6 +77,61 @@ async fn a_chat_reset_after_its_finish_reason_still_fails_the_attempt() {
         data(json!({"id":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]})),
         data(json!({"id":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
     ];
+    let failure = drive(normalizer, records).await.unwrap_err();
+    assert_eq!(failure.outcome, AttemptOutcome::ChunkError);
+}
+
+/// After `[DONE]` nothing more can arrive, so a reset in place of the clean end loses nothing:
+/// the answer is kept rather than asked for, and billed, again.
+#[tokio::test]
+async fn a_chat_reset_after_done_keeps_the_answer() {
+    let normalizer = OpenAiChat.normalizer(&openai_chat_frozen_config("m"), StepId(1));
+    let records = vec![
+        data(json!({"id":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]})),
+        data(json!({"id":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})),
+        data(json!({"id":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}})),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    let completion = drive(normalizer, records)
+        .await
+        .expect("[DONE] closed the step before the reset");
+    assert!(completion_holds_step(&completion));
+}
+
+fn bedrock_answer() -> Vec<Vec<u8>> {
+    use crate::families::bedrock_converse::test_event_stream_message as message;
+    vec![
+        message("messageStart", br#"{"role":"assistant"}"#),
+        message(
+            "contentBlockDelta",
+            br#"{"contentBlockIndex":0,"delta":{"text":"ok"}}"#,
+        ),
+        message("contentBlockStop", br#"{"contentBlockIndex":0}"#),
+        message("messageStop", br#"{"stopReason":"end_turn"}"#),
+        message(
+            "metadata",
+            br#"{"usage":{"inputTokens":10,"outputTokens":2}}"#,
+        ),
+    ]
+}
+
+/// Bedrock's step ends with `messageStop` and its `metadata` trailer; a reset after both keeps
+/// the answer.
+#[tokio::test]
+async fn a_bedrock_reset_after_its_metadata_trailer_keeps_the_answer() {
+    let normalizer = BedrockConverse.normalizer(&bedrock_frozen_config("m"), StepId(1));
+    let completion = drive(normalizer, bedrock_answer())
+        .await
+        .expect("messageStop and metadata closed the step before the reset");
+    assert!(completion_holds_step(&completion));
+}
+
+/// Without the metadata trailer the usage is still missing, so a reset fails the attempt.
+#[tokio::test]
+async fn a_bedrock_reset_before_its_metadata_trailer_still_fails_the_attempt() {
+    let normalizer = BedrockConverse.normalizer(&bedrock_frozen_config("m"), StepId(1));
+    let mut records = bedrock_answer();
+    records.pop();
     let failure = drive(normalizer, records).await.unwrap_err();
     assert_eq!(failure.outcome, AttemptOutcome::ChunkError);
 }

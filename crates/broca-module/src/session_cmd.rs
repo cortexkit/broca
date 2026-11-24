@@ -231,8 +231,6 @@ pub enum LineageCmd {
         idle_auto: bool,
         reply: oneshot::Sender<WarmOutcome>,
     },
-    /// The idle-TTL timer fired — consider closing.
-    IdleTick,
     /// A durable compaction view/notice or effective model-window change may unblock the
     /// pending head. Refresh its admission snapshot before trying the drain again.
     CompactionChanged {
@@ -533,7 +531,14 @@ pub enum ReleaseOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LineageStatus {
     Idle,
-    Active { run_id: RunId, step: u64 },
+    Active {
+        run_id: RunId,
+        step: u64,
+    },
+    /// A run paused for sign-in whose probe is still deciding whether to resume it. Callers
+    /// outside the actor see it as the paused run it still is (`session.status` answers idle);
+    /// the actor tells it apart so a caller that must wait for the decision can.
+    Probing,
     Closing,
 }
 

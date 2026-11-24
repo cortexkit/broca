@@ -2,10 +2,17 @@
 
 use super::*;
 
+/// When the session comes due for deletion, as the actor last decided it. The older retention
+/// seconds are folded from the session's records one record at a time: each decision reads only
+/// the records appended since the last one.
 #[derive(Default)]
 pub(super) struct Timer {
-    at: Option<u64>,
-    deadline: Option<u64>,
+    /// The seq of the first record not folded into `fold` yet: every record before it is.
+    at: u64,
+    fold: crate::retention::PolicyFold,
+    /// How many records the fold has read, for tests that pin how much a decision reads.
+    #[cfg(test)]
+    records_read: usize,
 }
 
 impl Timer {
@@ -55,9 +62,9 @@ impl Timer {
         self.legacy(session, clock).await
     }
 
-    /// The deadline the older retention seconds give the session (`store_policy`), read from its
-    /// records again only once it has changed; `None` when it was sent none. When its records
-    /// can't be read, a second from now, so retention is decided again then.
+    /// The deadline the older retention seconds give the session (`store_policy`); `None` when
+    /// it was sent none. When its records can't be read, a second from now, so retention is
+    /// decided again then.
     async fn legacy<B: SessionBackend>(
         &mut self,
         session: &Session<B>,
@@ -69,17 +76,59 @@ impl Timer {
             .first_start
             .as_ref()
             .and_then(|start| start.retention_secs)?;
-        if self.at != Some(session.next_seq()) {
-            match session.records_from(0).await {
-                Ok(records) => {
-                    self.deadline = crate::retention::store::store_policy(&records)
-                        .and_then(|(_, _, deadline)| deadline);
-                    self.at = Some(session.next_seq());
-                }
-                Err(_) => return Some(clock.now_ms().saturating_add(1000)),
+        if self.catch_up(session).await.is_err() {
+            return Some(clock.now_ms().saturating_add(1000));
+        }
+        self.fold.decided().2
+    }
+
+    /// The retention seconds a new send of the session is checked against and keeps when it asks
+    /// for none: the shortest any of its run starts or sends set, queued sends included, since
+    /// each was admitted against the ones before it. `None` when its first run set none.
+    pub(super) async fn seconds<B: SessionBackend>(
+        &mut self,
+        session: &Session<B>,
+    ) -> Result<Option<u64>, SessionError> {
+        if session
+            .operations
+            .owner
+            .first_start
+            .as_ref()
+            .and_then(|start| start.retention_secs)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.catch_up(session).await?;
+        Ok(self.fold.seconds())
+    }
+
+    /// Folds the records appended since the last fold. Reading the whole session instead would
+    /// cost a long session its log's length after every write.
+    async fn catch_up<B: SessionBackend>(
+        &mut self,
+        session: &Session<B>,
+    ) -> Result<(), SessionError> {
+        let next = session.next_seq();
+        if next < self.at {
+            // Never expected: a session's seqs only grow. Fold it again from its start.
+            *self = Self::default();
+        }
+        if next == self.at {
+            return Ok(());
+        }
+        let records = session.records_from(self.at).await?;
+        #[cfg(test)]
+        {
+            self.records_read += records.len();
+        }
+        for (_, record) in &records {
+            if let Some(event) = crate::retention::store::policy_event(record) {
+                self.fold.apply(event);
             }
         }
-        self.deadline
+        self.at = next;
+        Ok(())
     }
 }
 
@@ -122,3 +171,6 @@ pub(super) async fn delete(registry: &crate::registry::RegistryHandle, key: &Bin
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

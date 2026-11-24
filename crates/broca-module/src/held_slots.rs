@@ -102,6 +102,10 @@ impl HeldSlots {
             .or_default();
         slot.call_key = Some(call_key.to_owned());
         slot.result = Some(result);
+        // A redelivery whose earlier waiter gave up left that waiter's sender behind; nobody
+        // can hear it any more, and a result redelivered on every pull would otherwise add one
+        // per pull for as long as the run can't take it.
+        slot.delivered.retain(|waiter| !waiter.is_closed());
         slot.delivered.push(tx);
         slot.arrived.notify_waiters();
         rx
@@ -449,6 +453,29 @@ mod tests {
             panic!("the resumed batch finds the deposit")
         };
         assert_eq!(result, answer("late"));
+    }
+
+    /// Redelivering a result whose earlier delivery gave up keeps only the waiters still
+    /// listening, however often the result is redelivered before a run takes it.
+    #[tokio::test]
+    async fn redeliveries_keep_only_the_waiters_still_listening() {
+        let slots = HeldSlots::new();
+        for _ in 0..5 {
+            let gave_up = slots.deposit(&ctx().bind, &call().tool_call_id, "lin:4", answer("late"));
+            drop(gave_up);
+        }
+        let mut listening =
+            slots.deposit(&ctx().bind, &call().tool_call_id, "lin:4", answer("late"));
+        let waiters: usize = slots
+            .slots
+            .lock()
+            .unwrap()
+            .values()
+            .map(|slot| slot.delivered.len())
+            .sum();
+        assert_eq!(waiters, 1, "only the delivery still waiting is kept");
+        slots.terminal_synced(&ctx(), &call().tool_call_id).await;
+        assert_eq!(listening.try_recv(), Ok(()));
     }
 
     /// A deposit made under another key never answers this held call.

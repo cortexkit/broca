@@ -669,15 +669,16 @@ fn with_request_body<R>(
     let prepared = crate::structured_output::prepare(frozen, opts);
     let opts = prepared.as_ref();
     let view = crate::families::compaction_view(frozen.family_id, opts);
-    let opts = view.as_ref();
-    let placed = crate::turn_system::place(frozen, opts, |_| true);
-    render_placed(frozen, placed.as_ref(), media, provenance, use_body)
+    // Templates are placed in `render_placed`, against the messages that actually render: a
+    // message rendered empty (a reply holding only reasoning that can't be echoed) is left out,
+    // so placing against the whole prompt first could turn into a user note a template whose
+    // real neighbours Anthropic accepts, and a user note is never placed again.
+    render_placed(frozen, view.as_ref(), media, provenance, use_body)
 }
 
-/// The rest of [`with_request_body`], for a prompt whose templates were placed. When leaving out
-/// the messages that render empty moves a template next to something Anthropic refuses beside
-/// it, the template is placed again against the messages that do render, and the request is
-/// rendered from that.
+/// The rest of [`with_request_body`]. Templates are placed against the messages that render:
+/// when leaving out the messages that render empty puts a template next to something Anthropic
+/// refuses beside it, that template becomes a user note and the request is rendered from that.
 fn render_placed<R>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,

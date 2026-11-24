@@ -12,6 +12,13 @@ use crate::sqlite_read::open_read_only_database;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 /// The source descriptor Core passes to broca, plus the source's message count and newest id.
 #[derive(Debug)]
 pub struct Extracted {
@@ -120,7 +127,21 @@ pub fn extract(db: &Path, session: &str, out_dir: &Path) -> Result<Extracted> {
         )?;
         let newest_mid = connection.query_row("SELECT id FROM message WHERE session_id=?1 ORDER BY time_created DESC, id DESC LIMIT 1", [session], |row| row.get(0)).optional()?;
         let sha256 = sha256_file(&temp)?;
-        std::fs::rename(&temp, &path)?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_PUBLISH.with(|hook| hook.take()) {
+            hook();
+        }
+        // A competing extract may have published after the early existence check. Never
+        // replace its bytes: another caller may already hold the digest for that path.
+        match std::fs::hard_link(&temp, &path) {
+            Ok(()) => std::fs::remove_file(&temp)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(
+                    format!("extract destination {} already exists", path.display()).into(),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
         broca_records::fs_ops::sync_dir(out_dir)?;
         Ok(Extracted {
             path,

@@ -332,6 +332,72 @@ fn test_scope() -> &'static BatchScope {
 }
 
 #[test]
+fn recording_the_same_pending_usage_fact_does_not_charge_twice() {
+    let store = SystemOneStore::open_in_memory().unwrap();
+    let context = FactContext {
+        source_instance_id: "source".into(),
+        provider: "provider".into(),
+        model: "model".into(),
+        auth_selection: None,
+        account_ref: None,
+        charge_basis: broca_core::ChargeBasis::MeteredApi,
+        charge_basis_mapping_version: 5,
+        charge_basis_overrides: "none".into(),
+    };
+    let paid = PaidRecord {
+        spend_nanos: 4200,
+        now_ms: 2,
+        fact: Some(&context),
+    };
+    let outcome = answered(0, "{}", Some(100));
+    assert_eq!(
+        store
+            .claim(&claim("replay", "digest", None, "owner", 1))
+            .unwrap(),
+        Claimed::Fresh
+    );
+    assert!(store
+        .record_paid(ROLE, "replay", "owner", &outcome, &paid)
+        .unwrap());
+    assert!(store
+        .record_paid(ROLE, "replay", "owner", &outcome, &paid)
+        .unwrap());
+    assert!(store
+        .record_paid(
+            ROLE,
+            "replay",
+            "owner",
+            &answered(0, "changed", Some(200)),
+            &paid
+        )
+        .is_err());
+    assert!(store
+        .record_paid(
+            ROLE,
+            "replay",
+            "owner",
+            &outcome,
+            &PaidRecord {
+                spend_nanos: 4201,
+                ..paid
+            }
+        )
+        .is_err());
+    let pending = store.pending_facts().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].fact.usage.input_tokens, Some(100));
+    assert_eq!(pending[0].spend_nanos, 4200);
+    store.release(ROLE, "replay", "owner").unwrap();
+    let record = resumed(
+        store
+            .claim(&claim("replay", "digest", None, "next", 3))
+            .unwrap(),
+    );
+    assert_eq!(record.spent_nanos, 4200);
+    assert_eq!(record.outcomes, vec![outcome]);
+}
+
+#[test]
 fn paid_outcome_and_outbox_survive_reopen_and_publish_only_once() {
     let path = scratch("paid-recovery");
     let export_path = path.with_file_name("run-index.db");

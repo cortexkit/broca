@@ -1,6 +1,5 @@
 //! broca's SQLite stores: `run-index.db` ([`SqliteStore`]: the session-ref index, scope
-//! reservations, bus outboxes and usage export facts), `system-one.db`, `grants.db` and
-//! `late-results.db`.
+//! reservations, bus outboxes and usage export facts), `system-one.db` and `grants.db`.
 //!
 //! None of them holds a session's records: those live in `broca-session-store`, and anything
 //! here that is derived from them loses to them. Kept in its own crate so the bundled SQLite
@@ -28,7 +27,6 @@ pub mod legacy_inventory;
 pub(crate) use export_index::ExportStore;
 pub(crate) use keeper_connection::KeeperOpenError;
 pub mod grants;
-pub mod late_results_store;
 pub mod session_address;
 pub mod session_inventory;
 mod state_marker;
@@ -84,7 +82,6 @@ pub mod conformance;
 
 #[derive(Debug)]
 pub enum StoreError {
-    #[cfg(windows)]
     PrivateAccess {
         path: std::path::PathBuf,
         source: std::io::Error,
@@ -92,9 +89,7 @@ pub enum StoreError {
     Sqlite(rusqlite::Error),
     Int(std::num::TryFromIntError),
     Json(serde_json::Error),
-    /// The log being projected is a corrupt lineage (replay refused to fabricate a
-    /// prefix). Surfaced rather than silently materializing a wrong projection.
-    Replay(broca_core::ReplayError),
+    PoisonedConnection,
     InconsistentSnapshot(&'static str),
     BusEvent(String),
     MarkedStateRoot(MarkedStateRoot),
@@ -103,14 +98,13 @@ pub enum StoreError {
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(windows)]
             StoreError::PrivateAccess { path, source } => {
                 write!(f, "private database {}: {source}", path.display())
             }
             StoreError::Int(e) => write!(f, "integer conversion: {e}"),
             StoreError::Sqlite(e) => write!(f, "sqlite: {e}"),
             StoreError::Json(e) => write!(f, "json: {e}"),
-            StoreError::Replay(e) => write!(f, "replay: {e}"),
+            StoreError::PoisonedConnection => f.write_str(session_refs::CONNECTION_POISONED),
             StoreError::BusEvent(e) => write!(f, "run event: {e}"),
             StoreError::MarkedStateRoot(e) => write!(f, "{e}"),
             StoreError::InconsistentSnapshot(message) => {
@@ -122,20 +116,6 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-impl From<broca_core::projection_plan::ProjectionPlanError> for StoreError {
-    fn from(error: broca_core::projection_plan::ProjectionPlanError) -> Self {
-        use broca_core::projection_plan::ProjectionPlanError;
-        match error {
-            ProjectionPlanError::Json(e) => Self::Json(e),
-            ProjectionPlanError::Replay(e) => Self::Replay(e),
-            ProjectionPlanError::Int(e) => Self::Int(e),
-            ProjectionPlanError::InconsistentSnapshot(message) => {
-                Self::InconsistentSnapshot(message)
-            }
-        }
-    }
-}
-
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
         StoreError::Sqlite(e)
@@ -146,22 +126,19 @@ impl From<serde_json::Error> for StoreError {
         StoreError::Json(e)
     }
 }
-impl From<broca_core::ReplayError> for StoreError {
-    fn from(e: broca_core::ReplayError) -> Self {
-        StoreError::Replay(e)
-    }
-}
-
-/// SQLite-backed materialized store. The connection is behind a `Mutex` so the
-/// store is `Sync` (rusqlite `Connection` is `Send` not `Sync`).
-///
-/// The single `Mutex<Connection>` serializes database access. Projection keeps log replay,
-/// checkpoint folding, and JSON serialization outside that mutex so unrelated sessions wait
-/// only for the short snapshot and commit phases.
+/// The run index, including the session inventory, bus outboxes and usage-export facts.
+/// One mutex serializes access through this handle and its shared inventory and export views.
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     bus_events: bus_events::State,
     export: ExportStore,
+}
+
+/// Refuse to reuse the connection after a panic while it was locked.
+fn lock_connection(
+    conn: &Mutex<Connection>,
+) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
+    conn.lock().map_err(|_| StoreError::PoisonedConnection)
 }
 
 /// Restrict a store file and its sqlite sidecars to the owner.
@@ -196,7 +173,6 @@ fn restrict_to_owner(path: &Path) {
 #[cfg(test)]
 thread_local! {
     static SQLITE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static PROJECTION_AFTER_STATE_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn sqlite_open_observed() {
@@ -241,12 +217,11 @@ fn prepare_private_sqlite(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Create the SQLite database file at `path` owner-only before SQLite first opens it, for a
-/// store outside this crate that keeps its own schema. SQLite creates files through the
-/// process umask and gives no mode hook; a journal or WAL sidecar it creates later takes the
-/// database file's own mode on Unix, and on Windows the state tree's protected, inheritable
-/// DACL (checked here) gives every sidecar owner-only access. An existing file is opened as it
-/// is; on Windows one with broader access is refused.
+/// Create the SQLite database file at `path` owner-only before SQLite first opens it.
+/// SQLite creates files through the process umask and gives no mode hook. On Unix, new
+/// sidecars take the database file's mode; on Windows, the state tree's protected, inheritable
+/// DACL gives them owner-only access. An existing file is opened as it is; on Windows one
+/// with broader access is refused.
 pub fn create_private_sqlite(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -325,14 +300,8 @@ impl SqliteStore {
     ///
     /// Refused in a state root marked with another format (see [`refuse_marked_state_root`]).
     ///
-    /// On Unix the file is restricted to its owner after creation. This database holds
-    /// session refs, usage facts and outbound events, and sqlite creates it through the umask,
-    /// so a default install lands it 0644. sqlite gives no mode hook, so the chmod happens here,
-    /// immediately after open, before any row is written.
-    ///
-    /// Sidecars are covered too: WAL-mode sqlite creates `-wal` and `-shm` beside the
-    /// database, and the `-wal` holds committed frames not yet checkpointed into the main
-    /// file.
+    /// Create the file owner-only before SQLite can write any schema or sidecars. On Unix,
+    /// also restrict existing database files and sidecars before opening them.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         refuse_marked_state_root(path.parent().unwrap_or(Path::new(".")))
@@ -341,15 +310,14 @@ impl SqliteStore {
     }
 
     fn open_decided(path: &Path) -> Result<Self, StoreError> {
-        #[cfg(windows)]
-        prepare_private_sqlite(path).map_err(|source| StoreError::PrivateAccess {
+        create_private_sqlite(path).map_err(|source| StoreError::PrivateAccess {
             path: path.to_path_buf(),
             source,
         })?;
+        restrict_to_owner(path);
         sqlite_open_observed();
         let conn = Connection::open(path)?;
         let (source_instance_id, source_epoch, high_water) = Self::init(&conn)?;
-        restrict_to_owner(path);
         let conn = Arc::new(Mutex::new(conn));
         Ok(Self {
             conn: Arc::clone(&conn),
@@ -481,6 +449,61 @@ mod tests {
         SqliteStore::init(&conn).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn new_run_index_files_are_private_during_schema_initialization() {
+        use std::os::unix::fs::PermissionsExt;
+        thread_local! {
+            static ROOT: std::cell::RefCell<std::path::PathBuf> = const {
+                std::cell::RefCell::new(std::path::PathBuf::new())
+            };
+        }
+        let root = broca_test_support::scratch_root().join("store-private-init");
+        std::fs::create_dir_all(&root).unwrap();
+        ROOT.with(|saved| saved.replace(root.clone()));
+        super::SCHEMA_UPGRADE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(|| {
+                ROOT.with(|root| {
+                    let root = root.borrow();
+                    for name in ["run-index.db", "run-index.db-wal", "run-index.db-shm"] {
+                        let mode = std::fs::metadata(root.join(name))
+                            .unwrap()
+                            .permissions()
+                            .mode();
+                        assert_eq!(
+                            mode & 0o077,
+                            0,
+                            "{name} has mode {:o} during schema initialization",
+                            mode & 0o777
+                        );
+                    }
+                    Ok(())
+                })
+            });
+        });
+        let store = SqliteStore::open(root.join("run-index.db")).unwrap();
+        super::SCHEMA_UPGRADE_HOOK.with(|hook| *hook.borrow_mut() = None);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn poisoned_shared_run_index_returns_errors_instead_of_panicking() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.enable_bus_events("box_test").unwrap();
+        assert!(std::panic::catch_unwind(|| {
+            let _connection = store.conn.lock().unwrap();
+            panic!("injected run-index panic");
+        })
+        .is_err());
+        let session = crate::conformance::session("poison-probe");
+        let address = broca_core::session_addr(&session);
+        assert!(store.record_session(&address, &session).is_err());
+        assert!(store.read_export_page(None, 1).is_err());
+        assert!(store.session_refs(std::iter::empty()).is_err());
+        assert!(store.pending_bus_event().is_err());
+    }
+
     #[test]
     fn concurrent_store_opens_share_one_complete_schema_and_export_identity() {
         let path = broca_test_support::scratch_root().join("concurrent-store-init.sqlite");
@@ -552,17 +575,11 @@ mod tests {
 
     use super::SqliteStore;
 
-    /// A run-index row records WHEN it entered its state, so a stale row is distinguishable
-    /// from a live one.
-    ///
-    /// Without this, an operator asking "is anything running right now" reads `active` and
-    /// cannot tell a run started seconds ago from one abandoned weeks ago by a process that
-    /// died mid-run. The two are the same row.
     /// Every file this store creates must be owner-only, enumerated rather than named.
     ///
     /// Asserting the mode of the file under discussion is what misses the sidecars: sqlite
     /// creates `-wal` and `-shm` beside the database, and the `-wal` holds committed frames
-    /// not yet checkpointed, so it carries transcript content under a name nobody thinks to
+    /// not yet checkpointed, so it carries index data under a name nobody thinks to
     /// check. Enumerating the directory catches a creation site nobody was thinking about,
     /// which is the case that actually happens.
     #[cfg(unix)]

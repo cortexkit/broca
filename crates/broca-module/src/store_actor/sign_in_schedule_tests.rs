@@ -27,6 +27,10 @@ struct ScriptedExecutor {
     fail_after_move: AtomicBool,
     reached_model: Arc<Notify>,
     release_failure: Arc<Notify>,
+    /// While set, each routing question waits for `ask_release` after telling `ask_entered`.
+    gate_asks: AtomicBool,
+    ask_entered: Arc<Notify>,
+    ask_release: Arc<Notify>,
 }
 
 struct Continuation<'a> {
@@ -61,6 +65,10 @@ impl Provider for PendingModel {
 impl AccountContinue<Box<dyn Provider>> for Continuation<'_> {
     async fn ask(&self, _: &Wall<'_>) -> Answer<Box<dyn Provider>> {
         self.executor.asks.fetch_add(1, Ordering::SeqCst);
+        if self.executor.gate_asks.load(Ordering::SeqCst) {
+            self.executor.ask_entered.notify_one();
+            self.executor.ask_release.notified().await;
+        }
         match self
             .executor
             .replies
@@ -196,6 +204,9 @@ impl Fixture {
             fail_after_move: AtomicBool::new(false),
             reached_model: Arc::default(),
             release_failure: Arc::default(),
+            gate_asks: AtomicBool::new(false),
+            ask_entered: Arc::default(),
+            ask_release: Arc::default(),
         });
         let backend: &'static MemoryBackend = Box::leak(Box::default());
         let parts = SharedParts::new(Box::new(MemoryParts::default()));
@@ -462,4 +473,157 @@ async fn a_probe_loop_error_after_pause_lift_ends_the_orphan_and_drains_the_queu
         .unwrap();
     let ended = records.iter().position(|(_, record)| matches!(record, Record::RunEnd(end) if end.run_id == "r1" && end.reason == broca_protocol::RunFinishReason::Error)).unwrap();
     assert!(resumed < ended);
+}
+
+/// The session `fixture` left paused for sign-in, opened again by a new actor over the same
+/// records, which serves it on its own task and starts the probe owed at open.
+async fn reopened(
+    fixture: Fixture,
+) -> (
+    Arc<ScriptedExecutor>,
+    Commands,
+    tokio::task::JoinHandle<Session<&'static MemoryBackend>>,
+) {
+    let Fixture {
+        actor,
+        executor,
+        backend,
+        parts,
+        ..
+    } = fixture;
+    drop(actor);
+    let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts))
+        .with_retention_clock(executor.clock.clone());
+    let (tx, rx) = mpsc::unbounded_channel();
+    let commands = Commands::over(tx, backend);
+    let task = tokio::spawn(actor.serve(rx));
+    (executor, commands, task)
+}
+
+/// A keyed send to a session whose sign-in probe moved the run to another account and resumed
+/// it is answered while that run works, as for any running run; the actor doesn't wait for the
+/// run to end before it serves the send, or anything after it.
+#[tokio::test]
+async fn a_keyed_send_after_a_probe_resumed_the_run_is_answered_while_it_runs() {
+    let mut fixture = Fixture::new(
+        "keyed-after-lift",
+        vec![RoutingReply::Refuse, RoutingReply::Move],
+    )
+    .await;
+    fixture.check().await;
+    fixture
+        .executor
+        .fail_after_move
+        .store(true, Ordering::SeqCst);
+    let (executor, commands, task) = reopened(fixture).await;
+    executor.reached_model.notified().await;
+    let queued = tokio::time::timeout(
+        broca_test_support::EVENT_HANG_GUARD,
+        tests::send_with(
+            &commands,
+            "r2",
+            tests::untooled("queued"),
+            SendKey::SendId("q2".into()),
+        ),
+    )
+    .await
+    .expect("a keyed send is answered while the resumed run works");
+    assert!(
+        matches!(queued, crate::actor::SendOutcome::Pending { .. }),
+        "{queued:?}"
+    );
+    assert!(matches!(
+        tests::status(&commands).await,
+        crate::session_cmd::LineageStatus::Active { .. }
+    ));
+    executor.release_failure.notify_one();
+    idle(&commands).await;
+    drop(commands);
+    let session = task.await.unwrap();
+    let run = session.operations().run.as_ref().unwrap();
+    assert_eq!(run.run_id, "r2", "the keyed send ran after the resumed run");
+    assert_eq!(
+        run.finished,
+        Some(broca_protocol::RunFinishReason::Completed)
+    );
+}
+
+/// While a sign-in probe hasn't decided yet, the session's run is still the paused one: its
+/// status reads as probing, a plain send and a steer are refused as for any run paused for sign-in,
+/// and an interrupt waits for the probe's decision, then ends the paused run and runs.
+#[tokio::test]
+async fn commands_during_an_undecided_probe_meet_the_paused_run() {
+    let mut fixture = Fixture::new(
+        "undecided-probe",
+        vec![RoutingReply::Refuse, RoutingReply::Hold(None)],
+    )
+    .await;
+    fixture.check().await;
+    fixture.executor.gate_asks.store(true, Ordering::SeqCst);
+    let (executor, commands, task) = reopened(fixture).await;
+    executor.ask_entered.notified().await;
+    assert_eq!(
+        tests::status(&commands).await,
+        crate::session_cmd::LineageStatus::Probing,
+        "a probing run reads as its probe deciding, which session.status answers as paused"
+    );
+    let paused = crate::actor::SendOutcome::RunPaused {
+        run_id: RunId("r1".into()),
+        reason: broca_protocol::PauseReason::AuthRequired,
+    };
+    assert_eq!(
+        tests::send_with(&commands, "r2", tests::untooled("plain"), SendKey::Minted).await,
+        paused,
+        "a plain send"
+    );
+    assert_eq!(
+        tests::send_as(
+            &commands,
+            "s1",
+            tests::untooled("steered"),
+            SendKey::Minted,
+            broca_protocol::Delivery::Steer
+        )
+        .await,
+        paused,
+        "a steer"
+    );
+    let (interrupted, ()) = tokio::join!(
+        tests::send_as(
+            &commands,
+            "r3",
+            tests::untooled("interrupting"),
+            SendKey::Minted,
+            broca_protocol::Delivery::Interrupt
+        ),
+        async {
+            tokio::task::yield_now().await;
+            executor.ask_release.notify_one();
+        }
+    );
+    assert!(
+        matches!(interrupted, crate::actor::SendOutcome::Pending { .. }),
+        "{interrupted:?}"
+    );
+    idle(&commands).await;
+    drop(commands);
+    let session = task.await.unwrap();
+    let records = session.open_log_records().await.unwrap();
+    assert!(
+        records.iter().any(|(_, record)| matches!(record,
+            Record::RunEnd(end) if end.run_id == "r1"
+                && end.reason == broca_protocol::RunFinishReason::Cancelled)),
+        "the interrupt ended the paused run"
+    );
+    let run = session.operations().run.as_ref().unwrap();
+    assert_ne!(run.run_id, "r1");
+    assert_eq!(
+        run.finished,
+        Some(broca_protocol::RunFinishReason::Completed),
+        "the interrupt's message ran"
+    );
+    assert_eq!(executor.asks.load(Ordering::SeqCst), 2);
 }

@@ -135,6 +135,156 @@ fn resumable(text: &str) -> SubmissionRequest {
     sent
 }
 
+/// A store actor over a new session in memory whose first run pauses for a restart, under the
+/// retention clock `clock` when there is one.
+async fn restart_pausing(
+    clock: Option<broca_core::clock::Clock>,
+) -> (
+    store::Commands,
+    tokio::task::JoinHandle<
+        broca_session_store::session::Session<&'static broca_session_store::backend::MemoryBackend>,
+    >,
+) {
+    let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+        broca_session_loop::parts::MemoryParts::default(),
+    ));
+    let backend: &'static broca_session_store::backend::MemoryBackend = Box::leak(Box::default());
+    let session = broca_session_store::session::Session::create(
+        backend,
+        broca_session_store::backend::SessionAddr(store::ADDR.into()),
+        store::triple(),
+        &store::deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let mut actor = super::super::StoreActor::new(
+        store::bind(),
+        session,
+        Arc::new(StopsFirstRun::new(Arc::new(store::executor(hello(), None)))),
+        Box::new(parts),
+    )
+    .with_readers(Arc::new(move || backend));
+    if let Some(clock) = clock {
+        actor = actor.with_retention_clock(clock);
+    }
+    let (commands, receiver) = mpsc::unbounded_channel();
+    (
+        store::Commands::over(commands, backend),
+        tokio::spawn(actor.serve(receiver)),
+    )
+}
+
+/// The owner's send that first freezes a storage policy, arriving as a steer into a run paused for
+/// a restart, writes that policy with its steer, as a steer into a running run does.
+#[tokio::test]
+async fn a_steer_into_a_run_paused_for_a_restart_freezes_its_storage_policy() {
+    use cortexkit_role_llm_runner::session_retention::{Keep, RetentionPolicy};
+    let (commands, served) = restart_pausing(None).await;
+    let owner = broca_protocol::BindPrincipal::Reserved {
+        module_id: "starter".into(),
+    };
+    let caller = store::Caller::default();
+    let mut first = resumable("first");
+    first.principal = Some(owner.clone());
+    let first = caller.shape("r1", &SendKey::Minted, first);
+    let started = store::send_exactly(
+        &commands,
+        "r1",
+        first,
+        SendKey::Minted,
+        Delivery::Queue,
+        None,
+    )
+    .await;
+    assert!(matches!(started, SendOutcome::Active { .. }), "{started:?}");
+    store::idle(&commands).await;
+    let policy = RetentionPolicy::new(Keep::days(7), 0, false, false);
+    let mut steer = resumable("also this");
+    steer.principal = Some(owner);
+    steer.retention_policy = Some(policy.clone());
+    let key = || SendKey::SendId("k1".into());
+    let steer = caller.shape("r-k1", &key(), steer);
+    let steered = store::send_exactly(&commands, "r-k1", steer, key(), Delivery::Steer, None).await;
+    assert!(matches!(steered, SendOutcome::Paused { .. }), "{steered:?}");
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(
+        session
+            .operations
+            .run
+            .as_ref()
+            .unwrap()
+            .pending_steers
+            .len(),
+        1
+    );
+    assert_eq!(
+        session.operations.retention_policy,
+        Some(serde_json::to_value(&policy).unwrap()),
+        "the steer's policy was frozen"
+    );
+}
+
+/// A steer into a run paused for a restart, on a session kept by the older retention seconds, is
+/// accepted at the retention clock's time, as a steer into a running run is: that time is the
+/// session's activity its deadline counts from.
+#[tokio::test]
+async fn a_steer_into_a_run_paused_for_a_restart_is_stamped_by_the_retention_clock() {
+    const NOW: u64 = 1_700_000_000_000;
+    let dir = super::scratch_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("test-clock"),
+        serde_json::json!({"now_ms": NOW}).to_string(),
+    )
+    .unwrap();
+    let clock = broca_core::clock::Clock::for_state_root(&dir).unwrap();
+    let (commands, served) = restart_pausing(Some(clock)).await;
+    let caller = store::Caller::default();
+    let first = caller.shape("r1", &SendKey::Minted, resumable("first"));
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    commands
+        .send(crate::actor::LineageCmd::Send {
+            session_class: None,
+            retention: Some(3_600),
+            stop_sequences_named: false,
+            conversation_key: None,
+            title: None,
+            run_id: RunId("r1".into()),
+            request: Box::new(first),
+            kind: crate::executor::RunKind::FreshOrResume,
+            key: SendKey::Minted,
+            skip_materialization: false,
+            delivery: Delivery::Queue,
+            plan: None,
+            order: None,
+            reply,
+        })
+        .unwrap();
+    let started = answer.await.unwrap();
+    assert!(matches!(started, SendOutcome::Active { .. }), "{started:?}");
+    store::idle(&commands).await;
+    let key = || SendKey::SendId("k1".into());
+    let steer = caller.shape("r-k1", &key(), resumable("also this"));
+    let steered = store::send_exactly(&commands, "r-k1", steer, key(), Delivery::Steer, None).await;
+    assert!(matches!(steered, SendOutcome::Paused { .. }), "{steered:?}");
+    drop(commands);
+    let session = served.await.unwrap();
+    let steer = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, record)| match record {
+            broca_session_store::record::Record::Steer(steer) => Some(steer),
+            _ => None,
+        })
+        .expect("the steer was recorded");
+    assert_eq!(steer.written_at_ms, Some(NOW));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A run paused for a restart takes a steer: the steer is recorded for the run's resume and
 /// answered naming the paused run; a retry of it is answered by that run, and one with another
 /// payload is refused naming what differs. A plain send waits behind the paused run.

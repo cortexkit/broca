@@ -19,8 +19,8 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::SqliteStore;
 
-/// A connection to export_meta, export_facts and export_imported_runs in an existing
-/// run-index.db. It does not depend on the run_index or materialized message tables.
+/// A connection to the usage-export tables in run-index.db: export_meta, export_facts
+/// and export_imported_runs.
 /// Source identity and high-water getters retain the legacy open-time cache semantics.
 pub struct ExportStore {
     conn: Arc<Mutex<Connection>>,
@@ -163,10 +163,7 @@ impl ExportStore {
         fact: &broca_core::system_one_fact::SystemOneFact,
     ) -> Result<bool, ExportError> {
         let json = serde_json::to_string(fact).map_err(storage)?;
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| storage("store mutex poisoned"))?;
+        let mut conn = crate::lock_connection(&self.conn).map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage)?;
@@ -226,10 +223,7 @@ impl ExportStore {
         since: Option<ExportCursor>,
         limit: u64,
     ) -> Result<ExportPage, ExportError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| storage("store mutex poisoned"))?;
+        let mut conn = crate::lock_connection(&self.conn).map_err(storage)?;
         let tx = conn.transaction().map_err(storage)?;
         let (source_epoch, source_instance_id, high_water) = tx
             .query_row(
@@ -328,10 +322,7 @@ impl ExportStore {
         if segments.is_empty() && attempts.is_empty() {
             return Ok(());
         }
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| storage("store mutex poisoned"))?;
+        let mut conn = crate::lock_connection(&self.conn).map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage)?;
@@ -385,10 +376,7 @@ impl ExportStore {
             return Ok(());
         }
 
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| storage("store mutex poisoned"))?;
+        let mut conn = crate::lock_connection(&self.conn).map_err(storage)?;
         // Reserve SQLite's database writer before reading the imported-run set,
         // so another connection cannot commit a floor between this read and insertion.
         let tx = conn
@@ -747,7 +735,7 @@ impl ExportStore {
         session: &broca_protocol::BindIdentity,
         run_id: &RunId,
     ) -> Result<bool, ExportError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = crate::lock_connection(&self.conn).map_err(storage)?;
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM export_imported_runs WHERE session=?1 AND run_id=?2)",
             rusqlite::params![
@@ -766,10 +754,7 @@ impl ExportStore {
         run_ids: &[RunId],
     ) -> Result<(), ExportError> {
         let session_json = serde_json::to_string(session).map_err(storage)?;
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| storage("store mutex poisoned"))?;
+        let mut conn = crate::lock_connection(&self.conn).map_err(storage)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(storage)?;

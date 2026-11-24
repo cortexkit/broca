@@ -1234,6 +1234,10 @@ impl CatalogFetch<'_> {
     fn optional_tools(&self) -> bool {
         self.tool_item.is_some_and(|item| item.optional) && self.optional()
     }
+
+    fn has_facts(&self) -> bool {
+        self.text_item.is_some_and(|item| item.facts.is_some())
+    }
 }
 
 /// Admit `plan`: fetch every provider it names through `fetcher`, all within `deadline` of now,
@@ -1290,7 +1294,7 @@ pub async fn admit(
         }
     }
     for fetch in &mut catalog_fetches {
-        if fetch.text_item.is_none_or(|item| item.facts.is_none()) {
+        if fetch.optional_tools() || !fetch.has_facts() {
             continue;
         }
         let provider = fetch.provider;
@@ -1306,14 +1310,22 @@ pub async fn admit(
                     }
                 })?;
     }
-    let catalogs = futures::future::join_all(catalog_fetches.iter().map(|fetch| {
-        let request = fetch.request(plan, fetch.tool_item);
+    let catalogs = futures::future::join_all(catalog_fetches.iter_mut().map(|fetch| {
         let fetch_deadline = if fetch.optional_tools() {
             deadline.min(started + OPTIONAL_TOOL_BUDGET)
         } else {
             deadline
         };
         async move {
+            // If this probe fails, omit the optional provider and its text as for a catalog failure.
+            if fetch.optional_tools() && fetch.has_facts() {
+                fetch.facts_supported = within_deadline(fetch_deadline, || {
+                    fetcher.system_text_facts_supported(fetch.provider)
+                })
+                .await
+                .map_err(FetchMiss::from_error)?;
+            }
+            let request = fetch.request(plan, fetch.tool_item);
             catalog_with_optional_keepalive(fetcher, fetch.provider, &request, fetch_deadline).await
         }
     }));

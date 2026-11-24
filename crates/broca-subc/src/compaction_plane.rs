@@ -41,27 +41,26 @@ impl CapabilityCatalog {
     async fn read(
         &self,
         provider: &str,
-        read: impl Future<Output = Result<Vec<CatalogEntry>, ConnError>>,
+        read: impl Future<Output = Result<Arc<Vec<CatalogEntry>>, ConnError>>,
     ) -> ProviderCapabilities {
         let result = tokio::time::timeout(CATALOG_READ_BUDGET, read).await;
         let mut last = self.last.lock().unwrap_or_else(|error| error.into_inner());
         match result {
-            Ok(Ok(entries)) => {
-                match crate::provider_catalog::find_module(&entries, provider).cloned() {
-                    Some(entry) => {
-                        let provides = entry
-                            .capabilities
-                            .map(|caps| caps.provides)
-                            .unwrap_or_default();
-                        last.insert(provider.to_owned(), provides.clone());
-                        ProviderCapabilities::Declared(provides)
-                    }
-                    None => {
-                        last.remove(provider);
-                        ProviderCapabilities::NotInCatalog
-                    }
+            Ok(Ok(entries)) => match crate::provider_catalog::find_module(&entries, provider) {
+                Some(entry) => {
+                    let provides = entry
+                        .capabilities
+                        .as_ref()
+                        .map(|caps| caps.provides.clone())
+                        .unwrap_or_default();
+                    last.insert(provider.to_owned(), provides.clone());
+                    ProviderCapabilities::Declared(provides)
                 }
-            }
+                None => {
+                    last.remove(provider);
+                    ProviderCapabilities::NotInCatalog
+                }
+            },
             failure => {
                 let kept = last.get(provider).cloned();
                 tracing::warn!(provider, used_kept_list = kept.is_some(), error = ?failure,
@@ -360,7 +359,7 @@ mod capability_tests {
         entry
     }
 
-    async fn failed() -> Result<Vec<CatalogEntry>, ConnError> {
+    async fn failed() -> Result<Arc<Vec<CatalogEntry>>, ConnError> {
         Err(ConnError::Transport("catalog unavailable".into()))
     }
 
@@ -371,7 +370,10 @@ mod capability_tests {
         assert_eq!(
             catalog
                 .read("magic", async {
-                    Ok(vec![entry("magic", &["compaction-signed-floor/v1"])])
+                    Ok(Arc::new(vec![entry(
+                        "magic",
+                        &["compaction-signed-floor/v1"],
+                    )]))
                 })
                 .await,
             declared
@@ -384,7 +386,7 @@ mod capability_tests {
         // A successful read replaces the kept list, including a declaration with no capabilities.
         assert_eq!(
             catalog
-                .read("magic", async { Ok(vec![entry("magic", &[])]) })
+                .read("magic", async { Ok(Arc::new(vec![entry("magic", &[])])) })
                 .await,
             ProviderCapabilities::Declared(vec![])
         );
@@ -407,12 +409,15 @@ mod capability_tests {
         let catalog = CapabilityCatalog::default();
         let _ = catalog
             .read("magic", async {
-                Ok(vec![entry("magic", &["compaction-entry-speaks-for/v1"])])
+                Ok(Arc::new(vec![entry(
+                    "magic",
+                    &["compaction-entry-speaks-for/v1"],
+                )]))
             })
             .await;
         assert_eq!(
             catalog
-                .read("magic", async { Ok(vec![entry("other", &[])]) })
+                .read("magic", async { Ok(Arc::new(vec![entry("other", &[])])) })
                 .await,
             ProviderCapabilities::NotInCatalog
         );
@@ -430,7 +435,10 @@ mod capability_tests {
         assert_eq!(
             catalog
                 .read("magic", async {
-                    Ok(vec![entry("magic", &["compaction-entry-speaks-for/v1"])])
+                    Ok(Arc::new(vec![entry(
+                        "magic",
+                        &["compaction-entry-speaks-for/v1"],
+                    )]))
                 })
                 .await,
             declared

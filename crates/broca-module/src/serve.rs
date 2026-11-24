@@ -4143,7 +4143,8 @@ impl ServeHandler for crate::LineageRegistry {
     async fn status(&self, session: &LineageKey) -> Result<StatusResponse, ServeError> {
         use crate::actor::LineageStatus;
         match self.route_status(session).await? {
-            LineageStatus::Idle => Ok(StatusResponse::Idle),
+            // A run whose sign-in probe is still deciding answers as the paused run it is.
+            LineageStatus::Idle | LineageStatus::Probing => Ok(StatusResponse::Idle),
             LineageStatus::Active { run_id, step } => Ok(StatusResponse::Active {
                 run_id: run_id.0,
                 step,

@@ -123,7 +123,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 Delivery::Steer,
                 manifest.as_deref(),
                 None,
-                broca_core::clock::epoch_millis(),
+                self.retention_timestamp()
+                    .or_else(broca_core::clock::epoch_millis),
                 reply,
             )
             .await
@@ -153,7 +154,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(steer) => Record::Steer(steer),
             Err(error) => return SendOutcome::Error(error),
         };
-        if let Err(error) = self.append_own_with_media(record, &staged).await {
+        // The storage policy the send freezes is written with its steer, as every other record
+        // that takes a send writes it, so the two are durable together or not at all.
+        let batch = self.with_retention_set(record, start.prepared.retention_policy);
+        if let Err(error) = self.append_own_batch_with_media(&batch, &staged).await {
             return SendOutcome::Error(format!("{error:?}"));
         }
         SendOutcome::Paused {

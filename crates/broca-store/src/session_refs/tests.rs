@@ -827,6 +827,51 @@ fn session_ref_v2_startup_rekey_is_idempotent_and_keeps_v1() {
     assert_eq!(found.sessions[&v2], (address, session));
 }
 
+#[test]
+fn recording_a_session_keeps_startup_from_rekeying_current_aliases() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let session = BindIdentity::new("/synthetic/project", "runner", "already-keyed");
+    let address = session_addr(&session);
+    store.record_session(&address, &session).unwrap();
+    store.record_session(&address, &session).unwrap();
+    let conn = store.conn.lock().unwrap();
+    let changes = conn.total_changes();
+    init_schema(&conn).unwrap();
+    assert_eq!(
+        conn.total_changes(),
+        changes,
+        "startup must skip the alias walk after a current writer adds a session"
+    );
+}
+
+#[test]
+fn a_failed_alias_insert_leaves_neither_ref_nor_count_change() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let session = BindIdentity::new("/synthetic/project", "runner", "failed-alias");
+    let address = session_addr(&session);
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_alias BEFORE INSERT ON agent_data_session_ref_v2
+         BEGIN SELECT RAISE(ABORT, 'injected alias failure'); END;",
+        )
+        .unwrap();
+    assert!(store.record_session(&address, &session).is_err());
+    let conn = store.conn.lock().unwrap();
+    let (rows, aliases, recorded): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM agent_data_session_ref),
+                (SELECT count(*) FROM agent_data_session_ref_v2),
+                (SELECT sessions FROM agent_data_session_ref_v2_rule WHERE id=1)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((rows, aliases, recorded), (0, 0, 0));
+}
+
 /// A start skips the alias walk when the alias rule and the session count are as the last walk
 /// left them, and walks again for a session an older build added without its alias.
 #[test]

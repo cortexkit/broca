@@ -459,3 +459,56 @@ async fn class_adoption_queued_send_rechecks_placement_after_reload() {
         None
     );
 }
+
+/// Two sends creating one session at once can leave it in the root the other one chose: each
+/// marks the root its storage policy picks, and the open takes whichever mark is there. Whichever
+/// of them reaches the actor first, the send whose policy asks the opposite of that root's backup
+/// is refused `backup_fixed_at_creation` and freezes nothing, and the send whose choice placed the
+/// session freezes its own policy, so the policy never disagrees with where the session is kept.
+#[tokio::test]
+async fn a_creating_send_whose_root_another_send_chose_is_refused_the_other_backup() {
+    use super::tests::send_exactly;
+    use cortexkit_role_llm_runner::session_retention::{Keep, RetentionPolicy};
+    let policy = |backup| RetentionPolicy::new(Keep::forever(), 0, backup, false);
+    let sent = |run: &str, backup| {
+        let mut sent = request(run);
+        sent.retention_policy = Some(policy(backup));
+        sent
+    };
+    for (root, placed) in [
+        (StorageClass::Durable, true),
+        (StorageClass::Ordinary, false),
+    ] {
+        let (backend, session) = fresh(Cipher::None).await;
+        let parts = SharedParts::new(Box::new(MemoryParts::default()));
+        let (commands, served) = serve(
+            actor(session, root, &parts, vec![text_step("a1", "one")], None),
+            backend,
+        );
+        let send = |run: &'static str, backup| {
+            send_exactly(
+                &commands,
+                run,
+                sent(run, backup),
+                SendKey::Minted,
+                broca_protocol::Delivery::Queue,
+                None,
+            )
+        };
+        assert_eq!(
+            send("lost", !placed).await,
+            SendOutcome::RetentionRefused(crate::retention::policy::Refusal::BackupFixed),
+            "{root:?}"
+        );
+        let taken = send("placed", placed).await;
+        assert!(matches!(taken, SendOutcome::Active { .. }), "{taken:?}");
+        idle(&commands).await;
+        drop(commands);
+        let session = served.await.unwrap();
+        assert_eq!(
+            session.operations().retention_policy,
+            Some(serde_json::to_value(policy(placed)).unwrap()),
+            "{root:?}"
+        );
+    }
+}

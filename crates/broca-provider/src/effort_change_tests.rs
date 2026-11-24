@@ -119,6 +119,82 @@ fn a_change_that_rides_resets_the_top_level_effort() {
     );
 }
 
+/// Sealing history keeps only the runs whose `episode_render_key` changes (and every run from the
+/// cut on), and the request must render the same bytes from those runs as from all of them. The
+/// Anthropic effort and thinking mode of an earlier run decide its per-message efforts, so runs
+/// that differ only there must not look alike to the seal.
+#[test]
+fn sealed_runs_render_the_same_anthropic_effort_changes() {
+    let omitted = |effort: &str| {
+        let mut frozen = opus(effort);
+        frozen.variant = Some(FrozenVariant {
+            name: effort.into(),
+            request: VariantRequest::Anthropic {
+                thinking: Some(json!({"type": "adaptive", "display": "omitted"})),
+                effort: Some(effort.into()),
+            },
+        });
+        frozen
+    };
+    for configs in [
+        vec![opus("high"), opus("high"), opus("low"), opus("high")],
+        vec![opus("high"), opus("high"), omitted("high"), omitted("low")],
+    ] {
+        // Every message carries its position in the session as its ordinal, as a view that
+        // cut earlier messages passes them, and the cut falls at the start of the last run.
+        let mut whole = request(&configs);
+        for (ordinal, message) in whole.prompt.iter_mut().enumerate() {
+            message.ordinal = Some(ordinal as u64);
+        }
+        let mut history = broca_protocol::request::RenderHistory::clone(&whole.render_episodes);
+        history.raw_ordinals = true;
+        let first_kept = history.episodes.last().unwrap().prompt_start;
+        whole.prompt.drain(..first_kept);
+        whole.render_episodes = std::sync::Arc::new(history.clone());
+        let reduced_history =
+            crate::families::openai_responses_chatgpt::reduce_episodes(&history, first_kept);
+        assert!(
+            reduced_history.episodes.len() < history.episodes.len(),
+            "the seal drops a run"
+        );
+        let mut reduced = whole.clone();
+        reduced.render_episodes = std::sync::Arc::new(reduced_history);
+        let frozen = configs.last().unwrap();
+        let parse = |opts: &CallOptions| -> Value {
+            serde_json::from_slice(&AnthropicMessages.render(frozen, opts)).unwrap()
+        };
+        assert_eq!(parse(&reduced), parse(&whole), "{configs:#?}");
+    }
+}
+
+/// An earlier run with no Anthropic effort (another family, or no effort variant) resets the walk
+/// like a run that rides: the next run with an effort anchors the top level, so a later change on
+/// the same model still goes in per message and the earlier request stays a prefix.
+#[test]
+fn an_earlier_run_without_an_effort_starts_a_new_anchor() {
+    let mut no_variant = opus("high");
+    no_variant.variant = None;
+    let other_family = crate::families::openai_responses_frozen_config("gpt-6.2-sol");
+    for earlier in [no_variant, other_family] {
+        let first = render(&[earlier.clone(), opus("high")]);
+        let body = render(&[earlier.clone(), opus("high"), opus("low")]);
+        assert_eq!(
+            body["output_config"],
+            json!({"effort": "high"}),
+            "after {:?}",
+            earlier.family_id
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.last().unwrap()["output_config"],
+            json!({"effort": "low"}),
+            "{messages:#?}"
+        );
+        let earlier_messages = first["messages"].as_array().unwrap();
+        assert_eq!(&messages[..earlier_messages.len()], &earlier_messages[..]);
+    }
+}
+
 /// The run's beta is on every request of a run that may send a per-message effort, so the header
 /// is the same before and after the first change.
 #[test]

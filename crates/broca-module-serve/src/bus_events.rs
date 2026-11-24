@@ -52,6 +52,10 @@ struct Liveness {
     store_batches_waiting: AtomicU64,
     /// Batches of them dropped because too many were waiting.
     store_batches_dropped: AtomicU64,
+    /// Batches of send state notices dropped because too many were waiting for the account.
+    send_state_batches_dropped: AtomicU64,
+    /// Batches of route facts dropped because too many were waiting for the account.
+    route_fact_batches_dropped: AtomicU64,
 }
 
 impl Liveness {
@@ -62,6 +66,8 @@ impl Liveness {
             store_batches_recorded: AtomicU64::new(0),
             store_batches_waiting: AtomicU64::new(0),
             store_batches_dropped: AtomicU64::new(0),
+            send_state_batches_dropped: AtomicU64::new(0),
+            route_fact_batches_dropped: AtomicU64::new(0),
         }
     }
 
@@ -99,6 +105,14 @@ pub fn health() -> serde_json::Value {
         fields.insert(
             "bus_store_batches_dropped".into(),
             count(&LIVENESS.store_batches_dropped),
+        );
+        fields.insert(
+            "bus_send_state_batches_dropped".into(),
+            count(&LIVENESS.send_state_batches_dropped),
+        );
+        fields.insert(
+            "bus_route_fact_batches_dropped".into(),
+            count(&LIVENESS.route_fact_batches_dropped),
         );
         // Milliseconds since the loop began its latest pass. A running loop begins one every
         // quarter second, so a value that keeps growing means a pass is stuck. Null when no
@@ -152,13 +166,13 @@ impl Config {
 /// records them. Once any wait, later ones queue behind them, keeping each session's order.
 pub struct StoreRunEvents {
     store: Arc<dyn RunEventStore>,
-    waiting: Mutex<VecDeque<WaitingEvents>>,
+    waiting: Mutex<Waiting<WaitingEvents>>,
     /// Send state notices (see [`broca_module::store_send_states`]) that wait for the account,
     /// oldest first, each batch with the module each notice is for.
-    waiting_sends: Mutex<VecDeque<Vec<(String, SendStateNotice)>>>,
+    waiting_sends: Mutex<Waiting<Vec<(String, SendStateNotice)>>>,
     /// Route facts the ends of routed runs owe routing (see [`broca_module::store_run_events`])
     /// that wait for the account, oldest batch first.
-    waiting_facts: Mutex<VecDeque<RouteFacts>>,
+    waiting_facts: Mutex<Waiting<RouteFacts>>,
     /// Each session's epoch and the seq of its last durable record, which a `run.progress`
     /// beat carries as its `seq`.
     positions: Mutex<HashMap<BindIdentity, (String, u64)>>,
@@ -177,6 +191,78 @@ struct WaitingEvents {
 /// can't reach the bus for that long has readers on their fallback polls already.
 const STORE_EVENTS_WAITING_CAP: usize = 10_000;
 
+/// Batches that wait for the account, oldest first.
+///
+/// The publisher's loop records them one at a time, taking each out of the queue and recording
+/// it with the lock released, so a session writer that hands over a new batch meanwhile waits
+/// for at most one queue operation rather than for the whole backlog's store writes.
+struct Waiting<T> {
+    batches: VecDeque<T>,
+    /// The loop has taken the oldest batch out to record it. Until it is recorded or put
+    /// back, new batches queue behind it rather than being recorded ahead of it.
+    draining: bool,
+}
+
+impl<T> Default for Waiting<T> {
+    fn default() -> Self {
+        Self {
+            batches: VecDeque::new(),
+            draining: false,
+        }
+    }
+}
+
+impl<T> Waiting<T> {
+    /// Nothing waits, so a writer may record its batch itself without overtaking an older one.
+    fn idle(&self) -> bool {
+        self.batches.is_empty() && !self.draining
+    }
+
+    /// Queues `batch` behind the rest: `true` when the oldest still queued was dropped to stay
+    /// within [`STORE_EVENTS_WAITING_CAP`]. A batch the loop has taken out counts toward it.
+    fn push(&mut self, batch: T) -> bool {
+        let dropped = self.batches.len() + usize::from(self.draining) >= STORE_EVENTS_WAITING_CAP
+            && self.batches.pop_front().is_some();
+        self.batches.push_back(batch);
+        dropped
+    }
+}
+
+/// Records the batches waiting in `queue` with `record`, oldest first, holding the lock only to
+/// take each out and, when its recording fails, to put it back at the front. Returns how many
+/// are left waiting: zero once all are recorded.
+fn record_queue<T>(
+    queue: &Mutex<Waiting<T>>,
+    what: &str,
+    mut record: impl FnMut(&mut T) -> Result<bool, broca_store::StoreError>,
+) -> usize {
+    loop {
+        let mut batch = {
+            let mut waiting = queue.lock().unwrap();
+            match waiting.batches.pop_front() {
+                Some(batch) => {
+                    waiting.draining = true;
+                    batch
+                }
+                None => {
+                    waiting.draining = false;
+                    return 0;
+                }
+            }
+        };
+        let recorded = record(&mut batch);
+        if let Err(error) = &recorded {
+            tracing::warn!(target: "bus", %error, "could not record waiting {what}; retrying on the next pass");
+        }
+        if !matches!(recorded, Ok(true)) {
+            let mut waiting = queue.lock().unwrap();
+            waiting.batches.push_front(batch);
+            waiting.draining = false;
+            return waiting.batches.len();
+        }
+    }
+}
+
 impl StoreRunEvents {
     pub fn new(store: Arc<dyn RunEventStore>) -> Arc<Self> {
         Arc::new(Self {
@@ -191,57 +277,30 @@ impl StoreRunEvents {
     /// Records the batches waiting, oldest first: `false` while the account isn't known or a
     /// recording failed, leaving the rest waiting.
     fn record_waiting(&self, now_ms: u64) -> bool {
-        let mut waiting = self.waiting.lock().unwrap();
-        while let Some(batch) = waiting.front_mut() {
-            match self.store.record_run_events(
+        let events = record_queue(&self.waiting, "run events", |batch| {
+            let recorded = self.store.record_run_events(
                 &batch.session,
                 &batch.epoch,
                 &mut batch.events,
                 now_ms,
-            ) {
-                Ok(true) => {
-                    waiting.pop_front();
-                    LIVENESS
-                        .store_batches_recorded
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(false) => break,
-                Err(error) => {
-                    tracing::warn!(target: "bus", %error, "could not record waiting run events; retrying on the next pass");
-                    break;
-                }
+            );
+            if matches!(recorded, Ok(true)) {
+                LIVENESS
+                    .store_batches_recorded
+                    .fetch_add(1, Ordering::Relaxed);
             }
-        }
+            recorded
+        });
         LIVENESS
             .store_batches_waiting
-            .store(waiting.len() as u64, Ordering::Relaxed);
-        let mut sends = self.waiting_sends.lock().unwrap();
-        while let Some(batch) = sends.front() {
-            match self.store.record_send_states(batch, now_ms) {
-                Ok(true) => {
-                    sends.pop_front();
-                }
-                Ok(false) => break,
-                Err(error) => {
-                    tracing::warn!(target: "bus", %error, "could not record waiting send state notices; retrying on the next pass");
-                    break;
-                }
-            }
-        }
-        let mut facts = self.waiting_facts.lock().unwrap();
-        while let Some(batch) = facts.front() {
-            match self.store.record_route_facts(batch, now_ms) {
-                Ok(true) => {
-                    facts.pop_front();
-                }
-                Ok(false) => break,
-                Err(error) => {
-                    tracing::warn!(target: "bus", %error, "could not record waiting route facts; retrying on the next pass");
-                    break;
-                }
-            }
-        }
-        waiting.is_empty() && sends.is_empty() && facts.is_empty()
+            .store(events as u64, Ordering::Relaxed);
+        let sends = record_queue(&self.waiting_sends, "send state notices", |batch| {
+            self.store.record_send_states(batch, now_ms)
+        });
+        let facts = record_queue(&self.waiting_facts, "route facts", |batch| {
+            self.store.record_route_facts(batch, now_ms)
+        });
+        events == 0 && sends == 0 && facts == 0
     }
 
     /// The session's epoch and last durable seq, while its writer has told one.
@@ -269,7 +328,7 @@ impl broca_module::store_send_states::SendStateSink for StoreRunEvents {
             .map(|change| (change.sender, change.notice))
             .collect();
         let mut waiting = self.waiting_sends.lock().unwrap();
-        if waiting.is_empty() {
+        if waiting.idle() {
             match self.store.record_send_states(&changes, now_ms()) {
                 Ok(true) => return,
                 Ok(false) => {}
@@ -278,11 +337,12 @@ impl broca_module::store_send_states::SendStateSink for StoreRunEvents {
                 }
             }
         }
-        if waiting.len() >= STORE_EVENTS_WAITING_CAP {
-            waiting.pop_front();
+        if waiting.push(changes) {
+            LIVENESS
+                .send_state_batches_dropped
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(target: "bus", "too many send state batches wait for the bus; dropping the oldest");
         }
-        waiting.push_back(changes);
     }
 }
 
@@ -323,7 +383,7 @@ impl broca_module::store_run_events::RunEventSink for StoreRunEvents {
             return;
         }
         let mut waiting = self.waiting_facts.lock().unwrap();
-        if waiting.is_empty() {
+        if waiting.idle() {
             match self.store.record_route_facts(&facts, now_ms()) {
                 Ok(true) => return,
                 Ok(false) => {}
@@ -332,11 +392,12 @@ impl broca_module::store_run_events::RunEventSink for StoreRunEvents {
                 }
             }
         }
-        if waiting.len() >= STORE_EVENTS_WAITING_CAP {
-            waiting.pop_front();
+        if waiting.push(facts) {
+            LIVENESS
+                .route_fact_batches_dropped
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(target: "bus", "too many route fact batches wait for the bus; dropping the oldest");
         }
-        waiting.push_back(facts);
     }
 
     fn durable(
@@ -354,7 +415,7 @@ impl broca_module::store_run_events::RunEventSink for StoreRunEvents {
             return;
         }
         let mut waiting = self.waiting.lock().unwrap();
-        if waiting.is_empty() {
+        if waiting.idle() {
             match self
                 .store
                 .record_run_events(session, epoch, &mut events, now_ms())
@@ -371,21 +432,19 @@ impl broca_module::store_run_events::RunEventSink for StoreRunEvents {
                 }
             }
         }
-        if waiting.len() >= STORE_EVENTS_WAITING_CAP {
-            waiting.pop_front();
+        if waiting.push(WaitingEvents {
+            session: session.clone(),
+            epoch: epoch.to_owned(),
+            events,
+        }) {
             LIVENESS
                 .store_batches_dropped
                 .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(target: "bus", "too many run event batches wait for the bus; dropping the oldest");
         }
-        waiting.push_back(WaitingEvents {
-            session: session.clone(),
-            epoch: epoch.to_owned(),
-            events,
-        });
         LIVENESS
             .store_batches_waiting
-            .store(waiting.len() as u64, Ordering::Relaxed);
+            .store(waiting.batches.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -823,6 +882,226 @@ pub(crate) mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A [`SqliteStore`] that runs a hook once, inside the next run event write.
+    struct HookedStore {
+        inner: Arc<SqliteStore>,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl RunEventStore for HookedStore {
+        fn enable_bus_events(&self, account: &str) -> Result<(), String> {
+            self.inner.enable_bus_events(account)
+        }
+        fn bus_metrics(&self) -> &Metrics {
+            self.inner.bus_metrics()
+        }
+        fn bus_metrics_arc(&self) -> Arc<Metrics> {
+            self.inner.bus_metrics_arc()
+        }
+        fn retain_bus_progress(
+            &self,
+            session: &BindIdentity,
+            epoch: &str,
+            event: &RunEvent,
+            now_ms: u64,
+        ) -> Result<Option<broca_store::bus_events::Publication>, broca_store::StoreError> {
+            self.inner
+                .retain_bus_progress(session, epoch, event, now_ms)
+        }
+        fn get_bus_event(
+            &self,
+            event_key: &str,
+        ) -> Result<Option<(BindIdentity, Vec<u8>)>, broca_store::StoreError> {
+            self.inner.get_bus_event(event_key)
+        }
+        fn pending_bus_event(
+            &self,
+        ) -> Result<Option<broca_store::bus_events::Publication>, broca_store::StoreError> {
+            self.inner.pending_bus_event()
+        }
+        fn acknowledge_bus_event(
+            &self,
+            event: &broca_store::bus_events::Publication,
+            receipt: cortexkit_bus_trait::PublishReceipt,
+            now_ms: u64,
+        ) -> Result<(), broca_store::StoreError> {
+            self.inner.acknowledge_bus_event(event, receipt, now_ms)
+        }
+        fn skip_stale_bus_events(
+            &self,
+            now_ms: u64,
+        ) -> Result<broca_store::bus_events::SkipSummary, broca_store::StoreError> {
+            self.inner.skip_stale_bus_events(now_ms)
+        }
+        fn prune_bus_events(&self, now_ms: u64) -> Result<usize, broca_store::StoreError> {
+            self.inner.prune_bus_events(now_ms)
+        }
+        fn record_run_events(
+            &self,
+            session: &BindIdentity,
+            epoch: &str,
+            events: &mut [RunEvent],
+            now_ms: u64,
+        ) -> Result<bool, broca_store::StoreError> {
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            RunEventStore::record_run_events(self.inner.as_ref(), session, epoch, events, now_ms)
+        }
+        fn record_send_states(
+            &self,
+            changes: &[(String, SendStateNotice)],
+            now_ms: u64,
+        ) -> Result<bool, broca_store::StoreError> {
+            RunEventStore::record_send_states(self.inner.as_ref(), changes, now_ms)
+        }
+        fn record_route_facts(
+            &self,
+            facts: &[(String, Vec<u8>)],
+            now_ms: u64,
+        ) -> Result<bool, broca_store::StoreError> {
+            RunEventStore::record_route_facts(self.inner.as_ref(), facts, now_ms)
+        }
+        fn settle_route_fact(
+            &self,
+            fact_id: &str,
+            now_ms: u64,
+        ) -> Result<(), broca_store::StoreError> {
+            RunEventStore::settle_route_fact(self.inner.as_ref(), fact_id, now_ms)
+        }
+        fn pending_route_fact(
+            &self,
+            now_ms: u64,
+        ) -> Result<Option<broca_store::bus_events::Publication>, broca_store::StoreError> {
+            RunEventStore::pending_route_fact(self.inner.as_ref(), now_ms)
+        }
+        fn pending_findings_event(
+            &self,
+        ) -> Result<Option<broca_store::bus_events::Publication>, broca_store::StoreError> {
+            RunEventStore::pending_findings_event(self.inner.as_ref())
+        }
+    }
+
+    /// A session writer that hands over a batch while the publisher's loop records a backlog
+    /// waits for no more than one queue operation, not for every store write of the backlog,
+    /// and its batch is still recorded after the backlog.
+    #[test]
+    fn a_writer_does_not_wait_for_the_whole_waiting_backlog() {
+        use broca_module::store_run_events::RunEventSink;
+        let root = broca_test_support::scratch_root().join(format!("store-backlog-{}", now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let sqlite = Arc::new(SqliteStore::open(root.join("run-index.db")).unwrap());
+        let store = Arc::new(HookedStore {
+            inner: sqlite.clone(),
+            hook: Mutex::default(),
+        });
+        let events = StoreRunEvents::new(store.clone());
+        let session = BindIdentity::new(&root, "broca", "s1");
+        let session_ref = broca_core::session_refs::agent_session_ref(&session);
+        let epoch = "0123456789abcdef0123456789abcdef";
+        let started = move |seq: u64| RunEvent {
+            v: 1,
+            session_ref: session_ref.clone(),
+            run_id: "r1".into(),
+            seq,
+            at_ms: now_ms(),
+            detail: RunEventDetail::Started {},
+        };
+        for seq in 1..=3 {
+            events.durable(&session, epoch, seq, vec![started(seq)]);
+        }
+        sqlite.enable_bus_events("box_test").unwrap();
+        // While the loop writes the oldest waiting batch, a writer hands over another.
+        let writer_waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = Arc::new(Mutex::new(None));
+        *store.hook.lock().unwrap() = Some(Box::new({
+            let (events, session, writer_waited, writer) = (
+                events.clone(),
+                session.clone(),
+                writer_waited.clone(),
+                writer.clone(),
+            );
+            let batch = vec![started(4)];
+            move || {
+                let (done, finished) = std::sync::mpsc::channel();
+                *writer.lock().unwrap() = Some(std::thread::spawn(move || {
+                    events.durable(&session, epoch, 4, batch);
+                    let _ = done.send(());
+                }));
+                // The bound only separates "queued at once" from "blocked until the loop
+                // finished": a writer that queues returns in microseconds.
+                if finished.recv_timeout(Duration::from_secs(5)).is_err() {
+                    writer_waited.store(true, Ordering::SeqCst);
+                }
+            }
+        }));
+        assert!(events.record_waiting(now_ms()), "nothing is left waiting");
+        let writer = writer.lock().unwrap().take().expect("the hook ran");
+        writer.join().unwrap();
+        assert!(
+            !writer_waited.load(Ordering::SeqCst),
+            "a writer waited behind the whole backlog's store writes"
+        );
+        assert!(events.record_waiting(now_ms()), "nothing is left waiting");
+        let mut seqs = Vec::new();
+        while let Some(publication) = sqlite.pending_bus_event().unwrap() {
+            sqlite
+                .acknowledge_bus_event(
+                    &publication,
+                    cortexkit_bus_trait::PublishReceipt::new(1, false),
+                    now_ms(),
+                )
+                .unwrap();
+            seqs.push(publication.headers["seq"].clone());
+        }
+        assert_eq!(seqs, ["1", "2", "3", "4"], "batches are recorded in order");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Send state and route fact batches dropped at the waiting cap are counted in health, as
+    /// run event batches are: the dropped batches existed only in memory, so a count is the
+    /// only lasting sign of the loss.
+    #[test]
+    fn dropped_send_state_and_route_fact_batches_are_counted_in_health() {
+        use broca_module::{
+            store_run_events::{RoutedRunEnd, RunEventSink},
+            store_send_states::{SendStateChange, SendStateSink},
+        };
+        let events = StoreRunEvents::new(Arc::new(SqliteStore::open_in_memory().unwrap()));
+        let session = BindIdentity::new("/test", "broca", "s1");
+        // The account is never known here, so every batch waits; one more than the cap drops
+        // the oldest of each kind.
+        for seq in 0..=STORE_EVENTS_WAITING_CAP as u64 {
+            SendStateSink::durable(
+                &*events,
+                &session,
+                vec![SendStateChange {
+                    sender: "prefrontal".into(),
+                    notice: SendStateNotice {
+                        v: 1,
+                        session_ref: "session-ref".into(),
+                        send_id: "send".into(),
+                        seq,
+                        state: "finished",
+                    },
+                }],
+            );
+            events.routed_ends(
+                &session,
+                vec![RoutedRunEnd {
+                    event_id: format!("s1:{seq}"),
+                    admission_id: "admission".into(),
+                    run_id: "r1".into(),
+                    reason: broca_protocol::RunFinishReason::Completed,
+                }],
+            );
+        }
+        let health = health();
+        assert_eq!(health["bus_send_state_batches_dropped"], 1, "{health}");
+        assert_eq!(health["bus_route_fact_batches_dropped"], 1, "{health}");
     }
 
     #[tokio::test(start_paused = true)]

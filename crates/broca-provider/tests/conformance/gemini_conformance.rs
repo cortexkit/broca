@@ -353,14 +353,19 @@ fn gemini_clean_eof_without_finish_reason_is_truncation() {
         )
     )));
 
-    let error = normalizer
+    let final_events = normalizer
         .finish()
-        .expect_err("EOF without a finish reason must be rejected");
+        .expect("a cut body is the transport's to report, not a decode failure");
     assert!(
-        error
-            .to_string()
-            .contains("Gemini stream truncated: ended before a terminal chunk"),
-        "unexpected error: {error}"
+        !final_events.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Control(
+                ProviderControl::AssistantMessage { .. }
+                    | ProviderControl::StepFinished { .. }
+                    | ProviderControl::Finished { .. }
+            )
+        )),
+        "EOF without a finish reason must not close the step: {final_events:?}"
     );
 }
 

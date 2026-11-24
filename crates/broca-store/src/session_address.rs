@@ -220,7 +220,8 @@ impl SessionInventory {
         stamped_workdir: Option<&Path>,
         reservation: Option<&ScopeReservation>,
     ) -> Result<BindIdentity, SessionAddressError> {
-        let mut conn = self.conn.lock().map_err(SessionAddressError::store_error)?;
+        let mut conn =
+            crate::lock_connection(&self.conn).map_err(SessionAddressError::store_error)?;
         let root = conn
             .path()
             .and_then(|path| Path::new(path).parent())
@@ -269,7 +270,7 @@ impl SessionInventory {
         &self,
         session: &BindIdentity,
     ) -> Result<Option<ScopeReservation>, SessionAddressError> {
-        let conn = self.conn.lock().map_err(SessionAddressError::store_error)?;
+        let conn = crate::lock_connection(&self.conn).map_err(SessionAddressError::store_error)?;
         read_scope_reservation(&conn, &broca_core::session_addr(session))
             .map_err(SessionAddressError::store_error)
     }

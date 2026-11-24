@@ -633,8 +633,11 @@ impl AnthropicNormalizer {
                         // forgiving of the two directions and is chosen deliberately. Unknown
                         // failures generally default to Transient, since a needless retry costs
                         // attempts while a wrong Permanent kills a run that would have succeeded.
-                        // The reasoning inverts here: every error type this provider documents is
-                        // already in the table above, and an error event carrying no HTTP status is
+                        // The reasoning inverts here: every error type Anthropic's error reference
+                        // lists (`invalid_request_error`, `authentication_error`, `billing_error`,
+                        // `permission_error`, `not_found_error`, `request_too_large`,
+                        // `rate_limit_error`, `api_error`, `timeout_error` and `overloaded_error`)
+                        // has a row in `classify_error`, and an error event carrying no HTTP status is
                         // the provider deliberately reporting something about the request rather
                         // than a transport fault. Retrying re-sends byte-identical bytes, so a
                         // request fault reproduces exactly, three times, having possibly already
@@ -835,11 +838,21 @@ impl AnthropicNormalizer {
                     input_json,
                     start_input,
                 } => {
-                    if self.arguments_guard.fired()
-                        && ((input_json.is_empty() && !self.completed_blocks.contains(&idx))
+                    let closed = self.completed_blocks.contains(&idx);
+                    // When the provider ended the message itself, a block it never closed was
+                    // cut off mid-call (a refusal that stops partway through a tool call, say):
+                    // its start event's placeholder input is not the call's arguments, so it
+                    // must not become a call. When the whitespace guard stopped the stream, the
+                    // provider never got to close anything, so a block whose arguments already
+                    // parse is kept.
+                    let omit = if self.arguments_guard.fired() {
+                        (input_json.is_empty() && !closed)
                             || (!input_json.is_empty()
-                                && serde_json::from_str::<Value>(&input_json).is_err()))
-                    {
+                                && serde_json::from_str::<Value>(&input_json).is_err())
+                    } else {
+                        !closed
+                    };
+                    if omit {
                         self.arguments_guard.omit_tool();
                         continue;
                     }
@@ -1025,12 +1038,24 @@ pub(crate) fn classify_error(code: Option<&str>, status: Option<u16>) -> Option<
         {
             Some(ErrorClass::Permanent)
         }
-        Some("overloaded_error" | "api_error" | "rate_limit_error" | "rate_limit_exceeded") => {
-            Some(ErrorClass::Transient)
-        }
+        // Anthropic's `timeout_error` (documented as a 504, and also sent with other statuses or
+        // as a mid-stream `error` event) means the backend ran out of time on this request; a
+        // re-send can finish.
+        Some(
+            "overloaded_error"
+            | "api_error"
+            | "rate_limit_error"
+            | "rate_limit_exceeded"
+            | "timeout_error",
+        ) => Some(ErrorClass::Transient),
         Some("authentication_error" | "invalid_api_key") => Some(ErrorClass::Auth),
         Some("permission_error") => Some(ErrorClass::Permanent),
         Some("invalid_request_error") | Some("not_found_error") => Some(ErrorClass::Permanent),
+        // Anthropic's unpaid balance (402), an over-size request body (413) and a conflicting
+        // request (409) all need someone to change something before a re-send can succeed.
+        Some("billing_error" | "request_too_large" | "conflict_error") => {
+            Some(ErrorClass::Permanent)
+        }
         _ => None,
     }
 }
@@ -1058,6 +1083,33 @@ pub(crate) fn classify_error_with_status_defaults(
 ) -> ErrorClass {
     classify_error(code, status)
         .unwrap_or_else(|| status.map_or(ErrorClass::Permanent, status_default_class))
+}
+
+/// The class of an OpenAI-style in-band stream error by its `code`, for an error that states no
+/// HTTP status. OpenAI's backends use codes they never document for passing failures (a bare
+/// `server_error`, say), and a model request has no side effects, so only codes known to mean
+/// the request or the account cannot succeed as sent are permanent; every other code, and no
+/// code, is transient.
+pub(crate) fn openai_stream_error_class(code: Option<&str>) -> ErrorClass {
+    match code {
+        Some("context_length_exceeded" | "context_window_exceeded") => ErrorClass::ContextOverflow,
+        Some(
+            "billing_exhausted"
+            | "insufficient_quota"
+            | "credit_balance_exhausted"
+            | "organization_spend_limit_exceeded"
+            | "project_spend_limit_exceeded"
+            | "invalid_prompt"
+            | "content_filter"
+            | "cyber_policy"
+            | "bio_policy"
+            | "misalignment_policy_violation",
+        ) => ErrorClass::Permanent,
+        // A credential the backend rejects won't be accepted on a re-send; the caller needs to
+        // sign in again or replace the key.
+        Some("invalid_api_key" | "authentication_error") => ErrorClass::Auth,
+        Some(_) | None => ErrorClass::Transient,
+    }
 }
 
 /// What an HTTP status alone implies, absent a provider code that says otherwise. Kept as one
@@ -1293,6 +1345,34 @@ mod tests {
         }
     }
 
+    /// Every error type Anthropic documents gets the class its HTTP status would give it when it
+    /// arrives mid-stream as an `error` event, which carries no status. A backend timeout is
+    /// retryable; an unpaid balance, an over-size request or a conflict is not.
+    #[test]
+    fn documented_anthropic_error_events_keep_their_status_class() {
+        for (error_type, class) in [
+            ("timeout_error", ErrorClass::Transient),
+            ("billing_error", ErrorClass::Permanent),
+            ("request_too_large", ErrorClass::Permanent),
+            ("conflict_error", ErrorClass::Permanent),
+        ] {
+            let mut n = AnthropicNormalizer::new(StepId(0));
+            let out = n
+                .push_json(&format!(
+                    r#"{{"type":"error","error":{{"type":"{error_type}","message":"m"}}}}"#
+                ))
+                .expect("push");
+            match &out[0] {
+                NormalizedEvent::Control(ProviderControl::Error { error, .. }) => {
+                    assert_eq!(error.class, class, "{error_type}");
+                    assert_eq!(error.provider_code.as_deref(), Some(error_type));
+                    assert_eq!(error.status, None);
+                }
+                other => panic!("expected typed error, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn redacted_thinking_preserved_verbatim_and_distinct() {
         let blob = "ErUBCkYIBBg...ENCRYPTED...verbatim==";
@@ -1409,6 +1489,55 @@ mod tests {
         assert_eq!(reason, FinishReason::ContentFilter);
         assert_eq!(untouched.len(), 3, "{untouched:?}");
         assert!(matches!(&untouched[2], ContentBlock::Text { text } if text == "half a sen"));
+    }
+
+    /// A refusal that ends the message while a tool block is still open: the block got its id,
+    /// name and placeholder input, but never its arguments or its `content_block_stop`.
+    #[test]
+    fn a_refusal_with_an_unclosed_tool_block_assembles_no_call() {
+        let events = [
+            r#"{"type":"message_start","message":{"id":"msg_t","usage":{"input_tokens":5}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"refreshing"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"refresh","input":{}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        for trim in [true, false] {
+            let mut n = AnthropicNormalizer::new(StepId(1)).with_refusal_tool_use_trim(trim);
+            let mut all = Vec::new();
+            for e in events {
+                all.extend(n.push_json(e).expect("push"));
+            }
+            let message = all
+                .iter()
+                .find_map(|e| match e {
+                    NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                        Some(message)
+                    }
+                    _ => None,
+                })
+                .expect("assembled message");
+            assert_eq!(
+                message.tool_calls().count(),
+                0,
+                "trim={trim}: {:?}",
+                message.content
+            );
+            assert!(
+                matches!(message.content.as_slice(), [ContentBlock::Text { text }] if text == "refreshing"),
+                "trim={trim}: {:?}",
+                message.content
+            );
+            assert!(all.iter().any(|e| matches!(
+                e,
+                NormalizedEvent::Control(ProviderControl::Finished {
+                    finish_reason: FinishReason::ContentFilter,
+                    ..
+                })
+            )));
+        }
     }
 
     #[test]

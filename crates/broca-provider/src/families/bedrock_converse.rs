@@ -1686,6 +1686,12 @@ impl StreamNormalizer for BedrockStreamNormalizer {
         Ok(out)
     }
 
+    /// `messageStop` and the `metadata` trailer are the stream's two closing records; once both
+    /// arrived the step was emitted and later frames are ignored.
+    fn step_ended(&self) -> bool {
+        self.message_stopped && self.saw_metadata
+    }
+
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         if self.emitted_final || !self.started {
             return Ok(Vec::new());
@@ -1693,16 +1699,10 @@ impl StreamNormalizer for BedrockStreamNormalizer {
         if self.message_stopped && self.saw_metadata {
             return self.final_events();
         }
-
-        let missing = match (self.message_stopped, self.saw_metadata) {
-            (true, false) => "the metadata trailer",
-            (false, true) => "messageStop",
-            (false, false) => "messageStop and the metadata trailer",
-            (true, true) => unreachable!("complete stream returned above"),
-        };
-        Err(NormalizeError::Invalid(format!(
-            "Bedrock stream truncated: ended before {missing}"
-        )))
+        // A body that ended before `messageStop` or its metadata trailer was cut in transit,
+        // not decoded wrongly: assemble nothing, and the transport's completion check reports
+        // the missing step as a transport fault, as it does for every other family.
+        Ok(Vec::new())
     }
 }
 
@@ -2117,12 +2117,18 @@ mod tests {
         legacy_normalizer
             .push(&message_start)
             .expect("message start decodes");
-        let legacy_error = legacy_normalizer
+        let legacy_events = legacy_normalizer
             .finish()
-            .expect_err("the ignored exception leaves a truncated stream");
-        assert!(legacy_error
-            .to_string()
-            .contains("Bedrock stream truncated"));
+            .expect("a cut body is the transport's to report");
+        assert!(
+            !legacy_events.iter().any(|event| matches!(
+                event,
+                NormalizedEvent::Control(
+                    ProviderControl::AssistantMessage { .. } | ProviderControl::Error { .. }
+                )
+            )),
+            "the ignored exception leaves a truncated stream: {legacy_events:?}"
+        );
 
         let mut normalizer = BedrockStreamNormalizer::new(StepId(7));
         let mut events = normalizer

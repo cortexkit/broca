@@ -15,6 +15,37 @@ fn fixture(tag: &str) -> (std::path::PathBuf, Connection) {
     (root, connection)
 }
 
+#[test]
+fn opencode1_extract_refuses_a_destination_published_after_its_existence_check() {
+    use crate::opencode_extract::{extract, sha256_file, BEFORE_PUBLISH};
+
+    let (loser, _) = fixture("publish-loser");
+    let (winner, connection) = fixture("publish-winner");
+    connection
+        .execute("UPDATE message SET extra=X'42' WHERE id='msg_001'", [])
+        .unwrap();
+    drop(connection);
+    let out = winner.join("out");
+    let extract_winner = std::rc::Rc::new(std::cell::RefCell::new(None));
+    BEFORE_PUBLISH.with(|hook| {
+        let result = extract_winner.clone();
+        let out = out.clone();
+        *hook.borrow_mut() = Some(Box::new(move || {
+            *result.borrow_mut() =
+                Some(extract(&winner.join("source.db"), "ses_synthetic", &out).unwrap());
+        }));
+    });
+    let second = extract(&loser.join("source.db"), "ses_synthetic", &out);
+    let first = extract_winner.borrow_mut().take().unwrap();
+    assert_eq!(
+        sha256_file(&first.path).unwrap(),
+        first.sha256,
+        "the losing extract overwrote the published snapshot"
+    );
+    assert!(second.unwrap_err().to_string().contains("already exists"));
+    assert_eq!(std::fs::read_dir(out).unwrap().count(), 1);
+}
+
 /// OpenCode's own schema gives `session` a foreign key to `project`, a table the extract
 /// doesn't copy. The extract must still copy the session's rows rather than refuse them.
 #[test]

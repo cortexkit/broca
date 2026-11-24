@@ -97,6 +97,10 @@ pub struct StoreActor<B: SessionBackend> {
     /// Reopening the session loses them.
     one_shot_runs: std::collections::HashSet<RunId>,
     one_shot_submissions: std::collections::HashSet<broca_protocol::SubmissionId>,
+    /// Sends that arrived while a sign-in probe was deciding, handled once it has: a keyed send,
+    /// which may retry the paused send itself, and an interrupt, which ends the paused run or
+    /// the resumed one depending on that decision. Every other command is served meanwhile.
+    awaiting_probe: Vec<LineageCmd>,
     /// Set when the actor is to close as soon as nothing holds it open, instead of waiting out
     /// its idle timeout: after a one-shot run's durable end, and after the send that created the
     /// session was refused before its run started, so closing deletes the session it left
@@ -107,6 +111,8 @@ pub struct StoreActor<B: SessionBackend> {
     restart_admitting: bool,
     restart_waiters: Vec<oneshot::Sender<Result<(), String>>>,
     account_limit_timer: Option<account_limit_pause::TimedPause>,
+    /// The session's retention deadline and the older retention seconds its sends are held to.
+    retention_timer: expiry::Timer,
     sign_in_check: Option<account_limit_pause::SignInCheck>,
     sign_in_in_flight: Option<account_limit_pause::TimedPause>,
     sign_in_open_owed: bool,
@@ -257,7 +263,7 @@ enum Exit {
     Cut(oneshot::Sender<crate::actor::CutLockReply>),
     /// Every sender is gone.
     Closed,
-    /// The session went idle: at its idle deadline, or on an idle tick.
+    /// The session went idle at its idle deadline.
     Idle,
     /// The module is stopping.
     Stop,
@@ -425,13 +431,32 @@ async fn media_built(
 }
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
-    /// Serves `commands` until the session goes away: when the channel closes, or at an idle
-    /// tick that finds it idle with no subscriber attached. Returns the session, for whoever
-    /// closes it. A run still running when the channel closes is ended as a module stop ends it.
-    pub async fn serve(mut self, commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
+    /// Serves `commands` until the session goes away: when the channel closes. Returns the
+    /// session, for whoever closes it. A run still running when the channel closes is ended as a
+    /// module stop ends it.
+    pub async fn serve(self, commands: mpsc::UnboundedReceiver<LineageCmd>) -> Session<B> {
+        self.serve_with_idle(commands, None).await
+    }
+
+    /// [`StoreActor::serve`], closing at the session's idle deadline `idle_ttl` after the last
+    /// command, as an actor the registry opens does, unless something holds it open then.
+    #[cfg(test)]
+    pub(crate) async fn serve_idle(
+        self,
+        commands: mpsc::UnboundedReceiver<LineageCmd>,
+        idle_ttl: std::time::Duration,
+    ) -> Session<B> {
+        self.serve_with_idle(commands, Some(idle_ttl)).await
+    }
+
+    async fn serve_with_idle(
+        mut self,
+        commands: mpsc::UnboundedReceiver<LineageCmd>,
+        idle_ttl: Option<std::time::Duration>,
+    ) -> Session<B> {
         let mut commands = Commands::from(commands);
         let exit = self
-            .serve_until_exit(&mut commands, None, None, None, None)
+            .serve_until_exit(&mut commands, None, idle_ttl, None, None)
             .await;
         self.finish_pending_warm().await;
         self.stop_for_shutdown().await;
@@ -460,11 +485,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             run: None,
             one_shot_runs: Default::default(),
             one_shot_submissions: Default::default(),
+            awaiting_probe: Vec::new(),
             close_when_idle: false,
             held_resume_owed: false,
             restart_admitting: false,
             restart_waiters: Vec::new(),
             account_limit_timer: None,
+            retention_timer: Default::default(),
             sign_in_check: None,
             sign_in_in_flight: None,
             sign_in_open_owed: false,
@@ -602,7 +629,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Work that keeps this session open past its idle deadline: a run, an owed sign-in
     /// probe, a warm, an account-limit timer, or a subscriber.
     /// A subscriber keeps the session open while its stream is attached, so a caller
-    /// watching an idle session isn't cut off at its idle deadline; the first idle tick after
+    /// watching an idle session isn't cut off at its idle deadline; the first idle deadline after
     /// the last one has gone closes it. Empty when the session may close.
     fn idle_holds(&mut self) -> Vec<&'static str> {
         let mut holds = Vec::new();
@@ -650,21 +677,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
     }
 
-    /// Appends `record`, one the actor writes on its own, synced, after storing the bytes of each
-    /// medium of `staged` its messages name, and tells the active run's copy of the folds. Returns
-    /// the record as appended, which says where those bytes are.
-    async fn append_own_with_media(
-        &mut self,
-        record: Record,
-        staged: &[crate::person_media::StagedMedia],
-    ) -> Result<Record, SessionError> {
-        let mut appended = self
-            .append_own_batch_with_media(std::slice::from_ref(&record), staged)
-            .await?;
-        Ok(appended.pop().expect("one record was appended"))
-    }
-
-    /// [`Self::append_own_with_media`] for a batch of records, appended together.
+    /// Appends `records`, ones the actor writes on its own, together and synced, after storing the
+    /// bytes of each medium of `staged` their messages name, and tells the active run's copy of
+    /// the folds. Returns the records as appended, which say where those bytes are.
     async fn append_own_batch_with_media(
         &mut self,
         records: &[Record],
@@ -729,6 +744,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
             Exit::Closed | Exit::Stop => None,
         };
+        // Sends still waiting for a sign-in probe's decision are answered so their callers
+        // re-route through the registry, as commands that raced the close are.
+        for command in std::mem::take(&mut self.awaiting_probe) {
+            reopen(command);
+        }
         if close.is_some() {
             // Commands that raced the close are answered so their callers re-route through the
             // registry, which reopens the session once this close is done.
@@ -854,14 +874,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // What the registry was last told holds the session open; `None` until it took a note,
         // which it refuses until this actor's slot reads open.
         let mut noted: Option<Vec<&'static str>> = None;
-        let mut retention = expiry::Timer::default();
         let clock = self.retention_clock.clone().unwrap_or_default();
         let mut clock_changes = clock.subscribe();
         loop {
             self.probe_sign_in_on_open().await;
             // What the last event's writes handed over, before anything else reads the index.
             self.absorb_media();
-            let expiry_deadline = retention
+            let expiry_deadline = self
+                .retention_timer
                 .deadline(
                     &self.session,
                     self.run.is_some(),
@@ -1014,6 +1034,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         }
                         continue;
                     }
+                    if self.handle(command).await {
+                        return Exit::Idle;
+                    }
+                }
+            }
+            // Sends that waited for a sign-in probe's decision are handled once it has made it,
+            // oldest first.
+            if !self.awaiting_probe.is_empty() && !self.sign_in_probing() {
+                for command in std::mem::take(&mut self.awaiting_probe) {
                     if self.handle(command).await {
                         return Exit::Idle;
                     }
@@ -1177,6 +1206,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Handles one command. Returns whether the actor should go away.
     async fn handle(&mut self, command: LineageCmd) -> bool {
+        let waits_for_probe = matches!(
+            &command,
+            LineageCmd::Send { key, delivery, order, .. }
+                if key.is_keyed()
+                    || (order.is_none() && *delivery == broca_protocol::Delivery::Interrupt)
+        );
+        if waits_for_probe && self.sign_in_probing() {
+            self.awaiting_probe.push(command);
+            return false;
+        }
         match command {
             LineageCmd::Import { request, reply } => {
                 let (outcome, retire) = self.inline_import(*request).await;
@@ -1543,19 +1582,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             }
                         }
                     }
-                    // At open, a run paused for sign-in on a routed account gets one probe, which
-                    // may ask routing for another account and move the run there; it never
-                    // resumes the run on the account that lost its sign-in. A retry of the paused
-                    // send arriving meanwhile would read the probe as its run running and be
-                    // answered `active`, with nothing left to run it once the probe ends. So the
-                    // probe finishes first, and the retry then resumes the pause itself.
-                    if self
-                        .run
-                        .as_ref()
-                        .is_some_and(|active| active.preserve_auth_pause)
-                    {
-                        self.run_current_to_end().await;
-                    }
+                    // A keyed send arriving while a sign-in probe decided waited for that
+                    // decision (`awaiting_probe`), so a retry of the paused send finds the run
+                    // either still paused, and resumes it below, or running again.
                     match self
                         .keyed(retries::KeyedSend {
                             run_id: &run_id,
@@ -1778,8 +1807,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 // a paused run except one paused for a restart; that run keeps the steer for its
                 // resume (`steer_restart_paused`). An ordered send waits behind any paused run,
                 // unless its list could start one. An interrupt can't end a run waiting on calls
-                // a provider holds; it ends any other paused run (`interrupt_paused`).
-                if self.run.is_none() {
+                // a provider holds; it ends any other paused run (`interrupt_paused`). A run
+                // whose sign-in probe is still deciding is paused all the same.
+                if self.run.is_none() || self.sign_in_probing() {
                     if let Some((paused, reason)) = self.paused() {
                         let starts_runs = order
                             .as_ref()
@@ -1925,6 +1955,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
             LineageCmd::Status { reply } => {
                 let status = match &self.run {
+                    Some(_) if self.sign_in_probing() => LineageStatus::Probing,
                     Some(active) => LineageStatus::Active {
                         run_id: active.run_id.clone(),
                         step: self
@@ -1934,7 +1965,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             .as_ref()
                             .map_or(0, |run| run.completed_steps),
                     },
-                    None => LineageStatus::Idle,
+                    _ => LineageStatus::Idle,
                 };
                 let _ = reply.send(status);
                 false
@@ -2007,7 +2038,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
                 false
             }
-            LineageCmd::IdleTick => self.idle_holds().is_empty(),
             LineageCmd::Warm {
                 lineage_id,
                 reply,
@@ -2098,6 +2128,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         cancel: CancellationToken,
     ) {
         if let Err(error) = self.track_recovery() {
+            // No run exists to store the send's staged media, so nothing holds them any longer.
+            self.held.clear();
             if let Some(reply) = reply {
                 let _ = reply.send(SendOutcome::Error(error.clone()));
             }
@@ -2142,6 +2174,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 match self.run_cache(request.cache.as_ref(), manifest.as_deref()) {
                     Ok(run_cache) => Some(run_cache),
                     Err(error) => {
+                        self.held.clear();
                         if let Some(reply) = reply {
                             let _ = reply.send(SendOutcome::Error(error.clone()));
                         }
@@ -3183,6 +3216,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Some((RunId(run.run_id.clone()), reason))
     }
 
+    /// Whether the active run is a sign-in probe that hasn't decided yet. At open, and when a
+    /// timed recheck comes due, a run paused for sign-in on a routed account gets a probe, which
+    /// may ask routing for another account and move the run there. Until the probe records the
+    /// run resumed, the session's run is still the paused one, though the probe's task is out,
+    /// and commands treat it as paused.
+    fn sign_in_probing(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|active| active.preserve_auth_pause)
+            && !self.session.operations().run_going
+            && self
+                .paused()
+                .is_some_and(|(_, reason)| reason == broca_protocol::PauseReason::AuthRequired)
+    }
+
     /// The session's latest run while it is unfinished and either running here or paused: the
     /// run a new send would have to wait behind.
     fn running(&self) -> Option<&broca_session_store::fold::operations::Run> {
@@ -3217,167 +3265,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .await?)
     }
 
-    /// A keyed send is looked up by the run id its key names: a run started under the key answers
-    /// the retry from that run's records when the payload is the same, and is refused naming
-    /// what differs when it is not. A send that never started, a steer, or one queued and since
-    /// settled is answered from its records too (`unstarted_retry`). A key that has not been used
-    /// starts a run.
-    async fn keyed(&mut self, send: retries::KeyedSend<'_>) -> Result<Keyed, String> {
-        let retries::KeyedSend {
-            run_id,
-            key,
-            request,
-            delivery,
-            conversation_key,
-            order,
-            legacy_steers: _,
-        } = send;
-        let digest = broca_core::send_identity_digest_with_conversation_key(
-            request,
-            delivery,
-            conversation_key,
-        );
-        let session = &self.session;
-        let find = |kind, id: String| async move {
-            session
-                .find_id(kind, &id)
-                .await
-                .map_err(|error| format!("{error:?}"))
-        };
-        let by_run = find(IdKind::RunId, run_id.0.clone()).await?;
-        let submission = find(IdKind::SubmissionId, format!("sub-{}", run_id.0)).await?;
-        let Some(start) = by_run.iter().find_map(|(_, record)| match record {
-            Record::RunStart(start) => Some(start),
-            _ => None,
-        }) else {
-            let mut holders = submission;
-            if let Some(send_id) = key.send_id() {
-                holders.extend(find(IdKind::SendId, send_id.to_owned()).await?);
-            }
-            // A key whose send is still queued is answered by the queue (`queue`).
-            let queued_id = format!("sub-{}", run_id.0);
-            let still_queued = !holders.is_empty()
-                && holders.iter().all(|(_, record)| {
-                    matches!(record, Record::QueuedSend(_) | Record::DeliveryOrdered(_))
-                })
-                && self
-                    .session
-                    .operations()
-                    .queue
-                    .iter()
-                    .any(|pending| pending.submission_id == queued_id);
-            if holders.is_empty() || still_queued {
-                return Ok(Keyed::Fresh(digest));
-            }
-            return self.unstarted_retry(send, &holders, digest).await;
-        };
-        // The delivery order is part of a keyed send's identity: a run an ordered send started
-        // is answered only to a retry asking for the same order, and a run a plain send started
-        // only to a plain retry.
-        let earlier = submission.iter().find_map(|(_, record)| match record {
-            Record::DeliveryOrdered(ordered) => Some(&ordered.order),
-            _ => None,
-        });
-        let same_order = match (earlier, order) {
-            (None, None) => true,
-            (Some(earlier), Some(retry)) => {
-                serde_json::from_value::<broca_protocol::DeliveryOrder>(earlier.clone())
-                    .map_err(|error| format!("the send's recorded order: {error}"))
-                    .map(|earlier| crate::actor::same_order(retry, &earlier))?
-            }
-            _ => false,
-        };
-        if !same_order {
-            return Ok(Keyed::Answered(SendOutcome::SendIdReuse {
-                differing: "delivery",
-            }));
-        }
-        let Some(stored) = start.request_identity_digest.as_deref() else {
-            // Nothing can prove the payload is the same send, so the retry neither runs again nor
-            // passes as the same one.
-            return Ok(Keyed::Answered(SendOutcome::SendIdReuse {
-                differing: "request identity because the run's start recorded no digest",
-            }));
-        };
-        if stored != digest {
-            let differing = broca_core::admission::send_identity_difference_with_conversation_key(
-                stored,
-                request,
-                delivery,
-                conversation_key,
-            )
-            .unwrap_or("request identity");
-            return Ok(Keyed::Answered(SendOutcome::SendIdReuse { differing }));
-        }
-        let outcome = match self
-            .session
-            .operations()
-            .run
-            .as_ref()
-            .filter(|run| run.run_id == run_id.0)
-        {
-            Some(run) => match (run.finished, run.paused) {
-                (Some(reason), _) => finished(run_id, reason),
-                _ if self.run.is_some() => SendOutcome::Active {
-                    run_id: run_id.clone(),
-                    delivered: None,
-                },
-                // A run paused for sign-in is resumed by its retry; whether the
-                // credential is ready now is the executor's to decide. Runner-owned pauses are
-                // reported.
-                (None, Some(broca_protocol::PauseReason::AuthRequired)) => {
-                    return Ok(Keyed::Resume)
-                }
-                (
-                    None,
-                    Some(
-                        reason @ (broca_protocol::PauseReason::Restart
-                        | broca_protocol::PauseReason::AccountLimit
-                        | broca_protocol::PauseReason::ToolHeld),
-                    ),
-                ) => SendOutcome::Paused {
-                    run_id: run_id.clone(),
-                    reason,
-                    delivered: None,
-                },
-                // An unfinished run that opening the session did not recover is not driven here:
-                // a retry is answered from the run's records, which read it as active.
-                (None, None) => SendOutcome::Active {
-                    run_id: run_id.clone(),
-                    delivered: None,
-                },
-            },
-            // An earlier run: a later run started only after this one ended.
-            None => match by_run.iter().find_map(|(_, record)| match record {
-                Record::RunEnd(end) => Some(end.reason),
-                _ => None,
-            }) {
-                Some(reason) => finished(run_id, reason),
-                None => SendOutcome::Error(format!(
-                    "the run {} that a recorded send started has no end, yet a later run started",
-                    run_id.0
-                )),
-            },
-        };
-        // An ordered send that started its own run was delivered as that run's turn, so its
-        // retry carries the `turn` receipt naming the run, as a retry of one delivered into a
-        // running run carries `step`. The send's order is in its records, so this holds after a
-        // restart.
-        let ordered = self
-            .session
-            .find_id(IdKind::SubmissionId, &format!("sub-{}", run_id.0))
-            .await
-            .map_err(|error| format!("{error:?}"))?
-            .iter()
-            .any(|(_, record)| matches!(record, Record::DeliveryOrdered(_)));
-        let outcome = if ordered {
-            with_turn_receipt(outcome, run_id)
-        } else {
-            outcome
-        };
-        Ok(Keyed::Answered(outcome))
-    }
-
     /// Marks the run started once its start is in the session, and tells a waiting sender it
     /// is active.
     fn answer_admission(&mut self) {
@@ -3393,12 +3280,20 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .is_some_and(|start| start.run_id == active.run_id.0);
         if started {
             active.started = true;
+            // The hints are kept only while they can still be read: a one-shot run while it is
+            // the latest run, which is the only one resumed or warmed, and a one-shot send while
+            // it is still queued. Anything older, retracted or ended goes now, so the sets stay
+            // as small as the queue for the actor's whole life.
+            self.one_shot_runs.retain(|run| *run == active.run_id);
             if active.one_shot {
                 self.one_shot_runs.insert(active.run_id.clone());
             }
-            if let Some(submission) = &active.submission {
-                self.one_shot_submissions.remove(submission);
-            }
+            let queue = &self.session.operations().queue;
+            self.one_shot_submissions.retain(|submission| {
+                queue
+                    .iter()
+                    .any(|queued| queued.submission_id == submission.0)
+            });
             if let Some(reply) = active.admitting.take() {
                 // The run's start is durable, so this send was admitted whatever happens here:
                 // a failure to read the first run's settings only leaves the answer without its
@@ -3502,8 +3397,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         if active.account_limit_resume {
             if let Err(error) = &result {
+                // A refused admission keeps its own class, as for any other paused run; a
+                // failure inside the loop is permanent.
+                let class = match error {
+                    StoreRunError::Admission(error) => error.admission_error_class(),
+                    StoreRunError::Loop(_) => broca_protocol::ErrorClass::Permanent,
+                };
                 if let Err(error) = self
-                    .refuse_account_limit_resume(&active.run_id, format!("{error:?}"))
+                    .refuse_account_limit_resume(&active.run_id, class, format!("{error:?}"))
                     .await
                 {
                     tracing::error!(target: "broca.store_actor", %error, "could not end a refused account-limit resume");
@@ -3543,6 +3444,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
             _ => None,
         };
+        let mut drain = true;
         if let (Some(submission), false, Err(error)) = (&active.submission, started, &result) {
             let error = match error {
                 StoreRunError::Admission(error) => error.clone(),
@@ -3552,7 +3454,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .end_refused_drain(submission, &active.run_id, error)
                 .await
             {
-                // The send stays queued, and the queue behind it waits.
+                // The send stays queued, and the queue behind it waits: the failed append left
+                // the writer poisoned, so a drain now would start a queued send whose start can't
+                // be written either, and end up here again, in a loop. The rest of the run's end
+                // goes on.
                 tracing::error!(
                     target: "broca.store_actor",
                     session = %self.key.session,
@@ -3563,11 +3468,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 if let Some(reply) = active.admitting {
                     let _ = reply.send(SendOutcome::Error(error));
                 }
-                return;
-            }
-            // A send whose sender waited on the run it drained into was queued first: it
-            // remains answered `pending`, now ended with the refusal.
-            if let Some(reply) = active.admitting {
+                drain = false;
+            } else if let Some(reply) = active.admitting {
+                // A send whose sender waited on the run it drained into was queued first: it
+                // remains answered `pending`, now ended with the refusal.
                 let _ = reply.send(SendOutcome::Pending {
                     submission_id: submission.clone(),
                 });
@@ -3653,7 +3557,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 tracing::error!(target: "broca.store_actor", %error, "could not resume a held run after its task parked");
             }
         }
-        self.drain().await;
+        if drain {
+            self.drain().await;
+        }
         self.arm_account_limit().await;
         self.arm_idle_warm().await;
     }
@@ -4694,11 +4600,12 @@ fn unserved_request(kind: RunKind, _retention: bool, ran: bool) -> Option<&'stat
 fn reopen(command: LineageCmd) {
     const CLOSING: &str = "session actor is closing";
     match command {
-        LineageCmd::RepairRetention { reply }
-        | LineageCmd::ResumeRestart { reply }
-        | LineageCmd::ResumeHeld { reply } => {
+        LineageCmd::RepairRetention { reply } | LineageCmd::ResumeRestart { reply } => {
             let _ = reply.send(Err(CLOSING.into()));
         }
+        // Dropped unanswered, as the registry reads a reply the actor never sent: it opens the
+        // session again and asks the next actor, as for every other command.
+        LineageCmd::ResumeHeld { reply } => drop(reply),
         LineageCmd::Send { reply, .. } => {
             let _ = reply.send(SendOutcome::Reopen);
         }
@@ -4746,8 +4653,7 @@ fn reopen(command: LineageCmd) {
             let _ = reply.send(crate::actor::WarmOutcome::Reopen);
         }
         LineageCmd::CutLock { reply, .. } => drop(reply),
-        LineageCmd::IdleTick
-        | LineageCmd::CompactionChanged { .. }
+        LineageCmd::CompactionChanged { .. }
         | LineageCmd::ApplyCompaction { .. }
         | LineageCmd::CompactionV2 { .. } => {}
         #[cfg(test)]
@@ -4825,8 +4731,7 @@ fn refuse(command: LineageCmd) {
         | LineageCmd::SessionRefresh { .. }
         | LineageCmd::SessionRefreshPolicy { .. }
         | LineageCmd::SessionFlushPrefix { .. }
-        | LineageCmd::Release { .. }
-        | LineageCmd::IdleTick => unreachable!("served by the actor"),
+        | LineageCmd::Release { .. } => unreachable!("served by the actor"),
     }
 }
 

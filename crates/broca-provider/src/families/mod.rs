@@ -162,6 +162,13 @@ pub(crate) fn merge_inclusive_input_tokens(
         });
         usage.cached_input_tokens = cached;
     } else if let Some(cached) = cached {
+        // A cached count reported without a total subdivides the total an earlier object of
+        // this response already recorded, so re-split that total: adding the cached count on
+        // top would report more input than the prompt held.
+        if let Some(fresh) = usage.input_tokens {
+            let total = fresh.saturating_add(usage.cached_input_tokens.unwrap_or(0));
+            usage.input_tokens = Some(total.saturating_sub(cached));
+        }
         usage.cached_input_tokens = Some(cached);
     }
 }
@@ -193,6 +200,20 @@ pub(crate) fn merge_inclusive_input_tokens_with_writes(
         usage.cached_input_tokens = cached;
         usage.cache_write_tokens = written;
     } else {
+        // A subdivision reported without a total belongs to the total an earlier object of
+        // this response already recorded, so re-split that total around it rather than counting
+        // the subdivision on top of fresh input. A class this object leaves out keeps its earlier
+        // value.
+        if let (Some(fresh), true) = (usage.input_tokens, cached.is_some() || written.is_some()) {
+            let recorded_total = fresh
+                .saturating_add(usage.cached_input_tokens.unwrap_or(0))
+                .saturating_add(usage.cache_write_tokens.unwrap_or(0));
+            let split_out = cached
+                .or(usage.cached_input_tokens)
+                .unwrap_or(0)
+                .saturating_add(written.or(usage.cache_write_tokens).unwrap_or(0));
+            usage.input_tokens = Some(recorded_total.saturating_sub(split_out));
+        }
         if let Some(cached) = cached {
             usage.cached_input_tokens = Some(cached);
         }

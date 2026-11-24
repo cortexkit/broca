@@ -64,6 +64,11 @@ struct Rig {
 
 impl Rig {
     async fn new(name: &str, idle_ttl: Duration) -> Self {
+        Self::with_executor(name, idle_ttl, Arc::new(NoRuns)).await
+    }
+
+    /// [`Rig::new`], with sessions opened over `executor`.
+    async fn with_executor(name: &str, idle_ttl: Duration, executor: Arc<dyn RunExecutor>) -> Self {
         let root = broca_test_support::scratch_root()
             .join(format!("retention-store-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -83,7 +88,7 @@ impl Rig {
         );
         let opener = Arc::new(DefaultOpener::new(
             leases,
-            Arc::new(NoRuns),
+            executor,
             std::sync::Arc::new(crate::store_open::StoreSlot::loaded(runtime.clone())),
         ));
         let registry = LineageRegistry::new(opener.clone());
@@ -294,6 +299,18 @@ fn the_retention_rule_reads_a_session_history() {
             Some((10, 2_000, Some(12_000))),
         ),
         (
+            "a later send never lengthens a shortened one",
+            vec![
+                start("r1", Some(60), 1_000),
+                queued(Some(30), 1_200),
+                queued(Some(60), 1_400),
+                end("r1", 2_000),
+                start("r2", Some(60), 2_500),
+                end("r2", 3_000),
+            ],
+            Some((30, 3_000, Some(33_000))),
+        ),
+        (
             "a later run that sets none keeps it",
             vec![
                 start("r1", Some(60), 1_000),
@@ -383,6 +400,52 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
     assert!(rig.holds(&key));
     let view = rig.runtime.current_view(&key).await.unwrap().unwrap();
     assert!(view.operations.owner.first_start.is_none(), "a new session");
+}
+
+/// An executor that notes, for each transport it is told to retire, whether the session's lease
+/// was held at that moment.
+struct RetiresTransports {
+    leases: FileLeaseStore,
+    /// One entry per retirement: true when it happened while the lease was held.
+    under_lease: std::sync::Mutex<Vec<bool>>,
+}
+
+#[async_trait::async_trait]
+impl RunExecutor for RetiresTransports {
+    fn retire_session_transport(&self, session: &BindIdentity) {
+        let held =
+            broca_core::LeaseStore::acquire(&self.leases, &broca_core::lease_key_for(session))
+                .is_err();
+        self.under_lease.lock().unwrap().push(held);
+    }
+}
+
+/// The sweep retires a deleted session's transport only while it holds that session's lease.
+/// Once the lease is released a send can create a new session at the same address, and an
+/// eviction then would close the new session's transport and stop its warming timer.
+#[tokio::test]
+async fn a_sweep_retires_a_deleted_sessions_transport_only_under_its_lease() {
+    let name = "evicts-under-lease";
+    let root = broca_test_support::scratch_root()
+        .join(format!("retention-store-{name}-{}", std::process::id()));
+    let executor = Arc::new(RetiresTransports {
+        leases: FileLeaseStore::new(root.join("leases")),
+        under_lease: std::sync::Mutex::default(),
+    });
+    let rig = Rig::with_executor(name, Duration::from_secs(600), executor.clone()).await;
+    let key = rig.key("expired");
+    rig.seed(
+        &key,
+        &[
+            store_start("r1", Some(SECONDS), STARTED_MS),
+            store_end("r1", ENDED_MS),
+            store_billed("r1"),
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(rig.registry.sweep_once(DEADLINE_MS).await.unwrap(), 1);
+    assert_eq!(*executor.under_lease.lock().unwrap(), vec![true]);
 }
 
 /// A deletion a crash cut short, after the session's head was marked deleted and before its logs

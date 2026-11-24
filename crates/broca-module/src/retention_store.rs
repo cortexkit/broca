@@ -129,30 +129,38 @@ pub fn store_policy(records: &[(u64, Record)]) -> Option<(u64, u64, Option<u64>)
     if !matches!(first, Some(Some(_))) {
         return None;
     }
+    Some(policy_of(
+        records
+            .iter()
+            .filter_map(|(_, record)| policy_event(record)),
+    ))
+}
+
+/// What `record` says about its session's retention clock, by the rules [`store_policy`] names;
+/// `None` for a record that says nothing about it.
+pub(crate) fn policy_event(record: &Record) -> Option<PolicyEvent> {
     let receipt_u64 = |receipt: &Option<broca_protocol::json::Json>, name: &str| {
         receipt
             .as_ref()
             .and_then(|receipt| receipt.parse().get(name)?.as_u64())
     };
-    Some(policy_of(records.iter().filter_map(
-        |(_, record)| match record {
-            Record::RunStart(start) => Some(PolicyEvent::Started {
-                retention: start.retention_secs,
-                ts_ms: start.ts_ms,
-            }),
-            Record::QueuedSend(send) => Some(PolicyEvent::Sent {
-                retention: receipt_u64(&send.receipt, "retention"),
-                ts_ms: send.ts_ms,
-            }),
-            Record::Steer(steer) => Some(PolicyEvent::Sent {
-                retention: receipt_u64(&steer.receipt, "retention"),
-                ts_ms: receipt_u64(&steer.receipt, "ts_ms"),
-            }),
-            Record::RunEnd(end) => Some(PolicyEvent::RunFinished { ts_ms: end.ts_ms }),
-            Record::Pause(pause) => Some(PolicyEvent::RunPaused { ts_ms: pause.ts_ms }),
-            _ => None,
-        },
-    )))
+    match record {
+        Record::RunStart(start) => Some(PolicyEvent::Started {
+            retention: start.retention_secs,
+            ts_ms: start.ts_ms,
+        }),
+        Record::QueuedSend(send) => Some(PolicyEvent::Sent {
+            retention: receipt_u64(&send.receipt, "retention"),
+            ts_ms: send.ts_ms,
+        }),
+        Record::Steer(steer) => Some(PolicyEvent::Sent {
+            retention: receipt_u64(&steer.receipt, "retention"),
+            ts_ms: receipt_u64(&steer.receipt, "ts_ms"),
+        }),
+        Record::RunEnd(end) => Some(PolicyEvent::RunFinished { ts_ms: end.ts_ms }),
+        Record::Pause(pause) => Some(PolicyEvent::RunPaused { ts_ms: pause.ts_ms }),
+        _ => None,
+    }
 }
 
 /// When the session whose records are `records`, folded into `operations`, is due for deletion.

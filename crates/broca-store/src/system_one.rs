@@ -3,10 +3,9 @@
 //! A model-batch call (`classify.run`, later `extract.run`) admits a batch under a caller's
 //! `batch_id` and records each item's outcome before it replies, so a re-send of the same
 //! batch serves the stored outcomes and asks the provider only for items still needing one.
-//! This file is the authority for those batches: nothing else can rebuild it. That is why it
-//! is its own SQLite file (`system-one.db`) rather than tables in `run-index.db`, which is a
-//! projection of the session's log that broca may delete and rebuild at any time. Nothing here
-//! reads or writes a session, a lease or the session's log.
+//! `system-one.db` is the authority for these batches. It keeps them separate from the run
+//! index and its session-scope reservations, which likewise cannot be rebuilt from logs.
+//! Nothing here reads or writes a session, a lease or the session's log.
 //!
 //! Two tables:
 //!
@@ -727,10 +726,28 @@ impl SystemOneStore {
             };
             let json =
                 serde_json::to_string(&fact).map_err(|e| SystemOneStoreError(e.to_string()))?;
-            tx.execute(
-                "INSERT INTO usage_outbox (fact_id, fact_json, spend_nanos) VALUES (?1, ?2, ?3)",
+            let inserted = tx.execute(
+                "INSERT INTO usage_outbox (fact_id, fact_json, spend_nanos) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (fact_id) DO NOTHING",
                 rusqlite::params![fact.fact_id, json, to_i64(*spend_nanos)],
             )?;
+            if inserted == 0 {
+                let same: bool = tx.query_row(
+                    "SELECT fact_json = ?2 AND spend_nanos = ?3 FROM usage_outbox WHERE fact_id = ?1",
+                    rusqlite::params![fact.fact_id, json, to_i64(*spend_nanos)],
+                    |row| row.get(0),
+                )?;
+                if !same {
+                    return Err(SystemOneStoreError(format!(
+                        "conflicting usage fact {}",
+                        fact.fact_id
+                    )));
+                }
+                // This paid outcome already committed. Undo the attempted batch and item
+                // updates too, so replay cannot consume the budget a second time.
+                tx.rollback()?;
+                return Ok(true);
+            }
         }
         tx.commit()?;
         Ok(true)

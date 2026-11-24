@@ -1920,12 +1920,12 @@ async fn run_turn(
             Err(e) => return Err(format!("subscribe stream: {e}")),
         };
         match decode_subscribe_event(&event) {
-            Ok(SubscribeEvent::Control { wal_seq, unit, .. }) => {
+            Ok(SubscribeEvent::Control { cursor, unit }) => {
                 let action = tracker.consume(&unit);
                 if action == RunTurnAction::Ignore {
                     continue;
                 }
-                emit_control(ControlRenderMode::Run, json, wal_seq, &unit);
+                emit_control(ControlRenderMode::Run, json, cursor.wal_seq, &unit);
                 // RunFinished has no run id, so it is ours only after the matching RunStarted.
                 // Paused carries a run id and is accepted only when it names this run.
                 match action {
@@ -1934,24 +1934,21 @@ async fn run_turn(
                     RunTurnAction::Ignore | RunTurnAction::Continue => {}
                 }
             }
-            Ok(SubscribeEvent::UnrecognizedRunState { wal_seq, state, .. }) => {
+            Ok(SubscribeEvent::UnrecognizedRunState { cursor, state }) => {
                 let action = tracker.consume_unrecognized(&state);
                 if action == RunTurnAction::Ignore {
                     continue;
                 }
-                emit_unrecognized_run_state(json, wal_seq, &state);
+                emit_unrecognized_run_state(json, cursor.wal_seq, &state);
                 match action {
                     RunTurnAction::Finished | RunTurnAction::Paused => break,
                     RunTurnAction::Ignore | RunTurnAction::Continue => {}
                 }
             }
             Ok(SubscribeEvent::UnknownControlUnit {
-                wal_seq,
-                sub_index,
-                unit_type,
-                ..
+                cursor, unit_type, ..
             }) => {
-                emit_unknown_control_unit(json, wal_seq, sub_index, &unit_type);
+                emit_unknown_control_unit(json, cursor.wal_seq, cursor.sub_index, &unit_type);
             }
             Ok(SubscribeEvent::Display(_)) => {} // lossy display, not asserted on
             Err(e) => return Err(format!("decode subscribe event: {e}")),
@@ -2003,31 +2000,6 @@ fn emit_unknown_control_unit(json: bool, wal_seq: u64, sub_index: u32, unit_type
     );
 }
 
-fn decode_observed_event(
-    body: &[u8],
-) -> Result<(SubscribeEvent, Option<broca_wire::CursorWire>), String> {
-    let event = decode_subscribe_event(body)?;
-    let cursor = match &event {
-        SubscribeEvent::Display(_) => None,
-        SubscribeEvent::Control { .. }
-        | SubscribeEvent::UnrecognizedRunState { .. }
-        | SubscribeEvent::UnknownControlUnit { .. } => {
-            // The typed event decoder retains only the cursor's position, which the server
-            // refuses for resuming. Read the original envelope to keep the full resume proof.
-            #[derive(serde::Deserialize)]
-            struct Envelope {
-                cursor: broca_wire::CursorWire,
-            }
-            Some(
-                serde_json::from_slice::<Envelope>(body)
-                    .map_err(|error| format!("decode subscribe cursor: {error}"))?
-                    .cursor,
-            )
-        }
-    };
-    Ok((event, cursor))
-}
-
 fn observed_event(finished: u32, cursor: Option<&broca_wire::CursorWire>) -> serde_json::Value {
     serde_json::json!({
         "event": "observed",
@@ -2062,14 +2034,10 @@ async fn observe(
             Ok(None) => break, // the stream ended cleanly (or its underlying connection closed)
             Err(e) => return Err(format!("subscribe stream: {e}")),
         };
-        let (event, cursor) = decode_observed_event(&event)
-            .map_err(|error| format!("decode subscribe event: {error}"))?;
-        if let Some(cursor) = cursor {
-            last_cursor = Some(cursor);
-        }
-        match event {
-            SubscribeEvent::Control { wal_seq, unit, .. } => {
-                emit_control(ControlRenderMode::Subscribe, json, wal_seq, &unit);
+        match decode_subscribe_event(&event)? {
+            SubscribeEvent::Control { cursor, unit } => {
+                emit_control(ControlRenderMode::Subscribe, json, cursor.wal_seq, &unit);
+                last_cursor = Some(cursor);
                 if matches!(unit, ControlUnit::RunFinished { .. }) {
                     finished += 1;
                     if until_runs != 0 && finished >= until_runs {
@@ -2077,8 +2045,9 @@ async fn observe(
                     }
                 }
             }
-            SubscribeEvent::UnrecognizedRunState { wal_seq, state, .. } => {
-                emit_unrecognized_run_state(json, wal_seq, &state);
+            SubscribeEvent::UnrecognizedRunState { cursor, state } => {
+                emit_unrecognized_run_state(json, cursor.wal_seq, &state);
+                last_cursor = Some(cursor);
                 if matches!(state, UnrecognizedRunState::Finished { .. }) {
                     finished += 1;
                     if until_runs != 0 && finished >= until_runs {
@@ -2087,12 +2056,10 @@ async fn observe(
                 }
             }
             SubscribeEvent::UnknownControlUnit {
-                wal_seq,
-                sub_index,
-                unit_type,
-                ..
+                cursor, unit_type, ..
             } => {
-                emit_unknown_control_unit(json, wal_seq, sub_index, &unit_type);
+                emit_unknown_control_unit(json, cursor.wal_seq, cursor.sub_index, &unit_type);
+                last_cursor = Some(cursor);
             }
             SubscribeEvent::Display(event) => {
                 if display {
@@ -2785,8 +2752,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        cache_params, decode_observed_event, load_plan, observed_event, parse_subscribe_cursor,
-        read_page_event, run, Args, Cmd, PathBuf,
+        cache_params, load_plan, observed_event, parse_subscribe_cursor, read_page_event, run,
+        Args, Cmd, PathBuf,
     };
 
     #[test]
@@ -3612,7 +3579,8 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_observer_preserves_full_cursor_for_every_control_kind() {
+    fn subscribe_decoder_preserves_full_cursor_for_every_control_kind() {
+        use super::{decode_subscribe_event, SubscribeEvent};
         let cursor = broca_wire::CursorWire {
             wal_seq: 7,
             sub_index: 1,
@@ -3629,16 +3597,18 @@ mod tests {
                 "kind": "control", "cursor": cursor, "unit": unit,
             }))
             .unwrap();
-            let (_, decoded_cursor) = decode_observed_event(&body).unwrap();
-            assert_eq!(decoded_cursor.as_ref(), Some(&cursor), "{unit}");
+            let decoded = decode_subscribe_event(&body).unwrap();
+            let reencoded = serde_json::to_value(decoded).unwrap();
+            assert_eq!(
+                reencoded["cursor"],
+                serde_json::to_value(&cursor).unwrap(),
+                "{unit}"
+            );
         }
-        let (_, cursor) =
-            decode_observed_event(br#"{"kind":"display","event":{"type":"display_reset"}}"#)
+        let display =
+            decode_subscribe_event(br#"{"kind":"display","event":{"type":"display_reset"}}"#)
                 .unwrap();
-        assert_eq!(
-            cursor, None,
-            "display events cannot advance a durable cursor"
-        );
+        assert!(matches!(display, SubscribeEvent::Display(_)));
     }
 
     #[test]

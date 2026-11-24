@@ -326,7 +326,7 @@ pub struct RouteHandle {
 
 /// How a route that carries a session's tool calls is opened. A cached route is reused only by
 /// a batch that would open it the same way.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct RouteShape {
     /// Ask for `tool-result/v1` bodies (the provider declared that format in the plan).
     pub(crate) tool_result_v1: bool,
@@ -1151,11 +1151,10 @@ impl SubcConnection {
 
     async fn control_rpc_deadline(&self, body: Vec<u8>, deadline: Duration) -> ConnResult<Frame> {
         let corr = self.next_corr();
-        let (runtime, _registration, mut rx) = self.register_control((0, 0, corr), false)?;
+        let (runtime, registration, mut rx) = self.register_control((0, 0, corr), false)?;
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body)
             .map_err(|e| ConnError::Transport(e.to_string()))?;
-        self.send(&runtime, frame).await?;
-        self.await_terminal_deadline(&runtime, &mut rx, deadline)
+        self.control_exchange(&runtime, registration, &mut rx, frame, deadline)
             .await
     }
 
@@ -1643,7 +1642,7 @@ impl SubcConnection {
             .capabilities
             .get_or_try_init(|| async {
                 let corr = self.next_corr();
-                let (registered, _registration, mut rx) =
+                let (registered, registration, mut rx) =
                     self.register_control((0, 0, corr), false)?;
                 if registered.conn != runtime.conn {
                     return Err(ConnError::Transport(
@@ -1654,9 +1653,8 @@ impl SubcConnection {
                     .map_err(|e| ConnError::Transport(e.to_string()))?;
                 let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body)
                     .map_err(|e| ConnError::Transport(e.to_string()))?;
-                self.send(&runtime, frame).await?;
                 let frame = self
-                    .await_terminal_deadline(&runtime, &mut rx, RESPONSE_TIMEOUT)
+                    .control_exchange(&runtime, registration, &mut rx, frame, RESPONSE_TIMEOUT)
                     .await?;
                 match serde_json::from_slice::<ClientControlResponse>(&frame.body) {
                     Ok(ClientControlResponse::ServerDescribe { capabilities, .. }) => {
@@ -2109,8 +2107,9 @@ impl SubcConnection {
     /// module runs under its new one, and one under a scope registered by the old owner meets
     /// `scope_not_live` once only its re-synced twin (same `ref` and `scope_epoch`, new owner)
     /// is live. Each such open is tried again under the other id, the target and the owner each
-    /// renamed at most once. A refused open created no route, so a retry cannot deliver twice;
-    /// when the retries are refused too, the first refusal is returned.
+    /// renamed at most once. A refused open created no route, so a retry cannot deliver twice.
+    /// When a retry is refused as retryable, that refusal is returned so the caller's wait and
+    /// backoff apply; when the retries are refused otherwise, the first refusal is returned.
     async fn route_open_wire_target(
         &self,
         target: RouteTarget,
@@ -2163,6 +2162,12 @@ impl SubcConnection {
                     tracing::info!(target: "subc", code = refusal.code(), opened_as = ?target,
                         owner_renamed, "route opened under a renamed module's other id");
                     return Ok(handle);
+                }
+                Err(ConnError::Rejected(again)) if route_open_is_retryable(again.code()) => {
+                    // The module under its other id is there but not ready yet (restarting,
+                    // warming, or its re-synced scope still syncing or changing). That answer,
+                    // not the old id's terminal one, is what the caller must wait and retry on.
+                    return Err(ConnError::Rejected(again));
                 }
                 Err(ConnError::Rejected(again)) => code = again.code().to_owned(),
                 Err(_) => return first,
@@ -4949,6 +4954,7 @@ mod catalog_watch;
 mod late_open;
 mod probe;
 mod renamed;
+pub(crate) use catalog_watch::CatalogGeneration;
 use late_open::{retry_late_goodbye, OpenReply};
 use probe::{channel_zero_probe_blocker, request_liveness_probe};
 use renamed::{renamed_target, Renamed};

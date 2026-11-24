@@ -996,6 +996,9 @@ struct ToolCallBuf {
     /// The completed item's other fields (`status`, and any the API adds), kept when the
     /// endpoint replays provider state; see `replay_call_state`.
     state: Option<serde_json::Map<String, Value>>,
+    /// The completed item said `status: incomplete`: the provider stopped generating the call
+    /// before it was whole, so its arguments (often still `""`) are not the call's arguments.
+    incomplete: bool,
 }
 
 #[derive(Deserialize)]
@@ -1641,6 +1644,7 @@ impl OpenAiResponsesNormalizer {
                 if let Some(name) = item.get("name").and_then(Value::as_str) {
                     buf.name = name.to_owned();
                 }
+                buf.incomplete = item.get("status").and_then(Value::as_str) == Some("incomplete");
                 // Presence is authoritative even when the final value is empty:
                 // `decode_tool_arguments` maps an empty string to `{}` for a
                 // zero-argument call. Absence alone preserves accumulated deltas.
@@ -1700,7 +1704,10 @@ impl OpenAiResponsesNormalizer {
     /// `output_text.done` and the streamed text is a strict prefix of the completed text, the
     /// stream was cut short and the completed parts replace the streamed ones. Parts are
     /// compared joined, since a completed item may carry as one part text that streamed as
-    /// several: replacing per part would repeat it.
+    /// several: replacing per part would repeat it. When some part was finalized, the stream's
+    /// part boundaries are the provider's own, so each part that was not finalized is repaired
+    /// on its own: its streamed text, when a strict prefix of the same completed part, is
+    /// replaced by it.
     fn complete_text(&mut self, idx: u64, parts: Vec<(u64, &str)>) {
         let item = (idx, 0)..=(idx, u64::MAX);
         let finalized = self
@@ -1728,9 +1735,21 @@ impl OpenAiResponsesNormalizer {
             return;
         }
         for (part_idx, text) in parts {
-            self.text_items
-                .entry((idx, part_idx))
-                .or_insert_with(|| text.to_owned());
+            let key = (idx, part_idx);
+            match self.text_items.get_mut(&key) {
+                Some(streamed)
+                    if finalized
+                        && !self.completed_text_parts.contains(&key)
+                        && text.len() > streamed.len()
+                        && text.starts_with(streamed.as_str()) =>
+                {
+                    *streamed = text.to_owned();
+                }
+                Some(_) => {}
+                None => {
+                    self.text_items.insert(key, text.to_owned());
+                }
+            }
         }
     }
 
@@ -1978,6 +1997,19 @@ impl OpenAiResponsesNormalizer {
                 output_tokens: self.usage.output_tokens,
             });
         for (index, buf) in std::mem::take(&mut self.tool_calls) {
+            // A call the provider itself marked incomplete never becomes a call, whatever its
+            // arguments hold. Cut at the output ceiling, it fails the attempt as the same
+            // permanent ceiling cut a call with unparseable arguments is; cut for any other
+            // reason, it is left out of the answer.
+            if buf.incomplete {
+                if let Some(stop) = ceiling {
+                    return Err(NormalizeError::OutputCeiling(
+                        stop.cut(&buf.name, &buf.arguments),
+                    ));
+                }
+                self.arguments_guard.omit_tool();
+                continue;
+            }
             let Some(input) = self.arguments_guard.decode(
                 &buf.arguments,
                 &buf.name,
@@ -2201,6 +2233,47 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
             "OpenAI Responses stream error"
         );
     }
+    let now = std::time::SystemTime::now();
+    // Only `response.failed` carries a retry time Codex reads; it ignores a bare `error`
+    // event's fields (`codex-api/src/sse/responses.rs:349-352`). The value is read from the
+    // provider's own message even when `message` above is replaced.
+    let retry_after_secs = if nested {
+        crate::codex_retry_after::failed_response_retry_after(error, now)
+    } else {
+        None
+    };
+    // A used-up plan allowance that states when it refills is the same account wall a ChatGPT
+    // HTTP 429 reports: transient for routing, with its reset, and the transport ends the step
+    // without re-sending to this account. One without a reset keeps ending permanent below.
+    if !billing_exhausted
+        && matches!(
+            cortexkit_chatgpt_policy::classify_stream_failure(event),
+            cortexkit_chatgpt_policy::Classification::AccountLimitExhausted { .. }
+        )
+    {
+        if let Some((resets_at_ms, resets_at_source)) =
+            account_limit_reset(error, now, retry_after_secs)
+        {
+            return ProviderError {
+                provider_details: None,
+                cause: None,
+                provider_subcode: None,
+                refusal: None,
+                class: ErrorClass::Transient,
+                message,
+                status: None,
+                retry_after_secs,
+                provider_code: Some(broca_protocol::error::ACCOUNT_LIMIT_EXHAUSTED.to_owned()),
+                resets_at_ms: Some(resets_at_ms),
+                resets_at_source: Some(resets_at_source.to_owned()),
+                limit_window: None,
+                account_ref: None,
+                credential_id: None,
+                affordable_max_tokens: None,
+                account_continue: None,
+            };
+        }
+    }
     ProviderError {
         provider_details: None,
         cause: None,
@@ -2213,17 +2286,7 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
         },
         message,
         status: None,
-        // Only `response.failed` carries a retry time Codex reads; it ignores a bare `error`
-        // event's fields (`codex-api/src/sse/responses.rs:349-352`). The value is read from the
-        // provider's own message even when `message` above is replaced.
-        retry_after_secs: if nested {
-            crate::codex_retry_after::failed_response_retry_after(
-                error,
-                std::time::SystemTime::now(),
-            )
-        } else {
-            None
-        },
+        retry_after_secs,
         provider_code: if billing_exhausted {
             Some(broca_protocol::error::BILLING_EXHAUSTED.to_owned())
         } else {
@@ -2239,11 +2302,52 @@ fn response_stream_error(event: &Value, nested: bool, private_diagnostics: bool)
     }
 }
 
+/// When a stream failure's used-up plan allowance refills, read the way the ChatGPT policy reads
+/// an HTTP 429's body: the error's `resets_at` (epoch seconds, source `body`), else `now` plus its
+/// `resets_in_seconds`, else `now` plus the failure's retry time (both source `retry_after`).
+fn account_limit_reset(
+    error: &Value,
+    now: std::time::SystemTime,
+    retry_after_secs: Option<f64>,
+) -> Option<(u64, &'static str)> {
+    let now_ms = u64::try_from(
+        now.duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    error
+        .get("resets_at")
+        .and_then(Value::as_u64)
+        .map(|seconds| (seconds.saturating_mul(1_000), "body"))
+        .or_else(|| {
+            error
+                .get("resets_in_seconds")
+                .and_then(Value::as_u64)
+                .map(|seconds| {
+                    (
+                        now_ms.saturating_add(seconds.saturating_mul(1_000)),
+                        "retry_after",
+                    )
+                })
+        })
+        .or_else(|| {
+            retry_after_secs
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| {
+                    (
+                        now_ms.saturating_add((seconds * 1_000.0) as u64),
+                        "retry_after",
+                    )
+                })
+        })
+}
+
 fn response_error_class(event: &Value, code: Option<&str>) -> ErrorClass {
-    // A used-up plan allowance, or a plan without the requested use, cannot be granted by
-    // re-sending, so the shared ChatGPT policy's account-wall and not-included stream classes
-    // end the step. Its rate-limit and overload classes are transient, as the table below
-    // already makes every code it does not list.
+    // A used-up plan allowance with no stated reset, or a plan without the requested use, cannot
+    // be granted by re-sending, so the shared ChatGPT policy's account-wall and not-included
+    // stream classes end the step. Its rate-limit and overload classes are transient, as
+    // `openai_stream_error_class` already makes every code it does not list.
     if matches!(
         cortexkit_chatgpt_policy::classify_stream_failure(event),
         cortexkit_chatgpt_policy::Classification::AccountLimitExhausted { .. }
@@ -2251,28 +2355,9 @@ fn response_error_class(event: &Value, code: Option<&str>) -> ErrorClass {
     ) {
         return ErrorClass::Permanent;
     }
-    match code {
-        Some("context_length_exceeded" | "context_window_exceeded") => ErrorClass::ContextOverflow,
-        Some(
-            "billing_exhausted"
-            | "insufficient_quota"
-            | "credit_balance_exhausted"
-            | "organization_spend_limit_exceeded"
-            | "project_spend_limit_exceeded"
-            | "invalid_prompt"
-            | "content_filter"
-            | "cyber_policy"
-            | "bio_policy"
-            | "misalignment_policy_violation",
-        ) => ErrorClass::Permanent,
-        // A credential the backend rejects won't be accepted on a re-send; the caller needs to
-        // sign in again or replace the key.
-        Some("invalid_api_key" | "authentication_error") => ErrorClass::Auth,
-        // The Responses backend uses unknown codes for transient failures. Model requests
-        // have no side effects, so only codes known to mean the request cannot succeed as
-        // sent are permanent. Keep exhausted account allowances permanent as well.
-        Some(_) | None => ErrorClass::Transient,
-    }
+    // The Responses backend uses unknown codes for transient failures, so only the codes known
+    // to mean the request cannot succeed as sent are permanent.
+    crate::normalize::openai_stream_error_class(code)
 }
 
 pub(crate) fn map_response_status(status: &str) -> FinishReason {
@@ -2353,6 +2438,34 @@ mod tests {
         let error = response_stream_error(&typed, true, false);
         assert_eq!(error.class, ErrorClass::Transient);
         assert_eq!(error.provider_code, None);
+    }
+
+    /// A used-up plan allowance that states its reset is the account wall a ChatGPT HTTP 429
+    /// reports: transient, relabelled `account_limit_exhausted`, with the reset kept, from an
+    /// absolute `resets_at` or a relative `resets_in_seconds`, in either failure shape.
+    #[test]
+    fn a_timed_chatgpt_stream_account_wall_keeps_its_reset() {
+        let resets_at = 4_102_444_800u64; // 2100-01-01, always in the future
+        for event in [
+            serde_json::json!({"type":"response.failed","response":{"error":{"code":"usage_limit_reached","resets_at":resets_at}}}),
+            serde_json::json!({"type":"error","error":{"code":"usage_limit_reached","resets_at":resets_at}}),
+        ] {
+            let nested = event["type"] == "response.failed";
+            let error = response_stream_error(&event, nested, false);
+            assert_eq!(error.class, ErrorClass::Transient, "{event}");
+            assert!(error.is_account_limit_exhausted(), "{event}");
+            assert_eq!(error.resets_at_ms, Some(resets_at * 1_000), "{event}");
+            assert_eq!(error.resets_at_source.as_deref(), Some("body"), "{event}");
+            assert_eq!(error.status, None);
+        }
+        let before = crate::transport::now_millis();
+        let relative = serde_json::json!({"type":"response.failed","response":{"error":{"code":"usage_limit_reached","resets_in_seconds":600}}});
+        let error = response_stream_error(&relative, true, false);
+        let after = crate::transport::now_millis();
+        assert!(error.is_account_limit_exhausted());
+        let resets_at_ms = error.resets_at_ms.expect("reset from the relative delay");
+        assert!((before + 600_000..=after + 600_000).contains(&resets_at_ms));
+        assert_eq!(error.resets_at_source.as_deref(), Some("retry_after"));
     }
 
     /// A filtered stream must not be retried: `content_filter` ends the step in every
@@ -2445,6 +2558,27 @@ mod tests {
         assert_eq!(text, "part 0 granular part 1 granular");
     }
 
+    /// Part 0 is finalized by its own `output_text.done`; part 1 streamed only its start. The
+    /// completed item carries part 1 whole, and it replaces the cut-short stream of that part.
+    #[test]
+    fn responses_fallback_repairs_a_partial_part_beside_a_finalized_one() {
+        let mut normalizer = OpenAiResponsesNormalizer::new(StepId(1));
+        let chunks: &[&[u8]] = &[
+            b"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"A\"}\n\n",
+            b"data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"A\"}\n\n",
+            b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":1,\"delta\":\"he\"}\n\n",
+            b"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"A\"},{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+        ];
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(normalizer.push(chunk).unwrap());
+        }
+        events.extend(normalizer.finish().unwrap());
+        assert_eq!(extract_assistant_text(&events), "Ahello");
+    }
+
     #[test]
     fn responses_fallback_all_omitted_case_recovers_everything() {
         let mut normalizer = OpenAiResponsesNormalizer::new(StepId(1));
@@ -2460,6 +2594,83 @@ mod tests {
         events.extend(normalizer.finish().unwrap());
         let text = extract_assistant_text(&events);
         assert_eq!(text, "part 0 omitted part 1 omitted");
+    }
+
+    /// A function call added with empty arguments whose completed item says
+    /// `status: incomplete`, delivered either in its own `output_item.done` or only in the
+    /// terminal response's `output`, ending with `incomplete_details.reason = reason`.
+    fn incomplete_call(
+        format: EncryptedReasoningFormat,
+        in_terminal_output: bool,
+        reason: &str,
+    ) -> Result<Vec<NormalizedEvent>, NormalizeError> {
+        let item = r#"{"type":"function_call","id":"fc_1","call_id":"call_1","name":"refresh","arguments":"","status":"incomplete"}"#;
+        let added = r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"refresh","arguments":"","status":"in_progress"}}"#;
+        let done =
+            format!(r#"{{"type":"response.output_item.done","output_index":0,"item":{item}}}"#);
+        let output = if in_terminal_output { item } else { "" };
+        let terminal = format!(
+            r#"{{"type":"response.incomplete","response":{{"id":"resp_1","status":"incomplete","incomplete_details":{{"reason":"{reason}"}},"output":[{output}],"usage":{{"input_tokens":10,"output_tokens":64}}}}}}"#
+        );
+        let mut records = vec![
+            r#"{"type":"response.created","response":{"id":"resp_1"}}"#.to_owned(),
+            added.to_owned(),
+        ];
+        if !in_terminal_output {
+            records.push(done);
+        }
+        records.push(terminal);
+        let mut normalizer =
+            OpenAiResponsesNormalizer::new_for_format(StepId(1), format).with_max_output_tokens(64);
+        let mut events = Vec::new();
+        for record in records {
+            events.extend(normalizer.push(format!("data: {record}\n\n").as_bytes())?);
+        }
+        events.extend(normalizer.finish()?);
+        Ok(events)
+    }
+
+    const FORMATS: [EncryptedReasoningFormat; 2] = [
+        EncryptedReasoningFormat::OpenAiResponses,
+        EncryptedReasoningFormat::OpenAiResponsesChatgpt,
+    ];
+
+    #[test]
+    fn a_call_the_provider_marked_incomplete_is_not_a_call() {
+        for format in FORMATS {
+            for in_terminal_output in [false, true] {
+                let events = incomplete_call(format, in_terminal_output, "content_filter")
+                    .expect("an incomplete call outside the ceiling is left out, not an error");
+                let message = events
+                    .iter()
+                    .find_map(|event| match event {
+                        NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                            Some(message)
+                        }
+                        _ => None,
+                    })
+                    .expect("assembled message");
+                assert_eq!(
+                    message.tool_calls().count(),
+                    0,
+                    "{format:?} in_terminal_output={in_terminal_output}: {:?}",
+                    message.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_call_marked_incomplete_at_the_output_ceiling_is_a_ceiling_cut() {
+        for format in FORMATS {
+            for in_terminal_output in [false, true] {
+                let result = incomplete_call(format, in_terminal_output, "max_output_tokens");
+                assert!(
+                    matches!(&result, Err(NormalizeError::OutputCeiling(_))),
+                    "{format:?} in_terminal_output={in_terminal_output}: {result:?}"
+                );
+            }
+        }
     }
 
     /// The event shape a Meta Muse stream sent with `reasoning.summary: "auto"` and

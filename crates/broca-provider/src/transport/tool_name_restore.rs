@@ -66,6 +66,10 @@ impl StreamNormalizer for ToolNameRestoringNormalizer {
         self.inner.last_event_type()
     }
 
+    fn step_ended(&self) -> bool {
+        self.inner.step_ended()
+    }
+
     fn keepalives_after_content(&self) -> Option<u64> {
         self.inner.keepalives_after_content()
     }

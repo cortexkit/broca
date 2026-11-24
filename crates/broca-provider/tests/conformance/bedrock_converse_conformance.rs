@@ -213,12 +213,12 @@ fn bedrock_message_stop_without_metadata_is_truncation() {
         )
     )));
 
-    let error = normalizer
+    let final_events = normalizer
         .finish()
-        .expect_err("EOF before the metadata trailer must be rejected");
+        .expect("a cut body is the transport's to report, not a decode failure");
     assert!(
-        error.to_string().contains("metadata trailer"),
-        "unexpected error: {error}"
+        final_events.is_empty(),
+        "EOF before the metadata trailer must not close the step: {final_events:?}"
     );
 }
 
@@ -229,12 +229,12 @@ fn bedrock_started_without_message_stop_is_truncation() {
     let mut normalizer = BedrockConverse.normalizer(&frozen, StepId(7));
 
     normalizer.push(&recorded).expect("message start");
-    let error = normalizer
+    let final_events = normalizer
         .finish()
-        .expect_err("EOF before messageStop must be rejected");
+        .expect("a cut body is the transport's to report, not a decode failure");
     assert!(
-        error.to_string().contains("messageStop"),
-        "unexpected error: {error}"
+        final_events.is_empty(),
+        "EOF before messageStop must not close the step: {final_events:?}"
     );
 }
 

@@ -245,7 +245,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             Err(error) => {
-                self.refuse_account_limit_resume(&pause.run_id, error)
+                self.refuse_account_limit_resume(&pause.run_id, ErrorClass::Permanent, error)
                     .await?;
                 self.drain().await;
             }
@@ -421,9 +421,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
     }
 
+    /// Ends a timed account-limit resume that could not continue. `class` is the failure's own
+    /// class, so a dependency that was briefly unavailable is reported as transient rather than
+    /// as a fault that sending again would meet.
     pub(super) async fn refuse_account_limit_resume(
         &mut self,
         run_id: &RunId,
+        class: ErrorClass,
         message: String,
     ) -> Result<(), String> {
         if !self
@@ -436,7 +440,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             return Ok(());
         }
         let error = ProviderError {
-            class: ErrorClass::Permanent,
+            class,
             message,
             provider_code: Some("account_limit_resume_refused".into()),
             status: None,

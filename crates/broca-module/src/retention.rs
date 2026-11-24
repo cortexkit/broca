@@ -74,42 +74,72 @@ pub(crate) enum PolicyEvent {
 }
 
 /// The retention seconds, the last activity and the deadline of a retained session whose records
-/// say `events`, in record order. The latest retention a run start or send set wins; each event's
-/// time is the session's latest activity; and a session whose latest run is active or paused has
-/// no deadline.
+/// say `events`, in record order ([`PolicyFold`]).
 pub(crate) fn policy_of(events: impl IntoIterator<Item = PolicyEvent>) -> (u64, u64, Option<u64>) {
-    let mut seconds = 0;
-    let mut activity = 0;
-    let mut nonterminal = false;
+    let mut fold = PolicyFold::default();
     for event in events {
+        fold.apply(event);
+    }
+    fold.decided()
+}
+
+/// A retained session's retention as its records say so far, folded one record at a time, so a
+/// reader that has folded a session's older records folds only the ones appended since.
+///
+/// The shortest retention any run start or send set wins: a send may shorten a session's
+/// retention but never lengthen it, and a send queued behind one that shortened it was admitted
+/// against that shorter one, whatever seconds its own record carries. Each event's time is the
+/// session's latest activity, and a session whose latest run is active or paused has no deadline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PolicyFold {
+    seconds: Option<u64>,
+    activity: u64,
+    nonterminal: bool,
+}
+
+impl PolicyFold {
+    pub(crate) fn apply(&mut self, event: PolicyEvent) {
         match event {
             PolicyEvent::Started { retention, ts_ms } => {
-                if let Some(value) = retention {
-                    seconds = value;
-                }
-                activity = ts_ms.unwrap_or(activity);
-                nonterminal = true;
+                self.shorten(retention);
+                self.activity = ts_ms.unwrap_or(self.activity);
+                self.nonterminal = true;
             }
             PolicyEvent::Sent { retention, ts_ms } => {
-                if let Some(value) = retention {
-                    seconds = value;
-                }
+                self.shorten(retention);
                 if let Some(time) = ts_ms {
-                    activity = time;
+                    self.activity = time;
                 }
             }
             PolicyEvent::RunFinished { ts_ms } => {
-                activity = ts_ms.unwrap_or(activity);
-                nonterminal = false;
+                self.activity = ts_ms.unwrap_or(self.activity);
+                self.nonterminal = false;
             }
             PolicyEvent::RunPaused { ts_ms } => {
-                activity = ts_ms.unwrap_or(activity);
-                nonterminal = true;
+                self.activity = ts_ms.unwrap_or(self.activity);
+                self.nonterminal = true;
             }
         }
     }
-    let deadline = (!nonterminal).then_some(activity.saturating_add(seconds.saturating_mul(1000)));
-    (seconds, activity, deadline)
+
+    fn shorten(&mut self, retention: Option<u64>) {
+        if let Some(value) = retention {
+            self.seconds = Some(self.seconds.map_or(value, |seconds| seconds.min(value)));
+        }
+    }
+
+    /// The shortest retention a run start or send set so far, if any set one.
+    pub(crate) fn seconds(&self) -> Option<u64> {
+        self.seconds
+    }
+
+    /// The retention seconds, the last activity and the deadline the events so far decide.
+    pub(crate) fn decided(&self) -> (u64, u64, Option<u64>) {
+        let seconds = self.seconds.unwrap_or(0);
+        let deadline = (!self.nonterminal)
+            .then_some(self.activity.saturating_add(seconds.saturating_mul(1000)));
+        (seconds, self.activity, deadline)
+    }
 }
 
 type EvictCaches = dyn Fn(&BindIdentity) + Send + Sync;

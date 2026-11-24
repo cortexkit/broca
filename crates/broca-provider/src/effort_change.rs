@@ -83,7 +83,7 @@ pub fn thinking_mode(frozen: &FrozenRenderConfig) -> Option<String> {
 }
 
 /// The effort an Anthropic request sends at its top level: its reasoning variant's.
-fn anthropic_effort(frozen: &FrozenRenderConfig) -> Option<&str> {
+pub(crate) fn anthropic_effort(frozen: &FrozenRenderConfig) -> Option<&str> {
     match &frozen.variant {
         Some(FrozenVariant {
             request: VariantRequest::Anthropic { effort, .. },
@@ -143,10 +143,11 @@ pub(crate) struct EffortPlan {
 /// (`opts.render_episodes`, oldest first, the request's own run last). `None` when the request
 /// has no per-message effort to send, which renders the top-level effort as it always did.
 ///
-/// Walking the runs, a run on another model, with other thinking, without an effort, or whose
-/// own config can't send a per-message effort, starts again from its own effort: that change
-/// was sent at the top level. Each later run whose effort differs from the one
-/// in force adds a per-message effort. A config that doesn't read gives no plan.
+/// Walking the runs, a run on another model, with other thinking, or whose own config can't send
+/// a per-message effort, starts again from its own effort: that change was sent at the top level.
+/// A run without an Anthropic effort (another family, or no effort variant) starts again too, and
+/// the next run with an effort anchors the top level. Each later run whose effort differs from the
+/// one in force adds a per-message effort. A config that doesn't read gives no plan.
 pub(crate) fn anthropic_plan(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
@@ -161,38 +162,47 @@ pub(crate) fn anthropic_plan(
         .map(|episode| serde_json::from_value(episode.frozen_config.clone()))
         .collect::<Result<_, _>>()
         .ok()?;
-    let first = configs.first()?;
-    let mut in_force = anthropic_effort(first)?.to_owned();
-    let mut plan = EffortPlan {
-        top_level: in_force.clone(),
-        messages: Vec::new(),
-    };
-    for (index, episode) in opts.render_episodes.episodes.iter().enumerate().skip(1) {
-        let (before, config) = (&configs[index - 1], &configs[index]);
-        let effort = anthropic_effort(config);
-        let same_route = config.family_id == before.family_id
-            && config.wire_model_id == before.wire_model_id
-            && thinking_mode(config) == thinking_mode(before);
-        match effort {
-            Some(effort) if same_route && effort == in_force => {}
-            Some(effort) if same_route && per_message_effort(config) => {
-                plan.messages.push(EffortMessage {
-                    after: episode.first_user.unwrap_or(episode.prompt_start),
-                    effort: effort.to_owned(),
-                });
-                effort.clone_into(&mut in_force);
+    // `None` while no run since the last reset has sent an effort: there is no top level to keep.
+    let mut plan: Option<EffortPlan> = None;
+    for (index, episode) in opts.render_episodes.episodes.iter().enumerate() {
+        let config = &configs[index];
+        let Some(effort) = anthropic_effort(config) else {
+            plan = None;
+            continue;
+        };
+        let same_route = index > 0 && {
+            let before = &configs[index - 1];
+            config.family_id == before.family_id
+                && config.wire_model_id == before.wire_model_id
+                && thinking_mode(config) == thinking_mode(before)
+        };
+        match plan.as_mut() {
+            Some(current) if same_route => {
+                let in_force = current
+                    .messages
+                    .last()
+                    .map_or(current.top_level.as_str(), |message| {
+                        message.effort.as_str()
+                    });
+                if effort == in_force {
+                    continue;
+                }
+                if per_message_effort(config) {
+                    current.messages.push(EffortMessage {
+                        after: episode.first_user.unwrap_or(episode.prompt_start),
+                        effort: effort.to_owned(),
+                    });
+                    continue;
+                }
             }
-            Some(effort) => {
-                effort.clone_into(&mut in_force);
-                plan = EffortPlan {
-                    top_level: in_force.clone(),
-                    messages: Vec::new(),
-                };
-            }
-            None => return None,
+            _ => {}
         }
+        plan = Some(EffortPlan {
+            top_level: effort.to_owned(),
+            messages: Vec::new(),
+        });
     }
-    (!plan.messages.is_empty()).then_some(plan)
+    plan.filter(|plan| !plan.messages.is_empty())
 }
 
 #[cfg(test)]

@@ -64,8 +64,7 @@ fn run_awaits_contract_cases_decode_through_broca_bodies_and_frames() {
         assert_eq!(
             decoded,
             SubscribeEvent::Control {
-                wal_seq: 7,
-                sub_index: index as u32,
+                cursor: CursorWire::new(7, index as u32),
                 unit
             }
         );

@@ -335,6 +335,8 @@ struct HolderState {
     /// No issue is attempted before this, after a failed one.
     issue_after: Option<tokio::time::Instant>,
     issue_backoff: Duration,
+    /// No renewal is attempted before this, after one failed while the JWT still worked.
+    renew_after: Option<tokio::time::Instant>,
     /// The retired key the latest re-issue replaced, so its WARN is written once.
     reissued_for: Option<String>,
 }
@@ -366,6 +368,7 @@ impl CredentialHolder {
                 stopped: false,
                 issue_after: None,
                 issue_backoff: ISSUE_BACKOFF_FIRST,
+                renew_after: None,
                 reissued_for: None,
             }),
             warnings: WarnOnce::default(),
@@ -384,9 +387,20 @@ impl CredentialHolder {
         if credential.refresh_at_ms() > now_ms() {
             return Ok(credential);
         }
+        // A renewal failed a moment ago while the JWT still works. Each attempt holds this lock
+        // for up to the route's whole budget, and every publish and handshake needs the lock,
+        // so the renewal is tried again only once its retry delay has passed.
+        if !credential.expired()
+            && state
+                .renew_after
+                .is_some_and(|at| tokio::time::Instant::now() < at)
+        {
+            return Ok(credential);
+        }
         match renew(self.route.as_ref(), &credential).await {
             Ok(renewed) => {
                 self.warnings.succeeded("ckbus.credential_renew");
+                state.renew_after = None;
                 state.current = Some(renewed.clone());
                 Ok(renewed)
             }
@@ -402,8 +416,10 @@ impl CredentialHolder {
                     state.current = None;
                     self.issue_locked(&mut state).await
                 } else {
-                    // An outage, not a retired key: the JWT still works, and the next caller
-                    // past the refresh point tries the renewal again.
+                    // An outage, not a retired key: the JWT still works, and the first caller
+                    // after the retry delay tries the renewal again.
+                    state.renew_after =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(RENEW_RETRY_MS));
                     Ok(credential)
                 }
             }
@@ -457,6 +473,7 @@ impl CredentialHolder {
                 self.warnings.succeeded("ckbus.credential");
                 state.issue_after = None;
                 state.issue_backoff = ISSUE_BACKOFF_FIRST;
+                state.renew_after = None;
                 state.current = Some(credential.clone());
                 Ok(credential)
             }
@@ -721,12 +738,10 @@ impl crate::step_events::StepEventPublisher for NatsConnector {
 
     async fn publish(&self, subject: &str, body: Vec<u8>) -> Result<(), String> {
         let publisher = self.shared_publisher().await?;
-        let mut state = publisher.state.lock().await;
-        publisher.ensure_connected(&mut state).await?;
-        let link = state.link.as_ref().ok_or("ckbus connection absent")?;
+        let link = publisher.connected_link().await?;
         let result = link.publish_live(subject, body).await;
         if result.is_err() {
-            state.needs_redial = true;
+            publisher.redial_after(&link).await;
         }
         result
     }
@@ -780,12 +795,10 @@ impl BusConnector for NatsConnector {
 
     async fn compaction_consumer(&self) -> Result<Box<dyn StreamCursor>, String> {
         let publisher = self.shared_publisher().await?;
-        let mut state = publisher.state.lock().await;
-        publisher.ensure_connected(&mut state).await?;
-        let link = state.link.as_ref().ok_or("ckbus connection absent")?;
+        let link = publisher.connected_link().await?;
         let result = link.attach_compaction().await;
         if result.is_err() {
-            state.needs_redial = true;
+            publisher.redial_after(&link).await;
         }
         result
     }
@@ -836,7 +849,9 @@ struct LazyPublisher {
     state: Mutex<LazyState>,
 }
 struct LazyState {
-    link: Option<Box<dyn Link>>,
+    /// Shared so a publish can use the link after releasing this state's lock: only opening
+    /// and replacing the link has to be serialized, not each publish and its acknowledgement.
+    link: Option<Arc<dyn Link>>,
     /// Keep a failed link until its replacement is installed, so it can be closed too.
     needs_redial: bool,
 }
@@ -866,7 +881,7 @@ impl LazyPublisher {
             }
             dials += 1;
             let replacement = self.dialer.dial(&self.holder, &credential).await?;
-            let old = state.link.replace(replacement);
+            let old = state.link.replace(Arc::from(replacement));
             state.needs_redial = false;
             if let Some(old) = old {
                 if old.credential_public() != credential.credential_public {
@@ -894,18 +909,39 @@ impl LazyPublisher {
             }
         }
     }
+
+    /// A link on the holder's current key, opened if need be. The state's lock is held only
+    /// while the link is checked or replaced, so callers use the link concurrently.
+    async fn connected_link(&self) -> Result<Arc<dyn Link>, String> {
+        let mut state = self.state.lock().await;
+        self.ensure_connected(&mut state).await?;
+        state
+            .link
+            .clone()
+            .ok_or_else(|| "ckbus connection absent".into())
+    }
+
+    /// `link` failed a request: the next caller dials again on whatever key the holder then
+    /// has, then closes it. A link another caller already replaced is left alone.
+    async fn redial_after(&self, link: &Arc<dyn Link>) {
+        let mut state = self.state.lock().await;
+        if state
+            .link
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, link))
+        {
+            state.needs_redial = true;
+        }
+    }
 }
 #[async_trait]
 impl BusPublisher for LazyPublisher {
     async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
-        let mut state = self.state.lock().await;
-        self.ensure_connected(&mut state).await?;
-        let link = state.link.as_ref().ok_or("ckbus connection absent")?;
+        let link = self.connected_link().await?;
         let result = link.publish(event).await;
         if result.is_err() {
-            // The next publish dials again on whatever key the holder then has, then
-            // closes the failed link. Only ck-bus reporting retirement reissues a key.
-            state.needs_redial = true;
+            // Only ck-bus reporting retirement reissues a key; a failed publish just redials.
+            self.redial_after(&link).await;
         }
         result
     }
@@ -1135,6 +1171,11 @@ mod tests {
         closed: StdMutex<Vec<String>>,
         close_pending: AtomicBool,
         closing_violations: StdMutex<Vec<String>>,
+        /// A JetStream publish waits for a read guard, so a test holding the write guard
+        /// stands for a broker slow to acknowledge.
+        publish_gate: tokio::sync::RwLock<()>,
+        /// JetStream publishes that reached the broker, acknowledged or not.
+        publishes_started: std::sync::atomic::AtomicUsize,
     }
     impl Broker {
         fn new(ckbus: Arc<CkBus>) -> Arc<Self> {
@@ -1147,6 +1188,8 @@ mod tests {
                 closed: StdMutex::new(vec![]),
                 close_pending: AtomicBool::new(false),
                 closing_violations: StdMutex::new(vec![]),
+                publish_gate: tokio::sync::RwLock::new(()),
+                publishes_started: Default::default(),
             })
         }
     }
@@ -1174,6 +1217,8 @@ mod tests {
             Ok(())
         }
         async fn publish(&self, event: &Publication) -> Result<PublishReceipt, String> {
+            self.broker.publishes_started.fetch_add(1, Ordering::SeqCst);
+            let _acknowledged = self.broker.publish_gate.read().await;
             if self.connection.closed.load(Ordering::SeqCst) {
                 return Err("connection closed".into());
             }
@@ -1619,6 +1664,79 @@ mod tests {
         assert_ne!(renewed.credential_public, first.credential_public);
         assert_eq!(Some(renewed.credential_public), ckbus.current());
         assert_eq!(ckbus.issued(), 2);
+    }
+
+    /// A renewal that fails while the JWT still works is tried again only after
+    /// `RENEW_RETRY_MS`, not by every caller in between: each attempt holds the holder's lock
+    /// for up to the route's whole budget, and every publish and handshake needs that lock.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_renewal_waits_its_retry_delay_before_the_next_attempt() {
+        let exp = now_ms() / 1000 + 60;
+        let renew_call = "ckbus.credential_renew";
+        let route = Arc::new(FakeRoute(StdMutex::new(VecDeque::from([
+            (
+                "ckbus.credential",
+                json!({}),
+                Ok(
+                    json!({"jwt":"fixture","exp":exp,"acct":"box_test","inbox_prefix":"_INBOX.U_fixture","server_url":"nats://127.0.0.1:1","credential_public":"U_fixture"}),
+                ),
+            ),
+            (
+                renew_call,
+                json!({"credential_public":"U_fixture"}),
+                Err(CkbusError::TimedOut { method: renew_call }),
+            ),
+        ]))));
+        let holder = CredentialHolder::with_route(route.clone());
+        // Issued already inside the refresh margin, so the next call renews, and fails.
+        assert_eq!(holder.current().await.unwrap().jwt, "fixture");
+        assert_eq!(holder.current().await.unwrap().jwt, "fixture");
+        assert!(route.0.lock().unwrap().is_empty());
+        // Within the retry delay the working JWT is served with no ck-bus call: FakeRoute
+        // panics on a request it doesn't expect.
+        tokio::time::advance(Duration::from_millis(RENEW_RETRY_MS - 1)).await;
+        assert_eq!(holder.current().await.unwrap().jwt, "fixture");
+        // Once it has passed, the next caller renews.
+        route.0.lock().unwrap().push_back((
+            renew_call,
+            json!({"credential_public":"U_fixture"}),
+            Ok(json!({"jwt":"renewed","exp":exp + 3600,"credential_public":"U_fixture"})),
+        ));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(holder.current().await.unwrap().jwt, "renewed");
+        assert!(route.0.lock().unwrap().is_empty());
+    }
+
+    /// A broker slow to acknowledge one JetStream publish holds up only that publish: a live
+    /// step event goes out on the same connection meanwhile, rather than queueing behind the
+    /// acknowledgement on the shared connection's lock.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_acknowledgement_does_not_hold_up_live_step_events() {
+        use crate::step_events::StepEventPublisher;
+        let (connector, broker, publisher) = rotation_fixture().await;
+        let subject = connector.live_subject("broca").await.unwrap();
+        let started = broker.publishes_started.load(Ordering::SeqCst);
+        let unacknowledged = broker.publish_gate.write().await;
+        let slow = tokio::spawn(async move { publisher.publish(&publication()).await });
+        while broker.publishes_started.load(Ordering::SeqCst) == started {
+            tokio::task::yield_now().await;
+        }
+        // The clock is paused, so this bound passes only once every task is blocked: a live
+        // publish that waits behind the acknowledgement times out at once.
+        let live = tokio::time::timeout(
+            Duration::from_secs(5),
+            StepEventPublisher::publish(&connector, &subject, b"step body".to_vec()),
+        )
+        .await;
+        assert!(
+            live.is_ok(),
+            "a live step event waited behind an unacknowledged publish"
+        );
+        live.unwrap().unwrap();
+        drop(unacknowledged);
+        let _receipt = slow.await.unwrap().unwrap();
+        assert_eq!(broker.live.lock().unwrap().len(), 1);
+        assert_eq!(broker.connections.lock().unwrap().len(), 1);
     }
 
     /// `ckbus_generation_not_live` means this process is being replaced: the holder issues

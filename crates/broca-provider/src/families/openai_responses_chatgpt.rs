@@ -58,7 +58,8 @@ thread_local! {
 
 /// What any renderer reads from the render config of a run other than the ones whose messages
 /// it renders: [`effort_plan`]'s inputs, the family, the wire model, the reasoning effort and
-/// whether effort updates are on.
+/// whether effort updates are on, and for Anthropic Messages the effort and thinking mode that
+/// `effort_change::anthropic_plan` walks.
 ///
 /// A store that no longer holds every earlier run keeps only the first run and the runs where
 /// this key changes, so a renderer that starts reading another member of an earlier run's config
@@ -74,12 +75,22 @@ pub fn episode_render_key(frozen_config: &serde_json::Value) -> serde_json::Valu
         }
         _ => None,
     });
-    serde_json::json!({
+    let mut key = serde_json::json!({
         "family_id": config.family_id,
         "wire_model_id": config.wire_model_id,
         "effort": effort,
         "chatgpt_effort_updates": config.chatgpt_effort_updates,
-    })
+    });
+    // Only a run with an Anthropic effort adds them, so the key of every other run keeps the
+    // bytes it was recorded with. The thinking mode of a run without an effort never shapes a
+    // request: the effort walk starts again at such a run whatever its thinking is.
+    if let Some(effort) = crate::effort_change::anthropic_effort(&config) {
+        key["anthropic_effort"] = serde_json::json!(effort);
+        if let Some(thinking) = crate::effort_change::thinking_mode(&config) {
+            key["thinking_mode"] = serde_json::json!(thinking);
+        }
+    }
+    key
 }
 
 /// The runs of `history` a request must carry when the messages before prompt position

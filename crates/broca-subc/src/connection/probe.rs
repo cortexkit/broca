@@ -1,5 +1,6 @@
 //! Whether a silent connection may be probed now: a Ping waits while the daemon is busy with
-//! a request on channel zero, since it answers that channel in order.
+//! a request on channel zero, since it answers that channel in order. A channel-zero request
+//! therefore waits for room to send under a deadline, so it never holds a probe back for good.
 
 use super::*;
 
@@ -134,5 +135,39 @@ pub(super) fn request_liveness_probe(
             let owner = Arc::downgrade(shared);
             tokio::spawn(async move { run_liveness_probe(owner, runtime, corr).await });
         }
+    }
+}
+
+impl SubcConnection {
+    /// Send a registered channel-zero request and wait for its terminal reply, with one
+    /// `deadline` over both. From registration on, the request holds back liveness probes (the
+    /// daemon answers channel zero in order), so it must not wait for room in the writer queue
+    /// with no clock running: on a socket that stopped draining it would hold back, forever, the
+    /// very probe that would find the stall. A request that can't be queued in time is dropped
+    /// unsent, its waiter removed, and a probe asked for.
+    pub(super) async fn control_exchange(
+        &self,
+        runtime: &Arc<ConnectionRuntime>,
+        registration: PendingRegistration,
+        rx: &mut mpsc::UnboundedReceiver<Frame>,
+        frame: Frame,
+        deadline: Duration,
+    ) -> ConnResult<Frame> {
+        let until = time::Instant::now() + deadline;
+        match time::timeout_at(until, self.send(runtime, frame)).await {
+            Ok(sent) => sent?,
+            Err(_) => {
+                drop(registration);
+                self.spawn_liveness_probe(runtime);
+                return Err(ConnError::Transport(format!(
+                    "control request could not be queued for sending within {deadline:?}; \
+                     nothing was sent"
+                )));
+            }
+        }
+        let remaining = until.saturating_duration_since(time::Instant::now());
+        let reply = self.await_terminal_deadline(runtime, rx, remaining).await;
+        drop(registration);
+        reply
     }
 }

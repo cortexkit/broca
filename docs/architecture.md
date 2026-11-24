@@ -43,10 +43,10 @@ first sent. An intent with no outcome is indeterminate: the resumed run stops as
 them again. See the [durability contract](durability-contract.md).
 
 **SQLite stores** (`broca-store`). `run-index.db` holds the session-ref index,
-scope reservations, bus outboxes and usage-export facts. `system-one.db`,
-`grants.db` and `late-results.db` hold decision batches, consent grants and held
-calls, and late-result intake. None of them holds a session's records; where they
-derive something from them, the records win.
+scope reservations, bus outboxes and usage-export facts. `system-one.db` holds
+decision batches and `grants.db` holds consent grants. `broca-module` owns
+`late-results.db` for held calls and late-result intake. None of these stores holds
+a session's records; where they derive something from them, the records win.
 
 State roots without a `state-format` marker keep today's format. The staging-only
 `broca-state/2` redesign has been removed: a root whose marker names it refuses

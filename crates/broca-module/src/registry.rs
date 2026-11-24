@@ -193,6 +193,7 @@ impl ActorHandle {
 struct OpenGuard {
     inner: Arc<Inner>,
     key: LineageKey,
+    gen: u64,
     ready: broadcast::Sender<Result<ActorHandle, OpenError>>,
     committed: bool,
 }
@@ -201,11 +202,13 @@ impl OpenGuard {
     fn new(
         inner: Arc<Inner>,
         key: LineageKey,
+        gen: u64,
         ready: broadcast::Sender<Result<ActorHandle, OpenError>>,
     ) -> Self {
         Self {
             inner,
             key,
+            gen,
             ready,
             committed: false,
         }
@@ -222,7 +225,9 @@ impl Drop for OpenGuard {
             return;
         }
         let mut slots = self.inner.slots.lock().unwrap();
-        if matches!(slots.get(&self.key), Some(Entry::Opening { .. })) {
+        // Only this open's own slot: an actor that ended early may have cleared it, and a
+        // later caller may have claimed the session for a new open since.
+        if matches!(slots.get(&self.key), Some(Entry::Opening { gen, .. }) if *gen == self.gen) {
             slots.remove(&self.key);
         }
         drop(slots);
@@ -1787,6 +1792,13 @@ impl LineageRegistry {
                         Action::Open(tx, gen)
                     }
                     Some(Entry::Opening { ready, .. }) => Action::Wait(ready.subscribe()),
+                    // An actor that is gone without clearing its slot can't answer anything:
+                    // the slot is cleared so this caller opens the session afresh, rather than
+                    // every caller retrying a closed channel forever.
+                    Some(Entry::Open { handle, .. }) if handle.tx.is_closed() => {
+                        slots.remove(key);
+                        continue;
+                    }
                     Some(Entry::Open { handle, .. }) => Action::Have(handle.clone()),
                     Some(Entry::Closing { done, .. }) => Action::WaitClose(done.subscribe()),
                 }
@@ -1819,7 +1831,8 @@ impl LineageRegistry {
                     // than starting a second open. On ANY outcome we resolve `ready` AND
                     // fix the slot, so no waiter hangs. If this task is cancelled or panics
                     // mid-await, `OpenGuard` clears the Opening slot.
-                    let open_guard = OpenGuard::new(self.inner.clone(), key.clone(), ready.clone());
+                    let open_guard =
+                        OpenGuard::new(self.inner.clone(), key.clone(), gen, ready.clone());
                     let result = async {
                         ACTOR_OPENS.fetch_add(1, Ordering::Relaxed);
                         if status {
@@ -1841,10 +1854,20 @@ impl LineageRegistry {
                         }
                     }
                     .await;
+                    let mut published = false;
                     {
                         let mut slots = self.inner.slots.lock().unwrap();
+                        let still_opening = matches!(
+                            slots.get(key),
+                            Some(Entry::Opening { gen: g, .. }) if *g == gen
+                        );
                         match &result {
-                            Ok(handle) => {
+                            // The actor runs from before the slot is published, and one that
+                            // already ended (its session expired, or the module stopped) has
+                            // closed or cleared this slot itself, or left its channel closed.
+                            // Publishing it would hand every later caller a handle nothing
+                            // answers, so the slot is left for the next caller to open afresh.
+                            Ok(handle) if still_opening && !handle.tx.is_closed() => {
                                 slots.insert(
                                     key.clone(),
                                     Entry::Open {
@@ -1852,6 +1875,12 @@ impl LineageRegistry {
                                         handle: handle.clone(),
                                     },
                                 );
+                                published = true;
+                            }
+                            Ok(_) => {
+                                if still_opening {
+                                    slots.remove(key);
+                                }
                             }
                             Err(_) => {
                                 // Clear the failed Opening slot so a later, independent op
@@ -1861,7 +1890,7 @@ impl LineageRegistry {
                             }
                         }
                     }
-                    if let Ok(handle) = &result {
+                    if let (Ok(handle), true) = (&result, published) {
                         let _ = SERVED_REQUEST_ACTOR_OPENED.try_with(|opened| {
                             opened.store(true, Ordering::Relaxed);
                         });
@@ -2802,9 +2831,11 @@ impl LineageRegistry {
                 // The actor began closing: re-route through a fresh open.
                 continue;
             }
-            return rx
-                .await
-                .map_err(|_| "session actor dropped the held-run reply".to_owned())?;
+            // A closing actor drops the reply: re-route through a fresh open.
+            match rx.await {
+                Ok(result) => return result,
+                Err(_) => continue,
+            }
         }
         Err("session actor kept closing while a late result waited".into())
     }
@@ -2952,7 +2983,10 @@ impl RegistryHandle {
     pub fn begin_close(&self, key: &LineageKey, gen: u64) -> Option<CloseToken> {
         let mut slots = self.inner.slots.lock().unwrap();
         match slots.get(key) {
-            Some(Entry::Open { gen: g, .. }) if *g == gen => {
+            // An actor runs from before its opener publishes it, so one can end while its slot
+            // still reads opening; it closes that slot as it would an open one, and the opener
+            // then leaves it alone.
+            Some(Entry::Open { gen: g, .. } | Entry::Opening { gen: g, .. }) if *g == gen => {
                 let (done, _rx) = broadcast::channel(1);
                 slots.insert(
                     key.clone(),
@@ -2968,6 +3002,7 @@ impl RegistryHandle {
                 Some(CloseToken {
                     inner: self.inner.clone(),
                     key: key.clone(),
+                    gen,
                     done,
                     resolved: false,
                 })
@@ -2982,7 +3017,9 @@ impl RegistryHandle {
     /// generation (a newer actor) or already Closing/absent.
     pub fn finalize_exit(&self, key: &LineageKey, gen: u64) {
         let mut slots = self.inner.slots.lock().unwrap();
-        if let Some(Entry::Open { gen: g, .. }) = slots.get(key) {
+        // An actor that ends before its opener publishes it clears the opening slot too, so
+        // the opener never publishes a handle nothing answers.
+        if let Some(Entry::Open { gen: g, .. } | Entry::Opening { gen: g, .. }) = slots.get(key) {
             if *g == gen {
                 slots.remove(key);
             }
@@ -3021,6 +3058,8 @@ impl RegistryHandle {
 pub struct CloseToken {
     inner: Arc<Inner>,
     key: LineageKey,
+    /// The generation of the actor that is closing.
+    gen: u64,
     done: broadcast::Sender<()>,
     /// True once `commit`/`abort` ran. If the token is DROPPED still false (the actor task
     /// panicked mid-teardown), `Drop` treats it as a commit so the slot can't get stuck
@@ -3032,10 +3071,25 @@ impl CloseToken {
     /// The close finished: remove the slot (Closed) and wake the `actor_for` waiters.
     pub fn commit(mut self) {
         self.resolved = true;
+        self.clear();
+    }
+
+    /// Removes the slot and what the closing actor last reported holding it open, then wakes
+    /// the waiters. A later actor for the session reports its own holds once it is open, so
+    /// nothing of the closed one is kept for a session that may never open again.
+    fn clear(&self) {
         {
             let mut slots = self.inner.slots.lock().unwrap();
             slots.remove(&self.key);
         }
+        let mut holds = self.inner.actor_idle_holds.lock().unwrap();
+        if holds
+            .get(&self.key)
+            .is_some_and(|(owner, _)| *owner == self.gen)
+        {
+            holds.remove(&self.key);
+        }
+        drop(holds);
         let _ = self.done.send(());
     }
 }
@@ -3049,11 +3103,7 @@ impl Drop for CloseToken {
         if self.resolved {
             return;
         }
-        {
-            let mut slots = self.inner.slots.lock().unwrap();
-            slots.remove(&self.key);
-        }
-        let _ = self.done.send(());
+        self.clear();
     }
 }
 
@@ -3104,10 +3154,10 @@ impl LineageRegistry {
             } else {
                 service.sweep_due_store(&runtime, now_ms).await
             };
-            for key in found {
-                self.evict_retention_caches(&key);
-                deleted += 1;
-            }
+            // Each deletion already evicted the session's caches while it held the lease. An
+            // eviction here, after the lease is gone, could stop the warming timer and close the
+            // transport of a session a send created at the same address since.
+            deleted = found.len();
         }
         tracing::info!(target: "retention", deleted, full, "retention sweep complete");
         Ok(deleted)
@@ -3192,6 +3242,10 @@ impl LineageRegistry {
 
     fn evict_retention_caches(&self, key: &LineageKey) -> bool {
         self.handle().stop_idle_warm(key, "expired");
+        // The session is gone, so whether its warming was refused no longer applies: keeping
+        // the mark would only grow the set, and would refuse warming to a session created at
+        // the same address.
+        self.inner.idle_warm_stops.lock().unwrap().remove(key);
         self.inner.opener.retire_session_transport(key);
         self.inner.cache.remove(key);
         true
@@ -3406,7 +3460,75 @@ mod tests {
             gen: u64,
             _registry: RegistryHandle,
         ) -> Result<ActorHandle, OpenError> {
-            let (tx, _rx) = mpsc::channel(1);
+            Ok(ActorHandle {
+                gen,
+                tx: live_channel(),
+                run_in_flight: Arc::new(AtomicU64::new(0)),
+                first_episode: Arc::new(std::sync::OnceLock::new()),
+            })
+        }
+    }
+
+    /// A command channel whose actor stays alive, reading and ignoring every command, until the
+    /// last handle to it is gone.
+    fn live_channel() -> mpsc::Sender<crate::actor::LineageCmd> {
+        let (tx, mut rx) = mpsc::channel(1);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tx
+    }
+
+    /// How an actor that ends before its opener publishes it leaves: clearing its slot, as at a
+    /// stop, or closing it, as at an idle close or its session's expiry.
+    #[derive(Clone, Copy, Debug)]
+    enum EarlyExit {
+        Finalized,
+        Closed,
+    }
+
+    /// Opens actors that end before the opener returns, the first time only; later actors live.
+    struct EndsBeforePublishOpener {
+        exit: EarlyExit,
+        opens: AtomicU64,
+    }
+
+    #[async_trait]
+    impl LineageOpener for EndsBeforePublishOpener {
+        /// A session store whose runtime never opens: this opener keeps no sessions.
+        fn store_slot(&self) -> &std::sync::Arc<crate::store_open::StoreSlot> {
+            static SLOT: std::sync::OnceLock<std::sync::Arc<crate::store_open::StoreSlot>> =
+                std::sync::OnceLock::new();
+            SLOT.get_or_init(|| {
+                std::sync::Arc::new(crate::store_open::StoreSlot::awaiting_key(
+                    std::path::Path::new("/nonexistent-broca-test-store"),
+                    1,
+                ))
+            })
+        }
+        async fn open(
+            &self,
+            key: &LineageKey,
+            gen: u64,
+            registry: RegistryHandle,
+        ) -> Result<ActorHandle, OpenError> {
+            if self.opens.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(ActorHandle {
+                    gen,
+                    tx: live_channel(),
+                    run_in_flight: Arc::new(AtomicU64::new(0)),
+                    first_episode: Arc::new(std::sync::OnceLock::new()),
+                });
+            }
+            // The actor's whole life, run to its end before the opener returns.
+            let (tx, rx) = mpsc::channel(1);
+            match self.exit {
+                EarlyExit::Finalized => registry.finalize_exit(key, gen),
+                EarlyExit::Closed => {
+                    if let Some(close) = registry.begin_close(key, gen) {
+                        close.commit();
+                    }
+                }
+            }
+            drop(rx);
             Ok(ActorHandle {
                 gen,
                 tx,
@@ -3414,6 +3536,60 @@ mod tests {
                 first_episode: Arc::new(std::sync::OnceLock::new()),
             })
         }
+    }
+
+    /// An actor that ends before its opener publishes it is never published: the session's
+    /// slot is left clear, and the next caller opens a live actor instead of retrying a closed
+    /// channel forever.
+    #[tokio::test]
+    async fn an_actor_ending_before_it_is_published_leaves_no_open_slot() {
+        for exit in [EarlyExit::Finalized, EarlyExit::Closed] {
+            let opener = Arc::new(EndsBeforePublishOpener {
+                exit,
+                opens: AtomicU64::new(0),
+            });
+            let registry = LineageRegistry::new(opener.clone());
+            let session = key();
+            let _ = registry.actor_for(&session).await;
+            assert_eq!(registry.slot_state(&session), None, "{exit:?}");
+            let handle = tokio::time::timeout(
+                broca_test_support::EVENT_HANG_GUARD,
+                registry.actor_for(&session),
+            )
+            .await
+            .expect("the next open is bounded")
+            .expect("the next open succeeds");
+            assert!(!handle.tx.is_closed(), "{exit:?}: a live actor");
+            assert_eq!(opener.opens.load(Ordering::SeqCst), 2, "{exit:?}");
+        }
+    }
+
+    /// A slot left open on an actor that is gone is cleared by the next caller, which opens a
+    /// live actor in its place.
+    #[tokio::test]
+    async fn a_slot_open_on_a_gone_actor_is_opened_afresh() {
+        let opener = Arc::new(EndsBeforePublishOpener {
+            exit: EarlyExit::Finalized,
+            opens: AtomicU64::new(1),
+        });
+        let registry = LineageRegistry::new(opener.clone());
+        let session = key();
+        let (dead, _) = mpsc::channel(1);
+        registry.inner.slots.lock().unwrap().insert(
+            session.clone(),
+            Entry::Open {
+                gen: 1,
+                handle: ActorHandle {
+                    gen: 1,
+                    tx: dead,
+                    run_in_flight: Arc::new(AtomicU64::new(0)),
+                    first_episode: Arc::new(std::sync::OnceLock::new()),
+                },
+            },
+        );
+        let handle = registry.actor_for(&session).await.unwrap();
+        assert!(!handle.tx.is_closed());
+        assert_eq!(opener.opens.load(Ordering::SeqCst), 2);
     }
 
     fn key() -> LineageKey {
@@ -3491,6 +3667,43 @@ mod tests {
             None,
             "dropping an unresolved CloseToken clears the Closing slot (treated as commit)"
         );
+    }
+
+    /// A closed actor's report of what held its session open goes with its slot, so a registry
+    /// serving many short-lived sessions keeps nothing for those that closed.
+    #[test]
+    fn an_idle_close_forgets_what_held_the_session_open() {
+        let reg = LineageRegistry::new(Arc::new(NeverOpener));
+        for commit in [true, false] {
+            let k = key();
+            let gen = reg.inner.next_gen.fetch_add(1, Ordering::SeqCst);
+            let (dummy_tx, _rx) = mpsc::channel(1);
+            reg.inner.slots.lock().unwrap().insert(
+                k.clone(),
+                Entry::Open {
+                    gen,
+                    handle: ActorHandle {
+                        gen,
+                        tx: dummy_tx,
+                        run_in_flight: Arc::new(AtomicU64::new(0)),
+                        first_episode: Arc::new(std::sync::OnceLock::new()),
+                    },
+                },
+            );
+            assert!(reg.handle().note_idle_holds(&k, gen, Vec::new()));
+            assert!(reg.inner.actor_idle_holds.lock().unwrap().contains_key(&k));
+            let token = reg.handle().begin_close(&k, gen).expect("began close");
+            if commit {
+                token.commit();
+            } else {
+                drop(token);
+            }
+            assert_eq!(reg.slot_state(&k), None);
+            assert!(
+                reg.inner.actor_idle_holds.lock().unwrap().is_empty(),
+                "commit={commit}: the closed actor's holds are forgotten"
+            );
+        }
     }
 
     struct LeaseHeldOpener {
@@ -3580,10 +3793,9 @@ mod tests {
             while self.park.load(std::sync::atomic::Ordering::SeqCst) {
                 self.release.notified().await;
             }
-            let (tx, _rx) = mpsc::channel(1);
             Ok(ActorHandle {
                 gen,
-                tx,
+                tx: live_channel(),
                 run_in_flight: Arc::new(AtomicU64::new(0)),
                 first_episode: Arc::new(std::sync::OnceLock::new()),
             })

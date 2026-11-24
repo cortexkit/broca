@@ -84,8 +84,8 @@ mod setup;
 use setup::{store_setup, Setup};
 mod start_config;
 pub use start_config::{
-    run_config_members, run_config_of_run, run_config_of_start, run_frozen_facts, ConfigMembers,
-    FrozenFacts, SetupParts,
+    frozen_marker_order, run_config_members, run_config_of_run, run_config_of_start,
+    run_frozen_facts, ConfigMembers, FrozenFacts, SetupParts,
 };
 
 /// The cache-marker placement a session's first run freezes (see
@@ -435,7 +435,10 @@ where
         // A prefix rebuild writes the prompt afresh, so the run takes a versioned tool's
         // same-major definition there; its start records the tools it took.
         if admission.rebuild_point {
-            let changes = seams.tools.compatible_tools(&manifest).await;
+            let changes = seams
+                .tools
+                .compatible_tools(&seams.bind, admission.send.scope.as_ref(), &manifest)
+                .await;
             if let Some((taken, tools)) =
                 crate::plan_tools::take_compatible_tools(&manifest, &admission.tools, &changes)
             {
@@ -1547,18 +1550,6 @@ pub(crate) fn downgrade_render_config(render_config: &mut Arc<Value>) {
     broca_protocol::structured_output::FrozenStructuredOutput::downgrade_render_config(
         Arc::make_mut(render_config),
     );
-}
-
-/// The cache marker order `start` froze, which its record keeps beside its config; `None` for a
-/// run that froze none.
-pub fn frozen_marker_order(start: &broca_session_store::record::RunStart) -> Option<u32> {
-    start
-        .run_choices
-        .as_ref()
-        .and_then(|choices| choices.get("record"))
-        .and_then(|record| record.get("marker_order_version"))
-        .and_then(Value::as_u64)
-        .and_then(|version| u32::try_from(version).ok())
 }
 
 /// The admission a run's start froze: its model, settings, tools and system text, read back from
@@ -3709,11 +3700,11 @@ fn render_episodes<W: Writer>(
 /// records.
 ///
 /// Past the window, the conversation keeps only the runs whose render key changes (what renderers
-/// read from a run's render config to render another run's messages: the wire family, model and
-/// reasoning effort; see `episode_render_key`), so a run that changed only the tool set can be
-/// missing there and the fold may find a different change point than one over every run. That
-/// never changes a request: such a point is below the window, where no message the request
-/// renders sits, so either floor drops the same reasoning.
+/// read from a run's render config to render another run's messages: the wire family, model,
+/// reasoning effort and thinking mode; see `episode_render_key`), so a run that changed only the
+/// tool set can be missing there and the fold may find a different change point than one over
+/// every run. That never changes a request: such a point is below the window, where no message
+/// the request renders sits, so either floor drops the same reasoning.
 async fn render_history<W: Writer>(
     writer: &W,
     parts: &dyn Parts,

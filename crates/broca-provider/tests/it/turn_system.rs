@@ -388,3 +388,40 @@ fn anthropic_template_beside_a_message_that_renders_empty_renders_as_a_user_note
         .map(|(role, text)| (role.to_owned(), text.to_owned()))
     );
 }
+
+/// The converse: a template after a reply that renders empty sits after the user message before
+/// that reply, and before the next reply, a place Anthropic accepts, so it keeps its system role.
+#[test]
+fn anthropic_template_after_a_reply_that_renders_empty_keeps_its_system_role() {
+    let (family, frozen, _) = route("anthropic_messages", true);
+    let prompt = vec![
+        text(Role::System, "Fixed instructions."),
+        text(Role::User, "First turn."),
+        Message::new(Role::Assistant, vec![]),
+        system("After an empty reply."),
+        text(Role::Assistant, "A reply."),
+    ];
+    let body: Value =
+        serde_json::from_slice(&family.render(&frozen, &CallOptions::new(prompt))).unwrap();
+    let rendered: Vec<(String, String)> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| {
+            let content = match &message["content"] {
+                Value::String(text) => text.clone(),
+                blocks => blocks[0]["text"].as_str().unwrap_or_default().to_owned(),
+            };
+            (message["role"].as_str().unwrap().to_owned(), content)
+        })
+        .collect();
+    assert_eq!(
+        rendered,
+        [
+            ("user", "First turn."),
+            ("system", "After an empty reply."),
+            ("assistant", "A reply."),
+        ]
+        .map(|(role, text)| (role.to_owned(), text.to_owned()))
+    );
+}

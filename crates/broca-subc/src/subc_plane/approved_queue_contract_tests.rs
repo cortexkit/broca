@@ -2,7 +2,7 @@
 // snapshot too, so only the enqueue boundary can consume the scripted transport.
 fn cached_plane(conn: SubcConnection) -> SubcToolPlane {
     let plane = SubcToolPlane::new(conn, "aft");
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     plane
 }
 #[tokio::test]

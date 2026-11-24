@@ -345,12 +345,12 @@ async fn resolve_routing_module(conn: &broca_subc::SubcConnection) -> Result<Str
         .catalog_list()
         .await
         .map_err(|error| format!("routing catalog: {error}"))?
-        .into_iter()
+        .iter()
         .filter(|entry| {
             entry.nonce_verified
                 && broca_subc::catalog_entry_provides(entry, cortexkit_role_routing::PROVIDES)
         })
-        .map(|entry| entry.module_id)
+        .map(|entry| entry.module_id.clone())
         .collect::<Vec<_>>();
     providers.sort();
     providers.dedup();

@@ -183,6 +183,14 @@ fn account_changed_ends_with_substitute_error_reason() {
 }
 
 #[test]
+fn a_refreshed_credential_for_an_unlisted_host_ends_with_its_own_reason() {
+    refresh_ends(
+        RejectedRefreshResult::HostNotAllowed,
+        EndReason::CredentialHostNotAllowed,
+    );
+}
+
+#[test]
 fn unchanged_credential_ends_without_resending() {
     refresh_ends(
         RejectedRefreshResult::UnchangedCredential,

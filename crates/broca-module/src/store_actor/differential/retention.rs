@@ -514,6 +514,55 @@ async fn a_later_send_shortens_the_retention(cipher: Cipher) {
     new.stop().await;
 }
 
+/// Sends queued behind a running run keep the shortest retention any of them asked for: one that
+/// names none takes the shorter retention a send queued before it set, one asking for the longer
+/// one back is refused, and once every run has ended the session expires at the shorter deadline.
+async fn queued_sends_never_lengthen_a_queued_shortening(cipher: Cipher) {
+    let gate = Arc::new(Notify::new());
+    let new = retained(cipher, TTL, Some(gate.clone())).await;
+    let shorter = SECONDS / 2;
+    let sent = new.send("r1", Some(SECONDS)).await.unwrap();
+    assert!(matches!(sent, SendOutcome::Active { .. }), "{sent:?}");
+    let shortening = new.send("r2", Some(shorter)).await.unwrap();
+    assert!(
+        matches!(shortening, SendOutcome::Pending { .. }),
+        "{shortening:?}"
+    );
+    let unnamed = new.send("r3", None).await.unwrap();
+    assert!(
+        matches!(unnamed, SendOutcome::Pending { .. }),
+        "{unnamed:?}"
+    );
+    let longer = new.send("r4", Some(SECONDS)).await.unwrap();
+    assert!(
+        matches!(longer, SendOutcome::RetentionInvalid(_)),
+        "a queued send can't lengthen what a send queued before it shortened: {longer:?}"
+    );
+    broca_test_support::wait_until("the queued runs ran", || async {
+        // A notify holds at most one permit, so each poll lets the waiting model step go.
+        gate.notify_one();
+        let page = new
+            .module
+            .registry
+            .read(SessionReadRequest::new(new.module.key.clone(), None, None))
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        // Each run adds its input and its reply.
+        if page.messages.len() == 6 {
+            Ok(())
+        } else {
+            Err(format!("{} messages", page.messages.len()))
+        }
+    })
+    .await;
+    new.idle().await;
+    let deadline = NOW + shorter * 1000;
+    new.advance(deadline);
+    new.deleted().await;
+    new.expired_read(deadline).await;
+    new.stop().await;
+}
+
 fn principal(module_id: &str) -> broca_protocol::BindPrincipal {
     broca_protocol::BindPrincipal::Reserved {
         module_id: module_id.into(),
@@ -842,6 +891,7 @@ cipher_tests!(
     only_the_first_sender_releases_a_session,
     a_release_during_a_run_deletes_once_it_ends,
     a_later_send_shortens_the_retention,
+    queued_sends_never_lengthen_a_queued_shortening,
     retained_creating_sends_validate_alike,
     swept_retained_reads_and_fresh_sends_match,
     closed_retained_sessions_expire_before_any_sweep_alike,

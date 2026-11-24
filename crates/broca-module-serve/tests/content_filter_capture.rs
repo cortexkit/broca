@@ -157,6 +157,53 @@ async fn l2_thinking_only_refusal_resends_the_same_step() {
     rig.finish().await;
 }
 
+/// A refusal that stops while a tool block is open (its id, name and placeholder input arrived,
+/// its arguments and `content_block_stop` never did) is a refusal with no call: the step is
+/// resent rather than committed as a tool step, and nothing is dispatched.
+#[tokio::test]
+async fn a_refusal_cutting_a_tool_block_resends_the_step_without_a_call() {
+    let sse = [
+        json!({"type":"message_start","message":{"model":"claude-opus-5-5","id":"msg_cut","type":"message","role":"assistant","content":[],"usage":{"input_tokens":4,"output_tokens":1}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_cut","name":"refresh","input":{}}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}),
+        json!({"type":"message_stop"}),
+    ]
+    .iter()
+    .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+    .collect::<String>();
+    let events = normalize(&sse);
+    let calls = assistant(&events).tool_calls().count();
+    let mut rig = Rig::start("capture-refusal-open-tool").await;
+    *rig.script.refusal_fallback_model.lock().unwrap() = Some(target());
+    rig.script
+        .normalized_steps
+        .lock()
+        .unwrap()
+        .push_back(events);
+    let sent = rig
+        .send_with(
+            "open-tool",
+            "Synthetic prompt",
+            None,
+            json!({
+                "model": {"provider":"anthropic", "model":"claude-opus-5-5"}
+            }),
+        )
+        .await;
+    assert!(result(&sent)["run_id"].is_string());
+    rig.wait_idle().await;
+    let records = rig.records().await;
+    let refused = records
+        .iter()
+        .filter(|r| matches!(r, Record::StepRefused(_)))
+        .count();
+    assert_eq!(refused, 1, "the refusal reaches the resend path");
+    assert!(rig.script.dispatched.lock().unwrap().is_empty());
+    assert_eq!(rig.script.prompts.lock().unwrap().len(), 2);
+    assert_eq!(calls, 0);
+    rig.finish().await;
+}
+
 #[test]
 fn l3_keeps_handoff_and_both_usage_iterations_separate_from_last_iteration_usage() {
     let events = normalize(L3);

@@ -170,9 +170,11 @@ pub fn same_owner_string(a: &str, b: &str) -> bool {
 }
 
 impl BindPrincipal {
-    /// The principal as one string, for comparing against a scope owner and for naming it in
-    /// a refusal: `reserved:<module_id>`, `direct` or `unverified`. This is how a scope owner is
-    /// spelled, so a recorded principal matches an owner exactly when the strings are equal.
+    /// The principal as one string, for naming it in a refusal or forwarding it as an owner:
+    /// `reserved:<module_id>`, `direct` or `unverified`. This is how a scope owner is spelled,
+    /// but two equal-meaning spellings need not be equal strings: a module that changed its id
+    /// ([`RENAMED_MODULES`]) is spelled under either id. Compare with [`same_owner_string`], or
+    /// key by [`Self::canonical_owner_string`], never with string equality.
     ///
     /// An unknown kind renders as its compact JSON, which starts with `{` and so can never
     /// equal a scope owner or any of the three known spellings.

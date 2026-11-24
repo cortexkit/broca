@@ -125,6 +125,9 @@ struct ScriptedToolPlaneConnection {
     /// When set, the next tool call announces itself and waits for its release before it
     /// answers, so a test can act while that call is in flight.
     send_gate: Mutex<Option<RouteOpenGate>>,
+    /// What [`ToolPlaneConnection::catalog_generation`] reports; `None` (can't tell) unless a
+    /// test moves it.
+    catalog_generation: Mutex<Option<crate::connection::CatalogGeneration>>,
 }
 
 impl ScriptedToolPlaneConnection {
@@ -167,6 +170,7 @@ impl ScriptedToolPlaneConnection {
             dispatched_arguments: Mutex::new(Vec::new()),
             gates: Mutex::new(HashMap::new()),
             send_gate: Mutex::new(None),
+            catalog_generation: Mutex::new(None),
         })
     }
 
@@ -231,14 +235,19 @@ impl ScriptedToolPlaneConnection {
 
 #[async_trait]
 impl ToolPlaneConnection for ScriptedToolPlaneConnection {
-    async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
+    async fn catalog_list(&self) -> Result<Arc<Vec<CatalogEntry>>, ConnError> {
         self.catalog_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self
-            .catalogs
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("test must script every catalog.list response"))
+        Ok(Arc::new(
+            self.catalogs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("test must script every catalog.list response"),
+        ))
+    }
+
+    fn catalog_generation(&self) -> Option<crate::connection::CatalogGeneration> {
+        *self.catalog_generation.lock().unwrap()
     }
 
     async fn route_open(
@@ -737,7 +746,7 @@ async fn mid_run_module_warming_then_success_retries_route_open() {
     );
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/route-open-retry", "test", "session");
     let lifecycle = CancellationToken::new();
     tokio::time::pause();
@@ -774,7 +783,7 @@ async fn mid_run_module_warming_forever_stops_at_retry_deadline() {
     );
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/route-open-retry-deadline", "test", "session");
     let lifecycle = CancellationToken::new();
     tokio::time::pause();
@@ -813,7 +822,7 @@ async fn warm_bind_respects_its_own_timeout_under_persistent_warming() {
     );
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/warm-short-timeout", "test", "session");
     let lifecycle = CancellationToken::new();
 
@@ -845,7 +854,7 @@ async fn warm_bind_caps_route_open_attempts_per_outer_iteration() {
     );
     let plane = Arc::new(SubcToolPlane::with_connection(conn.clone(), "aft"));
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/warm-cap", "test", "session");
     let lifecycle = CancellationToken::new();
 
@@ -898,7 +907,7 @@ async fn mid_run_module_removed_is_not_retried() {
     );
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/route-open-terminal", "test", "session");
     let lifecycle = CancellationToken::new();
     let started = Instant::now();
@@ -932,7 +941,7 @@ async fn mid_run_unknown_route_open_code_is_not_retried() {
     );
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/route-open-unknown", "test", "session");
     let lifecycle = CancellationToken::new();
     let started = Instant::now();
@@ -963,7 +972,7 @@ async fn mid_run_transport_route_open_error_is_not_retried() {
     conn.script_route_open_sequence("aft", vec![RouteOpenScript::transport("socket lost")]);
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/route-open-transport", "test", "session");
     let lifecycle = CancellationToken::new();
     let started = Instant::now();
@@ -997,7 +1006,7 @@ async fn warm_module_removed_stops_after_one_attempt() {
     );
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/warm-terminal", "test", "session");
     let lifecycle = CancellationToken::new();
     let started = Instant::now();
@@ -1027,7 +1036,7 @@ async fn warm_structured_module_refusal_stops_after_one_attempt() {
     conn.script_route_open_sequence("aft", vec![RouteOpenScript::rejected_body(&body)]);
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/warm-structured-terminal", "test", "session");
     let started = Instant::now();
 
@@ -1061,7 +1070,7 @@ async fn warm_structured_retryable_refusal_is_retried() {
     );
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/warm-structured-retry", "test", "session");
 
     let result = plane
@@ -1083,7 +1092,7 @@ async fn warm_transport_route_open_error_still_retries_to_timeout() {
     conn.script_route_open_sequence("aft", vec![RouteOpenScript::transport("socket lost")]);
     let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
     plane.windows.lock().unwrap().insert("aft".into(), 1);
-    *plane.catalog_memo.lock().unwrap() = Some(Arc::new(Vec::new().into()));
+    *plane.catalog_memo.lock().unwrap() = Some((None, Arc::new(Vec::new().into())));
     let bind = BindIdentity::new("/tmp/warm-transport", "test", "session");
     let lifecycle = CancellationToken::new();
     let started = Instant::now();
@@ -1789,7 +1798,151 @@ async fn dispatch_uses_the_routed_providers_frozen_preset() {
         *conn.dispatched_presets.lock().unwrap(),
         [Some("worker".into()), Some("head".into()), None]
     );
-    assert!(plane.batch_presets.lock().unwrap().is_empty());
+    assert!(plane.batch_manifests.lock().unwrap().is_empty());
+}
+
+/// A manifest whose frozen plan gives `provider` a preset, a reply deadline and a schema pin
+/// for `tool`, which it declares as served by `provider`.
+fn pinned_plan(provider: &str, tool: &str) -> ToolManifest {
+    let plan = broca_records::record::PlanManifest {
+        rich_ui: None,
+        declarations: Vec::new(),
+        plan: broca_records::record::OpaqueJson::from_json_text(
+            serde_json::json!({"tool_items": [{"provider": provider, "preset": "frozen-preset"}]})
+                .to_string(),
+        )
+        .unwrap(),
+        plan_identity: String::new(),
+        composition_digest: String::new(),
+        role_versions: Default::default(),
+        fetches: vec![broca_records::record::ProviderFetch {
+            provider: provider.into(),
+            outcome: broca_records::record::FetchOutcome::Answered {
+                catalog_digest: "digest".into(),
+                tools: Vec::new().into(),
+                text: None,
+                result_ops: None,
+                reply: Some(BTreeMap::from([(
+                    tool.to_owned(),
+                    broca_records::record::FrozenReply {
+                        max_ms: 600_000,
+                        hold_argument: None,
+                    },
+                )])),
+                declarations_frozen: Some(Box::new(
+                    broca_records::record::FrozenProviderDeclarations {
+                        schema_pins: Some(BTreeMap::from([(tool.to_owned(), frozen_pin())])),
+                        ..Default::default()
+                    },
+                )),
+                reference_slots: None,
+            },
+        }],
+        tools: Arc::new(Vec::new()),
+        system_text: String::new(),
+        system_digest: String::new(),
+        join_version: 1,
+    };
+    ToolManifest::from_tools(vec![request_tool(tool, Some(provider))])
+        .with_plan_manifest(&plan)
+        .unwrap()
+}
+
+fn frozen_pin() -> broca_records::record::DispatchSchemaPin {
+    broca_records::record::DispatchSchemaPin {
+        schema_digest: "634bdb1fe768fce0974f9c89e6f15f889470a8288277c6433e4711ab6a5b9335".into(),
+        semantics: 7,
+        major: None,
+    }
+}
+
+/// A plan frozen before a module changed its id names the old id for the module's tools, preset,
+/// reply deadline and schema pins, while the catalog now lists only the new id. The call reaches
+/// the module under its new id and still carries everything the plan froze for it.
+#[tokio::test]
+async fn a_call_to_a_renamed_provider_carries_what_the_plan_froze_under_its_old_id() {
+    let conn = ScriptedToolPlaneConnection::new(
+        vec![vec![catalog_entry("prefrontal", &["recall"])]; 3],
+        vec![successful_tool_reply("recalled")],
+    );
+    let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+    let ctx = batch_ctx("renamed-provider");
+    let recall = call("recall");
+    plane
+        .batch_started(
+            &ctx,
+            std::slice::from_ref(&recall),
+            &pinned_plan("prefrontal-core", "recall"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plane.dispatch_target(&ctx, &recall.tool_call_id).as_deref(),
+        Some("prefrontal")
+    );
+    assert_completed_success(plane.dispatch(&ctx, &recall).await);
+    assert_eq!(
+        *conn.dispatched_presets.lock().unwrap(),
+        [Some("frozen-preset".to_owned())]
+    );
+    assert_eq!(
+        *conn.dispatched_schema_pins.lock().unwrap(),
+        [broca_core::projection::schema_pin_text(
+            "recall",
+            &frozen_pin()
+        )]
+    );
+    assert_eq!(
+        *conn.dispatched_deadlines.lock().unwrap(),
+        [Duration::from_millis(600_000)]
+    );
+}
+
+/// A call refused before delivery because its module is restarting is re-sent once, and the
+/// re-send is the same request: the same id, preset and schema pin, even when the call's module
+/// is not the plane's default one.
+#[tokio::test]
+async fn a_resend_after_module_reloading_carries_the_first_attempts_pin() {
+    let conn = ScriptedToolPlaneConnection::new(
+        vec![vec![catalog_entry("plexus", &["read"])]; 3],
+        vec![
+            Err(ConnError::Rejected(crate::connection::decode_error_body(
+                br#"{"code":"module_reloading","message":"draining endpoint"}"#,
+            ))),
+            successful_tool_reply("served after the restart"),
+        ],
+    );
+    let plane = SubcToolPlane::with_connection(conn.clone(), "aft");
+    let ctx = batch_ctx("resend-pin");
+    let read = call("read");
+    plane
+        .batch_started(
+            &ctx,
+            std::slice::from_ref(&read),
+            &pinned_plan("plexus", "read"),
+        )
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), plane.dispatch(&ctx, &read))
+        .await
+        .expect("the re-send must not wait on a lifecycle cancel");
+    assert_completed_success(outcome);
+    let pin = broca_core::projection::schema_pin_text("read", &frozen_pin());
+    assert!(pin.is_some());
+    assert_eq!(
+        *conn.dispatched_schema_pins.lock().unwrap(),
+        [pin.clone(), pin]
+    );
+    assert_eq!(
+        *conn.dispatched_presets.lock().unwrap(),
+        [
+            Some("frozen-preset".to_owned()),
+            Some("frozen-preset".to_owned())
+        ]
+    );
+    let ids = conn.dispatched_ids.lock().unwrap().clone();
+    assert_eq!(ids.len(), 2, "one refused attempt, one re-send: {ids:?}");
+    assert_eq!(ids[0], ids[1]);
 }
 
 fn request_tool(name: &str, module: Option<&str>) -> Tool {
@@ -1896,6 +2049,126 @@ async fn consecutive_batches_share_one_catalog_snapshot() {
         conn.catalog_calls.load(Ordering::SeqCst),
         1,
         "the second batch must reuse the plane's decoded catalog snapshot"
+    );
+}
+
+/// A scoped batch finds its session's routes under its scope as one range of the route map:
+/// exactly those routes, whatever other sessions and scopes, including neighbours in the map's
+/// order, have cached.
+#[test]
+fn a_sessions_routes_under_one_scope_are_read_as_one_range() {
+    let session = |name: &str| SessionKey {
+        project_root: PathBuf::from("/project"),
+        harness: "test".into(),
+        session: name.into(),
+    };
+    let scope = |epoch: u64| -> ScopeKey { Some(("prefrontal".into(), "head".into(), epoch)) };
+    let mut routes = BTreeMap::new();
+    let mut channel = 0;
+    for (name, scope) in [
+        ("a", scope(1)),
+        ("b", None),
+        ("b", scope(1)),
+        ("b", scope(2)),
+        ("bb", scope(1)),
+        ("c", scope(1)),
+    ] {
+        for module_id in ["", "aft", "magic-context"] {
+            for held_reply_v1 in [false, true] {
+                channel += 1;
+                routes.insert(
+                    RouteKey {
+                        session: session(name),
+                        scope: scope.clone(),
+                        module_id: module_id.into(),
+                        shape: RouteShape {
+                            tool_result_v1: held_reply_v1,
+                            ..RouteShape::default()
+                        },
+                        held_reply_v1,
+                    },
+                    RouteState {
+                        handle: RouteHandle::synthetic(channel),
+                        sem: Arc::new(Semaphore::new(1)),
+                        stamp: None,
+                        last_used: Instant::now(),
+                    },
+                );
+            }
+        }
+    }
+    let wanted = session("b");
+    let wanted_scope = scope(1);
+    let found: Vec<_> = session_scope_routes(&routes, &wanted, &wanted_scope)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let expected: Vec<_> = routes
+        .keys()
+        .filter(|key| key.session == wanted && key.scope == wanted_scope)
+        .cloned()
+        .collect();
+    assert_eq!(expected.len(), 6);
+    assert_eq!(found, expected);
+}
+
+/// The plane's catalog snapshot follows the connection's catalog generation. Once the daemon
+/// reports a new catalog, the next batch resolves against it: a tool that a second provider now
+/// serves too is refused as ambiguous instead of still going to the first.
+#[tokio::test]
+async fn a_new_catalog_generation_replaces_the_snapshot_before_the_next_batch() {
+    let conn = ScriptedToolPlaneConnection::new(
+        vec![
+            vec![catalog_entry("module-a", &["echo"])],
+            vec![
+                catalog_entry("module-a", &["echo"]),
+                catalog_entry("module-b", &["echo"]),
+            ],
+            vec![
+                catalog_entry("module-a", &["echo"]),
+                catalog_entry("module-b", &["echo"]),
+            ],
+        ],
+        vec![successful_tool_reply("first")],
+    );
+    *conn.catalog_generation.lock().unwrap() =
+        Some(crate::connection::CatalogGeneration::for_test(1));
+    let plane = SubcToolPlane::with_connection(conn.clone(), "");
+    for module in ["module-a", "module-b"] {
+        plane.windows.lock().unwrap().insert(module.into(), 1);
+    }
+    let tool_call = call("echo");
+    let manifest = ToolManifest::from_tools(vec![request_tool("echo", None)]);
+
+    let first = batch_ctx("batch-1");
+    plane
+        .batch_started(&first, std::slice::from_ref(&tool_call), &manifest)
+        .await
+        .unwrap();
+    assert_completed_success(plane.dispatch(&first, &tool_call).await);
+    plane.batch_finished(&first).await.unwrap();
+
+    *conn.catalog_generation.lock().unwrap() =
+        Some(crate::connection::CatalogGeneration::for_test(2));
+    let second = batch_ctx("batch-2");
+    plane
+        .batch_started(&second, std::slice::from_ref(&tool_call), &manifest)
+        .await
+        .unwrap();
+    let outcome = plane.dispatch(&second, &tool_call).await;
+    assert!(
+        matches!(&outcome, DispatchResult::Completed(result) if result.is_error),
+        "an ambiguous tool must not be dispatched: {outcome:?}"
+    );
+    plane.batch_finished(&second).await.unwrap();
+    assert_eq!(
+        conn.catalog_calls.load(Ordering::SeqCst),
+        3,
+        "the new generation is read, then read once more as every unresolved call is"
+    );
+    assert_eq!(
+        conn.tool_calls.load(Ordering::SeqCst),
+        1,
+        "only the first batch's call was sent"
     );
 }
 
@@ -2901,6 +3174,22 @@ fn fence_does_not_cross_session_dedup() {
     );
 }
 
+/// Two sessions can run batches with the same id: finishing one session's batch evicts only that
+/// session's entries.
+#[test]
+fn fence_eviction_stays_within_the_batchs_session() {
+    let mut fence = Fence::default();
+    let batch = BatchId("b1".into());
+    let a = session_key("/tmp/a", "runner", "sessionA");
+    let b = session_key("/tmp/b", "runner", "sessionB");
+    let id = ToolCallId("c1".into());
+    fence.insert(&batch, (a.clone(), id.clone()), result("A"));
+    fence.insert(&batch, (b.clone(), id.clone()), result("B"));
+    fence.evict_batch(&(a.clone(), batch));
+    assert!(fence.get(&(a, id.clone())).is_none());
+    assert_eq!(fence.get(&(b, id)), Some(result("B")));
+}
+
 /// EVICTION: a batch's fence entries are gone after its terminal — bounded growth.
 /// Without eviction the fence grows unbounded over thousands of batches.
 #[test]
@@ -2927,7 +3216,7 @@ fn fence_evicts_a_batchs_entries_on_terminal() {
     assert_eq!(fence.len(), 3);
 
     // Evicting b1 drops ONLY b1's two entries; b2's survives.
-    fence.evict_batch(&b1);
+    fence.evict_batch(&(session.clone(), b1.clone()));
     assert_eq!(fence.len(), 1, "only b1's entries evicted");
     assert!(fence
         .get(&(session.clone(), ToolCallId("c3".into())))
@@ -2936,7 +3225,7 @@ fn fence_evicts_a_batchs_entries_on_terminal() {
         .get(&(session.clone(), ToolCallId("c1".into())))
         .is_none());
 
-    fence.evict_batch(&b2);
+    fence.evict_batch(&(session.clone(), b2.clone()));
     assert_eq!(
         fence.len(),
         0,
@@ -2974,7 +3263,7 @@ fn cache_route_state_keeps_first_route_and_reports_the_loser() {
     let key = route_key("/tmp/proj", "runner", "s1", "aft");
     let first_sem = Arc::new(Semaphore::new(1));
     let second_sem = Arc::new(Semaphore::new(2));
-    let mut routes = HashMap::new();
+    let mut routes = BTreeMap::new();
 
     let first_handle = RouteHandle::synthetic(11);
     let second_handle = RouteHandle::synthetic(12);
@@ -3011,7 +3300,7 @@ fn cache_route_state_keeps_first_route_and_reports_the_loser() {
 
 #[test]
 fn route_cache_separates_every_wire_shape_member() {
-    let mut routes = HashMap::new();
+    let mut routes = BTreeMap::new();
     let key = route_key("/project", "broca", "session", "provider");
     for member in 0..6 {
         let mut handle = RouteHandle::synthetic(7 + member);
@@ -3157,7 +3446,7 @@ fn route_match_rejects_a_replaced_route_even_if_the_channel_number_is_reused() {
     let key = route_key("/tmp/proj", "runner", "s1", "aft");
     let old_sem = Arc::new(Semaphore::new(1));
     let new_sem = Arc::new(Semaphore::new(1));
-    let mut routes = HashMap::new();
+    let mut routes = BTreeMap::new();
 
     let old_handle = RouteHandle::synthetic_epoch(11, 1);
     let new_handle = RouteHandle::synthetic_epoch(11, 2);
@@ -3394,8 +3683,8 @@ impl ToolPlaneConnection for InProcessWireConnection {
             .await
     }
 
-    async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
-        Ok(Vec::new())
+    async fn catalog_list(&self) -> Result<Arc<Vec<CatalogEntry>>, ConnError> {
+        Ok(Arc::new(Vec::new()))
     }
 
     async fn route_open(
@@ -4261,6 +4550,42 @@ mod scope_carrier {
             2,
             "on a fresh route"
         );
+    }
+
+    /// A call refused before delivery because its module is restarting is re-sent, once the scope
+    /// reads live again, as the request its first attempt carried: with the schema pin the plan
+    /// froze for the call's own module, which is not the plane's default one here.
+    #[tokio::test]
+    async fn a_scoped_resend_keeps_the_calls_schema_pin() {
+        let (conn, plane, _) = rig(vec![
+            Err(ConnError::Rejected(crate::connection::decode_error_body(
+                br#"{"code":"module_reloading","message":"draining endpoint"}"#,
+            ))),
+            successful_tool_reply("sent once"),
+        ]);
+        let scoped = ctx("r-b1", "s", "r", Some(scope("head", 1)));
+        let read = call("read");
+        plane
+            .batch_started(
+                &scoped,
+                std::slice::from_ref(&read),
+                &pinned_plan("plexus", "read"),
+            )
+            .await
+            .expect("the scoped batch starts");
+
+        assert_completed_success(plane.dispatch(&scoped, &read).await);
+        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 2);
+        let pin = broca_core::projection::schema_pin_text("read", &frozen_pin());
+        assert!(pin.is_some());
+        // The attempt refused while the module drained, then its re-send.
+        assert_eq!(
+            *conn.dispatched_schema_pins.lock().unwrap(),
+            [pin.clone(), pin]
+        );
+        let ids = conn.dispatched_ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2, "one refused attempt, one re-send: {ids:?}");
+        assert_eq!(ids[0], ids[1]);
     }
 
     /// A rebind to another agent leaves the scope live, but the call was composed for the old

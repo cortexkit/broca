@@ -353,6 +353,9 @@ pub(super) fn expected(case: &Case) -> Vec<Event> {
                 let (action, reason) = match reason {
                     EndReason::Authentication => ("not_retryable", "authentication"),
                     EndReason::AccountChanged => ("not_retryable", "account_changed"),
+                    EndReason::CredentialHostNotAllowed => {
+                        ("not_retryable", "credential_host_not_allowed")
+                    }
                     EndReason::UnchangedCredential => ("not_retryable", "unchanged_credential"),
                     EndReason::RetryVeto => ("not_retryable", "retry_veto"),
                     EndReason::AttemptLimit => ("attempts_exhausted", "attempt_limit"),

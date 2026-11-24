@@ -509,11 +509,15 @@ pub trait ToolPlane: Send + Sync {
     /// The current definitions of `manifest`'s versioned tools that a fresh run at a prefix
     /// rebuild takes (llm-runner `tool_versions`): each tool whose provider now serves the same
     /// major as its frozen pin, under a different description, input schema or schema digest.
-    /// Read from what [`Self::run_transport`] just read for the same run, so it asks no
-    /// provider again. A tool whose provider could not be read, or that changed major, is not
-    /// listed and keeps its frozen definition. Adapters without discovery list none.
+    /// Read from what [`Self::run_transport`] just read for the same run (the same `bind`,
+    /// `scope` and `manifest`), so it asks no provider again and never takes what another
+    /// session's read returned. A tool whose provider could not be read, or that changed
+    /// major, is not listed and keeps its frozen definition. Adapters without discovery list
+    /// none.
     async fn compatible_tools(
         &self,
+        _bind: &BindIdentity,
+        _scope: Option<&broca_protocol::SessionScope>,
         _manifest: &broca_records::record::PlanManifest,
     ) -> Vec<CompatibleTool> {
         Vec::new()

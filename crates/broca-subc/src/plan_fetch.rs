@@ -124,7 +124,18 @@ impl SubcPlanFetcher {
                 .shared()
             })
             .clone();
-        snapshot.await
+        let result = snapshot.clone().await;
+        if result.is_err() {
+            let mut cached = self.catalog_snapshot.lock().unwrap();
+            // Another waiter may already have replaced the failed request with a retry.
+            if cached
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&snapshot))
+            {
+                *cached = None;
+            }
+        }
+        result
     }
 
     /// Prefer the carrier's selector for catalog composition, otherwise use the session's
@@ -359,15 +370,7 @@ impl Fetcher for SubcPlanFetcher {
             }))
     }
     async fn system_text_default_supported(&self, provider: &str) -> Result<bool, FetchError> {
-        let entries = match self.catalog_snapshot().await {
-            Ok(entries) => entries,
-            Err(error) => {
-                // Required preset discovery keeps its existing retry policy. Only a
-                // successful snapshot, or an optional lookup, is retained for admission.
-                self.catalog_snapshot.lock().unwrap().take();
-                return Err(error);
-            }
-        };
+        let entries = self.catalog_snapshot().await?;
         Ok(crate::provider_catalog::find_module(&entries, provider)
             .and_then(|entry| entry.capabilities.as_ref())
             .is_some_and(|caps| {
@@ -479,6 +482,61 @@ mod carrier_catalog_tests {
             subc_ops: Vec::new(),
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn catalog_fetch_and_facts_probe_retry_the_daemon_catalog_after_loss() {
+        for facts_probe in [false, true] {
+            let (conn, _, mut daemon) = SubcConnection::in_process_for_test(1, 1);
+            let fetcher = SubcPlanFetcher::new(
+                Arc::new(conn),
+                BindIdentity::new("/project", "broca", "catalog-retry"),
+                None,
+            );
+            let fetch = async {
+                let failed = if facts_probe {
+                    fetcher
+                        .system_text_facts_supported("tools")
+                        .await
+                        .unwrap_err()
+                } else {
+                    fetcher
+                        .call("tools", CATALOG_OP, json!({}))
+                        .await
+                        .unwrap_err()
+                };
+                assert!(matches!(failed, FetchError::Lost(_)));
+                assert_eq!(
+                    fetcher.call("tools", CATALOG_OP, json!({})).await,
+                    Ok(json!({"tools": []})),
+                    "another attempt must read the recovered daemon (facts probe: {facts_probe})"
+                );
+                assert!(!fetcher.system_text_facts_supported("tools").await.unwrap());
+            };
+            let serve = async {
+                let request = daemon.next_request().await;
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&request.body).unwrap()["op"],
+                    "catalog.list"
+                );
+                assert!(daemon.refuse(&request, "module_timeout"));
+                let request = daemon.next_request().await;
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&request.body).unwrap()["op"],
+                    "catalog.list"
+                );
+                daemon.reply(&request, inventory(&["tools"]));
+                let open = daemon.next_request().await;
+                daemon.reply(
+                    &open,
+                    br#"{"op":"route.open","route_channel":1,"route_epoch":1}"#.to_vec(),
+                );
+                let request = daemon.next_request().await;
+                assert_eq!(request.body, br#"{"name":"tool.catalog","arguments":{}}"#);
+                daemon.reply(&request, br#"{"tools":[]}"#.to_vec());
+            };
+            tokio::join!(fetch, serve);
+        }
     }
 
     #[tokio::test]

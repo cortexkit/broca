@@ -22,6 +22,10 @@ struct Rig {
     provides_role: AtomicBool,
     reply: Mutex<serde_json::Value>,
     sent: Mutex<Vec<(Option<String>, Option<String>)>>,
+    /// The schema pin each staged request carried, in send order.
+    sent_pins: Mutex<Vec<Option<String>>>,
+    /// Refused before delivery, as a module that began draining answers, instead of replying.
+    refuse_next_as_reloading: AtomicBool,
     groups: Mutex<Vec<Vec<LateResultRegistration>>>,
     pruned: Mutex<Vec<(String, String)>>,
     held_synced: AtomicBool,
@@ -49,6 +53,8 @@ impl Rig {
             provides_role: AtomicBool::new(true),
             reply: Mutex::new(json!({"content":[{"type":"text","text":"terminal"}]})),
             sent: Mutex::new(Vec::new()),
+            sent_pins: Mutex::new(Vec::new()),
+            refuse_next_as_reloading: AtomicBool::new(false),
             groups: Mutex::new(Vec::new()),
             pruned: Mutex::new(Vec::new()),
             held_synced: AtomicBool::new(false),
@@ -81,7 +87,7 @@ impl ToolPlaneConnection for Rig {
     fn consumer_module_id(&self) -> Option<&str> {
         self.identity.then_some("broca")
     }
-    async fn catalog_list(&self) -> Result<Vec<CatalogEntry>, ConnError> {
+    async fn catalog_list(&self) -> Result<Arc<Vec<CatalogEntry>>, ConnError> {
         let mut entry = CatalogEntry::new("provider", Vec::new(), Vec::new()).with_ready(true);
         if self.provides_role.load(Ordering::SeqCst) {
             entry.capabilities = Some(
@@ -91,7 +97,7 @@ impl ToolPlaneConnection for Rig {
                 .unwrap(),
             );
         }
-        Ok(vec![entry])
+        Ok(Arc::new(vec![entry]))
     }
     async fn route_open(
         &self,
@@ -159,9 +165,20 @@ impl ToolPlaneConnection for Rig {
         _: crate::connection::ToolReplyDeadline,
         _: Option<&str>,
         key: Option<&str>,
-        _schema_pin: Option<&str>,
+        schema_pin: Option<&str>,
         _: &broca_core::tool_plane::DispatchSignals,
     ) -> Result<serde_json::Value, crate::connection::ApprovedCallError> {
+        self.sent_pins
+            .lock()
+            .unwrap()
+            .push(schema_pin.map(str::to_owned));
+        if self.refuse_next_as_reloading.swap(false, Ordering::SeqCst) {
+            return Err(crate::connection::ApprovedCallError::AfterPush(
+                ConnError::Rejected(crate::connection::decode_error_body(
+                    br#"{"code":"module_reloading","message":"draining endpoint"}"#,
+                )),
+            ));
+        }
         self.sent
             .lock()
             .unwrap()
@@ -993,9 +1010,11 @@ fn manifest_pinning(
         .unwrap()
 }
 
-/// A run admitted by a build that freezes catalog schema pins, resumed here, dispatches each
-/// call under the pin its plan recorded for that tool, never one from a later catalog. A plan
-/// without pins, which is every plan this build admits itself, leaves the pin unknown.
+/// A run whose plan froze catalog schema pins, resumed here, sends each call with the pin its
+/// plan recorded for that tool, never one from a later catalog, and a call re-sent after a
+/// refusal before delivery carries that same pin. The call's module is not the plane's default
+/// one, so the re-send cannot borrow the default module's pin either. A plan without pins sends
+/// none.
 #[tokio::test]
 async fn a_resumed_batch_dispatches_under_the_schema_pin_its_plan_recorded() {
     let pin = broca_records::record::DispatchSchemaPin {
@@ -1010,20 +1029,23 @@ async fn a_resumed_batch_dispatches_under_the_schema_pin_its_plan_recorded() {
                 "tool".to_owned(),
                 pin.clone(),
             )])),
-            Some(pin.clone()),
+            broca_core::projection::schema_pin_text("tool", &pin),
         ),
         (None, None),
     ] {
         let rig = Rig::new(true, true, false, false);
-        let plane = rig.plane(false);
+        rig.refuse_next_as_reloading.store(true, Ordering::SeqCst);
+        let plane = SubcToolPlane::with_connection(rig.clone(), "aft");
         let ctx = ctx();
         plane
             .batch_started(&ctx, std::slice::from_ref(&call), &manifest_pinning(pins))
             .await
             .unwrap();
+        completed(plane.dispatch(&ctx, &call).await);
         assert_eq!(
-            plane.dispatch_schema_pin(&ctx, &call.tool_call_id, &call.tool_name),
-            expected
+            *rig.sent_pins.lock().unwrap(),
+            [expected.clone(), expected],
+            "the refused attempt and its re-send"
         );
         // A pin belongs to the tool it was recorded for.
         assert_eq!(

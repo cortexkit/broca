@@ -373,13 +373,13 @@ async fn compatible_tools_are_same_major_tools_the_newest_read_defines_different
         let conn =
             ScriptedToolPlaneConnection::new(vec![inventory(&provider)], vec![Ok(current.clone())]);
         let plane = SubcToolPlane::with_connection(conn.clone(), &provider);
+        let bind = BindIdentity::new("/project", "test", "versions");
         assert!(
-            plane.compatible_tools(&plan).await.is_empty(),
+            plane.compatible_tools(&bind, None, &plan).await.is_empty(),
             "nothing read yet"
         );
-        let bind = BindIdentity::new("/project", "test", "versions");
         plane.run_transport(&bind, None, &plan).await;
-        let compatible = plane.compatible_tools(&plan).await;
+        let compatible = plane.compatible_tools(&bind, None, &plan).await;
         assert_eq!(compatible.len(), usize::from(listed), "{current}");
         if listed {
             assert_eq!(compatible[0].provider, provider);
@@ -388,4 +388,107 @@ async fn compatible_tools_are_same_major_tools_the_newest_read_defines_different
             assert_eq!(compatible[0].pin.schema_digest, "b".repeat(64));
         }
     }
+}
+
+/// A catalog answer serves only runs that would send the same request on the same route.
+/// Another session, or the same session with other plan params, reads its own catalog, and a
+/// run that rewrites its prompt prefix takes only the definitions its own read returned.
+#[tokio::test(start_paused = true)]
+async fn run_transport_answers_serve_only_the_session_and_request_that_read_them() {
+    let provider = "transport-isolated";
+    let plan = versioned_plan(provider, "2.1.0");
+    let conn = ScriptedToolPlaneConnection::new(
+        vec![inventory(provider); 3],
+        vec![
+            Ok(versioned_catalog(
+                "2.2.0",
+                "Run work for the first session",
+                'b',
+            )),
+            Ok(versioned_catalog("2.1.0", "Run work", 'a')),
+            Ok(versioned_catalog("2.1.0", "Run work", 'a')),
+        ],
+    );
+    let plane = SubcToolPlane::with_connection(conn.clone(), provider);
+    let first = BindIdentity::new("/project", "test", "first");
+    let second = BindIdentity::new("/project", "test", "second");
+    plane.run_transport(&first, None, &plan).await;
+    plane.run_transport(&second, None, &plan).await;
+    assert_eq!(
+        conn.tool_calls.load(Ordering::SeqCst),
+        2,
+        "the second session reads its own catalog"
+    );
+    assert!(
+        plane
+            .compatible_tools(&second, None, &plan)
+            .await
+            .is_empty(),
+        "the second session takes nothing the first session's read returned"
+    );
+    assert_eq!(
+        plane.compatible_tools(&first, None, &plan).await[0]
+            .tool
+            .description,
+        "Run work for the first session"
+    );
+
+    let mut other_params = plan.clone();
+    other_params.plan = OpaqueJson::from_json_text(
+        json!({"tool_items":[{"provider":provider,"preset":"worker",
+            "params":{"root":"/elsewhere"}}]})
+        .to_string(),
+    )
+    .unwrap();
+    plane.run_transport(&first, None, &other_params).await;
+    assert_eq!(
+        conn.tool_calls.load(Ordering::SeqCst),
+        3,
+        "other params are another request"
+    );
+    assert!(conn.dispatched_arguments.lock().unwrap()[2]
+        .to_string()
+        .contains("/elsewhere"));
+    assert!(plane
+        .compatible_tools(&first, None, &other_params)
+        .await
+        .is_empty());
+}
+
+/// A scoped session's run reads its providers' catalogs only on a daemon that admits scoped
+/// routes. A daemon without `scopes/v1` would drop the scope and answer as if unscoped, so
+/// nothing is opened or asked and the run keeps the plan's frozen declarations.
+#[tokio::test]
+async fn a_scoped_run_reads_no_catalog_on_a_daemon_without_scopes_v1() {
+    let provider = "transport-scoped-downgrade";
+    let plan = plan(provider, true);
+    let conn = ScriptedToolPlaneConnection::new(
+        vec![inventory(provider); 2],
+        vec![Ok(catalog(true, true))],
+    );
+    conn.capabilities.lock().unwrap().clear();
+    let plane = SubcToolPlane::with_connection(conn.clone(), provider);
+    let bind = BindIdentity::new("/project", "test", provider);
+    let scope = broca_protocol::SessionScope {
+        owner: broca_protocol::BindPrincipal::Reserved {
+            module_id: "prefrontal".into(),
+        },
+        agent_id_frozen: false,
+        scope_ref: "head".into(),
+        scope_epoch: 1,
+        flow_id: None,
+        sender: None,
+        agent_id: None,
+        run_id: None,
+    };
+    assert!(plane
+        .run_transport(&bind, Some(&scope), &plan)
+        .await
+        .is_empty());
+    assert_eq!(
+        conn.route_open_calls.load(Ordering::SeqCst),
+        0,
+        "no route opens without scopes/v1"
+    );
+    assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
 }
