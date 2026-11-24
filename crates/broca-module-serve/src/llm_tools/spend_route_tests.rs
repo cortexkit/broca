@@ -252,11 +252,12 @@ async fn every_provider_outcome_states_its_spend() {
             "provider_error",
             RefusalSpend::ChargeCeiling,
         ),
+        // An overloaded provider turned the request away without running it.
         (
             "http 503",
             Box::new(status(503)),
             "provider_error",
-            RefusalSpend::ChargeCeiling,
+            RefusalSpend::NoSpend,
         ),
         (
             "workers 3036",
@@ -387,9 +388,16 @@ async fn internal_retry_does_not_send_again_when_spend_is_unknown() {
     let attempts = AtomicUsize::new(0);
     let rig = Rig::new(move || {
         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-            ProviderReply::Status {
-                status: 503,
-                retry_after_ms: Some(0),
+            // A transient error that names a wait, but may have been billed.
+            ProviderReply::ClassifiedError {
+                error: cortexkit_role_classifier::errors::ItemError::for_code(
+                    cortexkit_role_classifier::errors::PROVIDER_ERROR,
+                    "the provider failed after reading the request",
+                )
+                .with_retry_after_ms(0),
+                provider_code: None,
+                may_have_spent: true,
+                reported: None,
             }
         } else {
             ProviderReply::Unconnected("not sent".into())

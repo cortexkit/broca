@@ -448,12 +448,19 @@ pub(super) fn map_reply(
 
 /// What an attempt that failed may have cost, under the model tools' refusal-spend rule.
 /// An error the provider answered with a status or code it does not bill (authentication, a
-/// missing model, a rate limit, an item it rejected, the account's limits) and a failure before
-/// anything was sent (no credential, no connection) spent nothing. Every other failure may have
-/// reached a billed model: a `provider_error` status (408 or 5xx), a timeout, a connection lost
-/// mid-request, or a 200 whose body did not decode.
+/// missing model, a rate limit, an item it rejected, the account's limits, an overload) and a
+/// failure before anything was sent (no credential, no connection) spent nothing. An overload
+/// (503, or Anthropic's 529) means the provider turned the request away without running it, so
+/// it neither counts against the batch's ceiling nor stops a retry (the classifier role's
+/// contract charges a batch only for what a provider ran). Every other failure may have
+/// reached a billed model: another `provider_error` status (408, 500, 502, 504), a timeout, a
+/// connection lost mid-request, or a 200 whose body did not decode.
 pub(super) fn reply_spend(reply: &ProviderReply) -> ItemSpend {
     let code = match reply {
+        ProviderReply::Status {
+            status: 503 | 529, ..
+        }
+        | ProviderReply::WorkersAiError { status: 503, .. } => return ItemSpend::Nothing,
         ProviderReply::ClassifiedError { may_have_spent, .. } => {
             return if *may_have_spent {
                 ItemSpend::Unknown
@@ -495,7 +502,7 @@ pub(super) fn retry_wait(
             error.retry_after_ms?
         }
         ProviderReply::Status {
-            status: 429 | 529,
+            status: 429 | 503 | 529,
             retry_after_ms: Some(wait),
         } => *wait,
         ProviderReply::WorkersAiError {

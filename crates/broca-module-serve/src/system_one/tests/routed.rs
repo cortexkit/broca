@@ -1783,7 +1783,8 @@ async fn routed_unknown_spend_uses_the_charge_ceiling_on_resend() {
     rig.provider.script(
         "retry",
         vec![
-            Script::Status(503, Some(0)),
+            // A 502 may come after the model ran; an overload (503) would be retried instead.
+            Script::Status(502, Some(0)),
             Script::Answer(answered(Some(7))),
         ],
     );
