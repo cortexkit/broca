@@ -746,12 +746,23 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
             agent_facing: false,
             operations: broca_wire::agent_data::REQUIRED_OPS.iter().map(|op| op.to_string()).collect(),
         }, ProviderRole::ToolProvider {
-            tools: vec![subc_protocol::manifest::Tool {
-                name: crate::llm_tools::CLASSIFY_TOOL_NAME.into(),
-                description: Some("Classify one item with a decision model.".into()),
-                execution_mode: subc_protocol::manifest::ExecutionMode::Pure,
-                schema: cortexkit_llm_tools::classify::input_schema(),
-            }],
+            // Both tools the route lists. A caller such as Basal resolves a module's tools from
+            // this declaration before it reads the route's catalog, so a tool missing here is
+            // refused before broca sees the call.
+            tools: vec![
+                subc_protocol::manifest::Tool {
+                    name: crate::llm_tools::CLASSIFY_TOOL_NAME.into(),
+                    description: Some("Classify one item with a decision model.".into()),
+                    execution_mode: subc_protocol::manifest::ExecutionMode::Pure,
+                    schema: cortexkit_llm_tools::classify::input_schema(),
+                },
+                subc_protocol::manifest::Tool {
+                    name: crate::llm_tools::complete::COMPLETE_TOOL_NAME.into(),
+                    description: Some(crate::llm_tools::complete::COMPLETE_DESCRIPTION.into()),
+                    execution_mode: subc_protocol::manifest::ExecutionMode::Pure,
+                    schema: crate::llm_tools::complete::Complete::input_schema(),
+                },
+            ],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
             concurrency: Concurrency::ModuleManaged,
             emits_push: false,
@@ -1096,6 +1107,36 @@ mod provenance_tests {
         ]);
         assert!(
             subc_protocol::manifest::validate_hello_event_declarations(&hello(&dotted)).is_err()
+        );
+    }
+
+    /// The tool-provider role declares both tools broca's tool route lists, with the schemas the
+    /// route lists them with. Basal resolves a program's tools from this declaration first, so
+    /// `llm_complete` listed on the route but missing here was refused before reaching broca.
+    #[test]
+    fn the_manifest_declares_every_tool_the_route_lists() {
+        let declared: Vec<(String, serde_json::Value)> = manifest("broca")
+            .provides
+            .into_iter()
+            .filter_map(|role| match role {
+                ProviderRole::ToolProvider { tools, .. } => Some(tools),
+                _ => None,
+            })
+            .flatten()
+            .map(|tool| (tool.name, tool.schema))
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                (
+                    crate::llm_tools::CLASSIFY_TOOL_NAME.to_owned(),
+                    cortexkit_llm_tools::classify::input_schema()
+                ),
+                (
+                    crate::llm_tools::complete::COMPLETE_TOOL_NAME.to_owned(),
+                    crate::llm_tools::complete::Complete::input_schema()
+                ),
+            ]
         );
     }
 

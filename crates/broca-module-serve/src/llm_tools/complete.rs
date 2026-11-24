@@ -52,6 +52,10 @@ use crate::account_routing::RoutingCallError;
 /// identifier; the contract's tag goes in `capabilities`.
 pub const COMPLETE_TOOL_NAME: &str = "llm_complete";
 
+/// The tool's description, the same in broca's daemon manifest and its route's catalog.
+pub const COMPLETE_DESCRIPTION: &str =
+    "Ask a model routing picks for your demand to complete one prompt, as text or as JSON matching a schema.";
+
 /// The System One store role completions are recorded under, apart from classify's batches.
 pub const STORE_ROLE: &str = "llm.complete";
 

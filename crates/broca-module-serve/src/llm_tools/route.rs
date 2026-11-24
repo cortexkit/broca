@@ -563,7 +563,7 @@ impl LlmTools {
             let schema = super::complete::Complete::input_schema();
             let mut complete = json!({
                 "name":super::complete::COMPLETE_TOOL_NAME, "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).expect("contract schema has a digest"),
-                "semantics":1, "capabilities":[], "description":"Ask a model routing picks for your demand to complete one prompt, as text or as JSON matching a schema.",
+                "semantics":1, "capabilities":[], "description":super::complete::COMPLETE_DESCRIPTION,
                 "input_schema":schema,
                 "modes":cortexkit_llm_tools::MODES,
                 "result_format":result_format.unwrap_or(CONTENT_V1),
