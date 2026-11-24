@@ -125,6 +125,9 @@ async fn llm_complete_runs_one_tool_free_run_through_the_session_runtime() {
     let again = call().await.unwrap();
     assert_eq!(again.get(), answer.get());
     assert_eq!(http.requests.lock().unwrap().len(), 1);
+    // The completion holds the registry, and with it the retention service's open files: let
+    // them go before the rig closes, or Windows refuses to remove the folder they are in.
+    drop(complete);
     rig.close().await;
     std::fs::remove_dir_all(root).unwrap();
 }
