@@ -78,11 +78,18 @@ async fn real_cerebellum_answers_unmarked_scope() {
         "daemon",
     )
     .unwrap()
+    .arg("--config-store-root")
+    .arg(root.join("config-store"))
     .env("XDG_CONFIG_HOME", root.join("config"))
     .env("XDG_DATA_HOME", root.join("data"))
     .env("XDG_RUNTIME_DIR", root.join("runtime"))
     .env("HOME", root.join("home"))
     .env("SUBC_PORT", "0")
+    // Cerebellum takes its settings only from the daemon's view and refuses binds `not_ready`
+    // until one arrives. A test-support daemon delivers views only with its config gate on, which
+    // keeps its config store (and the key that signs views) in this scratch root instead of the
+    // operator's.
+    .env("SUBC_TEST_CONFIG_GATE", "1")
     .env_remove("SUBC_MODULE_ID")
     .env_remove("SUBC_LAUNCH_NONCE")
     .env_remove("SUBC_LAUNCH_NONCE_FD")
