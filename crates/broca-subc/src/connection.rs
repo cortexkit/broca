@@ -708,6 +708,17 @@ fn insert_pending(
 ) -> ConnResult<()> {
     let mut waiters = pending.lock().unwrap();
     if waiters.len() >= MAX_PENDING_REQUESTS {
+        // A route.open tombstone past its bind window no longer blocks probes, and a reply that
+        // still arrives for it is closed without one (the reader closes any route.open reply no
+        // waiter claims). Drop those first, so opens the daemon never answers cannot hold
+        // waiter slots for the life of the socket. Done only at the limit, so an ordinary
+        // request never walks the map.
+        let now = Instant::now();
+        waiters.retain(|_, entry| {
+            !matches!(entry, PendingEntry::LateRouteOpen { blocks_probe_until } if *blocks_probe_until <= now)
+        });
+    }
+    if waiters.len() >= MAX_PENDING_REQUESTS {
         return Err(ConnError::Transport(format!(
             "connection has reached the {MAX_PENDING_REQUESTS} in-flight request limit"
         )));
@@ -1591,25 +1602,29 @@ impl SubcConnection {
         let remaining = attempt_deadline.saturating_duration_since(time::Instant::now());
         let mut reply = OpenReply::new(rx, &self.shared, runtime.conn);
         let result = (self.await_terminal_deadline(&runtime, reply.receiver(), remaining)).await;
-        let mut rx = reply.taken();
         if matches!(&result, Err(ConnError::Transport(message)) if message.starts_with("timed out after"))
         {
             // A successful late route.open committed a daemon route. Keep its identity so the
             // reader can close that route rather than orphaning it after the caller timed out.
             if !registration.retain_late_route_open() {
                 // The reader won the boundary race and removed the registration before the
-                // timeout path could tombstone it. Its frame is already queued locally, so
-                // consume that terminal instead of reporting a timeout and losing the route.
-                if let Ok(frame) = rx.try_recv() {
+                // timeout path could tombstone it. It sends that terminal next, with no await in
+                // between, so wait for it rather than look once: a single look can run before
+                // the send and lose the route. Waiting inside `reply` keeps the route closed if
+                // this future is dropped meanwhile.
+                if let Some(frame) = reply.receiver().recv().await {
+                    drop(reply.taken());
                     return Ok((frame, runtime.conn));
                 }
             }
+            drop(reply.taken());
             // Name the deadline that expired: a route.open gives up on a different clock from
             // an ordinary control RPC, and "timed out" alone reads as the 10s one.
             return Err(ConnError::Transport(format!(
                 "route.open got no reply within {deadline:?} (ROUTE_OPEN_ATTEMPT_TIMEOUT)"
             )));
         }
+        drop(reply.taken());
         result.map(|frame| (frame, runtime.conn))
     }
 
@@ -3501,8 +3516,16 @@ async fn reader_task<R>(
         };
 
         let mut opened_route = None;
+        // A route.open reply that no waiter claims, not even a tombstone (it expired), still
+        // names a route the daemon committed for nobody: it is closed like a late one. Corr ids
+        // are never reused on a socket, so such a reply cannot belong to a later waiter.
+        let route_open_reply = match &pending_kind {
+            Some((_, true, late)) => Some(*late),
+            Some(_) => None,
+            None => Some(true),
+        };
         if channel == 0 && frame.header.ty == FrameType::Response {
-            if let Some((_, true, late)) = &pending_kind {
+            if let Some(late) = route_open_reply {
                 if let Ok(ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
@@ -3516,7 +3539,7 @@ async fn reader_task<R>(
                         .unwrap()
                         .insert(route_channel, route_epoch);
                     opened_route = Some((route_channel, route_epoch));
-                    if *late {
+                    if late {
                         pending.lock().unwrap().remove(&key);
                         let goodbye = Frame::build(
                             FrameType::Goodbye,
@@ -3788,12 +3811,6 @@ pub(crate) fn decode_error_body(body: &[u8]) -> RejectedMessage {
         }
         Err(_) => String::from_utf8_lossy(body).into_owned().into(),
     }
-}
-
-pub(crate) fn rejection_code(rejection: &str) -> &str {
-    rejection
-        .split_once(" — ")
-        .map_or(rejection, |(code, _)| code)
 }
 
 /// The default route-open retry budget. Covers the module-swap refusal window without making a
@@ -4709,20 +4726,12 @@ impl ModuleGates {
     }
 }
 
-/// Whether a daemon rejection names the router's freed-route code. Parsed `ErrorBody` refusals
-/// compare their structured code; only unstructured legacy text falls back to the old wire format.
+/// Whether a daemon rejection names the router's freed-route code. Only the structured
+/// `ErrorBody` code counts: every daemon error frame carries one, and text that merely reads
+/// `unknown_channel — ...` does not prove the daemon wrote it. The tool plane re-opens and
+/// re-sends on this code ([`classify_tool_route_refusal`]), so it must be the daemon's.
 pub fn rejection_is_unknown_channel(rejection: &RejectedMessage) -> bool {
-    if rejection
-        .code
-        .as_deref()
-        .is_some_and(|code| code == "unknown_channel")
-    {
-        true
-    } else if rejection.code.is_none() {
-        rejection_code(&rejection.text) == "unknown_channel"
-    } else {
-        false
-    }
+    rejection.code.as_deref() == Some("unknown_channel")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4738,10 +4747,11 @@ pub(crate) fn classify_tool_route_refusal(rejection: &RejectedMessage) -> ToolRo
     // unknown_channel and stale_route_epoch: the module never saw the request. An in-flight
     // reclaimed call may have applied side effects and must never be re-sent; unfamiliar codes
     // stay errors.
+    if rejection_is_unknown_channel(rejection) {
+        return ToolRouteRefusal::Reopen;
+    }
     match rejection.code() {
-        "unknown_channel" | "stale_route_epoch" | "route_not_bound" | "route_reclaimed" => {
-            ToolRouteRefusal::Reopen
-        }
+        "stale_route_epoch" | "route_not_bound" | "route_reclaimed" => ToolRouteRefusal::Reopen,
         "outcome_unknown_root_reclaimed" => ToolRouteRefusal::OutcomeUnknown,
         _ => ToolRouteRefusal::Other,
     }

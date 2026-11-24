@@ -934,8 +934,8 @@ fn route_open_retryable_codes_include_inventory_unavailability_not_permanent_err
 
     // AN UNDECODABLE BODY MUST BE TERMINAL, and this is the arm a future "robustness"
     // edit would break. `decode_error_body` falls back to the raw bytes when the body is
-    // not an ErrorBody, so there is no " — " to split and `rejection_code` returns the
-    // whole string -- which matches no code, so the route open fails fast.
+    // not an ErrorBody, and such a rejection carries no code at all -- which matches no
+    // retryable code, so the route open fails fast.
     //
     // Pinned because the tempting change is a fallback arm treating an unrecognised
     // rejection as retryable "in case it is transient". That turns a malformed reply from
@@ -944,22 +944,13 @@ fn route_open_retryable_codes_include_inventory_unavailability_not_permanent_err
         "internal error: connection reset",
         "",
         "unknown_channel: 10",
+        "module_warming — still starting",
     ] {
         assert!(
-            !is_retryable_route_open(rejection_code(raw)),
+            !is_retryable_route_open(decode_error_body(raw.as_bytes()).code()),
             "an undecodable rejection ({raw:?}) must be terminal, not retried"
         );
     }
-}
-
-#[test]
-fn route_rejection_code_extracts_the_prefix() {
-    assert_eq!(
-        rejection_code("module_warming — still starting"),
-        "module_warming"
-    );
-    assert_eq!(rejection_code("module_warming"), "module_warming");
-    assert_eq!(rejection_code(""), "");
 }
 
 #[test]
@@ -983,13 +974,18 @@ fn unknown_channel_rejection_uses_the_structured_code() {
     assert_eq!(misleading.code(), "module_warming");
     assert!(!rejection_is_unknown_channel(&misleading));
 
-    // Only a refusal without a structured ErrorBody code uses the legacy text fallback.
-    let legacy: RejectedMessage = "unknown_channel — route gone".into();
-    assert!(rejection_is_unknown_channel(&legacy));
-    assert!(!rejection_is_unknown_channel(&"unknown_channel: 10".into()));
-    assert!(!rejection_is_unknown_channel(
-        &"unknown_channels — route gone".into()
-    ));
+    // Text alone is never the code, even in the form `unknown_channel — ...`: every daemon error
+    // frame carries a structured ErrorBody code, and text does not prove the daemon wrote it.
+    for text in [
+        "unknown_channel — route gone",
+        "unknown_channel",
+        "unknown_channel: 10",
+    ] {
+        let plain: RejectedMessage = text.into();
+        assert!(!rejection_is_unknown_channel(&plain), "{text}");
+        let unparsed = decode_error_body(text.as_bytes());
+        assert!(!rejection_is_unknown_channel(&unparsed), "{text}");
+    }
 }
 
 /// The refusals the daemon or the provider sends before a call reaches the tool re-open the
@@ -1013,6 +1009,12 @@ fn only_refusals_before_dispatch_reopen_a_tool_route() {
         ToolRouteRefusal::OutcomeUnknown
     );
     assert_eq!(decode("module_warming"), ToolRouteRefusal::Other);
+    // Text in the `unknown_channel — ...` form is not the daemon's structured code, so it
+    // re-opens nothing.
+    assert_eq!(
+        classify_tool_route_refusal(&"unknown_channel — route gone".into()),
+        ToolRouteRefusal::Other
+    );
 }
 
 use subc_transport::{
@@ -2686,6 +2688,83 @@ async fn pending_waiter_limit_returns_a_typed_transport_error() {
         .expect_err("the 4097th in-flight request must be rejected");
     assert!(matches!(error, ConnError::Transport(message) if message.contains("4096")));
     assert_eq!(pending.lock().unwrap().len(), MAX_PENDING_REQUESTS);
+}
+
+/// A route.open tombstone stops counting against the waiter limit once its bind window has
+/// passed: a daemon that never answers those opens cannot fill the connection's waiter map
+/// for the life of the socket. A tombstone still inside its window keeps counting.
+#[test]
+fn expired_route_open_tombstones_free_their_waiter_slots() {
+    let tombstones = |blocks_probe_until: Instant| -> PendingMap {
+        Arc::new(Mutex::new(
+            (0..MAX_PENDING_REQUESTS as u64)
+                .map(|corr| {
+                    (
+                        (0, 0, corr),
+                        PendingEntry::LateRouteOpen { blocks_probe_until },
+                    )
+                })
+                .collect(),
+        ))
+    };
+    let register = |pending: &PendingMap| {
+        let (sender, _rx) = mpsc::unbounded_channel();
+        insert_pending(
+            pending,
+            (9, 1, u64::MAX),
+            PendingSender::Unary(sender),
+            false,
+            true,
+        )
+    };
+
+    let live = tombstones(Instant::now() + Duration::from_secs(60));
+    let refused = register(&live).expect_err("tombstones inside their window still count");
+    assert!(matches!(refused, ConnError::Transport(message) if message.contains("4096")));
+
+    let expired = tombstones(Instant::now());
+    register(&expired).expect("expired tombstones make room");
+    assert_eq!(
+        expired.lock().unwrap().len(),
+        1,
+        "only the new waiter is left"
+    );
+}
+
+/// A route.open reply whose tombstone already expired still names a route the daemon
+/// committed for nobody, so it is closed like a late reply.
+#[tokio::test]
+async fn a_route_open_reply_with_no_waiter_queues_goodbye() {
+    let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+    let routes: RouteEpochs = Arc::new(Mutex::new(HashMap::new()));
+    let (write_tx, mut write_rx) = mpsc::channel(4);
+    let (mut client, server) = tokio::io::duplex(1024);
+    let reader = tokio::spawn(reader_task(
+        server,
+        Arc::clone(&pending),
+        Arc::clone(&routes),
+        write_tx,
+        None,
+    ));
+    let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+        route_channel: 9,
+        route_epoch: 4,
+        request_window: None,
+        watch_window: None,
+    })
+    .unwrap();
+    let response = Frame::build(FrameType::Response, control_flags(), 0, 0, 5, body).unwrap();
+    write_frame(&mut client, &response).await.unwrap();
+
+    let goodbye = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+        .await
+        .expect("an unclaimed route.open must queue cleanup")
+        .expect("a GOODBYE frame");
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!((goodbye.header.channel, goodbye.header.epoch), (9, 4));
+    assert!(routes.lock().unwrap().is_empty());
+    drop(client);
+    reader.await.unwrap();
 }
 
 #[tokio::test]

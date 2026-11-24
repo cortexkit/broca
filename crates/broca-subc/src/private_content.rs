@@ -329,17 +329,32 @@ fn request_body(
     })
 }
 
+/// The diagnostic tokens of a refusal's detail (`reason_code` and `field`, when they are
+/// strings), and nothing else: a refusal is logged, and the rest of its detail can carry context
+/// and session data.
+fn diagnostic_tokens(detail: &Value) -> Value {
+    let mut safe = serde_json::Map::new();
+    for key in ["reason_code", "field"] {
+        if let Some(token) = detail.get(key).and_then(Value::as_str) {
+            safe.insert(key.into(), json!(token));
+        }
+    }
+    Value::Object(safe)
+}
+
 fn decode(
     reply: Result<Result<Vec<u8>, subc_protocol::ErrorBody>, ConnError>,
 ) -> Result<PrivateContent, PrivateContentError> {
     let bytes = match reply {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(error)) => {
+            // A refusal frame's message and detail can carry context and session data, as a
+            // refusal body can: keep only its code and the same diagnostic tokens.
             return Err(PrivateContentError::Refused {
                 code: error.code,
-                message: error.message,
-                detail: error.detail,
-            })
+                message: "request refused".into(),
+                detail: error.detail.as_ref().map(diagnostic_tokens),
+            });
         }
         Err(error) => return Err(PrivateContentError::from(error)),
     };
@@ -349,15 +364,7 @@ fn decode(
     if let Some(outcome) = value.get("outcome") {
         // Refusal bodies can carry context and session data. Keep only diagnostic tokens,
         // since this error is printed in a warning rather than returned as private content.
-        let detail = value.get("detail").map(|detail| {
-            let mut safe = serde_json::Map::new();
-            for key in ["reason_code", "field"] {
-                if let Some(token) = detail.get(key).and_then(Value::as_str) {
-                    safe.insert(key.into(), json!(token));
-                }
-            }
-            Value::Object(safe)
-        });
+        let detail = value.get("detail").map(diagnostic_tokens);
         return Err(PrivateContentError::Refused {
             code: outcome.as_str().unwrap_or("unknown_outcome").into(),
             message: "request refused".into(),
@@ -756,5 +763,26 @@ mod tests {
         ))))
         .unwrap_err();
         assert_eq!(error.code(), Some("private_content_unavailable"));
+    }
+
+    /// A typed refusal frame can carry context or session data in its message and detail, as a
+    /// JSON refusal body can. Its display is logged, so it keeps only the same diagnostic tokens.
+    #[test]
+    fn a_refusal_frame_names_only_diagnostic_tokens() {
+        let error = decode(Ok(Err(subc_protocol::ErrorBody::new(
+            "invalid_request",
+            "PRIVATE_MESSAGE",
+        )
+        .with_detail(json!({
+            "field": "scope_ref",
+            "reason_code": "unknown_field",
+            "context": "PRIVATE_CONTEXT",
+        })))))
+        .unwrap_err();
+        assert_eq!(error.code(), Some("invalid_request"));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("scope_ref"), "{diagnostic}");
+        assert!(diagnostic.contains("unknown_field"), "{diagnostic}");
+        assert!(!diagnostic.contains("PRIVATE_"), "{diagnostic}");
     }
 }

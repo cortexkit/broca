@@ -2139,8 +2139,18 @@ mod tests {
             requests: AtomicUsize::new(0),
             catalog_live: true,
             replies: std::sync::Mutex::new(VecDeque::from([
-                Err(ConnError::Rejected("unknown_channel — 10".into())),
-                Err(ConnError::Rejected("unknown_channel — 40".into())),
+                Err(ConnError::Rejected(
+                    crate::connection::RejectedMessage::structured(
+                        "unknown_channel".into(),
+                        "10".into(),
+                    ),
+                )),
+                Err(ConnError::Rejected(
+                    crate::connection::RejectedMessage::structured(
+                        "unknown_channel".into(),
+                        "40".into(),
+                    ),
+                )),
             ])),
             closes: std::sync::Mutex::new(Vec::new()),
             sent: std::sync::Mutex::new(Vec::new()),
@@ -2416,7 +2426,13 @@ mod tests {
     #[tokio::test]
     async fn status_evicts_route_and_retries_once() {
         for (failure, known_dead) in [
-            (ConnError::Rejected("unknown_channel — 10".into()), true),
+            (
+                ConnError::Rejected(crate::connection::RejectedMessage::structured(
+                    "unknown_channel".into(),
+                    "10".into(),
+                )),
+                true,
+            ),
             (ConnError::Transport("offline".into()), false),
         ] {
             let conn = status_connection(vec![Err(failure), Ok(status_reply())]);
@@ -2446,8 +2462,18 @@ mod tests {
     #[tokio::test]
     async fn status_exhausts_single_retry_and_evicts_replacement() {
         let conn = status_connection(vec![
-            Err(ConnError::Rejected("unknown_channel — 10".into())),
-            Err(ConnError::Rejected("unknown_channel — 40".into())),
+            Err(ConnError::Rejected(
+                crate::connection::RejectedMessage::structured(
+                    "unknown_channel".into(),
+                    "10".into(),
+                ),
+            )),
+            Err(ConnError::Rejected(
+                crate::connection::RejectedMessage::structured(
+                    "unknown_channel".into(),
+                    "40".into(),
+                ),
+            )),
             Ok(status_reply()),
         ]);
         let client = test_client(conn.clone(), RouteState::Ready(RouteHandle::synthetic(10)));

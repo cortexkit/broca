@@ -796,12 +796,14 @@ pub struct SubcToolPlane {
     /// the session was admitted.
     batch_manifests: Mutex<HashMap<BatchRouteKey, broca_core::capability::ToolManifest>>,
     registered_keys: Mutex<RegisteredKeys>,
-    inline_keys: Mutex<HashSet<String>>,
-    /// Call keys handed back for the person's steer in batches still open. Their provider still
-    /// owes each call its own terminal, which reaches the session as a notice, so the batch's end
-    /// keeps the call's late-results registration; the registration sweep removes it once that
-    /// notice is in the session.
-    yielded_keys: Mutex<HashSet<String>>,
+    /// Call keys of inline answers in batches still open, by batch. Kept per batch so the
+    /// batch's end, or its session's close if the batch never ends, forgets them.
+    inline_keys: Mutex<HashMap<BatchRouteKey, HashSet<String>>>,
+    /// Call keys handed back for the person's steer in batches still open, by batch. Their
+    /// provider still owes each call its own terminal, which reaches the session as a notice, so
+    /// the batch's end keeps the call's late-results registration; the registration sweep removes
+    /// it once that notice is in the session.
+    yielded_keys: Mutex<HashMap<BatchRouteKey, HashSet<String>>>,
     #[cfg(debug_assertions)]
     reply_fallback_ms: u64,
     /// Lives across batches for the plane's lifetime, but is reused only as the source snapshot
@@ -828,8 +830,8 @@ pub struct SubcToolPlane {
     /// close of one of these routes catches the batch's calls in flight, and the stamp decides
     /// whether a call not yet sent may be re-sent on a fresh route.
     batch_handles: Mutex<HashMap<BatchRouteKey, BatchComposedRoutes>>,
-    /// What each scoped run has learned that holds for the rest of its calls. Dropped with the
-    /// session's routes at session close.
+    /// What each scoped run has learned that holds for the rest of its calls. Dropped when the
+    /// session's next run starts a scoped batch, and with the session's routes at session close.
     run_latches: Mutex<HashMap<RunKey, RunScopeLatch>>,
     /// How long to wait for a scope's owner to sync before the scope counts as unverifiable:
     /// [`SCOPE_SYNC_HOLD`], except where a test shortens it.
@@ -1432,8 +1434,8 @@ impl SubcToolPlane {
             provider_held: None,
             batch_manifests: Mutex::new(HashMap::new()),
             registered_keys: Mutex::new(HashMap::new()),
-            inline_keys: Mutex::new(HashSet::new()),
-            yielded_keys: Mutex::new(HashSet::new()),
+            inline_keys: Mutex::new(HashMap::new()),
+            yielded_keys: Mutex::new(HashMap::new()),
             #[cfg(debug_assertions)]
             reply_fallback_ms: 120_000,
             catalog_memo: Mutex::new(None),
@@ -1921,7 +1923,14 @@ impl SubcToolPlane {
             .as_ref()
             .is_some_and(|current| may_resend_under(&composed_under, current))
         {
-            self.forget_route(ctx, module_id, fresh);
+            // Unlike the closed route forgotten above, this one is live: both describes around
+            // its open saw the new agent. Close it so the daemon frees the channel instead of
+            // holding it until the session ends. Only the task that takes it out of the cache
+            // closes it, so a route another call already took is never closed twice.
+            let key = Self::route_key(&ctx.bind, Some(scope), module_id);
+            if self.take_route_if_owned(&key, fresh).is_some() {
+                self.closer.close(fresh).await;
+            }
             return drained(SCOPE_AGENT_CHANGED);
         }
         if guard.interrupted() {
@@ -2060,6 +2069,8 @@ impl SubcToolPlane {
                             self.yielded_keys
                                 .lock()
                                 .unwrap()
+                                .entry(Self::batch_route_key(ctx))
+                                .or_default()
                                 .insert(key.call_key.to_owned());
                         }
                         return DispatchResult::Yielded {
@@ -2125,6 +2136,8 @@ impl SubcToolPlane {
                         self.inline_keys
                             .lock()
                             .unwrap()
+                            .entry(Self::batch_route_key(ctx))
+                            .or_default()
                             .insert(key.call_key.to_owned());
                     }
                 }
@@ -3083,6 +3096,14 @@ impl SubcToolPlane {
             .lock()
             .unwrap()
             .retain(|(owner, _), _| owner != &session);
+        self.inline_keys
+            .lock()
+            .unwrap()
+            .retain(|(owner, _), _| owner != &session);
+        self.yielded_keys
+            .lock()
+            .unwrap()
+            .retain(|(owner, _), _| owner != &session);
         self.run_latches
             .lock()
             .unwrap()
@@ -3147,6 +3168,13 @@ impl SubcToolPlane {
         guard: &ToolOpenGuard,
     ) -> Result<(), ToolPlaneError> {
         if ctx.scope.is_some() {
+            // A session runs one run at a time, so a batch of this run means the session's
+            // earlier runs have ended and nothing reads what they latched again.
+            let session = Self::session_key(&ctx.bind);
+            self.run_latches
+                .lock()
+                .unwrap()
+                .retain(|(owner, run), _| owner != &session || run == &ctx.run_id);
             // No call of this batch is in flight yet (its intents are written after this
             // returns), so what the run already learned, or a drain that closed its routes since
             // the last batch, decides the whole batch before anything opens.
@@ -3826,79 +3854,6 @@ impl SubcToolPlane {
             .await
     }
 
-    async fn recheck_approval_scope_inner(
-        &self,
-        ctx: &BatchCtx,
-        call: &ToolCall,
-        module: Option<&str>,
-    ) -> Result<(), ToolPlaneError> {
-        if !self
-            .conn
-            .server_capabilities()
-            .await
-            .map_err(conn_to_plane)?
-            .iter()
-            .any(|name| name == CAP_SCOPES_V1)
-        {
-            return Err(ToolPlaneError::ScopeRefused {
-                code: "scope_unsupported".into(),
-                detail: "a fresh approval route requires scopes/v1".into(),
-            });
-        }
-        let scope = ctx
-            .scope
-            .as_ref()
-            .ok_or_else(|| ToolPlaneError::ScopeRefused {
-                code: "approve_requires_scope".into(),
-                detail: "approval requires a frozen scope".into(),
-            })?;
-        let selector =
-            frozen_scope_selector(scope).map_err(|detail| ToolPlaneError::ScopeRefused {
-                code: "scope_unverifiable".into(),
-                detail,
-            })?;
-        let module = module
-            .map(str::to_owned)
-            .or_else(|| self.dispatch_target(ctx, &call.tool_call_id))
-            .ok_or_else(|| ToolPlaneError::Unavailable("approval_target_unavailable".into()))?;
-        let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
-        let route = retry_route_open_with_scope_hold(
-            RouteOpenRetry::within(
-                DEFAULT_ROUTE_OPEN_PATIENCE.deadline,
-                DEFAULT_ROUTE_OPEN_PATIENCE.max_interval,
-            ),
-            Some(ScopeHold {
-                deadline: Instant::now() + self.scope_sync_hold,
-                max_interval: SCOPE_SYNC_HOLD_MAX_INTERVAL,
-            }),
-            Some(&lifecycle),
-            || self.conn.module_gate(&module),
-            || {
-                self.conn.route_open_dispatch(
-                    &module,
-                    &ctx.bind,
-                    Some(&selector),
-                    self.frozen_contract(ctx, &module).route_shape(),
-                    self.held_reply_declared(),
-                    self.aft_harness(),
-                )
-            },
-        )
-        .await
-        .map_err(|error| {
-            let code = match &error {
-                RouteOpenError::Conn(ConnError::Rejected(message)) => message.code().to_owned(),
-                _ => SCOPE_UNVERIFIABLE.into(),
-            };
-            ToolPlaneError::ScopeRefused {
-                code,
-                detail: format!("approval scope recheck failed: {error:?}"),
-            }
-        })?;
-        let _ = self.closer.close(route).await;
-        Ok(())
-    }
-
     async fn batch_finished_inner(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
         // The run invokes this after syncing terminals and the batch commit. Inline answers
         // need the same registration retirement as held answers; the provider may publish both.
@@ -3910,16 +3865,26 @@ impl SubcToolPlane {
             .map(|calls| calls.values().cloned().collect())
             .unwrap_or_default();
         let (inline, held): (Vec<_>, Vec<_>) = {
-            let mut keys = self.inline_keys.lock().unwrap();
+            let keys = self
+                .inline_keys
+                .lock()
+                .unwrap()
+                .remove(&Self::batch_route_key(ctx))
+                .unwrap_or_default();
             registered
                 .into_iter()
-                .partition(|(_, key)| keys.remove(key))
+                .partition(|(_, key)| keys.contains(key))
         };
         // A handed-back call's terminal is still owed by its provider: keep its registration.
         let held: Vec<_> = {
-            let mut yielded = self.yielded_keys.lock().unwrap();
+            let yielded = self
+                .yielded_keys
+                .lock()
+                .unwrap()
+                .remove(&Self::batch_route_key(ctx))
+                .unwrap_or_default();
             held.into_iter()
-                .filter(|(_, key)| !yielded.remove(key))
+                .filter(|(_, key)| !yielded.contains(key))
                 .collect()
         };
         let prune = if let Some(support) = &self.provider_held {
@@ -4078,14 +4043,6 @@ impl ToolPlane for SubcToolPlane {
     ) -> DispatchResult {
         self.dispatch_approved_inner(ctx, call, args, key, signals)
             .await
-    }
-    async fn recheck_approval_scope(
-        &self,
-        ctx: &BatchCtx,
-        call: &ToolCall,
-        module: Option<&str>,
-    ) -> Result<(), ToolPlaneError> {
-        self.recheck_approval_scope_inner(ctx, call, module).await
     }
     async fn batch_finished(&self, ctx: &BatchCtx) -> Result<(), ToolPlaneError> {
         self.batch_finished_inner(ctx).await

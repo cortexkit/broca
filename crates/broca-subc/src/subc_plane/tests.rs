@@ -3596,35 +3596,6 @@ mod scope_carrier {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn approval_recheck_retries_temporary_scope_refusals_but_not_final_refusals() {
-        let (conn, plane, _) = rig(Vec::new());
-        let scoped = ctx("approval", "s", "r", Some(scope("head", 1)));
-        conn.script_route_open_sequence(
-            "aft",
-            vec![
-                RouteOpenScript::rejected("scope_not_synced — owner has not synced"),
-                RouteOpenScript::default(),
-            ],
-        );
-        plane
-            .recheck_approval_scope(&scoped, &call("read"), Some("aft"))
-            .await
-            .unwrap();
-        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(plane.tool_routes_health(&[])["cached_routes"], 0);
-        assert_eq!(conn.closed_routes.lock().unwrap().len(), 1);
-        conn.script_route_open_sequence(
-            "aft",
-            vec![RouteOpenScript::rejected("scope_ended — ended")],
-        );
-        assert!(plane
-            .recheck_approval_scope(&scoped, &call("read"), Some("aft"))
-            .await
-            .is_err());
-        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 3);
-    }
-
     use super::*;
     use crate::scope_describe::DescribedScope;
     use subc_protocol::scope::{ScopeAttributes, ScopeKind};
@@ -4209,6 +4180,40 @@ mod scope_carrier {
         }
     }
 
+    /// A session runs one run at a time, so a batch of a new run means the session's earlier
+    /// runs have ended: what they latched is dropped then, not kept until the session closes.
+    /// Another session's latches, and the current run's, stay.
+    #[tokio::test]
+    async fn a_new_run_drops_the_latches_of_its_sessions_ended_runs() {
+        let (_conn, plane, _describer) = rig(Vec::new());
+        let refused = || RunScopeLatch::Refused {
+            code: SCOPE_NOT_LIVE.into(),
+            detail: "scripted".into(),
+        };
+        let ended = ctx("r-b1", "s", "r", Some(scope("head", 1)));
+        let other_session = ctx("x-b1", "other", "x", Some(scope("head", 1)));
+        plane.latch_run(&ended, refused());
+        plane.latch_run(&other_session, refused());
+
+        let next = ctx("r2-b1", "s", "r2", Some(scope("head", 1)));
+        plane
+            .batch_started(&next, &[call("read")], &manifest())
+            .await
+            .expect("the new run's batch starts");
+        plane.latch_run(&next, refused());
+        let latched: std::collections::BTreeSet<_> = plane
+            .run_latches
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(_, run)| run.0.clone())
+            .collect();
+        assert_eq!(
+            latched,
+            std::collections::BTreeSet::from(["r2".to_owned(), "x".to_owned()])
+        );
+    }
+
     /// A describe answering for another epoch than the route was opened under means the
     /// scope we were admitted under ended (a newer session reused the ref).
     #[test]
@@ -4283,6 +4288,44 @@ mod scope_carrier {
             conn.tool_calls.load(Ordering::SeqCst),
             0,
             "nothing dispatched"
+        );
+    }
+
+    /// The route re-opened for a call the rebind then drains is live, unlike the closed one
+    /// it replaced: it is closed (GOODBYE), not just dropped from the cache, so the daemon
+    /// frees the channel instead of holding it until the session ends.
+    #[tokio::test]
+    async fn a_rebound_agent_closes_the_fresh_route_it_refused_to_send_on() {
+        let (conn, plane, describer) = rig(vec![successful_tool_reply("must not be sent")]);
+        describer.script(
+            "head",
+            vec![
+                live("head", 1, "agent-a"),
+                live("head", 1, "agent-a"),
+                live("head", 1, "agent-b"),
+            ],
+        );
+        let (scoped, read) = started(&plane).await;
+        let first = route_of(&plane, &scoped);
+        conn.close(first);
+
+        assert_drained(
+            plane.dispatch(&scoped, &read).await,
+            SCOPE_AGENT_CHANGED,
+            false,
+        );
+        assert_eq!(conn.route_open_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            plane
+                .cached_route_channel_for_scope(&scoped.bind, scoped.scope.as_ref(), "aft")
+                .is_none(),
+            "the refused route is no longer cached"
+        );
+        wait_for_closed_routes(&conn, 1).await;
+        let closed = conn.closed_routes.lock().unwrap().clone();
+        assert_ne!(
+            closed[0].channel, first.channel,
+            "the fresh route was closed"
         );
     }
 

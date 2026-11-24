@@ -590,19 +590,6 @@ pub trait ToolPlane: Send + Sync {
         }
     }
 
-    /// Open a fresh route under the session scope saved in ToolCallDeferred before
-    /// executing an approved call. A cached route cannot prove the scope is still live.
-    async fn recheck_approval_scope(
-        &self,
-        _ctx: &BatchCtx,
-        _call: &ToolCall,
-        _module: Option<&str>,
-    ) -> Result<(), ToolPlaneError> {
-        Err(ToolPlaneError::Unavailable(
-            "approval_scope_recheck_unavailable".into(),
-        ))
-    }
-
     /// The tool provider module the call `tool_call_id` will be sent to, as resolved by
     /// [`batch_started`](Self::batch_started), or `None` when the plane routes calls to no
     /// module (an in-process plane) or the call resolves to no module and will fail without

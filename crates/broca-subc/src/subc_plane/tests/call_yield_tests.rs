@@ -368,6 +368,90 @@ async fn a_person_steer_hands_the_call_back_once_and_its_interim_content_closes_
     .unwrap();
 }
 
+/// The call keys a batch keeps for its end (an inline answer's, a handed-back call's) are kept
+/// per batch, so a session that closes before its batch ends forgets them rather than holding
+/// them for the plane's life.
+#[tokio::test]
+async fn a_closed_session_forgets_the_call_keys_its_unfinished_batch_kept() {
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        let (wire, mut provider) = wire();
+        let rig = Rig::new(true, true, true, true);
+        let plane = SubcToolPlane::with_connection(wire, "provider")
+            .with_provider_held_support(rig.clone(), rig.clone());
+        let ctx = ctx();
+        let (inline, handed_back) = (call("inline"), call("handed-back"));
+        plane
+            .batch_started(
+                &ctx,
+                &[inline.clone(), handed_back.clone()],
+                &manifest_with_yield(Some("tool-result/v1"), true, true),
+            )
+            .await
+            .unwrap();
+        plane
+            .register_dispatch_group(
+                &ctx,
+                &[
+                    registration(&inline, "lineage:1", false),
+                    registration(&handed_back, "lineage:2", false),
+                ],
+            )
+            .await
+            .unwrap();
+        let guard = ToolOpenGuard::new(None, None);
+        let mut dispatch = Box::pin(plane.dispatch_guarded(
+            &ctx,
+            &inline,
+            Some(DispatchKey {
+                call_key: "lineage:1",
+                held_recorder: Some(rig.as_ref()),
+            }),
+            &guard,
+        ));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let original = provider.next_request().await;
+        let answer = json!({"content":[{"type":"text","text":"done"}]});
+        assert!(provider.reply(&original, serde_json::to_vec(&answer).unwrap()));
+        assert!(matches!(dispatch.await, DispatchResult::Completed(_)));
+
+        let (steers, seen) = tokio::sync::watch::channel(0u64);
+        let guard = ToolOpenGuard::new(None, None).with_person_steers(Some(PersonSteers(seen)));
+        let mut dispatch = Box::pin(plane.dispatch_guarded(
+            &ctx,
+            &handed_back,
+            Some(DispatchKey {
+                call_key: "lineage:2",
+                held_recorder: Some(rig.as_ref()),
+            }),
+            &guard,
+        ));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let original = provider.next_request().await;
+        steers.send_modify(|count| *count += 1);
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        let yielding = provider.next_request().await;
+        assert!(provider.reply(&yielding, br#"{"answer":"accepted"}"#.to_vec()));
+        let interim = json!({"content":[{"type":"text","text":"still building"}],
+            "held":{"reason":"running","yielded":true}});
+        assert!(provider.reply(&original, serde_json::to_vec(&interim).unwrap()));
+        assert!(matches!(dispatch.await, DispatchResult::Yielded { .. }));
+        assert!(!plane.inline_keys.lock().unwrap().is_empty());
+        assert!(!plane.yielded_keys.lock().unwrap().is_empty());
+
+        plane.close_session_routes(&ctx.bind).await;
+        assert!(
+            plane.inline_keys.lock().unwrap().is_empty(),
+            "the inline answer's key outlived its session"
+        );
+        assert!(
+            plane.yielded_keys.lock().unwrap().is_empty(),
+            "the handed-back call's key outlived its session"
+        );
+    })
+    .await
+    .unwrap();
+}
+
 /// A provider may send the call's yielded final frame before its answer to the yield request,
 /// since the two travel as separate frames. The call is still handed back: what makes it so is
 /// that broca asked it to yield for the person, not the order the provider's frames arrive in.

@@ -265,7 +265,7 @@ impl CompactionPlane for SubcCompactionPlane {
                 bind,
                 scope,
                 &serde_json::json!({"method": method, "params": params}),
-                Instant::now() + Duration::from_millis(deadline_ms),
+                bounded(Instant::now() + Duration::from_millis(deadline_ms)),
                 false,
             )
             .await

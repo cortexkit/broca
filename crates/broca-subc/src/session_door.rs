@@ -136,18 +136,88 @@ impl SessionDoorClient {
         log: &[u8],
         deadline: Instant,
     ) -> Result<DoorCoverage, SessionDoorError> {
+        self.admit_chunks(
+            session_ref,
+            log.len() as u64,
+            "session-door durableOffset exceeds frozen log endOffset",
+            deadline,
+            |from, end| std::future::ready(Ok(encode_hex(&log[from as usize..end as usize]))),
+        )
+        .await
+    }
+
+    /// Admit a device-local ciphertext stream without allocating its older snapshots.
+    /// The caller must keep the file unchanged throughout this call. The file is opened and
+    /// read on the blocking pool, a chunk of up to [`MAX_CALL_BYTES`] at a time, so the reads
+    /// never stall the async workers.
+    pub async fn admit_file(
+        &self,
+        session_ref: &str,
+        path: &std::path::Path,
+        deadline: Instant,
+    ) -> Result<DoorCoverage, SessionDoorError> {
+        let path = path.to_owned();
+        let (file, len) = blocking(move || {
+            let file = std::fs::File::open(&path)?;
+            let len = file.metadata()?.len();
+            Ok((Arc::new(std::sync::Mutex::new(file)), len))
+        })
+        .await?;
+        self.admit_chunks(
+            session_ref,
+            len,
+            "durable stream end exceeds local stream copy",
+            deadline,
+            |from, end| {
+                let file = Arc::clone(&file);
+                blocking(move || {
+                    use std::io::{Read as _, Seek as _};
+                    let mut bytes = vec![0; (end - from) as usize];
+                    let mut file = file.lock().unwrap();
+                    file.seek(std::io::SeekFrom::Start(from))?;
+                    file.read_exact(&mut bytes)?;
+                    Ok(encode_hex(&bytes))
+                })
+            },
+        )
+        .await
+    }
+
+    /// Send `[durable end, len)` of a stream to `session.admit`, one chunk of at most
+    /// [`MAX_CALL_BYTES`] per call, resuming from the door's durable end. `hex_chunk(from, end)`
+    /// supplies the hex of the stream's bytes `[from, end)`. `overrun` names the error when the
+    /// door's durable end lies past `len`.
+    async fn admit_chunks<F, Fut>(
+        &self,
+        session_ref: &str,
+        len: u64,
+        overrun: &'static str,
+        deadline: Instant,
+        mut hex_chunk: F,
+    ) -> Result<DoorCoverage, SessionDoorError>
+    where
+        F: FnMut(u64, u64) -> Fut,
+        Fut: std::future::Future<Output = Result<String, SessionDoorError>>,
+    {
         let mut coverage = self.offsets(session_ref, deadline).await?;
-        let mut offset = checked_offset(coverage.durable_offset, log.len())?;
+        let mut offset = coverage.durable_offset;
         let mut mismatch_backoff = FIRST_BACKOFF;
-        while offset < log.len() {
-            let end = offset.saturating_add(MAX_CALL_BYTES).min(log.len());
+        loop {
+            if offset > len {
+                return Err(unavailable(overrun));
+            }
+            if offset == len {
+                return Ok(coverage);
+            }
+            let end = offset.saturating_add(MAX_CALL_BYTES as u64).min(len);
+            let bytes = hex_chunk(offset, end).await?;
             let answer = self
                 .call(
                     "session.admit",
                     json!({
                         "sessionRef": session_ref,
-                        "fromOffset": offset as u64,
-                        "bytes": encode_hex(&log[offset..end]),
+                        "fromOffset": offset,
+                        "bytes": bytes,
                     }),
                     deadline,
                 )
@@ -155,7 +225,7 @@ impl SessionDoorClient {
             match answer {
                 Ok(value) => {
                     coverage = decode_coverage(value)?;
-                    if coverage.durable_offset != end as u64 {
+                    if coverage.durable_offset != end {
                         return Err(unavailable(
                             "session.admit returned an unexpected durableOffset",
                         ));
@@ -175,58 +245,9 @@ impl SessionDoorClient {
                     if coverage.durable_offset < expected {
                         return Err(refused(&error));
                     }
-                    let next = checked_offset(coverage.durable_offset, log.len())?;
-                    if next == offset {
+                    if coverage.durable_offset == offset {
                         backoff(deadline, &mut mismatch_backoff, &error).await?;
                     }
-                    offset = next;
-                }
-                Err(error) => return Err(refused(&error)),
-            }
-        }
-        Ok(coverage)
-    }
-
-    /// Admit a device-local ciphertext stream without allocating its older snapshots.
-    /// The caller must keep the file unchanged throughout this call.
-    pub async fn admit_file(
-        &self,
-        session_ref: &str,
-        path: &std::path::Path,
-        deadline: Instant,
-    ) -> Result<DoorCoverage, SessionDoorError> {
-        use std::io::{Read as _, Seek as _};
-        let mut file = std::fs::File::open(path).map_err(|error| unavailable(error.to_string()))?;
-        let len = file
-            .metadata()
-            .map_err(|error| unavailable(error.to_string()))?
-            .len();
-        let mut coverage = self.offsets(session_ref, deadline).await?;
-        let mut offset = coverage.durable_offset;
-        let mut mismatch_backoff = FIRST_BACKOFF;
-        loop {
-            if offset > len {
-                return Err(unavailable("durable stream end exceeds local stream copy"));
-            }
-            if offset == len {
-                return Ok(coverage);
-            }
-            let end = offset.saturating_add(MAX_CALL_BYTES as u64).min(len);
-            let mut bytes = vec![0; (end - offset) as usize];
-            file.seek(std::io::SeekFrom::Start(offset))
-                .and_then(|_| file.read_exact(&mut bytes))
-                .map_err(|error| unavailable(error.to_string()))?;
-            match self.call("session.admit", json!({"sessionRef":session_ref,"fromOffset":offset,"bytes":encode_hex(&bytes)}), deadline).await? {
-                Ok(value) => {
-                    coverage = decode_coverage(value)?;
-                    if coverage.durable_offset != end { return Err(unavailable("session.admit returned an unexpected durableOffset")); }
-                    offset = end; mismatch_backoff = FIRST_BACKOFF;
-                }
-                Err(error) if error.code == "offset_mismatch" => {
-                    let expected = error.detail.as_ref().and_then(|detail| detail.get("expectedOffset")).and_then(Value::as_u64).ok_or_else(|| refused(&error))?;
-                    coverage = self.offsets(session_ref, deadline).await?;
-                    if coverage.durable_offset < expected { return Err(refused(&error)); }
-                    if coverage.durable_offset == offset { backoff(deadline, &mut mismatch_backoff, &error).await?; }
                     offset = coverage.durable_offset;
                 }
                 Err(error) => return Err(refused(&error)),
@@ -434,15 +455,15 @@ fn decode_coverage(value: Value) -> Result<DoorCoverage, SessionDoorError> {
     Ok(coverage)
 }
 
-fn checked_offset(offset: u64, end: usize) -> Result<usize, SessionDoorError> {
-    let offset = usize::try_from(offset)
-        .map_err(|_| unavailable("session-door durableOffset exceeds frozen log endOffset"))?;
-    if offset > end {
-        return Err(unavailable(
-            "session-door durableOffset exceeds frozen log endOffset",
-        ));
-    }
-    Ok(offset)
+/// Run file IO on the blocking pool. An IO error, or a task that panicked or was cancelled,
+/// leaves the door unavailable.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<T, SessionDoorError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| unavailable(error.to_string()))?
+        .map_err(|error| unavailable(error.to_string()))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

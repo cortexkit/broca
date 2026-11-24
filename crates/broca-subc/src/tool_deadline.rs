@@ -129,10 +129,11 @@ enum AftTimeout {
     Refused,
 }
 
-/// AFT's reading of `timeout` (`coerce_optional_int_result`, AFT `subc_translate.rs:937`):
-/// absent, `null`, `""`, `[]`, `{}` and `0` are all OMITTED; a JSON integer, or a numeric
-/// string with no fractional part (`"600000"`, and also `"600000.0"`), is that many ms;
-/// anything else -- negative, fractional, non-numeric, above 2^53 -- is refused.
+/// AFT's reading of `bash_watch`'s `timeoutMs` (AFT `commands/bash_watch.rs:161-209`), which is
+/// not `coerce_optional_int_result`: only an absent value is OMITTED (the worker cap); an
+/// unsigned JSON integer, or a string that trims to an unsigned integer, is that many ms when it
+/// is within 1..=1,800,000; anything else -- `null`, `""`, `0`, fractions, negatives, values
+/// above the cap -- is refused.
 fn aft_bash_watch_timeout_ms(value: Option<&serde_json::Value>) -> AftTimeout {
     use serde_json::Value;
     let parsed = match value {
@@ -148,6 +149,10 @@ fn aft_bash_watch_timeout_ms(value: Option<&serde_json::Value>) -> AftTimeout {
     }
 }
 
+/// AFT's reading of `bash`'s `timeout` (`coerce_optional_int_result`, AFT
+/// `subc_translate.rs:937`): absent, `null`, `""`, `[]`, `{}` and `0` are all OMITTED; a JSON
+/// integer, or a numeric string with no fractional part (`"600000"`, and also `"600000.0"`),
+/// is that many ms; anything else -- negative, fractional, non-numeric, above 2^53 -- is refused.
 fn aft_timeout_ms(value: Option<&serde_json::Value>) -> AftTimeout {
     use serde_json::Value;
     let whole = match value {
