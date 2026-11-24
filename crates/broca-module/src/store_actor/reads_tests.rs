@@ -1762,6 +1762,44 @@ async fn operations_on_a_busy_expiring_session_read_none_of_its_log() {
     busy_session_operations_read_none_of_its_log(true).await;
 }
 
+/// The first `session.head` after an idle close reads none of the session's log: the closing
+/// actor kept the head it built from memory at the position it left the session. Each later
+/// write moves the session, so before, nearly every head read of a closed session loaded its
+/// whole view. The kept head is the head a read of the closed session builds.
+#[tokio::test]
+async fn the_first_head_after_an_idle_close_reads_no_log() {
+    use crate::serve::ServeHandler;
+    let m = module(vec![text_step("a1", "one"), text_step("a2", "two")]).await;
+    let runtime = m.runtime();
+    let scope = broca_protocol::SendScope::default();
+    for run in ["r1", "r2"] {
+        active(m.send(run, "hello").await);
+        m.gate.notify_one();
+        m.ended(run, "completed").await;
+        m.close().await;
+        runtime.log_reads.store(0, Ordering::Relaxed);
+        let served = m.registry.head_for(&m.key, None, &scope).await.unwrap();
+        assert_eq!(
+            runtime.log_reads.load(Ordering::Relaxed),
+            0,
+            "{run}: the head after the close reads no log"
+        );
+        assert_eq!(served.last_run_state.as_ref().unwrap().run_id, run);
+        let StoreReadReply::Head(Ok(fresh)) = m.fresh(&StoreReadRequest::Head).await else {
+            panic!("{run}: a fresh head builds");
+        };
+        // What `session.head` adds for its caller (who may send, the input profile and the
+        // prompt-cache clock) isn't part of the kept head.
+        let unadorned = |mut reply: broca_wire::HeadResponse| {
+            reply.sender = Default::default();
+            reply.input = None;
+            reply.cache = None;
+            reply
+        };
+        assert_eq!(unadorned(served), unadorned(fresh.reply), "{run}");
+    }
+}
+
 #[cfg(feature = "test-clock")]
 async fn busy_session_operations_read_none_of_its_log(policy: bool) {
     use crate::serve::{ServeHandler, SessionReadRequest};

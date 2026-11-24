@@ -756,6 +756,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if !self.session.unsynced() {
             self.retire_recovery();
         }
+        if matches!(exit, Exit::Idle) && !untouched {
+            self.keep_closing_head(&life.registry);
+        }
         let release_waiter = self.release_waiter.take();
         // Everything but the session is dropped here, before the lease, as the whole actor was.
         let session = self.into_session();
@@ -1061,42 +1064,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self.refresh_warm_config();
         if seals {
             self.collect_due = true;
-        }
-    }
-
-    /// Deletes what the session's committed changes stopped naming, once it has gone unnamed for
-    /// the grace period (see `broca_session_store::session::collect`). With nothing due, which
-    /// is usual since a change's deletions come due a day after it, nothing is read or written.
-    /// The actor is the session's only writer, so no append or seal runs meanwhile.
-    async fn collect_unreferenced(&mut self) {
-        self.collect_due = false;
-        let now_ms = (self.now_ms)();
-        match self.session.collect(now_ms).await {
-            Ok(0) => {}
-            Ok(changes) => tracing::info!(
-                target: "broca.store_actor",
-                session = %self.key.session,
-                changes,
-                "deleted what the session's changes stopped naming",
-            ),
-            Err(error) => tracing::warn!(
-                target: "broca.store_actor",
-                session = %self.key.session,
-                error = ?error,
-                "what the session's changes stopped naming could not be deleted; the next open \
-                 or the store's collection sweep retries",
-            ),
-        }
-    }
-
-    /// Runs deletions still due when the actor stops serving, unless the module is stopping or
-    /// the session is about to be deleted whole.
-    async fn collect_on_exit(&mut self, exit: &Exit) {
-        if self.collect_due
-            && !matches!(exit, Exit::Stop | Exit::Expired(_) | Exit::Cut(_))
-            && !self.created_and_untouched()
-        {
-            self.collect_unreferenced().await;
         }
     }
 
@@ -4875,6 +4842,7 @@ mod admission;
 mod apply_view;
 mod builders;
 mod cache_policy;
+mod collect;
 mod expiry;
 mod held;
 mod idle_warm;

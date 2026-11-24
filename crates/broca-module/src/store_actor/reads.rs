@@ -74,6 +74,61 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         crate::store_reads::answer_in_memory(&mut self.session, &context, request).await
     }
 
+    /// Keeps the session's head where `session.head` of a closed session looks first (see
+    /// `store_head::KeptHeads`), as the actor closes idle. A head built after a close loads the
+    /// session's whole view, and almost every closed head read follows a write the head was not
+    /// yet built at (125 of 126 such loads in one 16-minute sample). The head is built from what
+    /// the actor holds in memory, the way a read of the closed session builds it: no live actor,
+    /// no live step. A head that needs storage, or records not yet durable, keeps nothing, and
+    /// the closed read builds the head as before.
+    pub(super) fn keep_closing_head(&self, registry: &crate::registry::RegistryHandle) {
+        use futures::FutureExt as _;
+        if self.session.unsynced() {
+            return;
+        }
+        let Some(store) = registry.store_runtime() else {
+            return;
+        };
+        // A session that expires is left out, as `StoreRuntime::closed_position` leaves it out:
+        // whether it has expired is read from its whole view.
+        let class = match store.class_of(&self.key) {
+            Ok(Some(class)) if class != broca_records::session_storage::StorageClass::Ephemeral => {
+                class
+            }
+            _ => return,
+        };
+        let addr = broca_core::session_addr(&self.key);
+        let context = crate::store_reads::ReadContext {
+            labels: crate::store_awaits::Labels(Some(self.executor.clone())),
+            token_counts: None,
+            parts: store.parts_for(class, self.session.head().cipher()),
+            held: false,
+            open: false,
+            settled: Some((store.settled_runs(), addr.as_str())),
+            session_name: &self.key.session,
+            live_step: None,
+            // The cursor the actor's subscribers stand at, which a read of the same records
+            // projects again.
+            stream_head: self.fanout.as_ref().and_then(|fanout| fanout.head()),
+            entry_speaks_for: crate::store_entries::EntryAttribution::Known(false),
+            class: Some(class),
+        };
+        let memory = self.session.in_memory();
+        let reply = crate::store_reads::execute(
+            &self.session,
+            &context,
+            &crate::store_reads::StoreReadRequest::Head,
+        )
+        .now_or_never();
+        let from_memory = !memory.refused();
+        drop(memory);
+        if let (Some(crate::store_reads::StoreReadReply::Head(Ok(head))), true) =
+            (reply, from_memory)
+        {
+            store.heads().keep(addr, self.session.position(), &head);
+        }
+    }
+
     /// Whether the compaction entries `request` serves keep `speaks_for`: what the latest Setup
     /// this actor sent found in the provider's catalog entry. Before this actor has sent one, a
     /// `session.entries` read asks the catalog for the provider the session's plan names, and the
