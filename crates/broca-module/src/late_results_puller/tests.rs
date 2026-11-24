@@ -1462,6 +1462,51 @@ async fn review_regression_completed_sibling_is_not_withdrawn_on_recovery() {
     );
 }
 
+/// A session retention deleted can't have its held calls withdrawn or answered, so recovery
+/// settles their rows: a watch goes, a withdrawal already attempted fails with its scope ended,
+/// and recovery reports no failure. Recovery used to keep such rows for a later sweep that could
+/// never read them, and every start after the deletion reported broca degraded.
+#[tokio::test]
+async fn a_deleted_sessions_held_calls_are_settled_on_recovery() {
+    let bind = session("deleted");
+    let root = rig_root("deleted-session-withdrawals");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    // No root keeps the session: it was deleted after its calls were registered.
+    let runtime = session_store(&root).await;
+    let store = Arc::new(review_store(&root));
+    let (watched, attempted) = (
+        registration("lineage:4", "tools", &bind),
+        registration("lineage:5", "tools", &bind),
+    );
+    store
+        .register_calls(&[watched.clone(), attempted.clone()])
+        .unwrap();
+    store
+        .record_withdrawal(&attempted, "pending", 1, &serde_json::json!({"attempt": 1}))
+        .unwrap();
+    let route = Arc::new(WithdrawalRoute {
+        seen: Mutex::default(),
+        mode: "ok",
+    });
+    let service = withdrawals(store.clone(), &runtime, route.clone(), Default::default());
+    service.recover().await.unwrap();
+    assert!(route.seen.lock().unwrap().is_empty(), "nothing is asked");
+    let health = service.health();
+    assert_eq!(
+        (&health["failed"], &health["watching"], &health["pending"]),
+        (
+            &serde_json::json!(0),
+            &serde_json::json!(0),
+            &serde_json::json!(0)
+        ),
+        "{health}"
+    );
+    assert_eq!(health["scope_gone"], 1, "{health}");
+    assert!(health.get("error").is_none(), "{health}");
+    assert_eq!(store.withdrawal_state("tools", "lineage:4").unwrap(), None);
+}
+
 struct DrainWithdrawalRoute {
     seen: std::sync::atomic::AtomicUsize,
     stopping: tokio_util::sync::CancellationToken,

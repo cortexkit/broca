@@ -225,8 +225,9 @@ impl HeldWithdrawals {
     }
 
     /// Withdraws the owed calls of one session and retires the watches it no longer needs,
-    /// adding what it did to `tally`. A session the store doesn't hold keeps its rows for a later
-    /// sweep.
+    /// adding what it did to `tally`. While no store is installed, the rows stay for a later
+    /// sweep. A session no root keeps any more was deleted, and its rows are settled (see
+    /// [`Self::settle_deleted`]).
     async fn sweep_session(
         &self,
         runtime: Option<Arc<crate::store_open::StoreRuntime>>,
@@ -235,14 +236,16 @@ impl HeldWithdrawals {
         tally: &mut SweepTally,
     ) {
         let held = match runtime.as_ref().map(|runtime| runtime.holds(&bind)) {
-            Some(Ok(held)) => held,
+            Some(Ok(held)) => Some(held),
             Some(Err(error)) => {
                 tally.failure = Some(error.to_string());
-                false
+                None
             }
-            None => false,
+            None => None,
         };
-        if let (true, Some(runtime)) = (held, runtime) {
+        if held == Some(false) {
+            self.settle_deleted(&bind, &rows, tally);
+        } else if let (Some(true), Some(runtime)) = (held, runtime) {
             tally.sessions_read += 1;
             // Whether each call was cancelled while held, from one read of the session's ledger
             // back to the oldest of their intents, rather than one read per call.
@@ -308,8 +311,8 @@ impl HeldWithdrawals {
                 }
             }
         } else {
-            // The store doesn't hold the session, or isn't installed yet: its cancellations
-            // can't be read, so the rows stay for a later sweep.
+            // No store is installed yet, or the session's root couldn't be read: its
+            // cancellations can't be read, so the rows stay for a later sweep.
             tally.failure = Some(format!(
                 "held withdrawals wait: no session store holds {}",
                 broca_core::session_addr(&bind)
@@ -317,6 +320,54 @@ impl HeldWithdrawals {
         }
         self.sweep.lock().expect("withdrawal sweep").rows_remaining -= rows.len();
         tokio::task::yield_now().await;
+    }
+
+    /// Settles the `rows` of the session `bind`, which no root keeps any more: retention or an
+    /// operator deleted it. Its calls can't take a result, and none can be withdrawn, since a
+    /// withdrawal names the call's identity as the session's ledger recorded it. So the calls'
+    /// registrations and unattempted watches go, and a withdrawal already attempted is recorded
+    /// as failed with its scope ended, which health reports apart from failures that need
+    /// attention. Before this, such rows stayed for a later sweep that could never read them, and
+    /// every sweep reported the session as a failure.
+    fn settle_deleted(
+        &self,
+        bind: &broca_protocol::BindIdentity,
+        rows: &[(LateResultRegistration, String, u32)],
+        tally: &mut SweepTally,
+    ) {
+        let calls: Vec<_> = rows
+            .iter()
+            .map(|(call, _, _)| (call.module.clone(), call.call_key.clone()))
+            .collect();
+        let mut settled = match self.store.remove_spent_calls(&calls) {
+            Ok(removed) => removed,
+            Err(error) => {
+                tally.failure = Some(error);
+                return;
+            }
+        };
+        let gone = json!({"code": "scope_ended", "message": "the call's session was deleted"});
+        for (call, state, attempts) in rows {
+            if state == "scope_gone" || state == "failed" {
+                continue;
+            }
+            // A row the removal above kept had a withdrawal attempted.
+            match self.store.withdrawal_state(&call.module, &call.call_key) {
+                Ok(Some(_)) => match self
+                    .store
+                    .record_withdrawal(call, "failed", *attempts, &gone)
+                {
+                    Ok(()) => settled += 1,
+                    Err(error) => tally.failure = Some(error),
+                },
+                Ok(None) => {}
+                Err(error) => tally.failure = Some(error),
+            }
+        }
+        tracing::warn!(target: "late_results", session = %broca_core::session_addr(bind),
+            calls = rows.len(), settled, "provider-held calls of a deleted session settled");
+        tally.rows_settled += settled;
+        self.refresh_health();
     }
 
     /// Send one attempt to withdraw `call`, counting on from `attempts` sent before, and return
