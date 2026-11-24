@@ -10,11 +10,23 @@ fn estimated() -> u64 {
         .sum()
 }
 
+/// Held by every test that holds megabytes or reads the process-wide estimate. The estimate sums
+/// every thread's allocations, and `cargo test` runs a binary's tests on parallel threads in one
+/// process, so a test freeing its buffers while another measures takes them out of the other's
+/// reading (CI read 5.6 MB for 16 MB held).
+static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn heavy() -> std::sync::MutexGuard<'static, ()> {
+    HEAVY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The sites' estimates follow what the heap holds, and frees take them back out: the test
-/// binary's own allocations go through the profiler. Read under nextest, where each test has the
-/// process to itself.
+/// binary's own allocations go through the profiler.
 #[test]
 fn the_estimate_follows_what_the_heap_holds() {
+    let _heavy = heavy();
     let before = estimated();
     let held: Vec<Vec<u8>> = (0..4096).map(|_| vec![7u8; 4096]).collect();
     let real = 4096 * 4096u64;
@@ -35,6 +47,7 @@ fn the_estimate_follows_what_the_heap_holds() {
 /// counts as large.
 #[test]
 fn a_grown_buffer_counts_at_its_new_size() {
+    let _heavy = heavy();
     let before = estimated();
     let mut grown: Vec<Vec<u8>> = (0..2048).map(|_| Vec::with_capacity(16)).collect();
     for buffer in &mut grown {
@@ -86,6 +99,7 @@ fn a_held_guard_stays_held_through_nested_entries() {
 /// JSON names the sampled sites.
 #[test]
 fn a_snapshot_taken_under_the_profilers_guard_finishes() {
+    let _heavy = heavy();
     // Blocks several times the mean sampling gap are all but certain to be sampled.
     let held: Vec<Vec<u8>> = (0..4)
         .map(|_| vec![1u8; 4 * SAMPLE_BYTES as usize])
