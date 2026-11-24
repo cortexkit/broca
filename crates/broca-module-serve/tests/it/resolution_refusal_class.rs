@@ -18,6 +18,10 @@
 //! A routing module's refusal to choose an account reaches the caller with an outer code that says
 //! whether to wait, directly and for a queued send refused at its own admission. Set
 //! `BROCA_ACCOUNT_WAIT_SAMPLES` to a folder to write those bodies there.
+//!
+//! An ordered send that starts its own run on an idle session, refused at that run's admission,
+//! is answered `pending` and ends with the refusal. Set `BROCA_ORDERED_REFUSAL_SAMPLES` to a
+//! folder to write its bodies there.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -340,6 +344,11 @@ impl Rig {
 
     /// Sends `send_id` on `channel` as Core sends it, with a fetch plan when `plan` is set.
     async fn send(&mut self, channel: u16, send_id: &str, plan: bool) -> Frame {
+        self.send_with(channel, send_id, plan, json!({})).await
+    }
+
+    /// [`Self::send`] with `extra`'s members added to the send's params.
+    async fn send_with(&mut self, channel: u16, send_id: &str, plan: bool, extra: Value) -> Frame {
         let mut params = json!({
             "prompt": "hi",
             "send_id": send_id,
@@ -360,6 +369,9 @@ impl Rig {
                 }
             }
             params["plan"] = plan;
+        }
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            params[key] = value.clone();
         }
         self.request(channel, json!({"method": "session.send", "params": params}))
             .await
@@ -936,4 +948,97 @@ async fn a_queued_send_refused_by_routing_ends_with_the_refusal_code() {
             assert_eq!(error["resets_at_ms"], *resets_at_ms, "{storage}: {run}");
         }
     }
+}
+
+/// An ordered send (`["steer", "idle_start"]`, as prefrontal sends to a head) on an idle session
+/// starts its run as it is admitted. When routing gives that run no account decision, the send is
+/// already queued durably, so the sender hears `pending` with its submission id, not an error. The
+/// send then ends with the refusal: `session.send_status` answers it finished with reason `error`,
+/// and `run.status` for its run carries the whole transient `routing_unavailable` error. Nothing
+/// reaches the transcript, so the sender must read the end to know the message was not delivered.
+#[tokio::test]
+async fn an_ordered_send_refused_at_its_own_start_is_pending_then_ends_with_the_refusal() {
+    let samples = std::env::var_os("BROCA_ORDERED_REFUSAL_SAMPLES").map(PathBuf::from);
+    if let Some(samples) = &samples {
+        std::fs::create_dir_all(samples).unwrap();
+    }
+    let mut rig = Rig::start("ordered-refused").await;
+    let channel = rig.bind("ordered-refused").await;
+    let first = rig.send(channel, "turn-1", true).await;
+    assert_eq!(
+        first.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    *rig.executor.error.lock().unwrap() = Some(RunError::RoutingUnavailable(
+        broca_core::RoutingUnavailable::no_decision_within_budget(1_500),
+    ));
+    let sent = rig
+        .send_with(
+            channel,
+            "inbox-send-1",
+            true,
+            json!({"delivery": ["steer", "idle_start"]}),
+        )
+        .await;
+    assert_eq!(
+        sent.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&sent.body)
+    );
+    let reply: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(reply["result"]["state"], "pending", "{reply}");
+    let status = tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        loop {
+            let reply = rig
+                .request(
+                    channel,
+                    json!({"method": "session.send_status",
+                        "params": {"send_id": "inbox-send-1"}}),
+                )
+                .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            if body["result"]["state"] != "pending" {
+                break reply.body.to_vec();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the ordered send ends");
+    let ended: Value = serde_json::from_slice(&status).unwrap();
+    assert_eq!(ended["result"]["state"], "finished", "{ended}");
+    assert_eq!(ended["result"]["reason"], "error", "{ended}");
+    let run_id = ended["result"]["run_id"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let submission = reply["result"]["submission_id"].as_str().unwrap();
+            submission
+                .strip_prefix("sub-")
+                .unwrap_or(submission)
+                .to_owned()
+        });
+    let run = rig
+        .request(
+            channel,
+            json!({"method": "run.status", "params": {"run_id": run_id}}),
+        )
+        .await;
+    if let Some(samples) = &samples {
+        for (part, body) in [
+            ("1.session_send", &sent.body[..]),
+            ("2.session_send_status", &status[..]),
+            ("4.run_status", &run.body[..]),
+        ] {
+            std::fs::write(samples.join(format!("{part}.json")), body).unwrap();
+        }
+    }
+    let run: Value = serde_json::from_slice(&run.body).unwrap();
+    let error = &run["result"]["error"];
+    assert_eq!(run["result"]["state"], "error", "{run}");
+    assert_eq!(error["provider_code"], "routing_unavailable", "{run}");
+    assert_eq!(error["class"], "transient", "{run}");
 }
