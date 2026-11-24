@@ -184,6 +184,9 @@ pub struct StoreRecoverySweep {
     /// Finished sessions that warm themselves and still have a cache to keep, whose warming
     /// timer was armed without opening them: the session opens when its next warm is due.
     pub warm_armed: usize,
+    /// The sessions this pass left for a later one, deferred for want of the key or failed.
+    /// The pass after the key loads takes only these: the rest are done.
+    pub unfinished: Vec<(StorageClass, SessionAddr)>,
 }
 
 fn now_ms() -> u64 {
@@ -248,6 +251,23 @@ impl crate::registry::LineageRegistry {
     /// its run is not durable, so a one-shot session whose cache policy asked for warming is
     /// re-armed by a restart too, still bounded by its warming's cap.
     pub async fn recover_store_crash_orphans(&self) -> Result<StoreRecoverySweep, String> {
+        self.recover_store_sessions(None).await
+    }
+
+    /// The sweep over only `left`, the sessions an earlier pass of this boot left unfinished
+    /// ([`StoreRecoverySweep::unfinished`]). Reading every other head and view again would
+    /// find nothing new: that pass already recovered, armed or retired each of them.
+    pub async fn recover_store_sessions_left(
+        &self,
+        left: &[(StorageClass, SessionAddr)],
+    ) -> Result<StoreRecoverySweep, String> {
+        self.recover_store_sessions(Some(left)).await
+    }
+
+    async fn recover_store_sessions(
+        &self,
+        left: Option<&[(StorageClass, SessionAddr)]>,
+    ) -> Result<StoreRecoverySweep, String> {
         let Some(runtime) = self.store_runtime() else {
             return Ok(StoreRecoverySweep::default());
         };
@@ -266,11 +286,18 @@ impl crate::registry::LineageRegistry {
             // Every durable head is read; other sessions only when registered, so workers' idle
             // sessions don't turn each restart into an all-session read. A session that warms
             // itself stays registered for that (see `StoreActor::retire_recovery`).
-            let addresses = candidate_addresses(indexed, class, || {
-                backend
-                    .stored_sessions()
-                    .map_err(|error| format!("list {class} store sessions: {error:?}"))
-            })?;
+            let addresses = match left {
+                Some(left) => left
+                    .iter()
+                    .filter(|(left_class, _)| *left_class == class)
+                    .map(|(_, addr)| addr.clone())
+                    .collect(),
+                None => candidate_addresses(indexed, class, || {
+                    backend
+                        .stored_sessions()
+                        .map_err(|error| format!("list {class} store sessions: {error:?}"))
+                })?,
+            };
             let failures_before = sweep.failed.len();
             let deferred_before = sweep.deferred;
             for addr in addresses {
@@ -289,6 +316,7 @@ impl crate::registry::LineageRegistry {
                     // before the key arrives. Keep its durable candidate for the key-loaded pass.
                     if cipher != Cipher::None && !runtime.key_loaded() {
                         sweep.deferred += 1;
+                        sweep.unfinished.push((class, addr.clone()));
                         return Ok(());
                     }
                     sweep.inspected += 1;
@@ -393,6 +421,7 @@ impl crate::registry::LineageRegistry {
                 .await;
                 if let Err(error) = result {
                     sweep.failed.push(format!("{}: {error}", addr.0));
+                    sweep.unfinished.push((class, addr));
                 }
             }
             // Encrypted heads cannot be classified until the key arrives. Leave the marker

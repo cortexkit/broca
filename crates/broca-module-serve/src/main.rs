@@ -166,9 +166,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // nothing.
     let state_root = broca_module_serve::state_root::resolve_state_root()
         .map_err(|e| ServeIoError(e.to_string()))?;
-    // A profiling build answers heap snapshot requests from a folder in its state root.
-    #[cfg(feature = "heap-profile")]
-    broca_heap_profile::start(state_root.join("heap-profile"));
     // broca's settings, read once: every component they shape reads its own section from here.
     // broca registers first, and takes the daemon's settings when the daemon manages them;
     // then it never reads the file. Under a daemon that doesn't, it reads broca.jsonc.
@@ -177,6 +174,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // The start writes into the state root (the old settings file's saved copy) before the
     // settings arrive, so it takes the lock first.
     lock_state_root(&state_root)?;
+    // A profiling build answers heap snapshot requests from a folder in its state root, so it
+    // starts only once this process holds the root.
+    #[cfg(feature = "heap-profile")]
+    broca_heap_profile::start(state_root.join("heap-profile"));
     let (settings, gated) = match start_gated(
         &conn_path,
         registration_channel,
@@ -949,16 +950,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| ServeIoError(format!("agent-data boot recovery: {}", error.message)))?;
     tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
         "agent-data boot recovery complete");
-    let retention_sweep = Some({
-        let registry = registry.clone();
-        let ready = scope_describer.clone();
-        tokio::spawn(async move {
-            ready.wait_registered().await;
-            if registry.run_retention_sweeper().await.is_err() {
-                tracing::warn!(target: "retention", "retention sweep stopped; durable recovery required");
-            }
-        })
-    });
+    let retention_sweep = Some(spawn_retention_sweep(
+        registry.clone(),
+        scope_describer.clone(),
+    ));
     let bus_stop = tokio_util::sync::CancellationToken::new();
     let _bus_stop_guard = bus_stop.clone().drop_guard();
     // Compaction v2 uses session-bound calls. Legacy sessions no longer consume
@@ -1230,28 +1225,73 @@ mod runtime_shutdown_tests {
     }
 }
 
-/// The SIGTERM trigger for the seal. Not a backstop: until subc gives modules their own process
-/// groups, it is how every DAEMON CUT reaches broca, because launchd SIGTERMs the daemon's whole
-/// group (measured: 3 of 3 cuts on 2026-09-23 logged this arm). A module restart reaches the
-/// other arm, via `serve` returning.
-///
-/// The non-unix arm below stays pending because SIGTERM has no equivalent there; a module stop
-/// on Windows is the channel-0 GOODBYE, which the serve-return arm handles.
-/// End the process AS IF THE SIGTERM HAD NOT BEEN HANDLED, after the seal has run.
-///
-/// The supervisor's contract (subc, stated 2026-09-23): an unrequested EXIT 0 means "I stopped on
-/// purpose" and is left down, while a death BY SIGNAL is a crash and is respawned. This arm used
-/// to end in `exit(0)`, which turned an operator's `kill -TERM` from "respawned" into "left
-/// down" -- the defect callosum and astrocyte both shipped and found the same afternoon. The
-/// seal is the handler's whole job; how the process then ends has to be what the parent would
-/// have seen with no handler at all.
-///
-/// So: restore the default disposition and re-raise. The log record is already in the kernel --
-/// cortexkit-log writes each line with an unbuffered `write_all` -- so dying by signal loses
-/// nothing the seal logged.
-///
-/// Only this arm re-raises. The serve-return arm ends with the ordinary return from `main`: the
-/// daemon went away or asked us to stop, and exit 0 is the true answer there.
+/// Runs the retention sweeper once the module connection has registered. A stop ends the wait
+/// too: the signal arm joins this task before the process exits, and a SIGTERM during startup
+/// arrives before registration, which then never happens. Waiting on registration alone kept
+/// such a process alive, holding the state-root lock, until something killed it.
+fn spawn_retention_sweep(
+    registry: Arc<LineageRegistry>,
+    ready: Arc<broca_subc::ModuleScopeDescriber>,
+) -> tokio::task::JoinHandle<()> {
+    let stopping = registry.stopping_signal();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = stopping.cancelled() => return,
+            _ = ready.wait_registered() => {}
+        }
+        if registry.run_retention_sweeper().await.is_err() {
+            tracing::warn!(target: "retention", "retention sweep stopped; durable recovery required");
+        }
+    })
+}
+
+#[cfg(test)]
+mod retention_sweep_tests {
+    use super::*;
+    use broca_module::registry::{
+        ActorHandle, LineageKey, LineageOpener, OpenError, RegistryHandle,
+    };
+
+    struct NeverOpen;
+    #[async_trait::async_trait]
+    impl LineageOpener for NeverOpen {
+        /// A session store whose runtime never opens: this opener keeps no sessions.
+        fn store_slot(&self) -> &Arc<broca_module::store_open::StoreSlot> {
+            static SLOT: std::sync::OnceLock<Arc<broca_module::store_open::StoreSlot>> =
+                std::sync::OnceLock::new();
+            SLOT.get_or_init(|| {
+                Arc::new(broca_module::store_open::StoreSlot::awaiting_key(
+                    Path::new("/nonexistent-broca-test-store"),
+                    1,
+                ))
+            })
+        }
+        async fn open(
+            &self,
+            _: &LineageKey,
+            _: u64,
+            _: RegistryHandle,
+        ) -> Result<ActorHandle, OpenError> {
+            panic!("the retention task must not open a session")
+        }
+    }
+
+    /// The module never registers: the stop came first. Joining the task, as the signal arm
+    /// does, must still finish.
+    #[tokio::test]
+    async fn a_stop_before_registration_ends_the_retention_task() {
+        let registry = Arc::new(LineageRegistry::new(Arc::new(NeverOpen)));
+        let unregistered = Arc::new(broca_subc::ModuleScopeDescriber::new());
+        let sweep = spawn_retention_sweep(registry.clone(), unregistered.clone());
+        assert!(registry.stop_and_seal().await);
+        tokio::time::timeout(Duration::from_secs(10), sweep)
+            .await
+            .expect("the retention task kept waiting for a registration after the stop")
+            .unwrap();
+    }
+}
+
 /// ONE BROCA PER STATE ROOT, decided before anything touches the root: the settings gate's copy
 /// of the old settings file, the state-format decision, the stall log, store opens and every
 /// boot recovery step (fence-index rebuild, cut reconcile, crash-orphan seal, System One release)
@@ -1400,7 +1440,7 @@ async fn start_gated(
         }
     } else {
         // A daemon without the gate: the moved file is read as broca read the old one.
-        broca_module_serve::transport_config::validate_default().map_err(ServeIoError)?;
+        broca_module_serve::transport_config::use_file(&user_file).map_err(ServeIoError)?;
         let settings = Settings::read(&user_file).map_err(ServeIoError)?;
         (settings, gate::Gate::ungated(ack.negotiated_ver))
     };
@@ -1425,6 +1465,21 @@ async fn start_gated(
     )))
 }
 
+/// End the process AS IF THE SIGTERM HAD NOT BEEN HANDLED, after the seal has run.
+///
+/// The supervisor's contract (subc, stated 2026-09-23): an unrequested EXIT 0 means "I stopped on
+/// purpose" and is left down, while a death BY SIGNAL is a crash and is respawned. The signal
+/// arm used to end in `exit(0)`, which turned an operator's `kill -TERM` from "respawned" into
+/// "left down" -- the defect callosum and astrocyte both shipped and found the same afternoon.
+/// The seal is the handler's whole job; how the process then ends has to be what the parent would
+/// have seen with no handler at all.
+///
+/// So: restore the default disposition and re-raise. The log record is already in the kernel --
+/// cortexkit-log writes each line with an unbuffered `write_all` -- so dying by signal loses
+/// nothing the seal logged.
+///
+/// Only the signal arm re-raises. The serve-return arm ends with the ordinary return from
+/// `main`: the daemon went away or asked us to stop, and exit 0 is the true answer there.
 fn die_as_signalled() -> ! {
     #[cfg(unix)]
     {
@@ -1435,6 +1490,13 @@ fn die_as_signalled() -> ! {
     std::process::exit(143)
 }
 
+/// The SIGTERM trigger for the seal. Not a backstop: until subc gives modules their own process
+/// groups, it is how every DAEMON CUT reaches broca, because launchd SIGTERMs the daemon's whole
+/// group (measured: 3 of 3 cuts on 2026-09-23 logged this arm). A module restart reaches the
+/// other arm, via `serve` returning.
+///
+/// The non-unix arm below stays pending because SIGTERM has no equivalent there; a module stop
+/// on Windows is the channel-0 GOODBYE, which the serve-return arm handles.
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
     {

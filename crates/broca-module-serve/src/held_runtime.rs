@@ -28,7 +28,7 @@
 //! its exit; planned daemon shutdown instead preserves the provider's obligation.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -152,6 +152,16 @@ impl WithdrawTransport for FeedRoutes {
     ) {
         broca_subc::late_results::withdraw_held_call(&self.conn, call, session_identity).await
     }
+}
+
+/// Each session the registrations name, once, in the order they first name it. A session with
+/// many registered calls appears once per call, so the dedup is a set lookup per call.
+fn distinct_sessions(binds: impl IntoIterator<Item = BindIdentity>) -> Vec<BindIdentity> {
+    let mut seen = HashSet::new();
+    binds
+        .into_iter()
+        .filter(|bind| seen.insert(bind.clone()))
+        .collect()
 }
 
 fn feed_error(error: broca_subc::LateResultsError) -> FeedError {
@@ -386,15 +396,7 @@ impl HeldRuntime {
                 return;
             }
         };
-        let sessions: Vec<BindIdentity> = {
-            let mut sessions: Vec<BindIdentity> = Vec::new();
-            for call in calls {
-                if !sessions.contains(&call.bind) {
-                    sessions.push(call.bind);
-                }
-            }
-            sessions
-        };
+        let sessions = distinct_sessions(calls.into_iter().map(|call| call.bind));
         let (opened, failed) = tokio::select! {
             biased;
             _ = stopping.cancelled() => return,

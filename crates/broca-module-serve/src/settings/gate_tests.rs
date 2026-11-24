@@ -729,3 +729,60 @@ async fn the_frames_the_gate_exchanges_are_what_readers_were_shown() {
         "an unstamped view has no attempt to acknowledge"
     );
 }
+
+thread_local! {
+    /// Runs once, on this thread, right after a changed view's freshness check: it stands in
+    /// for another push's task running while this one waits for the CPU.
+    static AFTER_FRESHNESS_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn after_freshness_check() {
+    if let Some(hook) = AFTER_FRESHNESS_CHECK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Each `config.changed` push runs as its own task. The older view's task loses the CPU right
+/// after it finds its view newer than the one broca runs on, and the newer view is taken
+/// meanwhile: broca must still end on the newer view, its live value and its generation.
+#[test]
+fn an_older_view_never_overwrites_a_newer_one_taken_after_its_freshness_check() {
+    let started = json!({"service_tier": {"enabled": true}});
+    let gate = std::sync::Arc::new(super::Gate {
+        calls: super::Calls::new(subc_protocol::PROTOCOL_VERSION),
+        schema: crate::settings::schema(),
+        applied: std::sync::Mutex::new(Some(super::Applied {
+            effective: started.clone(),
+            generation: 2,
+            attempt: Some(1),
+            started: started.clone(),
+            waiting_restart: Vec::new(),
+            refused_at: None,
+        })),
+    });
+    let mut older = started.clone();
+    older["chatgpt_force_https"] = json!(false);
+    let mut newer = started;
+    newer["chatgpt_force_https"] = json!(true);
+    let older = view(3, 1, older, ConfigStatus::Pending);
+    let newer = view(4, 1, newer, ConfigStatus::Pending);
+    AFTER_FRESHNESS_CHECK.with(|hook| {
+        let gate = gate.clone();
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(matches!(gate.take_in_place(&newer), super::InPlace::Taken));
+        }));
+    });
+    // What the older push makes of its view doesn't matter, only where broca ends.
+    gate.take_in_place(&older);
+    let applied = gate.applied.lock().unwrap();
+    let applied = applied.as_ref().unwrap();
+    assert_eq!(
+        (
+            applied.generation,
+            &applied.effective["chatgpt_force_https"]
+        ),
+        (4, &json!(true)),
+        "an older view overwrote the newer one broca took"
+    );
+}

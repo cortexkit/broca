@@ -405,6 +405,75 @@ async fn plain_restart_candidates_continue_without_a_key_source() {
     assert!(rig.registry.stop_and_seal().await);
 }
 
+/// Every restart's first pass reads every head of the durable class, plain ones included, and
+/// defers the encrypted ones. The pass after the key loads reads only those it deferred: the
+/// plain ones are done, and reading their heads and views again finds nothing new.
+#[tokio::test]
+async fn the_pass_after_the_key_loads_reads_only_the_sessions_the_first_pass_left() {
+    let rig = Rig::new("second-pass").await;
+    let idle = BindIdentity::new(rig.root.join("project"), "recovery", "idle-durable");
+    let durable = StorageClass::Durable.store_root(&rig.root);
+    std::fs::create_dir_all(&durable).unwrap();
+    Session::create(
+        LocalBackend::new(durable),
+        SessionAddr(broca_core::session_addr(&idle)),
+        SessionTriple {
+            project_root: idle.project_root.display().to_string(),
+            harness: idle.harness.clone(),
+            session: idle.session.clone(),
+        },
+        &DeploymentKey::new(1, &[7; 32]).creating(Cipher::None),
+        false,
+    )
+    .await
+    .unwrap();
+    let locked = rig.paused("locked", Cipher::XChaCha20Poly1305).await;
+    // Any process's sweep reaches this observer; the loader's own scope below sees only its
+    // second pass, which runs inside the loader's task (the first runs in a task of its own).
+    let observed = broca_test_support::LogCapture::observe(|event| event.target == "lifecycle");
+    let scoped = broca_test_support::LogCapture::new();
+    let source = Arc::new(DelayedKey {
+        requested: Default::default(),
+        release: Default::default(),
+    });
+    let loader = tokio::spawn(
+        scoped.scope_future(rig.loader(Some(source.clone())).run(rig.registry.clone())),
+    );
+    let sweeps = |logs: &broca_test_support::LogCapture| {
+        logs.events()
+            .iter()
+            .filter(|event| event.message() == "store restart resume candidate sweep complete")
+            .map(|event| {
+                (
+                    event.fields.get("inspected").cloned().unwrap_or_default(),
+                    event.fields.get("deferred").cloned().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = ("1".to_owned(), "1".to_owned());
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
+        while !sweeps(&observed).contains(&first) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first pass read the plain head and deferred the encrypted one");
+    source.release.notify_one();
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, loader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rig.slot.key_loaded());
+    rig.assert_continued_once(&locked).await;
+    assert_eq!(
+        sweeps(&scoped),
+        [("1".to_owned(), "0".to_owned())],
+        "the pass after the key loaded read a session the first pass had finished"
+    );
+    assert!(rig.registry.stop_and_seal().await);
+}
+
 #[tokio::test]
 async fn expired_and_cancelled_restart_candidates_log_their_terminal_outcome() {
     for (name, cancelled, outcome) in [

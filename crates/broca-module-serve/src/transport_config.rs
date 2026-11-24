@@ -1,6 +1,9 @@
 //! Runtime transport policy, deliberately separate from the admitted render configuration.
 use serde::Deserialize;
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Default, Deserialize)]
 struct Config {
@@ -22,12 +25,17 @@ fn load(path: &Path) -> Result<bool, String> {
     Ok(config.chatgpt_force_https)
 }
 
-/// Validate at boot; read again at each attempt so an outage switch takes effect on active runs.
-pub fn validate_default() -> Result<(), String> {
-    match crate::CacheTtlTable::default_path() {
-        crate::config_home::ConfigHome::Resolved { path, .. } => load(&path).map(|_| ()),
-        crate::config_home::ConfigHome::Unresolvable => Ok(()),
-    }
+/// The settings file broca read at boot under a daemon without the settings gate.
+static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Validates `path`, the settings file boot read every other setting from, and makes each attempt
+/// read the switch from it again, so an outage switch takes effect on active runs. The file
+/// must be the same one: boot moves the settings out of broca's old folder, and the copy left
+/// there no longer reaches this build.
+pub fn use_file(path: &Path) -> Result<(), String> {
+    load(path)?;
+    let _ = FILE.set(path.to_owned());
+    Ok(())
 }
 
 /// The value the daemon's settings give `chatgpt_force_https`, once broca runs on them
@@ -43,18 +51,22 @@ pub fn set_managed(force_https: bool) {
 
 /// Invalid edits made after boot fail safe to HTTPS without altering any rendered bytes.
 pub fn default_policy() -> Arc<dyn Fn() -> bool + Send + Sync> {
-    let resolved = crate::CacheTtlTable::default_path();
     Arc::new(move || {
         if let Some(managed) = MANAGED.get() {
             return managed.load(std::sync::atomic::Ordering::Relaxed);
         }
-        match &resolved {
-        crate::config_home::ConfigHome::Resolved { path, .. } => load(path).unwrap_or_else(|error| {
-            tracing::warn!(target: "provider", %error, "invalid runtime transport policy; forcing ChatGPT HTTPS");
-            true
-        }),
-        crate::config_home::ConfigHome::Unresolvable => false,
-    }
+        file_policy()
+    })
+}
+
+/// The switch as the boot settings file now says. With no file recorded, nothing configured it.
+fn file_policy() -> bool {
+    let Some(path) = FILE.get() else {
+        return false;
+    };
+    load(path).unwrap_or_else(|error| {
+        tracing::warn!(target: "provider", %error, "invalid runtime transport policy; forcing ChatGPT HTTPS");
+        true
     })
 }
 
@@ -73,5 +85,23 @@ mod tests {
         assert!(!load(&path).unwrap());
         std::fs::write(&path, r#"{"chatgpt_force_https":"yes"}"#).unwrap();
         assert!(load(&path).is_err());
+    }
+
+    /// Without the settings gate, boot reads `<config home>/cortexkit/broca.jsonc`; the switch
+    /// must come from that file, not from the old copy in `<config home>/cortexkit/broca/`.
+    #[test]
+    fn ungated_https_switch_follows_the_file_boot_read() {
+        let home = broca_test_support::scratch_root()
+            .join(format!("transport-config-boot-file-{}", std::process::id()));
+        let path = home.join("cortexkit/broca.jsonc");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"chatgpt_force_https": true}"#).unwrap();
+        use_file(&path).unwrap();
+        assert!(file_policy(), "the switch set in the boot file was ignored");
+        std::fs::write(&path, "{}").unwrap();
+        assert!(
+            !file_policy(),
+            "an edit to the boot file did not reach the next attempt"
+        );
     }
 }

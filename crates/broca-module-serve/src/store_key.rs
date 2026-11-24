@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_module::store_open::{StoreRuntimeSetup, StoreSlot};
+use broca_records::session_storage::StorageClass;
+use broca_session_store::backend::SessionAddr;
 use broca_session_store::keys::DeploymentKey;
 
 /// The key id the module uses when `broca.jsonc` names none.
@@ -173,7 +175,7 @@ impl KeyLoader {
         // of the durable class, and every encrypted session would wait for that walk to end.
         let first_pass = tokio::spawn({
             let registry = registry.clone();
-            async move { recover_sessions(&registry).await }
+            async move { recover_sessions(&registry, None).await }
         });
         let stop_deferred = || {
             tracing::info!(target: "lifecycle", "store recovery deferred until next startup: module stopping before deployment key recovery");
@@ -237,7 +239,12 @@ impl KeyLoader {
         .await;
         // The first pass always finishes, key or no key: plain sessions need none. The second
         // pass waits for it, so the two never recover one session at once.
-        let deferred = first_pass.await.unwrap_or(true) || !runtime_ready;
+        let deferred = first_pass.await.unwrap_or(Left::Everything);
+        let deferred = if runtime_ready {
+            deferred
+        } else {
+            Left::Everything
+        };
         if !loaded {
             return;
         }
@@ -252,8 +259,14 @@ impl KeyLoader {
             stop_deferred();
             return;
         }
-        if deferred {
-            recover_sessions(&registry).await;
+        match deferred {
+            Left::Nothing => {}
+            Left::Sessions(left) => {
+                recover_sessions(&registry, Some(&left)).await;
+            }
+            Left::Everything => {
+                recover_sessions(&registry, None).await;
+            }
         }
         if refused.is_empty() {
             return;
@@ -278,9 +291,26 @@ impl KeyLoader {
 #[cfg(test)]
 mod recovery_tests;
 
-/// Opens durable recovery candidates, not just sessions refused by commands during key loading.
-async fn recover_sessions(registry: &broca_module::LineageRegistry) -> bool {
-    match registry.recover_store_crash_orphans().await {
+/// What a recovery pass leaves for the pass after the key loads.
+enum Left {
+    Nothing,
+    /// The sessions the pass deferred or failed; it finished every other one.
+    Sessions(Vec<(StorageClass, SessionAddr)>),
+    /// The pass could not list its candidates, so none of them is known to be done.
+    Everything,
+}
+
+/// Opens durable recovery candidates, not just sessions refused by commands during key loading:
+/// every candidate, or with `left` only the sessions an earlier pass left unfinished.
+async fn recover_sessions(
+    registry: &broca_module::LineageRegistry,
+    left: Option<&[(StorageClass, SessionAddr)]>,
+) -> Left {
+    let sweep = match left {
+        Some(left) => registry.recover_store_sessions_left(left).await,
+        None => registry.recover_store_crash_orphans().await,
+    };
+    match sweep {
         Ok(sweep) => {
             let opened_for = sweep
                 .opened_for
@@ -296,11 +326,15 @@ async fn recover_sessions(registry: &broca_module::LineageRegistry) -> bool {
             for error in sweep.failed {
                 tracing::warn!(target: "lifecycle", %error, "could not recover a store session");
             }
-            sweep.deferred != 0
+            if sweep.deferred == 0 {
+                Left::Nothing
+            } else {
+                Left::Sessions(sweep.unfinished)
+            }
         }
         Err(error) => {
             tracing::warn!(target: "lifecycle", %error, "store recovery could not list candidate sessions");
-            true
+            Left::Everything
         }
     }
 }

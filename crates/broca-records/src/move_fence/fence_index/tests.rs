@@ -107,7 +107,12 @@ fn boot_fence_rebuild_fails_closed_when_a_listed_cut_vanishes() {
         Ok(entries)
     });
     assert!(removed);
-    let error = result.unwrap_err();
+    // Boot goes on serving, so the vanished cut is reported rather than raised; the index
+    // stays unready, which keeps write checks scanning the cuts.
+    let (path, error) = result
+        .unwrap()
+        .expect("a vanished cut must leave the index unready");
+    assert_eq!(path, cut);
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert_eq!(
         error.to_string(),

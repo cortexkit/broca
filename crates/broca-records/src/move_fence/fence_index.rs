@@ -81,8 +81,8 @@ fn refs(state: &Value) -> io::Result<Vec<&str>> {
     }
     Ok(result)
 }
-fn publish(state_root: &Path, cut_id: &str, state: &Value) -> io::Result<()> {
-    for reference in refs(state)? {
+fn publish(state_root: &Path, cut_id: &str, refs: &[&str]) -> io::Result<()> {
+    for reference in refs {
         atomic_json(state_root, &root(state_root).join(reference), &cut_id)?;
     }
     Ok(())
@@ -144,25 +144,37 @@ pub(super) fn before<'a>(
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid("invalid cut path"))?
         .to_owned();
-    let keep = refs(&state)?.into_iter().map(str::to_owned).collect();
+    let refs = refs(&state)?;
     // Fence first, intent second. A crash may over-fence, never expose bytes
     // whose activation/release intent is durable but whose fence is missing.
-    publish(state_root, &cut_id, &state)?;
+    publish(state_root, &cut_id, &refs)?;
     Ok(Some(Publication {
         _lock: lock,
         state_root,
-        indexed: Some((cut_id, keep)),
+        indexed: Some((cut_id, refs.into_iter().map(str::to_owned).collect())),
     }))
 }
 
 pub fn rebuild(state_root: &Path) -> io::Result<()> {
+    if let Some((path, error)) = rebuild_for_boot(state_root)? {
+        return Err(io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the cut that could not be read or understood, leaving the index unready so
+/// write checks scan the cuts instead. Errors operating on the index itself are fatal.
+pub fn rebuild_for_boot(state_root: &Path) -> io::Result<Option<(PathBuf, io::Error)>> {
     rebuild_with_read_dir(state_root, |path| fs::read_dir(path))
 }
 
 fn rebuild_with_read_dir(
     state_root: &Path,
     mut read_dir: impl FnMut(&Path) -> io::Result<fs::ReadDir>,
-) -> io::Result<()> {
+) -> io::Result<Option<(PathBuf, io::Error)>> {
     // The lock file's directory must exist before the lock can be taken.
     durable_dir(state_root, &root(state_root))?;
     let _lock = write_lock(state_root)?;
@@ -189,19 +201,31 @@ fn rebuild_with_read_dir(
                 }
                 // A listed cut is fencing authority, so losing it before reading must
                 // fail closed rather than publish an incomplete index.
-                let state: Value = read_json(&path)?
-                    .ok_or_else(|| invalid("cut disappeared during fence initialization"))?;
-                let cut_id = path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| invalid("invalid cut path"))?;
-                publish(state_root, cut_id, &state)?;
+                let state: Value = match read_json(&path) {
+                    Ok(Some(state)) => state,
+                    Ok(None) => {
+                        return Ok(Some((
+                            path,
+                            invalid("cut disappeared during fence initialization"),
+                        )))
+                    }
+                    Err(error) => return Ok(Some((path, error))),
+                };
+                let Some(cut_id) = path.file_stem().and_then(|name| name.to_str()) else {
+                    return Ok(Some((path, invalid("invalid cut path"))));
+                };
+                let refs = match refs(&state) {
+                    Ok(refs) => refs,
+                    Err(error) => return Ok(Some((path, error))),
+                };
+                publish(state_root, cut_id, &refs)?;
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    atomic_json(state_root, &ready(state_root), &true)
+    atomic_json(state_root, &ready(state_root), &true)?;
+    Ok(None)
 }
 
 fn listed_boot_entry(

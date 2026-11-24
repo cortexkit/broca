@@ -317,13 +317,23 @@ async fn boot_error_names_its_step_when_the_state_root_is_missing() {
 }
 
 #[tokio::test]
-async fn boot_error_names_fence_rebuild_when_a_cut_is_unreadable() {
+async fn boot_serves_reads_but_fences_writes_when_a_cut_is_unreadable() {
     let rig = Rig::new("boot-unreadable-cut", Arc::new(FakeDoor::default())).await;
+    let session = BindIdentity::new("broca-unscoped-v1", "broca", "healthy");
+    rig.seed(&session, true).await;
+    // A restart must discard an existing ready marker rather than trust a stale fence index.
+    broca_records::move_fence::rebuild_fence_index(&rig.root).unwrap();
     let cuts = rig.root.join("agent-data/cuts");
     std::fs::create_dir_all(&cuts).unwrap();
-    std::fs::write(cuts.join("broken.json"), b"not json").unwrap();
-    let error = rig.service.reconcile_boot().await.unwrap_err();
-    assert!(error.message.starts_with("rebuild_fence_index: "));
+    let damaged = cuts.join(format!("{CUT}.json"));
+    std::fs::write(&damaged, b"not json").unwrap();
+
+    rig.service.reconcile_boot().await.unwrap();
+    assert_eq!(std::fs::read(damaged).unwrap(), b"not json");
+    assert!(rig.registry.check_move(&session, true).is_err());
+    let mut reader = Wire::new(&rig, Value::Null, false).await;
+    reader.bind_session(&session).await;
+    assert!(reader.management("session.read", json!({})).await.is_ok());
 }
 
 #[tokio::test]

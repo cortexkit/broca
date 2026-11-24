@@ -82,6 +82,17 @@ fn registration(key: String, bind: &BindIdentity) -> LateResultRegistration {
     }
 }
 
+/// Boot recovery opens each registered session once, in the order its first call was
+/// registered, however many of its calls are registered.
+#[test]
+fn recovery_opens_each_registered_session_once_in_first_seen_order() {
+    let a = BindIdentity::new("/project", "runner", "a");
+    let b = BindIdentity::new("/project", "runner", "b");
+    let c = BindIdentity::new("/project", "runner", "c");
+    let binds = [&b, &a, &b, &c, &a, &b].map(Clone::clone);
+    assert_eq!(distinct_sessions(binds), vec![b, a, c]);
+}
+
 #[tokio::test]
 async fn large_stale_outbox_does_not_delay_held_result_intake() {
     let root = broca_test_support::scratch_root().join("held-runtime-pullers-first");

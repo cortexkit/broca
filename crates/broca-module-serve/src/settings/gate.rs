@@ -209,6 +209,16 @@ pub enum GateStart {
     Stopped(crate::ServeEnd),
 }
 
+/// What [`Gate::take_in_place`] did with a changed view.
+enum InPlace {
+    /// broca already runs on this view or a newer one.
+    Stale,
+    /// A field read at start changed: the view waits for the restart the daemon makes.
+    WaitsForRestart,
+    /// The view's in-place fields are live, and broca runs on its generation.
+    Taken,
+}
+
 /// Why broca can't start yet, as a probe reports it.
 #[derive(Clone, Debug, PartialEq)]
 enum Waiting {
@@ -545,34 +555,49 @@ impl Gate {
             self.apply_unstamped(view);
             return Ok(());
         }
-        let restart = {
-            let applied = self.applied.lock().unwrap();
-            let Some(applied) = applied
-                .as_ref()
-                .filter(|applied| view.generation > applied.generation)
-            else {
+        match self.take_in_place(&view) {
+            InPlace::Stale => return Ok(()),
+            InPlace::WaitsForRestart => {
+                // The daemon restarts broca once it approves this view; the new process reads it.
+                tracing::info!(target: "config", generation = view.generation,
+                    "the changed settings take effect at broca's next start");
                 return Ok(());
-            };
-            restart_fields_differ(self.schema, &applied.effective, &view.effective)
-        };
-        if restart {
-            // The daemon restarts broca once it approves this view; the new process reads it.
-            tracing::info!(target: "config", generation = view.generation,
-                "the changed settings take effect at broca's next start");
-            return Ok(());
-        }
-        crate::transport_config::set_managed(force_https(&view.effective));
-        if let Some(applied) = self.applied.lock().unwrap().as_mut() {
-            applied.effective = view.effective.clone();
-            applied.generation = view.generation;
-            applied.attempt = view.attempt;
-            applied.refused_at = None;
+            }
+            InPlace::Taken => {}
         }
         if let Some(attempt) = view.attempt {
             self.acknowledge(view.generation, attempt).await?;
         }
         tracing::info!(target: "config", generation = view.generation, "applied changed settings in place");
         Ok(())
+    }
+
+    /// Takes a stamped `view` when it is newer than the one broca runs on and changes only fields
+    /// applied in place. Each `config.changed` push runs as its own task, so two pushes can both
+    /// pass the freshness check; checking and installing under one hold of the lock keeps an older
+    /// view from overwriting a newer one's live value or generation.
+    fn take_in_place(&self, view: &ConfigView) -> InPlace {
+        let taken = {
+            let mut applied = self.applied.lock().unwrap();
+            let Some(applied) = applied
+                .as_mut()
+                .filter(|applied| view.generation > applied.generation)
+            else {
+                return InPlace::Stale;
+            };
+            if restart_fields_differ(self.schema, &applied.effective, &view.effective) {
+                return InPlace::WaitsForRestart;
+            }
+            crate::transport_config::set_managed(force_https(&view.effective));
+            applied.effective = view.effective.clone();
+            applied.generation = view.generation;
+            applied.attempt = view.attempt;
+            applied.refused_at = None;
+            InPlace::Taken
+        };
+        #[cfg(test)]
+        tests::after_freshness_check();
+        taken
     }
 
     /// Takes an unstamped view (generation 0, no attempt): applies its in-place fields when its

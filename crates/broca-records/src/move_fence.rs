@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 mod fence_index;
 use crate::fs_ops as fs;
-pub use fence_index::rebuild as rebuild_fence_index;
+pub use fence_index::{
+    rebuild as rebuild_fence_index, rebuild_for_boot as rebuild_fence_index_for_boot,
+};
 use std::{
     io,
     io::Write,

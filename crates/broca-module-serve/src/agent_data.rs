@@ -152,8 +152,13 @@ impl AgentDataService {
     }
 
     pub async fn reconcile_boot(&self) -> Result<(), ErrorBody> {
-        broca_records::move_fence::rebuild_fence_index(&self.root)
-            .map_err(|error| unavailable(format!("rebuild_fence_index: {error}")))?;
+        if let Some((path, error)) =
+            broca_records::move_fence::rebuild_fence_index_for_boot(&self.root)
+                .map_err(|error| unavailable(format!("rebuild_fence_index: {error}")))?
+        {
+            tracing::error!(cut = %path.display(), %error,
+                "cut fence index is not ready; write checks will scan the cut files");
+        }
         self.cuts
             .reconcile_boot(&self.artifacts)
             .await
