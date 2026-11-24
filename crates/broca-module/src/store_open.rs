@@ -72,6 +72,8 @@ pub struct StoreRuntime {
     settled: Arc<crate::store_status::SettledRuns>,
     /// Views of sessions no actor holds, kept by position (see `store_reads`).
     views: crate::store_reads::ViewCache<crate::store_read::StoredView<LocalBackend>>,
+    /// Heads of sessions no actor holds, kept by position (see `store_head::KeptHeads`).
+    heads: crate::store_head::KeptHeads,
     /// Where each session's run events go once their records are durable; none in tests and
     /// while run events are off.
     run_events: Option<Arc<dyn crate::store_run_events::RunEventSink>>,
@@ -174,6 +176,7 @@ impl StoreRuntime {
                 crate::store_reads::ViewCache::MAX_ENTRIES,
                 crate::store_reads::ViewCache::MAX_BYTES,
             ),
+            heads: Default::default(),
             #[cfg(all(test, feature = "test-clock"))]
             log_reads: Arc::default(),
             #[cfg(all(test, feature = "test-clock"))]
@@ -561,6 +564,34 @@ impl StoreRuntime {
             Err(SessionError::Missing) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// The heads kept for sessions no actor holds.
+    pub(crate) fn heads(&self) -> &crate::store_head::KeptHeads {
+        &self.heads
+    }
+
+    /// Where the session `key` stands now, when no actor holds it and it is kept outside the
+    /// ephemeral root: the position a kept head is matched against, read from the session's head
+    /// and its open log's length alone. `None` otherwise, and for anything this cheap read can't
+    /// settle (a session moving, moved or needing a recovery), which the full read answers. An
+    /// ephemeral session is left out because whether it has expired is read from its whole view.
+    pub(crate) async fn closed_position(
+        &self,
+        registry: &crate::LineageRegistry,
+        key: &BindIdentity,
+    ) -> Option<Position> {
+        if registry.open_handle(key).is_some() {
+            return None;
+        }
+        let class = self.class_of(key).ok()??;
+        if class == StorageClass::Ephemeral {
+            return None;
+        }
+        let addr = SessionAddr(broca_core::session_addr(key));
+        Session::stored_position(&self.backend(class), &addr, self.deployment())
+            .await
+            .ok()?
     }
 
     /// The session `key`, kept in the root of `class`, as it stood at `position`: the kept view,

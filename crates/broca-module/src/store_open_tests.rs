@@ -223,6 +223,66 @@ async fn cached_closed_pages_read_the_log_once() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A closed session's head is kept by the position it was built at: asking again reads no log,
+/// even when the session's view is too large to keep, as apps watching a closed chat ask for its
+/// head every 30 seconds. A write moves the session, and its head is built again.
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn a_closed_sessions_head_reads_its_log_once_per_position() {
+    use crate::serve::ServeHandler;
+    use broca_session_store::record::Record;
+    use std::sync::atomic::Ordering;
+    // No view fits the cache, so only a kept head can spare a read.
+    let (root, runtime, registry, key) = closed_read_fixture("kept-heads", 1).await;
+    let scope = broca_protocol::SendScope::default();
+    runtime.log_reads.store(0, Ordering::Relaxed);
+    let first = registry.head_for(&key, None, &scope).await.unwrap();
+    let read = runtime.log_reads.load(Ordering::Relaxed);
+    assert!(read > 0, "the first head reads the log");
+    assert_eq!(registry.head_for(&key, None, &scope).await.unwrap(), first);
+    assert_eq!(
+        runtime.log_reads.load(Ordering::Relaxed),
+        read,
+        "a repeat at the same position reads no log"
+    );
+
+    let mut session = Session::load(
+        LocalBackend::new(StorageClass::Ordinary.store_root(&root)),
+        SessionAddr(broca_core::session_addr(&key)),
+        &triple(&key),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let records = session.open_log_records().await.unwrap();
+    let last = |pick: fn(&Record) -> Option<Record>| {
+        records
+            .iter()
+            .rev()
+            .find_map(|(_, record)| pick(record))
+            .unwrap()
+    };
+    let (Record::RunStart(mut start), Record::RunEnd(mut end)) = (
+        last(|record| matches!(record, Record::RunStart(_)).then(|| record.clone())),
+        last(|record| matches!(record, Record::RunEnd(_)).then(|| record.clone())),
+    ) else {
+        unreachable!()
+    };
+    start.run_id = "later".into();
+    end.run_id = "later".into();
+    session
+        .append(&[Record::RunStart(start), Record::RunEnd(end)], true)
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+    let moved = registry.head_for(&key, None, &scope).await.unwrap();
+    assert_eq!(moved.last_run_state.unwrap().run_id, "later");
+    assert!(runtime.log_reads.load(Ordering::Relaxed) > read);
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn stored_read_future_stays_small() {

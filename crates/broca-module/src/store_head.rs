@@ -93,6 +93,7 @@ pub enum StoreHeadError {
 }
 
 /// A session's head as the session alone decides it.
+#[derive(Clone)]
 pub struct StoreHead {
     /// The reply, without what only the serving module knows: `input` (see [`Self::input`]),
     /// `cache`, and `sender`, which depends on the caller (see [`Self::sender`]).
@@ -389,12 +390,27 @@ pub(crate) async fn serve_head(
     scope: &SendScope,
 ) -> Result<broca_wire::HeadResponse, crate::serve::ServeError> {
     use crate::store_reads::{StoreReadReply, StoreReadRequest};
-    let built = match store.read(registry, key, StoreReadRequest::Head).await? {
-        Some(StoreReadReply::Head(built)) => built?,
-        Some(_) => return Err(crate::store_reads::mismatched()),
-        // The session's creation never committed, so it holds nothing: this is the answer for a
-        // session never written.
-        None => return Ok(broca_wire::HeadResponse::default()),
+    let addr = broca_core::session_addr(key);
+    let closed = store.closed_position(registry, key).await;
+    let built = match closed.and_then(|position| store.heads().get(&addr, position)) {
+        Some(built) => built,
+        None => {
+            let built = match store.read(registry, key, StoreReadRequest::Head).await? {
+                Some(StoreReadReply::Head(built)) => *built?,
+                Some(_) => return Err(crate::store_reads::mismatched()),
+                // The session's creation never committed, so it holds nothing: this is the
+                // answer for a session never written.
+                None => return Ok(broca_wire::HeadResponse::default()),
+            };
+            // Kept only when the session is still where it was before the read, so the head
+            // is the one that position holds, built from the session as stored.
+            if let Some(position) = closed {
+                if store.closed_position(registry, key).await == Some(position) {
+                    store.heads().keep(addr, position, &built);
+                }
+            }
+            built
+        }
     };
     let sender = built.sender(principal, scope);
     let mut reply = built.reply;
@@ -414,6 +430,76 @@ pub(crate) async fn serve_head(
             expiry_basis: broca_wire::EXPIRY_BASIS_ESTIMATED.into(),
         });
     Ok(reply)
+}
+
+/// The heads of sessions no actor holds, by session address, each with the position it was built
+/// at. A session left at a position keeps the same head, and apps ask for the heads of the same
+/// closed sessions again and again, while building one loads the session's whole view, a full
+/// read of its log: after one restart, every closed-session view broca loaded was for a head, 142
+/// MB of them kept. So the head is kept instead. Only a head that stays true while the session
+/// stays put is kept: one whose latest run has ended and waits on nothing, or that has no run (a
+/// running or paused run's head reports waits that change with time). At most [`HEADS_KEPT`]
+/// sessions, the oldest forgotten first.
+#[derive(Default)]
+pub(crate) struct KeptHeads(std::sync::Mutex<KeptHeadsInner>);
+
+const HEADS_KEPT: usize = 4096;
+
+#[derive(Default)]
+struct KeptHeadsInner {
+    heads: std::collections::HashMap<String, (broca_session_store::session::Position, StoreHead)>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl KeptHeads {
+    fn lock(&self) -> std::sync::MutexGuard<'_, KeptHeadsInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The head kept for the session at `addr`, when it was built at `position`.
+    pub(crate) fn get(
+        &self,
+        addr: &str,
+        position: broca_session_store::session::Position,
+    ) -> Option<StoreHead> {
+        self.lock()
+            .heads
+            .get(addr)
+            .filter(|(at, _)| *at == position)
+            .map(|(_, head)| head.clone())
+    }
+
+    /// Keeps `head`, built at `position` for the session at `addr`, when no clock changes it.
+    pub(crate) fn keep(
+        &self,
+        addr: String,
+        position: broca_session_store::session::Position,
+        head: &StoreHead,
+    ) {
+        let settled = head.reply.last_run_state.as_ref().is_none_or(|last| {
+            last.awaits.is_none()
+                && last.resume_not_before_ms.is_none()
+                && !matches!(last.state.as_str(), "active" | "paused")
+        });
+        if !settled {
+            return;
+        }
+        let mut kept = self.lock();
+        if kept
+            .heads
+            .insert(addr.clone(), (position, head.clone()))
+            .is_none()
+        {
+            kept.order.push_back(addr);
+        }
+        while kept.order.len() > HEADS_KEPT {
+            if let Some(oldest) = kept.order.pop_front() {
+                kept.heads.remove(&oldest);
+            }
+        }
+    }
 }
 
 /// A head that couldn't be built. Only a backend failure is worth a retry: anything else is the
