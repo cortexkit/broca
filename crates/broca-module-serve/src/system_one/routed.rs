@@ -30,6 +30,22 @@ use super::{
 use crate::account_routing::{self, Candidates, RoutingCallError, RoutingClient};
 use crate::llm_tools::spend::MarkedItemError;
 
+/// The routing consumer every classifier caller's name hangs under. Routing matches a dotted
+/// name to its nearest configured entry, so settings on this root cover every caller.
+pub const CONSUMER_ROOT: &str = "broca.classifier";
+
+/// The routing consumer for a `classify.run` from `principal`: the module the daemon stamped on
+/// the route's bind, or `direct` for a direct opener. Never anything the request body says, so a
+/// caller can't ask for another caller's routing policy.
+pub fn consumer_for(principal: Option<&broca_protocol::BindPrincipal>) -> String {
+    match principal {
+        Some(broca_protocol::BindPrincipal::Reserved { module_id }) => {
+            format!("{CONSUMER_ROOT}.{module_id}")
+        }
+        _ => format!("{CONSUMER_ROOT}.direct"),
+    }
+}
+
 pub struct Routing {
     pub client: Arc<RoutingClient>,
     pub credentials: Arc<dyn RoutingCredentials>,
@@ -367,8 +383,10 @@ impl SystemOne {
             .classifier_describe()
             .await
             .map_err(|error| routing_error(error, pin, (self.clock)().max(0) as u64))?;
-        if describe.consumer("classifier").is_none() {
-            return Err(unavailable("routing does not serve consumer classifier"));
+        if describe.consumer(CONSUMER_ROOT).is_none() {
+            return Err(unavailable(format!(
+                "routing does not serve consumer {CONSUMER_ROOT}"
+            )));
         }
         Ok(describe)
     }
@@ -430,13 +448,14 @@ async fn select(
     service: &SystemOne,
     request: &ClassifyRequest,
     estimates: &[Estimate],
+    consumer: &str,
 ) -> Result<Choice, Error> {
     let describe = service.routing_ready(request.model.as_deref()).await?;
     let routing = service
         .routing
         .as_ref()
         .expect("readiness checked configuration");
-    let mut query = SelectRequest::new("classifier", requirements(request, estimates, &describe))
+    let mut query = SelectRequest::new(consumer, requirements(request, estimates, &describe))
         .with_runners(vec![routing.module_id.clone()]);
     if let Some(pin) = &request.model {
         query = query.with_pin(pin);
@@ -1296,6 +1315,7 @@ pub(super) async fn run(
     scope: &BatchScope,
     admitted_at_ms: Option<i64>,
     prepared: &super::images::PreparedImages,
+    consumer: &str,
 ) -> Result<Option<Box<RawValue>>, Error> {
     cortexkit_role_classifier::request::check_request_bytes(
         params.len(),
@@ -1501,6 +1521,7 @@ pub(super) async fn run(
                 .or(ceiling),
             stored.as_ref().map_or(0, |record| record.spent_nanos),
             prepared,
+            consumer,
         )
         .await;
         if answer.is_err() && (fresh || unadmitted) && journal.runs.is_empty() && journal.outbox.iter().all(|rpc| rpc.closed)
@@ -1778,6 +1799,7 @@ async fn dispatch(
     ceiling: Option<u64>,
     mut spent: u64,
     prepared: &super::images::PreparedImages,
+    consumer: &str,
 ) -> Result<Box<RawValue>, Error> {
     let raw: RawParams<'_> = serde_json::from_str(params)
         .map_err(|_| Refusal::invalid_params("params", "request did not decode"))?;
@@ -1796,7 +1818,7 @@ async fn dispatch(
         None => match journal.selected.clone() {
             Some(choice) => choice,
             None => {
-                let choice = select(service, request, &estimates).await?;
+                let choice = select(service, request, &estimates, consumer).await?;
                 journal.selected = Some(choice.clone());
                 // Persist a newly selected model's validation refusal and its report
                 // together, never a replayable body waiting to be refused after a crash.
@@ -1843,7 +1865,7 @@ async fn dispatch(
             .as_ref()
             .and_then(|selection| selection.choice.clone())
     } else if reselection_due(journal, any_answer) {
-        Some(reselect(service, request, &estimates, journal).await?)
+        Some(reselect(service, request, &estimates, journal, consumer).await?)
     } else {
         None
     };
@@ -2125,7 +2147,7 @@ async fn dispatch(
         )
         .await?;
         if should_reselect {
-            let selected = reselect(service, request, &estimates, journal).await?;
+            let selected = reselect(service, request, &estimates, journal, consumer).await?;
             previous_choice = Some(choice);
             choice = selected;
             continue;
@@ -2179,10 +2201,11 @@ async fn reselect(
     request: &ClassifyRequest,
     estimates: &[Estimate],
     journal: &mut Journal,
+    consumer: &str,
 ) -> Result<Choice, Error> {
     journal.reselection = Some(Reselection::default());
     save(service, &request.batch_id, journal).await?;
-    match select(service, request, estimates).await {
+    match select(service, request, estimates, consumer).await {
         Ok(choice) => {
             journal.reselected = true;
             journal

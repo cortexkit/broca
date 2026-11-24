@@ -89,7 +89,7 @@ impl Router {
     fn new(run_reports: bool, fields: bool) -> Arc<Self> {
         let mut describe = RoleDescribe::new(
             vec![ConsumerEntry {
-                id: "classifier".into(),
+                id: "broca.classifier".into(),
                 priced_only: true,
             }],
             false,
@@ -1172,6 +1172,45 @@ async fn audit_recovery_runs_at_boot_and_interval_and_skips_corrupt_batch() {
     worker.await.unwrap();
 }
 
+/// A `classify.run` on a route asks routing as the module the daemon stamped on that route's
+/// bind, under `broca.classifier`, whatever the request body says.
+#[tokio::test]
+async fn a_routed_call_asks_routing_as_its_route_caller() {
+    let rig = routed_rig(true, true);
+    rig.provider
+        .script("first", vec![Script::Answer(answered(Some(10)))]);
+    let basal = broca_protocol::BindPrincipal::Reserved {
+        module_id: "basal".into(),
+    };
+    let flow = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+        scope: broca_protocol::SessionScope {
+            owner: basal.clone(),
+            agent_id_frozen: false,
+            scope_ref: "flow-scope".into(),
+            scope_epoch: 1,
+            flow_id: Some("flow-1".into()),
+            sender: None,
+            agent_id: None,
+            run_id: None,
+        },
+        owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+    });
+    let params: Value = serde_json::from_str(&routed_request(&["first"])).unwrap();
+    let body = serde_json::to_vec(&json!({"method": "classify.run", "params": params})).unwrap();
+    rig.service
+        .clone()
+        .answer(&body, Some(&basal), &flow)
+        .await
+        .unwrap_or_else(|body| panic!("{}", String::from_utf8_lossy(&body)));
+    assert_eq!(
+        rig.router.bodies("route.select")[0]["consumer"],
+        "broca.classifier.basal"
+    );
+}
+
 #[tokio::test]
 async fn routed_batch_freezes_requirements_account_and_replays_bytes() {
     let rig = routed_rig(true, true);
@@ -1189,7 +1228,7 @@ async fn routed_batch_freezes_requirements_account_and_replays_bytes() {
     let schema = r#"{"q":{"type":"noul","instructions":"true?"}}"#.len() as u64;
     assert_eq!(
         select,
-        &json!({"consumer":"classifier","requirements":{"iq":0,"context_window":512+schema+8,"questions":1,"input_tokens":2*(512+schema)+7+8,"max_cost_usd":1.0},"runners":["broca"]})
+        &json!({"consumer":"broca.classifier.direct","requirements":{"iq":0,"context_window":512+schema+8,"questions":1,"input_tokens":2*(512+schema)+7+8,"max_cost_usd":1.0},"runners":["broca"]})
     );
     let accounts = rig.router.bodies("route.account_for");
     assert_eq!(accounts[0]["decision_id"], "decision-0");

@@ -389,11 +389,13 @@ impl SystemOne {
         scope: broca_store::system_one::BatchScope,
         admitted_at_ms: Option<i64>,
     ) -> Result<Box<RawValue>, Vec<u8>> {
+        // An in-process caller has no route, so routing sees it as a direct opener.
         self.spawn_call_with_images(
             params,
             scope,
             admitted_at_ms,
             images::PreparedImages::default(),
+            routed::consumer_for(None),
         )
         .await
     }
@@ -846,8 +848,14 @@ impl SystemOne {
                     .prepare_images(params, send, stored.as_ref())
                     .await
                     .map_err(|e| refusal_body(&e))?;
-                self.spawn_call_with_images(params.to_owned(), scope, None, images)
-                    .await
+                self.spawn_call_with_images(
+                    params.to_owned(),
+                    scope,
+                    None,
+                    images,
+                    routed::consumer_for(principal),
+                )
+                .await
             }
             other => Err(error_body(
                 "unknown_method",
@@ -862,6 +870,7 @@ impl SystemOne {
         scope: broca_store::system_one::BatchScope,
         admitted_at_ms: Option<i64>,
         images: images::PreparedImages,
+        consumer: String,
     ) -> Result<Box<RawValue>, Vec<u8>> {
         // Raised here and lowered by the task itself, so a caller that stops waiting (its
         // route closed) does not hide a call that is still running.
@@ -873,9 +882,16 @@ impl SystemOne {
             let _lowered = lowered;
             let _slot = Arc::clone(&service.call_slots).acquire_owned().await;
             if service.config.routed_models && service.role == STORE_ROLE {
-                if let Some(reply) = routed::run(&service, &params, &scope, admitted_at_ms, &images)
-                    .await
-                    .map_err(routed::Error::bytes)?
+                if let Some(reply) = routed::run(
+                    &service,
+                    &params,
+                    &scope,
+                    admitted_at_ms,
+                    &images,
+                    &consumer,
+                )
+                .await
+                .map_err(routed::Error::bytes)?
                 {
                     return Ok(reply);
                 }

@@ -22,7 +22,7 @@ fn now() -> u64 {
 fn describe() -> RoleDescribe {
     let mut describe = RoleDescribe::new(
         vec![ConsumerEntry {
-            id: "classifier".into(),
+            id: "broca.classifier".into(),
             priced_only: true,
         }],
         false,
@@ -193,7 +193,12 @@ impl State {
                     &describe().capabilities,
                 )
                 .unwrap();
-                assert_eq!(query.consumer, "classifier");
+                // The rig's route caller, under broca's classifier consumer root.
+                assert!(
+                    query.consumer.starts_with("broca.classifier."),
+                    "{}",
+                    query.consumer
+                );
                 assert_eq!(
                     query.runners.as_deref(),
                     Some(["broca".to_owned()].as_slice())
@@ -622,7 +627,7 @@ mod tests {
         call(
             state,
             "route.select",
-            json!({"consumer":"classifier","requirements":{"iq":0},"runners":["broca"],"pin":JEV}),
+            json!({"consumer":"broca.classifier.direct","requirements":{"iq":0},"runners":["broca"],"pin":JEV}),
         );
         call(
             state,
@@ -693,7 +698,7 @@ mod tests {
         call(
             &state,
             "route.select",
-            json!({"consumer":"classifier","requirements":{"iq":0},"runners":["broca"],"pin":JEV}),
+            json!({"consumer":"broca.classifier.direct","requirements":{"iq":0},"runners":["broca"],"pin":JEV}),
         );
         let answer = call(
             &state,
@@ -781,7 +786,7 @@ mod tests {
             RoutingRefusalFixture::new("account_hold", "held").with_detail(json!({"until_ms":123}));
         let state = Arc::new(scripted_state());
         state.admission_refusal(refusal.clone());
-        let reply = state.request(json!({"method":"route.select","params":{"consumer":"classifier","requirements":{"iq":0},"runners":["broca"]}}));
+        let reply = state.request(json!({"method":"route.select","params":{"consumer":"broca.classifier.direct","requirements":{"iq":0},"runners":["broca"]}}));
         let FixtureReply::Refused(answer) = reply else {
             panic!("hook did not refuse");
         };
