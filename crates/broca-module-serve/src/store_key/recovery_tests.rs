@@ -289,6 +289,31 @@ async fn encrypted_startup_sweep_defers_without_failures() {
     assert!(rig.registry.stop_and_seal().await);
 }
 
+/// Boot recovery of held calls opens registered sessions before the key loads. An encrypted one
+/// is refused with the error `is_key_unavailable` recognises, so the recovery defers it to the key
+/// loader instead of warning that it could not be opened.
+#[tokio::test]
+async fn a_registered_session_opened_before_the_key_reads_as_waiting_for_it() {
+    let rig = Rig::new("registered").await;
+    let encrypted = rig.paused("encrypted", Cipher::XChaCha20Poly1305).await;
+    let (opened, failed) = rig
+        .registry
+        .open_registered_sessions(vec![encrypted.clone()], 2)
+        .await;
+    assert_eq!(opened, 0);
+    assert_eq!(failed.len(), 1);
+    assert!(
+        broca_module::store_open::is_key_unavailable(&failed[0].1),
+        "{:?}",
+        failed[0].1
+    );
+    assert!(!broca_module::store_open::is_key_unavailable(
+        &broca_module::registry::OpenError::UnknownSession
+    ));
+    assert_eq!(rig.slot.take_refused(), vec![encrypted]);
+    assert!(rig.registry.stop_and_seal().await);
+}
+
 #[tokio::test]
 async fn delayed_key_continues_all_restart_candidates_once_and_logs_each_run() {
     let rig = Rig::new("delayed").await;

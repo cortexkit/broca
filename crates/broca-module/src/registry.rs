@@ -2851,20 +2851,16 @@ impl LineageRegistry {
         &self,
         sessions: Vec<LineageKey>,
         concurrency: usize,
-    ) -> (usize, Vec<(LineageKey, String)>) {
+    ) -> (usize, Vec<(LineageKey, OpenError)>) {
         use futures::stream::{self, StreamExt};
         let mut seen = HashSet::new();
         let sessions: Vec<LineageKey> = sessions
             .into_iter()
             .filter(|session| seen.insert(session.clone()))
             .collect();
-        let outcomes: Vec<(LineageKey, Result<(), String>)> = stream::iter(sessions)
+        let outcomes: Vec<(LineageKey, Result<(), OpenError>)> = stream::iter(sessions)
             .map(|session| async move {
-                let opened = self
-                    .actor_for(&session)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string());
+                let opened = self.actor_for(&session).await.map(|_| ());
                 (session, opened)
             })
             .buffer_unordered(concurrency.max(1))

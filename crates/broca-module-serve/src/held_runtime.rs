@@ -401,21 +401,13 @@ impl HeldRuntime {
             opened = registry.open_registered_sessions(sessions, RECOVERY_CONCURRENCY) => opened,
         };
         // This recovery runs before the deployment key has loaded (it takes a few seconds after a
-        // start), so an encrypted session is refused here. That refusal is expected and not a
-        // loss: the store slot remembers every session refused for want of the key, and the key
-        // loader opens them all once it loads. Only the other failures are warnings. A key that
-        // loads between the refusal and this check makes one expected refusal read as a
-        // warning; the key loader still opens that session.
-        let runtime = registry.store_runtime();
-        let waits_for_key = |session: &BindIdentity| {
-            runtime.as_ref().is_some_and(|runtime| {
-                runtime.holds(session).unwrap_or(false)
-                    && !runtime.readable_now(session).unwrap_or(true)
-            })
-        };
+        // start), so an encrypted session is refused `key_unavailable` here. That refusal is
+        // expected and not a loss: the session store's slot (`StoreSlot`) records every session
+        // it refuses that way, and the key loader opens them all once the key loads. Only the
+        // other failures are warnings.
         let (after_key, failed): (Vec<_>, Vec<_>) = failed
             .into_iter()
-            .partition(|(session, _)| waits_for_key(session));
+            .partition(|(_, error)| broca_module::store_open::is_key_unavailable(error));
         for (session, error) in &failed {
             tracing::warn!(target: "late_results", session = %session.session, "late-results recovery could not open a registered session: {error}");
         }

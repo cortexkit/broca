@@ -1258,6 +1258,18 @@ pub fn key_unavailable(key_id: u16) -> OpenError {
     }
 }
 
+/// Whether `error` is the [`key_unavailable`] refusal. [`StoreSlot::holding`] records every
+/// session it refuses this way, and the key loader opens them all once the key loads
+/// ([`StoreSlot::take_refused`]), so a caller that opens sessions early (boot recovery) can
+/// treat it as deferred rather than failed.
+pub fn is_key_unavailable(error: &OpenError) -> bool {
+    matches!(
+        error,
+        OpenError::Classified { reason, class: broca_protocol::ErrorClass::Transient }
+            if reason.starts_with("key_unavailable:")
+    )
+}
+
 /// The refusal of a session whose head is in two of the session store's roots: damage, which an
 /// operator must look at, so it is permanent and never served from either root.
 fn session_in_two_classes(
