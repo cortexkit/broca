@@ -46,12 +46,16 @@ refused call gets an error result and is never dispatched. A dispatched call end
 | Completed | the tool's result | no | continues |
 | Not sent: the call never left the process | an error result naming why | no | continues |
 | Sent, outcome unknown | an error result saying the outcome is unknown | never | stops `Interrupted` |
-| Scoped route closed before the call was sent | an error result saying it was not run | no | stops `Interrupted` |
+| Scoped route closed when its batch opened | every call gets a `route_drained` error result saying it was not run | no | stops `Interrupted` |
+| Scoped route closed after its batch opened, before the call was sent | a `route_drained` error result saying it was not run; the call is refused | no | continues |
 | Scoped route closed after the call was sent | an error result saying the outcome is unknown | never | stops `Interrupted` |
 
 A scoped route is one the daemon opened under a scope (an agent's identity and epoch); it closes
-when that scope ends. A cancel that arrives while a call is in doubt ends the run `Cancelled`
-instead.
+when that scope ends. A call whose route closed before it was sent was definitely not run, so, as
+llm-runner's contract has it, it is refused like a denied call: `run.tool_calls` lists it as
+`refused`, and the model sees the refusal and may go on. Only a scope found closed as the batch
+opens stops the run, before any of its calls is sent. A cancel that arrives while a call is in
+doubt ends the run `Cancelled` instead.
 
 In a parallel batch, once one call's outcome is unknown, no later call of the batch is sent: each
 gets a not-run result. Calls already in flight finish.

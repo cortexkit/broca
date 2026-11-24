@@ -103,3 +103,28 @@ pub(super) fn with_plan_notes<W: Writer>(writer: &W, opts: CallOptions) -> CallO
     });
     broca_core::plan_notes::view(&opts, notes).unwrap_or(opts)
 }
+
+/// `opts` as the model sees it once a plan refresh applied: the system text of the plan the run
+/// froze in place of the session's original system message (`durable_system`), as a view of the
+/// request only. A session on the current compaction contract renders its system text from its
+/// entries instead. A step's live request and its offline rebuild both take it from here, so a
+/// rebuilt request matches the bytes the step sent.
+pub(super) fn with_plan_system<W: Writer>(
+    writer: &W,
+    admission: &Admission,
+    durable_system: &[Message],
+    opts: CallOptions,
+) -> CallOptions {
+    let applied = writer
+        .operations()
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.applied_generation > 0);
+    match &admission.manifest {
+        Some(manifest) if applied && admission.compaction_plan_version.is_none() => {
+            broca_core::plan_system::view(&opts, durable_system, &manifest.system_text)
+                .unwrap_or(opts)
+        }
+        _ => opts,
+    }
+}

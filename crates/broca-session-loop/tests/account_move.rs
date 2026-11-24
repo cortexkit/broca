@@ -387,6 +387,8 @@ struct Asked {
     refused: Vec<String>,
     reask: bool,
     attempt_seq: u64,
+    /// Whether the question names the run as a head's turn.
+    head_turn: bool,
 }
 
 /// The executor's side of a move, scripted.
@@ -409,6 +411,7 @@ impl AccountContinue<Box<dyn Provider>> for Routing {
             refused: wall.refused_accounts.to_vec(),
             reask: wall.reask,
             attempt_seq: wall.attempt_seq,
+            head_turn: wall.head_turn,
         });
         let answer = self
             .answers
@@ -774,6 +777,8 @@ struct Case {
     compaction: Option<Arc<Compactor>>,
     /// The caller's routing selection the send carried.
     route_decision: Option<&'static str>,
+    /// The send is a head's turn.
+    head_turn: bool,
 }
 
 impl Case {
@@ -791,6 +796,7 @@ impl Case {
             context_limit: None,
             compaction: None,
             route_decision: None,
+            head_turn: false,
         }
     }
 }
@@ -917,6 +923,7 @@ async fn run_case(case: Case) -> Ran {
         .unwrap_or_else(|| routed(first, &format!("decision-{first}")));
     let mut request = request();
     request.route_decision_id = case.route_decision.map(str::to_owned);
+    request.head_turn = case.head_turn;
     let compacted = case.compaction.is_some();
     let context_limit = case.context_limit.or(compacted.then_some(COMPACTED_LIMIT));
     request.context_limit = context_limit;
@@ -1585,6 +1592,31 @@ async fn two_walls_in_one_step_move_from_a_to_b_to_c() {
     let on_c = ran.sent_on("C");
     assert_eq!(on_c[0].first_attempt, 2);
     assert_eq!(rendered(&ran.sent_on("A")[1].opts), rendered(&on_c[0].opts));
+}
+
+/// A head's turn stays one across moves: the question at the second wall, asked after the run
+/// moved to B, still names the run as a head's turn, as the first did.
+#[tokio::test]
+async fn a_head_turn_names_itself_at_every_wall() {
+    let ran = run_case(Case {
+        head_turn: true,
+        ..Case::new(
+            vec![
+                ("A", vec![Reply::Tool, wall()]),
+                ("B", vec![wall()]),
+                ("C", vec![Reply::Answer]),
+            ],
+            vec![offer("B"), offer("C")],
+        )
+    })
+    .await;
+    assert_eq!(ran.reason(), RunFinishReason::Completed);
+    let named: Vec<_> = ran
+        .asked
+        .iter()
+        .map(|asked| (asked.account.as_str(), asked.head_turn))
+        .collect();
+    assert_eq!(named, [("A", true), ("B", true)]);
 }
 
 /// A run admitted under a caller's routing selection names that selection as its predecessor on

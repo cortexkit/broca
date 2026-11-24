@@ -1,5 +1,6 @@
 //! Refresh a provider's cached prompt while tools are outstanding. The tool wait owns both
-//! the timer and provider future, so receiving the tool results stops that future's local IO.
+//! the timer and the provider future; when the tools finish, a warm already in flight finishes
+//! and records before the wait returns, and no further warm is sent.
 
 use broca_protocol::RunId;
 use broca_records::record::RunConfig;
@@ -53,10 +54,10 @@ pub enum WarmTick {
     },
 }
 
-/// The returned future must own the provider request so dropping it when tools finish stops
-/// the request instead of leaving it running. Once a warm reports usage, queue `CacheWarmed`
-/// with that warm and usage in the session store before any further await, so cancellation
-/// cannot lose the reported usage.
+/// The returned future owns the provider request. A wait whose tools finish, or whose run is
+/// cancelled, while it runs awaits it to its end rather than dropping it: a request the provider
+/// accepted is billed, so its record must still be written. Once a warm reports usage, queue
+/// `CacheWarmed` with that warm and usage in the session store before any further await.
 ///
 /// `C` is what the driver reads a run's frozen request from: the run loop hands it the run's
 /// `RunConfig`; another run loop may hand it its own frozen admission.
@@ -186,6 +187,14 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
         tokio::select! {
             biased;
             result = &mut tools => {
+                // A warm already in flight finishes first. Its request may already have reached
+                // the provider, which bills it whether or not broca reads the answer; only a warm
+                // that finishes writes the record that counts it in the usage export and toward
+                // the run's warm cap after a restart. This holds the run's next request back by
+                // at most that one warm.
+                if let Some(in_flight) = tick.take() {
+                    in_flight.await;
+                }
                 // The wait's ordinary ends, once per tool batch: debug, so they don't bury the stops
                 // that mean warming couldn't do its job (unsupported, missed, capped).
                 if !stopped {
@@ -195,7 +204,8 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
                 return result;
             }
             _ = async { match warm.cancel { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } }, if !stopped => {
-                tick = None;
+                // A warm in flight is left to finish and record (see the tools' end above); no
+                // other is sent.
                 next = None;
                 stopped = true;
                 tracing::debug!(target: "cache_warm", stop = "cancelled", "keep_warm stopped");
@@ -249,7 +259,7 @@ pub async fn wait_tools_with_spend<F: Future, C: ?Sized + Sync>(
                     }
                 }
             }
-            _ = async { match next { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } }, if tick.is_none() => {
+            _ = async { match next { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } }, if tick.is_none() && !stopped => {
                 next = None;
                 let costs = warm.driver.costs(warm.config);
                 match crate::keep_warm::allows_warm(warm.keep_warm, costs.clone(), spent, warms, now_ms()) {
@@ -362,5 +372,111 @@ mod tests {
             2,
             "two warms at fourteen reach the rewrite's twenty-one; counted at ten, a third would go"
         );
+    }
+
+    /// A driver whose warm, once started, waits for `release` before the provider answers and
+    /// its record is written.
+    #[derive(Default)]
+    struct HeldDriver {
+        started: AtomicUsize,
+        recorded: AtomicUsize,
+        sending: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl KeepWarmDriver for HeldDriver {
+        fn timing(&self, _: &RunConfig) -> Result<WarmTiming, String> {
+            Ok(WarmTiming {
+                ttl_ms: 1000,
+                lead_ms: 0,
+                after_send_ms: Some(1),
+            })
+        }
+        fn last_sent_at_ms(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn costs(&self, _: &RunConfig) -> Result<crate::keep_warm::WarmCosts, String> {
+            Ok(crate::keep_warm::WarmCosts {
+                warm: 1.0,
+                bust: 1_000.0,
+            })
+        }
+        async fn warm(&self, _: &RunConfig, _: &RunId) -> WarmTick {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.sending.notify_one();
+            self.release.notified().await;
+            self.recorded.fetch_add(1, Ordering::SeqCst);
+            WarmTick::Sent
+        }
+    }
+
+    /// Runs a tool wait whose first warm is in flight when the run is cancelled (with `cancel`)
+    /// and then its tools finish, and answers how many warms started and how many were recorded.
+    async fn warm_in_flight_at_the_wait_end(cancel: bool) -> (usize, usize) {
+        let driver = Arc::new(HeldDriver::default());
+        let tools_done = CancellationToken::new();
+        let run_cancel = CancellationToken::new();
+        let task = {
+            let driver = driver.clone();
+            let tools_done = tools_done.clone();
+            let run_cancel = run_cancel.clone();
+            tokio::spawn(async move {
+                let driver: Arc<dyn KeepWarmDriver> = driver;
+                let config = serde_json::from_value(serde_json::json!({
+                    "model": broca_protocol::request::ModelHandle::new("p", "m"), "tools": [],
+                    "tool_choice": broca_protocol::ToolChoice::Auto, "generation": broca_protocol::GenerationConfig::default(),
+                    "response_format": broca_protocol::request::ResponseFormat::default(), "context_epoch": 0, "renderer_version": 1,
+                })).unwrap();
+                let unsupported = AtomicBool::new(false);
+                let missed = AtomicBool::new(false);
+                let run = RunId("r".into());
+                wait_tools_with_spend(
+                    tools_done.cancelled(),
+                    Some(WarmWait {
+                        driver: &driver,
+                        config: &config,
+                        run_id: &run,
+                        cancel: Some(&run_cancel),
+                        unsupported_logged: &unsupported,
+                        warm_missed: &missed,
+                        keep_warm: &broca_protocol::request::KeepWarm::Auto,
+                        warms_before: 0,
+                    }),
+                    0.0,
+                )
+                .await;
+            })
+        };
+        driver.sending.notified().await;
+        if cancel {
+            run_cancel.cancel();
+            // The provider answers the warm well before the cancelled tools finish, leaving time
+            // in which another warm would be due.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            driver.release.notify_one();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tools_done.cancel();
+        } else {
+            tools_done.cancel();
+            driver.release.notify_one();
+        }
+        task.await.unwrap();
+        (
+            driver.started.load(Ordering::SeqCst),
+            driver.recorded.load(Ordering::SeqCst),
+        )
+    }
+
+    /// A warm the provider may already have accepted is billed, so its record must be written:
+    /// tools that finish while it is in flight let it finish before the wait ends.
+    #[tokio::test(start_paused = true)]
+    async fn tools_that_finish_during_a_warm_let_it_finish_and_record() {
+        assert_eq!(warm_in_flight_at_the_wait_end(false).await, (1, 1));
+    }
+
+    /// A cancel during a warm lets that warm finish and record, and sends no other.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_a_warm_lets_it_finish_and_sends_no_other() {
+        assert_eq!(warm_in_flight_at_the_wait_end(true).await, (1, 1));
     }
 }

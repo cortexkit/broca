@@ -73,7 +73,7 @@ use call_plan::{hook_plan, plan_calls, CallPlan};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
 mod plan_notes;
-use plan_notes::{removed_tools, with_plan_notes};
+use plan_notes::{removed_tools, with_plan_notes, with_plan_system};
 mod resolved;
 use resolved::{resolve, Resolved};
 mod stops;
@@ -1919,6 +1919,8 @@ async fn offline_request_for<W: Writer>(
     )?;
     finalize_tool_choice(writer, &mut opts);
     if !compacted {
+        let durable_system: Vec<Message> = opts.prompt.first().cloned().into_iter().collect();
+        let opts = with_plan_system(writer, &admission, &durable_system, opts);
         return Ok(with_plan_notes(writer, opts));
     }
     let opts = crate::compaction::offline_prompt(writer, &admission, bind, step_id, opts).await?;
@@ -2007,11 +2009,17 @@ where
     };
     // The account the run left is not sent to again by this run.
     seams.provider.close_run_transport();
+    // A head's turn isn't frozen in the run's start (see `Admission::head_turn`), so the
+    // admission read back below says false: the run keeps the one it began under, and routing
+    // hears of a head's turn at every usage wall that asks it for another account, not just
+    // the first.
+    let head_turn = admission.head_turn;
     loop {
         let run = run_state(writer);
         let structured_downgraded = run.structured_downgraded;
         // The run goes on under what the move refroze, as a resume reads it back.
-        let admission = frozen_admission(run, parts)?;
+        let mut admission = frozen_admission(run, parts)?;
+        admission.head_turn = head_turn;
         let crate::account_move::Moving { moved, reentry } = next;
         // A strict schema the run already downgraded stays downgraded on the new provider, which
         // was built from the run's frozen config without it.
@@ -2637,24 +2645,7 @@ where
                 }
             }
         }
-        // Once a refresh is applied, the model sees the system text of the plan the run froze in
-        // place of the session's original system message, as a view of the request only. A session
-        // on the current compaction contract renders its system text from its entries instead.
-        if admission.compaction_plan_version.is_none()
-            && writer
-                .operations()
-                .plan
-                .as_ref()
-                .is_some_and(|plan| plan.applied_generation > 0)
-        {
-            if let Some(manifest) = &admission.manifest {
-                if let Some(view) =
-                    broca_core::plan_system::view(&opts, &durable_system, &manifest.system_text)
-                {
-                    opts = view;
-                }
-            }
-        }
+        let opts = with_plan_system(writer, admission, &durable_system, opts);
         let opts = with_plan_notes(writer, opts);
         // Client-side refusal fallback: the step goes to the run's refusal-fallback model while
         // the session's schedule says so, or when it is a step already refused and re-sent.

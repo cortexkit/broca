@@ -84,10 +84,14 @@ outside the process:
 
 1. The run's start (`RunStart` and what admission froze) is synced before the first model call.
 2. A tool batch's start and its `ToolIntent` records are synced before any call is dispatched.
-3. The batch's end, with every call's result or outcome, is synced before the next model request.
-4. A step that calls no tool is synced at its end.
+3. Each dispatched call's result is synced as soon as it arrives, while the batch's other calls
+   may still run: a reader sees it at once (a quick `say` beside a long `bash`), and a crash can't
+   lose a result a reader already saw, which would leave that call's outcome unknown.
+4. The batch's end, after every call's result or outcome, is synced before the next model request.
+5. A step that calls no tool is synced at its end.
 
-So a step with one tool call costs one sync before the dispatch and one after the result. The
+So a step whose model calls N tools costs N + 2 syncs: one before the dispatch, one for each
+call's result, and one for the batch's end; a step with one tool call costs three. The
 `storage_sync.full_flush` setting changes how a sync is made, not when: off (the default) issues a
 plain `fsync`, and on macOS on selects a full drive-cache flush (`F_FULLFSYNC`). Other platforms
 behave the same either way.
