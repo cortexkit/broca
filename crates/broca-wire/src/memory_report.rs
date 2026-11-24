@@ -40,6 +40,30 @@ pub struct MemoryReport {
     /// one per storage class and mode.
     #[serde(default)]
     pub setup_stores: Vec<MemorySetupStore>,
+    /// How `session.head` of closed sessions was answered from kept heads, and why heads weren't
+    /// kept. Absent from a broca that keeps no heads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_heads: Option<KeptHeadCounts>,
+}
+
+/// `session.head` reads of sessions no actor holds since broca started: those a kept head
+/// answered, those that loaded the session's view, and why heads weren't kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptHeadCounts {
+    /// Reads a kept head answered.
+    pub hits: u64,
+    /// Reads that built the head from the session's view, by why no kept head answered:
+    /// `ephemeral` (a session that expires is never kept), `no_position` (the session's position
+    /// couldn't be read cheaply), `not_kept` (no head kept at the session's position).
+    pub misses: std::collections::BTreeMap<String, u64>,
+    /// Heads kept, by where they were built: `read` (by a head read of the closed session) or
+    /// `close` (by its actor as it closed idle).
+    pub kept: std::collections::BTreeMap<String, u64>,
+    /// Heads an idle-closing actor or a read built and didn't keep, by why: `unsettled` (a run
+    /// active, paused or waiting), `ephemeral`, `unsynced` (records the actor appended were not yet
+    /// durable), `pending` (the head needed to wait on something), `storage` (it needed records
+    /// not in memory), `failed`.
+    pub not_kept: std::collections::BTreeMap<String, u64>,
 }
 
 /// One session open in the session store (`broca-session-store`).
@@ -210,6 +234,23 @@ pub struct MemoryCache {
     /// view (`run.result`, `session.read`, `expiry` and so on). Absent for other caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loads_by_reason: Option<std::collections::BTreeMap<String, ViewLoads>>,
+    /// For the closed-session view cache: the sessions whose loads read the most bytes since
+    /// broca started, most first, at most ten. Absent for other caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_sessions: Option<Vec<SessionViewLoads>>,
+}
+
+/// One closed session's view loads since broca started.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionViewLoads {
+    /// The session's store address.
+    pub address: String,
+    /// Views loaded, their walked bytes, and the loads that replaced a view of an older position.
+    pub loads: u64,
+    pub loaded_bytes: u64,
+    pub reloads: u64,
+    /// The read or check that loaded its latest view.
+    pub reason: String,
 }
 
 /// Closed-session views loaded for one reason since broca started.

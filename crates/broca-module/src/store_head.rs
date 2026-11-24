@@ -393,8 +393,26 @@ pub(crate) async fn serve_head(
     let addr = broca_core::session_addr(key);
     let closed = store.closed_position(registry, key).await;
     let built = match closed.and_then(|position| store.heads().get(&addr, position)) {
-        Some(built) => built,
+        Some(built) => {
+            store.heads().count_hit();
+            built
+        }
         None => {
+            // An open actor answers the read itself, which loads nothing.
+            if registry.open_handle(key).is_none() {
+                store.heads().count_miss(if closed.is_some() {
+                    "not_kept"
+                } else if matches!(
+                    store.class_of(key),
+                    Ok(Some(
+                        broca_records::session_storage::StorageClass::Ephemeral
+                    ))
+                ) {
+                    "ephemeral"
+                } else {
+                    "no_position"
+                });
+            }
             let built = match store.read(registry, key, StoreReadRequest::Head).await? {
                 Some(StoreReadReply::Head(built)) => *built?,
                 Some(_) => return Err(crate::store_reads::mismatched()),
@@ -406,7 +424,7 @@ pub(crate) async fn serve_head(
             // is the one that position holds, built from the session as stored.
             if let Some(position) = closed {
                 if store.closed_position(registry, key).await == Some(position) {
-                    store.heads().keep(addr, position, &built);
+                    store.heads().keep(addr, position, &built, "read");
                 }
             }
             built
@@ -449,6 +467,8 @@ const HEADS_KEPT: usize = 4096;
 struct KeptHeadsInner {
     heads: std::collections::HashMap<String, (broca_session_store::session::Position, StoreHead)>,
     order: std::collections::VecDeque<String>,
+    /// What the memory report shows of how heads were kept and served.
+    counts: broca_wire::KeptHeadCounts,
 }
 
 impl KeptHeads {
@@ -472,11 +492,13 @@ impl KeptHeads {
     }
 
     /// Keeps `head`, built at `position` for the session at `addr`, when no clock changes it.
+    /// `source` names what built it, for the memory report: `read` or `close`.
     pub(crate) fn keep(
         &self,
         addr: String,
         position: broca_session_store::session::Position,
         head: &StoreHead,
+        source: &'static str,
     ) {
         let settled = head.reply.last_run_state.as_ref().is_none_or(|last| {
             last.awaits.is_none()
@@ -484,9 +506,11 @@ impl KeptHeads {
                 && !matches!(last.state.as_str(), "active" | "paused")
         });
         if !settled {
+            self.count_not_kept("unsettled");
             return;
         }
         let mut kept = self.lock();
+        *kept.counts.kept.entry(source.to_owned()).or_default() += 1;
         if kept
             .heads
             .insert(addr.clone(), (position, head.clone()))
@@ -499,6 +523,32 @@ impl KeptHeads {
                 kept.heads.remove(&oldest);
             }
         }
+    }
+
+    /// Counts a closed session's `session.head` a kept head answered.
+    pub(crate) fn count_hit(&self) {
+        self.lock().counts.hits += 1;
+    }
+
+    /// Counts a closed session's `session.head` that built its head from the session's view,
+    /// with why no kept head answered it (see `broca_wire::KeptHeadCounts::misses`).
+    pub(crate) fn count_miss(&self, why: &'static str) {
+        *self.lock().counts.misses.entry(why.to_owned()).or_default() += 1;
+    }
+
+    /// Counts a head built and not kept, with why (see `broca_wire::KeptHeadCounts::not_kept`).
+    pub(crate) fn count_not_kept(&self, why: &'static str) {
+        *self
+            .lock()
+            .counts
+            .not_kept
+            .entry(why.to_owned())
+            .or_default() += 1;
+    }
+
+    /// What the memory report shows of kept heads.
+    pub(crate) fn counts(&self) -> broca_wire::KeptHeadCounts {
+        self.lock().counts.clone()
     }
 }
 

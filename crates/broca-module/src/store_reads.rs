@@ -607,7 +607,17 @@ struct CacheInner<V> {
     reloads: u64,
     /// The same three counts per reason a view was loaded for (see [`ViewCache::view`]).
     by_reason: std::collections::BTreeMap<&'static str, broca_wire::ViewLoads>,
+    /// The same counts per session, with the reason of its latest load, for at most
+    /// [`SESSIONS_COUNTED`] sessions: a new session pushes out the one whose loads read the
+    /// fewest bytes, so the sessions that cost the most stay counted.
+    by_session: HashMap<String, (broca_wire::ViewLoads, &'static str)>,
 }
+
+/// How many sessions the view cache counts loads for (see `CacheInner::by_session`).
+const SESSIONS_COUNTED: usize = 512;
+
+/// How many of those the memory report names.
+const SESSIONS_REPORTED: usize = 10;
 
 /// Views of closed sessions this process loaded and didn't keep because each alone was larger
 /// than its cache's byte cap, over every cache: `health.check` reports it as `views_over_cap`.
@@ -630,6 +640,7 @@ impl<V> Default for CacheInner<V> {
             loaded_bytes: 0,
             reloads: 0,
             by_reason: Default::default(),
+            by_session: HashMap::new(),
         }
     }
 }
@@ -795,6 +806,7 @@ impl<V: CachedBytes> ViewCache<V> {
                 by_reason.loads += 1;
                 by_reason.loaded_bytes += loaded;
                 by_reason.reloads += u64::from(reload);
+                inner.count_session(addr, loaded, reload, reason);
             }
         }
         for (addr, bytes) in inner.evict(self.max_entries, self.max_bytes) {
@@ -839,6 +851,7 @@ impl<V: CachedBytes> ViewCache<V> {
                     .map(|(reason, loads)| ((*reason).to_owned(), loads.clone()))
                     .collect(),
             ),
+            top_sessions: Some(inner.top_sessions()),
         }
     }
 
@@ -863,6 +876,47 @@ impl Default for ViewCache {
 }
 
 impl<V> CacheInner<V> {
+    /// Counts one load of the session at `addr` (see `by_session`).
+    fn count_session(&mut self, addr: &str, loaded: u64, reload: bool, reason: &'static str) {
+        if !self.by_session.contains_key(addr) && self.by_session.len() >= SESSIONS_COUNTED {
+            let cheapest = self
+                .by_session
+                .iter()
+                .min_by_key(|(_, (loads, _))| loads.loaded_bytes)
+                .map(|(addr, _)| addr.clone());
+            if let Some(cheapest) = cheapest {
+                self.by_session.remove(&cheapest);
+            }
+        }
+        let (loads, latest) = self.by_session.entry(addr.to_owned()).or_default();
+        loads.loads += 1;
+        loads.loaded_bytes += loaded;
+        loads.reloads += u64::from(reload);
+        *latest = reason;
+    }
+
+    /// The counted sessions whose loads read the most bytes, most first.
+    fn top_sessions(&self) -> Vec<broca_wire::SessionViewLoads> {
+        let mut top: Vec<_> = self
+            .by_session
+            .iter()
+            .map(|(address, (loads, reason))| broca_wire::SessionViewLoads {
+                address: address.clone(),
+                loads: loads.loads,
+                loaded_bytes: loads.loaded_bytes,
+                reloads: loads.reloads,
+                reason: (*reason).to_owned(),
+            })
+            .collect();
+        top.sort_by(|a, b| {
+            b.loaded_bytes
+                .cmp(&a.loaded_bytes)
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        top.truncate(SESSIONS_REPORTED);
+        top
+    }
+
     /// Drops the least recently used views until the cache is within its bounds.
     /// Drops views until the cache fits its caps, and returns the views dropped because each
     /// alone was larger than the byte cap, with their counted bytes. Such a view goes first, so

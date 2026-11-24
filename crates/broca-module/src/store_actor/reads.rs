@@ -83,19 +83,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// the closed read builds the head as before.
     pub(super) fn keep_closing_head(&self, registry: &crate::registry::RegistryHandle) {
         use futures::FutureExt as _;
-        if self.session.unsynced() {
-            return;
-        }
         let Some(store) = registry.store_runtime() else {
             return;
         };
+        if self.session.unsynced() {
+            store.heads().count_not_kept("unsynced");
+            return;
+        }
         // A session that expires is left out, as `StoreRuntime::closed_position` leaves it out:
         // whether it has expired is read from its whole view.
         let class = match store.class_of(&self.key) {
             Ok(Some(class)) if class != broca_records::session_storage::StorageClass::Ephemeral => {
                 class
             }
-            _ => return,
+            Ok(Some(_)) => {
+                store.heads().count_not_kept("ephemeral");
+                return;
+            }
+            _ => {
+                store.heads().count_not_kept("failed");
+                return;
+            }
         };
         let addr = broca_core::session_addr(&self.key);
         let context = crate::store_reads::ReadContext {
@@ -122,10 +130,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         .now_or_never();
         let from_memory = !memory.refused();
         drop(memory);
-        if let (Some(crate::store_reads::StoreReadReply::Head(Ok(head))), true) =
-            (reply, from_memory)
-        {
-            store.heads().keep(addr, self.session.position(), &head);
+        match (reply, from_memory) {
+            (Some(crate::store_reads::StoreReadReply::Head(Ok(head))), true) => {
+                store
+                    .heads()
+                    .keep(addr, self.session.position(), &head, "close");
+            }
+            (_, false) => store.heads().count_not_kept("storage"),
+            (None, true) => store.heads().count_not_kept("pending"),
+            (Some(_), true) => store.heads().count_not_kept("failed"),
         }
     }
 
