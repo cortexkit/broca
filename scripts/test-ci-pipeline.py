@@ -1002,6 +1002,11 @@ class WorkflowGraph(unittest.TestCase):
         downloads = [i for i, step in enumerate(steps) if step.get('uses', '').startswith('actions/download-artifact@')]
         self.assertTrue(downloads)
         self.assertTrue(all(i > wait for i in downloads))
+        # Each download reads the public API the wait polled. Without a token it read the run's
+        # internal list, which had not caught up with an archive the wait already saw.
+        for i in downloads:
+            self.assertEqual(steps[i]['with'].get('github-token'), '${{ github.token }}', steps[i])
+            self.assertEqual(steps[i]['with'].get('run-id'), '${{ github.run_id }}', steps[i])
         self.assertEqual(self.workflow('ci.yml')['permissions']['actions'], 'read')
         self.assertEqual(set(jobs['test']['needs']),
                          {'lint', 'scripts', 'unit', 'production-features', 'store-contention-macos',
