@@ -369,6 +369,61 @@ async fn answers_keep_the_providers_number_spelling_and_request_order() {
     );
 }
 
+/// Jev 1.14 is pinned beside 1.13: its wire model is its catalog id's model part, the same
+/// derivation that gives 1.13 the `cortexkit-role-classifier` crate's `models::JEV_1_13_0`, and
+/// it is listed only while the catalog holds its row with kind `decision`.
+#[tokio::test]
+async fn jev_1_14_sends_its_own_version_and_lists_with_its_catalog_row() {
+    assert_eq!(
+        ModelPin::jev(Arc::new(StandIn::default())).provider_model,
+        cortexkit_role_classifier::provider::models::JEV_1_13_0
+    );
+    let stand_in = Arc::new(StandIn::default());
+    let with_row = |present: bool| {
+        let mut rows = HashMap::from([(JEV.to_owned(), row(Some("decision")))]);
+        if present {
+            rows.insert(JEV_1_14_0.to_owned(), row(Some("decision")));
+        }
+        Arc::new(SystemOne::new(
+            Arc::new(SystemOneStore::open_in_memory().unwrap()),
+            "this-process",
+            Arc::new(Rows(rows)),
+            vec![
+                ModelPin::jev(stand_in.clone()),
+                ModelPin::jev_1_14(stand_in.clone()),
+            ],
+            Config::default(),
+            Arc::default(),
+        ))
+    };
+    let listed = |service: &SystemOne| -> Vec<String> {
+        serde_json::to_value(service.describe()).unwrap()["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["model"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(listed(&with_row(false)), [JEV]);
+    let service = with_row(true);
+    assert_eq!(listed(&service), [JEV, JEV_1_14_0]);
+    stand_in.script(
+        "a",
+        vec![Script::Answer(
+            r#"{"model":"jev-1.14.0","answers":{"q":{"type":"noul","noul":0.3}}}"#.to_owned(),
+        )],
+    );
+    let rig = Rig {
+        service,
+        stand_in: stand_in.clone(),
+        gauge: Arc::default(),
+        store: Arc::new(SystemOneStore::open_in_memory().unwrap()),
+    };
+    admitted(&rig, params("jev-1.14", JEV_1_14_0, &["a"], None)).await;
+    let sent: Value = serde_json::from_str(&stand_in.bodies.lock().unwrap()[0]).unwrap();
+    assert_eq!(sent["model"], "jev-1.14.0");
+}
+
 /// A reply naming another model is still answered and stored; only the difference is
 /// reported, so the row's pin, not the provider's alias resolution, decides what is billed.
 #[tokio::test]

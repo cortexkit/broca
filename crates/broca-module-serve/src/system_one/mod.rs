@@ -220,10 +220,10 @@ pub struct ModelPin {
     pub provider: Arc<dyn ClassifierProvider>,
 }
 
-/// The `model` value broca sends for the `typesafe/jev-1.13.0` row: the pinned version, never
-/// TypeSafe's moving `jev-latest` alias, which already names a newer model and would let it
-/// answer, and be billed, as 1.13.0.
-const JEV_1_13_0_WIRE: &str = cortexkit_role_classifier::provider::models::JEV_1_13_0;
+/// TypeSafe's Jev 1.14.0 row in the curated catalog, the version Artificial Analysis's Decision
+/// Index grades. The `cortexkit-role-classifier` crate defines a constant for 1.13.0 only;
+/// newer versions come from the catalog and use the same TypeSafe endpoint and host as 1.13.0.
+pub const JEV_1_14_0: &str = "typesafe/jev-1.14.0";
 
 /// A catalog key's provider id and model id. Catalog keys are `<provider>/<model>` and only
 /// the provider id is free of slashes, so the key splits once, at its first slash: Clef's
@@ -259,12 +259,26 @@ impl ModelPin {
         }
     }
 
-    /// TypeSafe's Jev 1.13.0, text only. Its question limit is the role's own question-id
-    /// space at the clef bound, since TypeSafe states none.
+    /// TypeSafe's Jev 1.13.0.
     pub fn jev(provider: Arc<dyn ClassifierProvider>) -> Self {
+        Self::typesafe_jev(JEV_1_13_0, provider)
+    }
+
+    /// TypeSafe's Jev 1.14.0.
+    pub fn jev_1_14(provider: Arc<dyn ClassifierProvider>) -> Self {
+        Self::typesafe_jev(JEV_1_14_0, provider)
+    }
+
+    /// The TypeSafe Jev version `catalog_id` names, text only. The request's `model` is the
+    /// catalog id's model part (`typesafe/jev-1.14.0` sends `jev-1.14.0`): a pinned version,
+    /// never TypeSafe's moving `jev-latest` alias, which already names a newer model and would
+    /// let it answer, and be billed, as the version asked for. TypeSafe states no question limit,
+    /// so it takes the classifier role's general limit, `clef_limits::MAX_QUESTIONS` (64).
+    fn typesafe_jev(catalog_id: &str, provider: Arc<dyn ClassifierProvider>) -> Self {
+        let (_, model) = catalog_key_parts(catalog_id).expect("a pinned catalog id names a model");
         Self {
-            catalog_id: JEV_1_13_0.to_owned(),
-            provider_model: JEV_1_13_0_WIRE.to_owned(),
+            catalog_id: catalog_id.to_owned(),
+            provider_model: model.to_owned(),
             max_questions: cortexkit_role_classifier::provider::clef_limits::MAX_QUESTIONS as u64,
             images_max: None,
             provider,

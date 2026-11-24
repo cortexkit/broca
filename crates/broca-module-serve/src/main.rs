@@ -832,8 +832,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             broca_module_serve::serve::process_launch_id(),
             Arc::new(broca_module_serve::system_one::LiveCatalog),
             {
+                let typesafe = Arc::new(typesafe);
                 let mut pins = vec![
-                    broca_module_serve::system_one::ModelPin::jev(Arc::new(typesafe)),
+                    broca_module_serve::system_one::ModelPin::jev(typesafe.clone()),
+                    broca_module_serve::system_one::ModelPin::jev_1_14(typesafe),
                     broca_module_serve::system_one::ModelPin::clef(clef),
                     broca_module_serve::system_one::ModelPin::clef_flash(clef_flash),
                 ];
