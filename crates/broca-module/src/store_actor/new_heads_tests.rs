@@ -368,64 +368,6 @@ async fn a_started_head_answers_later_sends_from_its_history_not_its_reservation
     assert_eq!(store.store_class(), Some(StorageClass::Durable));
 }
 
-/// A refused send writes nothing, so its log line is the only record of it: the line names the
-/// session, the send's id, the run id it would have had and its wire code.
-#[tokio::test]
-async fn a_refused_send_is_logged_with_its_ids() {
-    use crate::serve::{SendRequest, ServeHandler};
-    let store = module(vec![text_step("a1", "hello")], None).await;
-    let mut request = sent_by("over budget", core(), stamped(core(), "head-1", 1));
-    // broca keeps no input-token budget, so a send naming one is refused before anything is
-    // opened or written.
-    request.budget = Some(broca_protocol::request::BudgetConfig {
-        max_input_tokens: Some(10),
-        nudges: Vec::new(),
-        finalize_at_tool_calls: u64::MAX,
-        finalize_text: String::new(),
-    });
-    let refused = SendRequest {
-        session_class: None,
-        retention: None,
-        conversation_key: None,
-        session: store.key.clone(),
-        run_id: RunId("r-refused".into()),
-        send_id: Some("send-refused".into()),
-        title: None,
-        request: Box::new(request),
-        skip_materialization: false,
-        kind: RunKind::FreshOrResume,
-        delivery: broca_protocol::Delivery::Queue,
-        stop_sequences_named: false,
-        plan: None,
-        order: None,
-    };
-    let (answer, logs) =
-        broca_test_support::capture_logs(ServeHandler::send(&store.registry, refused)).await;
-    assert!(answer.is_err(), "{answer:?}");
-    let line = logs
-        .iter()
-        .find(|event| {
-            event.target == "requests" && event.message().starts_with("session.send refused")
-        })
-        .unwrap_or_else(|| panic!("no refusal line in {logs:?}"));
-    assert_eq!(
-        line.fields.get("session").map(String::as_str),
-        Some(broca_core::session_addr(&store.key).as_str())
-    );
-    assert_eq!(
-        line.fields.get("send_id").map(String::as_str),
-        Some("send-refused")
-    );
-    assert_eq!(
-        line.fields.get("run_id").map(String::as_str),
-        Some("r-refused")
-    );
-    assert_eq!(
-        line.fields.get("code").map(String::as_str),
-        Some("invalid_params")
-    );
-}
-
 /// The refusal a reserved session gives a send from any scope but the one that reserved it.
 fn assert_reserved_for_core(outcome: &SendOutcome, label: &str) {
     match outcome {

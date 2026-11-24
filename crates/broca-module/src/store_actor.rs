@@ -3749,6 +3749,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             run_id: run_id.clone(),
             error: crate::serve::admission_refusal::queued_admission_error(error),
         };
+        // Its sender was answered `pending`, so the refusal reaches it only through the send's
+        // status. Logged beside the refusals answered on the send itself (`session.send
+        // refused`), so one search finds every send that ran nothing.
+        tracing::info!(
+            target: "session.send",
+            session_ref = %self.key.session,
+            submission_id = %submission.0,
+            run_id = %run_id.0,
+            refusal_code = failure.error.provider_code.as_deref().unwrap_or(""),
+            class = ?failure.error.class,
+            "queued send ended refused at its run's start"
+        );
         let record = Record::Retraction(Retraction {
             submission_id: submission.0.clone(),
             failure: Some(serde_json::to_value(failure).map_err(|error| error.to_string())?),

@@ -1568,6 +1568,10 @@ async fn a_queued_send_runs_when_the_run_before_it_ends() {
 /// the send behind it still runs.
 #[tokio::test]
 async fn a_refused_queued_send_ends_and_the_next_one_runs() {
+    let refusals = broca_test_support::LogCapture::observe(|event| {
+        event.target == "session.send"
+            && event.fields.get("submission_id").map(String::as_str) == Some("sub-r2")
+    });
     let gate = Arc::new(Notify::new());
     let (commands, served, _) = actor(executor(
         vec![text_step("a1", "hello"), text_step("a2", "again")],
@@ -1606,6 +1610,14 @@ async fn a_refused_queued_send_ends_and_the_next_one_runs() {
         .expect("the refused send's retraction carries its refusal");
     assert_eq!(failure["run_id"], "r2");
     assert!(session.operations().queue.is_empty());
+    // Its sender heard `pending`, so the log names the send that ran nothing.
+    let logged = refusals.events();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(
+        logged[0].message(),
+        "queued send ended refused at its run's start"
+    );
+    assert_eq!(logged[0].fields["run_id"], "r2");
 }
 
 /// A steer while a run runs joins it: it is answered `active` naming that run, and the run places
