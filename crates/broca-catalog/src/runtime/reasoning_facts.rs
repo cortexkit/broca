@@ -1,7 +1,8 @@
 //! Readers for the reasoning facts of a fusiform row: whether the model reasons, the variants
 //! it offers, and the effort its vendor uses when a request names none.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use broca_provider::spec::{CapabilityFlag, ReasoningOptions};
 use serde_json::Value;
@@ -44,14 +45,43 @@ pub(super) fn reasoning_options_fact(
 ) -> Result<ReasoningOptions, CatalogError> {
     match facts.get("capability.reasoning_options") {
         None => Ok(ReasoningOptions::Unstated),
-        Some(value) => {
-            ReasoningOptions::from_value(value).ok_or_else(|| CatalogError::FusiformFact {
+        Some(value) => ReasoningOptions::from_value(value)
+            .map(shared_options)
+            .ok_or_else(|| CatalogError::FusiformFact {
                 model: identity.to_string(),
                 fact: "capability.reasoning_options".to_string(),
                 reason: format!("expected array or null, found {}", value_kind(value)),
-            })
-        }
+            }),
     }
+}
+
+/// The parsed option lists rows currently hold, by their JSON text. A catalog serves the same
+/// few lists on thousands of rows (183 distinct lists on 9,089 rows at one count), and a parsed
+/// list is a tree of JSON values, so rows with the same list share one copy, also across a
+/// refresh. A list lives only as long as some row holds it.
+static SHARED_OPTIONS: LazyLock<Mutex<HashMap<String, Weak<[Value]>>>> =
+    LazyLock::new(Default::default);
+
+/// `options`, sharing the parsed list of any row that already holds the same one.
+fn shared_options(options: ReasoningOptions) -> ReasoningOptions {
+    let ReasoningOptions::Entries(entries) = options else {
+        return options;
+    };
+    let Ok(text) = serde_json::to_string(&*entries) else {
+        return ReasoningOptions::Entries(entries);
+    };
+    let mut shared = SHARED_OPTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(held) = shared.get(&text).and_then(Weak::upgrade) {
+        return ReasoningOptions::Entries(held);
+    }
+    // Forget the lists no row holds any more before the map outgrows the live ones.
+    if shared.len() >= 1024 {
+        shared.retain(|_, list| list.strong_count() > 0);
+    }
+    shared.insert(text, Arc::downgrade(&entries));
+    ReasoningOptions::Entries(entries)
 }
 
 /// `capability.reasoning_default`: `{type, value}`, one entry's type and one of its values. Only

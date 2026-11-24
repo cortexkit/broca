@@ -3234,6 +3234,47 @@ fn served_reasoning_options_keep_null_empty_and_populated_distinct() {
     assert_eq!(options("unserved-options"), ReasoningOptions::Unstated);
 }
 
+/// Rows serving the same reasoning options hold one parsed list between them, so a catalog of
+/// thousands of rows parses each distinct list once; a different list stays its own.
+#[test]
+fn rows_with_the_same_reasoning_options_share_one_parsed_list() {
+    let mut served = response(100);
+    let effort = serde_json::json!([{"type": "effort", "values": ["low", "medium", "high"]}]);
+    let toggle = serde_json::json!([{"type": "toggle"}]);
+    for (id, options) in [
+        ("anthropic/first", &effort),
+        ("anthropic/second", &effort),
+        ("anthropic/other", &toggle),
+    ] {
+        served.models.insert(
+            id.into(),
+            BTreeMap::from([
+                ("existence".into(), serde_json::json!("present")),
+                ("limit.context".into(), serde_json::json!(200000)),
+                ("capability.reasoning".into(), serde_json::json!(true)),
+                ("capability.reasoning_options".into(), options.clone()),
+            ]),
+        );
+    }
+    let cache = CatalogCache::empty();
+    cache
+        .install_for_test(served, CatalogSource::Fusiform)
+        .unwrap();
+    let snapshot = cache.snapshot().unwrap();
+    let list = |model: &str| match snapshot
+        .model_for_serving("anthropic", model)
+        .expect("mapped model")
+        .1
+        .reasoning_options
+    {
+        ReasoningOptions::Entries(entries) => entries,
+        other => panic!("{other:?}"),
+    };
+    assert!(std::sync::Arc::ptr_eq(&list("first"), &list("second")));
+    assert!(!std::sync::Arc::ptr_eq(&list("first"), &list("other")));
+    assert_eq!(ReasoningOptions::Entries(list("second")).to_value(), effort);
+}
+
 #[test]
 fn stale_health_reports_age_and_lkg_source_without_a_degradation_state() {
     let cache = CatalogCache::empty();
