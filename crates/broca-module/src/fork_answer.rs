@@ -29,7 +29,7 @@
 //! durably, so listing it again revives nothing.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use broca_core::LeaseStore as _;
 use broca_protocol::{BindIdentity, BindPrincipal};
@@ -253,10 +253,9 @@ struct OpenFork {
     session: Session<LocalBackend>,
     records: Vec<Record>,
     state: ForkState,
-    _lease: Box<dyn broca_core::LeaseHandle>,
-    /// Set while an attempt of this process is with the executor. A fork opened from storage
-    /// with an attempt in flight was cut by a restart.
-    running: bool,
+    /// Only the ask future owns the strong reference. When it is dropped, its durable
+    /// in-flight attempt is interrupted, not a running call.
+    running: Weak<()>,
 }
 
 impl OpenFork {
@@ -274,7 +273,61 @@ impl OpenFork {
     }
 }
 
-type Entry = Arc<tokio::sync::Mutex<OpenFork>>;
+struct LoadedFork {
+    fork: OpenFork,
+    lease: Box<dyn broca_core::LeaseHandle>,
+}
+
+type OpenForks = Mutex<HashMap<String, Weak<ForkSlot>>>;
+
+/// The map only indexes slots. Operations own them while they need the fork, and a usage
+/// writer owns one only while handling a report. The last owner releases the file lease
+/// before another operation can install a slot for the same address.
+struct ForkSlot {
+    addr: String,
+    open: Arc<OpenForks>,
+    loaded: tokio::sync::Mutex<Option<LoadedFork>>,
+}
+
+struct Entry(Option<Arc<ForkSlot>>);
+
+impl Entry {
+    fn slot(&self) -> &Arc<ForkSlot> {
+        self.0.as_ref().expect("a live fork entry owns its slot")
+    }
+
+    async fn lock(&self) -> tokio::sync::MappedMutexGuard<'_, OpenFork> {
+        tokio::sync::MutexGuard::map(self.slot().loaded.lock().await, |loaded| {
+            &mut loaded.as_mut().expect("the entry loaded the fork").fork
+        })
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        let slot = self.0.take().expect("a live fork entry owns its slot");
+        let open = Arc::clone(&slot.open);
+        let closed = {
+            let mut open = open.lock().unwrap_or_else(|poison| poison.into_inner());
+            let weak = Arc::downgrade(&slot);
+            let Some(slot) = Arc::into_inner(slot) else {
+                return;
+            };
+            if open
+                .get(&slot.addr)
+                .is_some_and(|entry| entry.ptr_eq(&weak))
+            {
+                open.remove(&slot.addr);
+            }
+            slot.loaded.into_inner().map(|LoadedFork { fork, lease }| {
+                drop(lease);
+                fork
+            })
+        };
+        // The session and records can be large; free them outside the map lock.
+        drop(closed);
+    }
+}
 
 /// The head of a fork as an operation reads it: where it is kept, and its view.
 struct Head {
@@ -289,7 +342,7 @@ pub struct ForkManager {
     clock: broca_core::Clock,
     leases: broca_core::FileLeaseStore,
     /// The forks some operation holds open, by their session's address.
-    open: tokio::sync::Mutex<HashMap<String, Entry>>,
+    open: Arc<OpenForks>,
     /// Where each fork attempt's model call is published as a step event, when anywhere.
     step_events: Option<Arc<crate::step_events::StepEvents>>,
 }
@@ -303,7 +356,7 @@ impl ForkManager {
             runtime,
             clock,
             leases,
-            open: tokio::sync::Mutex::new(HashMap::new()),
+            open: Arc::default(),
             step_events: None,
         }
     }
@@ -476,10 +529,35 @@ impl ForkManager {
         }
         let key = fork_session(head, fork_id);
         let addr = broca_core::session_addr(&key);
-        let mut open = self.open.lock().await;
-        if let Some(entry) = open.get(&addr) {
-            return Ok(Some(Arc::clone(entry)));
+        let entry = {
+            let mut open = self
+                .open
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let slot = open.entry(addr.clone()).or_default();
+            Entry(Some(slot.upgrade().unwrap_or_else(|| {
+                let new = Arc::new(ForkSlot {
+                    addr: addr.clone(),
+                    open: Arc::clone(&self.open),
+                    loaded: tokio::sync::Mutex::new(None),
+                });
+                *slot = Arc::downgrade(&new);
+                new
+            })))
+        };
+        {
+            let mut loaded = entry.slot().loaded.lock().await;
+            if loaded.is_none() {
+                let Some(fork) = self.load(key, addr).await? else {
+                    return Ok(None);
+                };
+                *loaded = Some(fork);
+            }
         }
+        Ok(Some(entry))
+    }
+
+    async fn load(&self, key: BindIdentity, addr: String) -> Result<Option<LoadedFork>, ForkError> {
         if self.runtime.class_of(&key).ok().flatten() != Some(StorageClass::Ephemeral) {
             return Ok(None);
         }
@@ -514,34 +592,13 @@ impl ForkManager {
             session,
             records,
             state,
-            _lease: lease,
-            running: false,
+            running: Weak::new(),
         };
         self.recover(&mut fork).await?;
-        let entry = Arc::new(tokio::sync::Mutex::new(fork));
-        open.insert(addr, Arc::clone(&entry));
-        Ok(Some(entry))
+        Ok(Some(LoadedFork { fork, lease }))
     }
 
-    /// Closes `entry` unless an attempt still runs on it, releasing its lease so retention may
-    /// delete the fork's session once it is due.
-    async fn settle(&self, entry: Entry) {
-        let mut open = self.open.lock().await;
-        let Ok(fork) = entry.try_lock() else {
-            return;
-        };
-        if fork.running {
-            return;
-        }
-        let addr = broca_core::session_addr(&fork.key);
-        drop(fork);
-        // The map's copy and this one: no other operation holds the fork.
-        if Arc::strong_count(&entry) == 2 {
-            open.remove(&addr);
-        }
-    }
-
-    /// Stores an attempt a restart cut as `model_error` with the usage it recorded, and releases
+    /// Stores an interrupted attempt as `model_error` with the usage it recorded, and releases
     /// every routing admission no record says was released.
     async fn recover(&self, fork: &mut OpenFork) -> Result<(), ForkError> {
         let now = self.now_ms();
@@ -594,6 +651,14 @@ impl ForkManager {
                     "a fork attempt's routing admission was not released: {error}"
                 ),
             }
+        }
+        Ok(())
+    }
+
+    /// A dropped ask can leave the slot open while another operation holds it.
+    async fn recover_cut(&self, fork: &mut OpenFork) -> Result<(), ForkError> {
+        if fork.state.in_flight.is_some() && fork.running.strong_count() == 0 {
+            self.recover(fork).await?;
         }
         Ok(())
     }
@@ -827,9 +892,7 @@ impl ForkManager {
         let Some(entry) = self.entry(head, &request.fork_id).await? else {
             return Err(ForkError::UnknownFork);
         };
-        let result = self.ask_on(&entry, head, principal, request).await;
-        self.settle(entry).await;
-        result
+        self.ask_on(&entry, head, principal, request).await
     }
 
     async fn ask_on(
@@ -843,6 +906,7 @@ impl ForkManager {
         let hint = request.effort.map(effort_name);
         let mut fork = entry.lock().await;
         self.check_caller(&mut fork, head, caller).await?;
+        self.recover_cut(&mut fork).await?;
         if let Some(ask) = fork.state.asks.get(&request.ask_id) {
             if let Some(answer) = &ask.answer {
                 if ask.question != request.question || ask.effort != hint {
@@ -886,7 +950,8 @@ impl ForkManager {
         started.effort.clone_from(&hint);
         started.admission_id = Some(admission_id.clone());
         fork.append(vec![started]).await?;
-        fork.running = true;
+        let running = Arc::new(());
+        fork.running = Arc::downgrade(&running);
         let mut call = fork_request(&rebuilt.opts, &fork.state.branch, &request.question);
         if applied.is_some() {
             Arc::make_mut(&mut call.render_episodes)
@@ -910,17 +975,20 @@ impl ForkManager {
                 .map(|spend| json!({ SPEND: spend }))
         };
         let usage_writer = {
-            let entry = Arc::clone(entry);
+            let slot = Arc::downgrade(entry.slot());
+            let active = Arc::downgrade(&running);
             let spent = Arc::clone(&spent);
             let fork_id = fork_id.clone();
             let ask_id = request.ask_id.clone();
             let clock = self.clock.clone();
             tokio::spawn(async move {
                 while let Some(usage) = usage_rx.recv().await {
+                    let Some(slot) = slot.upgrade() else { break };
+                    let entry = Entry(Some(slot));
                     let mut fork = entry.lock().await;
                     // Reports that arrive after the attempt ended are dropped: its end records
                     // its whole usage.
-                    if !fork.running {
+                    if active.strong_count() == 0 {
                         break;
                     }
                     let mut fact = record(&fork_id, ForkEvent::AskUsage, clock.now_ms());
@@ -964,12 +1032,12 @@ impl ForkManager {
                     usage: RunUsage::default(),
                     error: "the fork's model call panicked".into(),
                 });
-        // The usage writer ends on its own: it stops at the first report after `running` is
-        // cleared below, or when the executor drops its callback.
+        // The usage writer ends when the executor drops its callback or reports after the
+        // attempt ends. It does not keep the fork open while waiting for a report.
         drop(usage_writer);
 
         let mut fork = entry.lock().await;
-        fork.running = false;
+        drop(running);
         let now = self.now_ms();
         let mut facts = Vec::new();
         let reply = match outcome {
@@ -1074,19 +1142,15 @@ impl ForkManager {
         let Some(entry) = self.entry(head, &request.fork_id).await? else {
             return Err(ForkError::UnknownFork);
         };
-        let result = async {
-            let mut fork = entry.lock().await;
-            self.check_caller(&mut fork, head, caller_of(principal))
-                .await?;
-            if fork.state.ended_at_ms.is_none() {
-                let ended = record(&fork.state.fork_id, ForkEvent::Ended, self.now_ms());
-                fork.append(vec![ended]).await?;
-            }
-            Ok(ForkEndReply::new(request.fork_id.clone()))
+        let mut fork = entry.lock().await;
+        self.check_caller(&mut fork, head, caller_of(principal))
+            .await?;
+        self.recover_cut(&mut fork).await?;
+        if fork.state.ended_at_ms.is_none() {
+            let ended = record(&fork.state.fork_id, ForkEvent::Ended, self.now_ms());
+            fork.append(vec![ended]).await?;
         }
-        .await;
-        self.settle(entry).await;
-        result
+        Ok(ForkEndReply::new(request.fork_id.clone()))
     }
 }
 

@@ -65,15 +65,28 @@ impl LiveLoopExecutor {
                     })
                 }
                 AccountForOutcome::Refused(refusal) => {
-                    Some(fork_routing_refusal(refusal.routing_code))
+                    Some(if refusal.class == ErrorClass::Transient {
+                        ForkCallRefusal::AccountHeld {
+                            routing_code: Some(refusal.routing_code),
+                            mismatch: None,
+                        }
+                    } else {
+                        ForkCallRefusal::AccountBlocked { routing_code: refusal.routing_code }
+                    })
                 }
                 AccountForOutcome::AuthRequired { .. } => {
-                    Some(fork_routing_refusal("auth_required".into()))
+                    Some(ForkCallRefusal::AccountBlocked { routing_code: "auth_required".into() })
                 }
                 AccountForOutcome::SelectionDisabled { .. } => {
-                    Some(fork_routing_refusal("account_selection_disabled".into()))
+                    Some(ForkCallRefusal::AccountBlocked { routing_code: "account_selection_disabled".into() })
                 }
                 AccountForOutcome::Unreachable(_) | AccountForOutcome::NoDecisionWithinBudget => {
+                    // Routing may have committed the admission before the reply was lost.
+                    // The manager keeps it owed so it can release by admission id on reopen.
+                    self.note_fork_release(
+                        &job.admission_id,
+                        Err("routing's admission decision is unknown".into()),
+                    );
                     Some(ForkCallRefusal::AccountHeld {
                         routing_code: None,
                         mismatch: None,
@@ -103,12 +116,11 @@ impl LiveLoopExecutor {
         outcome
     }
 
-    /// Remembers a fork admission routing wasn't told was released, so the fork manager keeps
-    /// it owed and releases it again later (`fork_release_failed`).
+    /// Keeps a possibly granted admission owed until routing confirms its release.
     fn note_fork_release(&self, admission_id: &str, released: Result<(), String>) {
         if let Err(error) = released {
             tracing::warn!(target: "fork", admission_id, %error,
-                "a fork attempt's routing admission wasn't released; it is released again when the fork next opens");
+                "could not confirm a fork admission's release; release is retried when the fork next opens");
             self.unreleased_forks
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -290,19 +302,6 @@ fn fork_account_params(
     params
 }
 
-fn fork_routing_refusal(code: String) -> broca_module::executor::ForkCallRefusal {
-    use broca_module::executor::ForkCallRefusal;
-    match code.as_str() {
-        "account_hold" | "account_pool_exhausted" | "account_selection_unavailable" => {
-            ForkCallRefusal::AccountHeld {
-                routing_code: Some(code),
-                mismatch: None,
-            }
-        }
-        _ => ForkCallRefusal::AccountBlocked { routing_code: code },
-    }
-}
-
 async fn fork_step(
     provider: &dyn broca_core::Provider,
     job: &broca_module::executor::ForkCallJob,
@@ -452,7 +451,9 @@ fn fork_reply(
     let text = |blocks: &mut dyn Iterator<Item = &ContentBlock>| {
         blocks
             .filter_map(|block| match block {
-                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
+                    Some(text.as_str())
+                }
                 _ => None,
             })
             .collect::<String>()

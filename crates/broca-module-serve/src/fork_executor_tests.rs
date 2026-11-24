@@ -3,7 +3,8 @@ use broca_module::executor::{ForkCallJob, ForkCallOutcome, ForkCallRefusal, Fork
 // The same RoutingTransport seam as the account-selection tests: only network IO is replaced.
 struct ForkRouting {
     requests: Mutex<Vec<serde_json::Value>>,
-    reply: broca_module_serve::account_routing::RoutingReply,
+    /// No reply means routing receives the request but does not answer before the deadline.
+    reply: Option<broca_module_serve::account_routing::RoutingReply>,
     release_fails: bool,
     /// Whether the router declares `account_fork_of`; otherwise its description is unknown.
     fork_of: bool,
@@ -36,7 +37,10 @@ impl broca_module_serve::account_routing::RoutingTransport for ForkRouting {
                 Ok(Ok(br#"{"result":{}}"#.to_vec()))
             }
         } else {
-            self.reply.clone()
+            match &self.reply {
+                Some(reply) => reply.clone(),
+                None => std::future::pending().await,
+            }
         }
     }
 }
@@ -44,7 +48,7 @@ impl broca_module_serve::account_routing::RoutingTransport for ForkRouting {
 fn fork_routing(reply: broca_module_serve::account_routing::RoutingReply) -> Arc<ForkRouting> {
     Arc::new(ForkRouting {
         requests: Mutex::new(Vec::new()),
-        reply,
+        reply: Some(reply),
         release_fails: false,
         fork_of: false,
     })
@@ -178,24 +182,72 @@ fork_refusal_test!(
     false
 );
 fork_refusal_test!(fork_account_unknown_refusal, "future_refusal", false);
+fork_refusal_test!(
+    fork_account_pool_reserve_limited,
+    "account_pool_reserve_limited",
+    true
+);
 
 #[tokio::test]
-async fn fork_routing_temporary_unavailable() {
-    for reply in [
-        Err("disconnected".into()),
-        Ok(Ok(br#"{"result":{}}"#.to_vec())),
+async fn fork_no_route_is_held_only_when_routing_reports_concurrency_full() {
+    for (reason, expected) in [
+        (
+            "concurrency_full",
+            ForkCallRefusal::AccountHeld {
+                routing_code: Some("no_route".into()),
+                mismatch: None,
+            },
+        ),
+        (
+            "no_match",
+            ForkCallRefusal::AccountBlocked {
+                routing_code: "no_route".into(),
+            },
+        ),
     ] {
-        let router = fork_routing(reply);
-        let (root, _vault, executor, server) = fork_fixture("temporary", router.clone()).await;
+        let router = fork_routing(Ok(Err(serde_json::to_vec(&serde_json::json!({
+            "code": "no_route", "detail": {"reason": reason}
+        }))
+        .unwrap())));
+        let (root, _vault, executor, server) = fork_fixture(reason, router.clone()).await;
+        assert_eq!(
+            executor.fork_call(fork_job(&root, &server.url)).await,
+            ForkCallOutcome::Refused(expected),
+            "{reason}"
+        );
+        assert_eq!(router.requests.lock().unwrap().len(), 1);
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_fork_admission_without_a_usable_reply_stays_owed() {
+    for (case, reply) in [
+        ("lost-reply", Some(Err("disconnected".into()))),
+        ("invalid-reply", Some(Ok(Ok(br#"{"result":{}}"#.to_vec())))),
+        ("timed-out", None),
+    ] {
+        let router = Arc::new(ForkRouting {
+            requests: Mutex::new(Vec::new()),
+            reply,
+            release_fails: false,
+            fork_of: false,
+        });
+        let (root, _vault, executor, server) = fork_fixture(case, router.clone()).await;
         assert_eq!(
             executor.fork_call(fork_job(&root, &server.url)).await,
             ForkCallOutcome::Refused(ForkCallRefusal::AccountHeld {
                 routing_code: None,
                 mismatch: None
-            })
+            }),
+            "{case}"
         );
         assert_eq!(router.requests.lock().unwrap().len(), 1);
         assert!(server.requests.lock().unwrap().is_empty());
+        assert!(
+            executor.fork_release_failed("fork-admission"),
+            "{case}: without a definite refusal, the manager must not record Released"
+        );
     }
 }
 
@@ -272,7 +324,7 @@ async fn fork_digest_refusal_releases_without_model_call() {
 async fn a_fork_release_routing_never_received_is_reported_once() {
     let router = Arc::new(ForkRouting {
         requests: Mutex::new(Vec::new()),
-        reply: fork_chosen("head-account", "apikey:anthropic", None),
+        reply: Some(fork_chosen("head-account", "apikey:anthropic", None)),
         release_fails: true,
         fork_of: false,
     });
@@ -317,7 +369,7 @@ async fn fork_restart_release_only_routed_and_reports_delivery_failure() {
     assert_fork_release(&router, 0);
     let failed = Arc::new(ForkRouting {
         requests: Mutex::new(Vec::new()),
-        reply: Err("unused".into()),
+        reply: None,
         release_fails: true,
         fork_of: false,
     });
@@ -432,7 +484,7 @@ async fn fork_finish_tool_call_refused_only_text_before_call() {
 async fn fork_names_the_head_admission_when_routing_declares_fork_of() {
     let router = Arc::new(ForkRouting {
         requests: Mutex::new(Vec::new()),
-        reply: fork_chosen("head-account", "apikey:anthropic", None),
+        reply: Some(fork_chosen("head-account", "apikey:anthropic", None)),
         release_fails: false,
         fork_of: true,
     });
@@ -575,6 +627,17 @@ fn fork_reply_text(text: &str) -> broca_protocol::content::ContentBlock {
     broca_protocol::content::ContentBlock::Text { text: text.into() }
 }
 
+fn fork_reply_text_with_state(text: &str) -> broca_protocol::content::ContentBlock {
+    use broca_protocol::content::{ContentBlock, TextProviderFormat, TextProviderState};
+    ContentBlock::TextWithState {
+        text: text.into(),
+        provider_state: TextProviderState {
+            format: TextProviderFormat::OpenAiResponses,
+            data: r#"{"phase":"final_answer"}"#.into(),
+        },
+    }
+}
+
 fn fork_reply_call() -> broca_protocol::content::ContentBlock {
     broca_protocol::content::ContentBlock::ToolCall(broca_protocol::content::ToolCall {
         tool_call_id: broca_protocol::ToolCallId("call-1".into()),
@@ -637,6 +700,19 @@ fn a_fork_reply_without_a_named_stop_reason_is_a_completed_answer() {
 }
 
 #[test]
+fn a_fork_end_turn_keeps_responses_text_with_state() {
+    let reply = fork_reply_message(vec![fork_reply_text_with_state("the answer")]);
+    let result = fork_reply(
+        &reply,
+        broca_protocol::FinishReason::Stop,
+        None,
+        &StreamedText::default(),
+        Default::default(),
+    );
+    assert_eq!(fork_reply_answer(result), ("the answer".into(), "end_turn".into()));
+}
+
+#[test]
 fn a_refused_tool_call_answers_with_the_text_streamed_before_it() {
     use broca_protocol::display::DisplayEvent;
     use broca_protocol::FinishReason;
@@ -693,4 +769,11 @@ fn a_refused_tool_call_answers_with_the_text_streamed_before_it() {
     ]);
     assert_eq!(answer(&ordered_blocks, &ordered).0, "before tool");
     assert_eq!(answer(&ordered_blocks, &StreamedText::default()).0, "before tool");
+
+    let stateful = fork_reply_message(vec![
+        fork_reply_text_with_state("before toolafter tool"),
+        fork_reply_call(),
+    ]);
+    assert_eq!(answer(&stateful, &ordered).0, "before tool");
+    assert_eq!(answer(&stateful, &StreamedText::default()).0, "before toolafter tool");
 }

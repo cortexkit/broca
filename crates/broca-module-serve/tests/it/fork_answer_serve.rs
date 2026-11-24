@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use broca_core::{AllowAll, FileLeaseStore, OutputEvent};
+use broca_core::{AllowAll, FileLeaseStore, LeaseStore, OutputEvent};
 use broca_module::actor::{SendKey, SendOutcome, SendPlan};
 use broca_module::executor::{
     ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, RunExecutor, RunKind,
@@ -25,6 +25,7 @@ use broca_protocol::content::{AssistantMessage, ContentBlock, FinishReason};
 use broca_protocol::{
     BindIdentity, MessageId, NormalizedEvent, ProviderControl, RunId, SubmissionRequest, Usage,
 };
+use cortexkit_role_llm_runner::fork_answer::{ForkAskReply, ForkAskRequest};
 use cortexkit_role_llm_runner::usage::RunUsage;
 use serde_json::{json, Value};
 use subc_protocol::session::ModuleControlRequest;
@@ -75,14 +76,33 @@ struct Hold {
     release: oneshot::Receiver<()>,
 }
 
+impl Hold {
+    async fn install(
+        slot: &tokio::sync::Mutex<Option<Self>>,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (arrived, arrival) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        *slot.lock().await = Some(Self {
+            arrived: Some(arrived),
+            release: released,
+        });
+        (arrival, release)
+    }
+}
+
+type UsageCallback = Arc<dyn Fn(RunUsage) + Send + Sync>;
+
 /// What the fork's model calls answer, in order, and what they were asked.
 #[derive(Default)]
 struct ForkScript {
     outcomes: Mutex<VecDeque<ForkCallOutcome>>,
     calls: Mutex<Vec<Call>>,
     hold: tokio::sync::Mutex<Option<Hold>>,
+    hold_release: tokio::sync::Mutex<Option<Hold>>,
     /// Usage each call reports before it answers.
     report: Mutex<Option<RunUsage>>,
+    /// Keeps an idle usage writer waiting after the call answers.
+    capture_usage: Mutex<Option<oneshot::Sender<UsageCallback>>>,
     released: Mutex<Vec<String>>,
     /// The next call's own release didn't reach routing (`fork_release_failed`).
     release_fails: std::sync::atomic::AtomicBool,
@@ -99,13 +119,7 @@ impl ForkScript {
 
     /// Holds the next call; the returned pair says when it arrived and lets it go.
     async fn hold_next(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
-        let (arrived, arrival) = oneshot::channel();
-        let (release, released) = oneshot::channel();
-        *self.hold.lock().await = Some(Hold {
-            arrived: Some(arrived),
-            release: released,
-        });
-        (arrival, release)
+        Hold::install(&self.hold).await
     }
 }
 
@@ -332,6 +346,9 @@ impl RunExecutor for StoreLoop {
             base: job.base.opts.clone(),
             base_digest: job.base.request_body_sha256.clone(),
         });
+        if let Some(capture) = self.forks.capture_usage.lock().unwrap().take() {
+            let _ = capture.send(job.on_usage.clone().unwrap());
+        }
         let report = self.forks.report.lock().unwrap().clone();
         if let Some(report) = report {
             if let Some(on_step) = &job.on_step {
@@ -372,6 +389,11 @@ impl RunExecutor for StoreLoop {
     }
 
     async fn fork_release(&self, job: ForkReleaseJob) -> Result<(), String> {
+        let hold = self.forks.hold_release.lock().await.take();
+        if let Some(mut hold) = hold {
+            hold.arrived.take().unwrap().send(()).unwrap();
+            hold.release.await.unwrap();
+        }
         self.forks.released.lock().unwrap().push(job.admission_id);
         Ok(())
     }
@@ -810,6 +832,35 @@ fn ask_params(fork: &str, ask_id: &str, question: &str) -> Value {
 }
 
 impl Rig {
+    /// Call the manager directly so the connection does not serialize requests on the same head.
+    async fn manager_ask(
+        &self,
+        fork: &str,
+        ask_id: &str,
+        question: &str,
+    ) -> Result<ForkAskReply, broca_module::fork_answer::ForkError> {
+        let principal = broca_protocol::BindPrincipal::Reserved {
+            module_id: ASKER.into(),
+        };
+        let request: ForkAskRequest = serde_json::from_value(json!({
+            "fork_id": fork, "ask_id": ask_id, "question": question,
+        }))
+        .unwrap();
+        self.registry
+            .fork_manager()
+            .unwrap()
+            .ask(&self.key, Some(&principal), request)
+            .await
+    }
+
+    fn acquire_fork_lease(
+        &self,
+        fork: &str,
+    ) -> Result<Box<dyn broca_core::LeaseHandle>, broca_core::LeaseError> {
+        let fork_key = broca_module::fork_answer::fork_session(&self.key, fork);
+        FileLeaseStore::new(self.dir.join("leases")).acquire(&broca_core::lease_key_for(&fork_key))
+    }
+
     /// The usage export's facts of every fork session, in the order they were written.
     fn fork_facts(&self) -> Vec<broca_core::billing::SpendSegment> {
         use broca_core::ExportIndex as _;
@@ -1478,6 +1529,125 @@ async fn a_release_routing_never_heard_of_stays_owed_and_is_sent_again() {
         *forks.released.lock().unwrap(),
         [broca_module::executor::fork_admission_id(&fork, "first", 1)],
         "the owed release is sent again when the fork opens"
+    );
+}
+
+#[tokio::test]
+async fn a_completed_fork_ask_releases_its_file_lease_with_an_idle_usage_writer() {
+    let mut rig = Rig::head("idle-usage-writer", vec![text_step("a", "head reply")]).await;
+    let fork = rig.prepare(1).await.unwrap();
+    let (capture, usage_callback) = oneshot::channel();
+    *rig.forks.capture_usage.lock().unwrap() = Some(capture);
+    rig.forks.answer(answered("stored answer"));
+    rig.ask(1, &fork, "ask", "the question").await.unwrap();
+    let usage_callback = usage_callback.await.unwrap();
+    let lease = rig.acquire_fork_lease(&fork);
+    drop(usage_callback);
+    assert!(
+        lease.is_ok(),
+        "a completed ask's idle usage writer must not hold the fork lease"
+    );
+}
+
+#[tokio::test]
+async fn cold_fork_recovery_does_not_block_another_fork_opening() {
+    let mut rig = Rig::head("cold-fork", vec![text_step("a", "head reply")]).await;
+    let cold_fork = rig.prepare(1).await.unwrap();
+    let other_fork = rig.prepare(1).await.unwrap();
+    rig.forks.answer(answered("cold answer"));
+    rig.forks
+        .release_fails
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.ask(1, &cold_fork, "cold", "cold question")
+        .await
+        .unwrap();
+    rig.forks.answer(answered("other answer"));
+    let other_answer = rig
+        .ask(1, &other_fork, "other", "other question")
+        .await
+        .unwrap();
+    let image = scratch("cold-fork-image");
+    crash_image(&rig.dir, &image);
+
+    let forks = Arc::new(ForkScript::default());
+    let reopened = Rig::open(image, vec![], Arc::clone(&forks), true).await;
+    let (arrived, resume) = Hold::install(&forks.hold_release).await;
+    let cold = reopened.manager_ask(&cold_fork, "cold", "cold question");
+    let other = async {
+        broca_test_support::wait_for("the cold fork's release arrives", arrived, String::new)
+            .await
+            .unwrap();
+        let result = broca_test_support::event_timeout(
+            "the unrelated fork answers while the cold fork's release is pending",
+            reopened.manager_ask(&other_fork, "other", "other question"),
+            String::new,
+        )
+        .await;
+        resume.send(()).unwrap();
+        result
+    };
+    let (cold, other) = tokio::join!(cold, other);
+    assert!(cold.is_ok(), "{cold:?}");
+    assert_eq!(
+        serde_json::to_value(other.unwrap().unwrap()).unwrap(),
+        other_answer
+    );
+    assert_eq!(
+        *forks.released.lock().unwrap(),
+        [broca_module::executor::fork_admission_id(
+            &cold_fork, "cold", 1
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_disconnected_fork_ask_is_recovered_on_the_next_ask_without_restart() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut rig = Rig::head("disconnected", vec![text_step("a", "head reply")]).await;
+    let fork = rig.prepare(1).await.unwrap();
+    let (arrival, mut release) = rig.forks.hold_next().await;
+    rig.send_request(1, ask_params(&fork, "cut", "cut question"))
+        .await;
+    broca_test_support::wait_for("the fork call arrives", arrival, String::new)
+        .await
+        .unwrap();
+    rig.writer.shutdown().await.unwrap();
+    broca_test_support::wait_for(
+        "the disconnected fork call is dropped",
+        release.closed(),
+        String::new,
+    )
+    .await;
+    assert!(rig.forks.released.lock().unwrap().is_empty());
+
+    let lease =
+        broca_test_support::wait_until("the dropped ask releases its file lease", || async {
+            rig.acquire_fork_lease(&fork)
+                .map_err(|error| format!("{error:?}"))
+        })
+        .await;
+    // If the old loaded slot were still open, the manager would not need to acquire the lease.
+    let ask_again = || rig.manager_ask(&fork, "cut", "cut question");
+    assert!(matches!(ask_again().await,
+        Err(broca_module::fork_answer::ForkError::Transient(message)) if message.contains("the fork's lease")
+    ));
+    drop(lease);
+    let recovered =
+        serde_json::to_value(ask_again().await.expect("recover the disconnected ask")).unwrap();
+    assert_eq!(
+        recovered,
+        json!({"answer": "", "finish": "model_error", "usage": RunUsage::default()})
+    );
+    assert_eq!(
+        serde_json::to_value(ask_again().await.unwrap()).unwrap(),
+        recovered
+    );
+    assert_eq!(rig.forks.calls().len(), 1, "do not send the cut ask again");
+    assert_eq!(
+        *rig.forks.released.lock().unwrap(),
+        [broca_module::executor::fork_admission_id(&fork, "cut", 1)],
+        "report the cut admission's end once"
     );
 }
 
