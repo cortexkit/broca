@@ -72,6 +72,8 @@ mod call_plan;
 use call_plan::{hook_plan, plan_calls, CallPlan};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused};
+mod plan_notes;
+use plan_notes::{refresh_applied, removed_tools, with_plan_notes};
 mod resolved;
 use resolved::{resolve, Resolved};
 mod stops;
@@ -1672,20 +1674,6 @@ pub fn admission_of_start(
     })
 }
 
-/// A run start's application of a pending plan change, as the record that follows the run's
-/// input in the start's batch keeps it.
-pub fn refresh_applied(
-    applied: &broca_protocol::session_change::AppliedChange,
-) -> broca_session_store::record::RefreshApplied {
-    broca_session_store::record::RefreshApplied {
-        generation: applied.generation,
-        applied_by: applied.applied_by.clone(),
-        manifest_digest: applied.manifest_digest.clone(),
-        composition_digest: applied.composition_digest.clone(),
-        absent_items: applied.absent_items.clone(),
-    }
-}
-
 /// A session compacted under the first compaction protocol keeps rendering under that protocol's
 /// last view; the run loop refuses it rather than send different bytes.
 fn refuse_first_protocol_compaction<W: Writer>(writer: &W) -> Result<(), LoopError> {
@@ -1927,9 +1915,10 @@ async fn offline_request_for<W: Writer>(
     )?;
     finalize_tool_choice(writer, &mut opts);
     if !compacted {
-        return Ok(opts);
+        return Ok(with_plan_notes(writer, opts));
     }
-    crate::compaction::offline_prompt(writer, &admission, bind, step_id, opts).await
+    let opts = crate::compaction::offline_prompt(writer, &admission, bind, step_id, opts).await?;
+    Ok(with_plan_notes(writer, opts))
 }
 
 /// Disables tool calls on the budget's finalize step, and says whether the step is one. The step
@@ -2662,6 +2651,7 @@ where
                 }
             }
         }
+        let opts = with_plan_notes(writer, opts);
         // Client-side refusal fallback: the step goes to the run's refusal-fallback model while
         // the session's schedule says so, or when it is a step already refused and re-sent.
         let mut route = crate::refusal::Route::decide(writer, seams.provider, step_id)?;
@@ -4503,6 +4493,7 @@ where
         seams.approval,
         hooks,
         step_id,
+        &removed_tools(writer.operations()),
     )
     .await?
     else {

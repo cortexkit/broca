@@ -27,7 +27,8 @@ pub(super) enum CallPlan {
 
 /// Decides each call's plan in the message's order, or `None` when a stop or the caller's
 /// cancel cuts a pre-tool hook short: a repeated call id gets an error; a call a resume already
-/// knows is sent as recorded; a refused batch refuses
+/// knows is sent as recorded; a call to a tool a pending plan change removes (`removed`) is
+/// refused with its removal wording; a refused batch refuses
 /// every call; a call the run's manifest doesn't allow is never sent. A valid call then goes
 /// through the pre-tool mutate hooks, a second manifest check, the approval policy and the
 /// validate hooks; its input in `calls` becomes what those left, so its intent records it.
@@ -40,12 +41,13 @@ pub(super) async fn plan_calls(
     approval: &dyn ApprovalPolicy,
     hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
     step_id: u64,
+    removed: &std::collections::BTreeSet<String>,
 ) -> Result<Option<Vec<CallPlan>>, LoopError> {
     let mut seen = std::collections::HashSet::new();
     let mut plans = Vec::with_capacity(calls.len());
     for call in calls.iter_mut() {
         let first = seen.insert(call.tool_call_id.clone());
-        let plan = match gate_call(call, first, known, refusal, manifest) {
+        let plan = match gate_call(call, first, known, refusal, manifest, removed) {
             Some(plan) => plan,
             None => match gate_hooked(call, manifest, approval, hooks, step_id).await? {
                 Some(plan) => plan,
@@ -199,6 +201,7 @@ pub(super) fn gate_call(
     known: &[Known],
     refusal: Option<&broca_core::tool_plane::ToolPlaneError>,
     manifest: &ToolManifest,
+    removed: &std::collections::BTreeSet<String>,
 ) -> Option<CallPlan> {
     use broca_core::tool_plane::ToolPlaneError;
     // A repeat of an id is never sent, even when a resume knows the id: what it knows is the
@@ -211,6 +214,18 @@ pub(super) fn gate_call(
     }
     if known.iter().any(|known| known.id == call.tool_call_id) {
         return Some(CallPlan::Dispatch(None));
+    }
+    // The applied plan's tool list still renders a tool its pending change removes, until the
+    // change applies in full; the model was told not to call it, and a call is refused with the
+    // same words (llm-runner `plan_notes`).
+    if removed.contains(&call.tool_name) {
+        return Some(CallPlan::Synthetic {
+            result: error_result(
+                &call.tool_call_id,
+                &broca_core::plan_notes::tool_removal(&call.tool_name),
+            ),
+            reason: None,
+        });
     }
     match refusal {
         None => {}

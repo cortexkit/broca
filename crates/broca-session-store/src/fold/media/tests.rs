@@ -884,6 +884,7 @@ fn enrollment_refresh_and_billing_hand_nothing_over() {
             manifest_digest: "d".into(),
             composition_digest: None,
             absent_items: Vec::new(),
+            reason: None,
         }),
         Record::CompactionEnrolled(CompactionEnrolled {
             through_ordinal: 3,

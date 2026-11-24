@@ -819,7 +819,95 @@ fn refresh(generation: u64, identity: &str, selection: Option<serde_json::Value>
         manifest: Some(serde_json::json!({"plan_identity": identity})),
         selection,
         refetch: Vec::new(),
+        system_note: None,
+        accepted_at_ms: None,
     })
+}
+
+/// Plan notes (llm-runner `plan_notes`) render until their change applies in full: the fold
+/// keeps every delivery since the acceptance, and the time of the oldest change still pending,
+/// which a newer refresh replacing it doesn't reset. The apply clears both. A checkpoint keeps
+/// the notes, and with the must-understand bit a reader that predates them refuses it.
+#[test]
+fn plan_notes_last_until_the_change_applies_and_survive_a_checkpoint() {
+    use crate::codec::Message as _;
+    use crate::record::{PlanNote, PlanNoteKind, PlanNotes, RefreshApplied};
+    let accepted = |generation: u64, at_ms| {
+        let Record::SessionRefresh(mut refresh) = refresh(generation, "plan", None) else {
+            unreachable!()
+        };
+        refresh.policy = "notes_until_rebuild".into();
+        refresh.accepted_at_ms = Some(at_ms);
+        refresh.system_note = Some(format!("note {generation}"));
+        Record::SessionRefresh(refresh)
+    };
+    let notes = |generation, anchor| {
+        Record::PlanNotes(PlanNotes {
+            generation,
+            anchor,
+            notes: vec![PlanNote {
+                kind: PlanNoteKind::ToolRemoval,
+                text: "t".into(),
+                form: "turn_system".into(),
+            }],
+            refused_tools: vec!["t".into()],
+            model_key: "p:m".into(),
+        })
+    };
+    let pending = fold(&[
+        start(),
+        accepted(1, 100),
+        notes(1, 1),
+        accepted(2, 200),
+        notes(2, 3),
+    ])
+    .unwrap();
+    let plan = pending.plan.as_ref().expect("the session took refreshes");
+    assert_eq!(plan.pending_since_ms, Some(100), "the oldest change's age");
+    assert_eq!(
+        plan.pending_note.as_deref(),
+        Some("note 2"),
+        "the pending refresh's note"
+    );
+    let anchors: Vec<u64> = plan.notes.iter().map(|notes| notes.anchor).collect();
+    assert_eq!(anchors, vec![1, 3]);
+    let numbers: Vec<u32> = crate::codec::Fields::new(&plan.encode(), "Plan")
+        .map(Result::unwrap)
+        .filter(|field| field.must)
+        .map(|field| field.number)
+        .collect();
+    assert_eq!(numbers, vec![13, 13]);
+    let checkpoint = crate::checkpoint::Checkpoint {
+        covers_through: 5,
+        next_seq: 6,
+        conversation: crate::fold::conversation::Conversation::new(false),
+        operational: pending.clone(),
+        transcript_base: None,
+        ledger_base: None,
+        activity_ms: None,
+        media: None,
+    };
+    let decoded = crate::checkpoint::Checkpoint::decode(&checkpoint.encode()).unwrap();
+    assert_eq!(decoded.operational.plan, pending.plan);
+    let applied = fold(&[
+        start(),
+        accepted(1, 100),
+        notes(1, 1),
+        start(),
+        Record::RefreshApplied(RefreshApplied {
+            generation: 1,
+            applied_by: "fold".into(),
+            manifest_digest: "m".into(),
+            composition_digest: None,
+            absent_items: Vec::new(),
+            reason: None,
+        }),
+    ])
+    .unwrap();
+    let plan = applied.plan.expect("the session took a refresh");
+    assert!(plan.notes.is_empty(), "the apply ends the notes");
+    assert_eq!(plan.pending_since_ms, None);
+    assert_eq!(plan.pending_note, None);
 }
 
 #[test]

@@ -283,6 +283,8 @@ fn one_of_each() -> Vec<Record> {
             manifest: None,
             selection: Some(serde_json::json!({"provider": "p", "model": "m"})),
             refetch: Vec::new(),
+            system_note: Some("Answer in French.".into()),
+            accepted_at_ms: Some(9),
         }),
         Record::RefreshPolicy(RefreshPolicy {
             generation: 2,
@@ -299,6 +301,7 @@ fn one_of_each() -> Vec<Record> {
             manifest_digest: "m".into(),
             composition_digest: Some("c".into()),
             absent_items: vec![serde_json::json!({"provider": "p", "kind": "tool"})],
+            reason: Some("no_note_form".into()),
         }),
         Record::StructuredResult(StructuredResult {
             run_id: "run-1".into(),
@@ -414,6 +417,84 @@ fn a_retention_fact_keeps_its_kind_number_and_bytes() {
     let body = released.encode_body();
     assert_eq!(crate::codec::hex(&body), "100220ac02");
     assert_eq!(Record::decode(108, &body).unwrap(), released);
+}
+
+#[test]
+fn plan_notes_keep_their_kind_number_and_bytes() {
+    // A session's delivered plan notes render byte for byte in every later request until their
+    // change applies, including after a restart, so the kind number and encoding are pinned:
+    // field numbers in order, each note a nested message with its kind as its declared number.
+    let record = Record::PlanNotes(PlanNotes {
+        generation: 2,
+        anchor: 7,
+        notes: vec![PlanNote {
+            kind: PlanNoteKind::System,
+            text: "n".into(),
+            form: "turn_system".into(),
+        }],
+        refused_tools: vec!["t".into()],
+        model_key: "p:m".into(),
+    });
+    assert_eq!(record.kind(), 109);
+    assert_eq!(record.stream(), Stream::Ledger);
+    assert_eq!(record.activity_ms(), None);
+    let body = record.encode_body();
+    assert_eq!(
+        crate::codec::hex(&body),
+        concat!(
+            "1002",
+            "2007",
+            "3212",
+            "1001",
+            "22016e",
+            "320b7475726e5f73797374656d",
+            "420174",
+            "5203703a6d",
+        )
+    );
+    assert_eq!(Record::decode(109, &body).unwrap(), record);
+}
+
+#[test]
+fn a_system_note_and_an_apply_reason_are_must_understand() {
+    // A reader that skipped the note would render a session's runs without it, and one that
+    // skipped the reason would report a forced apply as an ordinary one.
+    for (record, number) in [
+        (
+            Record::SessionRefresh(SessionRefresh {
+                generation: 1,
+                policy: "notes_until_rebuild".into(),
+                run_in_progress: false,
+                applies_from_next_run: false,
+                setup: vec![],
+                manifest: None,
+                selection: None,
+                refetch: Vec::new(),
+                system_note: Some("note".into()),
+                accepted_at_ms: None,
+            }),
+            9,
+        ),
+        (
+            Record::RefreshApplied(RefreshApplied {
+                generation: 1,
+                applied_by: "fold".into(),
+                manifest_digest: "m".into(),
+                composition_digest: None,
+                absent_items: vec![],
+                reason: Some("no_note_form".into()),
+            }),
+            6,
+        ),
+    ] {
+        let body = record.encode_body();
+        assert_eq!(Record::decode(record.kind(), &body).unwrap(), record);
+        let field = crate::codec::Fields::new(&body, "old reader")
+            .map(Result::unwrap)
+            .find(|field| field.number == number)
+            .unwrap();
+        assert!(field.must, "{} field {number}", record.name());
+    }
 }
 
 #[test]

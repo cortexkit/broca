@@ -4074,6 +4074,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             manifest: rest,
             selection: broca_session_loop::plan::recorded_selection(&manifest),
             refetch,
+            system_note: None,
+            accepted_at_ms: None,
         });
         match self.append_own(record).await {
             Ok(()) => {

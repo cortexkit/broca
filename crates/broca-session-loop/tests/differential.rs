@@ -11446,6 +11446,9 @@ async fn a_converted_sessions_reading_names_the_view_today_rendered_it_under() {
 #[path = "differential/ride_placement.rs"]
 mod ride_placement;
 
+#[path = "differential/plan_notes.rs"]
+mod plan_notes;
+
 /// A call handed back for the person's steer is closed by the interim content its provider
 /// answered with, and its outcome names that provider. That result is written as soon as the
 /// hand-back is answered, without waiting for the other calls dispatched in the same step to

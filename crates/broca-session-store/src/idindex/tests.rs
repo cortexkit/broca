@@ -170,6 +170,8 @@ fn records_name_their_ids() {
         manifest: None,
         selection: None,
         refetch: Vec::new(),
+        system_note: None,
+        accepted_at_ms: None,
     });
     assert_eq!(
         ids(&refresh),
@@ -200,6 +202,7 @@ fn records_name_their_ids() {
         manifest_digest: "m".into(),
         composition_digest: None,
         absent_items: Vec::new(),
+        reason: None,
     });
     assert_eq!(
         ids(&applied),

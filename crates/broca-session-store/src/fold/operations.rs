@@ -1147,6 +1147,32 @@ state! {
             reset: "a refresh that chooses a model",
             bound: Bound::Fixed,
         },
+        /// When the oldest change still pending was accepted, in milliseconds since the Unix
+        /// epoch: a newer refresh that replaces the pending one keeps it. Under policy
+        /// `notes_until_rebuild` the change applies in full once it is six hours old. Absent when
+        /// nothing is pending, or the acceptance recorded no time.
+        12 opt pub pending_since_ms: u64 => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Fixed,
+        },
+        /// The plan notes delivered since the latest apply (llm-runner `plan_notes`), in log
+        /// order: each run's requests render them until the pending change applies in full. A
+        /// reader that skipped them would render requests without the notes and send tools the
+        /// change removed, so they are must-understand.
+        13 rep pub [must] notes: crate::record::PlanNotes => {
+            owner: "admission",
+            reset: "refresh_applied",
+            bound: Bound::Config("one per run start between a refresh's acceptance and its full apply"),
+        },
+        /// The pending refresh's `system_note`, which a run start delivers while the change
+        /// waits under `notes_until_rebuild`. Absent when nothing is pending or the refresh sent
+        /// none.
+        14 opt pub pending_note: String => {
+            owner: "admission",
+            reset: "session_refresh",
+            bound: Bound::Config("at most 8,192 bytes, as llm-runner bounds a system note"),
+        },
     }
 }
 
@@ -1190,6 +1216,9 @@ impl Plan {
         self.effective = plan.effective;
         self.accepted = plan.accepted;
         self.selection = plan.selection;
+        self.pending_since_ms = plan.pending_since_ms;
+        self.notes = plan.notes;
+        self.pending_note = plan.pending_note;
         Transitions {
             accepted_generation: plan.accepted_generation,
             applied_generation: plan.applied_generation,
@@ -1233,18 +1262,27 @@ impl Plan {
             | Record::PrefixFlush(_)
             | Record::ViewApplied(_)
             | Record::RunStart(_)
-            | Record::RefreshApplied(_) => true,
+            | Record::RefreshApplied(_)
+            | Record::PlanNotes(_) => true,
             _ => false,
         };
         if !changes_plan {
             return;
         }
         let state = plan.get_or_insert_with(Plan::default);
+        if let Record::PlanNotes(notes) = record {
+            state.notes.push(notes.clone());
+            return;
+        }
         if let Record::SessionRefresh(refresh) = record {
             state.accepted = Some(ManifestRef::of_refresh(refresh));
             if refresh.selection.is_some() {
                 state.selection.clone_from(&refresh.selection);
             }
+            if state.pending.is_none() {
+                state.pending_since_ms = refresh.accepted_at_ms;
+            }
+            state.pending_note.clone_from(&refresh.system_note);
         }
         let mut change = state.transitions();
         match record {
@@ -1273,6 +1311,10 @@ impl Plan {
                     },
                 };
                 if change.applied(applying).is_some() {
+                    // Applied in full: the notes about it stop rendering.
+                    state.pending_since_ms = None;
+                    state.pending_note = None;
+                    state.notes.clear();
                     state.effective = Some(EffectiveChange {
                         generation: applied.generation,
                         applied_by: applied.applied_by.clone(),

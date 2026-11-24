@@ -177,6 +177,8 @@ pub fn record_ids(record: &Record) -> Vec<(IdKind, String)> {
         Record::Fork(_) => {}
         // A session holds at most one policy and one release, which the operational fold keeps.
         Record::Retention(_) => {}
+        // The operational fold keeps the notes since the latest apply; nothing looks one up by id.
+        Record::PlanNotes(_) => {}
         // A steer's send id is part of its receipt, which the queue owns.
         Record::Steer(steer) => {
             let receipt = steer

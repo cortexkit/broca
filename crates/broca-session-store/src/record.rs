@@ -1195,6 +1195,16 @@ message! {
         /// named them; empty when it named none. Only an identical repeat of this refresh reads
         /// it, so a build without the field may skip it.
         8 rep refetch: String,
+        /// The owner's short description of the change to the system text, under policy
+        /// `notes_until_rebuild` (llm-runner `plan_notes`): what the model is told until the
+        /// change applies in full. A reader without it would render the session's runs without
+        /// the note, so it is must-understand.
+        9 opt [must] system_note: String,
+        /// Wall-clock time of the acceptance, in milliseconds since the Unix epoch. Under
+        /// `notes_until_rebuild` the oldest change still pending applies in full at the first run
+        /// six hours after its acceptance, if no flush, model change or lost prompt cache applied
+        /// it sooner; a reader without the field waits for one of those.
+        10 opt accepted_at_ms: u64,
     }
 }
 
@@ -1236,6 +1246,53 @@ message! {
         4 opt composition_digest: String,
         /// Owned by the fetch-plan code: each absent item as the baseline reports it.
         5 rep absent_items: serde_json::Value,
+        /// Why a change under `notes_until_rebuild` applied in full at a run with no flush, no
+        /// model change, no lost prompt cache and no six-hour wait behind it, the runs where such
+        /// a change applies: `no_note_form` when it changes the system text and the run's route
+        /// has no system-role turn a note could use. Absent otherwise. A reader without it would
+        /// report the apply as an ordinary one, so it is must-understand.
+        6 opt [must] reason: String,
+    }
+}
+
+values! {
+    /// What a [`PlanNote`] tells the model about a pending plan change.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    pub enum PlanNoteKind {
+        /// The plan owner's `system_note`: a short description of the change to the system text.
+        1 System,
+        /// A tool the pending plan no longer offers, in llm-runner's fixed removal wording.
+        2 ToolRemoval,
+    }
+}
+
+message! {
+    /// One plan note: what it announces, the exact text the model sees, and the form it renders
+    /// in (`turn_system`, a system-role message at its place in the conversation).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct PlanNote {
+        1 req kind: PlanNoteKind,
+        2 req text: String,
+        3 req form: String,
+    }
+}
+
+message! {
+    /// What the run whose start shares this record's batch tells the model about the pending
+    /// refresh `generation` under policy `notes_until_rebuild` (llm-runner `plan_notes`), while
+    /// the system text and tools of the applied plan keep rendering. `notes` render right after
+    /// the message of ordinal `anchor`, the last message of the user turn that starts the run, in
+    /// every request until the change applies in full. `refused_tools` are the tools the pending
+    /// plan removes: from this run on, a call to one is refused with its removal wording, whether
+    /// or not a note announced it. `model_key` is the model and route the notes' form was chosen
+    /// for. A ledger record, so reads, history and step counts never see a note.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct PlanNotes {
+        1 req generation: u64,
+        2 req anchor: u64,
+        3 rep notes: PlanNote,
+        4 rep refused_tools: String,
+        5 req model_key: String,
     }
 }
 
@@ -2098,6 +2155,7 @@ records! {
         106 Moved,
         107 Fork,
         108 Retention,
+        109 PlanNotes,
     }
 }
 
