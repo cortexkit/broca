@@ -110,15 +110,32 @@ impl ReadPolicy {
         })
     }
 
-    /// What the policy holds, walked as `broca_session_store::held` walks values.
-    pub(crate) fn heap_bytes(&self) -> usize {
+    /// A policy whose plan in force and accepted plan are both `manifest`.
+    #[cfg(test)]
+    pub(crate) fn with_manifest(manifest: Arc<PlanManifest>) -> Self {
+        Self {
+            ownership: serde_json::from_value(serde_json::json!({})).expect("empty ownership"),
+            effective: Some(Arc::clone(&manifest)),
+            accepted: Some(manifest),
+        }
+    }
+
+    /// What the policy holds, walked as `broca_session_store::held` walks values. A plan
+    /// manifest is shared by every policy (and setup-part cache entry) that read the same part,
+    /// so it is counted only when `seen` doesn't hold it yet, and added to `seen`.
+    pub(crate) fn heap_bytes(&self, seen: &mut std::collections::HashSet<usize>) -> usize {
         use broca_session_store::held::serde_heap_bytes;
-        let manifest = |manifest: &Option<Arc<PlanManifest>>| {
-            manifest.as_deref().map_or(0, |manifest| {
-                std::mem::size_of::<PlanManifest>() + serde_heap_bytes(manifest)
+        let mut manifest = |manifest: &Option<Arc<PlanManifest>>| {
+            manifest.as_ref().map_or(0, |manifest| {
+                if !seen.insert(Arc::as_ptr(manifest) as usize) {
+                    return 0;
+                }
+                std::mem::size_of::<PlanManifest>() + serde_heap_bytes(&**manifest)
             })
         };
-        serde_heap_bytes(&self.ownership) + manifest(&self.effective) + manifest(&self.accepted)
+        let effective = manifest(&self.effective);
+        let accepted = manifest(&self.accepted);
+        serde_heap_bytes(&self.ownership) + effective + accepted
     }
 }
 

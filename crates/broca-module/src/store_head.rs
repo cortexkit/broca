@@ -577,11 +577,11 @@ impl KeptHeads {
     }
 
     /// What the kept heads hold, walked now (see `broca_session_store::held`), with their cap.
-    /// A plan manifest that several heads, or a head and its read policy, share is counted for
-    /// each.
+    /// A plan manifest that several heads' read policies share is counted once.
     pub(crate) fn memory(&self) -> broca_wire::MemoryCache {
         use broca_session_store::held::{serde_heap_bytes, HeldBytes};
         let kept = self.lock();
+        let mut seen = std::collections::HashSet::new();
         let estimated = kept
             .heads
             .iter()
@@ -596,7 +596,7 @@ impl KeptHeads {
                     + head
                         .read_policy
                         .as_ref()
-                        .map_or(0, crate::reader_admission::ReadPolicy::heap_bytes)
+                        .map_or(0, |policy| policy.heap_bytes(&mut seen))
             })
             .sum::<usize>();
         broca_wire::MemoryCache {
