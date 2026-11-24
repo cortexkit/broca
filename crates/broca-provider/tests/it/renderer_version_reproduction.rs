@@ -204,6 +204,12 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/google_codeassist_v7.json"))
             .expect("Code Assist v7 pins are JSON"),
     );
+    // The same Claude config frozen at v8, rendered by the v8 code, before v9 gave a Claude
+    // config's replayed calls their ids.
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/google_codeassist_v8.json"))
+            .expect("Code Assist v8 pins are JSON"),
+    );
     pins.extend(
         serde_json::from_str::<Vec<Value>>(include_str!(
             "../fixtures/pre_chat_reasoning_policy.json"

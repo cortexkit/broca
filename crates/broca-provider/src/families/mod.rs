@@ -446,6 +446,8 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
             // v8 changes a request only when its config was frozen at v8, which a v7 config was
             // not, even one for a Claude model.
             (7, Reproducible),
+            // v9 changes a request only when its config was frozen at v9.
+            (8, Reproducible),
         ],
         WireFamilyId::OpenAiResponsesChatgpt => &[
             (
@@ -997,13 +999,15 @@ pub fn frozen_config_for_family(
 /// v8: a request to a Claude model leaves out replayed reasoning and every thought signature, and
 /// its labels say `used_claude`, as Antigravity's own client sends them. Only a Claude model's
 /// config freezes v8 ([`google_codeassist_renderer_version`]).
-pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 8;
+/// v9: a request to a Claude model names each replayed tool call and its result by one id,
+/// which Claude requires.
+pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 9;
 
-/// The Code Assist render ABI version a config for `wire_model_id` freezes: v8 for a Claude
-/// model, v7 otherwise.
+/// The Code Assist render ABI version a config for `wire_model_id` freezes: the current version
+/// for a Claude model, v7 otherwise.
 ///
-/// v8 changes only a Claude model's requests, so recording v8 for any other model would make a
-/// later rollback refuse to resume runs whose bytes are unchanged.
+/// v8 and v9 change only a Claude model's requests, so recording them for any other model would
+/// make a later rollback refuse to resume runs whose bytes are unchanged.
 pub fn google_codeassist_renderer_version(wire_model_id: &str) -> u32 {
     if google_codeassist::is_claude_wire_model(wire_model_id) {
         GOOGLE_CODEASSIST_RENDERER_VERSION

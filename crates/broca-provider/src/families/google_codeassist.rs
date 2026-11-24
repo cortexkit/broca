@@ -85,6 +85,14 @@ pub(crate) fn sends_claude_shape(frozen: &FrozenRenderConfig) -> bool {
         && is_claude_wire_model(&frozen.wire_model_id)
 }
 
+/// Whether a Claude request names each replayed tool call and its result by one id. Antigravity
+/// passes them to Claude as `tool_use.id` and `tool_use_id`, which Claude requires: a request
+/// replaying a call without one is refused `tool_use.id: Field required`. A config frozen
+/// before v9 keeps its old bytes.
+pub(crate) fn sends_claude_call_ids(frozen: &FrozenRenderConfig) -> bool {
+    sends_claude_shape(frozen) && frozen.renderer_version >= 9
+}
+
 fn build_envelope<'a>(
     frozen: &FrozenRenderConfig,
     opts: &CallOptions,
@@ -746,10 +754,10 @@ mod tests {
     }
 
     #[test]
-    fn only_a_claude_model_freezes_v8() {
+    fn only_a_claude_model_freezes_v9() {
         assert_eq!(
             crate::families::google_codeassist_renderer_version("claude-sonnet-5-5-high"),
-            8
+            9
         );
         assert_eq!(
             crate::families::google_codeassist_renderer_version("gemini-3.5-flash-low"),
@@ -758,7 +766,7 @@ mod tests {
         assert_eq!(
             crate::families::google_codeassist_frozen_config("claude-opus-5-5-thinking")
                 .renderer_version,
-            8
+            9
         );
         assert_eq!(
             crate::families::google_codeassist_frozen_config("gemini-2.5-flash").renderer_version,
@@ -774,7 +782,7 @@ mod tests {
             contents[1],
             json!({"role": "model", "parts": [
                 {"text": "partial answer"},
-                {"functionCall": {"name": "read", "args": {"path": "a.rs"}}},
+                {"functionCall": {"id": "toolu_1_0", "name": "read", "args": {"path": "a.rs"}}},
             ]}),
             "{body}"
         );
@@ -784,6 +792,69 @@ mod tests {
             body["request"]["labels"]["used_claude_conservative"],
             json!("true")
         );
+    }
+
+    /// Each replayed call and its result carry one id, unique in the request although the stored
+    /// ids repeat from one answer to the next, and stable across renders.
+    #[test]
+    fn a_claude_call_and_its_result_share_an_id_unique_in_the_request() {
+        let model = broca_protocol::ModelHandle::new("google", "antigravity-claude-sonnet-5-5");
+        let call = |path: &str| {
+            Message::assistant_from(
+                vec![ContentBlock::ToolCall(ToolCall {
+                    tool_call_id: ToolCallId("call_0".into()),
+                    tool_name: "read".into(),
+                    input: json!({"path": path}).into(),
+                    thought_signature: None,
+                    provider_state: None,
+                })],
+                model.clone(),
+            )
+        };
+        let result = || {
+            Message::new(
+                broca_protocol::Role::Tool,
+                vec![ContentBlock::ToolResult(broca_protocol::ToolResult {
+                    tool_call_id: ToolCallId("call_0".into()),
+                    output: broca_protocol::ToolOutput::Text { text: "ok".into() },
+                    is_error: false,
+                })],
+            )
+        };
+        let mut prompt = vec![
+            user("read both"),
+            call("a.rs"),
+            result(),
+            call("b.rs"),
+            result(),
+        ];
+        broca_protocol::content::stamp_ordinals(&mut prompt);
+        let mut opts = CallOptions::new(prompt);
+        opts.target_model = Some(model);
+        opts.step_context = Some(step("run-1", 3));
+        let body = GoogleCodeAssist.shape(&claude_frozen(), &opts);
+        let contents = &body["request"]["contents"];
+        let ids: Vec<_> = (1..=4)
+            .map(|index| {
+                let part = &contents[index]["parts"][0];
+                part["functionCall"]["id"]
+                    .as_str()
+                    .or(part["functionResponse"]["id"].as_str())
+                    .unwrap_or_else(|| panic!("no id on {part}"))
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(ids[0], ids[1], "a call and its result share an id: {body}");
+        assert_eq!(ids[2], ids[3], "a call and its result share an id: {body}");
+        assert_ne!(ids[0], ids[2], "two calls never share an id: {body}");
+        assert_eq!(GoogleCodeAssist.shape(&claude_frozen(), &opts), body);
+        // A config frozen at v8 keeps sending its calls without ids.
+        let mut v8 = claude_frozen();
+        v8.renderer_version = 8;
+        let old = GoogleCodeAssist.shape(&v8, &opts);
+        assert!(old["request"]["contents"][1]["parts"][0]["functionCall"]
+            .get("id")
+            .is_none());
     }
 
     #[test]

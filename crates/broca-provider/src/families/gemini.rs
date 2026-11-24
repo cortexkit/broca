@@ -369,14 +369,25 @@ fn convert_contents_with_provenance<'a>(
     let mut current_tool_call_names = BTreeMap::new();
     // Claude through Antigravity takes no replayed reasoning and no thought signatures.
     let replays_signed_parts = !super::google_codeassist::sends_claude_shape(frozen);
+    // Claude needs every replayed call and its result named by the same id
+    // (`google_codeassist::sends_claude_call_ids`): the last model turn's call ids, by the
+    // stored call id each result names.
+    let names_calls = super::google_codeassist::sends_claude_call_ids(frozen);
+    let mut current_call_ids: BTreeMap<String, String> = BTreeMap::new();
 
     let mut i = 0;
     while i < non_system.len() {
         let m = non_system[i];
         match m.role {
             Role::User => {
-                let parts = convert_user_parts(&m.content, &current_tool_call_names, media);
+                let parts = convert_user_parts(
+                    &m.content,
+                    &current_tool_call_names,
+                    &current_call_ids,
+                    media,
+                );
                 current_tool_call_names.clear();
+                current_call_ids.clear();
                 // Gemini rejects turns left empty after unsupported blocks are stripped.
                 if !parts.is_empty() {
                     if let Some(sink) = provenance.as_deref_mut() {
@@ -391,6 +402,25 @@ fn convert_contents_with_provenance<'a>(
             }
             Role::Assistant => {
                 current_tool_call_names = tool_call_names_in_message(m, name_map);
+                let call_ids = names_calls.then(|| claude_call_ids(m, out.len()));
+                current_call_ids = call_ids
+                    .as_ref()
+                    .map(|ids| {
+                        m.content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::ToolCall(call) => Some(call.tool_call_id.0.clone()),
+                                _ => None,
+                            })
+                            .zip(ids.iter().cloned())
+                            // A stored id the message repeats pairs its result with its first
+                            // call.
+                            .fold(BTreeMap::new(), |mut map, (stored, id)| {
+                                map.entry(stored).or_insert(id);
+                                map
+                            })
+                    })
+                    .unwrap_or_default();
                 let echo_safe = replays_signed_parts
                     && crate::families::signed_reasoning_is_echo_safe(
                         m.origin.as_ref(),
@@ -399,6 +429,7 @@ fn convert_contents_with_provenance<'a>(
                 let parts = convert_model_parts(
                     &m.content,
                     frozen.tool_id,
+                    call_ids.as_deref(),
                     echo_safe,
                     name_map,
                     |format| {
@@ -431,6 +462,7 @@ fn convert_contents_with_provenance<'a>(
                     parts.extend(convert_tool_result_parts(
                         non_system[i],
                         &current_tool_call_names,
+                        &current_call_ids,
                         media,
                     ));
                     if let Some((sink, start)) = provenance.as_deref_mut().zip(start) {
@@ -439,6 +471,7 @@ fn convert_contents_with_provenance<'a>(
                     i += 1;
                 }
                 current_tool_call_names.clear();
+                current_call_ids.clear();
                 if !parts.is_empty() {
                     out.push(Node::object([
                         ("role", Node::str("user")),
@@ -448,6 +481,7 @@ fn convert_contents_with_provenance<'a>(
             }
             Role::System => {
                 current_tool_call_names.clear();
+                current_call_ids.clear();
                 i += 1;
             }
         }
@@ -455,9 +489,25 @@ fn convert_contents_with_provenance<'a>(
     out
 }
 
+/// The ids a Claude request names `message`'s tool calls by, in call order: unique in the
+/// request and the same on every render of the message. The stored ids repeat from one answer
+/// to the next (`call_0` in each), and Claude refuses a request naming one id twice, so each
+/// id carries the message's ordinal, or its place in the request when it has none.
+fn claude_call_ids(message: &Message, position: usize) -> Vec<String> {
+    let key = message.ordinal.unwrap_or(position as u64);
+    message
+        .content
+        .iter()
+        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .enumerate()
+        .map(|(index, _)| format!("toolu_{key}_{index}"))
+        .collect()
+}
+
 fn convert_user_parts<'a>(
     blocks: &'a [ContentBlock],
     id_to_name: &BTreeMap<String, String>,
+    call_ids: &BTreeMap<String, String>,
     media: Option<&MediaRender<'_>>,
 ) -> Vec<Node<'a>> {
     blocks
@@ -475,9 +525,12 @@ fn convert_user_parts<'a>(
             ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. } => {
                 Some(text_part(text))
             }
-            ContentBlock::ToolResult(result) => {
-                Some(convert_tool_result_part(result, id_to_name, media))
-            }
+            ContentBlock::ToolResult(result) => Some(convert_tool_result_part(
+                result,
+                id_to_name,
+                call_ids.get(&result.tool_call_id.0).map(String::as_str),
+                media,
+            )),
             _ => None,
         })
         .collect()
@@ -488,9 +541,12 @@ fn text_part(text: &str) -> Node<'_> {
     Node::object([("text", Node::str(text))])
 }
 
+/// `call_ids`, when given, names each tool call in order (`claude_call_ids`) in place of the
+/// family's own id policy.
 fn convert_model_parts<'a>(
     blocks: &'a [ContentBlock],
     tool_id: ToolIdPolicy,
+    call_ids: Option<&[String]>,
     signed_calls_are_echo_safe: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
     text_state_is_echo_safe: impl Fn(broca_protocol::content::TextProviderFormat) -> bool,
@@ -578,7 +634,11 @@ fn convert_model_parts<'a>(
                     ),
                     ("args", Node::Json(&tc.input)),
                 ]);
-                if tool_id == ToolIdPolicy::Passthrough {
+                if let Some(ids) = call_ids {
+                    if let Some(id) = ids.get(call_index as usize - 1) {
+                        fc.insert("id", Node::string(id.clone()));
+                    }
+                } else if tool_id == ToolIdPolicy::Passthrough {
                     fc.insert("id", Node::string(wire_id));
                 }
                 let mut part = Node::object([("functionCall", fc)]);
@@ -624,22 +684,29 @@ fn tool_call_names_in_message(
 fn convert_tool_result_parts<'a>(
     m: &'a Message,
     id_to_name: &BTreeMap<String, String>,
+    call_ids: &BTreeMap<String, String>,
     media: Option<&MediaRender<'_>>,
 ) -> Vec<Node<'a>> {
     m.content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolResult(result) => {
-                Some(convert_tool_result_part(result, id_to_name, media))
-            }
+            ContentBlock::ToolResult(result) => Some(convert_tool_result_part(
+                result,
+                id_to_name,
+                call_ids.get(&result.tool_call_id.0).map(String::as_str),
+                media,
+            )),
             _ => None,
         })
         .collect()
 }
 
+/// A tool result's `functionResponse` part. `call_id`, when given, is the id its call was
+/// rendered with, which the part carries too (`claude_call_ids`).
 fn convert_tool_result_part<'a>(
     result: &'a ToolResult,
     id_to_name: &BTreeMap<String, String>,
+    call_id: Option<&str>,
     media: Option<&MediaRender<'_>>,
 ) -> Node<'a> {
     let name = id_to_name
@@ -672,15 +739,19 @@ fn convert_tool_result_part<'a>(
         if !inline.is_empty() {
             function_response["parts"] = json!(inline);
         }
+        if let Some(id) = call_id {
+            function_response["id"] = json!(id);
+        }
         return Node::value(json!({ "functionResponse": function_response }));
     }
-    Node::object([(
-        "functionResponse",
-        Node::object([
-            ("name", Node::string(name)),
-            ("response", function_response_payload(&result.output)),
-        ]),
-    )])
+    let mut function_response = Node::object([
+        ("name", Node::string(name)),
+        ("response", function_response_payload(&result.output)),
+    ]);
+    if let Some(id) = call_id {
+        function_response.insert("id", Node::string(id.to_owned()));
+    }
+    Node::object([("functionResponse", function_response)])
 }
 
 fn media_part(reference: &MediaRef, tool: bool, media: Option<&MediaRender<'_>>) -> Value {
@@ -1545,7 +1616,7 @@ mod tests {
 
         assert_eq!(
             serde_json::to_vec(
-                &convert_user_parts(&blocks, &BTreeMap::new(), None)
+                &convert_user_parts(&blocks, &BTreeMap::new(), &BTreeMap::new(), None)
                     .iter()
                     .map(Node::to_value)
                     .collect::<Vec<_>>()
