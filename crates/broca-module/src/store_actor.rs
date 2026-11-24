@@ -4126,6 +4126,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 applies_from_next_run,
             } => (run_in_progress, applies_from_next_run),
         };
+        // A note sent with system text that didn't change is ignored, as if absent.
+        let system_note = system_note.filter(|_| {
+            crate::plan_change::system_text_changed(facts.current_manifest.as_deref(), &manifest)
+        });
         let mut setup = Vec::new();
         let rest =
             match broca_session_loop::run::manifest_parts(&manifest, &mut self.parts, &mut setup) {

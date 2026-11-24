@@ -113,8 +113,12 @@ pub(crate) fn refresh_order(
                 .as_ref()
                 .expect("a repeat names an accepted refresh");
             // An identical repeat carries the same note too (llm-runner `plan_notes`); another
-            // body under an accepted generation is stale, as any other change would be.
-            if accepted.system_note.as_deref() != system_note {
+            // body under an accepted generation is stale, as any other change would be. A
+            // `notes_until_rebuild` refresh recorded with no note didn't change the system text,
+            // so a note its repeat carries is ignored as the first one's was.
+            let ignored = accepted.system_note.is_none()
+                && accepted.policy == cortexkit_role_llm_runner::plan_notes::NOTES_UNTIL_REBUILD;
+            if accepted.system_note.as_deref() != system_note && !ignored {
                 return Err(SessionChangeError::GenerationStale {
                     accepted: facts.accepted_generation,
                 });
@@ -233,17 +237,23 @@ pub(crate) fn accept_refresh(
     }
 }
 
+/// Whether `next`'s system text differs from the applied plan's, `current` (none applied reads as
+/// empty text).
+pub(crate) fn system_text_changed(current: Option<&PlanManifest>, next: &PlanManifest) -> bool {
+    current.map_or("", |current| current.system_text.as_str()) != next.system_text
+}
+
 /// llm-runner's check of a refresh's `system_note` against what it changes: under
-/// `notes_until_rebuild` a note is required exactly when the fetched system text differs from
-/// the applied plan's (none applied reads as empty text), and at most 8,192 bytes; under any
-/// other policy there is none.
+/// `notes_until_rebuild` a note is required when the fetched system text differs from the applied
+/// plan's, and at most 8,192 bytes; one sent when the text is unchanged is accepted and ignored
+/// (the refresh is recorded with none). Under any other policy there is none.
 pub(crate) fn check_system_note(
     current: Option<&PlanManifest>,
     next: &PlanManifest,
     policy: &str,
     system_note: Option<&str>,
 ) -> Result<(), SessionChangeError> {
-    let changed = current.map_or("", |current| current.system_text.as_str()) != next.system_text;
+    let changed = system_text_changed(current, next);
     cortexkit_role_llm_runner::plan_notes::check_refresh(
         policy,
         system_note,
@@ -253,8 +263,8 @@ pub(crate) fn check_system_note(
     .map_err(|field| SessionChangeError::InvalidParams {
         field: field.into(),
         message: if field == "system_note" {
-            "under notes_until_rebuild a system_note is required exactly when the system text \
-             changes, and is at most 8192 bytes"
+            "under notes_until_rebuild a system_note is required when the system text changes, \
+             and is at most 8192 bytes"
                 .into()
         } else {
             format!("policy {policy} is not accepted")
@@ -609,8 +619,9 @@ mod tests {
     }
 
     /// llm-runner `plan_notes`: an identical repeat carries the same note, so another note under
-    /// an accepted generation is stale; a note is required exactly when the system text changes;
-    /// and a policy change to `notes_until_rebuild` needs the note the pending refresh recorded.
+    /// an accepted generation is stale; a note is required when the system text changes, and one
+    /// sent when it didn't is accepted and ignored; and a policy change to `notes_until_rebuild`
+    /// needs the note the pending refresh recorded.
     #[test]
     fn a_system_note_repeats_with_its_refresh_and_comes_exactly_with_a_system_change() {
         let mut facts = facts();
@@ -646,16 +657,18 @@ mod tests {
             )),
             None
         );
-        assert_eq!(
-            field(check_system_note(Some(&current), &same, notes, None)),
-            None
-        );
-        for (next, note) in [(&changed, None), (&same, Some("n"))] {
+        for note in [None, Some("n")] {
             assert_eq!(
-                field(check_system_note(Some(&current), next, notes, note)),
-                Some("system_note".into())
+                field(check_system_note(Some(&current), &same, notes, note)),
+                None,
+                "unchanged text, note {note:?}"
             );
         }
+        assert!(!system_text_changed(Some(&current), &same));
+        assert_eq!(
+            field(check_system_note(Some(&current), &changed, notes, None)),
+            Some("system_note".into())
+        );
         assert_eq!(
             field(check_system_note(
                 Some(&current),
@@ -664,6 +677,21 @@ mod tests {
                 Some("n")
             )),
             Some("system_note".into())
+        );
+        // A notes refresh recorded with no note didn't change the text: a repeat carrying a note
+        // is that refresh again, its note ignored as the first one's was.
+        let mut ignored = facts.clone();
+        let accepted = ignored.accepted.as_mut().unwrap();
+        accepted.policy = notes.into();
+        accepted.system_note = None;
+        assert_eq!(
+            refresh_order(&ignored, 2, "plan-2", notes, &[], Some("n")),
+            Ok(Some((true, true)))
+        );
+        ignored.accepted.as_mut().unwrap().policy = "immediately".into();
+        assert_eq!(
+            refresh_order(&ignored, 2, "plan-2", "immediately", &[], Some("n")),
+            Err(SessionChangeError::GenerationStale { accepted: 2 })
         );
         // A policy change to notes needs the pending refresh's note when the text changes.
         let mut pending = facts;

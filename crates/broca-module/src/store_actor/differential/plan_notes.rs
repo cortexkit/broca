@@ -317,3 +317,49 @@ async fn a_system_change_on_a_route_without_a_form_applies_at_once() {
         vec![("append".to_owned(), Some("no_note_form".to_owned()))]
     );
 }
+
+/// A note sent with a change that leaves the system text as it is (only the tools change) is
+/// accepted and ignored (llm-runner 0.9.5 `plan_notes`): the refresh is recorded with no note,
+/// its run shows none, and a repeat carrying the note again is answered as that refresh.
+#[tokio::test]
+async fn a_note_with_unchanged_system_text_is_accepted_and_ignored() {
+    let first = manifest(&plan("you are a worker", &["read"], None, None), "plan-1");
+    let next = manifest(&plan("you are a worker", &[], None, None), "plan-2");
+    let (module, executor) = module(vec![text_step("a1", "hi"), text_step("a2", "hi")], true).await;
+    send(&module, "r1", Some(&first)).await;
+    for _ in 0..2 {
+        let accepted = module
+            .registry
+            .route_session_refresh(
+                &module.key,
+                1,
+                "notes_until_rebuild".into(),
+                Box::new(next.clone()),
+                Vec::new(),
+                Some(NOTE.into()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                accepted,
+                crate::actor::SessionRefreshOutcome::Accepted { .. }
+            ),
+            "{accepted:?}"
+        );
+    }
+    let refreshes: Vec<_> = records(&module)
+        .await
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::SessionRefresh(refresh) => Some(refresh.system_note),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refreshes, vec![None], "one refresh, recorded with no note");
+    send(&module, "r2", None).await;
+    let calls = executor.provider.inner.calls();
+    assert!(!shown(calls.last().unwrap())
+        .iter()
+        .any(|(_, _, text)| text == NOTE));
+}
