@@ -275,7 +275,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "broca-bench"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-protocol",
  "broca-replay",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "broca-catalog"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "base64",
  "broca-catalog",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "broca-ck"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-protocol",
  "serde",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "broca-core"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "async-trait",
  "base64",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "broca-diagnostics"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "serde",
  "tokio",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "broca-fetch-plan"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "async-trait",
  "broca-protocol",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "broca-heap-profile"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "serde",
  "serde_json",
@@ -387,11 +387,11 @@ dependencies = [
 
 [[package]]
 name = "broca-memory-relief"
-version = "0.4.124"
+version = "0.4.125"
 
 [[package]]
 name = "broca-module"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "async-trait",
  "base64",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "broca-module-serve"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -503,14 +503,14 @@ dependencies = [
 
 [[package]]
 name = "broca-owner-only"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "broca-protocol"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "cortexkit-anthropic-policy",
  "cortexkit-bus-naming",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "broca-provider"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "async-trait",
  "base64",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "broca-records"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-owner-only",
  "broca-protocol",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "broca-replay"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-protocol",
  "rustix",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "broca-session-loop"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "broca-session-store"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-owner-only",
  "broca-protocol",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "broca-store"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "async-trait",
  "broca-core",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "broca-store-contention-tests"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -678,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "broca-subc"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "async-trait",
  "base64",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "broca-test-support"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-core",
  "broca-owner-only",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "broca-wire"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-core",
  "broca-protocol",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "ck-import"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "broca-core",
  "broca-module",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "ck-session-import"
-version = "0.4.124"
+version = "0.4.125"
 dependencies = [
  "base64",
  "broca-module-serve",
