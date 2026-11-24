@@ -1765,7 +1765,9 @@ async fn operations_on_a_busy_expiring_session_read_none_of_its_log() {
 /// The first `session.head` after an idle close reads none of the session's log: the closing
 /// actor kept the head it built from memory at the position it left the session. Each later
 /// write moves the session, so before, nearly every head read of a closed session loaded its
-/// whole view. The kept head is the head a read of the closed session builds.
+/// whole view. The kept head is the head a read of the closed session builds. It counts log
+/// reads, which the store runtime keeps only under `test-clock`.
+#[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn the_first_head_after_an_idle_close_reads_no_log() {
     use crate::serve::ServeHandler;
