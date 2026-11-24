@@ -951,6 +951,17 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let _bus_stop_guard = bus_stop.clone().drop_guard();
     // Compaction v2 uses session-bound calls. Legacy sessions no longer consume
     // provider announcements or replay the retired compaction bus outbox.
+    // Records the self-diagnosis findings each time they change, as `findings_changed` events
+    // the bus service below publishes.
+    let _findings_watch = broca_module_serve::findings_watch::spawn(
+        Arc::clone(run_index.as_ref().unwrap()),
+        state_root.clone(),
+        {
+            let catalog_cache = Arc::clone(&catalog_cache);
+            move |now| broca_module_serve::diagnostics::catalog_age(Some(&catalog_cache), now)
+        },
+        bus_stop.clone(),
+    );
     let event_store: Arc<dyn broca_store::bus_events::RunEventStore> =
         run_index.as_ref().unwrap().clone();
     let _bus_events = broca_module_serve::bus_events::Service {

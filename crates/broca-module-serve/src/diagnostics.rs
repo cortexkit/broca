@@ -145,6 +145,25 @@ pub fn answer(
     Ok(report(evidence, now, window))
 }
 
+/// How old the model catalog is, as the `catalog_stale` check reads it.
+pub fn catalog_age(cache: Option<&broca_catalog::CatalogCache>, now: i64) -> Result<i64, String> {
+    cache
+        .ok_or_else(|| "catalog cache is not configured".to_owned())
+        .and_then(|cache| {
+            cache
+                .health(now)
+                .map(|health| health.age_ms)
+                .map_err(|_| "catalog cache is unreadable".to_owned())
+        })
+}
+
+/// The `params` of a `diagnostics.findings` or `events_get` request's body.
+pub fn request_params(body: &[u8]) -> Result<Value, ErrorBody> {
+    serde_json::from_slice::<broca_wire::RouteRequest>(body)
+        .map(|request| request.params)
+        .map_err(|_| ErrorBody::new("invalid_request", "the request is not decodable"))
+}
+
 pub fn serving_reply(
     params: Value,
     principal: Option<&BindPrincipal>,

@@ -101,7 +101,7 @@ impl Metrics {
 
 #[derive(Default)]
 pub(crate) struct State {
-    account: Mutex<Option<AccountNames>>,
+    pub(crate) account: Mutex<Option<AccountNames>>,
     pub(crate) metrics: Arc<Metrics>,
     #[cfg(test)]
     before_write_unlock: Mutex<Option<WriteObserver>>,
@@ -293,6 +293,9 @@ pub trait RunEventStore: Send + Sync {
     fn settle_route_fact(&self, fact_id: &str, now_ms: u64) -> Result<(), StoreError>;
     /// The oldest stored route fact left unsettled for [`ROUTE_FACT_GRACE_MS`] at `now_ms`.
     fn pending_route_fact(&self, now_ms: u64) -> Result<Option<Publication>, StoreError>;
+    /// The oldest `findings_changed` event the bus hasn't acknowledged (see
+    /// [`crate::findings_events`]).
+    fn pending_findings_event(&self) -> Result<Option<Publication>, StoreError>;
 }
 
 /// Drain orchestration belongs to the publisher, not the object-safe storage port.
@@ -305,7 +308,10 @@ pub async fn drain_bus_event<S: RunEventStore + ?Sized>(
         Some(event) => event,
         None => match store.pending_route_fact(now_ms)? {
             Some(fact) => fact,
-            None => return Ok(DrainResult::Empty),
+            None => match store.pending_findings_event()? {
+                Some(findings) => findings,
+                None => return Ok(DrainResult::Empty),
+            },
         },
     };
     match publisher.publish(&event).await {
@@ -394,6 +400,9 @@ impl RunEventStore for SqliteStore {
     }
     fn pending_route_fact(&self, now_ms: u64) -> Result<Option<Publication>, StoreError> {
         self.event_store().pending_route_fact(now_ms)
+    }
+    fn pending_findings_event(&self) -> Result<Option<Publication>, StoreError> {
+        crate::findings_events::pending(&self.conn.lock().unwrap())
     }
 }
 
@@ -934,7 +943,8 @@ impl EventStore<'_> {
             "UPDATE bus_event_outbox SET published_ms=?2 WHERE event_key=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
         )? as u64;
-        // Send state notices and route facts keep no gauge: they are counted only as published.
+        // Send state notices, route facts and findings events keep no gauge: they are counted
+        // only as published.
         let sends_updated = conn.execute(
             "UPDATE send_state_outbox SET published_ms=?2 WHERE message_id=?1 AND published_ms IS NULL",
             params![event.event_key, now_ms],
@@ -942,7 +952,8 @@ impl EventStore<'_> {
             + conn.execute(
                 "UPDATE route_fact_outbox SET published_ms=?2 WHERE fact_id=?1 AND published_ms IS NULL",
                 params![event.event_key, now_ms],
-            )? as u64;
+            )? as u64
+            + crate::findings_events::acknowledge(conn, &event.event_key, now_ms)? as u64;
         Ok((lifecycle, lifecycle_updated, sends_updated))
         }, |_| ())?;
         let updated = lifecycle_updated + sends_updated;
@@ -979,7 +990,8 @@ impl EventStore<'_> {
         }
         let deleted = conn.execute("DELETE FROM bus_event_outbox WHERE at_ms<?1", [cutoff])?
             + conn.execute("DELETE FROM send_state_outbox WHERE at_ms<?1", [cutoff])?
-            + conn.execute("DELETE FROM route_fact_outbox WHERE at_ms<?1", [cutoff])?;
+            + conn.execute("DELETE FROM route_fact_outbox WHERE at_ms<?1", [cutoff])?
+            + crate::findings_events::prune(conn, now_ms)?;
         Ok((deleted, dropped))
         }, |_| ())?;
         if dropped > 0 {

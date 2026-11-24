@@ -84,3 +84,4 @@ pub use vault_config::{
 
 pub mod devtools;
 pub mod diagnostics;
+pub mod findings_watch;

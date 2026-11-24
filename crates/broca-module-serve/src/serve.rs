@@ -1454,6 +1454,18 @@ where
             let Some((_, session, bind)) = routes.by_channel.get(&channel).cloned() else {
                 unreachable!("route binding disappeared after the channel/epoch guard")
             };
+            if bind.management
+                && request_operation(&frame.body) == crate::findings_watch::OP_EVENTS_GET
+            {
+                count_management_operation(crate::findings_watch::OP_EVENTS_GET);
+                match crate::findings_watch::answer(&frame.body) {
+                    Ok(reply) => {
+                        send_json_response(writer, ver, channel, epoch, corr, &reply).await?
+                    }
+                    Err(error) => send_error_body(writer, ver, channel, epoch, corr, error).await?,
+                }
+                return Ok(true);
+            }
             if bind.management && request_operation(&frame.body) == crate::diagnostics::OP {
                 count_management_operation(crate::diagnostics::OP);
                 match crate::management_admission::admit(
@@ -1468,31 +1480,15 @@ where
                     }
                     _ => unreachable!("diagnostics scope admission returned a different operation"),
                 }
-                let req: RouteRequest = match serde_json::from_slice(&frame.body) {
-                    Ok(req) => req,
-                    Err(_) => {
-                        send_error(
-                            writer,
-                            ver,
-                            channel,
-                            epoch,
-                            corr,
-                            "invalid_request",
-                            "diagnostics.findings request is not decodable",
-                        )
-                        .await?;
+                let params = match crate::diagnostics::request_params(&frame.body) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        send_error_body(writer, ver, channel, epoch, corr, error).await?;
                         return Ok(true);
                     }
                 };
                 let now = now_epoch_ms();
-                let catalog_age = catalog_cache
-                    .ok_or_else(|| "catalog cache is not configured".to_owned())
-                    .and_then(|cache| {
-                        cache
-                            .health(now)
-                            .map(|h| h.age_ms)
-                            .map_err(|_| "catalog cache is unreadable".to_owned())
-                    });
+                let catalog_age = crate::diagnostics::catalog_age(catalog_cache, now);
                 let writer = writer.clone();
                 let slots = request_slots.clone();
                 request_tasks.spawn(reply_on_panic(
@@ -1505,7 +1501,7 @@ where
                             .map_err(|e| ServeIoError(e.to_string()))?;
                         let reply = tokio::task::spawn_blocking(move || {
                             crate::diagnostics::serving_reply(
-                                req.params,
+                                params,
                                 bind.principal.as_ref(),
                                 &bind.scope,
                                 catalog_age,

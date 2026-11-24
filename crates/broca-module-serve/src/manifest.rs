@@ -162,6 +162,11 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             description: Some("Read bounded, content-free diagnoses of broca's own degraded state.".into()),
         },
         ManagementOperation {
+            name: crate::findings_watch::OP_EVENTS_GET.into(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Fetch a findings_changed event's stored body by its key (7 day retention).".into()),
+        },
+        ManagementOperation {
             name: cortexkit_role_llm_runner::ops::SESSION_HISTORY.into(),
             kind: ManagementOperationKind::Query,
             description: Some("Page surviving session history as stored entries or display rows.".into()),
@@ -697,6 +702,13 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
         must_never_reach: Vec::new(),
     }))
     .flow_operations(Some(crate::management_admission::flow_operations()))
+    // A flow triggers on a declared event only. Broca's run events and compaction notices stay
+    // undeclared (see the test below); `findings_changed` wakes the self-diagnosis flow.
+    .events(Some(vec![subc_protocol::manifest::EventDeclaration::new(
+        broca_store::findings_events::FINDINGS_EVENT,
+        broca_store::findings_events::FINDINGS_VERSION,
+    )
+    .with_headers(vec![broca_store::findings_events::EVENT_KEY_HEADER.into()])]))
     .provides(vec![ProviderRole::ManagementSurface {
             // Concurrent ACROSS sessions, FIFO WITHIN one: the registry fans requests out to
             // per-session lineage actors, and each actor processes its own commands in order
@@ -1005,6 +1017,7 @@ mod provenance_tests {
                 "bindings",
                 "capabilities",
                 "consumes",
+                "events",
                 "flow_operations",
                 "module_id",
                 "module_version",
@@ -1050,11 +1063,11 @@ mod provenance_tests {
 
     /// broca publishes its run events and its compaction advance notices
     /// (`compaction.advanced`) undeclared. Their names are dotted, and the daemon's HELLO check
-    /// refuses a dotted event declaration, so declaring one would keep broca from registering
-    /// at all. So the manifest declares no events, and in particular no dotted name; the
-    /// daemon's own validator accepts it.
+    /// once refused a dotted event declaration, which would keep broca from registering at all.
+    /// So the manifest declares only `findings_changed`, which a flow triggers on, and no
+    /// dotted name; the daemon's own validator accepts it.
     #[test]
-    fn the_manifest_declares_no_dotted_event_names() {
+    fn the_manifest_declares_only_findings_changed() {
         let encoded = serde_json::to_value(manifest("broca")).expect("manifest serialises");
         let declared: Vec<&str> = encoded
             .get("events")
@@ -1067,9 +1080,10 @@ mod provenance_tests {
             declared.iter().all(|name| !name.contains('.')),
             "dotted event declarations: {declared:?}"
         );
-        assert!(
-            encoded.get("events").is_none(),
-            "broca publishes its events undeclared: {declared:?}"
+        assert_eq!(declared, ["findings_changed"]);
+        assert_eq!(
+            encoded["events"][0],
+            serde_json::json!({"name": "findings_changed", "version": 1, "headers": ["event_key"]})
         );
         let hello = |manifest: &serde_json::Value| serde_json::json!({ "manifest": manifest });
         subc_protocol::manifest::validate_hello_event_declarations(&hello(&encoded))

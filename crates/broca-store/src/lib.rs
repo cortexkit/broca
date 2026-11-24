@@ -22,6 +22,7 @@ use busy::STORE_BUSY_TIMEOUT;
 
 pub mod bus_events;
 pub mod export_index;
+pub mod findings_events;
 mod keeper_connection;
 pub mod legacy_inventory;
 pub(crate) use export_index::ExportStore;
@@ -394,6 +395,7 @@ impl SqliteStore {
         let from_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         session_refs::init_schema(conn)?;
         bus_events::init_schema(conn)?;
+        findings_events::init_schema(conn)?;
         #[cfg(test)]
         SCHEMA_UPGRADE_HOOK.with(|hook| match *hook.borrow() {
             Some(hook) => hook(),
