@@ -2910,278 +2910,20 @@ impl ServeHandler for crate::LineageRegistry {
         crate::uploads::media_read(self, session, params).await
     }
 
-    async fn send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
-        use crate::actor::SendOutcome;
-        // broca keeps no input-token budget and doesn't declare `input_token_cap`, so a send
-        // naming one is refused before anything is staged or opened, rather than admitted and
-        // then failed when its run starts.
-        if req
-            .request
-            .budget
-            .as_ref()
-            .is_some_and(|budget| budget.max_input_tokens.is_some())
-        {
-            return Err(ServeError::InvalidParams {
-                field: "budget.max_input_tokens".into(),
-                message: "broca keeps no input-token budget (input_token_cap is not declared)"
-                    .into(),
-            });
+    async fn send(&self, req: SendRequest) -> Result<SendResponse, ServeError> {
+        // Kept for the refusal line: a refused send writes nothing, so that line is the only
+        // record that it was refused.
+        let refused_as = (
+            broca_core::session_addr(&req.session),
+            req.send_id.clone(),
+            req.run_id.0.clone(),
+        );
+        let answer = Box::pin(self.admit_send(req)).await;
+        if let Err(error) = &answer {
+            let (session, send_id, run_id) = refused_as;
+            log_send_refusal(&session, send_id.as_deref(), &run_id, error);
         }
-        // A session the store doesn't hold yet has no run, and an owner's scoped bind may have
-        // reserved its address. Refuse anyone else's first send here, before staging media or
-        // creating the session. Once the store holds it, its actor applies the reservation while
-        // it has no run (`StoreActor::send_scope`).
-        if req.request.scope != broca_protocol::SendScope::Internal
-            && self.store_holding(&req.session)?.is_none()
-        {
-            // A reservation that cannot be read refuses the send as transient, never as "not
-            // reserved", which would let anyone start the session.
-            let reservation = self
-                .scope_reservation(&req.session)
-                .await
-                .map_err(ServeError::Transient)?;
-            let ownership = broca_core::SessionOwnershipV1 {
-                reservation,
-                ..Default::default()
-            };
-            broca_core::scope_admission::check_scope_reservation(
-                &ownership,
-                req.request.principal.as_ref(),
-                &req.request.scope,
-            )
-            .map_err(ServeError::ScopeRefused)?;
-        }
-        if !req.request.content.is_empty() && !self.session_written(&req.session)? {
-            let mut request = (*req.request).clone();
-            crate::person_media::stage(self.upload_store().as_ref(), &req.session, &mut request)
-                .map_err(media_preflight_error)?;
-            let profile = self
-                .media_profile(&request)
-                .await
-                .map_err(media_preflight_error)?;
-            let model = format!(
-                "{}/{}",
-                request.model.provider_module_id, request.model.model_id
-            );
-            crate::person_media::check(profile.as_deref(), &model, &request.input)
-                .map_err(media_preflight_error)?;
-            if let Some(held) = &mut request.staged_uploads {
-                std::sync::Arc::make_mut(held).profile = profile
-                    .as_ref()
-                    .map(|profile| serde_json::to_value(profile).expect("media profile JSON"));
-            }
-            req.request.staged_uploads = request.staged_uploads;
-        }
-        // Opening an actor creates the lineage header. A fresh run scope has no frozen
-        // history to consult, so reject a wrong carrier or tools before creating any log.
-        // Existing sessions still use the actor's authoritative frozen-ownership check.
-        if broca_core::scope_admission::AGENT_RUN_SCOPES_WRITER_ENABLED
-            && matches!(&req.request.scope, broca_protocol::SendScope::Stamped(bind) if bind.scope.run_id.is_some())
-        {
-            if let Some(ownership) = self.session_ownership_for_bind(&req.session).await {
-                if ownership.episodes == 0 {
-                    if let Some(field) = broca_core::scope_admission::model_only_scope_tool_field(
-                        &req.request.scope,
-                        req.request
-                            .tools
-                            .as_ref()
-                            .is_some_and(|tools| !tools.is_empty()),
-                        req.plan
-                            .as_ref()
-                            .and_then(|plan| plan.manifest.as_ref())
-                            .is_some_and(|manifest| !manifest.tools.is_empty()),
-                    ) {
-                        return Err(ServeError::InvalidParams {
-                            field: field.to_owned(),
-                            message: format!("agent-run sends cannot carry {field}"),
-                        });
-                    }
-                    broca_core::decide_scope(
-                        &ownership,
-                        req.request.principal.as_ref(),
-                        &req.request.scope,
-                    )
-                    .map_err(ServeError::ScopeRefused)?;
-                }
-            }
-        }
-        // Opening a fresh actor writes the session log's first frame, so refuse a scoped send with
-        // tools before opening it. A session that already has episodes goes to the actor,
-        // so a resent `send_id` of an admitted run gets its recorded answer before the tool
-        // check runs.
-        if req.plan.is_none()
-            && req
-                .request
-                .tools
-                .as_ref()
-                .is_some_and(|tools| !tools.is_empty())
-        {
-            if let Some(ownership) = self.session_ownership_for_bind(&req.session).await {
-                if ownership.episodes == 0 {
-                    let decision = broca_core::decide_scope(
-                        &ownership,
-                        req.request.principal.as_ref(),
-                        &req.request.scope,
-                    )
-                    .map_err(ServeError::ScopeRefused)?;
-                    if decision.scope().is_some() {
-                        return Err(ServeError::PlanRefused(
-                            broca_fetch_plan::Refusal::ScopedToolsRequirePlan,
-                        ));
-                    }
-                }
-            }
-        }
-        match self
-            .route_submission_with_order(
-                &req.session,
-                req.run_id,
-                *req.request,
-                req.kind,
-                match req.send_id {
-                    Some(send_id) => crate::actor::SendKey::SendId(send_id),
-                    None => crate::actor::SendKey::Minted,
-                },
-                req.skip_materialization,
-                req.delivery,
-                req.plan,
-                req.conversation_key,
-                req.title,
-                req.retention,
-                req.session_class,
-                req.stop_sequences_named,
-                req.order,
-            )
-            .await?
-        {
-            SendOutcome::RetentionInvalid(detail) => Err(ServeError::RetentionInvalid(detail)),
-            SendOutcome::RetentionRefused(refusal) => Err(ServeError::RetentionRefused(refusal)),
-            SendOutcome::SessionClassInvalid(message) => Err(ServeError::InvalidParams {
-                field: "session_class".into(),
-                message,
-            }),
-            SendOutcome::InputTokenBudgetInvalid(message) => Err(ServeError::InvalidParams {
-                field: "budget.max_input_tokens".into(),
-                message,
-            }),
-            SendOutcome::ContextCeiling(detail) => Err(ServeError::ContextCeiling(detail)),
-            SendOutcome::StructuredOutputInvalid { field } => Err(ServeError::InvalidParams {
-                message: format!("{field} is not admissible for this send"),
-                field,
-            }),
-            SendOutcome::Finished {
-                run_id,
-                reason,
-                delivered,
-            } => Ok(SendResponse::Finished {
-                run_id: run_id.0,
-                reason,
-                delivered,
-            }),
-            SendOutcome::Paused {
-                run_id,
-                reason,
-                delivered,
-            } => Ok(SendResponse::Paused {
-                run_id: run_id.0,
-                pause_reason: reason,
-                delivered,
-            }),
-            SendOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
-            SendOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
-            SendOutcome::Active { run_id, delivered } => Ok(SendResponse::Active {
-                run_id: run_id.0,
-                delivered,
-            }),
-            SendOutcome::Pending { submission_id } => Ok(SendResponse::Pending {
-                submission_id: submission_id.0,
-            }),
-            // Reopen is consumed by the registry's retry loop; Error surfaces as Open.
-            SendOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
-            SendOutcome::Retracted { submission_id } => Err(ServeError::SendRetracted {
-                submission_id: submission_id.0,
-            }),
-            SendOutcome::SendEnded {
-                submission_id,
-                reason,
-            } => Err(ServeError::SendEnded {
-                submission_id: submission_id.0,
-                outcome: reason.as_str(),
-            }),
-            SendOutcome::DeliveryRefused {
-                code: "invalid_params",
-                field,
-                message,
-            } => Err(ServeError::InvalidParams {
-                field: field.into(),
-                message,
-            }),
-            SendOutcome::DeliveryRefused { code, message, .. } => {
-                Err(ServeError::DeliveryRefused { code, message })
-            }
-            SendOutcome::TemplatePartGone { slot } => Err(ServeError::TemplatePartGone { slot }),
-            SendOutcome::SendIdReuse { differing } => Err(ServeError::SendIdReuse {
-                differing: differing.to_owned(),
-            }),
-            SendOutcome::SteerSettingsConflict { field } => Err(ServeError::InvalidParams {
-                field: field.to_owned(),
-                message: format!("joining steer cannot change the active run's frozen {field}"),
-            }),
-            SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
-            SendOutcome::ToolAliasInvalid(e) => Err(ServeError::ToolAliasInvalid(e)),
-            SendOutcome::RouteDecisionFixed => Err(ServeError::InvalidParams {
-                field: "route_decision_id".into(),
-                message: "route_decision_id is fixed for the active run".into(),
-            }),
-            SendOutcome::AccountRouteFixed => Err(ServeError::InvalidParams {
-                field: "account_route".into(),
-                message: "account_route is fixed for the active run".into(),
-            }),
-            SendOutcome::ServiceTierInvalid { reason, message } => {
-                Err(ServeError::ServiceTierInvalid { reason, message })
-            }
-            SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
-            SendOutcome::MediaTooLarge(detail) => Err(ServeError::MediaTooLarge(detail)),
-            // Actor errors can combine replay, storage and lifecycle failures after type erasure.
-            SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
-            SendOutcome::ClassifiedError { reason, class } => {
-                Err(ServeError::Open(reason, Some(class)))
-            }
-            SendOutcome::ModuleStopping(at) => Err(ServeError::ModuleStopping(at)),
-            SendOutcome::NotServedOnNewStorage { feature } => {
-                Err(ServeError::NotServedOnNewStorage { feature })
-            }
-            SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
-            SendOutcome::CredentialsUnavailable => Err(ServeError::CredentialsUnavailable),
-            SendOutcome::CredentialAmbiguous {
-                credential,
-                candidate_ids,
-            } => Err(ServeError::CredentialAmbiguous {
-                credential,
-                candidate_ids,
-            }),
-            SendOutcome::AccountSelectionRefused(refusal) => {
-                Err(ServeError::AccountSelectionRefused(refusal))
-            }
-            SendOutcome::RoutingUnavailable(unavailable) => {
-                Err(ServeError::RoutingUnavailable(unavailable))
-            }
-            SendOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
-            SendOutcome::ScopeFreezeBusy { reason, run_id } => Err(ServeError::ScopeFreezeBusy {
-                reason,
-                run_id: run_id.map(|run_id| run_id.0),
-            }),
-            SendOutcome::RunPaused { run_id, reason } => {
-                Err(ServeError::RunPaused(RunPausedRefusal {
-                    run_id: run_id.0,
-                    reason,
-                }))
-            }
-            SendOutcome::PlanRefused(refusal) => Err(ServeError::PlanRefused(refusal)),
-            SendOutcome::PreUserUnavailable { provider } => {
-                Err(ServeError::PreUserUnavailable { provider })
-            }
-        }
+        answer
     }
 
     async fn send_status(
@@ -4191,6 +3933,302 @@ impl ServeHandler for crate::LineageRegistry {
         self.check_expired(session, Some(&run_id.0)).await?;
         Ok(RunStatusResponse::Unknown.into())
     }
+}
+
+impl crate::LineageRegistry {
+    /// `session.send` up to its answer; [`ServeHandler::send`] logs the refusals it answers.
+    async fn admit_send(&self, mut req: SendRequest) -> Result<SendResponse, ServeError> {
+        use crate::actor::SendOutcome;
+        // broca keeps no input-token budget and doesn't declare `input_token_cap`, so a send
+        // naming one is refused before anything is staged or opened, rather than admitted and
+        // then failed when its run starts.
+        if req
+            .request
+            .budget
+            .as_ref()
+            .is_some_and(|budget| budget.max_input_tokens.is_some())
+        {
+            return Err(ServeError::InvalidParams {
+                field: "budget.max_input_tokens".into(),
+                message: "broca keeps no input-token budget (input_token_cap is not declared)"
+                    .into(),
+            });
+        }
+        // A session the store doesn't hold yet has no run, and an owner's scoped bind may have
+        // reserved its address. Refuse anyone else's first send here, before staging media or
+        // creating the session. Once the store holds it, its actor applies the reservation while
+        // it has no run (`StoreActor::send_scope`).
+        if req.request.scope != broca_protocol::SendScope::Internal
+            && self.store_holding(&req.session)?.is_none()
+        {
+            // A reservation that cannot be read refuses the send as transient, never as "not
+            // reserved", which would let anyone start the session.
+            let reservation = self
+                .scope_reservation(&req.session)
+                .await
+                .map_err(ServeError::Transient)?;
+            let ownership = broca_core::SessionOwnershipV1 {
+                reservation,
+                ..Default::default()
+            };
+            broca_core::scope_admission::check_scope_reservation(
+                &ownership,
+                req.request.principal.as_ref(),
+                &req.request.scope,
+            )
+            .map_err(ServeError::ScopeRefused)?;
+        }
+        if !req.request.content.is_empty() && !self.session_written(&req.session)? {
+            let mut request = (*req.request).clone();
+            crate::person_media::stage(self.upload_store().as_ref(), &req.session, &mut request)
+                .map_err(media_preflight_error)?;
+            let profile = self
+                .media_profile(&request)
+                .await
+                .map_err(media_preflight_error)?;
+            let model = format!(
+                "{}/{}",
+                request.model.provider_module_id, request.model.model_id
+            );
+            crate::person_media::check(profile.as_deref(), &model, &request.input)
+                .map_err(media_preflight_error)?;
+            if let Some(held) = &mut request.staged_uploads {
+                std::sync::Arc::make_mut(held).profile = profile
+                    .as_ref()
+                    .map(|profile| serde_json::to_value(profile).expect("media profile JSON"));
+            }
+            req.request.staged_uploads = request.staged_uploads;
+        }
+        // Opening an actor writes the session log's first frame. A session first sent to under an
+        // agent run's scope has no frozen ownership to check against yet, so a send that carries
+        // tools (which agent-run sends may not) or comes from a principal the scope doesn't admit
+        // is refused here, before any log exists. A session with earlier runs is checked by its
+        // actor against the ownership it froze.
+        if broca_core::scope_admission::AGENT_RUN_SCOPES_WRITER_ENABLED
+            && matches!(&req.request.scope, broca_protocol::SendScope::Stamped(bind) if bind.scope.run_id.is_some())
+        {
+            if let Some(ownership) = self.session_ownership_for_bind(&req.session).await {
+                if ownership.episodes == 0 {
+                    if let Some(field) = broca_core::scope_admission::model_only_scope_tool_field(
+                        &req.request.scope,
+                        req.request
+                            .tools
+                            .as_ref()
+                            .is_some_and(|tools| !tools.is_empty()),
+                        req.plan
+                            .as_ref()
+                            .and_then(|plan| plan.manifest.as_ref())
+                            .is_some_and(|manifest| !manifest.tools.is_empty()),
+                    ) {
+                        return Err(ServeError::InvalidParams {
+                            field: field.to_owned(),
+                            message: format!("agent-run sends cannot carry {field}"),
+                        });
+                    }
+                    broca_core::decide_scope(
+                        &ownership,
+                        req.request.principal.as_ref(),
+                        &req.request.scope,
+                    )
+                    .map_err(ServeError::ScopeRefused)?;
+                }
+            }
+        }
+        // Opening a fresh actor writes the session log's first frame, so refuse a scoped send with
+        // tools before opening it. A session that already has episodes goes to the actor,
+        // so a resent `send_id` of an admitted run gets its recorded answer before the tool
+        // check runs.
+        if req.plan.is_none()
+            && req
+                .request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
+        {
+            if let Some(ownership) = self.session_ownership_for_bind(&req.session).await {
+                if ownership.episodes == 0 {
+                    let decision = broca_core::decide_scope(
+                        &ownership,
+                        req.request.principal.as_ref(),
+                        &req.request.scope,
+                    )
+                    .map_err(ServeError::ScopeRefused)?;
+                    if decision.scope().is_some() {
+                        return Err(ServeError::PlanRefused(
+                            broca_fetch_plan::Refusal::ScopedToolsRequirePlan,
+                        ));
+                    }
+                }
+            }
+        }
+        match self
+            .route_submission_with_order(
+                &req.session,
+                req.run_id,
+                *req.request,
+                req.kind,
+                match req.send_id {
+                    Some(send_id) => crate::actor::SendKey::SendId(send_id),
+                    None => crate::actor::SendKey::Minted,
+                },
+                req.skip_materialization,
+                req.delivery,
+                req.plan,
+                req.conversation_key,
+                req.title,
+                req.retention,
+                req.session_class,
+                req.stop_sequences_named,
+                req.order,
+            )
+            .await?
+        {
+            SendOutcome::RetentionInvalid(detail) => Err(ServeError::RetentionInvalid(detail)),
+            SendOutcome::RetentionRefused(refusal) => Err(ServeError::RetentionRefused(refusal)),
+            SendOutcome::SessionClassInvalid(message) => Err(ServeError::InvalidParams {
+                field: "session_class".into(),
+                message,
+            }),
+            SendOutcome::InputTokenBudgetInvalid(message) => Err(ServeError::InvalidParams {
+                field: "budget.max_input_tokens".into(),
+                message,
+            }),
+            SendOutcome::ContextCeiling(detail) => Err(ServeError::ContextCeiling(detail)),
+            SendOutcome::StructuredOutputInvalid { field } => Err(ServeError::InvalidParams {
+                message: format!("{field} is not admissible for this send"),
+                field,
+            }),
+            SendOutcome::Finished {
+                run_id,
+                reason,
+                delivered,
+            } => Ok(SendResponse::Finished {
+                run_id: run_id.0,
+                reason,
+                delivered,
+            }),
+            SendOutcome::Paused {
+                run_id,
+                reason,
+                delivered,
+            } => Ok(SendResponse::Paused {
+                run_id: run_id.0,
+                pause_reason: reason,
+                delivered,
+            }),
+            SendOutcome::SessionMoving { cut_id } => Err(ServeError::SessionMoving { cut_id }),
+            SendOutcome::SessionMoved { holder } => Err(ServeError::SessionMoved { holder }),
+            SendOutcome::Active { run_id, delivered } => Ok(SendResponse::Active {
+                run_id: run_id.0,
+                delivered,
+            }),
+            SendOutcome::Pending { submission_id } => Ok(SendResponse::Pending {
+                submission_id: submission_id.0,
+            }),
+            // Reopen is consumed by the registry's retry loop; Error surfaces as Open.
+            SendOutcome::Reopen => unreachable!("registry retry consumes Reopen"),
+            SendOutcome::Retracted { submission_id } => Err(ServeError::SendRetracted {
+                submission_id: submission_id.0,
+            }),
+            SendOutcome::SendEnded {
+                submission_id,
+                reason,
+            } => Err(ServeError::SendEnded {
+                submission_id: submission_id.0,
+                outcome: reason.as_str(),
+            }),
+            SendOutcome::DeliveryRefused {
+                code: "invalid_params",
+                field,
+                message,
+            } => Err(ServeError::InvalidParams {
+                field: field.into(),
+                message,
+            }),
+            SendOutcome::DeliveryRefused { code, message, .. } => {
+                Err(ServeError::DeliveryRefused { code, message })
+            }
+            SendOutcome::TemplatePartGone { slot } => Err(ServeError::TemplatePartGone { slot }),
+            SendOutcome::SendIdReuse { differing } => Err(ServeError::SendIdReuse {
+                differing: differing.to_owned(),
+            }),
+            SendOutcome::SteerSettingsConflict { field } => Err(ServeError::InvalidParams {
+                field: field.to_owned(),
+                message: format!("joining steer cannot change the active run's frozen {field}"),
+            }),
+            SendOutcome::VariantUnsupported(e) => Err(ServeError::VariantUnsupported(e)),
+            SendOutcome::ToolAliasInvalid(e) => Err(ServeError::ToolAliasInvalid(e)),
+            SendOutcome::RouteDecisionFixed => Err(ServeError::InvalidParams {
+                field: "route_decision_id".into(),
+                message: "route_decision_id is fixed for the active run".into(),
+            }),
+            SendOutcome::AccountRouteFixed => Err(ServeError::InvalidParams {
+                field: "account_route".into(),
+                message: "account_route is fixed for the active run".into(),
+            }),
+            SendOutcome::ServiceTierInvalid { reason, message } => {
+                Err(ServeError::ServiceTierInvalid { reason, message })
+            }
+            SendOutcome::Upload(error) => Err(ServeError::Upload(error)),
+            SendOutcome::MediaTooLarge(detail) => Err(ServeError::MediaTooLarge(detail)),
+            // Actor errors can combine replay, storage and lifecycle failures after type erasure.
+            SendOutcome::Error(e) => Err(ServeError::Open(e, None)),
+            SendOutcome::ClassifiedError { reason, class } => {
+                Err(ServeError::Open(reason, Some(class)))
+            }
+            SendOutcome::ModuleStopping(at) => Err(ServeError::ModuleStopping(at)),
+            SendOutcome::NotServedOnNewStorage { feature } => {
+                Err(ServeError::NotServedOnNewStorage { feature })
+            }
+            SendOutcome::Transient(e) => Err(ServeError::Transient(e)),
+            SendOutcome::CredentialsUnavailable => Err(ServeError::CredentialsUnavailable),
+            SendOutcome::CredentialAmbiguous {
+                credential,
+                candidate_ids,
+            } => Err(ServeError::CredentialAmbiguous {
+                credential,
+                candidate_ids,
+            }),
+            SendOutcome::AccountSelectionRefused(refusal) => {
+                Err(ServeError::AccountSelectionRefused(refusal))
+            }
+            SendOutcome::RoutingUnavailable(unavailable) => {
+                Err(ServeError::RoutingUnavailable(unavailable))
+            }
+            SendOutcome::ScopeRefused(refusal) => Err(ServeError::ScopeRefused(refusal)),
+            SendOutcome::ScopeFreezeBusy { reason, run_id } => Err(ServeError::ScopeFreezeBusy {
+                reason,
+                run_id: run_id.map(|run_id| run_id.0),
+            }),
+            SendOutcome::RunPaused { run_id, reason } => {
+                Err(ServeError::RunPaused(RunPausedRefusal {
+                    run_id: run_id.0,
+                    reason,
+                }))
+            }
+            SendOutcome::PlanRefused(refusal) => Err(ServeError::PlanRefused(refusal)),
+            SendOutcome::PreUserUnavailable { provider } => {
+                Err(ServeError::PreUserUnavailable { provider })
+            }
+        }
+    }
+}
+
+/// Logs a refused `session.send` with the session, the send's id, the run id it would have had
+/// and the refusal's wire code. Nothing durable records a send refused before it wrote anything,
+/// so this line is how a caller that lost such a refusal finds which sends to make again.
+fn log_send_refusal(session: &str, send_id: Option<&str>, run_id: &str, error: &ServeError) {
+    let code = admission_refusal::admission_refusal(error)
+        .and_then(|body| serde_json::to_value(body).ok())
+        .and_then(|body| body.get("code")?.as_str().map(str::to_owned));
+    tracing::info!(
+        target: "requests",
+        session,
+        send_id = send_id.unwrap_or("<none>"),
+        run_id,
+        code = code.as_deref().unwrap_or("<see message>"),
+        "session.send refused: {error}"
+    );
 }
 
 #[cfg(test)]
