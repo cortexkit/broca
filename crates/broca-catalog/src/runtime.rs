@@ -2165,8 +2165,14 @@ impl CatalogCache {
         response: FusiformCatalogResponse,
         poll_summary: Option<(usize, Instant)>,
     ) -> Result<(), CatalogRefreshError> {
+        // Each correction at debug: fusiform sends every one again with each catalog, so at info
+        // they filled the log with the same 204 lines every refresh.
         for correction in &response.wire_corrections {
-            tracing::info!(target: "catalog", correction = %correction, "fusiform wire correction");
+            tracing::debug!(target: "catalog", correction = %correction, "fusiform wire correction");
+        }
+        if !response.wire_corrections.is_empty() {
+            tracing::info!(target: "catalog", corrections = response.wire_corrections.len(),
+                "fusiform catalog carries wire corrections");
         }
         let catalog_version = response.catalog_version;
         let resolved_at_ms = response.resolved_at_ms;
