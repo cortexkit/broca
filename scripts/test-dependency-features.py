@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 # A member listed here must declare no Tokio at all; the feature-agreement rule below exists so
 # test builds that do pull Tokio agree, and a Tokio-free member cannot disagree.
 # broca-session-store runs on any executor and builds for WebAssembly, where Tokio doesn't run.
+# broca-heap-profile is the global allocator: it answers snapshot requests from a plain thread
+# and must not pull an async runtime into what every allocation calls.
 TOKIO_FREE_MEMBERS = {
+    "broca-heap-profile",
     "broca-owner-only",
     "broca-memory-relief",
     "broca-records",
