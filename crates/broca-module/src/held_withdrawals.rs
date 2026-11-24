@@ -366,7 +366,9 @@ impl HeldWithdrawals {
                 Err(error) => tally.failure = Some(error),
             }
         }
-        tracing::warn!(target: "late_results", session = %broca_core::session_addr(bind),
+        // Settling a deleted session's held calls is routine: retention deletes sessions every
+        // day. A row that failed to settle becomes the sweep's failure, which health reports.
+        tracing::info!(target: "late_results", session = %broca_core::session_addr(bind),
             calls = rows.len(), settled, "provider-held calls of a deleted session settled");
         tally.rows_settled += settled;
         self.refresh_health();
