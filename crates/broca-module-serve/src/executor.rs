@@ -3157,9 +3157,16 @@ impl LiveLoopExecutor {
         let tools = self.plane.as_ref();
         let held = control.provider_held_lifecycle.clone();
         let compaction_plane = control.compaction_plane.clone();
-        if let StoreRunMode::Seal(cause) = mode {
-            // A seal writes its records and calls no model, so its provider is one that has
-            // nothing to answer; any model call it made would fail as an empty stream.
+        let cancelled_resume = matches!(
+            mode,
+            StoreRunMode::Resume | StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn
+        ) && control
+            .cancel
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+        if matches!(mode, StoreRunMode::Seal(_)) || cancelled_resume {
+            // Neither sealing nor cancelling a parked run needs a model call. In particular
+            // cancellation must work even when sign-in or provider access is unavailable.
             let provider = broca_core::provider::StubProvider::new(Vec::new());
             let seams = store_seams(
                 &provider,
@@ -3168,21 +3175,29 @@ impl LiveLoopExecutor {
                 out,
                 &control,
                 held.as_deref(),
-                compaction_plane.as_deref(),
+                if cancelled_resume {
+                    None
+                } else {
+                    compaction_plane.as_deref()
+                },
                 &now,
                 None,
                 None,
                 self.max_same_account_wait,
             );
             // Routing holds a lease for a run it admitted until it hears the run end, so a
-            // sealed run reports its end under the account it ran on, as any run does.
+            // seal or cancellation reports the end under the run's frozen account decision.
             let reporter = {
-                use broca_session_loop::writer::Writer as _;
-                let selection = writer.operations().run.as_ref().and_then(|run| {
-                    broca_session_loop::account_move::current_auth_selection(run, parts)
-                        .ok()
-                        .flatten()
-                });
+                let selection = writer
+                    .operations()
+                    .run
+                    .as_ref()
+                    .filter(|run| run.finished.is_none())
+                    .and_then(|run| {
+                        broca_session_loop::account_move::current_auth_selection(run, parts)
+                            .ok()
+                            .flatten()
+                    });
                 match (
                     self.routing.as_ref(),
                     selection
@@ -3203,41 +3218,17 @@ impl LiveLoopExecutor {
                 }
             };
             let durable_head = writer.durable_head();
-            let sealed = broca_session_loop::seal(writer, parts, &seams, cause)
-                .await
-                .map_err(StoreRunError::Loop)?;
-            if let Some(reporter) = reporter.filter(|_| sealed.paused.is_none()) {
-                reporter.finish(durable_head.load(Ordering::Acquire), sealed.reason);
+            let finished = match mode {
+                StoreRunMode::Seal(cause) => {
+                    broca_session_loop::seal(writer, parts, &seams, cause).await
+                }
+                _ => Box::pin(broca_session_loop::resume(writer, parts, &seams)).await,
             }
-            return Ok(sealed);
-        }
-        if matches!(
-            mode,
-            StoreRunMode::Resume | StoreRunMode::RecheckSignIn | StoreRunMode::ProbeSignIn
-        ) && control
-            .cancel
-            .as_ref()
-            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-        {
-            // A caller may cancel because sign-in or provider access is unavailable. Closing
-            // the existing run must not depend on admitting another model call first.
-            let provider = broca_core::provider::StubProvider::new(Vec::new());
-            let seams = store_seams(
-                &provider,
-                tools,
-                req,
-                out,
-                &control,
-                held.as_deref(),
-                None,
-                &now,
-                None,
-                None,
-                self.max_same_account_wait,
-            );
-            return Box::pin(broca_session_loop::resume(writer, parts, &seams))
-                .await
-                .map_err(StoreRunError::Loop);
+            .map_err(StoreRunError::Loop)?;
+            if let Some(reporter) = reporter.filter(|_| finished.paused.is_none()) {
+                reporter.finish(durable_head.load(Ordering::Acquire), finished.reason);
+            }
+            return Ok(finished);
         }
         let stored = store_history(writer, parts)
             .await

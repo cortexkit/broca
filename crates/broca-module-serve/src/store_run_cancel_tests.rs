@@ -1,6 +1,7 @@
-/// A parked sign-in pause can be cancelled even when the vault would refuse its credential.
+/// Cancelling a parked sign-in pause releases its routing admission without renewing credentials.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_parked_store_cancel_needs_no_credentials_or_provider() {
+async fn a_parked_store_cancel_reports_the_routed_end_without_credentials_or_provider() {
+    use broca_module_serve::account_routing::RoutingClient;
     use broca_core::provider::StubProvider;
     use broca_session_loop::writer::Writer as _;
     use broca_session_store::record::{CancelPoint, CancelRequest, Record};
@@ -10,9 +11,14 @@ async fn a_parked_store_cancel_needs_no_credentials_or_provider() {
     let root = fresh_vault_root("store-parked-cancel");
     let _catalog = install_alias_catalog();
     let daemon = CapturingVaultDaemon::start_refusing_scoped_reads(&root).await;
+    let routing = Arc::new(TerminalRouting {
+        reports: Default::default(),
+        supported: true,
+    });
     let executor = executor_with_capturing_vault(&root, &daemon)
         .await
-        .with_provider_overrides(runtime_overrides(&server.url));
+        .with_provider_overrides(runtime_overrides(&server.url))
+        .with_routing(Arc::new(RoutingClient::new(routing.clone(), Default::default())));
     assert!(executor
         .decide_auth("deepseek", None, true, Some(AuthMethod::ApiKey), None)
         .await
@@ -52,6 +58,11 @@ async fn a_parked_store_cancel_needs_no_credentials_or_provider() {
     )]]);
     let control = broca_core::run::RunControl {
         admitted_context_limit: req.context_limit,
+        auth_selection: Some(serde_json::from_value(serde_json::json!({
+            "auth_method": "apikey",
+            "credential_id": "apikey:deepseek:main",
+            "account_decision": {"path": "routed", "admission_id": "parked-admission"},
+        })).unwrap()),
         ..Default::default()
     };
     let admission = broca_session_loop::admit::admission(
@@ -97,22 +108,25 @@ async fn a_parked_store_cancel_needs_no_credentials_or_provider() {
         .unwrap();
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let end = serve_store_run_with_control(
-        &executor,
-        &mut session,
-        &parts,
-        req,
-        broca_module::executor::StoreRunMode::Resume,
-        broca_core::run::RunControl {
-            cancel: Some(cancel),
-            ..Default::default()
-        },
-        None,
-    )
-    .await;
-    let finished = end.result.expect("cancellation does not require admission");
-    assert_eq!(finished.reason, RunFinishReason::Cancelled);
-    assert!(finished.paused.is_none());
+    // A second resume sees the durable end and must not report it again.
+    for _ in 0..2 {
+        let end = serve_store_run_with_control(
+            &executor,
+            &mut session,
+            &parts,
+            req.clone(),
+            broca_module::executor::StoreRunMode::Resume,
+            broca_core::run::RunControl {
+                cancel: Some(cancel.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let finished = end.result.expect("cancellation does not require admission");
+        assert_eq!(finished.reason, RunFinishReason::Cancelled);
+        assert!(finished.paused.is_none());
+    }
     let records = session.open_log_records().await.unwrap();
     assert_eq!(
         records
@@ -139,6 +153,20 @@ async fn a_parked_store_cancel_needs_no_credentials_or_provider() {
     );
     daemon.assert_healthy();
     drop(executor);
+    broca_test_support::wait_until("cancel end report drained", || async {
+        if Arc::strong_count(&routing) == 1 {
+            Ok(())
+        } else {
+            Err("report task still owns routing".into())
+        }
+    })
+    .await;
+    let reports = routing.reports.lock().unwrap();
+    assert_eq!(reports.len(), 1, "expected one routing release: {reports:?}");
+    assert_eq!(reports[0]["kind"], "run_finished");
+    assert_eq!(reports[0]["admission_id"], "parked-admission");
+    assert_eq!(reports[0]["run_id"], req.run_id.0);
+    assert_eq!(reports[0]["terminal_reason"], "cancelled");
     drop(daemon);
     let _ = std::fs::remove_dir_all(root);
 }

@@ -762,9 +762,9 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
 `routed_accounts` capability. Broca chooses subscription accounts and pooled API keys through
 `route.account_for` and reports their runs through `route.account_observe`.
 `antigravity` is not listed: its existing caller/configured credential selection is unchanged.
-Without new hints, an `auth.account` pin bypasses routing. For subscription sign-ins, if broca
-cannot list credentials or finds at most one account, it also uses the configured credential
-without asking routing. Resumed runs retain their frozen choice.
+For these methods, broca asks routing even with one eligible credential. A subscription pin
+without routing hints or a decision limits the offer to the named account; routing still admits
+the run. If broca cannot list the candidates, it refuses rather than using a static credential.
 
 For a listed method, `auth.pool` is sent as `route.account_for.pool`, and optional
 `auth.credential_id` is sent only as `requested_account.credential_id`, a preference the router
@@ -779,13 +779,13 @@ for a permanent one (including every routing code broca does not know, and the h
 [error class contract](error-class-contract.md).
 Both hints are ignored for unlisted methods before request storage and identity comparison.
 A strict `auth.account` pin cannot be combined with either hint for a listed method:
-`invalid_params` names `auth.account` before storage or any routing request. A pin without
-either hint bypasses routing. Queued requests retain their original hints across
-restart; a resumed run keeps its frozen credential/decision and accepts no fresh auth pin.
+`invalid_params` names `auth.account` before storage or any routing request. Queued requests
+retain their original hints across restart; a resumed run keeps its frozen credential/decision
+and accepts no fresh auth pin.
 
-API-key sends without a pool, credential hint or routing decision keep the configured static
-credential, even when several keys are listed. With any of those selectors, broca asks routing
-with `mode: "admit"` and loads the answered `account.credential_id`, never the credential hint.
+The static exception is an API-key send that explicitly pins `auth.account` and supplies no
+pool, credential hint, account route or routing decision. Other API-key sends ask routing with
+`mode: "admit"` and load the answered `account.credential_id`, never the credential hint.
 Broca validates that the answer declares method `apikey` and names an active, readable API key
 in its own vault listing. Its `provider_ids` must contain the credential provider, or be empty
 (the legacy provider-unmapped case). Broca offers those keys as candidates and refuses an

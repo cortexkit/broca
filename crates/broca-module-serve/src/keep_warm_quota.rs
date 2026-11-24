@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use broca_catalog::live::{AuthMethod, WireFamilyId};
 use serde::Deserialize;
 
-use crate::account_routing::{RoutingClient, RoutingReply, ADMISSION_BUDGET};
+use crate::account_routing::{
+    is_message_plane_code, RoutingClient, RoutingReply, ADMISSION_BUDGET,
+};
 
 pub const ACCOUNT_STATUS_OP: &str = "route.account_status";
 
@@ -72,9 +74,9 @@ pub fn classify_status_reply(reply: Result<Vec<u8>, Vec<u8>>) -> StatusOutcome {
                 .ok()
                 .and_then(|body| body["code"].as_str().map(str::to_owned));
             match code.as_deref() {
-                Some("unknown_method") => StatusOutcome::Unavailable {
-                    cause: "unknown_method".into(),
-                },
+                Some(code) if code == "unknown_method" || is_message_plane_code(code) => {
+                    StatusOutcome::Unavailable { cause: code.into() }
+                }
                 _ => StatusOutcome::Stop {
                     code: code.unwrap_or_else(|| "reading_missing".into()),
                 },
@@ -331,10 +333,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_quota_method_unknown_and_unreachable_use_the_counted_headers_fallback() {
+    async fn warm_quota_unavailable_status_uses_the_counted_headers_fallback() {
         for reply in [
             Ok(Err(br#"{"code":"unknown_method"}"#.to_vec())),
             Err("routing unreachable".into()),
+            Ok(Err(br#"{"code":"target_unavailable"}"#.to_vec())),
         ] {
             for (fraction, expected) in [
                 ("0.89", QuotaDecision::Allow),

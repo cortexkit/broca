@@ -90,13 +90,14 @@ mod tests {
     };
     use crate::routing_capabilities::CapabilitySupport;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    /// Routing that describes `route_fact_stream` as `stream` and answers every request, or
-    /// none when `away` (the call fails as a daemon cut makes it fail).
+    /// Routing that describes `route_fact_stream` as `stream` and returns a scripted reply.
     struct Routing {
         stream: CapabilitySupport,
         requests: Mutex<Vec<Value>>,
-        away: bool,
+        reply: RoutingReply,
+        delay: Duration,
     }
 
     #[async_trait]
@@ -112,10 +113,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(serde_json::from_slice(&body).unwrap());
-            if self.away {
-                return Err("routing is away".into());
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
             }
-            Ok(Ok(br#"{"result":{}}"#.to_vec()))
+            self.reply.clone()
         }
     }
 
@@ -123,6 +124,7 @@ mod tests {
     struct Bus {
         acks: bool,
         published: Mutex<Vec<(String, Value, String)>>,
+        delay: Duration,
     }
 
     #[async_trait]
@@ -137,6 +139,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((op.into(), params.clone(), fact_id.into()));
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             if self.acks {
                 Ok(())
             } else {
@@ -151,20 +156,21 @@ mod tests {
         stream: CapabilitySupport,
         acks: Option<bool>,
     ) -> (Vec<Value>, Vec<(String, Value, String)>) {
-        let (requests, published, _) = observe_settling(stream, acks, false).await;
+        let (requests, published, _) = observe_settling(stream, acks, observe_ok()).await;
         (requests, published)
     }
 
-    /// [`observe`] with routing `away` or not, also returning the stored facts it settled.
+    /// [`observe`] with a scripted direct reply, also returning the stored facts it settled.
     async fn observe_settling(
         stream: CapabilitySupport,
         acks: Option<bool>,
-        away: bool,
+        reply: RoutingReply,
     ) -> (Vec<Value>, Vec<(String, Value, String)>, Vec<String>) {
         let routing = Arc::new(Routing {
             stream,
             requests: Mutex::default(),
-            away,
+            reply,
+            delay: Duration::ZERO,
         });
         let outbox = Arc::new(Settled::default());
         let client = RoutingClient::new(routing.clone(), AccountSelectionConfig::default());
@@ -172,6 +178,7 @@ mod tests {
             Arc::new(Bus {
                 acks,
                 published: Mutex::default(),
+                delay: Duration::ZERO,
             })
         });
         if let Some(bus) = &bus {
@@ -195,6 +202,10 @@ mod tests {
         }
     }
 
+    fn observe_ok() -> RoutingReply {
+        Ok(Ok(br#"{"result":{}}"#.to_vec()))
+    }
+
     /// A run's end report settles its stored copy once routing has it, by an acknowledged
     /// publish or an answered call. When neither reached routing (it and the bus were away, as
     /// at a daemon cut), the stored copy stays, for the outbox to deliver.
@@ -207,19 +218,64 @@ mod tests {
                 Vec::new()
             }
         };
+        let away = Err("routing is away".into());
         let (_, _, by_publish) =
-            observe_settling(CapabilitySupport::Declared, Some(true), true).await;
+            observe_settling(CapabilitySupport::Declared, Some(true), away.clone()).await;
         assert_eq!(
             by_publish,
             settled(true),
             "an acknowledged publish delivers it"
         );
-        let (_, _, by_call) = observe_settling(CapabilitySupport::NotDeclared, None, false).await;
+        let (_, _, by_call) =
+            observe_settling(CapabilitySupport::NotDeclared, None, observe_ok()).await;
         assert_eq!(by_call, settled(true), "an answered call delivers it");
+        let (_, _, by_refusal) = observe_settling(
+            CapabilitySupport::NotDeclared,
+            None,
+            Ok(Err(br#"{"code":"account_selection_disabled"}"#.to_vec())),
+        )
+        .await;
+        assert_eq!(by_refusal, settled(true), "routing itself answered it");
         let (requests, published, kept) =
-            observe_settling(CapabilitySupport::Declared, Some(false), true).await;
+            observe_settling(CapabilitySupport::Declared, Some(false), away).await;
         assert_eq!((requests.len(), published.len()), (1, 1));
         assert_eq!(kept, settled(false), "neither reached routing");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_non_delivery_keeps_the_end_fact_pending() {
+        let (requests, published, settled) = observe_settling(
+            CapabilitySupport::Declared,
+            Some(false),
+            Ok(Err(br#"{"code":"target_unavailable"}"#.to_vec())),
+        )
+        .await;
+        assert_eq!(published, [the_fact()]);
+        assert_eq!(requests, [the_call()]);
+        assert_eq!(settled, Vec::<String>::new(), "routing never got the end");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_bus_publish_leaves_the_full_direct_observation_budget() {
+        let routing = Arc::new(Routing {
+            stream: CapabilitySupport::Declared,
+            requests: Mutex::default(),
+            reply: observe_ok(),
+            delay: Duration::from_secs(4),
+        });
+        let bus = Arc::new(Bus {
+            acks: true,
+            published: Mutex::default(),
+            delay: Duration::from_secs(3),
+        });
+        let outbox = Arc::new(Settled::default());
+        let client = RoutingClient::new(routing.clone(), AccountSelectionConfig::default());
+        client.set_route_facts(bus.clone());
+        client.set_route_fact_outbox(outbox.clone());
+        client.observe(observation()).await;
+        assert_eq!(*bus.published.lock().unwrap(), [the_fact()]);
+        assert_eq!(*routing.requests.lock().unwrap(), [the_call()]);
+        assert_eq!(*outbox.0.lock().unwrap(), ["adm1:run_finished"]);
     }
 
     fn observation() -> Value {

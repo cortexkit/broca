@@ -245,6 +245,22 @@ fn describe_reply(capabilities: &[&str]) -> Result<Vec<u8>, Vec<u8>> {
     Ok(serde_json::to_vec(&json!({"result": describe})).unwrap())
 }
 
+#[tokio::test]
+async fn the_next_routing_call_reopens_after_the_open_task_panics() {
+    let daemon = RoutingDaemon::start(Ok(br#"{"result":{}}"#.to_vec()), false).await;
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    *daemon.transport.route.lock().unwrap() = RouteSlot::Opening(rx);
+    let opener = tokio::spawn(async move {
+        let _tx = tx;
+        panic!("route opener panicked");
+    });
+    assert!(opener.await.unwrap_err().is_panic());
+
+    let route = daemon.transport.route().await.expect("reopen the route");
+    assert_eq!(daemon.transport.route().await.unwrap(), route);
+    assert_eq!(daemon.opens.load(Ordering::SeqCst), 1);
+}
+
 async fn advance_cache_age(duration: Duration) {
     // Pause only after network setup, and resume before another exchange, so socket I/O
     // does not accidentally auto-advance its authentication or request deadlines.

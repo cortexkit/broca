@@ -468,8 +468,9 @@ impl SubcRoutingTransport {
             let mut slot = self.route.lock().unwrap();
             match &*slot {
                 RouteSlot::Ready(route) => return Ok(*route),
-                RouteSlot::Opening(rx) => rx.clone(),
-                RouteSlot::Empty => {
+                RouteSlot::Opening(rx) if rx.has_changed().is_ok() => rx.clone(),
+                // A closed opening channel means the task exited without updating the slot.
+                RouteSlot::Empty | RouteSlot::Opening(_) => {
                     let (tx, rx) = tokio::sync::watch::channel(None);
                     *slot = RouteSlot::Opening(rx.clone());
                     let conn = Arc::clone(&self.conn);
@@ -1668,9 +1669,9 @@ impl RoutingClient {
         }
     }
 
-    /// Send one report and wait at most [`OBSERVE_BUDGET`] for routing to take it. Never
-    /// resent after possible delivery: a lost report only costs routing that one observation,
-    /// and routing expires on its own the lease of a run whose `run_finished` never arrived.
+    /// Send one report. Capability discovery, bus publish and the direct call have separate
+    /// budgets so a slow bus publish does not shorten the direct fallback. A run's stored end
+    /// stays pending until delivery; other observations are not retried here.
     pub async fn observe(&self, params: Value) {
         let deadline = tokio::time::Instant::now() + OBSERVE_BUDGET;
         if params["kind"] == "transient_backoff" || params["kind"] == "credential_refused" {
@@ -1732,7 +1733,7 @@ impl RoutingClient {
             self.delivered(&params).await;
             return;
         }
-        let answered = self.observe_directly(&params, deadline).await;
+        let answered = self.observe_directly(&params).await;
         if !streamed {
             self.publish_route_fact(ACCOUNT_OBSERVE_OP, &params).await;
         }
@@ -1770,7 +1771,7 @@ impl RoutingClient {
 
     /// Send one observation as the direct `route.account_observe` call, and say whether routing
     /// answered it (took it, or refused it by name). A report it refused is not worth resending.
-    async fn observe_directly(&self, params: &Value, deadline: tokio::time::Instant) -> bool {
+    async fn observe_directly(&self, params: &Value) -> bool {
         let body =
             match serde_json::to_vec(&json!({ "method": ACCOUNT_OBSERVE_OP, "params": params })) {
                 Ok(body) => body,
@@ -1780,23 +1781,25 @@ impl RoutingClient {
                 }
             };
         let kind = params["kind"].as_str().unwrap_or("?").to_string();
-        match tokio::time::timeout_at(deadline, self.transport.request(body)).await {
+        match tokio::time::timeout(OBSERVE_BUDGET, self.transport.request(body)).await {
             Ok(Ok(Ok(_))) => {
                 self.counters.bump("observe_sent");
                 true
             }
-            Ok(Ok(Err(error)))
-                if serde_json::from_slice::<ErrorBodyView>(&error)
-                    .is_ok_and(|error| error.code == SELECTION_DISABLED) =>
-            {
-                // Expected while routing's account selection is switched off: it refuses every
-                // account operation, yet still records the report for the decisions it computes
-                // without acting on them.
-                self.counters.bump("observe_disabled");
-                true
-            }
             Ok(Ok(Err(error))) => {
+                let decoded = serde_json::from_slice::<ErrorBodyView>(&error).ok();
+                let code = decoded.as_ref().map(|body| body.code.as_str());
+                if code == Some(SELECTION_DISABLED) {
+                    // Routing still records reports for the decisions it computes without
+                    // acting on them when account selection is switched off.
+                    self.counters.bump("observe_disabled");
+                    return true;
+                }
                 self.counters.bump("observe_failed");
+                if let Some(code) = code.filter(|code| is_message_plane_code(code)) {
+                    tracing::warn!(target: "accounts", "a {kind} account report was not delivered: {code}");
+                    return false;
+                }
                 tracing::warn!(
                     target: "accounts",
                     "routing refused a {kind} account report: {}",
@@ -3287,7 +3290,7 @@ const MESSAGE_PLANE_CODES: [&str; 11] = [
     "routing_ambiguous",
 ];
 
-fn is_message_plane_code(code: &str) -> bool {
+pub(crate) fn is_message_plane_code(code: &str) -> bool {
     MESSAGE_PLANE_CODES.contains(&code)
 }
 
