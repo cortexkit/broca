@@ -253,7 +253,15 @@ pub fn verdict(
     base: impl Fn(&[u8]) -> Result<ChainBase, String>,
     rebuilt_base: Option<ChainBase>,
 ) -> Result<Verdict, LogError> {
+    let len = bytes.len() as u64;
     let damaged_at = match read.end {
+        LogEnd::Clean if len < read.durable_bound => {
+            // A complete batch boundary doesn't make the published suffix optional.
+            return Ok(Verdict::Corrupt {
+                at: len,
+                durable_bound: read.durable_bound,
+            });
+        }
         LogEnd::Clean => return Ok(Verdict::Opens(read)),
         LogEnd::TornTail { at } => {
             let durable_bound = read.durable_bound;
@@ -272,12 +280,17 @@ pub fn verdict(
         mut gaps,
         trailing_benign,
     } = scan(bytes, key, bind)?;
-    let len = bytes.len() as u64;
     // Every authenticated frame's sync claim is true, a torn tail's included.
     let durable_bound = frames
         .iter()
         .map(|frame| frame.header.synced_through)
         .fold(created_len, u64::max);
+    if len < durable_bound {
+        return Ok(Verdict::Corrupt {
+            at: damaged_at,
+            durable_bound,
+        });
+    }
 
     // A torn tail at the end: what an unsynced append leaves after the last intact frame, plus
     // the frames of a batch the file ends inside.

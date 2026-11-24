@@ -417,6 +417,85 @@ async fn a_failed_insert_leaves_the_run_owed_until_the_next_runs_end() {
     );
 }
 
+/// A run whose own records don't build its spend facts stays owed, but is read once per open of
+/// the session, not again at every later run's end: its records never change, and reading them
+/// reads all the history after it. The later runs are billed as usual.
+#[tokio::test]
+async fn an_unbillable_run_is_tried_once_per_open() {
+    const UNBILLABLE: &str = "r-unbillable-once";
+    let tried = broca_test_support::LogCapture::observe(|event| {
+        event.target == "broca.store_actor"
+            && event.fields.get("run_id").map(String::as_str) == Some(UNBILLABLE)
+    });
+    let backend = leaked();
+    let parts = parts();
+    // The run ends where nothing bills it, so it stays owed.
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let actor = StoreActor::new(
+        bind(),
+        session,
+        Arc::new(executor(vec![text_step("a1", "hello")], None)),
+        Box::new(parts.clone()),
+    );
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(sender, backend);
+    let served = tokio::spawn(actor.serve(receiver));
+    ran(&commands, UNBILLABLE, "first").await;
+    drop(commands);
+    let mut session = served.await.unwrap();
+    // A warm of it whose billing payload isn't an object: the run's records no longer build its
+    // facts, at any read.
+    session
+        .append(
+            &[Record::Warmed(broca_session_store::record::Warmed {
+                run_id: UNBILLABLE.into(),
+                step_id: 1,
+                trigger: Some("keep_warm".into()),
+                request_body_sha256: broca_session_store::codec::Digest([1; 32]),
+                warm_body_sha256: broca_session_store::codec::Digest([2; 32]),
+                usage: Default::default(),
+                served_account_ref: None,
+                sent_at_ms: 5,
+                ttl_ms: None,
+                expires_at_ms: None,
+                attempt_id: None,
+                billing: Some(serde_json::json!([1]).into()),
+                ratelimit_headers: None,
+                reached_cache: None,
+                requested_cache_ttl_ms: None,
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+    drop(session);
+
+    let export = Export::new(backend, &[]);
+    let steps = vec![text_step("a2", "again"), text_step("a3", "and again")];
+    let (commands, served) =
+        open_billed(backend, executor(steps, None), &parts, &export, false).await;
+    ran(&commands, "r-later-1", "second").await;
+    ran(&commands, "r-later-2", "third").await;
+    drop(commands);
+    let session = served.await.unwrap();
+    assert_eq!(run_ids(&export.facts()), ["r-later-1", "r-later-2"]);
+    assert_eq!(session.operations.billing_owed, [UNBILLABLE]);
+    assert_eq!(
+        tried.events().len(),
+        1,
+        "the unbillable run was tried again: {:?}",
+        tried.events()
+    );
+}
+
 /// A converted session holds a `Billed` record after each run's end, since today's storage
 /// billed those runs: it opens owing nothing and inserts no fact. A run in the session store after
 /// them is billed once.

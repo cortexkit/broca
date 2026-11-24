@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use broca_protocol::{BindPrincipal, SendScope};
 use broca_store::grants::{GrantsStore, HeldCall, HeldState, HoldRequest};
-use broca_store::system_one::{BatchScope, Outcome, StoredBatch};
+use broca_store::system_one::{BatchScope, StoredBatch};
 use cortexkit_llm_tools::classify;
 use cortexkit_role_classifier::errors::Refusal;
 use serde_json::{json, value::RawValue, Value};
@@ -41,6 +41,9 @@ impl super::Asks for NoPrivateContent {
 }
 
 type Answer = Result<Box<RawValue>, Vec<u8>>;
+
+/// How many grants the release log remembers; see `LlmTools::released_grants`.
+const RELEASED_GRANTS_KEPT: usize = 256;
 
 /// tool-provider 0.13's name for the opt-in reply format that 0.10 called `content/v1`. The
 /// rename changed nothing else: the reply shapes, held replies and late results are identical,
@@ -107,9 +110,18 @@ pub struct LlmTools {
     consent: Option<Arc<super::consent::Consent>>,
     consent_workers: Mutex<std::collections::HashSet<String>>,
     consent_stop: tokio_util::sync::CancellationToken,
-    /// Grants that have already released a call in this process. Only the first release by
-    /// each grant is logged, so a run of calls under one grant writes one line.
-    released_grants: Mutex<std::collections::HashSet<String>>,
+    /// One reconciliation of every held call at a time, shared by all card watchers: see
+    /// [`LlmTools::reconcile`].
+    reconciling: tokio::sync::Mutex<()>,
+    /// Reconciliations asked for, and how many of those requests the last finished pass
+    /// covered.
+    reconcile_requests: std::sync::atomic::AtomicU64,
+    reconciled: std::sync::atomic::AtomicU64,
+    /// Grants that have already released a call in this process, oldest first. Only the first
+    /// release by each grant is logged, so a run of calls under one grant writes one line. Only
+    /// the most recent [`RELEASED_GRANTS_KEPT`] are remembered: an older grant releasing again
+    /// logs one more line, which is cheaper than remembering every grant ever used.
+    released_grants: Mutex<std::collections::VecDeque<String>>,
     /// `llm.complete/v1`, when this broca serves it: listed in the catalog and answered only then.
     complete: Option<Arc<super::complete::Complete>>,
 }
@@ -133,7 +145,10 @@ impl LlmTools {
             consent: None,
             consent_workers: Mutex::new(std::collections::HashSet::new()),
             consent_stop: tokio_util::sync::CancellationToken::new(),
-            released_grants: Mutex::new(std::collections::HashSet::new()),
+            reconciling: tokio::sync::Mutex::new(()),
+            reconcile_requests: std::sync::atomic::AtomicU64::new(0),
+            reconciled: std::sync::atomic::AtomicU64::new(0),
+            released_grants: Mutex::new(std::collections::VecDeque::new()),
             complete: None,
             held: Arc::new(super::held::HeldCalls::new(
                 Arc::new(GrantsStore::open_in_memory().expect("in-memory grants store opens")),
@@ -173,13 +188,18 @@ impl LlmTools {
     /// Log the first call `grant` releases in this process. It names who holds the grant, for
     /// which provider, how long it lasts and which run used it, and nothing from the call.
     fn note_release(&self, grant: &broca_store::grants::Grant, scope_ref: &str) {
-        let first = self
-            .released_grants
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(grant.id.clone());
-        if !first {
-            return;
+        {
+            let mut released = self
+                .released_grants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if released.contains(&grant.id) {
+                return;
+            }
+            if released.len() >= RELEASED_GRANTS_KEPT {
+                released.pop_front();
+            }
+            released.push_back(grant.id.clone());
         }
         let kind = match grant.kind {
             broca_store::grants::GrantKind::Run => "run",
@@ -257,14 +277,8 @@ impl LlmTools {
                     return;
                 };
                 loop {
+                    service.reconcile(consent).await;
                     let now = service.system.tool_now();
-                    if let Err(error) = service.held.sweep_image_entries(consent, now).await {
-                        tracing::warn!(%error, "held-call image cleanup will be retried");
-                    }
-                    if let Err(error) = consent.resume_granted(now).await {
-                        tracing::warn!(%error, "held-call grant reconciliation failed");
-                    }
-                    let _ = service.recover_authorized();
                     let Ok(Some(card)) = consent.store.card(&key) else {
                         return;
                     };
@@ -282,7 +296,6 @@ impl LlmTools {
                         broca_store::grants::CardState::Allowed
                             | broca_store::grants::CardState::Denied
                     ) {
-                        let _ = service.recover_authorized();
                         let waiting = consent.store.card_calls(&key, now).is_ok_and(|rows| {
                             rows.iter()
                                 .any(|row| matches!(row.state, HeldState::Filing | HeldState::Held))
@@ -300,16 +313,7 @@ impl LlmTools {
                     } else {
                         match consent.wait_once(&key, now).await {
                             Ok(false) => {
-                                let _ = service
-                                    .held
-                                    .sweep_image_entries(consent, service.system.tool_now())
-                                    .await;
-                                if let Err(error) =
-                                    consent.resume_granted(service.system.tool_now()).await
-                                {
-                                    tracing::warn!(%error, "held-call grant reconciliation failed");
-                                }
-                                let _ = service.recover_authorized();
+                                service.reconcile(consent).await;
                                 return;
                             }
                             Ok(true) => (),
@@ -318,7 +322,6 @@ impl LlmTools {
                             }
                         }
                     }
-                    let _ = service.recover_authorized();
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             };
@@ -331,18 +334,61 @@ impl LlmTools {
         });
     }
 
-    /// Only previously authorized rows dispatch on startup. Filing and held rows remain in
+    /// Reconcile every held call with the durable consent state: drop finished calls' images,
+    /// authorize waiting calls a grant now releases, and dispatch authorized calls that are due.
+    /// One watcher runs per pending card and each asks for this on every wake, but a pass reads
+    /// every held call whatever card it waits on. So a pass that started after a request covers
+    /// it: watchers waking together share one pass instead of each repeating it.
+    async fn reconcile(self: &Arc<Self>, consent: &super::consent::Consent) {
+        use std::sync::atomic::Ordering;
+        let requested = self.reconcile_requests.fetch_add(1, Ordering::SeqCst) + 1;
+        let _turn = self.reconciling.lock().await;
+        if self.reconciled.load(Ordering::SeqCst) >= requested {
+            return;
+        }
+        let covers = self.reconcile_requests.load(Ordering::SeqCst);
+        let now = self.system.tool_now();
+        if let Err(error) = self.held.sweep_image_entries(consent, now).await {
+            tracing::warn!(%error, "held-call image cleanup will be retried");
+        }
+        if let Err(error) = consent.resume_granted(now).await {
+            tracing::warn!(%error, "held-call grant reconciliation failed");
+        }
+        if let Err(error) = self.dispatch_authorized() {
+            tracing::warn!(%error, "authorized held calls will be dispatched on the next pass");
+        }
+        self.reconciled.store(covers, Ordering::SeqCst);
+    }
+
+    /// Dispatch every authorized call that is due, and hand later retries to the held-call
+    /// timer, which calls back on each tick. Called at startup, when no call has a retry
+    /// scheduled, so every authorized call is dispatched once. Filing and held rows remain in
     /// consent recovery, and their timers use the persisted deadlines rather than a new wait.
     pub fn recover_authorized(self: &Arc<Self>) -> Result<(), broca_store::grants::GrantsError> {
-        for row in self.held.store.recovering(self.system.tool_now())? {
-            if row.state != HeldState::Authorized {
+        let tools = Arc::downgrade(self);
+        self.held.set_dispatch(Arc::new(move || {
+            if let Some(tools) = tools.upgrade() {
+                if let Err(error) = tools.dispatch_authorized() {
+                    tracing::warn!(%error, "authorized held calls will be dispatched on the next tick");
+                }
+            }
+        }));
+        self.dispatch_authorized()
+    }
+
+    /// Start an attempt for each authorized call whose retry is due. A call already running
+    /// or waiting out its backoff is left alone.
+    fn dispatch_authorized(self: &Arc<Self>) -> Result<(), broca_store::grants::GrantsError> {
+        let now = self.system.tool_now();
+        for row in self.held.store.calls_in_state(HeldState::Authorized, now)? {
+            if !self.held.start_attempt(&row, now) {
                 continue;
             }
             // An authorized row always keeps its validated request. A row without one can't be
             // dispatched, so it stays recorded and is skipped here rather than panicking the task.
             let Some(params) = row.request.clone() else {
                 tracing::warn!(target: "llm_tools", batch = %row.batch_id,
-                    "authorized held call has no stored request; not dispatched at startup");
+                    "authorized held call has no stored request; not dispatched");
                 continue;
             };
             let service = self.clone();
@@ -604,7 +650,64 @@ impl LlmTools {
         }
     }
 
+    /// One attempt at a model-tool call. An authorized held call that is still authorized
+    /// afterwards recorded no outcome, so its next attempt is scheduled; one that settled has
+    /// its result stored and delivered as a late result.
     async fn call(
+        self: &Arc<Self>,
+        admission: Admission,
+        keyed: bool,
+        scope: &SendScope,
+        stamped_project_id: Option<&str>,
+        held: Option<HeldCall>,
+        hold_caller: Option<(&str, &str)>,
+    ) -> Answer {
+        let authorized = held
+            .as_ref()
+            .filter(|row| row.state == HeldState::Authorized)
+            .cloned();
+        let answer = self
+            .attempt(
+                admission,
+                keyed,
+                scope,
+                stamped_project_id,
+                held,
+                hold_caller,
+            )
+            .await;
+        if let Some(row) = authorized {
+            self.schedule_unsettled(&row, &answer);
+        }
+        answer
+    }
+
+    fn schedule_unsettled(&self, row: &HeldCall, answer: &Answer) {
+        let now = self.system.tool_now();
+        // A store that cannot be read counts as unsettled: a retry of a call that did settle
+        // finds its stored result and sends nothing.
+        let unsettled = self
+            .held
+            .store
+            .lookup(&row.batch_id, now)
+            .map_or(true, |current| {
+                current.is_some_and(|current| {
+                    current.state == HeldState::Authorized
+                        && current.admitted_at_ms == row.admitted_at_ms
+                })
+            });
+        if !unsettled {
+            return;
+        }
+        let retry_after_ms = answer
+            .as_ref()
+            .err()
+            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+            .and_then(|body| body["detail"]["retry_after_ms"].as_i64());
+        self.held.retry_later(row, retry_after_ms, now);
+    }
+
+    async fn attempt(
         self: &Arc<Self>,
         mut admission: Admission,
         keyed: bool,
@@ -666,7 +769,7 @@ impl LlmTools {
                         .map_err(unspent)?,
                 );
                 if held.is_some() {
-                    self.persist_held_answer(&admission.batch_id, &answer, Spend::Nothing)?;
+                    self.persist_held_answer(&admission.batch_id, &answer, Spend::Nothing, true)?;
                 }
                 return answer;
             }
@@ -717,7 +820,12 @@ impl LlmTools {
                 Err(refusal) => {
                     let answer = Err(unspent(refusal));
                     if held.is_some() {
-                        self.persist_held_answer(&admission.batch_id, &answer, Spend::Nothing)?;
+                        self.persist_held_answer(
+                            &admission.batch_id,
+                            &answer,
+                            Spend::Nothing,
+                            false,
+                        )?;
                     }
                     return answer;
                 }
@@ -734,10 +842,11 @@ impl LlmTools {
                 .admit_tool(&admission.params, stored.as_ref())
                 .map_err(unspent)?
         };
-        // Private-content admission runs on every call that is not replaying a stored answer:
-        // a repeat must return the bytes it already paid for even after the operator's list
-        // changed or cerebellum started marking the scope.
-        if stored.is_none() && held.is_none() {
+        // Private-content admission runs on every call that may reach a provider. A recorded
+        // outcome already returned above, so a stored batch here has none and this call would
+        // dispatch its item again: it needs consent exactly as a fresh call would. A held call
+        // was admitted by the person's decision instead.
+        if held.is_none() {
             if let Err(refusal) = self.private_content.admit(scope, &admission.provider).await {
                 let reason: Value = serde_json::from_slice(&refusal).unwrap_or(Value::Null);
                 let consent_reason = reason["detail"]["consent"].as_str().unwrap_or("");
@@ -800,7 +909,7 @@ impl LlmTools {
                     };
                     let sources = self.private_content.card_sources(scope).await;
                     let dedup_key = consent
-                        .dedup_key(agent, &admission.provider, &identity)
+                        .dedup_key(agent, &admission.provider, &identity, now)
                         .map_err(|e| self.consent_unavailable(e))?;
                     let body = broca_subc::consent_card::private_content_card_for_project(
                         provider_label,
@@ -907,8 +1016,9 @@ impl LlmTools {
                         )),
                     };
                     let answer = if held.is_some() {
+                        let recorded = answer.is_err() && service.recorded(&batch_id).await;
                         service
-                            .persist_held_answer(&batch_id, &answer, Spend::Unknown)
+                            .persist_held_answer(&batch_id, &answer, Spend::Unknown, recorded)
                             .and(answer)
                     } else {
                         answer
@@ -926,17 +1036,31 @@ impl LlmTools {
         await_flight(receiver).await
     }
 
+    /// Whether the batch has a recorded outcome, which is final for its call key.
+    async fn recorded(&self, batch_id: &str) -> bool {
+        self.system
+            .stored_batch(batch_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|stored| has_final_outcome(&stored))
+    }
+
     /// Record a held call's outcome. `lost` is the spend a failure to record states: unknown
     /// after an execution that may have reached the provider, nothing when no request was sent.
+    /// `recorded` says the refusal is the batch's recorded outcome.
     fn persist_held_answer(
         &self,
         batch_id: &str,
         answer: &Answer,
         lost: Spend,
+        recorded: bool,
     ) -> Result<(), Vec<u8>> {
         let error = |refusal| error(refusal, Some(lost));
-        // Transient execution refusals stay authorized so recovery can retry them. They must
-        // not be converted into a not-started consent outcome after dispatch.
+        // A recorded outcome is final for the call key whatever its class, so it is the held
+        // call's result. A transient refusal that recorded nothing leaves the call authorized
+        // for its retry schedule. Neither is ever converted into a not-started consent outcome
+        // after dispatch.
         if let Ok(body) = answer {
             self.held
                 .store
@@ -952,7 +1076,7 @@ impl LlmTools {
                     "held execution error is unreadable",
                 ))
             })?;
-            if value["detail"]["class"] == "permanent" {
+            if recorded || value["detail"]["class"] == "permanent" {
                 self.held
                     .store
                     .complete_authorized_error(
@@ -1008,17 +1132,12 @@ fn check_replay(stored: &StoredBatch, admission: &Admission) -> Result<(), Refus
     Ok(())
 }
 
+/// Every recorded outcome is final for its call key, a transient refusal included: a repeat
+/// of the same key returns it with the spend members it was recorded with and sends nothing.
+/// A caller that wants another attempt sends a new call key. Only a batch with no recorded
+/// outcome (its process ended between the claim and the answer) may dispatch again.
 fn has_final_outcome(stored: &StoredBatch) -> bool {
-    stored
-        .outcomes
-        .first()
-        .is_some_and(|outcome| match &outcome.outcome {
-            Outcome::Answered(_) => true,
-            Outcome::Failed(body) => {
-                serde_json::from_str::<cortexkit_role_classifier::errors::ItemError>(body)
-                    .map_or(true, |error| !error.is_retried_on_resend())
-            }
-        })
+    !stored.outcomes.is_empty()
 }
 
 /// Encode a refusal with its spend mark. `None` is for a refusal an earlier step already

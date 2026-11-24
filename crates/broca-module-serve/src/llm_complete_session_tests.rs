@@ -131,3 +131,140 @@ async fn llm_complete_runs_one_tool_free_run_through_the_session_runtime() {
     rig.close().await;
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// A completion's run asks routing for its account with the select's decision, so the account it
+/// is admitted on is the one its price was frozen for. A subscription route is tied to its
+/// account by the decision alone; a pooled-key route also names the pool and credential routing
+/// chose, among the API keys this broca holds.
+#[tokio::test]
+async fn llm_complete_asks_routing_for_the_account_its_decision_priced() {
+    if !run_catalog_drift_child("llm_complete_asks_routing_for_the_account_its_decision_priced") {
+        return;
+    }
+    use cortexkit_role_routing::price::{Price, RatesPerMtok};
+    use cortexkit_role_routing::select::{RouteRef, RunnerAuth, RunnerRef, SelectAnswer};
+    let _catalog = install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("llm-complete-account");
+    let daemon = CapturingVaultDaemon::start(&root).await;
+    let http = resume_http_fixture().await;
+    let routing = Arc::new(AuthHintRouting::default());
+    let live = auth_hint_executor(&root, &daemon, routing.clone(), &http.url).await;
+    let key = |id: &str, account: &str| {
+        serde_json::json!({"id": id, "type": "apikey", "categories": ["llm"], "serves": ["openai"],
+            "state": "active", "record_version": 1, "operations": ["read"],
+            "provider_ids": ["openai"], "auth_method": "apikey", "account_id": account})
+    };
+    let listing = serde_json::from_value(serde_json::json!({"credentials": [
+        key("apikey:openai:a", "key-account-a"),
+        key("apikey:openai:b", "key-account-b"),
+    ], "grants": 1, "grant_tuples": [], "view": "llm-complete"}))
+    .unwrap();
+    live.vault.as_ref().unwrap().listing.store(listing);
+    let rig = TierServeRig::start_with_executor(&root, live).await;
+    rig.registry.set_retention_service(Arc::new(
+        broca_module::retention::RetentionService::new(
+            &root,
+            Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
+        )
+        .unwrap(),
+    ));
+    let route = RouteRef::new("openai", "test-ultrafast");
+    let answer = |decision: &str, auth: Option<RunnerAuth>| {
+        let runner = RunnerRef::new("broca", route.clone());
+        SelectAnswer::new(
+            decision,
+            route.clone(),
+            match auth {
+                Some(auth) => runner.with_auth(auth),
+                None => runner,
+            },
+            100_000,
+            4_000,
+            u64::MAX,
+            "test",
+        )
+        .with_price(Price::metered(RatesPerMtok::new(3u64.into(), 15u64.into())))
+    };
+    let basal = broca_protocol::BindPrincipal::Reserved {
+        module_id: "basal".into(),
+    };
+    let scope = broca_protocol::SendScope::Stamped(broca_protocol::BindScope {
+        scope: broca_protocol::SessionScope {
+            owner: basal.clone(),
+            agent_id_frozen: false,
+            scope_ref: "flow-scope".into(),
+            scope_epoch: 1,
+            flow_id: Some("flow-1".into()),
+            sender: None,
+            agent_id: None,
+            run_id: None,
+        },
+        owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+    });
+    let arguments = serde_json::value::to_raw_value(&serde_json::json!({
+        "demand": {"iq": 50}, "prompt": "Say done.", "max_output_tokens": 64,
+        "max_cost_usd": 0.01,
+    }))
+    .unwrap();
+    for (call_key, select) in [
+        ("k-subscription", answer("decision-subscription", None)),
+        (
+            "k-pooled",
+            answer(
+                "decision-pooled",
+                Some(RunnerAuth {
+                    pool: Some("keys".into()),
+                    credential_id: Some("apikey:openai:b".into()),
+                }),
+            ),
+        ),
+    ] {
+        let complete = Arc::new(
+            broca_module_serve::llm_tools::complete::Complete::new(
+                Arc::new(broca_store::system_one::SystemOneStore::open_in_memory().unwrap()),
+                "test-owner",
+                Arc::new(OneRoute(select)),
+                rig.registry.clone(),
+                "broca",
+            )
+            .with_poll(Duration::from_millis(10)),
+        );
+        // The stand-in routing refuses every account, so nothing reaches the provider.
+        let refused = complete
+            .answer(Some(&basal), &scope, &arguments, Some(call_key), &AnyProvider)
+            .await;
+        assert!(refused.is_err(), "{call_key}");
+    }
+    {
+        let requests = routing.requests.lock().unwrap();
+        let asked = |decision: &str| {
+            requests
+                .iter()
+                .map(|request| &request["params"])
+                .find(|params| params["decision_id"] == decision)
+                .unwrap_or_else(|| panic!("no account_for named {decision}: {requests:?}"))
+                .clone()
+        };
+        let subscription = asked("decision-subscription");
+        assert!(subscription.get("pool").is_none(), "{subscription}");
+        assert!(subscription.get("requested_account").is_none(), "{subscription}");
+        let pooled = asked("decision-pooled");
+        assert_eq!(pooled["pool"], "keys");
+        assert_eq!(pooled["requested_account"]["credential_id"], "apikey:openai:b");
+        let mut offered: Vec<_> = pooled["candidates"]["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|account| account["credential_id"].as_str().unwrap().to_owned())
+            .collect();
+        offered.sort();
+        assert_eq!(offered, ["apikey:openai:a", "apikey:openai:b"]);
+    }
+    assert!(http.requests.lock().unwrap().is_empty());
+    rig.close().await;
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}

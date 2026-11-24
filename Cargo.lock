@@ -517,6 +517,7 @@ dependencies = [
  "cortexkit-anthropic-policy",
  "cortexkit-bus-naming",
  "cortexkit-compaction-view",
+ "cortexkit-role-compaction",
  "cortexkit-role-llm-runner 0.7.48",
  "cortexkit-role-llm-runner 0.9.6",
  "jiff",

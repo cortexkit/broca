@@ -668,7 +668,7 @@ async fn unknown_liveness_cannot_mint_or_use_run_grants() {
     store.revoke(&store.grants().unwrap()[0].id).unwrap();
     io.unknown.lock().unwrap().push("a".into());
     let key = consent
-        .dedup_key("agent", "typesafe", &identity("a"))
+        .dedup_key("agent", "typesafe", &identity("a"), now())
         .unwrap();
     let body = broca_subc::consent_card::private_content_card(
         "TypeSafe",
@@ -728,7 +728,7 @@ async fn revoke_restart_changes_the_next_card_key_and_leaves_held_calls_waiting(
         let io = Arc::new(Io::default());
         let consent = Consent::new(store.clone(), io.clone());
         old_key = consent
-            .dedup_key("agent", "typesafe", &identity("a"))
+            .dedup_key("agent", "typesafe", &identity("a"), now())
             .unwrap();
         let grant = seed(&store, &old_key, "a", Decision::AllowRun, now());
         let at = now();
@@ -786,7 +786,7 @@ async fn revoke_restart_changes_the_next_card_key_and_leaves_held_calls_waiting(
         .await
         .unwrap());
     let new_key = consent
-        .dedup_key("agent", "typesafe", &identity("a"))
+        .dedup_key("agent", "typesafe", &identity("a"), now())
         .unwrap();
     assert_ne!(old_key, new_key);
     let body = broca_subc::consent_card::private_content_card(

@@ -147,7 +147,24 @@ impl TagNumbering {
         rules: Option<broca_protocol::tags::ComputedRules>,
         computed_tags: Option<broca_records::record::ComputedTagRules>,
     ) -> Self {
-        let mut numbering = Self::new(TagSeed::from_prefix(prior), prior.len());
+        Self::for_run_after(
+            broca_protocol::tags::high_after(prior),
+            prior.len(),
+            rules,
+            computed_tags,
+        )
+    }
+
+    /// [`Self::for_run`] for a run whose earlier transcript holds `numbered` messages showing
+    /// at most `high`: a caller numbering several runs of one transcript in order carries `high`
+    /// from run to run rather than rescanning every earlier message for each run.
+    pub fn for_run_after(
+        high: u64,
+        numbered: usize,
+        rules: Option<broca_protocol::tags::ComputedRules>,
+        computed_tags: Option<broca_records::record::ComputedTagRules>,
+    ) -> Self {
+        let mut numbering = Self::new(TagSeed { high, rules: None }, numbered);
         numbering.rules = rules;
         if let Some(computed) = computed_tags {
             numbering.high = numbering.high.max(computed.checkpoint);

@@ -93,6 +93,30 @@ fn card() -> Card {
     }
 }
 
+/// Answer the test card `allow_run` for the live run, which mints the run grant `card-1`.
+fn grant(store: &GrantsStore) {
+    store
+        .apply_answer(
+            &scope(),
+            CardAnswer {
+                dedup_key: "one-card".into(),
+                card_id: "card-1".into(),
+                decision: Decision::AllowRun,
+                run_live: true,
+            },
+            1000,
+        )
+        .unwrap();
+}
+
+/// Authorize a held call under the run grant `card-1`, minting it first if needed.
+fn authorize(store: &GrantsStore, batch_id: &str, now: i64) -> bool {
+    if store.grant_from_card("card-1").unwrap().is_none() {
+        grant(store);
+    }
+    store.authorize(batch_id, "card-1", 0, now).unwrap()
+}
+
 #[test]
 fn schema_and_private_file_survive_reopen() {
     let root = broca_test_support::scratch_root();
@@ -293,8 +317,8 @@ fn authorization_cas_survives_restart_and_late_deadline() {
     let store = GrantsStore::open(&path).unwrap();
     let row = insert(&store, "p1", "race", 1000);
     store.put_card(&card()).unwrap();
-    assert!(store.authorize(&row.batch_id, 600_999).unwrap());
-    assert!(!store.authorize(&row.batch_id, 600_999).unwrap());
+    assert!(authorize(&store, &row.batch_id, 600_999));
+    assert!(!authorize(&store, &row.batch_id, 600_999));
     drop(store);
     let held = HeldCalls::new(
         Arc::new(GrantsStore::open(&path).unwrap()),
@@ -346,11 +370,11 @@ fn deadline_cas_prevents_late_authorization_and_double_settlement() {
     let row = insert(&store, "p1", "timeout", 1000);
     store.put_card(&card()).unwrap();
     assert!(!store.expire_held(&row.batch_id, "{}", 600_999).unwrap());
-    assert!(!store.authorize(&row.batch_id, 601_000).unwrap());
+    assert!(!authorize(&store, &row.batch_id, 601_000));
     assert!(store
         .expire_held(&row.batch_id, &not_started("pending"), 601_000)
         .unwrap());
-    assert!(!store.authorize(&row.batch_id, 601_001).unwrap());
+    assert!(!authorize(&store, &row.batch_id, 601_001));
     assert!(!store
         .finish_unstarted(&row.batch_id, &not_started("denied"), 601_001)
         .unwrap());
@@ -408,7 +432,7 @@ fn unacknowledged_delivery_expires_at_admission_not_settlement() {
     let store = GrantsStore::open_in_memory().unwrap();
     let row = insert(&store, "p1", "unacked", 1000);
     store.put_card(&card()).unwrap();
-    store.authorize(&row.batch_id, 2000).unwrap();
+    authorize(&store, &row.batch_id, 2000);
     store
         .complete_authorized(&row.batch_id, "{}", 86_401_000)
         .unwrap();
@@ -630,7 +654,7 @@ async fn two_principals_restart_authorize_and_deliver_under_raw_keys() {
         "restart".into(),
     ));
     for row in [&first, &second] {
-        assert!(held.store.authorize(&row.batch_id, 2000).unwrap());
+        assert!(authorize(&held.store, &row.batch_id, 2000));
         held.store
             .complete_authorized(
                 &row.batch_id,
@@ -768,7 +792,7 @@ async fn authorized_recovery_executes_frozen_request_after_deadline_and_preserve
     let store = GrantsStore::open(&path).unwrap();
     let row = insert(&store, "p1", "authorized-replay", 1000);
     store.put_card(&card()).unwrap();
-    assert!(store.authorize(&row.batch_id, 2000).unwrap());
+    assert!(authorize(&store, &row.batch_id, 2000));
     drop(store);
     let held = Arc::new(HeldCalls::new(
         Arc::new(GrantsStore::open(&path).unwrap()),
@@ -945,7 +969,7 @@ async fn approval_before_deadline_allows_slow_execution_past_deadline() {
     let store = Arc::new(GrantsStore::open_in_memory().unwrap());
     let row = insert(&store, "p1", "slow", 1000);
     store.put_card(&card()).unwrap();
-    assert!(store.authorize(&row.batch_id, 600_999).unwrap());
+    assert!(authorize(&store, &row.batch_id, 600_999));
     let held = Arc::new(HeldCalls::new(store, "start".into()));
     let clock = Arc::new(AtomicI64::new(600_999));
     let provider = Arc::new(SlowProvider {
@@ -1009,12 +1033,13 @@ fn independent_connections_race_authorization_and_deadline_with_one_winner() {
     let row = insert(&store, "p1", "race", 1000);
     store.put_card(&card()).unwrap();
     let other = GrantsStore::open(&path).unwrap();
+    grant(&store);
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let ready = barrier.clone();
     let batch = row.batch_id.clone();
     let authorize = std::thread::spawn(move || {
         ready.wait();
-        other.authorize(&batch, 600_999).unwrap()
+        authorize(&other, &batch, 600_999)
     });
     barrier.wait();
     let expired = store
@@ -1037,7 +1062,7 @@ async fn authorized_permanent_failure_is_final_replayed_and_delivered_as_result(
     let store = Arc::new(GrantsStore::open_in_memory().unwrap());
     let row = insert(&store, "p1", "failed", 1000);
     store.put_card(&card()).unwrap();
-    store.authorize(&row.batch_id, 2000).unwrap();
+    authorize(&store, &row.batch_id, 2000);
     let held = Arc::new(HeldCalls::new(store, "start".into()));
     let tools = tools(
         held.clone(),
@@ -1167,7 +1192,7 @@ async fn authorized_replay_uses_first_admitted_request_bytes() {
         other => panic!("unexpected admission: {other:?}"),
     };
     store.put_card(&card()).unwrap();
-    store.authorize(&row.batch_id, 2000).unwrap();
+    authorize(&store, &row.batch_id, 2000);
     let provider = Arc::new(CapturedProvider::default());
     let tools = tools(
         Arc::new(HeldCalls::new(store, "start".into())),
@@ -1183,4 +1208,312 @@ async fn authorized_replay_uses_first_admitted_request_bytes() {
         .unwrap();
     let payload = provider.0.lock().unwrap();
     assert!(payload.find("\"b\"").unwrap() < payload.find("\"a\"").unwrap(), "authorized replay must use the first admitted request, not the retry's canonically equal JSON");
+}
+
+/// A provider that refuses its first call with a rate limit naming a two-minute wait, then
+/// answers.
+#[derive(Default)]
+struct RateLimitedOnce(AtomicUsize);
+
+#[async_trait::async_trait]
+impl ClassifierProvider for RateLimitedOnce {
+    fn egress_host(&self) -> String {
+        "localhost".into()
+    }
+    fn credential_id(&self) -> Option<String> {
+        None
+    }
+    async fn call(&self, body: String) -> ProviderReply {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            return ProviderReply::Status {
+                status: 429,
+                retry_after_ms: Some(120_000),
+            };
+        }
+        Provider::default().call(body).await
+    }
+}
+
+/// A provider whose first call ends without an answer, as an execution would that stopped
+/// between the batch claim and the provider's reply, so nothing is recorded. Later calls
+/// answer.
+#[derive(Default)]
+struct EndsFirstCall(AtomicUsize);
+
+#[async_trait::async_trait]
+impl ClassifierProvider for EndsFirstCall {
+    fn egress_host(&self) -> String {
+        "localhost".into()
+    }
+    fn credential_id(&self) -> Option<String> {
+        None
+    }
+    async fn call(&self, body: String) -> ProviderReply {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("the execution ends before the provider answers");
+        }
+        Provider::default().call(body).await
+    }
+}
+
+/// Wait up to half a second for `calls` to reach `count`; `false` when it never did.
+async fn reaches(calls: &AtomicUsize, count: usize) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        broca_test_support::wait_until("provider call count", || async {
+            if calls.load(Ordering::SeqCst) >= count {
+                Ok(())
+            } else {
+                Err("not yet".to_owned())
+            }
+        }),
+    )
+    .await
+    .is_ok()
+}
+
+/// An authorized call whose provider refused it transiently has that refusal recorded, and a
+/// recorded outcome is final for its call key: the refusal is the held call's result, delivered
+/// as a late result, and nothing sends the call again.
+#[tokio::test]
+async fn a_recorded_transient_refusal_is_the_authorized_calls_late_result() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let row = insert(&store, "p1", "rate-limited", 1000);
+    store.put_card(&card()).unwrap();
+    assert!(authorize(&store, &row.batch_id, 2000));
+    let held = Arc::new(HeldCalls::new(store, "start".into()));
+    let provider = Arc::new(RateLimitedOnce::default());
+    let clock = Arc::new(AtomicI64::new(2000));
+    let tools = tools(
+        held.clone(),
+        provider.clone(),
+        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        clock.clone(),
+    );
+    let body = json!({"name":"llm_classify","arguments":arguments(),"call_key":"rate-limited"})
+        .to_string();
+    let failure = tools
+        .answer(body.as_bytes(), Some(&principal("p1")), &stamp())
+        .await
+        .unwrap_err();
+    let refusal: Value = serde_json::from_slice(&failure).unwrap();
+    assert_eq!(refusal["code"], "rate_limited", "{refusal}");
+    let settled = held.store.lookup(&row.batch_id, 2000).unwrap().unwrap();
+    assert_eq!(settled.state, HeldState::Final);
+    let page = answer(&tools, "late_results", json!({"since":null}), "p1").await;
+    assert_eq!(page["entries"][0]["kind"], "result", "{page}");
+    assert_eq!(page["entries"][0]["result"]["isError"], true, "{page}");
+    assert_eq!(
+        page["entries"][0]["result"]["errorCode"], "rate_limited",
+        "{page}"
+    );
+    tools.recover_authorized().unwrap();
+    clock.store(2000 + 120_000, Ordering::SeqCst);
+    held.expire_due(2000 + 120_000).unwrap();
+    assert_eq!(
+        tools
+            .answer(body.as_bytes(), Some(&principal("p1")), &stamp())
+            .await
+            .unwrap_err(),
+        failure,
+        "a repeat answers the recorded refusal"
+    );
+    assert!(
+        !reaches(&provider.0, 2).await,
+        "nothing sends the call again"
+    );
+}
+
+/// An authorized call whose attempt ended without recording anything is retried by the
+/// held-call timer, not by every recovery pass: never before its backoff has passed, and then
+/// without any caller or card activity, ending in a late result.
+#[tokio::test]
+async fn an_authorized_call_that_recorded_nothing_is_retried_by_the_timer_after_its_backoff() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let row = insert(&store, "p1", "retried", 1000);
+    store.put_card(&card()).unwrap();
+    assert!(authorize(&store, &row.batch_id, 2000));
+    let held = Arc::new(HeldCalls::new(store, "start".into()));
+    let provider = Arc::new(EndsFirstCall::default());
+    let clock = Arc::new(AtomicI64::new(2000));
+    let tools = tools(
+        held.clone(),
+        provider.clone(),
+        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        clock.clone(),
+    );
+    let body =
+        json!({"name":"llm_classify","arguments":arguments(),"call_key":"retried"}).to_string();
+    let failure: Value = serde_json::from_slice(
+        &tools
+            .answer(body.as_bytes(), Some(&principal("p1")), &stamp())
+            .await
+            .unwrap_err(),
+    )
+    .unwrap();
+    assert_eq!(failure["detail"]["cost_unknown"], true, "{failure}");
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        held.store
+            .lookup(&row.batch_id, 2000)
+            .unwrap()
+            .unwrap()
+            .state,
+        HeldState::Authorized
+    );
+    tools.recover_authorized().unwrap();
+    assert!(
+        !reaches(&provider.0, 2).await,
+        "recovery must not resend before the retry is due"
+    );
+    let due = 2000 + broca_module_serve::llm_tools::held::RETRY_FIRST_MS;
+    clock.store(due - 1, Ordering::SeqCst);
+    held.expire_due(due - 1).unwrap();
+    assert!(
+        !reaches(&provider.0, 2).await,
+        "the timer must wait out the backoff"
+    );
+    clock.store(due, Ordering::SeqCst);
+    held.expire_due(due).unwrap();
+    assert!(
+        reaches(&provider.0, 2).await,
+        "the timer must retry once the backoff has passed"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        broca_test_support::wait_until("retried call settles", || async {
+            match held.store.lookup(&row.batch_id, due).unwrap() {
+                Some(row) if row.state == HeldState::Final => Ok(()),
+                _ => Err("still authorized".to_owned()),
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let page = answer(&tools, "late_results", json!({"since":null}), "p1").await;
+    assert_eq!(page["entries"][0]["kind"], "result", "{page}");
+    assert_eq!(
+        page["entries"][0]["result"]["structuredContent"]["answers"]["q"]["noul"], 0.5,
+        "{page}"
+    );
+    assert_eq!(provider.0.load(Ordering::SeqCst), 2);
+}
+
+/// A call whose card filing never resolved still has its ten-minute deadline: the timer ends
+/// it `not_started` / `pending` and delivers that as a late result.
+#[test]
+fn a_filing_call_ends_pending_at_its_deadline() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let row = insert(&store, "p1", "filing", 1000);
+    assert_eq!(row.state, HeldState::Filing);
+    let held = HeldCalls::new(store.clone(), "start".into());
+    held.expire_due(600_999).unwrap();
+    assert_eq!(
+        store.lookup(&row.batch_id, 600_999).unwrap().unwrap().state,
+        HeldState::Filing
+    );
+    held.expire_due(601_000).unwrap();
+    let expired = store.lookup(&row.batch_id, 601_000).unwrap().unwrap();
+    assert_eq!(expired.state, HeldState::Final);
+    assert_eq!(expired.final_result.unwrap().body, not_started("pending"));
+    assert_eq!(
+        store
+            .late_results("reserved:p1", 0, 10, 601_000)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// The deadline timer selects due rows by their state and deadline columns, so it never reads
+/// the request of a call that is not due.
+#[test]
+fn the_deadline_timer_reads_only_due_rows() {
+    let path = broca_test_support::scratch_root().join("due-rows.db");
+    let store = Arc::new(GrantsStore::open(&path).unwrap());
+    let due = insert(&store, "p1", "due", 1000);
+    let waiting = insert(&store, "p1", "waiting", 300_000);
+    store.put_card(&card()).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE held_calls SET body='not a held call' WHERE batch_id=?1",
+        [&waiting.batch_id],
+    )
+    .unwrap();
+    drop(conn);
+    HeldCalls::new(store.clone(), "start".into())
+        .expire_due(601_000)
+        .unwrap();
+    assert_eq!(
+        store.lookup(&due.batch_id, 601_000).unwrap().unwrap().state,
+        HeldState::Final
+    );
+}
+
+/// Seven days after a 24-hour grant expired it is deleted, and an answered card no held call
+/// refers to any more goes with it. A live grant and a card with calls stay.
+#[test]
+fn retention_ages_out_expired_grants_and_settled_cards() {
+    let store = GrantsStore::open_in_memory().unwrap();
+    store.put_card(&card()).unwrap();
+    store
+        .apply_answer(
+            &scope(),
+            CardAnswer {
+                dedup_key: "one-card".into(),
+                card_id: "card-1".into(),
+                decision: Decision::Allow24h,
+                run_live: false,
+            },
+            1000,
+        )
+        .unwrap();
+    let mut kept = card();
+    kept.dedup_key = "kept-card".into();
+    kept.card_id = Some("card-2".into());
+    kept.project_id = Some("project".into());
+    store.put_card(&kept).unwrap();
+    store
+        .apply_answer(
+            &scope(),
+            CardAnswer {
+                dedup_key: "kept-card".into(),
+                card_id: "card-2".into(),
+                decision: Decision::AllowAlways,
+                run_live: false,
+            },
+            1000,
+        )
+        .unwrap();
+    let mut waiting = request("p1", "kept", 86_401_000 + SEVEN_DAYS_MS - 1);
+    waiting.dedup_key = "kept-card".into();
+    store.hold(waiting).unwrap();
+    let expired_at = 1000 + 86_400_000;
+    store.sweep(expired_at + SEVEN_DAYS_MS - 1).unwrap();
+    assert_eq!(store.grants().unwrap().len(), 2);
+    assert!(store.card("one-card").unwrap().is_some());
+    store.sweep(expired_at + SEVEN_DAYS_MS).unwrap();
+    let grants = store.grants().unwrap();
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0].kind, GrantKind::Always);
+    assert!(store.card("one-card").unwrap().is_none());
+    assert!(store.card("kept-card").unwrap().is_some());
+}
+
+#[test]
+fn held_calls_are_indexed_by_dedup_key() {
+    let path = broca_test_support::scratch_root().join("indexes.db");
+    drop(GrantsStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let leading: Vec<String> = conn
+        .prepare("SELECT ii.name FROM pragma_index_list('held_calls') il JOIN pragma_index_info(il.name) ii WHERE ii.seqno=0")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        leading.iter().any(|column| column == "dedup_key"),
+        "{leading:?}"
+    );
 }

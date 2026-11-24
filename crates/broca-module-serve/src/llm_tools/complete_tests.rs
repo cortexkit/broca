@@ -1,6 +1,6 @@
 use super::*;
 use cortexkit_role_routing::price::RatesPerMtok;
-use cortexkit_role_routing::select::{RouteRef, RunnerRef};
+use cortexkit_role_routing::select::{RouteRef, RunnerAuth, RunnerRef};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn number(text: &str) -> serde_json::Number {
@@ -29,10 +29,16 @@ fn metered() -> Price {
     Price::metered(RatesPerMtok::new(number("3"), number("15")))
 }
 
+type Hook = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 /// Routing's answer, and every request it got.
 struct FakeSelect {
     answer: Mutex<Result<SelectAnswer, RoutingCallError>>,
     asked: Mutex<Vec<SelectRequest>>,
+    /// Run before the next select answers: what another process does meanwhile.
+    before: Mutex<Option<Hook>>,
+    /// The next select panics.
+    panic_next: std::sync::atomic::AtomicBool,
 }
 
 impl FakeSelect {
@@ -40,6 +46,8 @@ impl FakeSelect {
         Arc::new(Self {
             answer: Mutex::new(answer),
             asked: Mutex::new(Vec::new()),
+            before: Mutex::new(None),
+            panic_next: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -47,6 +55,13 @@ impl FakeSelect {
 #[async_trait]
 impl Select for FakeSelect {
     async fn select(&self, request: &SelectRequest) -> Result<SelectAnswer, RoutingCallError> {
+        if self.panic_next.swap(false, Ordering::SeqCst) {
+            panic!("routing's stand-in panics");
+        }
+        let before = self.before.lock().unwrap().take();
+        if let Some(before) = before {
+            before.await;
+        }
         self.asked.lock().unwrap().push(request.clone());
         match &*self.answer.lock().unwrap() {
             Ok(answer) => Ok(answer.clone()),
@@ -64,8 +79,9 @@ impl Select for FakeSelect {
     }
 }
 
-/// A session runtime whose runs end as `ends` says, one per send, in order; a run reads
-/// `active` the first time it is read.
+/// A session runtime whose runs end as `ends` says, one per session, in order; a run reads
+/// `active` the first time it is read. A repeat of a send into a session that already holds a
+/// run answers that run, as a repeated send id does in a real session.
 #[derive(Default)]
 struct FakeSessions {
     ends: Mutex<Vec<Value>>,
@@ -74,6 +90,10 @@ struct FakeSessions {
     cancelled: Mutex<Vec<String>>,
     /// Sends wait for this to open, so two calls can meet in flight.
     gate: Option<Arc<tokio::sync::Notify>>,
+    /// This many reads of a run fail before any succeeds.
+    read_errors: Mutex<usize>,
+    /// A cancel is accepted but never stops the run.
+    ignore_cancel: bool,
 }
 
 impl FakeSessions {
@@ -96,7 +116,14 @@ impl Sessions for FakeSessions {
             gate.notified().await;
         }
         let run_id = request.run_id.0.clone();
-        self.sent.lock().unwrap().push(request);
+        let mut sent = self.sent.lock().unwrap();
+        if let Some(first) = sent.iter().find(|send| send.session == request.session) {
+            return Ok(SendResponse::Active {
+                run_id: first.run_id.0.clone(),
+                delivered: None,
+            });
+        }
+        sent.push(request);
         Ok(SendResponse::Active {
             run_id,
             delivered: None,
@@ -115,6 +142,16 @@ impl Sessions for FakeSessions {
             .iter()
             .position(|send| &send.session == session)
             .expect("a read follows its send");
+        {
+            let mut errors = self.read_errors.lock().unwrap();
+            if *errors > 0 {
+                *errors -= 1;
+                return Err(ServeError::Open(
+                    "the run's records could not be read".into(),
+                    None,
+                ));
+            }
+        }
         let reads = {
             let mut reads = self.reads.lock().unwrap();
             let count = reads.entry(run_id.0.clone()).or_default();
@@ -126,7 +163,10 @@ impl Sessions for FakeSessions {
         } else {
             self.ends.lock().unwrap()[index].clone()
         };
-        if end["state"] == "paused" && self.cancelled.lock().unwrap().contains(&run_id.0) {
+        if end["state"] == "paused"
+            && !self.ignore_cancel
+            && self.cancelled.lock().unwrap().contains(&run_id.0)
+        {
             end = json!({"state": "cancelled"});
         }
         end["run_id"] = json!(run_id.0);
@@ -210,26 +250,47 @@ struct Rig {
     select: Arc<FakeSelect>,
     sessions: Arc<FakeSessions>,
     store: Arc<SystemOneStore>,
+    /// The time the rig's clock reads, in milliseconds.
+    now: Arc<std::sync::atomic::AtomicI64>,
 }
 
 fn rig(select: Arc<FakeSelect>, sessions: Arc<FakeSessions>) -> Rig {
-    let store = Arc::new(SystemOneStore::open_in_memory().unwrap());
+    rig_on(
+        Arc::new(SystemOneStore::open_in_memory().unwrap()),
+        "test-owner",
+        select,
+        sessions,
+    )
+}
+
+/// A rig on `store`, which another rig may share as another process would, holding records as
+/// `owner`.
+fn rig_on(
+    store: Arc<SystemOneStore>,
+    owner: &str,
+    select: Arc<FakeSelect>,
+    sessions: Arc<FakeSessions>,
+) -> Rig {
+    let now = Arc::new(std::sync::atomic::AtomicI64::new(1_000_000));
+    let clock = now.clone();
     let complete = Arc::new(
         Complete::new(
             store.clone(),
-            "test-owner",
+            owner,
             select.clone(),
             sessions.clone(),
             "broca",
         )
-        .with_clock(Arc::new(|| 1_000_000))
-        .with_poll(Duration::from_millis(1)),
+        .with_clock(Arc::new(move || clock.load(Ordering::SeqCst)))
+        .with_poll(Duration::from_millis(1))
+        .with_stop_wait(Duration::from_millis(50)),
     );
     Rig {
         complete,
         select,
         sessions,
         store,
+        now,
     }
 }
 
@@ -516,54 +577,25 @@ async fn an_answer_without_its_token_counts_is_withheld() {
     }
 }
 
+/// A transient failure is answered and recorded, and it is final for its key: a repeat answers
+/// the same refusal with the same spend mark and runs nothing.
 #[tokio::test]
-async fn unknown_completion_spend_uses_the_charge_ceiling_on_resend() {
+async fn a_transient_failure_is_final_for_its_key() {
     let failed = json!({"state": "error", "usage": {"steps": 0, "unreported_steps": 0},
         "error": {"class": "transient", "message": "stream cut", "provider_code": "provider_error"}});
     let rig = rig(
         FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
         FakeSessions::ending(vec![failed, completed("Teal.", Some(1_000), Some(500))]),
     );
-    let first = refusal(&rig.call(text_call(), Some("unknown")).await.unwrap_err());
-    assert_eq!(first["detail"]["cost_unknown"], true);
-    let again = rig.call(text_call(), Some("unknown")).await;
-    assert!(
-        again.is_err(),
-        "the resend must not start another completion: {again:?}"
-    );
-    let again = refusal(&again.unwrap_err());
-    assert_eq!(again["code"], "cost_exceeded");
-    assert_eq!(again["detail"]["no_spend"], true);
+    let first = rig.call(text_call(), Some("k1")).await.unwrap_err();
+    let refused = refusal(&first);
+    assert_eq!(refused["code"], "provider_error");
+    assert_eq!(refused["detail"]["class"], "transient");
+    assert_eq!(refused["detail"]["cost_unknown"], true);
+    let again = rig.call(text_call(), Some("k1")).await.unwrap_err();
+    assert_eq!(again, first);
     assert_eq!(rig.sessions.sent().len(), 1);
-}
-
-/// An unbilled transient failure is recorded, but a repeat can still run in a fresh session.
-#[tokio::test]
-async fn a_transient_failure_is_tried_again_in_a_fresh_session() {
-    let failed = json!({"state": "error", "usage": {"steps": 0, "unreported_steps": 0},
-        "error": {"class": "transient", "message": "all slots occupied", "provider_code": "concurrency_full"}});
-    let rig = rig(
-        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
-        FakeSessions::ending(vec![failed, completed("Teal.", Some(1_000), Some(500))]),
-    );
-    let refused = refusal(&rig.call(text_call(), Some("k1")).await.unwrap_err());
-    assert_eq!(refused["code"], "rate_limited");
-    assert_eq!(refused["detail"]["no_spend"], true);
-    let answer = rig.call(text_call(), Some("k1")).await.unwrap();
-    assert!(answer.get().contains("Teal."));
-    let sent = rig.sessions.sent();
-    assert_eq!(sent.len(), 2);
-    assert!(sent[1].session.session.ends_with(":1"));
-    assert_eq!(
-        sent[0].session.session.trim_end_matches(":0"),
-        sent[1].session.session.trim_end_matches(":1")
-    );
-    // Routing chose once: every attempt runs on the route the call was admitted with.
     assert_eq!(rig.select.asked.lock().unwrap().len(), 1);
-    // The answer is final now.
-    let again = rig.call(text_call(), Some("k1")).await.unwrap();
-    assert_eq!(answer.get(), again.get());
-    assert_eq!(rig.sessions.sent().len(), 2);
 }
 
 /// A run that pauses on its account's usage limit is stopped and answered
@@ -638,6 +670,246 @@ async fn a_gated_scope_sends_nothing() {
     assert_eq!(refusal(&body)["detail"]["no_spend"], true);
     assert_eq!(gate.0.load(Ordering::Relaxed), 1);
     assert!(rig.sessions.sent().is_empty());
+}
+
+/// The record key of a text call from the test caller under `call_key`.
+fn key_of(call_key: &str) -> String {
+    match admit(
+        Some(&principal()),
+        &flow_scope(),
+        &arguments(text_call()),
+        Some(call_key),
+    ) {
+        Ok(call) => call.key,
+        Err(refusal) => panic!("the test call is admitted: {refusal:?}"),
+    }
+}
+
+/// The completion's send names routing's decision, and the key pool and credential routing
+/// chose, so the run is admitted on the account its price was frozen for. A route with no key
+/// pool (a subscription account) names the decision alone.
+#[tokio::test]
+async fn the_send_carries_routings_decision_and_account_choice() {
+    let mut pooled = route("openai", "gpt", Some(metered()));
+    pooled.runner = pooled.runner.clone().with_auth(RunnerAuth {
+        pool: Some("keys".into()),
+        credential_id: Some("key-b".into()),
+    });
+    let rig = rig(
+        FakeSelect::answering(Ok(pooled)),
+        FakeSessions::ending(vec![
+            completed("Teal.", Some(1_000), Some(500)),
+            completed("Plum.", Some(1_000), Some(500)),
+        ]),
+    );
+    rig.call(text_call(), Some("k1")).await.unwrap();
+    *rig.select.answer.lock().unwrap() = Ok(route("anthropic", "claude-sonnet", Some(metered())));
+    rig.call(text_call(), Some("k2")).await.unwrap();
+    let sent = rig.sessions.sent();
+    assert_eq!(sent.len(), 2);
+    let pooled = &sent[0].request;
+    assert_eq!(pooled.route_decision_id.as_deref(), Some("decision-1"));
+    let auth = pooled.auth.as_ref().expect("the key pool routing chose");
+    assert_eq!(
+        (
+            auth.method.as_str(),
+            auth.pool.as_deref(),
+            auth.credential_id.as_deref(),
+            auth.account.as_deref()
+        ),
+        ("apikey", Some("keys"), Some("key-b"), None)
+    );
+    let subscription = &sent[1].request;
+    assert_eq!(
+        subscription.route_decision_id.as_deref(),
+        Some("decision-1")
+    );
+    assert!(subscription.auth.is_none());
+}
+
+/// A run that couldn't be read hasn't been seen to end: the call answers its spend unknown and
+/// records nothing, and a repeat of the key reads the same run again rather than answering the
+/// read failure or starting another run.
+#[tokio::test]
+async fn a_failed_read_leaves_the_attempt_for_a_repeat_to_read() {
+    let sessions = Arc::new(FakeSessions {
+        ends: Mutex::new(vec![completed("Teal.", Some(1_000), Some(500))]),
+        read_errors: Mutex::new(1),
+        ..Default::default()
+    });
+    let rig = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        sessions,
+    );
+    let refused = refusal(&rig.call(text_call(), Some("k1")).await.unwrap_err());
+    assert_eq!(refused["code"], "provider_error");
+    assert_eq!(refused["detail"]["cost_unknown"], true);
+    assert!(rig
+        .store
+        .outcomes(STORE_ROLE, &key_of("k1"))
+        .unwrap()
+        .is_empty());
+    let answer = rig.call(text_call(), Some("k1")).await.unwrap();
+    assert!(answer.get().contains("Teal."));
+    assert_eq!(rig.sessions.sent().len(), 1, "one run, read twice");
+    assert_eq!(rig.select.asked.lock().unwrap().len(), 1);
+}
+
+/// A run broca cancelled that never stops is waited for only so long. The call then answers its
+/// spend unknown and records nothing, so a repeat of the key reads the same run again.
+#[tokio::test]
+async fn a_cancelled_run_that_never_stops_is_not_waited_on_forever() {
+    let paused = json!({"state": "paused", "reason": "account_limit",
+        "usage": {"steps": 0, "unreported_steps": 0}});
+    let sessions = Arc::new(FakeSessions {
+        ends: Mutex::new(vec![paused]),
+        ignore_cancel: true,
+        ..Default::default()
+    });
+    let rig = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        sessions,
+    );
+    let answer = tokio::time::timeout(Duration::from_secs(30), rig.call(text_call(), Some("k1")))
+        .await
+        .expect("the call answers once its cancel has had its time");
+    let refused = refusal(&answer.unwrap_err());
+    assert_eq!(refused["code"], "provider_error");
+    assert_eq!(refused["detail"]["cost_unknown"], true);
+    assert_eq!(rig.sessions.cancelled.lock().unwrap().len(), 1);
+    assert!(rig
+        .store
+        .outcomes(STORE_ROLE, &key_of("k1"))
+        .unwrap()
+        .is_empty());
+}
+
+/// Another process sharing the store can run and record the call between this one's lookup and
+/// its claim. The claim's record is the one that counts: its answer is answered as recorded, and
+/// this process neither runs the call again nor adds its cost to the record a second time.
+#[tokio::test]
+async fn a_call_recorded_after_the_lookup_is_answered_from_the_claimed_record() {
+    let other = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        FakeSessions::ending(vec![completed("Teal.", Some(1_000), Some(500))]),
+    );
+    let this = rig_on(
+        other.store.clone(),
+        "this-owner",
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        FakeSessions::ending(vec![completed("Plum.", Some(1_000), Some(500))]),
+    );
+    let first = other.complete.clone();
+    let (recorded, answered) = tokio::sync::oneshot::channel();
+    *this.select.before.lock().unwrap() = Some(Box::pin(async move {
+        let answer = first
+            .answer(
+                Some(&principal()),
+                &flow_scope(),
+                &arguments(text_call()),
+                Some("k1"),
+                &Allow,
+            )
+            .await;
+        let _ = recorded.send(answer);
+    }));
+    let answer = this.call(text_call(), Some("k1")).await.unwrap();
+    let recorded = answered.await.unwrap().unwrap();
+    assert_eq!(answer.get(), recorded.get());
+    assert!(this.sessions.sent().is_empty());
+    // The $0.50 ceiling, and one run's $0.0105.
+    assert_eq!(
+        this.store.ledger(STORE_ROLE, &key_of("k1")).unwrap(),
+        Some((Some(500_000_000), 10_500_000))
+    );
+}
+
+/// A repeat of a running call's key with other arguments is refused, spending nothing, rather
+/// than joining the running call and answering its answer and cost.
+#[tokio::test]
+async fn a_concurrent_repeat_with_other_arguments_is_refused() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let sessions = Arc::new(FakeSessions {
+        ends: Mutex::new(vec![completed("Teal.", Some(1_000), Some(500))]),
+        gate: Some(gate.clone()),
+        ..Default::default()
+    });
+    let rig = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        sessions,
+    );
+    let (first, second) = tokio::join!(rig.call(text_call(), Some("k1")), async {
+        tokio::task::yield_now().await;
+        let mut other = text_call();
+        other["prompt"] = json!("Name a fruit.");
+        let second = rig.call(other, Some("k1"));
+        gate.notify_one();
+        second.await
+    });
+    assert!(first.unwrap().get().contains("Teal."));
+    let refused = refusal(&second.unwrap_err());
+    assert_eq!(refused["code"], "invalid_params");
+    assert_eq!(refused["detail"]["field"], "call_key");
+    assert_eq!(refused["detail"]["no_spend"], true);
+    assert_eq!(rig.sessions.sent().len(), 1);
+}
+
+/// A call whose task panicked leaves its key free: a later repeat runs, rather than joining the
+/// call that panicked and answering that it stopped without an answer.
+#[tokio::test]
+async fn a_call_that_panicked_does_not_hold_its_key() {
+    let rig = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        FakeSessions::ending(vec![completed("Teal.", Some(1_000), Some(500))]),
+    );
+    rig.select.panic_next.store(true, Ordering::SeqCst);
+    let complete = rig.complete.clone();
+    let panicked = tokio::spawn(async move {
+        complete
+            .answer(
+                Some(&principal()),
+                &flow_scope(),
+                &arguments(text_call()),
+                Some("k1"),
+                &Allow,
+            )
+            .await
+    })
+    .await;
+    assert!(panicked.unwrap_err().is_panic());
+    let answer = rig.call(text_call(), Some("k1")).await.unwrap();
+    assert!(answer.get().contains("Teal."));
+}
+
+/// A record past its seven days is not replayed, even before the sweep removes it: the repeat
+/// is refused as transient, spending nothing. Once the sweep has removed it, the key starts a
+/// new call in a new session with a new run, never the old week's.
+#[tokio::test]
+async fn a_key_past_its_week_is_not_replayed_and_then_starts_a_new_call() {
+    let rig = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        FakeSessions::ending(vec![
+            completed("Teal.", Some(1_000), Some(500)),
+            completed("Plum.", Some(1_000), Some(500)),
+        ]),
+    );
+    let first = rig.call(text_call(), Some("k1")).await.unwrap();
+    assert!(first.get().contains("Teal."));
+    rig.now
+        .fetch_add(broca_store::system_one::RETENTION_MS, Ordering::SeqCst);
+    let refused = refusal(&rig.call(text_call(), Some("k1")).await.unwrap_err());
+    assert_eq!(refused["code"], "provider_error");
+    assert_eq!(refused["detail"]["class"], "transient");
+    assert_eq!(refused["detail"]["no_spend"], true);
+    assert_eq!(rig.sessions.sent().len(), 1);
+    assert_eq!(rig.select.asked.lock().unwrap().len(), 1);
+    let swept = rig.store.sweep(rig.now.load(Ordering::SeqCst)).unwrap();
+    assert_eq!(swept.batches, 1);
+    let again = rig.call(text_call(), Some("k1")).await.unwrap();
+    assert!(again.get().contains("Plum."));
+    let sent = rig.sessions.sent();
+    assert_eq!(sent.len(), 2);
+    assert_ne!(sent[0].session, sent[1].session);
 }
 
 /// Every `llm_complete` reply shape a caller decodes, as the tool-provider route writes it: the

@@ -109,6 +109,9 @@ struct FakeIo {
     wait_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     waiting: tokio::sync::Notify,
     clock_after_wait: Mutex<Option<(Arc<AtomicI64>, i64)>>,
+    live_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    checking_live: tokio::sync::Notify,
+    live_checks: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -172,6 +175,12 @@ impl ConsentIo for FakeIo {
         &self,
         _: &SessionScope,
     ) -> broca_module_serve::llm_tools::consent::RunLiveness {
+        self.live_checks.fetch_add(1, Ordering::SeqCst);
+        let gate = self.live_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            self.checking_live.notify_one();
+            gate.acquire().await.unwrap().forget();
+        }
         if self.live.load(Ordering::SeqCst) {
             broca_module_serve::llm_tools::consent::RunLiveness::Live
         } else {
@@ -193,21 +202,29 @@ fn dedup_key_uses_full_scope_provider_and_revocation_generation() {
         Arc::new(AtomicI64::new(1000)),
     );
     let agent = scope().agent_id.unwrap();
-    let key = consent.dedup_key(&agent, "typesafe", &identity()).unwrap();
+    let key = consent
+        .dedup_key(&agent, "typesafe", &identity(), 1000)
+        .unwrap();
     assert_eq!(
         key,
         "0ab378f55349aebe99550e29113304f58add2abe9c4fb03825326dfa2992b733"
     );
     let mut other = identity();
     other.scope_epoch += 1;
-    assert_ne!(key, consent.dedup_key(&agent, "typesafe", &other).unwrap());
+    assert_ne!(
+        key,
+        consent.dedup_key(&agent, "typesafe", &other, 1000).unwrap()
+    );
     other = identity();
     other.owner = "reserved:another-owner".into();
-    assert_ne!(key, consent.dedup_key(&agent, "typesafe", &other).unwrap());
+    assert_ne!(
+        key,
+        consent.dedup_key(&agent, "typesafe", &other, 1000).unwrap()
+    );
     assert_ne!(
         key,
         consent
-            .dedup_key(&agent, "cloudflare-workers-ai", &identity())
+            .dedup_key(&agent, "cloudflare-workers-ai", &identity(), 1000)
             .unwrap()
     );
     store
@@ -237,7 +254,9 @@ fn dedup_key_uses_full_scope_provider_and_revocation_generation() {
     assert!(store.revoke("granted-card").unwrap());
     assert_ne!(
         key,
-        consent.dedup_key(&agent, "typesafe", &identity()).unwrap()
+        consent
+            .dedup_key(&agent, "typesafe", &identity(), 1000)
+            .unwrap()
     );
 }
 
@@ -1220,7 +1239,7 @@ async fn recovered_held_calls_match_always_grants_only_against_their_frozen_proj
         };
         request.project_id = project.map(str::to_owned);
         request.dedup_key = consent
-            .dedup_key(&request.agent_id, "typesafe", &request.scope)
+            .dedup_key(&request.agent_id, "typesafe", &request.scope, 1000)
             .unwrap();
         let body = broca_subc::consent_card::private_content_card_for_project(
             "TypeSafe",
@@ -1271,7 +1290,7 @@ async fn adding_the_always_option_replaces_card_content_without_changing_the_ded
     io.live.store(true, Ordering::SeqCst);
     let consent = coordinator(store.clone(), io.clone(), Arc::new(AtomicI64::new(1000)));
     let key = consent
-        .dedup_key(&scope().agent_id.unwrap(), "typesafe", &identity())
+        .dedup_key(&scope().agent_id.unwrap(), "typesafe", &identity(), 1000)
         .unwrap();
     consent
         .file(hold("first", &key, "Jev", 1000), body(&key, "Jev"), 1000)
@@ -1981,5 +2000,378 @@ async fn consent_health_counts_each_verdict_and_outcome_and_logs_each_grant_once
         .map(|count| count.as_u64().unwrap())
         .sum();
     assert_eq!(outcomes, 8 + 1);
+    stop.cancel();
+}
+
+/// A provider whose first call never returns an answer: it panics, as an execution would that
+/// ended between the batch claim and the provider's reply. Later calls answer.
+#[derive(Default)]
+struct EndsFirstCall {
+    calls: AtomicUsize,
+}
+#[async_trait::async_trait]
+impl ClassifierProvider for EndsFirstCall {
+    fn egress_host(&self) -> String {
+        "localhost".into()
+    }
+    fn credential_id(&self) -> Option<String> {
+        None
+    }
+    async fn call(&self, _: String) -> ProviderReply {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("the execution ends before the provider answers");
+        }
+        ProviderReply::Answered(br#"{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":0.5}},"usage":{"input_tokens":100}}"#.to_vec())
+    }
+}
+
+fn run_stamp() -> SendScope {
+    SendScope::Stamped(BindScope {
+        scope: scope(),
+        owner_authorized: true,
+        kind: broca_protocol::ScopeKind::Head,
+        parent: None,
+        parent_state: None,
+    })
+}
+
+async fn classify(
+    tools: &Arc<LlmTools>,
+    key: &str,
+    reads_held_reply: bool,
+) -> Result<Value, Value> {
+    let request =
+        json!({"name":"llm_classify","arguments":args("typesafe/jev-1.13.0"),"call_key":key});
+    match tools
+        .answer_with_capabilities(
+            request.to_string().as_bytes(),
+            Some(&BindPrincipal::Reserved {
+                module_id: "caller".into(),
+            }),
+            &run_stamp(),
+            reads_held_reply,
+        )
+        .await
+    {
+        Ok(reply) => Ok(serde_json::from_str::<Value>(reply.get()).unwrap()),
+        Err(body) => Err(serde_json::from_slice::<Value>(&body).unwrap()),
+    }
+}
+
+/// A keyed resend of a batch with no recorded outcome sends the item to the provider again, so
+/// it is a new dispatch, not a replay: once the scope is marked it needs consent like any fresh
+/// call, and is refused before anything is sent.
+#[tokio::test]
+async fn a_keyed_resend_of_an_unfinished_batch_is_gated_once_the_scope_is_marked() {
+    let provider = Arc::new(EndsFirstCall::default());
+    let system = SystemOne::new(
+        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        "unfinished-resend",
+        Arc::new(Catalog {
+            provider_name: Some("TypeSafe".into()),
+        }),
+        vec![ModelPin::jev(provider.clone())],
+        Config::default(),
+        Arc::default(),
+    )
+    .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+    .with_clock(Arc::new(|| 1000));
+    let cerebellum = Arc::new(Answering::default());
+    cerebellum.set(Some(broca_subc::PrivateContent::unmarked()));
+    let tools = Arc::new(LlmTools::new(
+        Arc::new(system),
+        Default::default(),
+        cerebellum.clone(),
+    ));
+    let first = classify(&tools, "k", false).await.unwrap_err();
+    assert_eq!(first["detail"]["cost_unknown"], true, "{first}");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    cerebellum.set(marked_by(vec![broca_subc::SourceKind::PersonBrowser]));
+    let fresh = classify(&tools, "fresh", false).await.unwrap_err();
+    assert_eq!(fresh["detail"]["consent"], "consent_required", "{fresh}");
+    // The ended execution releases its batch hold in the background; until then a resend is
+    // told the batch is in progress.
+    let resend = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        broca_test_support::wait_until("batch hold released", || async {
+            match classify(&tools, "k", false).await {
+                Err(body) if body["code"] == "batch_in_progress" => Err(body.to_string()),
+                answer => Ok(answer),
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let resend = resend.unwrap_err();
+    assert_eq!(resend["detail"]["consent"], "consent_required", "{resend}");
+    assert_eq!(resend["detail"]["no_spend"], true, "{resend}");
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "the marked resend must not reach the provider"
+    );
+}
+
+/// A run grant releases a call only while its run is known to be live. A new call joining a
+/// card that was answered `allow_run` earlier gets no other path: while liveness is not
+/// confirmed it keeps waiting rather than being authorized from the old grant.
+#[tokio::test]
+async fn a_settled_run_card_cannot_authorize_a_new_call_once_the_run_is_not_known_live() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let io = Arc::new(FakeIo::default());
+    io.live.store(true, Ordering::SeqCst);
+    let consent = coordinator(store.clone(), io.clone(), Arc::new(AtomicI64::new(1000)));
+    let key = "6".repeat(64);
+    consent
+        .file(hold("first", &key, "Jev", 1000), body(&key, "Jev"), 1000)
+        .await
+        .unwrap();
+    io.answers
+        .lock()
+        .unwrap()
+        .push_back(record("card-1", &key, "allow_run"));
+    assert!(!consent.wait_once(&key, 1000).await.unwrap());
+    assert_eq!(
+        store.lookup("first", 1000).unwrap().unwrap().state,
+        HeldState::Authorized
+    );
+    io.live.store(false, Ordering::SeqCst);
+    consent
+        .file(hold("second", &key, "Jev", 1001), body(&key, "Jev"), 1001)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.lookup("second", 1001).unwrap().unwrap().state,
+        HeldState::Held,
+        "an old run grant must not authorize a call while the run is not known live"
+    );
+    assert_eq!(io.requests.lock().unwrap().len(), 1);
+}
+
+/// Revoking the grant a reconciliation read, while that reconciliation waits for the run's
+/// liveness, leaves the held call waiting: authorization rechecks the grant when it commits.
+#[tokio::test]
+async fn a_revoke_during_the_liveness_wait_keeps_the_held_call_waiting() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let io = Arc::new(FakeIo::default());
+    io.live.store(true, Ordering::SeqCst);
+    let consent = coordinator(store.clone(), io.clone(), Arc::new(AtomicI64::new(1000)));
+    let key = "5".repeat(64);
+    consent
+        .file(hold("waiting", &key, "Jev", 1000), body(&key, "Jev"), 1000)
+        .await
+        .unwrap();
+    let other = "4".repeat(64);
+    store
+        .put_card(&Card {
+            project_id: None,
+            dedup_key: other.clone(),
+            scope: identity(),
+            agent_id: scope().agent_id.unwrap(),
+            provider: "typesafe".into(),
+            content: "same run".into(),
+            card_id: Some("run-source".into()),
+            state: CardState::Pending,
+        })
+        .unwrap();
+    store
+        .apply_answer(
+            &identity(),
+            CardAnswer {
+                dedup_key: other,
+                card_id: "run-source".into(),
+                decision: Decision::AllowRun,
+                run_live: true,
+            },
+            1000,
+        )
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *io.live_gate.lock().unwrap() = Some(gate.clone());
+    let reconciling = tokio::spawn({
+        let consent = consent.clone();
+        async move { consent.resume_granted(1000).await.unwrap() }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        io.checking_live.notified(),
+    )
+    .await
+    .unwrap();
+    assert!(store.revoke("run-source").unwrap());
+    gate.add_permits(1);
+    assert_eq!(reconciling.await.unwrap(), 0);
+    assert_eq!(
+        store.lookup("waiting", 1000).unwrap().unwrap().state,
+        HeldState::Held,
+        "a call must not be authorized by a grant revoked before the authorization committed"
+    );
+}
+
+/// Once the 24-hour grant a card produced has expired, the next call of the same run (whose
+/// scope cerebellum marks as having read private content) asks the person again with a new
+/// card instead of joining the old, answered one.
+#[tokio::test]
+async fn an_expired_24h_grant_files_a_new_card_for_the_next_call() {
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let io = Arc::new(FakeIo::default());
+    let clock = Arc::new(AtomicI64::new(1000));
+    let consent = coordinator(store.clone(), io.clone(), clock.clone());
+    let provider = Arc::new(Provider::default());
+    let system = SystemOne::new(
+        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        "expired-24h",
+        Arc::new(Catalog {
+            provider_name: Some("TypeSafe".into()),
+        }),
+        vec![ModelPin::jev(provider.clone())],
+        Config::default(),
+        Arc::default(),
+    )
+    .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+    .with_clock({
+        let clock = clock.clone();
+        Arc::new(move || clock.load(Ordering::SeqCst))
+    });
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tools = Arc::new(
+        LlmTools::new(Arc::new(system), Default::default(), Arc::new(Marked))
+            .with_held(Arc::new(HeldCalls::new(
+                store.clone(),
+                "expired-24h".into(),
+            )))
+            .with_consent(consent, stop.clone()),
+    );
+    let first = classify(&tools, "first", true).await.unwrap();
+    assert_eq!(first["held"]["detail"]["ask_id"], "card-1", "{first}");
+    let card = store.pending_cards().unwrap().pop().unwrap();
+    store
+        .apply_answer(
+            &identity(),
+            CardAnswer {
+                dedup_key: card.dedup_key,
+                card_id: "card-1".into(),
+                decision: Decision::Allow24h,
+                run_live: false,
+            },
+            1000,
+        )
+        .unwrap();
+    clock.store(1000 + 86_400_000, Ordering::SeqCst);
+    let next = classify(&tools, "next", true).await.unwrap();
+    assert_eq!(
+        next["held"]["detail"]["ask_id"], "card-2",
+        "the call must be asked about again: {next}"
+    );
+    assert_eq!(io.requests.lock().unwrap().len(), 2);
+    stop.cancel();
+}
+
+/// Matching a scope's grants reads only that agent's grants for the provider: another
+/// holder's grant row is never decoded.
+#[tokio::test]
+async fn grant_matching_reads_only_the_callers_grants() {
+    let path = broca_test_support::scratch_root().join("grant-matching.db");
+    let store = Arc::new(GrantsStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO grants VALUES ('other','someone-else',NULL,'typesafe','24_hours',NULL,'other',1000,NULL,'not a grant')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let io = Arc::new(FakeIo::default());
+    let consent = coordinator(store, io, Arc::new(AtomicI64::new(1000)));
+    assert!(!consent.granted(&scope(), "typesafe", 1000).await.unwrap());
+}
+
+/// Card watchers that wake together share one reconciliation of the held calls instead of each
+/// reading every held call. A run grant for the scope makes each pass ask about the run's
+/// liveness once per waiting call, which counts the passes: the first pass is held at its first
+/// question while every other watcher asks for a pass, and one more pass then serves them all.
+#[tokio::test]
+async fn card_watchers_share_one_reconciliation_pass() {
+    const CARDS: usize = 4;
+    let store = Arc::new(GrantsStore::open_in_memory().unwrap());
+    let io = Arc::new(FakeIo::default());
+    let consent = coordinator(store.clone(), io.clone(), Arc::new(AtomicI64::new(1000)));
+    let source = "f".repeat(64);
+    let card = |dedup_key: &str, card_id: &str| Card {
+        project_id: None,
+        dedup_key: dedup_key.into(),
+        scope: identity(),
+        agent_id: scope().agent_id.unwrap(),
+        provider: "typesafe".into(),
+        content: "card".into(),
+        card_id: Some(card_id.into()),
+        state: CardState::Pending,
+    };
+    store.put_card(&card(&source, "run-source")).unwrap();
+    store
+        .apply_answer(
+            &identity(),
+            CardAnswer {
+                dedup_key: source,
+                card_id: "run-source".into(),
+                decision: Decision::AllowRun,
+                run_live: true,
+            },
+            1000,
+        )
+        .unwrap();
+    for index in 0..CARDS {
+        let key = format!("{index:064}");
+        store
+            .hold(hold(&format!("call-{index}"), &key, "Jev", 1000))
+            .unwrap();
+        store
+            .put_card(&card(&key, &format!("card-{index}")))
+            .unwrap();
+    }
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *io.live_gate.lock().unwrap() = Some(gate.clone());
+    let system = SystemOne::new(
+        Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+        "shared-reconciliation",
+        Arc::new(Catalog {
+            provider_name: Some("TypeSafe".into()),
+        }),
+        vec![ModelPin::jev(Arc::new(Provider::default()))],
+        Config::default(),
+        Arc::default(),
+    )
+    .with_store_role(LLM_CLASSIFY_STORE_ROLE)
+    .with_clock(Arc::new(|| 1000));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tools = Arc::new(
+        LlmTools::new(Arc::new(system), Default::default(), Arc::new(Marked))
+            .with_held(Arc::new(HeldCalls::new(store.clone(), "shared".into())))
+            .with_consent(consent, stop.clone()),
+    );
+    tools.recover_consent().unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        io.checking_live.notified(),
+    )
+    .await
+    .unwrap();
+    // Let every other watcher run up to its request for a pass.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    gate.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        broca_test_support::wait_until("every watcher awaits its card", || async {
+            if io.awaits.load(Ordering::SeqCst) >= CARDS {
+                Ok(())
+            } else {
+                Err("watchers are still reconciling".to_owned())
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(io.live_checks.load(Ordering::SeqCst), 2 * CARDS);
     stop.cancel();
 }

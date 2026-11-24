@@ -187,6 +187,15 @@ pub trait Writer {
         ordinal: u64,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError>;
 
+    /// The message id of the entry at `ordinal`, as [`Writer::entry_at`] reads it; `None` when
+    /// the conversation has placed no message there.
+    async fn entry_mid_at(&self, ordinal: u64) -> Result<Option<String>, SessionError> {
+        Ok(self
+            .entry_at(ordinal)
+            .await?
+            .and_then(|entry| entry.state.facts.as_ref().map(|facts| facts.mid.clone())))
+    }
+
     /// For a session moved in by an import, the id and ordinal of the entry the move's first view
     /// cuts through (`Session::moved_through`); `None` for any other session.
     async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError>;

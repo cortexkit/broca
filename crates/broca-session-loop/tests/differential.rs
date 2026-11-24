@@ -3664,9 +3664,21 @@ fn resume_invariants(
             _ => {}
         }
     }
+    // A model can repeat a call id within a step; each planned copy gets its own result.
+    let mut copies: BTreeMap<(Option<&str>, &str), usize> = BTreeMap::new();
+    for record in &resumed.records {
+        if let Record::BatchStart(start) = record {
+            for id in &start.planned {
+                *copies
+                    .entry((Some(start.batch_id.as_str()), id.0.as_str()))
+                    .or_default() += 1;
+            }
+        }
+    }
     for ((batch, call), count) in results {
-        assert_eq!(
-            count, 1,
+        let planned = copies.get(&(batch, call)).copied().unwrap_or(1).max(1);
+        assert!(
+            count <= planned,
             "{context}: call {call} of batch {batch:?} has {count} results"
         );
     }
@@ -7436,6 +7448,89 @@ async fn a_repeated_call_id_keys_each_copy_by_its_own_record() {
     .await;
 }
 
+/// A step that repeats a call id beside another call. The first copy's result is synced as soon
+/// as it answers, while the repeat's duplicate error waits for the batch's closing barrier, so a
+/// crash between the two leaves the repeat with no result. Whatever the cut, the resume gives each
+/// copy its own result, sends the repeat nowhere, and closes the tool turn, so the next request
+/// still shows the step's calls and results.
+#[tokio::test]
+async fn a_repeated_call_id_closes_its_turn_after_every_crash_cut() {
+    let scenario = Scenario {
+        input: vec![user("read a twice and grep")],
+        tools: vec![
+            tool("read", ExecutionMode::Parallel),
+            tool("grep", ExecutionMode::Parallel),
+        ],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c1", "read", json!({"path": "b"})),
+                    call("c2", "grep", json!({"pattern": "x"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    for layout in LAYOUTS {
+        let scenario = scenario.clone();
+        LAYOUT
+            .scope(
+                layout,
+                Box::pin(with_each_writer(|| {
+                    let scenario = scenario.clone();
+                    Box::pin(async move {
+                        let source = new_source(&scenario, None, scenario.steps.clone()).await;
+                        let records = source.records.len();
+                        for cut in source
+                            .batch_ends
+                            .iter()
+                            .copied()
+                            .filter(|&end| end < records)
+                        {
+                            let steps = scenario.steps[source.answered(cut)..].to_vec();
+                            let resumed =
+                                Box::pin(new_source(&scenario, Some(source.cut(cut)), steps)).await;
+                            let context = format!("cut after record {cut} of {records}");
+                            // Only cuts after the step's answer hold the repeated call.
+                            if source.answered(cut) == 0 {
+                                continue;
+                            }
+                            let c1_results = resumed
+                                .records
+                                .iter()
+                                .filter(|record| {
+                                    matches!(record, Record::ToolReply(reply)
+                                        if reply.result.tool_call_id.0 == "c1")
+                                })
+                                .count();
+                            assert_eq!(
+                                c1_results, 2,
+                                "{context}: each copy of c1 has one result: {:#?}",
+                                resumed.outcome.records
+                            );
+                            let sent_c1 = resumed
+                                .outcome
+                                .calls
+                                .iter()
+                                .filter(|call| {
+                                    call.starts_with("dispatch") && call.contains(" c1 ")
+                                })
+                                .count();
+                            assert_eq!(sent_c1, 0, "{context}: c1 is never sent again");
+                            resume_invariants(&context, &source, cut, &resumed, Requests::Same);
+                        }
+                    })
+                })),
+            )
+            .await;
+    }
+}
+
 /// Runs [`compare_in`] once, on the current compaction contract, with a compaction provider
 /// scripted by `script` that both loops call.
 async fn compare_compacted(scenario: Scenario, script: CompactionScript) {
@@ -9750,68 +9845,193 @@ async fn provider_reset_is_not_duplicated_on_error() {
     );
 }
 
-#[tokio::test]
-async fn unsupported_cut_stream_is_reset() {
-    let (out, mut events) = mpsc::channel(64);
-    let mut cut = cut_call(
-        answer(
-            "a0",
-            vec![call("c1", "read", json!({}))],
-            FinishReason::ToolCalls,
-        ),
-        "c1",
-        "read",
-    );
-    cut.insert(0, text_delta("a0", "abandoned"));
-    DISPLAY_OUT
-        .scope(
-            out,
-            EXPECT_UNSUPPORTED.scope(
-                true,
-                STRUCTURED.scope(Some(unconstrained("final_text")), async {
-                    new_loop(&single(vec![cut])).await;
-                }),
-            ),
-        )
-        .await;
-    assert_eq!(
-        display_events(&mut events),
-        vec![
-            expected_delta("a0", "abandoned"),
-            DisplayEvent::DisplayReset
-        ]
-    );
+/// The records of `outcome` of kind `name`, as JSON.
+fn named<'a>(outcome: &'a Outcome, name: &str) -> Vec<&'a Value> {
+    outcome
+        .records
+        .iter()
+        .filter_map(|record| record.get(name))
+        .collect()
 }
 
+/// The reason the one run of `outcome` ended with.
+fn run_end_reason(outcome: &Outcome) -> Value {
+    let ends = named(outcome, "RunEnd");
+    assert_eq!(ends.len(), 1, "one run end: {:#?}", outcome.records);
+    ends[0]["reason"].clone()
+}
+
+/// Each call's outcome, as `id:outcome:reason`, in the order they were written.
+fn call_outcomes(outcome: &Outcome) -> Vec<String> {
+    named(outcome, "ToolOutcome")
+        .into_iter()
+        .map(|record| {
+            format!(
+                "{}:{}:{}",
+                record["tool_call_id"].as_str().unwrap_or_default(),
+                record["outcome"].as_str().unwrap_or_default(),
+                record["reason"].as_str().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+fn dispatched(outcome: &Outcome) -> Vec<&String> {
+    outcome
+        .calls
+        .iter()
+        .filter(|call| call.starts_with("dispatch"))
+        .collect()
+}
+
+/// A cut call on a step that meets a stop condition keeps its error; the step's other call
+/// closes as not run, and the run ends as the stop condition ends it.
 #[tokio::test]
-async fn unsupported_stopped_cut_stream_is_reset() {
-    let (out, mut events) = mpsc::channel(64);
-    let mut cut = cut_call(
+async fn a_cut_call_on_a_step_that_meets_a_stop_condition_ends_as_the_stop() {
+    let mut scenario = cut_scenario(
+        vec![
+            call("c1", "read", json!({"path": "a"})),
+            call("c2", "read", json!({"path": "b"})),
+        ],
+        &["c2"],
+    );
+    scenario.stop_when = vec![StopCondition::StepCount { n: 1 }];
+    let outcome = new_loop(&scenario).await;
+    assert_eq!(run_end_reason(&outcome), "max_steps");
+    assert_eq!(
+        call_outcomes(&outcome),
+        ["c2:Completed:tool_args_trailing_garbage", "c1:MaxSteps:"]
+    );
+    assert!(dispatched(&outcome).is_empty(), "{:?}", outcome.calls);
+}
+
+/// A cut call on a step the caller cancels before its batch keeps its error; the step's other
+/// call closes as not run, and the run ends cancelled.
+#[tokio::test]
+async fn a_cut_call_on_a_step_cancelled_before_its_batch_ends_cancelled() {
+    let mut scenario = cancel_before_batch_scenario();
+    scenario.steps[0] = cut_call(
         answer(
-            "a0",
-            vec![call("c1", "read", json!({}))],
+            "a1",
+            vec![
+                ContentBlock::Text {
+                    text: "reading it, cancel me".into(),
+                },
+                call("c1", "read", json!({"path": "a"})),
+                call("c2", "read", json!({"path": "b"})),
+            ],
+            FinishReason::ToolCalls,
+        ),
+        "c2",
+        "read",
+    );
+    let outcome = new_loop(&scenario).await;
+    assert_eq!(run_end_reason(&outcome), "cancelled");
+    assert_eq!(
+        call_outcomes(&outcome),
+        ["c2:Completed:tool_args_trailing_garbage", "c1:Interrupted:"]
+    );
+    assert!(dispatched(&outcome).is_empty(), "{:?}", outcome.calls);
+}
+
+/// In a `submit_tool` run, a cut call beside `submit_result` keeps its error, and the submit
+/// ends the run as a submit does.
+#[tokio::test]
+async fn a_cut_call_beside_a_submit_keeps_its_error_and_the_submit_ends_the_run() {
+    let first = cut_call(
+        answer(
+            "a1",
+            vec![
+                call("c1", "read", json!({"path": "a"})),
+                submit_call("c2", json!({"answer": 3})),
+            ],
             FinishReason::ToolCalls,
         ),
         "c1",
         "read",
     );
-    cut.insert(0, text_delta("a0", "abandoned"));
-    let mut scenario = single(vec![cut]);
-    scenario.stop_when = vec![StopCondition::StepCount { n: 1 }];
-    DISPLAY_OUT
+    let outcome = STRUCTURED
         .scope(
-            out,
-            EXPECT_UNSUPPORTED.scope(true, async {
-                new_loop(&scenario).await;
-            }),
+            Some(unconstrained("submit_tool")),
+            new_loop(&single(vec![first])),
         )
         .await;
+    assert_eq!(run_end_reason(&outcome), "completed");
     assert_eq!(
-        display_events(&mut events),
+        call_outcomes(&outcome),
+        ["c1:Completed:tool_args_trailing_garbage", "c2:Completed:"]
+    );
+    assert!(dispatched(&outcome).is_empty(), "{:?}", outcome.calls);
+}
+
+/// In a `submit_tool` run, a `submit_result` call the provider cut isn't counted: it keeps its
+/// error, the model is asked again, and its next `submit_result` ends the run.
+#[tokio::test]
+async fn a_cut_submit_is_not_counted_and_the_model_can_submit_again() {
+    let first = cut_call(
+        answer(
+            "a1",
+            vec![submit_call("c1", json!({"answer": 3}))],
+            FinishReason::ToolCalls,
+        ),
+        "c1",
+        broca_protocol::structured_output::SUBMIT_RESULT_TOOL,
+    );
+    let second = answer(
+        "a2",
+        vec![submit_call("c2", json!({"answer": 4}))],
+        FinishReason::ToolCalls,
+    );
+    let outcome = STRUCTURED
+        .scope(
+            Some(unconstrained("submit_tool")),
+            new_loop(&single(vec![first, second])),
+        )
+        .await;
+    assert_eq!(run_end_reason(&outcome), "completed");
+    assert_eq!(outcome.requests.len(), 2, "the model is asked again");
+    assert_eq!(
+        call_outcomes(&outcome),
+        ["c1:Completed:tool_args_trailing_garbage", "c2:Completed:"]
+    );
+    assert!(dispatched(&outcome).is_empty(), "{:?}", outcome.calls);
+}
+
+/// A finalize step drops every call its answer asked for, a cut one too, and ends the run as a
+/// finalize step whose call wasn't cut ends it.
+#[tokio::test]
+async fn a_cut_call_on_a_finalize_step_is_dropped_with_the_others() {
+    let last = answer(
+        "z",
         vec![
-            expected_delta("a0", "abandoned"),
-            DisplayEvent::DisplayReset
-        ]
+            ContentBlock::Text {
+                text: "finishing".into(),
+            },
+            call("cz", "read", json!({"path": "z"})),
+        ],
+        FinishReason::ToolCalls,
+    );
+    let whole = BUDGET
+        .scope(
+            Some(budgeted(&[], Some(1))),
+            new_loop(&reads(1, last.clone())),
+        )
+        .await;
+    let outcome = BUDGET
+        .scope(
+            Some(budgeted(&[], Some(1))),
+            new_loop(&reads(1, cut_call(last, "cz", "read"))),
+        )
+        .await;
+    assert_ne!(run_end_reason(&whole), "error");
+    assert_eq!(run_end_reason(&outcome), run_end_reason(&whole));
+    assert_eq!(call_outcomes(&outcome), call_outcomes(&whole));
+    assert!(
+        !call_outcomes(&outcome)
+            .iter()
+            .any(|outcome| outcome.starts_with("cz:")),
+        "{:#?}",
+        outcome.records
     );
 }
 

@@ -281,3 +281,179 @@ async fn the_next_request_lists_the_results_in_the_calls_order() {
         .collect();
     assert_eq!(results, ["bash-1", "say-1"], "listed in the calls' order");
 }
+
+/// Each call's outcome in the order they were written, as `id:Outcome`.
+async fn outcomes(session: &Session<&'static MemoryBackend>) -> Vec<String> {
+    session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, record)| match record {
+            Record::ToolOutcome(outcome) => {
+                Some(format!("{}:{:?}", outcome.tool_call_id.0, outcome.outcome))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A person's steer the run hasn't placed yet: the run's end places it.
+fn steer() -> Record {
+    Record::Steer(broca_session_store::record::Steer {
+        named_speaker: None,
+        kept_notice: None,
+        media: Vec::new(),
+        input: vec![broca_protocol::content::Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "also check the logs".into(),
+            }],
+        )],
+        written_at_ms: Some(1_800_000_000_001),
+        tags_v1: None,
+        receipt: None,
+        message_marks: None,
+    })
+}
+
+/// The error the session's owner ends a failed run with.
+fn loop_failed() -> broca_protocol::ProviderError {
+    broca_protocol::ProviderError {
+        class: broca_protocol::ErrorClass::Permanent,
+        message: "storing the call's media failed".into(),
+        provider_code: Some("runner_error".into()),
+        provider_details: None,
+        cause: None,
+        provider_subcode: None,
+        refusal: None,
+        status: None,
+        retry_after_secs: None,
+        resets_at_ms: None,
+        resets_at_source: None,
+        limit_window: None,
+        account_ref: None,
+        credential_id: None,
+        affordable_max_tokens: None,
+        account_continue: None,
+    }
+}
+
+/// A run whose loop failed with its tool batch open, `say` answered and `bash` sent with no
+/// result, as when storing a call's media fails while the log stays writable, and a person
+/// steered in meanwhile. The owner's end closes the batch before it places the steer and ends
+/// the run: `bash` gets an unknown outcome, the tool turn closes, and the session takes the next
+/// append.
+#[tokio::test]
+async fn ending_a_failed_run_closes_its_open_batch_before_placing_a_steer() {
+    let backend = run_batch(true).await;
+    let mut session = reload(backend).await;
+    session.append(&[steer()], true).await.unwrap();
+    let ended = crate::run::end_run_with_error(
+        &mut session,
+        "early",
+        broca_protocol::RunFinishReason::Error,
+        &loop_failed(),
+        1_800_000_000_002,
+        None,
+    )
+    .await;
+    assert!(ended.is_ok(), "end_run_with_error: {ended:?}");
+    assert!(
+        Writer::conversation(&session).open_tool_turn().is_none(),
+        "the tool turn closes with the run"
+    );
+    assert_eq!(
+        outcomes(&session).await,
+        ["say-1:Completed", "bash-1:Unknown"]
+    );
+    let later = session.append(&[steer()], true).await;
+    assert!(later.is_ok(), "a later append: {later:?}");
+}
+
+/// The held calls' lifecycle, logging each withdrawal.
+#[derive(Default)]
+struct Withdrawals(Mutex<Vec<String>>);
+
+#[async_trait]
+impl broca_core::tool_plane::ProviderHeldLifecycle for Withdrawals {
+    async fn wait(
+        &self,
+        _ctx: &BatchCtx,
+        _call: &ToolCall,
+        _reply: &broca_core::tool_plane::ProviderHeldReply,
+    ) -> DispatchResult {
+        std::future::pending().await
+    }
+
+    async fn withdraw_held(
+        &self,
+        call: &broca_core::tool_plane::ProviderHeldReply,
+    ) -> Result<(), String> {
+        self.0.lock().unwrap().push(call.tool_call_id.0.clone());
+        Ok(())
+    }
+}
+
+/// A failed run's end with a call its provider still holds: the call gets the held close
+/// result, and its provider is asked to withdraw it, since nobody will collect its late result.
+#[tokio::test]
+async fn ending_a_failed_run_withdraws_a_call_its_provider_holds() {
+    let backend = run_batch(true).await;
+    let mut session = reload(backend).await;
+    let batch = Writer::operations(&session)
+        .run
+        .as_ref()
+        .and_then(|run| run.open_batch.clone())
+        .expect("the batch is open");
+    let position = (0..batch.calls.len())
+        .find(|position| batch.id(*position).0 == "bash-1")
+        .expect("bash is planned");
+    session
+        .append(
+            &[Record::ToolHeld(broca_session_store::record::ToolHeld {
+                batch_id: batch.batch_id.clone(),
+                tool_call_id: ToolCallId("bash-1".into()),
+                call_key: batch.key(position).expect("bash was sent").to_owned(),
+                module: "provider".into(),
+                reason: "running".into(),
+                detail_digest: None,
+                held_at_ms: 1_800_000_000_001,
+                sequential: false,
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+    let withdrawals = Withdrawals::default();
+    let ended = crate::run::end_run_with_error(
+        &mut session,
+        "early",
+        broca_protocol::RunFinishReason::Error,
+        &loop_failed(),
+        1_800_000_000_002,
+        Some(&withdrawals),
+    )
+    .await;
+    assert!(ended.is_ok(), "end_run_with_error: {ended:?}");
+    assert!(
+        Writer::conversation(&session).open_tool_turn().is_none(),
+        "the tool turn closes with the run"
+    );
+    assert_eq!(
+        outcomes(&session).await,
+        ["say-1:Completed", "bash-1:Interrupted"]
+    );
+    let held_close = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|(_, record)| {
+            matches!(&record, Record::ToolOutcome(outcome)
+                if outcome.tool_call_id.0 == "bash-1"
+                    && outcome.reason.as_deref() == Some("provider_held_interrupted"))
+        });
+    assert!(held_close, "bash-1 gets the held close result");
+    assert_eq!(*withdrawals.0.lock().unwrap(), ["bash-1"]);
+}

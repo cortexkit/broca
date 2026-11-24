@@ -19,7 +19,6 @@ use broca_core::delivery_order::{appended_text, choose_mode, Boundary};
 use broca_core::output_events::OutputEvent;
 use broca_core::provider::{Provider, StepRuntime};
 use broca_core::stop_conditions::{limiting_stop_satisfied, stop_satisfied};
-use broca_core::tags::TagNumbering;
 use broca_core::tool_plane::{
     BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
     ProviderHeldRecorder, ProviderHeldReply, ToolOpenGuard, ToolPlane,
@@ -67,7 +66,12 @@ mod warming;
 pub(crate) use warming::Warming;
 pub use warming::{warm_count, warm_spend};
 mod close_out;
-use close_out::{held_close_result, never_dispatched_close_out, open_batch_close_out};
+pub use close_out::{
+    end_restart_resume_refused, end_run_with_error, end_run_with_error_and_interrupt_reason,
+};
+use close_out::{
+    held_close_result, never_dispatched_close_out, open_batch_close_out, turn_positions,
+};
 mod call_plan;
 use call_plan::{hook_plan, plan_calls, CallPlan};
 mod dispatch;
@@ -84,11 +88,15 @@ mod send_facts;
 pub use send_facts::SendFacts;
 mod setup;
 use setup::{store_setup, Setup};
+mod ordered_sends;
 mod start_config;
+use ordered_sends::{ordered_sends, OrderedSend, OrderedSendsRead};
+mod tag_numbering;
 pub use start_config::{
     frozen_marker_order, run_config_members, run_config_of_run, run_config_of_start,
     run_frozen_facts, ConfigMembers, FrozenFacts, SetupParts,
 };
+use tag_numbering::number_runs;
 
 /// The cache-marker placement a session's first run freezes (see
 /// `broca_provider::cache_markers::plan_markers` and `admit::marker_order_for_next_run`).
@@ -511,6 +519,7 @@ where
     });
     let mut placed = Placed {
         calls: Default::default(),
+        floor_mid: Default::default(),
         runner,
         rich_ui: admission
             .manifest
@@ -935,6 +944,7 @@ where
     let drift = drift.filter(|_| !matches!(resolution, Resolution::Paused(_)));
     let mut placed = Placed {
         calls: Default::default(),
+        floor_mid: Default::default(),
         runner,
         rich_ui: admission
             .manifest
@@ -1198,6 +1208,7 @@ where
     // resume places it.
     let mut placed = Placed {
         calls: Default::default(),
+        floor_mid: Default::default(),
         runner,
         rich_ui: admission
             .manifest
@@ -1270,22 +1281,19 @@ fn unsent_calls<W: Writer>(writer: &W) -> Option<Vec<ToolCall>> {
     let open = writer.conversation().open_tool_turn()?;
     let batch = run_state(writer).open_batch.as_ref();
     Some(
-        open.content
-            .iter()
-            .filter_map(|block| match block {
-                broca_protocol::content::ContentBlock::ToolCall(call) => Some(call.clone()),
-                _ => None,
-            })
-            .filter(|call| {
+        turn_positions(open, batch)
+            .into_iter()
+            .filter(|(_, position)| {
                 batch.is_none_or(|batch| {
                     matches!(
-                        batch.state_of(&call.tool_call_id),
+                        position.map(|position| batch.state(position)),
                         Some(
                             CallState::NotSent | CallState::ProviderHeld | CallState::HeldSuccessor
                         )
                     )
                 })
             })
+            .map(|(call, _)| call.clone())
             .collect(),
     )
 }
@@ -2161,6 +2169,8 @@ where
         .map(|changes| changes.sharing(compaction));
     // Each window run's frozen part numbering, read from its start once for the whole run.
     let mut tag_rules = TagRulesCache::default();
+    // Each waiting ordered send, read once while it waits rather than at every boundary.
+    let mut sends_read = OrderedSendsRead::default();
     // On the current compaction contract a request numbers its parts from the entries, so the
     // runs' frozen numbering goes unused there: it's read at the run's first step only, which
     // refuses a window run whose start can't be read, as every step's read would. No run joins
@@ -2250,7 +2260,16 @@ where
         let cancelled_now = seams.cancel.is_cancelled()
             || run_state(writer).cancel == Some(broca_session_store::record::CancelPoint::Now);
         if let Some(stop) = stop_before_batch(writer, &stop_when) {
-            return hard_stop(writer, seams, &admission.run_id, step_id, &planned, &stop).await;
+            return hard_stop(
+                writer,
+                seams,
+                &admission.run_id,
+                step_id,
+                &planned,
+                false,
+                &stop,
+            )
+            .await;
         }
         if cancelled_now || seams.stop.is_cancelled() {
             // A call a provider holds was sent, so it is never closed as not run. A cancel
@@ -2301,6 +2320,7 @@ where
             warming.as_ref(),
             changes.as_ref(),
             admission.compaction_plan_version.is_some(),
+            &mut sends_read,
         )
         .await?
         {
@@ -2397,7 +2417,7 @@ where
         // records may be sealed. One queued after this read waits for the next boundary.
         let ordered = match entering {
             Some(_) => Default::default(),
-            None => Box::pin(ordered_sends(writer)).await?,
+            None => Box::pin(ordered_sends(writer, &mut sends_read)).await?,
         };
         // A step entered again after a move writes no boundary, unless the run must end or
         // pause here: a cancel or a stop that came while routing was asked or the move was
@@ -3184,16 +3204,11 @@ where
             Some(runtime) => post_assistant(runtime, step_id, &mut step.message).await,
             None => None,
         };
-        // A cut call on a budget's finalize step or in a structured run needs handling the run
-        // loop hasn't built, so it is refused by name rather than run without it.
-        if !step.cuts.is_empty() && (finalizing || structured.is_some()) {
-            return Err(LoopError::Unsupported(
-                "a cut tool call on a finalize step or in a structured-output run",
-            ));
-        }
         // The finalize step's answer is the run's last: calls the model made anyway are dropped
-        // before anything records or decides on the answer, and it ends as a stop.
+        // before anything records or decides on the answer, and it ends as a stop. A call the
+        // provider cut goes with them.
         if finalizing {
+            step.cuts.clear();
             step.message.content.retain(|block| {
                 !matches!(block, broca_protocol::content::ContentBlock::ToolCall(_))
             });
@@ -3236,15 +3251,11 @@ where
         // request on itself.
         let whole = step.served.total(step.usage);
         // A call whose arguments the provider cut is answered with an error in the step's
-        // own batch, before anything is sent; the batch then runs the other calls.
+        // own batch, before anything is sent; the batch then runs the other calls, or a stop
+        // condition, a stop or a cancel closes them as never run.
         let batch_id = format!("{}-b{step_id}", admission.run_id);
         let mut cut = Vec::new();
         if !step.cuts.is_empty() {
-            if stop.is_some() || seams.stop.is_cancelled() || seams.cancel.is_cancelled() {
-                return Err(LoopError::Unsupported(
-                    "a cut tool call on a step that meets a stop condition, a stop or a cancel",
-                ));
-            }
             cut.push(Record::BatchStart(BatchStart {
                 run_id: admission.run_id.clone(),
                 batch_id: batch_id.clone(),
@@ -3372,30 +3383,58 @@ where
             return Ok(finished(writer, RunFinishReason::Completed));
         }
         // A `submit_tool` run ends at the step that calls `submit_result`, before anything is
-        // dispatched or a stop condition is weighed.
+        // dispatched or a stop condition is weighed. A `submit_result` call the provider cut
+        // isn't counted: it keeps its error, and the model can call it again.
+        let started = !step.cuts.is_empty();
         if let Some(frozen) = structured.as_ref() {
+            let rejected: Vec<ToolResult> = step
+                .cuts
+                .iter()
+                .map(|garbage| error_result(&garbage.tool_call_id, ""))
+                .collect();
             if let Some(submit) =
-                broca_core::structured_output::counted_submit(frozen, &step.message, &[])
+                broca_core::structured_output::counted_submit(frozen, &step.message, &rejected)
             {
                 let pending = PendingSubmit {
                     step_id,
                     calls: calls.clone(),
                     submit,
-                    started: false,
-                    answered: Vec::new(),
+                    started,
+                    answered: step
+                        .cuts
+                        .iter()
+                        .map(|garbage| garbage.tool_call_id.clone())
+                        .collect(),
                 };
                 return submitted(writer, seams, &admission.run_id, frozen, &pending).await;
             }
         }
         if let Some(stop) = stop {
-            return hard_stop(writer, seams, &admission.run_id, step_id, &calls, &stop).await;
+            return hard_stop(
+                writer,
+                seams,
+                &admission.run_id,
+                step_id,
+                &uncut,
+                started,
+                &stop,
+            )
+            .await;
         }
         // A stop, or a caller's cancel that arrived after the model's answer, refuses the batch
         // before any call is gated, so no pre-tool hook runs and the plane is never told.
         if seams.stop.is_cancelled() || seams.cancel.is_cancelled() {
             let cancelled = seams.cancel.is_cancelled();
-            return stopped_batch(writer, seams, &admission.run_id, step_id, &calls, cancelled)
-                .await;
+            return stopped_batch_in(
+                writer,
+                seams,
+                &admission.run_id,
+                step_id,
+                &uncut,
+                cancelled,
+                !started,
+            )
+            .await;
         }
         match batch(
             writer,
@@ -3413,6 +3452,7 @@ where
             warming.as_ref(),
             changes.as_ref(),
             admission.compaction_plan_version.is_some(),
+            &mut sends_read,
         )
         .await?
         {
@@ -3888,16 +3928,7 @@ fn call_options<W: Writer>(
             }
             // A session on the established layout numbers each run's messages by that run's
             // frozen rules, in the order they were placed, and renders them in place.
-            for (at, run) in run_rules.iter().enumerate() {
-                let end = run_rules
-                    .get(at + 1)
-                    .map_or(prompt.len(), |next| next.start)
-                    .min(prompt.len());
-                let start = run.start.min(end);
-                TagNumbering::for_run(&prompt[..start], run.rules, run.computed)
-                    .number_new(&mut prompt[..end])
-                    .map_err(overflow)?;
-            }
+            number_runs(&mut prompt, run_rules).map_err(overflow)?;
             prompt
         }
     };
@@ -4474,6 +4505,8 @@ async fn batch<W, P, T>(
     changes: Option<&crate::compaction::Changes<'_>>,
     // Whether the session is on the compaction contract, which picks a ride's carrier.
     contract: bool,
+    // What the run has read of the queue's ordered sends (see [`OrderedSendsRead`]).
+    sends_read: &mut OrderedSendsRead,
 ) -> Result<BatchOutcome, LoopError>
 where
     W: Writer,
@@ -4523,6 +4556,24 @@ where
             call.input = args.into();
         }
     }
+    // A batch that already started may plan only some of its calls again, as a resume does with
+    // the ones still to be answered. When an id's first planned copy already has its result, a
+    // copy of it planned here is a repeat: only the first copy is ever sent, and the session
+    // reads a later copy's intent as one never sent, so sending it could send it twice.
+    let answered_first: std::collections::HashSet<ToolCallId> = run_state(writer)
+        .open_batch
+        .as_ref()
+        .filter(|_| started)
+        .map(|batch| {
+            (0..batch.calls.len())
+                .filter(|&position| {
+                    batch.state(position) == CallState::Terminated
+                        && (0..position).all(|earlier| batch.id(earlier) != batch.id(position))
+                })
+                .map(|position| batch.id(position).clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let Some(plans) = plan_calls(
         &mut calls,
         known,
@@ -4532,6 +4583,7 @@ where
         hooks,
         step_id,
         &removed_tools(writer.operations()),
+        &answered_first,
     )
     .await?
     else {
@@ -4587,7 +4639,7 @@ where
     let ordered = if dispatching {
         Default::default()
     } else {
-        Box::pin(ordered_sends(writer)).await?
+        Box::pin(ordered_sends(writer, sends_read)).await?
     };
     let system_after = system_after_results(seams.provider);
     let written = writer
@@ -4859,7 +4911,7 @@ where
     // Budget firings caused by the step's calls go in the barrier that closes its batch; a batch
     // that closes held calls on a cancel makes none. Queued sends ride on its results in the same
     // barrier, after its end, read as it closes.
-    let ordered = Box::pin(ordered_sends(writer)).await?;
+    let ordered = Box::pin(ordered_sends(writer, sends_read)).await?;
     let closed_at = (seams.now_ms)();
     let mut records = Some(records);
     let cancelling = !closed.is_empty();
@@ -5083,81 +5135,7 @@ async fn end_with_error<W: Writer, P, T>(
     reason: RunFinishReason,
     error: &ProviderError,
 ) -> Result<Finished, LoopError> {
-    end_run_with_error(writer, run_id, reason, error, (seams.now_ms)()).await
-}
-
-/// Ends the session's unfinished latest run `run_id` as `reason`, with `error` on its end and
-/// `now_ms` as its time: the end the loop writes for a run that can't go on, durable before it
-/// returns, with the messages steered or delivered since the run's last step boundary. For the
-/// session's owner, when a run's loop stopped without writing an end.
-pub async fn end_run_with_error<W: Writer>(
-    writer: &mut W,
-    run_id: &str,
-    reason: RunFinishReason,
-    error: &ProviderError,
-    now_ms: u64,
-) -> Result<Finished, LoopError> {
-    end_run_with_error_and_interrupt_reason(writer, run_id, reason, error, now_ms, None).await
-}
-
-/// [`end_run_with_error`] with the recorded interruption reason the actor's seal selected, so
-/// callers read the same cause whether the loop or its actor wrote the interrupted end.
-pub async fn end_run_with_error_and_interrupt_reason<W: Writer>(
-    writer: &mut W,
-    run_id: &str,
-    reason: RunFinishReason,
-    error: &ProviderError,
-    now_ms: u64,
-    interrupt_reason: Option<String>,
-) -> Result<Finished, LoopError> {
-    let mut record = run_end(writer, run_id, reason, now_ms);
-    if let Record::RunEnd(end) = &mut record {
-        end.error = Some(
-            serde_json::to_value(error)
-                .map_err(|e| LoopError::Parts(e.to_string()))?
-                .into(),
-        );
-        end.interrupt_reason = interrupt_reason;
-    }
-    append_end(writer, run_id, vec![record]).await?;
-    Ok(finished(writer, reason))
-}
-
-/// Records a refused restart continuation and its interrupted terminal without dispatching
-/// anything. Set `record_resume` when the attempt failed before recording a resume entry;
-/// owners that already recorded it keep the existing entry instead of appending a duplicate.
-pub async fn end_restart_resume_refused<W: Writer>(
-    writer: &mut W,
-    run_id: &str,
-    error: &ProviderError,
-    now_ms: u64,
-    record_resume: bool,
-) -> Result<Finished, LoopError> {
-    if record_resume {
-        let resolution = run_state(writer).resolution();
-        let mut batch = Some(vec![Record::Resumed(resumed_record(writer, &resolution))]);
-        writer
-            .append_with(
-                &mut |_, _, first_seq| {
-                    let mut batch = batch.take().expect("one refused resume entry");
-                    name_resumed_from(&mut batch, first_seq);
-                    batch
-                },
-                false,
-            )
-            .await?;
-    }
-    let mut record = run_end(writer, run_id, RunFinishReason::Interrupted, now_ms);
-    if let Record::RunEnd(end) = &mut record {
-        end.interrupt_reason = Some("runner_crash".into());
-        end.error = Some(
-            serde_json::to_value(error)
-                .map_err(|e| LoopError::Parts(e.to_string()))?
-                .into(),
-        );
-    }
-    append_end(writer, run_id, vec![record]).await?;
-    Ok(finished(writer, RunFinishReason::Interrupted))
+    end_run_with_error(writer, run_id, reason, error, (seams.now_ms)(), seams.held).await
 }
 
 /// The timed pause on the run's own account that `limited`, the step's attempt the provider refused
@@ -5352,157 +5330,6 @@ async fn submitted<W: Writer, P, T>(
     Ok(finished(writer, RunFinishReason::Completed))
 }
 
-/// A queued send with a delivery order, as a boundary delivers it.
-struct OrderedSend {
-    order: DeliveryOrder,
-    /// The user messages a `steer` or `turn_system` delivery places: the input after the send's
-    /// `pre_user` hooks, without system messages.
-    input: Vec<Message>,
-    written_at_ms: Option<u64>,
-    /// The send's id as a ride names it: the caller's `send_id`, else its submission id.
-    send_id: String,
-    /// Who a ride names as its sender: the module that sent it, else `broca`.
-    ride_sender: String,
-    /// What a ride's text is shown as having come from: its sender and the plan template it was
-    /// rendered from.
-    notice: Notice,
-    /// Where the queued record stored the bytes of each medium the send's messages carry, by
-    /// digest: a delivered copy of a message points at the same objects.
-    media: std::collections::HashMap<String, broca_session_store::record::MediaObject>,
-}
-
-impl OrderedSend {
-    /// Where each medium of `message`, a message this send delivers, is stored. Matched by
-    /// digest, since the send's `pre_user` transforms may have rewritten the messages its
-    /// queued record kept.
-    fn media_of(&self, message: &Message) -> Vec<broca_session_store::record::InputMedia> {
-        broca_session_store::session::message_media(message)
-            .into_iter()
-            .filter_map(|(block, part, reference)| {
-                self.media.get(&reference.sha256).map(|object| {
-                    broca_session_store::record::InputMedia {
-                        block,
-                        part,
-                        log: object.log,
-                        generation: object.generation,
-                        seq: object.seq,
-                    }
-                })
-            })
-            .collect()
-    }
-}
-
-/// The module a principal names, or `broca` if there is none.
-fn module_or_broca(principal: Option<&broca_protocol::BindPrincipal>) -> String {
-    match principal {
-        Some(broca_protocol::BindPrincipal::Reserved { module_id }) => module_id.clone(),
-        _ => "broca".into(),
-    }
-}
-
-/// The queue's sends that carry a delivery order, read from their records: the order, the input,
-/// who sent each send, and when it was accepted.
-async fn ordered_sends<W: Writer>(
-    writer: &mut W,
-) -> Result<std::collections::BTreeMap<String, OrderedSend>, LoopError> {
-    // The session's actor queues sends while the run waits on its model or its tools, so the
-    // run's copy of the queue may lag. Without catching up, a send queued while a tool ran
-    // would miss that tool's results and wait for a later boundary.
-    writer.caught_up().await?;
-    let ids: Vec<String> = writer
-        .operations()
-        .queue
-        .iter()
-        .filter(|pending| pending.ordered)
-        .map(|pending| pending.submission_id.clone())
-        .collect();
-    let mut sends = std::collections::BTreeMap::new();
-    for id in ids {
-        let records = writer.send_records(&id).await?;
-        let order = records.iter().find_map(|record| match record {
-            Record::DeliveryOrdered(ordered) => Some(ordered.order.clone()),
-            _ => None,
-        });
-        let queued = records.iter().find_map(|record| match record {
-            Record::QueuedSend(queued) => Some(queued),
-            _ => None,
-        });
-        let (Some(order), Some(queued)) = (order, queued) else {
-            return Err(LoopError::Parts(format!(
-                "queued send {id} is missing its order or its request"
-            )));
-        };
-        let order: DeliveryOrder =
-            serde_json::from_value(order).map_err(|e| LoopError::Parts(e.to_string()))?;
-        let principal = |value: Option<&Value>| -> Result<_, LoopError> {
-            value
-                .map(|value| serde_json::from_value::<broca_protocol::BindPrincipal>(value.clone()))
-                .transpose()
-                .map_err(|e| LoopError::Parts(format!("queued send {id}'s sender: {e}")))
-        };
-        let ordered_by = principal(records.iter().find_map(|record| match record {
-            Record::DeliveryOrdered(ordered) => ordered.sent_by.as_ref(),
-            _ => None,
-        }))?;
-        let receipt_value = queued
-            .receipt
-            .as_ref()
-            .map(broca_protocol::json::Json::parse);
-        let receipt = |name: &str| receipt_value.as_ref().and_then(|receipt| receipt.get(name));
-        let queued_by = principal(receipt("sent_by"))?;
-        let queued_as = principal(receipt("principal"))?;
-        // A ride names the module its queued record says sent it; the notice names the one its
-        // order says.
-        let ride_sender = module_or_broca(
-            queued_by
-                .as_ref()
-                .or(ordered_by.as_ref())
-                .or(queued_as.as_ref()),
-        );
-        let notice_sender = broca_core::compaction_v2::entries::delivery_sender(
-            ordered_by
-                .as_ref()
-                .or(queued_by.as_ref())
-                .or(queued_as.as_ref()),
-            DeliveryMode::ToolResult,
-        )
-        .unwrap_or_else(|| "broca".into());
-        let notice = Notice {
-            sender: notice_sender,
-            template: order.template.as_ref().map(|template| template.id.clone()),
-        };
-        let hooked = queued
-            .receipt
-            .as_ref()
-            .map(broca_protocol::json::Json::parse)
-            .and_then(|receipt| receipt.get("hooks")?.get("final_value").cloned())
-            .and_then(|value| serde_json::from_value::<Vec<Message>>(value).ok());
-        let input = hooked
-            .unwrap_or_else(|| queued.input.clone())
-            .into_iter()
-            .filter(|message| message.role != Role::System)
-            .collect();
-        let send_id = queued.send_id.clone().unwrap_or_else(|| id.clone());
-        let media = broca_session_store::session::stored_media(&Record::QueuedSend(queued.clone()))
-            .into_iter()
-            .collect();
-        sends.insert(
-            id,
-            OrderedSend {
-                order,
-                input,
-                written_at_ms: queued.written_at_ms,
-                send_id,
-                ride_sender,
-                notice,
-                media,
-            },
-        );
-    }
-    Ok(sends)
-}
-
 /// The records that deliver queued sends at the close of a tool batch: an expired send ends, and
 /// one whose first possible mode here is `tool_result` rides on the batch's carrier result
 /// (`ResultAppend` with its envelope, then `Delivery`), in queue order. Every other send waits for
@@ -5516,7 +5343,7 @@ fn tool_batch_deliveries(
     conversation: &broca_session_store::fold::conversation::Conversation,
     operations: &Operations,
     batch: &[Record],
-    ordered: &std::collections::BTreeMap<String, OrderedSend>,
+    ordered: &std::collections::BTreeMap<String, Arc<OrderedSend>>,
     run_id: &str,
     contract: bool,
     system_after_results: bool,
@@ -5528,6 +5355,7 @@ fn tool_batch_deliveries(
         .iter()
         .filter(|pending| pending.ordered)
         .filter_map(|pending| ordered.get(&pending.submission_id))
+        .map(Arc::as_ref)
         .collect();
     if pending.is_empty() {
         return Vec::new();

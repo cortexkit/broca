@@ -357,7 +357,9 @@ pub fn check_log(log: &WrittenLog, mutation: &Mutation) {
         "the durable bound of a log cut at {len}"
     );
     match (&read.end, &verdict) {
-        (LogEnd::Clean, Verdict::Opens(_)) => {}
+        (LogEnd::Clean, Verdict::Opens(_)) if len as u64 >= bound => {}
+        (LogEnd::Clean, Verdict::Corrupt { at, durable_bound })
+            if *at == len as u64 && *at < bound && *durable_bound == bound => {}
         (LogEnd::TornTail { at }, Verdict::Opens(_)) if *at >= bound => {}
         (
             LogEnd::TornTail { at },

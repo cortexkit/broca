@@ -10,13 +10,15 @@ use crate::codec::{Digest, Message as _};
 use crate::head::SessionTriple;
 use crate::keys::{Cipher, DeploymentKey};
 use crate::record::{
-    Assistant, BatchStart, CallOutcome, Input, Placement, Record, RunEnd, RunStart, StepStart,
-    ToolIntent, ToolOutcome, ToolReply,
+    Assistant, BatchEnd, BatchStart, CallOutcome, Input, Placement, Record, RunEnd, RunStart,
+    StepStart, ToolIntent, ToolOutcome, ToolReply,
 };
 use crate::session::{Session, SessionError};
 
 cipher_tests!(
     a_lost_tool_result_closes_open_work_and_warns_the_model,
+    a_previous_reply_with_the_same_id_does_not_close_a_later_call,
+    a_previous_step_with_the_same_id_does_not_close_a_later_call,
     a_kept_outcome_says_the_call_finished,
     only_outcomes_lost_with_the_log_are_derived,
     seqs_after_a_recovery_are_above_everything_the_damage_removed,
@@ -153,18 +155,22 @@ fn step(run: &str, step_id: u64) -> Record {
 }
 
 fn dispatched(run: &str, id: &str) -> [Record; 2] {
+    dispatched_at(run, id, 1, "b")
+}
+
+fn dispatched_at(run: &str, id: &str, step_id: u64, batch_id: &str) -> [Record; 2] {
     [
         Record::BatchStart(BatchStart {
             run_id: run.into(),
-            batch_id: "b".into(),
-            step_id: 1,
+            batch_id: batch_id.into(),
+            step_id,
             planned: vec![ToolCallId(id.into())],
             mid: None,
             shown_tags: Vec::new(),
         }),
         Record::ToolIntent(ToolIntent {
             run_id: run.into(),
-            batch_id: "b".into(),
+            batch_id: batch_id.into(),
             tool_call_id: ToolCallId(id.into()),
             tool_name: Some("bash".into()),
             module_id: None,
@@ -181,10 +187,14 @@ fn dispatched(run: &str, id: &str) -> [Record; 2] {
 }
 
 fn answered(run: &str, id: &str) -> [Record; 2] {
+    answered_in(run, id, "b")
+}
+
+fn answered_in(run: &str, id: &str, batch_id: &str) -> [Record; 2] {
     [
         Record::ToolReply(ToolReply {
             run_id: run.into(),
-            batch_id: Some("b".into()),
+            batch_id: Some(batch_id.into()),
             result: ToolResult {
                 tool_call_id: ToolCallId(id.into()),
                 output: ToolOutput::Text {
@@ -199,7 +209,7 @@ fn answered(run: &str, id: &str) -> [Record; 2] {
         Record::ToolOutcome(ToolOutcome {
             yielded_by: None,
             run_id: run.into(),
-            batch_id: "b".into(),
+            batch_id: batch_id.into(),
             tool_call_id: ToolCallId(id.into()),
             outcome: CallOutcome::Completed,
             result_digest: Digest([0; 32]),
@@ -381,6 +391,132 @@ fn a_kept_outcome_says_the_call_finished(cipher: Cipher) {
     let window = texts(&session.conversation.held_messages().unwrap());
     assert!(
         window[3].contains("finished, but storage damage removed its output"),
+        "{window:?}"
+    );
+}
+
+fn a_previous_reply_with_the_same_id_does_not_close_a_later_call(cipher: Cipher) {
+    recover_reused_call_id(cipher, "a", 1, "b", &["ask a", "done", "ask b"]);
+}
+
+fn a_previous_step_with_the_same_id_does_not_close_a_later_call(cipher: Cipher) {
+    recover_reused_call_id(cipher, "b", 2, "b2", &["ask b", "done"]);
+}
+
+fn recover_reused_call_id(
+    cipher: Cipher,
+    first_run: &str,
+    second_step: u64,
+    second_batch: &str,
+    prefix: &[&str],
+) {
+    let backend = MemoryBackend::default();
+    let (from, to) = block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        session
+            .append(
+                &[
+                    start(first_run),
+                    input(first_run, &format!("ask {first_run}")),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        session
+            .append(
+                &[step(first_run, 1), assistant(first_run, 1, vec![call("c")])],
+                true,
+            )
+            .await
+            .unwrap();
+        session
+            .append(&dispatched(first_run, "c"), true)
+            .await
+            .unwrap();
+        session
+            .append(&answered(first_run, "c"), true)
+            .await
+            .unwrap();
+        session
+            .append(
+                &[Record::BatchEnd(BatchEnd {
+                    run_id: first_run.into(),
+                    batch_id: "b".into(),
+                })],
+                true,
+            )
+            .await
+            .unwrap();
+        if first_run != "b" {
+            session
+                .append(&[end(first_run), start("b"), input("b", "ask b")], true)
+                .await
+                .unwrap();
+        }
+        session
+            .append(
+                &[
+                    step("b", second_step),
+                    assistant("b", second_step, vec![call("c")]),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        session
+            .append(&dispatched_at("b", "c", second_step, second_batch), true)
+            .await
+            .unwrap();
+        let from = session.open_log().1;
+        session
+            .append(&answered_in("b", "c", second_batch), false)
+            .await
+            .unwrap();
+        let to = session.open_log().1;
+        session
+            .append(&[step("b", second_step + 1)], false)
+            .await
+            .unwrap();
+        (from, to)
+    });
+    damage(&backend, from + 60, cipher);
+    damage(&backend, to - 20, cipher);
+    assert!(matches!(
+        load(&backend, cipher),
+        Err(SessionError::NeedsRecovery)
+    ));
+
+    let Recovery::Recovered(recovered) = recover(&backend, 1_000, cipher).unwrap() else {
+        panic!("nothing recovered");
+    };
+    assert_eq!(recovered.interrupted_runs, ["b"]);
+    assert_eq!(recovered.unknown_calls, [ToolCallId("c".into())]);
+    let session = load(&backend, cipher).unwrap();
+    let records = block_on(session.open_log_records()).unwrap();
+    let unknown: Vec<_> = records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            Record::ToolOutcome(outcome) if outcome.outcome == CallOutcome::Unknown => Some((
+                outcome.run_id.as_str(),
+                outcome.batch_id.as_str(),
+                outcome.tool_call_id.0.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unknown, [("b", second_batch, "c")]);
+    let window = texts(&session.conversation.held_messages().unwrap());
+    assert_eq!(window.len(), prefix.len() + 2, "{window:?}");
+    assert_eq!(&window[..prefix.len()], prefix);
+    assert!(
+        window[prefix.len()].contains("outcome_unknown"),
+        "{window:?}"
+    );
+    assert!(
+        window[prefix.len() + 1].starts_with("Storage damage removed records"),
         "{window:?}"
     );
 }

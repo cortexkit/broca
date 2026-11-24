@@ -186,6 +186,12 @@ from its scope stamp, never from the arguments. When routing can place the call 
 subscription account it does; otherwise the call runs on a per-token account. `cost_usd`
 is the per-token price of the call's usage either way (on a subscription, what the call
 would have cost per token), and `max_cost_usd` caps it before anything is sent. Unlike a classify batch, a completion runs as one run with no tools in a
-session of its own (`llm-complete:<call_key>:<attempt>`), kept 7 days. Its admission and
+session of its own (`llm-complete:<call_key>:<admitted_at_ms>:<attempt>`), kept 7 days. Its admission and
 answer are recorded in the System One store under the role `llm.complete`, so a repeat of
 the same `call_key` within 7 days answers the recorded result and is never billed twice.
+A recorded refusal is final too, a transient one included: the repeat answers it with the
+same spend mark (`cost_usd`, `cost_unmeasured`, `cost_unknown` or `no_spend`) and runs
+nothing. A caller that wants another try sends a new `call_key`.
+A repeat after the 7 days is a new call: until the hourly sweep removes the old record it is
+refused as a transient `provider_error` that spent nothing, and once removed it runs in new
+sessions, since the admission time in the session name differs.

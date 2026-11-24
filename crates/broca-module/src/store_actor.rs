@@ -123,6 +123,10 @@ pub struct StoreActor<B: SessionBackend> {
     /// Where the session's spend facts are written. Without it, a run that ends stays owed
     /// until an actor that has it opens the session.
     billing: Option<crate::store_billing::StoreBilling>,
+    /// Owed runs whose own records don't build their spend facts, found so while this actor
+    /// has the session open. Each stays owed, but isn't read again at every run's end: the
+    /// records never change, and reading them reads the whole history after the run.
+    unbillable: std::collections::HashSet<String>,
     /// The session's compaction state, kept for the actor's whole life and handed to every
     /// run. A run restores it from the session's records the first time; after that it
     /// carries what holds only for this actor's life, such as whether the compaction
@@ -499,6 +503,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             sign_in_open_deadline: None,
             stopping: false,
             billing: None,
+            unbillable: Default::default(),
             compaction_session: Arc::default(),
             pending_views: Vec::new(),
             seal: CancellationToken::new(),
@@ -2595,13 +2600,17 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// Bills every run whose billing is owed, oldest first: its spend facts are inserted into
     /// the usage export, then a `Billed` record settles it, never before the insert commits.
     /// A run that can't be billed stays owed, and the next run's end or the next open tries
-    /// again; billing never fails a run.
+    /// again; billing never fails a run. A run whose own records can't build its facts is tried
+    /// once per open of the session, not again at every later run's end.
     async fn bill_owed(&mut self) {
         let Some(billing) = self.billing.clone() else {
             return;
         };
         let owed = self.session.operations().billing_owed.clone();
         for run_id in owed {
+            if self.unbillable.contains(&run_id) {
+                continue;
+            }
             let inserted = billing
                 .insert(&self.session, &self.key, &self.parts, &run_id)
                 .await;
@@ -2617,7 +2626,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                             format!("the run's billing could not be recorded: {error:?}")
                         })
                 }
-                Err(error) => Err(error),
+                Err(crate::store_billing::BillingFailure::Unbillable(error)) => {
+                    tracing::warn!(
+                        target: "broca.store_actor",
+                        session = %self.key.session,
+                        run_id = %run_id,
+                        error = %error,
+                        "the run's records don't build its spend facts; it stays owed and is tried again only when the session next opens",
+                    );
+                    self.unbillable.insert(run_id);
+                    continue;
+                }
+                Err(crate::store_billing::BillingFailure::Failed(error)) => Err(error),
             };
             if let Err(error) = settled {
                 tracing::warn!(
@@ -3589,12 +3609,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             account_continue: None,
         };
         let now = (self.now_ms)();
+        // A call a provider still holds is closed with the run, and nobody will collect its late
+        // result, so the provider is asked to withdraw it.
+        let held = self.executor.provider_held_lifecycle();
         if let Err(error) = broca_session_loop::run::end_run_with_error(
             &mut self.durable(),
             &run_id.0,
             broca_protocol::RunFinishReason::Error,
             &error,
             now,
+            held.as_deref(),
         )
         .await
         {

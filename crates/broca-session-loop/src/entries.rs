@@ -22,6 +22,8 @@ use broca_protocol::content::{ContentBlock, Message, Role};
 use broca_protocol::ToolCallId;
 use broca_session_store::fold::conversation::{Conversation, Delivered};
 use broca_session_store::fold::operations::{CallState, Operations};
+use broca_session_store::placement::{entry_facts, runner_notice};
+pub use broca_session_store::placement::{lifetime_tag_high, native};
 use broca_session_store::record::{
     CallFacts, CallOutcome, EntryFacts, Notice, Placement, ReasoningSummary, Record, ResultAppend,
     RichUi, RideForm, RideNotice, StepUsage, ToolIntent, ToolOutcome, ToolReply, TurnFacts,
@@ -47,6 +49,12 @@ pub struct Placed<'w, W> {
     pub rich_ui: Option<RichUi>,
     /// The run's own part numbering, which each message's `runner_tag_base` records.
     pub runner: Option<RunnerTags>,
+    /// The ordinal, history version and message id of the last entry whose id was looked up by
+    /// its place ([`Writer::entry_mid_at`]): the entry the session's signed floor goes through,
+    /// which every step states. A placed message keeps its id until a rewrite of the history
+    /// moves the version, so the run reads it from the session once, not at every step, even
+    /// once it is sealed.
+    pub floor_mid: std::sync::Mutex<Option<(u64, u64, String)>>,
 }
 
 /// A run's own part numbering (llm-runner's computed tags, `broca_core::tags::computed_rules`):
@@ -179,13 +187,21 @@ fn key_seq(key: &str, session: &str) -> Option<u64> {
 
 impl OpenCalls {
     /// Notes what `records`, the first at `first_seq`, record about the open batch's calls.
+    /// Intents are kept only for the batch still open: a batch's start or end forgets those
+    /// noted before it, so a long run doesn't hold every call it ever made. (A batch an end
+    /// leaves open, its calls not all answered, has its intents looked up again by
+    /// `learn_open_calls`.)
     fn note(&mut self, records: &[Record], first_seq: u64) {
         for (seq, record) in (first_seq..).zip(records) {
-            if let Record::ToolIntent(intent) = record {
-                if let Some(key) = &intent.call_key {
-                    self.intents
-                        .insert(key.clone(), (intent.clone(), Some(seq)));
+            match record {
+                Record::ToolIntent(intent) => {
+                    if let Some(key) = &intent.call_key {
+                        self.intents
+                            .insert(key.clone(), (intent.clone(), Some(seq)));
+                    }
                 }
+                Record::BatchStart(_) | Record::BatchEnd(_) => self.intents.clear(),
+                _ => {}
             }
         }
         let Some(batch) = records.iter().rev().find_map(|record| match record {
@@ -464,6 +480,21 @@ impl<W: Writer> Writer for Placed<'_, W> {
         self.inner.entry_at(ordinal).await
     }
 
+    async fn entry_mid_at(&self, ordinal: u64) -> Result<Option<String>, SessionError> {
+        let version = self.inner.operations().history_version;
+        let kept = self.floor_mid.lock().expect("floor mid").clone();
+        if let Some((at, kept_version, mid)) = kept {
+            if at == ordinal && kept_version == version {
+                return Ok(Some(mid));
+            }
+        }
+        let mid = self.inner.entry_mid_at(ordinal).await?;
+        if let Some(mid) = &mid {
+            *self.floor_mid.lock().expect("floor mid") = Some((ordinal, version, mid.clone()));
+        }
+        Ok(mid)
+    }
+
     async fn moved_through(&self) -> Result<Option<(String, u64)>, SessionError> {
         self.inner.moved_through().await
     }
@@ -654,9 +685,19 @@ pub fn with_facts_and_messages(
     };
     let mut time = last_time(at.conversation);
     // The run's own numbering continues from the newest message it placed, or from its
-    // checkpoint when it has placed none (a run's start in this batch resets it there).
+    // checkpoint when it has placed none (a run's start in this batch resets it there). Finding
+    // where it stands walks the window, so it is done only for a batch that places a message
+    // before any run start of its own: the numbering is read only when a message is placed.
+    let walks = batch
+        .iter()
+        .find(|record| {
+            matches!(record, Record::RunStart(_))
+                || record.stream() == broca_session_store::record::Stream::Transcript
+        })
+        .is_some_and(|record| !matches!(record, Record::RunStart(_)));
     let mut runner_high = at
         .runner
+        .filter(|_| walks)
         .map(|runner| runner_high_water(at.conversation, runner));
     let mut out = Vec::with_capacity(batch.len() + 2);
     let mut pending: Vec<EntryFacts> = Vec::new();
@@ -960,28 +1001,26 @@ pub fn with_facts_and_messages(
                         facts.send.marks.as_ref(),
                     ),
                     marks: facts.send.marks.map(Into::into),
-                    no_display_facts: None,
                     reasoning_summaries: message.map(reasoning_summaries).unwrap_or_default(),
                     rich_ui: stamped.map(Into::into),
                     runner_tag_base: runner_high,
-                    legacy_view_seq: None,
-                    ordinal,
-                    written_at_ms,
-                    tag_base: high,
                     notice: facts.notice.filter(|_| entries).map(Into::into),
                     usage: facts.usage.filter(|_| entries),
                     generated_under: facts.generated_under.filter(|_| entries).map(Into::into),
-                    native: facts.native,
-                    render_tags: at.tags.render,
                     clean_reply: facts.clean_reply,
-                    // Empty until `flush` mints one: only a message nothing announced takes an
-                    // id from the seq of its own facts.
-                    mid: announced.unwrap_or_default(),
                     run_id: facts.run_id.map(Into::into),
                     created_at_ms: facts.created_at_ms,
                     delivery_mode: delivery_mode.map(Into::into),
                     delivery_tool_call_id,
-                    notices: Vec::new(),
+                    ..entry_facts(
+                        &record,
+                        ordinal,
+                        // If no id was announced, `flush` mints one from the facts' seq.
+                        announced.unwrap_or_default(),
+                        written_at_ms,
+                        high,
+                        at.tags.render,
+                    )
                 });
                 high = high
                     .checked_add(if entries {
@@ -1572,21 +1611,9 @@ struct Described {
     notice: Option<Notice>,
     usage: Option<StepUsage>,
     generated_under: Option<ViewRef>,
-    native: bool,
     clean_reply: bool,
     /// Who sent the send that placed the message, and its `client_message_id`.
     send: SendFacts,
-}
-
-/// Whether the message `record` places was written by broca itself (a model step's message, a
-/// tool-results message, or a budget reminder), rather than given as input. A model step's
-/// message is complete when its tool calls all have results.
-pub fn native(record: &Record) -> bool {
-    match record {
-        Record::Input(input) => input.placement == Placement::BudgetNudge,
-        Record::Assistant(_) | Record::ToolReply(_) => true,
-        _ => false,
-    }
 }
 
 /// Interpret recorded marks when writing facts and when reading facts from older writers.
@@ -1635,25 +1662,28 @@ fn describe<'r>(
     run_send: &SendFacts,
 ) -> Result<(Option<&'r Message>, Described), String> {
     Ok(match record {
-        // A budget reminder is the runner's own message, sent as a notice from broca.
-        Record::Input(input) if input.placement == Placement::BudgetNudge => (
-            Some(&input.message),
-            Described {
-                written_at_ms: input.written_at_ms,
-                run_id: Some(input.run_id.clone()),
-                created_at_ms: None,
-                delivery_mode: None,
-                notice: Some(Notice {
-                    sender: "broca".into(),
-                    template: None,
-                }),
-                usage: None,
-                generated_under: None,
-                native: native(record),
-                clean_reply: false,
-                send: SendFacts::default(),
-            },
-        ),
+        // Reminders and damage notices are the runner's own messages.
+        Record::Input(input)
+            if matches!(
+                input.placement,
+                Placement::BudgetNudge | Placement::DamageNotice
+            ) =>
+        {
+            (
+                Some(&input.message),
+                Described {
+                    written_at_ms: input.written_at_ms,
+                    run_id: Some(input.run_id.clone()),
+                    created_at_ms: None,
+                    delivery_mode: None,
+                    notice: Some(runner_notice()),
+                    usage: None,
+                    generated_under: None,
+                    clean_reply: false,
+                    send: SendFacts::default(),
+                },
+            )
+        }
         Record::Input(input) => {
             let send = match input.placement {
                 Placement::RunInput => run_send.clone(),
@@ -1695,7 +1725,6 @@ fn describe<'r>(
                     notice: notice.filter(|_| input.message.role == Role::User),
                     usage: None,
                     generated_under: None,
-                    native: native(record),
                     clean_reply: at.tags.clean_replies && input.message.role == Role::Assistant,
                     send,
                 },
@@ -1738,7 +1767,6 @@ fn describe<'r>(
                     }
                 }),
                 generated_under: at.view.clone(),
-                native: native(record),
                 clean_reply: at.tags.clean_replies,
                 send: SendFacts::default(),
             },
@@ -1754,7 +1782,6 @@ fn describe<'r>(
                 notice: None,
                 usage: None,
                 generated_under: None,
-                native: native(record),
                 clean_reply: false,
                 send: SendFacts::default(),
             },
@@ -1781,38 +1808,38 @@ fn runner_high_water(conversation: &Conversation, runner: &RunnerTags) -> u64 {
         .as_ref()
         .zip(conversation.open_tool_turn())
         .map(|(entry, message)| (message, entry));
-    let all: Vec<(Walked<'_>, &EntryState)> = conversation
-        .messages
-        .iter()
-        .map(Walked::Window)
-        .zip(conversation.entries.iter())
-        .chain(held.map(|(message, entry)| (Walked::Open(message), entry)))
-        .collect();
+    let walk = || {
+        conversation
+            .messages
+            .iter()
+            .map(Walked::Window)
+            .zip(conversation.entries.iter())
+            .chain(held.map(|(message, entry)| (Walked::Open(message), entry)))
+    };
+    let len =
+        conversation.messages.len().min(conversation.entries.len()) + usize::from(held.is_some());
     fn facts(entry: &EntryState) -> Option<&EntryFacts> {
         entry.facts.as_deref()
     }
     let ours = |entry: &EntryState| {
         facts(entry).and_then(|facts| facts.run_id.as_deref()) == Some(runner.run_id.as_str())
     };
-    let anchor = all.iter().rposition(|(_, entry)| {
-        ours(entry)
-            && facts(entry)
-                .and_then(|facts| facts.runner_tag_base)
-                .is_some()
+    // Searched from the newest message back, where the anchor usually is, so a long window
+    // isn't walked (or gathered) on every batch the run appends.
+    let anchor = walk().rev().enumerate().find_map(|(back, (_, entry))| {
+        facts(entry)
+            .and_then(|facts| facts.runner_tag_base)
+            .filter(|_| ours(entry))
+            .map(|base| (len - 1 - back, base))
     });
-    let (mut high, rest) = match anchor {
-        Some(at) => (
-            facts(all[at].1)
-                .and_then(|facts| facts.runner_tag_base)
-                .unwrap_or(runner.checkpoint),
-            &all[at..],
-        ),
-        None => match all.iter().position(|(_, entry)| ours(entry)) {
-            Some(first) => (runner.checkpoint, &all[first..]),
-            None => (runner.checkpoint, &all[all.len()..]),
+    let (mut high, from) = match anchor {
+        Some((at, base)) => (base, at),
+        None => match walk().position(|(_, entry)| ours(entry)) {
+            Some(first) => (runner.checkpoint, first),
+            None => (runner.checkpoint, len),
         },
     };
-    for (message, _) in rest {
+    for (message, _) in walk().skip(from) {
         high = match message {
             Walked::Window(message) => {
                 crate::window_shape::runner_high(message, runner.rules, high).unwrap_or(high)
@@ -1829,51 +1856,6 @@ fn runner_high_water(conversation: &Conversation, runner: &RunnerTags) -> u64 {
 enum Walked<'a> {
     Window(&'a broca_session_store::fold::conversation::WindowMessage),
     Open(&'a Message),
-}
-
-/// The highest part number any message of the session has taken, in the projection's
-/// numbering, which the next message's parts are numbered after: the newest message's base plus
-/// its own numbered parts, or the marker's checkpoint when the window is empty, and never below
-/// the highest number the session recorded (`Operations::tag_high_water`: an enrollment's, or
-/// that of the messages a revert dropped). A message placed before the session enrolled in the
-/// current compaction contract was numbered by the enrollment, not by its own facts (recorded off
-/// the contract), so while it is the newest the enrollment's last number stands for it. The next
-/// run's numbering and every reader of the session's part numbers ask here.
-pub fn lifetime_tag_high(
-    conversation: &Conversation,
-    operations: &Operations,
-) -> Result<u64, String> {
-    // The newest message's ordinal, how many numbers it takes, and its entry.
-    let newest = match (&conversation.open_entry, conversation.open_tool_turn()) {
-        (Some(entry), Some(message)) => {
-            Some((conversation.placed + 1, numbered_parts(message), entry))
-        }
-        _ => conversation
-            .messages
-            .last()
-            .zip(conversation.entries.last())
-            .map(|(message, entry)| {
-                let parts = crate::window_shape::numbered_parts(message);
-                (conversation.placed, parts, entry)
-            }),
-    };
-    let high = match (newest, operations.enrolled.as_ref()) {
-        (Some((ordinal, _, _)), Some(enrolled)) if ordinal <= enrolled.through_ordinal => {
-            enrolled.tag_high
-        }
-        (Some((_, parts, entry)), _) => {
-            let facts = entry
-                .facts
-                .as_ref()
-                .ok_or("entry facts: the newest message has none")?;
-            facts.tag_base + parts
-        }
-        (None, _) => conversation
-            .marker
-            .as_ref()
-            .map_or(0, |marker| marker.checkpoint),
-    };
-    Ok(high.max(operations.tag_high_water))
 }
 
 /// The newest entry's time, which a message without its own time takes.
@@ -2210,6 +2192,73 @@ mod lifetime_tag_high_tests {
     }
 }
 
+#[cfg(test)]
+mod open_calls_tests {
+    use super::*;
+    use broca_session_store::record::{BatchEnd, BatchStart};
+
+    fn start(batch: &str) -> Record {
+        Record::BatchStart(BatchStart {
+            run_id: "r".into(),
+            batch_id: batch.into(),
+            step_id: 1,
+            planned: vec![ToolCallId(format!("{batch}-call"))],
+            mid: None,
+            shown_tags: Vec::new(),
+        })
+    }
+
+    fn intent(batch: &str, key: &str) -> Record {
+        Record::ToolIntent(ToolIntent {
+            run_id: "r".into(),
+            batch_id: batch.into(),
+            tool_call_id: ToolCallId(format!("{batch}-call")),
+            tool_name: Some("read".into()),
+            module_id: None,
+            args_digest: broca_session_store::codec::Digest([0; 32]),
+            args: None,
+            call_key: Some(key.into()),
+            approval_digest: None,
+            dispatched_at_ms: None,
+            schema_pin: None,
+            hooks: None,
+            key_derived: None,
+        })
+    }
+
+    fn end(batch: &str) -> Record {
+        Record::BatchEnd(BatchEnd {
+            run_id: "r".into(),
+            batch_id: batch.into(),
+        })
+    }
+
+    fn keys(calls: &OpenCalls) -> Vec<&str> {
+        let mut keys: Vec<&str> = calls.intents.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The writer keeps the intents of the open batch only: a batch's end, or the next batch's
+    /// start, forgets the intents of the batches before, so a run of many tool steps holds one
+    /// batch's intents at a time.
+    #[test]
+    fn only_the_open_batch_keeps_its_intents() {
+        let mut calls = OpenCalls::default();
+        calls.note(&[start("b1"), intent("b1", "s:2")], 1);
+        assert_eq!(keys(&calls), ["s:2"]);
+        calls.note(&[end("b1")], 3);
+        assert_eq!(keys(&calls), Vec::<&str>::new(), "a batch's end");
+        // A batch whose end was never noted (a run resumed elsewhere, say) is forgotten when
+        // the next starts.
+        calls.note(&[start("b2"), intent("b2", "s:5")], 4);
+        calls.note(&[start("b3"), intent("b3", "s:7")], 6);
+        assert_eq!(keys(&calls), ["s:7"], "the next batch's start");
+        // An intent noted after the end in the same batch of records stays.
+        calls.note(&[end("b3"), start("b4"), intent("b4", "s:10")], 8);
+        assert_eq!(keys(&calls), ["s:10"]);
+    }
+}
 #[cfg(test)]
 mod send_id_tests {
     use super::*;

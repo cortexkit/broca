@@ -458,6 +458,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             account_continue: None,
         };
         let now = (self.now_ms)();
+        let held = self.executor.provider_held_lifecycle();
         broca_session_loop::run::end_run_with_error_and_interrupt_reason(
             &mut self.durable(),
             &run_id.0,
@@ -465,6 +466,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             &error,
             now,
             Some("runner_crash".into()),
+            held.as_deref(),
         )
         .await
         .map_err(|error| format!("{error:?}"))?;

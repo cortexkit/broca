@@ -192,12 +192,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             account_continue: None,
         };
         let now = (self.now_ms)();
+        let held = self.executor.provider_held_lifecycle();
         broca_session_loop::run::end_restart_resume_refused(
             &mut self.durable(),
             &run_id.0,
             &error,
             now,
             !recorded_resume,
+            held.as_deref(),
         )
         .await
         .map_err(|error| format!("seal refused restart resume: {error:?}"))?;

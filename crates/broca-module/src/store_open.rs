@@ -1014,7 +1014,23 @@ impl StoreRuntime {
             )
             .await
         } else {
-            Session::load(backend, addr, &triple, self.deployment()).await
+            match Session::load(backend, addr.clone(), &triple, self.deployment()).await {
+                Err(SessionError::NeedsRecovery) => {
+                    // The session's writer lease excludes other openers while recovery replaces
+                    // the log. Don't expose the actor or its reads until the replacement opens.
+                    Box::pin(Session::recover(
+                        self.backend(class),
+                        addr.clone(),
+                        &triple,
+                        self.deployment(),
+                        crate::store_awaits::now_ms(),
+                    ))
+                    .await
+                    .map_err(|error| open_error(error, false))?;
+                    Session::load(self.backend(class), addr, &triple, self.deployment()).await
+                }
+                result => result,
+            }
         }
         .map_err(|error| open_error(error, create.is_some()))?;
         session.raise_retired_tag_floor(

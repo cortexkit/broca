@@ -1,7 +1,10 @@
 //! Durable held-call replay and custodian-scoped late delivery. The consent transport owns
 //! filing and answers; this layer owns deadlines and never turns authorized work into a deny.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use broca_protocol::{BindPrincipal, SendScope};
 use broca_store::grants::{FinalKind, GrantsStore, HeldCall, HeldState, ScopeIdentity};
@@ -12,10 +15,34 @@ use super::spend::Spend;
 
 type Answer = Result<Box<RawValue>, Vec<u8>>;
 
+/// The wait before the first retry of an authorized call whose attempt recorded no outcome.
+/// Each further failure doubles it, up to [`RETRY_MAX_MS`]; a refusal naming a longer
+/// `retry_after_ms` waits that long instead.
+pub const RETRY_FIRST_MS: i64 = 30_000;
+pub const RETRY_MAX_MS: i64 = 30 * 60 * 1000;
+
+/// When an authorized call may be dispatched again. `due_at_ms` is `i64::MAX` while an attempt
+/// is running, so neither the timer nor a recovery pass starts a second one beside it.
+struct Retry {
+    admitted_at_ms: i64,
+    failures: u32,
+    due_at_ms: i64,
+}
+
+type Retries = Mutex<HashMap<String, Retry>>;
+
 pub struct HeldCalls {
     pub store: Arc<GrantsStore>,
     incarnation: String,
     pub(super) images: Arc<super::held_images::HeldImages>,
+    /// The retry schedule of authorized calls whose attempt ended without recording an outcome.
+    /// A call with no entry is due now, which is how startup recovery dispatches every
+    /// authorized call once. Entries go when their call settles.
+    retries: Arc<Retries>,
+    /// Dispatches the authorized calls that are due. The model-tool route installs it; the
+    /// deadline timer calls it on every tick, so a failed call is retried with no card, caller
+    /// or restart to prompt it.
+    dispatch: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     _on_terminal: Arc<broca_store::grants::HeldCallTerminal>,
 }
 
@@ -50,11 +77,22 @@ impl HeldCalls {
         limit: usize,
     ) -> Self {
         let images = Arc::new(super::held_images::HeldImages::new(limit));
+        let retries = Arc::new(Retries::default());
         let weak = Arc::downgrade(&images);
+        let weak_retries = Arc::downgrade(&retries);
         let on_terminal: Arc<broca_store::grants::HeldCallTerminal> =
             Arc::new(move |key, admitted_at| {
                 if let Some(images) = weak.upgrade() {
                     images.remove(key, admitted_at);
+                }
+                if let Some(retries) = weak_retries.upgrade() {
+                    let mut retries = retries.lock().unwrap_or_else(|p| p.into_inner());
+                    if retries
+                        .get(key)
+                        .is_some_and(|retry| retry.admitted_at_ms == admitted_at)
+                    {
+                        retries.remove(key);
+                    }
                 }
             });
         store.on_held_call_terminal(&on_terminal);
@@ -62,8 +100,69 @@ impl HeldCalls {
             store,
             incarnation,
             images,
+            retries,
+            dispatch: Mutex::new(None),
             _on_terminal: on_terminal,
         }
+    }
+
+    pub(super) fn set_dispatch(&self, dispatch: Arc<dyn Fn() + Send + Sync>) {
+        *self.dispatch.lock().unwrap_or_else(|p| p.into_inner()) = Some(dispatch);
+    }
+
+    /// Whether the authorized `row` is due for an attempt at `now_ms`. A due call is marked
+    /// running until [`Self::retry_later`] schedules its next attempt or it settles.
+    pub(super) fn start_attempt(&self, row: &HeldCall, now_ms: i64) -> bool {
+        let mut retries = self.retries.lock().unwrap_or_else(|p| p.into_inner());
+        match retries.get_mut(&row.batch_id) {
+            Some(retry) if retry.admitted_at_ms == row.admitted_at_ms => {
+                if now_ms < retry.due_at_ms {
+                    return false;
+                }
+                retry.due_at_ms = i64::MAX;
+            }
+            _ => {
+                retries.insert(
+                    row.batch_id.clone(),
+                    Retry {
+                        admitted_at_ms: row.admitted_at_ms,
+                        failures: 0,
+                        due_at_ms: i64::MAX,
+                    },
+                );
+            }
+        }
+        true
+    }
+
+    /// Schedule the next attempt of an authorized call whose attempt ended without settling
+    /// it: an exponential backoff from [`RETRY_FIRST_MS`], or the refusal's own
+    /// `retry_after_ms` when that is longer. An attempt already scheduled by another waiter on
+    /// the same execution is left as it is.
+    pub(super) fn retry_later(&self, row: &HeldCall, retry_after_ms: Option<i64>, now_ms: i64) {
+        let mut retries = self.retries.lock().unwrap_or_else(|p| p.into_inner());
+        let retry = retries
+            .entry(row.batch_id.clone())
+            .or_insert_with(|| Retry {
+                admitted_at_ms: row.admitted_at_ms,
+                failures: 0,
+                due_at_ms: i64::MAX,
+            });
+        if retry.admitted_at_ms != row.admitted_at_ms {
+            *retry = Retry {
+                admitted_at_ms: row.admitted_at_ms,
+                failures: 0,
+                due_at_ms: i64::MAX,
+            };
+        }
+        if retry.due_at_ms != i64::MAX {
+            return;
+        }
+        let backoff = RETRY_FIRST_MS
+            .saturating_mul(1_i64 << retry.failures.min(16))
+            .min(RETRY_MAX_MS);
+        retry.failures = retry.failures.saturating_add(1);
+        retry.due_at_ms = now_ms.saturating_add(backoff.max(retry_after_ms.unwrap_or(0)));
     }
 
     pub(super) fn replay(
@@ -111,7 +210,8 @@ impl HeldCalls {
                 Spend::Nothing,
             ));
         }
-        if row.state == HeldState::Held && now_ms >= row.deadline_at_ms {
+        if matches!(row.state, HeldState::Filing | HeldState::Held) && now_ms >= row.deadline_at_ms
+        {
             self.store
                 .expire_held(batch_id, &not_started("pending"), now_ms)
                 .map_err(internal)?;
@@ -139,16 +239,24 @@ impl HeldCalls {
         RawValue::from_string(result.body.clone()).map_err(lost)
     }
 
-    /// Re-arm from persisted deadlines, including on startup. Authorized calls deliberately
-    /// have no deadline here: only their provider execution may settle them.
+    /// Re-arm from persisted deadlines, including on startup, then dispatch the authorized calls
+    /// whose retry is due. A call whose card filing never resolved has the same deadline as one
+    /// waiting on a filed card. Authorized calls deliberately have no deadline here: only their
+    /// provider execution may settle them.
     pub fn expire_due(&self, now_ms: i64) -> Result<(), broca_store::grants::GrantsError> {
-        for row in self.store.recovering(now_ms)? {
-            if row.state == HeldState::Held && now_ms >= row.deadline_at_ms {
-                self.store
-                    .expire_held(&row.batch_id, &not_started("pending"), now_ms)?;
-            }
+        for batch_id in self.store.due_waiting(now_ms)? {
+            self.store
+                .expire_held(&batch_id, &not_started("pending"), now_ms)?;
         }
         self.store.sweep(now_ms)?;
+        let dispatch = self
+            .dispatch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(dispatch) = dispatch {
+            dispatch();
+        }
         Ok(())
     }
 
@@ -367,4 +475,80 @@ fn lost(error: impl std::fmt::Display) -> Vec<u8> {
     crate::system_one::refusal_body(&Spend::Unknown.mark(crate::system_one::internal_refusal(
         &format!("held-call result: {error}"),
     )))
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    fn authorized() -> HeldCall {
+        HeldCall {
+            batch_id: "batch".into(),
+            project_id: None,
+            scope: ScopeIdentity {
+                owner: "reserved:owner".into(),
+                scope_ref: "run".into(),
+                scope_epoch: 1,
+            },
+            batch_scope: broca_store::system_one::BatchScope::Run {
+                agent_id: "agent".into(),
+                run_id: "run".into(),
+            },
+            principal: "reserved:caller".into(),
+            call_key: "key".into(),
+            agent_id: "agent".into(),
+            provider: "typesafe".into(),
+            model: "typesafe/jev-1.13.0".into(),
+            request: Some("{}".into()),
+            args_digest: "digest".into(),
+            frozen_row: "{}".into(),
+            dedup_key: "card".into(),
+            state: HeldState::Authorized,
+            admitted_at_ms: 1000,
+            deadline_at_ms: 601_000,
+            card_id: None,
+            final_result: None,
+        }
+    }
+
+    /// Each failure doubles the wait up to its cap, a refusal naming a longer wait is honoured,
+    /// and a running attempt is never joined by a second one.
+    #[test]
+    fn retries_back_off_honour_retry_after_and_never_overlap() {
+        let held = HeldCalls::new(
+            Arc::new(GrantsStore::open_in_memory().unwrap()),
+            "retries".into(),
+        );
+        let row = authorized();
+        assert!(
+            held.start_attempt(&row, 0),
+            "a call with no schedule is due"
+        );
+        assert!(
+            !held.start_attempt(&row, 0),
+            "an attempt is already running"
+        );
+        held.retry_later(&row, None, 0);
+        assert!(!held.start_attempt(&row, RETRY_FIRST_MS - 1));
+        assert!(held.start_attempt(&row, RETRY_FIRST_MS));
+        held.retry_later(&row, None, RETRY_FIRST_MS);
+        assert!(!held.start_attempt(&row, 3 * RETRY_FIRST_MS - 1));
+        assert!(held.start_attempt(&row, 3 * RETRY_FIRST_MS));
+        held.retry_later(&row, Some(10 * RETRY_FIRST_MS), 3 * RETRY_FIRST_MS);
+        held.retry_later(&row, None, 3 * RETRY_FIRST_MS);
+        assert!(!held.start_attempt(&row, 13 * RETRY_FIRST_MS - 1));
+        assert!(held.start_attempt(&row, 13 * RETRY_FIRST_MS));
+        for _ in 0..20 {
+            held.retry_later(&row, None, 0);
+            held.retries
+                .lock()
+                .unwrap()
+                .get_mut("batch")
+                .unwrap()
+                .due_at_ms = i64::MAX;
+        }
+        held.retry_later(&row, None, 0);
+        assert!(!held.start_attempt(&row, RETRY_MAX_MS - 1));
+        assert!(held.start_attempt(&row, RETRY_MAX_MS));
+    }
 }

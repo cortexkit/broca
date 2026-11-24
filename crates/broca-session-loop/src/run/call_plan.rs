@@ -42,8 +42,11 @@ pub(super) async fn plan_calls(
     hooks: Option<&broca_core::hooks::HookRuntime<'_>>,
     step_id: u64,
     removed: &std::collections::BTreeSet<String>,
+    // Ids whose first planned copy already has its result, so every copy of them planned here is
+    // a repeat.
+    answered_first: &std::collections::HashSet<ToolCallId>,
 ) -> Result<Option<Vec<CallPlan>>, LoopError> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = answered_first.clone();
     let mut plans = Vec::with_capacity(calls.len());
     for call in calls.iter_mut() {
         let first = seen.insert(call.tool_call_id.clone());

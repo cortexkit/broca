@@ -36,12 +36,12 @@
 //! no ledger segment precedes, started from empty state. With the rebuilt checkpoint, the records
 //! after it chain to its bases, so a damaged checkpoint alone loses nothing.
 //!
-//! Not built yet: entry facts for the records a recovery writes, steers pending inside an interrupted run, withdrawals
+//! Not built yet: sends waiting to steer an interrupted run, withdrawals
 //! owed for provider-held calls, the crash-loop limit, and showing the damage notice at system
 //! authority and keeping it in view until a model step has seen it (the run loop's part).
 
 use super::media::OpenLogIndex;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use broca_protocol::caller::RunFinishReason;
 use broca_protocol::content::{ContentBlock, Message, Role, ToolOutput, ToolResult};
@@ -57,6 +57,7 @@ use crate::head::{self, PendingDeletion, Residence, SessionTriple};
 use crate::idindex::{self, OpenIds};
 use crate::keys::{random_id, DeploymentKey};
 use crate::log::{ChainBase, LogEncoder};
+use crate::placement::{entry_facts, lifetime_tag_high, runner_notice};
 use crate::record::{
     CallOutcome, ChangeAborted, ChangeIntent, ChangeKind, Input, Placement, Record, RecoveryCut,
     RunEnd, SendEnded, Stream, ToolOutcome, ToolReply, WriterOpened,
@@ -100,13 +101,32 @@ pub struct Recovered {
     pub history_version: Option<u64>,
 }
 
-/// What the kept records say about one call.
+/// The transcript names a turn by step. Ledger records can still name its batch even when
+/// nothing kept connects that batch to a step.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Turn<'a> {
+    Step(&'a str, u64),
+    Batch(&'a str, &'a str),
+}
+
+impl<'a> Turn<'a> {
+    fn run_id(self) -> &'a str {
+        match self {
+            Self::Step(run, _) | Self::Batch(run, _) => run,
+        }
+    }
+}
+
+type CallKey<'a> = (Turn<'a>, &'a ToolCallId);
+
+/// What the kept records say about one call in one turn.
 #[derive(Default)]
-struct Call {
-    run_id: Option<String>,
-    batch_id: Option<String>,
-    tool_name: Option<String>,
-    call_key: Option<String>,
+struct Call<'a> {
+    batch_id: Option<&'a str>,
+    tool_name: Option<&'a str>,
+    call_key: Option<&'a str>,
+    on_transcript: bool,
+    reply: Option<&'a ToolResult>,
     /// Its ledger intent was kept.
     intent: bool,
     /// Its ledger outcome was kept.
@@ -115,6 +135,31 @@ struct Call {
     /// was open at the log's checkpoint, or the message that made it comes after everything the
     /// checkpoint sealed. Otherwise its outcome was sealed before this log, and it is settled.
     in_log: bool,
+}
+
+/// Keep first-seen order when writing closing records and the notice.
+#[derive(Default)]
+struct Calls<'a> {
+    indices: HashMap<CallKey<'a>, usize>,
+    entries: Vec<(CallKey<'a>, Call<'a>)>,
+}
+
+impl<'a> Calls<'a> {
+    fn slot(
+        &mut self,
+        turn: Turn<'a>,
+        id: &'a ToolCallId,
+        batch: Option<&'a str>,
+    ) -> &mut Call<'a> {
+        let key = (turn, id);
+        let at = *self.indices.entry(key).or_insert_with(|| {
+            self.entries.push((key, Call::default()));
+            self.entries.len() - 1
+        });
+        let call = &mut self.entries[at].1;
+        call.batch_id = call.batch_id.or(batch);
+        call
+    }
 }
 
 /// The run a ledger record names, if it names one.
@@ -161,6 +206,10 @@ fn fold_media(
 
 fn digest(bytes: &[u8]) -> Digest {
     Digest(Sha256::digest(bytes).into())
+}
+
+fn kept_record((seq, _, record): &(u64, u64, Record)) -> (u64, &Record) {
+    (*seq, record)
 }
 
 impl<B: SessionBackend> Session<B> {
@@ -316,10 +365,7 @@ impl<B: SessionBackend> Session<B> {
         let mut activity =
             OpenLogIndex::from_checkpoint(checkpoint.activity_ms, checkpoint.next_seq);
         conversation.enrolled(operations.enrolled_through());
-        let mut kept_transcript = transcript
-            .iter()
-            .map(|(seq, _, record)| (*seq, record))
-            .peekable();
+        let mut kept_transcript = transcript.iter().map(kept_record).peekable();
         for (seq, record) in &ledger {
             reply_fallbacks.note(*seq, record);
             while let Some((kept_seq, kept)) =
@@ -398,54 +444,42 @@ impl<B: SessionBackend> Session<B> {
         };
         let mut notice = None;
         if loss_aware {
-            let calls = known_calls(
+            let (calls, open_turn) = known_calls(
                 &checkpoint.operational,
                 &conversation,
                 &ledger,
                 &transcript,
                 checkpoint.covers_through,
             );
-            let replied = replied_calls(&conversation, &transcript);
             let latest_run = operations.run.as_ref().map(|run| run.run_id.clone());
             let mut lost_parts = Vec::new();
-            let open_turn: Vec<ToolCallId> = conversation
-                .open_tool_turn()
-                .map(call_ids)
-                .unwrap_or_default();
-            let in_transcript = transcript_calls(&conversation);
-            for (id, call) in &calls {
-                let run_id = call
-                    .run_id
-                    .clone()
-                    .or_else(|| latest_run.clone())
-                    .unwrap_or_default();
-                let batch_id = call.batch_id.clone().unwrap_or_default();
-                let has_reply = replied.contains(&id.0);
-                if !call.outcome && (!has_reply || call.in_log) {
-                    let (outcome, result_digest, is_error, reason) = if has_reply {
-                        // Only its transcript result was kept: its outcome comes from that.
-                        let result = transcript_result(&transcript, id).expect("replied");
-                        recovered.derived_outcomes.push(id.clone());
-                        let bytes = serde_json::to_vec(&result).expect("results serialize");
-                        (
-                            CallOutcome::Completed,
-                            digest(&bytes),
-                            result.is_error,
-                            None,
-                        )
-                    } else {
-                        recovered.unknown_calls.push(id.clone());
-                        (
-                            CallOutcome::Unknown,
-                            digest(UNKNOWN_TEXT.as_bytes()),
-                            true,
-                            Some("storage_damage".to_string()),
-                        )
-                    };
+            for ((turn, id), call) in calls.entries {
+                let run_id = turn.run_id();
+                if !call.outcome && (call.reply.is_none() || call.in_log) {
+                    let (outcome, result_digest, is_error, reason) =
+                        if let Some(result) = call.reply {
+                            // Only its transcript result was kept: its outcome comes from that.
+                            recovered.derived_outcomes.push(id.clone());
+                            let bytes = serde_json::to_vec(result).expect("results serialize");
+                            (
+                                CallOutcome::Completed,
+                                digest(&bytes),
+                                result.is_error,
+                                None,
+                            )
+                        } else {
+                            recovered.unknown_calls.push(id.clone());
+                            (
+                                CallOutcome::Unknown,
+                                digest(UNKNOWN_TEXT.as_bytes()),
+                                true,
+                                Some("storage_damage".to_string()),
+                            )
+                        };
                     closing_ledger.push(Record::ToolOutcome(ToolOutcome {
                         yielded_by: None,
-                        run_id: run_id.clone(),
-                        batch_id: batch_id.clone(),
+                        run_id: run_id.to_owned(),
+                        batch_id: call.batch_id.unwrap_or_default().to_owned(),
                         tool_call_id: id.clone(),
                         outcome,
                         result_digest,
@@ -457,15 +491,15 @@ impl<B: SessionBackend> Session<B> {
                         call_key: None,
                     }));
                 }
-                if open_turn.contains(id) && !has_reply {
+                if open_turn == Some(turn) && call.on_transcript && call.reply.is_none() {
                     let text = if call.outcome {
                         LOST_OUTPUT_TEXT
                     } else {
                         UNKNOWN_TEXT
                     };
                     closing_transcript.push(Record::ToolReply(ToolReply {
-                        run_id,
-                        batch_id: call.batch_id.clone(),
+                        run_id: run_id.to_owned(),
+                        batch_id: call.batch_id.map(str::to_owned),
                         result: ToolResult {
                             tool_call_id: id.clone(),
                             output: ToolOutput::error(text),
@@ -475,8 +509,8 @@ impl<B: SessionBackend> Session<B> {
                         tags_v1: None,
                         media: Vec::new(),
                     }));
-                } else if call.intent && !in_transcript.contains(&id.0) {
-                    lost_parts.push(lost_part_line(id, call));
+                } else if call.intent && !call.on_transcript {
+                    lost_parts.push(lost_part_line(id, &call));
                 }
             }
             for pending in &operations.queue {
@@ -660,7 +694,7 @@ impl<B: SessionBackend> Session<B> {
                     .map_or(transcript.len(), |offset| batch_start + offset);
                 let kept: Vec<(u64, &Record)> = transcript[batch_start..batch_end]
                     .iter()
-                    .map(|(seq, _, record)| (*seq, record))
+                    .map(kept_record)
                     .collect();
                 for (seq, record) in &kept {
                     conversation
@@ -674,10 +708,51 @@ impl<B: SessionBackend> Session<B> {
             let mut batch = vec![Record::WriterOpened(WriterOpened {
                 generation: session.head.generation,
             })];
-            batch.extend(closing_transcript);
-            batch.extend(notice);
-            batch.extend(closing_ledger);
             let first = encoder.next_seq();
+            let prefix = session.message_id_prefix();
+            let on_contract = settled.on_contract();
+            let tag_base = if loss_aware && on_contract {
+                lifetime_tag_high(&conversation, &settled).map_err(SessionError::Fold)?
+            } else {
+                0
+            };
+            let mut ordinal = conversation.placed;
+            batch.extend(closing_transcript);
+            if let Some(record @ Record::ToolReply(reply)) = batch.last() {
+                // The last reply places both the already-reserved assistant and its results.
+                ordinal += 2;
+                let mid = results_mid(reply, &ledger, &checkpoint.operational)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{prefix}.{}", first + batch.len() as u64));
+                batch.push(repair_entry_facts(
+                    record,
+                    ordinal,
+                    mid,
+                    tag_base,
+                    on_contract,
+                    &conversation,
+                ));
+            }
+            if let Some(record) = notice {
+                // Results have no compaction numbers of their own; the notice starts at the
+                // same base. Its nonempty text takes one number on the contract.
+                if on_contract && tag_base >= 9_007_199_254_740_991 {
+                    return Err(SessionError::Fold(
+                        "compaction tag numbers exceed the protocol integer range".into(),
+                    ));
+                }
+                let mid = format!("{prefix}.{}", first + batch.len() as u64 + 1);
+                let facts = repair_entry_facts(
+                    &record,
+                    ordinal + 1,
+                    mid,
+                    tag_base,
+                    on_contract,
+                    &conversation,
+                );
+                batch.extend([record, facts]);
+            }
+            batch.extend(closing_ledger);
             let mut operations = settled.clone();
             for (offset, record) in batch.iter().enumerate() {
                 window.note(first + offset as u64, record);
@@ -826,7 +901,7 @@ fn notice_text(lost_parts: &[String]) -> String {
     text
 }
 
-fn lost_part_line(id: &ToolCallId, call: &Call) -> String {
+fn lost_part_line(id: &ToolCallId, call: &Call<'_>) -> String {
     let outcome = if call.outcome {
         "finished"
     } else {
@@ -834,35 +909,70 @@ fn lost_part_line(id: &ToolCallId, call: &Call) -> String {
     };
     format!(
         "{} (call {}): {outcome}",
-        call.tool_name.as_deref().unwrap_or("a tool"),
-        call.call_key.as_deref().unwrap_or(&id.0),
+        call.tool_name.unwrap_or("a tool"),
+        call.call_key.unwrap_or(&id.0),
     )
 }
 
-fn call_ids(message: &Message) -> Vec<ToolCallId> {
-    message
-        .content
+fn results_mid<'a>(
+    reply: &ToolReply,
+    ledger: &'a [(u64, Record)],
+    checkpoint: &'a crate::fold::operations::Operations,
+) -> Option<&'a str> {
+    let id = reply.batch_id.as_deref()?;
+    ledger
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolCall(call) => Some(call.tool_call_id.clone()),
+        .rev()
+        .find_map(|(_, record)| match record {
+            Record::BatchStart(start) if start.run_id == reply.run_id && start.batch_id == id => {
+                start.mid.as_deref()
+            }
             _ => None,
         })
-        .collect()
+        .or_else(|| {
+            let run = checkpoint
+                .run
+                .as_ref()
+                .filter(|run| run.run_id == reply.run_id)?;
+            let batch = run
+                .open_batch
+                .as_ref()
+                .filter(|batch| batch.batch_id == id)?;
+            batch.results_mid.as_deref()
+        })
 }
 
-/// Calls whose call part is on the kept transcript: in the window or the turn still open.
-fn transcript_calls(conversation: &Conversation) -> BTreeSet<String> {
-    let window = conversation
-        .messages
-        .iter()
-        .flat_map(window_ids(BlockKind::ToolCall));
-    conversation
-        .open_tool_turn()
-        .into_iter()
-        .flat_map(call_ids)
-        .chain(window)
-        .map(|id| id.0)
-        .collect()
+fn repair_entry_facts(
+    record: &Record,
+    ordinal: u64,
+    mid: String,
+    tag_base: u64,
+    on_contract: bool,
+    conversation: &Conversation,
+) -> Record {
+    let (run_id, written_at_ms, notice) = match record {
+        Record::ToolReply(reply) => (&reply.run_id, reply.finished_at_ms, None),
+        Record::Input(input) => (
+            &input.run_id,
+            input.written_at_ms,
+            on_contract.then(runner_notice),
+        ),
+        _ => unreachable!("repair facts follow a closing reply or the damage notice"),
+    };
+    let render_tags = on_contract
+        && conversation
+            .open_entry
+            .iter()
+            .chain(conversation.entries.iter().rev())
+            .filter_map(|entry| entry.facts.as_deref())
+            .find(|facts| facts.run_id.as_deref() == Some(run_id.as_str()))
+            .is_some_and(|facts| facts.render_tags);
+    let mut facts = entry_facts(record, ordinal, mid, written_at_ms, tag_base, render_tags);
+    facts.run_id = (!run_id.is_empty()).then(|| run_id.as_str().into());
+    facts.notice = notice.map(Into::into);
+    // Recovery didn't render under the interrupted run's frozen tag rules. Leave its runner
+    // base absent so a read cannot mistake a guessed number for one the model saw.
+    Record::EntryFacts(facts.into())
 }
 
 /// The ids of a window message's blocks of `kind`: a tool call's own id, or the call a result
@@ -877,121 +987,140 @@ fn window_ids(kind: BlockKind) -> impl Fn(&WindowMessage) -> Vec<ToolCallId> {
     }
 }
 
-/// Calls with a kept transcript result: in the window, or replied in the turn still open.
-fn replied_calls(
-    conversation: &Conversation,
+/// Attach replies to the assistant that opened their turn, including replies that name no batch.
+fn transcript_turns(
     transcript: &[(u64, u64, Record)],
-) -> BTreeSet<String> {
-    let mut replied: BTreeSet<String> = conversation
-        .messages
-        .iter()
-        .flat_map(window_ids(BlockKind::ToolResult))
-        .map(|id| id.0)
-        .collect();
-    for (_, _, record) in transcript {
-        if let Record::ToolReply(reply) = record {
-            replied.insert(reply.result.tool_call_id.0.clone());
-        }
-    }
-    replied
-}
-
-fn transcript_result(transcript: &[(u64, u64, Record)], id: &ToolCallId) -> Option<ToolResult> {
-    transcript
-        .iter()
-        .rev()
-        .find_map(|(_, _, record)| match record {
-            Record::ToolReply(reply) if &reply.result.tool_call_id == id => {
-                Some(reply.result.clone())
+) -> impl Iterator<Item = (Turn<'_>, u64, &Record)> {
+    let mut turn = None;
+    transcript.iter().filter_map(move |(seq, _, record)| {
+        match record {
+            Record::Assistant(assistant) => {
+                turn = Some(Turn::Step(&assistant.run_id, assistant.step_id));
             }
-            _ => None,
-        })
+            Record::Input(_) => turn = None,
+            _ => {}
+        }
+        turn.map(|turn| (turn, *seq, record))
+    })
 }
 
 /// Every call a kept record or the folded state names, with what the kept records say about
-/// it, in the order first named. A call named only by a closed entry in the window is settled
-/// already and left out.
-fn known_calls(
-    operations: &crate::fold::operations::Operations,
+/// it, in the order first named. A model-facing id can recur, so only evidence from the same
+/// turn can settle a call. Also returns the turn that still needs replies, if there is one.
+fn known_calls<'a>(
+    operations: &'a crate::fold::operations::Operations,
     conversation: &Conversation,
-    ledger: &[(u64, Record)],
-    transcript: &[(u64, u64, Record)],
+    ledger: &'a [(u64, Record)],
+    transcript: &'a [(u64, u64, Record)],
     covers_through: u64,
-) -> Vec<(ToolCallId, Call)> {
-    fn slot<'c>(calls: &'c mut Vec<(ToolCallId, Call)>, id: &ToolCallId) -> &'c mut Call {
-        let at = match calls.iter().position(|(known, _)| known == id) {
-            Some(at) => at,
-            None => {
-                calls.push((id.clone(), Call::default()));
-                calls.len() - 1
-            }
-        };
-        &mut calls[at].1
+) -> (Calls<'a>, Option<Turn<'a>>) {
+    let open_batch = operations
+        .run
+        .as_ref()
+        .filter(|run| run.finished.is_none())
+        .and_then(|run| Some((run.run_id.as_str(), run.open_batch.as_ref()?)));
+    let mut steps = BTreeMap::new();
+    if let Some((run, batch)) = open_batch {
+        steps.insert((run, batch.batch_id.as_str()), batch.step_id);
     }
-    let mut calls: Vec<(ToolCallId, Call)> = Vec::new();
-    if let Some(run) = operations.run.as_ref().filter(|run| run.finished.is_none()) {
-        if let Some(batch) = &run.open_batch {
-            for call in &batch.calls {
-                let known = slot(&mut calls, &call.id);
-                known.run_id = Some(run.run_id.clone());
-                known.in_log = true;
+    for (_, record) in ledger {
+        if let Record::BatchStart(start) = record {
+            steps.insert(
+                (start.run_id.as_str(), start.batch_id.as_str()),
+                start.step_id,
+            );
+        }
+    }
+    // If the batch start was lost, a kept reply can still link its named batch to the step.
+    for (turn, _, record) in transcript_turns(transcript) {
+        if let (Turn::Step(run, step), Record::ToolReply(reply)) = (turn, record) {
+            if let Some(batch) = reply.batch_id.as_deref().filter(|_| reply.run_id == run) {
+                steps.entry((run, batch)).or_insert(step);
             }
+        }
+    }
+    let by_batch = |run: &'a str, batch: &'a str| {
+        steps
+            .get(&(run, batch))
+            .map_or(Turn::Batch(run, batch), |step| Turn::Step(run, *step))
+    };
+
+    let mut calls = Calls::default();
+    let mut batch_owners = BTreeMap::new();
+    if let Some((run, batch)) = open_batch {
+        let batch_id = batch.batch_id.as_str();
+        batch_owners.insert(batch_id, run);
+        for call in &batch.calls {
+            let known = calls.slot(Turn::Step(run, batch.step_id), &call.id, Some(batch_id));
+            known.intent |= call.intent;
+            known.outcome |= call.terminal.is_some();
+            known.call_key = call.key.as_deref().or(known.call_key);
+            known.in_log = true;
         }
     }
     for (_, record) in ledger {
-        if let Some(id) = match record {
-            Record::ToolIntent(r) => Some(&r.tool_call_id),
-            Record::ToolHeld(r) => Some(&r.tool_call_id),
-            Record::ToolOutcome(r) => Some(&r.tool_call_id),
-            _ => None,
-        } {
-            slot(&mut calls, id).in_log = true;
-        }
         match record {
             Record::BatchStart(start) => {
+                let (run, batch) = (start.run_id.as_str(), start.batch_id.as_str());
+                batch_owners.insert(batch, run);
                 for id in &start.planned {
-                    let call = slot(&mut calls, id);
-                    call.run_id = Some(start.run_id.clone());
-                    call.batch_id = Some(start.batch_id.clone());
-                    call.in_log = true;
+                    calls.slot(by_batch(run, batch), id, Some(batch)).in_log = true;
                 }
             }
             Record::ToolIntent(intent) => {
-                let call = slot(&mut calls, &intent.tool_call_id);
-                call.run_id = Some(intent.run_id.clone());
-                call.batch_id = Some(intent.batch_id.clone());
-                if intent.tool_name.is_some() {
-                    call.tool_name = intent.tool_name.clone();
-                }
-                if intent.call_key.is_some() {
-                    call.call_key = intent.call_key.clone();
-                }
+                let (run, batch) = (intent.run_id.as_str(), intent.batch_id.as_str());
+                batch_owners.insert(batch, run);
+                let call = calls.slot(by_batch(run, batch), &intent.tool_call_id, Some(batch));
+                call.tool_name = intent.tool_name.as_deref().or(call.tool_name);
+                call.call_key = intent.call_key.as_deref().or(call.call_key);
                 call.intent = true;
+                call.in_log = true;
             }
             Record::ToolHeld(held) => {
-                let call = slot(&mut calls, &held.tool_call_id);
-                call.batch_id = Some(held.batch_id.clone());
-                call.call_key = Some(held.call_key.clone());
+                let batch = held.batch_id.as_str();
+                // The held record has no run id. Don't attribute it to a run without its
+                // preceding batch or intent; the held record itself is still kept in the ledger.
+                let Some(&run) = batch_owners.get(batch) else {
+                    continue;
+                };
+                let call = calls.slot(by_batch(run, batch), &held.tool_call_id, Some(batch));
+                call.call_key = Some(&held.call_key);
+                call.in_log = true;
             }
-            Record::ToolOutcome(outcome) => slot(&mut calls, &outcome.tool_call_id).outcome = true,
+            Record::ToolOutcome(outcome) => {
+                let (run, batch) = (outcome.run_id.as_str(), outcome.batch_id.as_str());
+                let call = calls.slot(by_batch(run, batch), &outcome.tool_call_id, Some(batch));
+                call.outcome = true;
+                call.in_log = true;
+            }
             _ => {}
         }
     }
-    for (seq, _, record) in transcript {
-        if let Record::Assistant(assistant) = record {
-            for id in call_ids(&assistant.message) {
-                let call = slot(&mut calls, &id);
-                call.run_id.get_or_insert_with(|| assistant.run_id.clone());
-                call.in_log |= *seq > covers_through;
+    let mut last_turn = None;
+    for (turn, seq, record) in transcript_turns(transcript) {
+        match record {
+            Record::Assistant(assistant) => {
+                last_turn = Some(turn);
+                for block in &assistant.message.content {
+                    if let ContentBlock::ToolCall(tool) = block {
+                        let call = calls.slot(turn, &tool.tool_call_id, None);
+                        call.on_transcript = true;
+                        call.in_log |= seq > covers_through;
+                    }
+                }
             }
+            Record::ToolReply(reply) => {
+                let call = calls.slot(turn, &reply.result.tool_call_id, reply.batch_id.as_deref());
+                call.reply = Some(&reply.result);
+            }
+            _ => {}
         }
     }
-    if let Some(turn) = conversation.open_tool_turn() {
-        for id in call_ids(turn) {
-            slot(&mut calls, &id);
-        }
-    }
-    calls
+    // A checkpoint never splits a tool turn, so any open turn began at a kept assistant record.
+    (
+        calls,
+        last_turn.filter(|_| conversation.open_tool_turn().is_some()),
+    )
 }
 
 /// Runs a kept record or the folded state names that no kept record ends.

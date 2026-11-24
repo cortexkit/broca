@@ -199,12 +199,73 @@ struct ConsentDetail<'a> {
     no_spend: bool,
 }
 
+/// How many scopes each answer cache keeps. Scopes come and go for the life of the process,
+/// and nothing says when one has ended, so the caches keep the scopes used most recently.
+const MAX_CACHED_SCOPES: usize = 4096;
+
+/// Answers cached per scope, at most [`MAX_CACHED_SCOPES`] of them: inserting past that drops
+/// the scope used longest ago. Dropping one only means its next call asks again, as the
+/// first call after a restart does.
+#[derive(Debug)]
+struct ScopeCache<V> {
+    entries: BTreeMap<ScopeIdentity, (u64, V)>,
+    uses: u64,
+}
+
+impl<V> ScopeCache<V> {
+    fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            uses: 0,
+        }
+    }
+
+    fn get_mut(&mut self, identity: &ScopeIdentity) -> Option<&mut V> {
+        self.uses += 1;
+        let uses = self.uses;
+        self.entries.get_mut(identity).map(|(used, value)| {
+            *used = uses;
+            value
+        })
+    }
+
+    fn insert(&mut self, identity: ScopeIdentity, value: V) {
+        self.uses += 1;
+        if !self.entries.contains_key(&identity) && self.entries.len() >= MAX_CACHED_SCOPES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(identity, _)| identity.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(identity, (self.uses, value));
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, identity: &ScopeIdentity) -> bool {
+        self.entries.contains_key(identity)
+    }
+}
+
 /// The decisions and the cache they produce, for the life of one `LlmTools`.
 pub(super) struct PrivateContent {
     config: LlmToolsConfig,
     asks: Arc<dyn Asks>,
-    marked: Mutex<BTreeMap<ScopeIdentity, MarkedScope>>,
-    flows: Mutex<BTreeMap<ScopeIdentity, broca_subc::ApprovedFlowProviders>>,
+    marked: Mutex<ScopeCache<MarkedScope>>,
+    flows: Mutex<ScopeCache<broca_subc::ApprovedFlowProviders>>,
     /// Each admitted call's verdict, and the route's record of how marked calls ended.
     pub(super) counters: Counters,
 }
@@ -214,8 +275,8 @@ impl PrivateContent {
         Self {
             config,
             asks,
-            marked: Mutex::new(BTreeMap::new()),
-            flows: Mutex::new(BTreeMap::new()),
+            marked: Mutex::new(ScopeCache::new()),
+            flows: Mutex::new(ScopeCache::new()),
             counters: Counters::default(),
         }
     }
@@ -391,7 +452,7 @@ impl PrivateContent {
             }
         }
         let keep = marked
-            .get(&identity)
+            .get_mut(&identity)
             .is_some_and(|cached| cached.same_as(&scope) || (cached.marked && !scope.marked));
         if !keep {
             marked.insert(identity, scope);
@@ -402,7 +463,7 @@ impl PrivateContent {
         self.marked
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(identity)
+            .get_mut(identity)
             .filter(|scope| scope.marked)
             .cloned()
     }
@@ -411,8 +472,8 @@ impl PrivateContent {
         self.flows
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(identity)
-            .cloned()
+            .get_mut(identity)
+            .map(|approved| approved.clone())
     }
 }
 
@@ -965,5 +1026,28 @@ mod tests {
                 .any(|event| event.level == tracing::Level::WARN
                     && event.fields.get("code").map(String::as_str) == Some(code)));
         }
+    }
+
+    /// The answer caches stay bounded however many scopes a long-running process sees, and keep
+    /// the scopes used most recently.
+    #[test]
+    fn the_scope_caches_keep_only_the_most_recently_used_scopes() {
+        let mut cache = ScopeCache::new();
+        let last = MAX_CACHED_SCOPES as u64;
+        for epoch in 0..last {
+            cache.insert(identity(&run(epoch)), epoch);
+        }
+        assert!(cache.get_mut(&identity(&run(0))).is_some());
+        cache.insert(identity(&run(last)), last);
+        assert_eq!(cache.len(), MAX_CACHED_SCOPES);
+        assert!(
+            cache.contains_key(&identity(&run(0))),
+            "a recent use keeps a scope"
+        );
+        assert!(
+            !cache.contains_key(&identity(&run(1))),
+            "the oldest scope goes"
+        );
+        assert!(cache.contains_key(&identity(&run(last))));
     }
 }

@@ -4,10 +4,11 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use broca_protocol::{BindPrincipal, ContentBlock, Message, Role as HostRole, Usage};
+pub use broca_protocol::tags::compaction::{numbered_parts, numbered_parts_of, NumberingKind};
+use broca_protocol::{BindPrincipal, Usage};
 use cortexkit_role_compaction::{
-    part::{Delivered, PartBody, ToolPart, ToolStatus},
-    read::{NoticeOrigin, Role, SpeaksFor, StepUsage},
+    part::Delivered,
+    read::{NoticeOrigin, SpeaksFor, StepUsage},
     view::AppliedView,
 };
 
@@ -165,73 +166,6 @@ pub fn step_usage(usage: Usage) -> Option<StepUsage> {
         || out.output_tokens.is_some()
         || out.reasoning_tokens.is_some())
     .then_some(out)
-}
-
-/// Classification comes from the view library; host mapping only decides which
-/// native blocks represent text and calls. Results take their call's number.
-pub fn numbered_parts(message: &Message) -> u64 {
-    numbered_parts_of(message.role, message.content.iter().map(NumberingKind::of))
-}
-
-/// What the numbering reads of a block: whether it is text with something in it, or a tool
-/// call. A caller holding only a block's shape (its content released from memory) numbers it
-/// the same as the block itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NumberingKind {
-    /// Text that isn't empty.
-    Text,
-    ToolCall,
-    /// Empty text and every other kind of block, which take no number.
-    Other,
-}
-
-impl NumberingKind {
-    pub fn of(block: &ContentBlock) -> Self {
-        match block {
-            ContentBlock::Text { text } | ContentBlock::TextWithState { text, .. }
-                if !text.is_empty() =>
-            {
-                Self::Text
-            }
-            ContentBlock::ToolCall(_) => Self::ToolCall,
-            _ => Self::Other,
-        }
-    }
-}
-
-/// [`numbered_parts`] over a message's role and its blocks' numbering kinds.
-pub fn numbered_parts_of(role: HostRole, kinds: impl IntoIterator<Item = NumberingKind>) -> u64 {
-    numbered_flags_of(role, kinds)
-        .into_iter()
-        .filter(|numbered| *numbered)
-        .count() as u64
-}
-
-fn numbered_flags_of(role: HostRole, kinds: impl IntoIterator<Item = NumberingKind>) -> Vec<bool> {
-    let role = match role {
-        HostRole::Tool => return kinds.into_iter().map(|_| false).collect(),
-        HostRole::User => Role::User,
-        HostRole::Assistant => Role::Assistant,
-        HostRole::System => Role::System,
-    };
-    kinds
-        .into_iter()
-        .map(|kind| {
-            let body = match kind {
-                NumberingKind::Text => PartBody::Text {
-                    text: Default::default(),
-                },
-                NumberingKind::ToolCall => PartBody::Tool(ToolPart::new(
-                    "",
-                    "",
-                    serde_json::Value::Null,
-                    ToolStatus::Running,
-                )),
-                NumberingKind::Other => return false,
-            };
-            cortexkit_compaction_view::tags::is_numbered(&role, &body)
-        })
-        .collect()
 }
 
 impl Fold {}

@@ -27,7 +27,51 @@ cipher_tests!(
     a_revert_across_the_enrollment_refuses_and_a_later_one_records_its_high,
     a_revert_off_the_contract_records_no_high,
     a_seal_that_would_change_the_enrollment_refuses_before_it_commits,
+    the_enrollment_is_checked_once_per_read_of_its_object,
 );
+
+/// How many enrollment entries this thread has checked so far.
+fn ordinals_checked() -> u64 {
+    super::ORDINALS_CHECKED.with(std::cell::Cell::get)
+}
+
+/// The enrollment's entries are checked once, when they are stored or first read back, not at
+/// every read: a session that enrolled after many messages serves each later read from the
+/// overlay it checked.
+fn the_enrollment_is_checked_once_per_read_of_its_object(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        two_runs(&mut session).await;
+        let before = ordinals_checked();
+        enroll(&mut session).await;
+        assert_eq!(ordinals_checked() - before, 5, "storing checks each entry");
+        for _ in 0..3 {
+            session.enrollment().await.unwrap().unwrap();
+            session.compaction_entries(1, usize::MAX).await.unwrap();
+        }
+        assert_eq!(
+            ordinals_checked() - before,
+            5,
+            "reads after storing check nothing again"
+        );
+        let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
+            .await
+            .unwrap();
+        let before = ordinals_checked();
+        for _ in 0..3 {
+            loaded.enrollment().await.unwrap().unwrap();
+            loaded.compaction_entries(1, usize::MAX).await.unwrap();
+        }
+        assert_eq!(
+            ordinals_checked() - before,
+            5,
+            "a reloaded session checks the object it reads back once"
+        );
+    });
+}
 
 fn triple() -> SessionTriple {
     SessionTriple {

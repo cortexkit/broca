@@ -248,6 +248,8 @@ impl GrantsStore {
                  principal TEXT NOT NULL, expires_at_ms INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS late_results_principal ON late_results(principal, seq);
+             CREATE INDEX IF NOT EXISTS held_calls_due ON held_calls(state, deadline_at_ms);
+             CREATE INDEX IF NOT EXISTS held_calls_card ON held_calls(dedup_key, admitted_at_ms);
              CREATE TABLE IF NOT EXISTS late_cursors (
                  principal TEXT PRIMARY KEY, seq INTEGER NOT NULL
              );",
@@ -503,15 +505,11 @@ impl GrantsStore {
     }
 
     pub fn generation(&self, agent_id: &str, provider: &str) -> Result<u64> {
-        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(conn
-            .query_row(
-                "SELECT generation FROM generations WHERE agent_id=?1 AND provider=?2",
-                params![agent_id, provider],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0))
+        read_generation(
+            &self.conn.lock().unwrap_or_else(|p| p.into_inner()),
+            agent_id,
+            provider,
+        )
     }
 
     pub fn grants(&self) -> Result<Vec<Grant>> {
@@ -521,16 +519,36 @@ impl GrantsStore {
         rows.map(|r| decode(&r?)).collect()
     }
 
-    pub fn denied(&self, agent_id: &str, scope: &ScopeIdentity, provider: &str) -> Result<bool> {
+    /// The grants `holder` has for `provider`, selected by their columns so a consent check
+    /// reads only the grants that could release its call.
+    pub fn grants_for(&self, holder: &str, provider: &str) -> Result<Vec<Grant>> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(conn
+        let mut stmt =
+            conn.prepare("SELECT body FROM grants WHERE holder=?1 AND provider=?2 ORDER BY id")?;
+        let rows = stmt.query_map([holder, provider], |r| r.get::<_, String>(0))?;
+        rows.map(|r| decode(&r?)).collect()
+    }
+
+    /// The grant an answer to the consent card `card_id` minted, if it still exists.
+    pub fn grant_from_card(&self, card_id: &str) -> Result<Option<Grant>> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let body: Option<String> = conn
             .query_row(
-                "SELECT 1 FROM denies WHERE agent_id=?1 AND scope=?2 AND provider=?3",
-                params![agent_id, encode(scope)?, provider],
-                |_| Ok(()),
+                "SELECT body FROM grants WHERE source_card_id=?1",
+                [card_id],
+                |r| r.get(0),
             )
-            .optional()?
-            .is_some())
+            .optional()?;
+        body.map(|body| decode(&body)).transpose()
+    }
+
+    pub fn denied(&self, agent_id: &str, scope: &ScopeIdentity, provider: &str) -> Result<bool> {
+        read_denied(
+            &self.conn.lock().unwrap_or_else(|p| p.into_inner()),
+            agent_id,
+            scope,
+            provider,
+        )
     }
 
     /// Revocation and the next card generation commit together. Keeping the settled card row
@@ -542,6 +560,24 @@ impl GrantsStore {
             tx.execute("DELETE FROM grants WHERE id=?1", [id])?;
             tx.execute("INSERT INTO generations VALUES (?1,?2,1) ON CONFLICT(agent_id,provider) DO UPDATE SET generation=generation+1", params![holder, provider])?;
             Ok(true)
+        })
+    }
+
+    /// Move the consent generation of `agent_id` and `provider` past `from`, unless another
+    /// caller already moved it. Returns the generation now current, so concurrent callers that
+    /// saw the same expired card agree on one new card key.
+    pub fn advance_generation(&self, agent_id: &str, provider: &str, from: u64) -> Result<u64> {
+        self.write(|tx| {
+            let current = read_generation(tx, agent_id, provider)?;
+            if current != from {
+                return Ok(current);
+            }
+            let next = from.saturating_add(1);
+            tx.execute(
+                "INSERT INTO generations VALUES (?1,?2,?3) ON CONFLICT(agent_id,provider) DO UPDATE SET generation=excluded.generation",
+                params![agent_id, provider, integer(next)?],
+            )?;
+            Ok(next)
         })
     }
 
@@ -648,13 +684,47 @@ impl GrantsStore {
         })
     }
 
-    /// The authorization and deadline checks share the write transaction with the state move.
-    pub fn authorize(&self, batch_id: &str, now_ms: i64) -> Result<bool> {
+    /// Move a held call to authorized under the grant `grant_id`. The deadline, the grant and
+    /// the consent generation are checked in the write transaction that moves the call, so a
+    /// revoke or deny that committed first leaves the call waiting, even when the caller read
+    /// the grant before a slow liveness check. `generation` is the caller's reading of
+    /// [`Self::generation`], taken before it read the grant: any revoke since changes it.
+    pub fn authorize(
+        &self,
+        batch_id: &str,
+        grant_id: &str,
+        generation: u64,
+        now_ms: i64,
+    ) -> Result<bool> {
         self.write(|tx| {
             let Some(mut row) = read_call(tx, batch_id, now_ms)? else {
                 return Ok(false);
             };
             if row.state != HeldState::Held || now_ms >= row.deadline_at_ms {
+                return Ok(false);
+            }
+            let grant: Option<String> = tx
+                .query_row("SELECT body FROM grants WHERE id=?1", [grant_id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            let Some(grant) = grant.map(|body| decode::<Grant>(&body)).transpose()? else {
+                return Ok(false);
+            };
+            let covers = grant.holder == row.agent_id
+                && grant.provider == row.provider
+                && grant.expires_at_ms.is_none_or(|expiry| now_ms < expiry)
+                && match grant.kind {
+                    GrantKind::Run => grant.scope.as_ref() == Some(&row.scope),
+                    GrantKind::Hours24 => true,
+                    GrantKind::Always => {
+                        row.project_id.is_some() && grant.project == row.project_id
+                    }
+                };
+            if !covers
+                || read_generation(tx, &row.agent_id, &row.provider)? != generation
+                || read_denied(tx, &row.agent_id, &row.scope, &row.provider)?
+            {
                 return Ok(false);
             }
             row.state = HeldState::Authorized;
@@ -708,12 +778,17 @@ impl GrantsStore {
         })
     }
 
+    /// End a call still waiting for consent at its deadline. A call whose card filing never
+    /// resolved (still `Filing`, possibly without a card id) has the same deadline as one
+    /// waiting on a filed card, and ends the same way.
     pub fn expire_held(&self, batch_id: &str, body: &str, now_ms: i64) -> Result<bool> {
         self.terminal_write(|tx, terminal| {
             let Some(row) = read_call(tx, batch_id, now_ms)? else {
                 return Ok(false);
             };
-            if row.state != HeldState::Held || now_ms < row.deadline_at_ms {
+            if !matches!(row.state, HeldState::Filing | HeldState::Held)
+                || now_ms < row.deadline_at_ms
+            {
                 return Ok(false);
             }
             finalize(tx, row, FinalKind::NotStarted, body, true, now_ms, terminal)
@@ -727,6 +802,34 @@ impl GrantsStore {
             r.get::<_, String>(0)
         })?;
         rows.map(|r| decode(&r?)).collect()
+    }
+
+    /// The retained calls in `state`, selected by the state column so rows in other states are
+    /// never read or decoded.
+    pub fn calls_in_state(&self, state: HeldState, now_ms: i64) -> Result<Vec<HeldCall>> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT body FROM held_calls WHERE state=?1 AND admitted_at_ms>?2 ORDER BY batch_id",
+        )?;
+        let rows = stmt.query_map(
+            params![state_name(state), now_ms.saturating_sub(RETENTION_MS)],
+            |r| r.get::<_, String>(0),
+        )?;
+        rows.map(|r| decode(&r?)).collect()
+    }
+
+    /// The ids of calls still waiting for consent whose deadline has passed, read from the
+    /// state and deadline columns alone: the deadline timer runs every second and must not
+    /// decode the request of every call that is still within its ten minutes.
+    pub fn due_waiting(&self, now_ms: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT batch_id FROM held_calls WHERE state IN ('filing','held') AND deadline_at_ms<=?1 AND admitted_at_ms>?2 ORDER BY batch_id",
+        )?;
+        let rows = stmt.query_map(params![now_ms, now_ms.saturating_sub(RETENTION_MS)], |r| {
+            r.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     pub fn late_head(&self, principal: &str) -> Result<u64> {
@@ -788,10 +891,28 @@ impl GrantsStore {
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?,
             );
-            Ok(tx.execute(
+            let swept = tx.execute(
                 "DELETE FROM held_calls WHERE admitted_at_ms<=?1",
                 [now_ms.saturating_sub(RETENTION_MS)],
-            )?)
+            )?;
+            // A 24-hour grant stays for the retention period after it expired, as the held calls
+            // it may have released do, and then goes.
+            tx.execute(
+                "DELETE FROM grants WHERE expires_at_ms IS NOT NULL AND expires_at_ms<=?1",
+                [now_ms.saturating_sub(RETENTION_MS)],
+            )?;
+            // An answered card is kept while a held call names it or the grant its answer
+            // minted exists: it stops a replayed answer from minting that grant again and lets
+            // a new call see the answer. Once neither is left, nothing reads it. Answer intake
+            // ignores records for a card it does not have, so a late replay cannot recreate one.
+            tx.execute(
+                "DELETE FROM cards WHERE json_extract(body,'$.state') IN ('allowed','denied')
+                 AND NOT EXISTS (SELECT 1 FROM held_calls h WHERE h.dedup_key=cards.dedup_key)
+                 AND NOT EXISTS (SELECT 1 FROM grants g
+                     WHERE g.source_card_id=json_extract(cards.body,'$.card_id'))",
+                [],
+            )?;
+            Ok(swept)
         })
     }
 }
@@ -807,6 +928,33 @@ fn read_call(conn: &Connection, batch_id: &str, now_ms: i64) -> Result<Option<He
     body.map(|body| decode(&body)).transpose()
 }
 
+fn read_generation(conn: &Connection, agent_id: &str, provider: &str) -> Result<u64> {
+    Ok(conn
+        .query_row(
+            "SELECT generation FROM generations WHERE agent_id=?1 AND provider=?2",
+            params![agent_id, provider],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+fn read_denied(
+    conn: &Connection,
+    agent_id: &str,
+    scope: &ScopeIdentity,
+    provider: &str,
+) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM denies WHERE agent_id=?1 AND scope=?2 AND provider=?3",
+            params![agent_id, encode(scope)?, provider],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 fn read_card(conn: &Connection, dedup_key: &str) -> Result<Option<Card>> {
     let body: Option<String> = conn
         .query_row(
@@ -818,13 +966,17 @@ fn read_card(conn: &Connection, dedup_key: &str) -> Result<Option<Card>> {
     body.map(|body| decode(&body)).transpose()
 }
 
-fn save_call(tx: &Transaction<'_>, row: &HeldCall) -> Result<()> {
-    let state = match row.state {
+fn state_name(state: HeldState) -> &'static str {
+    match state {
         HeldState::Filing => "filing",
         HeldState::Held => "held",
         HeldState::Authorized => "authorized",
         HeldState::Final => "final",
-    };
+    }
+}
+
+fn save_call(tx: &Transaction<'_>, row: &HeldCall) -> Result<()> {
+    let state = state_name(row.state);
     tx.execute(
         "UPDATE held_calls SET state=?2,body=?3 WHERE batch_id=?1",
         params![row.batch_id, state, encode(row)?],

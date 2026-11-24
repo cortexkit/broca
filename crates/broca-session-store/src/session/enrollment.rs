@@ -22,9 +22,10 @@ use crate::backend::SessionBackend;
 use crate::codec::{hex, Message as _};
 use crate::record::{EnrolledEntries, EnrolledEntry, EnrollmentOverlayRef};
 
-/// A session's enrollment decisions, once read, with the object they were read from.
-pub(crate) type OverlayCache =
-    std::sync::Mutex<Option<(EnrollmentOverlayRef, Arc<EnrolledEntries>)>>;
+/// A session's enrollment decisions, once read and checked, with the object they were read from.
+/// The overlay is kept already checked, so a session that enrolled after many messages doesn't
+/// walk every one of their ordinals again at each read.
+pub(crate) type OverlayCache = std::sync::Mutex<Option<(EnrollmentOverlayRef, EnrollmentOverlay)>>;
 
 /// What an enrolled session serves about the messages placed before it enrolled.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,9 +33,24 @@ pub struct EnrollmentOverlay {
     entries: Arc<EnrolledEntries>,
 }
 
+/// The overlay holds only its entries, which the session's memory report counts.
+impl crate::held::HeldBytes for EnrollmentOverlay {
+    fn heap_bytes(&self) -> usize {
+        crate::held::HeldBytes::heap_bytes(&self.entries)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many entries' ordinals [`EnrollmentOverlay::new`] has checked on this thread.
+    static ORDINALS_CHECKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl EnrollmentOverlay {
     /// The overlay over `entries`, which must hold one entry per ordinal from 1, in order.
     pub fn new(entries: Arc<EnrolledEntries>) -> Result<Self, String> {
+        #[cfg(test)]
+        ORDINALS_CHECKED.with(|checked| checked.set(checked.get() + entries.entries.len() as u64));
         if let Some((at, entry)) = entries
             .entries
             .iter()
@@ -144,7 +160,8 @@ impl<B: SessionBackend> Session<B> {
             return Err(SessionError::Poisoned);
         }
         let entries = Arc::new(entries.clone());
-        EnrollmentOverlay::new(entries.clone()).map_err(SessionError::EnrollmentDamaged)?;
+        let checked =
+            EnrollmentOverlay::new(entries.clone()).map_err(SessionError::EnrollmentDamaged)?;
         let overlay = EnrollmentOverlayRef {
             log: self.log,
             generation: self.head.generation,
@@ -161,7 +178,7 @@ impl<B: SessionBackend> Session<B> {
         self.backend
             .sync_objects(&self.addr, &self.log, self.version)
             .await?;
-        *self.enrollment.lock().expect("enrollment cache") = Some((overlay.clone(), entries));
+        *self.enrollment.lock().expect("enrollment cache") = Some((overlay.clone(), checked));
         Ok(overlay)
     }
 
@@ -179,12 +196,13 @@ impl<B: SessionBackend> Session<B> {
             .expect("enrollment cache")
             .as_ref()
             .filter(|(overlay, _)| *overlay == enrolled.overlay)
-            .map(|(_, entries)| entries.clone());
-        let entries = match cached {
-            Some(entries) => entries,
+            .map(|(_, overlay)| overlay.clone());
+        let name = || self.enrollment_name(&enrolled.overlay);
+        let overlay = match cached {
+            Some(overlay) => overlay,
             None => {
                 self.storage_read()?;
-                let name = self.enrollment_name(&enrolled.overlay);
+                let name = name();
                 let damaged =
                     |reason: &str| SessionError::EnrollmentDamaged(format!("{name}: {reason}"));
                 let sealed = self
@@ -201,14 +219,12 @@ impl<B: SessionBackend> Session<B> {
                     EnrolledEntries::decode(&bytes)
                         .map_err(|error| damaged(&format!("doesn't decode: {error}")))?,
                 );
+                let overlay = EnrollmentOverlay::new(entries).map_err(|error| damaged(&error))?;
                 *self.enrollment.lock().expect("enrollment cache") =
-                    Some((enrolled.overlay.clone(), entries.clone()));
-                entries
+                    Some((enrolled.overlay.clone(), overlay.clone()));
+                overlay
             }
         };
-        let name = || self.enrollment_name(&enrolled.overlay);
-        let overlay = EnrollmentOverlay::new(entries)
-            .map_err(|error| SessionError::EnrollmentDamaged(format!("{}: {error}", name())))?;
         if overlay.through_ordinal() != enrolled.through_ordinal {
             return Err(SessionError::EnrollmentDamaged(format!(
                 "{}: it holds {} entries, but the session enrolled after message {}",

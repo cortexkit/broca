@@ -423,16 +423,17 @@ async fn internal_retry_can_follow_a_proven_unbilled_attempt() {
     assert_eq!(rig.provider.calls.load(Ordering::SeqCst), 2);
 }
 
+/// A reply that may have been billed is charged at the ceiling, and that refusal is the call
+/// key's recorded outcome: a resend answers it again, unchanged, without calling the provider.
 #[tokio::test]
-async fn unknown_spend_uses_the_charge_ceiling_on_resend() {
+async fn unknown_spend_uses_the_charge_ceiling_and_a_resend_replays_it() {
     let rig = Rig::new(|| ProviderReply::Transport("timed out waiting for a reply".into()));
     let first = rig.refuse("unknown-spend", arguments()).await;
     assert_eq!(first["code"], "provider_error", "{first}");
     assert_eq!(spend(&first), RefusalSpend::ChargeCeiling);
 
     let again = rig.refuse("unknown-spend", arguments()).await;
-    assert_eq!(again["code"], "cost_exceeded", "{again}");
-    assert_eq!(spend(&again), RefusalSpend::NoSpend);
+    assert_eq!(again, first);
     assert_eq!(rig.provider.calls.load(Ordering::SeqCst), 1);
 }
 

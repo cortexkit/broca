@@ -127,8 +127,8 @@ impl ConsentIo for SubcConsentIo {
 pub struct Consent {
     pub(super) store: Arc<GrantsStore>,
     pub(super) io: Arc<dyn ConsentIo>,
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    feeds: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    locks: Locks,
+    feeds: Locks,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
@@ -152,12 +152,7 @@ impl Consent {
     }
 
     fn key_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(key.into())
-            .or_default()
-            .clone()
+        shared_lock(&self.locks, key)
     }
 
     fn reading_open(&self, key: &str, now: i64) -> Result<bool, GrantsError> {
@@ -168,16 +163,36 @@ impl Consent {
             .is_some_and(|row| now < row.deadline_at_ms.saturating_add(86_400_000)))
     }
 
+    /// The consent card key for `agent` calling `provider` from `scope`. When the card under the
+    /// current key was answered with a 24-hour grant that has since expired, the next call must
+    /// ask the person again rather than join that answered card, so the generation moves on and
+    /// the key names a new card. Revocation moves it the same way.
     pub fn dedup_key(
         &self,
         agent: &str,
         provider: &str,
         scope: &ScopeIdentity,
+        now: i64,
     ) -> Result<String, GrantsError> {
-        Ok(super::admission::hash(
-            &json!({"agent_id":agent,"provider":provider,"owner":scope.owner,
-            "scope_ref":scope.scope_ref,"scope_epoch":scope.scope_epoch,"generation":self.store.generation(agent,provider)?}),
-        ))
+        let generation = self.store.generation(agent, provider)?;
+        let key = card_key(agent, provider, scope, generation);
+        let card = self.store.card(&key)?;
+        let answered_grant = match card {
+            Some(card) if card.state == CardState::Allowed => match card.card_id.as_deref() {
+                Some(card_id) => self.store.grant_from_card(card_id)?,
+                None => None,
+            },
+            _ => None,
+        };
+        let expired = answered_grant.is_some_and(|grant| {
+            grant.kind == GrantKind::Hours24
+                && grant.expires_at_ms.is_some_and(|expiry| now >= expiry)
+        });
+        if !expired {
+            return Ok(key);
+        }
+        let generation = self.store.advance_generation(agent, provider, generation)?;
+        Ok(card_key(agent, provider, scope, generation))
     }
 
     pub async fn granted(
@@ -209,10 +224,7 @@ impl Consent {
         if self.store.denied(agent, &identity, provider)? {
             return Ok(None);
         }
-        for grant in self.store.grants()? {
-            if grant.holder != agent || grant.provider != provider {
-                continue;
-            }
+        for grant in self.store.grants_for(agent, provider)? {
             match grant.kind {
                 GrantKind::Always
                     if project_id.is_some() && grant.project.as_deref() == project_id =>
@@ -238,10 +250,7 @@ impl Consent {
     /// exits. Reconcile waiting rows from the durable authority before resuming their waits.
     pub async fn resume_granted(&self, now: i64) -> Result<usize, GrantsError> {
         let mut authorized = 0;
-        for row in self.store.recovering(now)? {
-            if row.state != HeldState::Held {
-                continue;
-            }
+        for row in self.store.calls_in_state(HeldState::Held, now)? {
             let observed = (self.clock)();
             if observed >= row.deadline_at_ms {
                 self.store
@@ -252,17 +261,27 @@ impl Consent {
             {
                 self.store
                     .finish_unstarted(&row.batch_id, &not_started("denied"), observed)?;
-            } else if self
-                .releasing_grant(
-                    &session(&row),
-                    row.project_id.as_deref(),
-                    &row.provider,
-                    observed,
-                )
-                .await?
-                .is_some()
-            {
-                authorized += usize::from(self.store.authorize(&row.batch_id, (self.clock)())?);
+            } else {
+                // Read before the grant: a revoke after this point changes the generation, and
+                // authorization then refuses the grant this pass found.
+                let generation = self.store.generation(&row.agent_id, &row.provider)?;
+                let Some(grant) = self
+                    .releasing_grant(
+                        &session(&row),
+                        row.project_id.as_deref(),
+                        &row.provider,
+                        observed,
+                    )
+                    .await?
+                else {
+                    continue;
+                };
+                authorized += usize::from(self.store.authorize(
+                    &row.batch_id,
+                    &grant.id,
+                    generation,
+                    (self.clock)(),
+                )?);
             }
         }
         Ok(authorized)
@@ -321,7 +340,7 @@ impl Consent {
         if current.state == CardState::Pending && current.content == card.content {
             self.store.put_card(&current)?;
         } else if matches!(current.state, CardState::Allowed | CardState::Denied) {
-            self.settle_calls(&current, now)?;
+            self.settle_calls(&current, now).await?;
         } else {
             self.store.put_card(&card)?;
             if recovering {
@@ -398,13 +417,7 @@ impl Consent {
         let scope = session(row);
         let feed_key =
             serde_json::to_string(&identity(&scope)).map_err(|e| GrantsError(e.to_string()))?;
-        let feed = self
-            .feeds
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(feed_key)
-            .or_default()
-            .clone();
+        let feed = shared_lock(&self.feeds, &feed_key);
         // A feed page can settle several keys. Taking the scope lock first prevents two
         // recoveries from each owning one key while waiting for the other's key.
         let _feed_guard = feed.lock().await;
@@ -438,7 +451,7 @@ impl Consent {
             }
         }
         if let Some(card) = self.store.card(key)? {
-            self.settle_calls(&card, (self.clock)())?;
+            self.settle_calls(&card, (self.clock)()).await?;
         }
         Ok(())
     }
@@ -531,7 +544,7 @@ impl Consent {
                     if card.card_id.as_deref() != Some(&answer.card_id) {
                         duplicates.push(answer.card_id.clone());
                     }
-                    self.settle_calls(&card, decided_at)?;
+                    self.settle_calls(&card, decided_at).await?;
                 }
             }
             // An explicit decision, including one for an older id adopted during recovery,
@@ -662,17 +675,18 @@ impl Consent {
                 .apply_answer(&current.scope, answer, (self.clock)())?;
         }
         let current = self.store.card(key)?.unwrap_or(current);
-        self.settle_calls(&current, (self.clock)())?;
+        self.settle_calls(&current, (self.clock)()).await?;
         Ok(matches!(
             current.state,
             CardState::Pending | CardState::Filing
         ))
     }
 
-    fn settle_calls(&self, card: &Card, now: i64) -> Result<(), GrantsError> {
-        for row in self.store.card_calls(&card.dedup_key, now)? {
-            match card.state {
-                CardState::Denied => {
+    async fn settle_calls(&self, card: &Card, now: i64) -> Result<(), GrantsError> {
+        let rows = self.store.card_calls(&card.dedup_key, now)?;
+        match card.state {
+            CardState::Denied => {
+                for row in rows {
                     let outcome = if now >= row.deadline_at_ms {
                         "pending"
                     } else {
@@ -681,26 +695,71 @@ impl Consent {
                     self.store
                         .finish_unstarted(&row.batch_id, &not_started(outcome), now)?;
                 }
-                CardState::Allowed => {
-                    let admitted = self.store.grants()?.iter().any(|grant| {
-                        grant.source_card_id == card.card_id.as_deref().unwrap_or("")
-                            && ((grant.kind == GrantKind::Hours24
-                                && grant.expires_at_ms.is_some_and(|expiry| now < expiry))
-                                || (grant.kind == GrantKind::Run
-                                    && grant.scope.as_ref() == Some(&row.scope))
-                                || (grant.kind == GrantKind::Always
-                                    && row.project_id.is_some()
-                                    && grant.project == row.project_id))
-                    });
-                    if admitted {
-                        self.store.authorize(&row.batch_id, now)?;
+            }
+            CardState::Allowed => {
+                // Read before the grant, as in `resume_granted`: authorization refuses the
+                // grant if a revoke committed after this point.
+                let generation = self.store.generation(&card.agent_id, &card.provider)?;
+                let Some(grant) = (match card.card_id.as_deref() {
+                    Some(card_id) => self.store.grant_from_card(card_id)?,
+                    None => None,
+                }) else {
+                    return Ok(());
+                };
+                // A run grant releases calls only while its run is known to be live, exactly as
+                // in `releasing_grant`. A call can join this answered card after the run's
+                // liveness became unknown, and must then keep waiting. Every call on one card
+                // shares its scope, so the run is asked about at most once.
+                let mut run_live = None;
+                for row in rows.iter().filter(|row| row.state == HeldState::Held) {
+                    let covers = match grant.kind {
+                        GrantKind::Hours24 => {
+                            grant.expires_at_ms.is_some_and(|expiry| now < expiry)
+                        }
+                        GrantKind::Always => {
+                            row.project_id.is_some() && grant.project == row.project_id
+                        }
+                        GrantKind::Run => {
+                            grant.scope.as_ref() == Some(&row.scope)
+                                && match run_live {
+                                    Some(live) => live,
+                                    None => {
+                                        let live = self.io.run_live(&session(row)).await
+                                            == RunLiveness::Live;
+                                        run_live = Some(live);
+                                        live
+                                    }
+                                }
+                        }
+                    };
+                    if covers {
+                        self.store
+                            .authorize(&row.batch_id, &grant.id, generation, now)?;
                     }
                 }
-                _ => (),
             }
+            CardState::Filing | CardState::Pending => (),
         }
         Ok(())
     }
+}
+
+fn card_key(agent: &str, provider: &str, scope: &ScopeIdentity, generation: u64) -> String {
+    super::admission::hash(
+        &json!({"agent_id":agent,"provider":provider,"owner":scope.owner,
+        "scope_ref":scope.scope_ref,"scope_epoch":scope.scope_epoch,"generation":generation}),
+    )
+}
+
+type Locks = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// The lock for `key`. Locks nobody holds or waits for are dropped first: a new lock behaves
+/// exactly like an unheld one, so the map keeps only the cards and scopes in use instead of one
+/// entry for every card and scope the process has seen.
+fn shared_lock(locks: &Locks, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = locks.lock().unwrap_or_else(|p| p.into_inner());
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    locks.entry(key.into()).or_default().clone()
 }
 
 pub(super) fn identity(scope: &SessionScope) -> ScopeIdentity {
@@ -751,6 +810,22 @@ fn supports_no_expiry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unheld_locks_are_dropped_and_held_ones_kept() {
+        let locks = super::Locks::default();
+        let held = super::shared_lock(&locks, "held");
+        drop(super::shared_lock(&locks, "finished"));
+        let _next = super::shared_lock(&locks, "next");
+        let keys = locks.lock().unwrap();
+        assert!(keys.contains_key("held"));
+        assert!(keys.contains_key("next"));
+        assert!(
+            !keys.contains_key("finished"),
+            "a lock nobody holds is not kept"
+        );
+        assert!(std::sync::Arc::ptr_eq(&held, &keys["held"]));
+    }
+
     #[test]
     fn no_expiry_requires_target_capability() {
         let caps = serde_json::from_value(serde_json::json!({"provides":["consent-no-expiry/v1"]}))

@@ -13,13 +13,17 @@
 //! The call's admission (the frozen route and rates) and its final answer are recorded in the
 //! System One batch store under [`STORE_ROLE`], keyed like a classify batch: by the caller, its
 //! scope and its `call_key`. A repeat of the key answers the recorded result and is never billed
-//! twice. A repeat that finds an admission without an answer (broca stopped while the call ran)
-//! joins the run that admission started, which the session's own send id makes a no-op send.
+//! twice. A repeat that finds an admission without an answer (broca stopped while the call ran,
+//! or couldn't read its run's end) joins the run that admission started: the repeat's send names
+//! the same send id in the same session, which answers the existing run instead of starting one.
 //!
-//! Each attempt runs in its own session, `llm-complete:<key>:<attempt>`, and every attempt's end
-//! is recorded as its outcome. A transient failure is not final: a repeat of the key starts the
-//! next attempt in a fresh session, rather than replaying the failure for the week the record is
-//! kept or adding a second prompt to the failed attempt's context.
+//! The call runs in a session of its own, `llm-complete:<key>:<admitted_at_ms>:<attempt>`, and
+//! its run's end is recorded as the key's outcome. Every recorded outcome is final, a transient
+//! refusal too: a repeat of the key answers it with the same spend mark (`cost_usd`,
+//! `cost_unmeasured`, `cost_unknown` or `no_spend`) and runs nothing, as the
+//! cortexkit-llm-tools contract requires. A caller that wants another try sends a new `call_key`.
+//! The record is kept seven days from the call's admission; the admission time in the session
+//! name keeps a key used again after that from reaching the old call's session.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,9 +42,9 @@ use cortexkit_model_batch::errors as batch;
 use cortexkit_model_batch::estimate::{
     cost_nanos, nanos_to_usd, usd_to_nanos, RateNanosPerMtok, Rounding, Tokens,
 };
-use cortexkit_role_classifier::errors::{ErrorClass, Refusal};
+use cortexkit_role_classifier::errors::Refusal;
 use cortexkit_role_routing::price::{Price, PriceBasis};
-use cortexkit_role_routing::select::{Requirements, SelectAnswer, SelectRequest};
+use cortexkit_role_routing::select::{Requirements, RunnerAuth, SelectAnswer, SelectRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
 use tokio::sync::watch;
@@ -82,6 +86,11 @@ const OVERHEAD_TOKENS: u64 = 512;
 
 /// How long a completion may run before broca stops it and answers `provider_error`.
 const MAX_RUN: Duration = Duration::from_secs(15 * 60);
+
+/// How long broca waits for a run it cancelled to stop. A cancel that hasn't landed by then is
+/// not waited on further: the call answers its spend unknown, and a repeat of its key reads the
+/// same run again.
+const STOP_WAIT: Duration = Duration::from_secs(60);
 
 type Answer = Result<Box<RawValue>, Vec<u8>>;
 
@@ -151,8 +160,13 @@ impl Sessions for broca_module::LineageRegistry {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Frozen {
     model: complete::Model,
-    /// The select's decision, for tracing the call back to routing's record of it.
+    /// The select's decision. Every attempt's send names it, so routing admits the run on the
+    /// account it chose and priced the route for, not on an account it picks afresh.
     decision_id: String,
+    /// The key pool and credential routing chose with the route, when its policy names a key
+    /// pool. Every attempt's send names them as its account hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<RunnerAuth>,
     /// `metered` or `subscription_equivalent`, as routing priced the route.
     basis: String,
     /// Nanodollars per million tokens. Subscription-equivalent rates arrive already divided by
@@ -194,8 +208,35 @@ pub struct Complete {
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     /// How often a running call's run is read.
     poll: Duration,
-    /// Calls running in this process, by key: a concurrent repeat of a key waits for the first.
-    flights: Mutex<HashMap<String, watch::Receiver<Option<Answer>>>>,
+    /// How long a run broca cancelled is waited on to stop; [`STOP_WAIT`] unless a test sets it.
+    stop_wait: Duration,
+    /// Calls running in this process, by key: a concurrent repeat of a key with the same
+    /// arguments and scope waits for the first.
+    flights: Mutex<HashMap<String, Flight>>,
+}
+
+/// A call running in this process: what a repeat of its key must match to join it, and where its
+/// answer arrives.
+struct Flight {
+    digest: String,
+    scope: BatchScope,
+    answer: watch::Receiver<Option<Answer>>,
+}
+
+/// Takes a call out of the running calls however its run ends, a panic included, so a later
+/// repeat of the key runs rather than joining a call that will never answer.
+struct Landing<'a> {
+    flights: &'a Mutex<HashMap<String, Flight>>,
+    key: &'a str,
+}
+
+impl Drop for Landing<'_> {
+    fn drop(&mut self) {
+        self.flights
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(self.key);
+    }
 }
 
 impl Complete {
@@ -214,6 +255,7 @@ impl Complete {
             runner: runner.into(),
             clock: Arc::new(crate::system_one::now_ms),
             poll: Duration::from_millis(250),
+            stop_wait: STOP_WAIT,
             flights: Mutex::new(HashMap::new()),
         }
     }
@@ -225,6 +267,11 @@ impl Complete {
 
     pub fn with_poll(mut self, poll: Duration) -> Self {
         self.poll = poll;
+        self
+    }
+
+    pub fn with_stop_wait(mut self, stop_wait: Duration) -> Self {
+        self.stop_wait = stop_wait;
         self
     }
 
@@ -248,10 +295,22 @@ impl Complete {
         let flight = {
             let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
             match flights.get(&call.key) {
-                Some(running) => Err(running.clone()),
+                // The key alone doesn't name the call: a repeat with other arguments is refused
+                // as a repeat after the call ended would be, rather than given this call's answer.
+                Some(running) if running.digest != call.digest || running.scope != call.scope => {
+                    return Err(unspent(key_reused()));
+                }
+                Some(running) => Err(running.answer.clone()),
                 None => {
                     let (sender, receiver) = watch::channel(None);
-                    flights.insert(call.key.clone(), receiver);
+                    flights.insert(
+                        call.key.clone(),
+                        Flight {
+                            digest: call.digest.clone(),
+                            scope: call.scope.clone(),
+                            answer: receiver,
+                        },
+                    );
                     Ok(sender)
                 }
             }
@@ -260,11 +319,12 @@ impl Complete {
             Ok(sender) => sender,
             Err(running) => return await_flight(running).await,
         };
+        let landing = Landing {
+            flights: &self.flights,
+            key: &call.key,
+        };
         let answer = self.run(&call, principal, scope, gate).await;
-        self.flights
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&call.key);
+        drop(landing);
         let _ = sender.send(Some(answer.clone()));
         answer
     }
@@ -288,7 +348,10 @@ impl Complete {
         } else {
             None
         };
-        let (frozen, attempt) = match &stored {
+        let frozen = match &stored {
+            Some(stored) if expired(stored.admitted_at_ms, now) => {
+                return Err(unspent(being_cleared()))
+            }
             Some(stored) => {
                 if stored.args_digest != call.digest || stored.scope.as_ref() != Some(&call.scope) {
                     return Err(unspent(key_reused()));
@@ -296,14 +359,13 @@ impl Complete {
                 if let Some(answer) = replay(&stored.outcomes) {
                     return answer;
                 }
-                let frozen: Frozen = serde_json::from_str(&stored.frozen_row)
-                    .map_err(|_| unspent(internal("the completion record is unreadable")))?;
-                (frozen, stored.outcomes.len() as u64)
+                serde_json::from_str::<Frozen>(&stored.frozen_row)
+                    .map_err(|_| unspent(internal("the completion record is unreadable")))?
             }
-            None => (self.price(call).await.map_err(unspent)?, 0),
+            None => self.price(call).await.map_err(unspent)?,
         };
-        // Every call that may send text is gated, a later attempt too: a scope may have read
-        // the person's private content since the call was first admitted. A replay is not.
+        // Every call that may send text is gated, a resumed one too: a scope may have read the
+        // person's private content since the call was first admitted. A replay is not.
         gate.admit(scope, &frozen.model.provider).await?;
         let frozen_row = serde_json::to_string(&frozen).expect("a frozen route encodes");
         let model_key = route_key(&frozen.model);
@@ -319,12 +381,9 @@ impl Complete {
             owner: &self.owner,
             now_ms: now,
         };
-        let (spent, ceiling) = match self.store.claim(&claim) {
-            Ok(Claimed::Fresh) => (0, call.ceiling_nanos),
-            Ok(Claimed::Resumed(record)) => (
-                record.spent_nanos,
-                record.ceiling_nanos.unwrap_or(call.ceiling_nanos),
-            ),
+        let resumed = match self.store.claim(&claim) {
+            Ok(Claimed::Fresh) => None,
+            Ok(Claimed::Resumed(record)) => Some(record),
             Ok(Claimed::InProgress) => {
                 return Err(unspent(refused(
                     batch::PROVIDER_ERROR,
@@ -341,35 +400,72 @@ impl Complete {
             key: &call.key,
             owner: &self.owner,
         };
+        // The claimed record is the one that counts, not the lookup above: another process
+        // sharing the store may have run and recorded the call in between. Its recorded outcome
+        // is answered as recorded, and an unfinished attempt runs on the route and prices it
+        // froze, gated again when that route's provider is not the one gated above.
+        let (frozen, attempt, admitted_at, spent, ceiling) = match resumed {
+            None => (frozen, 0, now, 0, call.ceiling_nanos),
+            Some(record) => {
+                if expired(record.admitted_at_ms, now) {
+                    return Err(unspent(being_cleared()));
+                }
+                if let Some(answer) = replay(&record.outcomes) {
+                    return answer;
+                }
+                let recorded: Frozen = serde_json::from_str(&record.frozen_row)
+                    .map_err(|_| unspent(internal("the completion record is unreadable")))?;
+                if recorded.model.provider != frozen.model.provider {
+                    gate.admit(scope, &recorded.model.provider).await?;
+                }
+                (
+                    recorded,
+                    record.outcomes.len() as u64,
+                    record.admitted_at_ms,
+                    record.spent_nanos,
+                    record.ceiling_nanos.unwrap_or(call.ceiling_nanos),
+                )
+            }
+        };
         if spent > 0 && spent.saturating_add(cost_bound(&call.request, &frozen)) > ceiling {
             return Err(unspent(refused(
                 batch::COST_EXCEEDED,
                 "answering this completion could cross the cumulative max_cost_usd",
             )));
         }
-        let (answer, spend_nanos, tokens) =
-            self.execute(call, &frozen, attempt, principal, scope).await;
-        // Every attempt's end is recorded, a transient failure too: the next repeat must start
-        // the next attempt, since this attempt's session already holds its ended run.
-        let outcome = StoredOutcome {
-            index: attempt,
-            outcome: match &answer {
-                Ok(result) => Outcome::Answered(result.get().to_owned()),
-                Err(body) => Outcome::Failed(String::from_utf8_lossy(body).into_owned()),
-            },
-            input_tokens: tokens.0,
-            output_tokens: tokens.1,
-        };
-        if let Err(error) = self.store.record(
-            STORE_ROLE,
-            &call.key,
-            &self.owner,
-            &outcome,
+        let (answer, ended) = self
+            .execute(call, &frozen, admitted_at, attempt, principal, scope)
+            .await;
+        // An attempt whose run ended is recorded, a transient failure too: it is the key's final
+        // outcome, which every repeat answers without running anything. One whose end broca
+        // didn't see (its run couldn't be read, or didn't stop when cancelled) is not recorded:
+        // that run may still be running or may have answered, so a repeat reads the same
+        // attempt's session again rather than answering a failure that isn't the run's.
+        if let Some(Ended {
             spend_nanos,
-            (self.clock)(),
-        ) {
-            tracing::warn!(target: "llm_tools", %error,
-                "could not record a completion's outcome; a repeat of its key joins its run");
+            tokens,
+        }) = ended
+        {
+            let outcome = StoredOutcome {
+                index: attempt,
+                outcome: match &answer {
+                    Ok(result) => Outcome::Answered(result.get().to_owned()),
+                    Err(body) => Outcome::Failed(String::from_utf8_lossy(body).into_owned()),
+                },
+                input_tokens: tokens.0,
+                output_tokens: tokens.1,
+            };
+            if let Err(error) = self.store.record(
+                STORE_ROLE,
+                &call.key,
+                &self.owner,
+                &outcome,
+                spend_nanos,
+                (self.clock)(),
+            ) {
+                tracing::warn!(target: "llm_tools", %error,
+                    "could not record a completion's outcome; a repeat of its key joins its run");
+            }
         }
         drop(hold);
         answer
@@ -403,7 +499,12 @@ impl Complete {
                 ),
             ));
         };
-        let frozen = freeze(model, answer.decision_id.clone(), price)?;
+        let frozen = freeze(
+            model,
+            answer.decision_id.clone(),
+            answer.runner.auth.clone(),
+            price,
+        )?;
         let estimate = cost_bound(request, &frozen);
         if estimate > call.ceiling_nanos {
             let mut refusal = refused(
@@ -420,20 +521,25 @@ impl Complete {
         Ok(frozen)
     }
 
-    /// Run one attempt and turn its end into the answer, its spend in nanodollars and its
-    /// measured input and output tokens.
+    /// Run one attempt and turn its end into the answer and what the ended run spent, or no
+    /// spend when broca didn't see the run end.
     async fn execute(
         &self,
         call: &Admitted,
         frozen: &Frozen,
+        admitted_at: i64,
         attempt: u64,
         principal: Option<&BindPrincipal>,
         scope: &SendScope,
-    ) -> (Answer, u64, (Option<u64>, Option<u64>)) {
-        let session = session_of(&call.key, attempt);
+    ) -> (Answer, Option<Ended>) {
+        let nothing = Some(Ended {
+            spend_nanos: 0,
+            tokens: (None, None),
+        });
+        let session = session_of(&call.key, admitted_at, attempt);
         let send = match send_request(&session, call, frozen, principal, scope) {
             Ok(send) => send,
-            Err(refusal) => return (Err(unspent(refusal)), 0, (None, None)),
+            Err(refusal) => return (Err(unspent(refusal)), nothing),
         };
         let run_id = send.run_id.clone();
         match self.sessions.send(send).await {
@@ -443,27 +549,33 @@ impl Complete {
                 let _ = self.sessions.cancel(&session, run_id).await;
                 return (
                     Err(unspent(internal("the completion's session was busy"))),
-                    0,
-                    (None, None),
+                    nothing,
                 );
             }
             Ok(_) => {}
-            Err(error) => return (Err(unspent(send_refusal(&error))), 0, (None, None)),
+            Err(error) => return (Err(unspent(send_refusal(&error))), nothing),
         }
         match self.wait(&session, &run_id).await {
-            Ok((result, stop)) => finish(&call.request, frozen, &result, stop, call.ceiling_nanos),
+            Ok((result, stop)) => {
+                let (answer, spend_nanos, tokens) =
+                    finish(&call.request, frozen, &result, stop, call.ceiling_nanos);
+                (
+                    answer,
+                    Some(Ended {
+                        spend_nanos,
+                        tokens,
+                    }),
+                )
+            }
             // The run may have reached the provider, and nothing here measured it.
-            Err(refusal) => (
-                Err(serialize(Spend::Unknown.mark(refusal))),
-                call.ceiling_nanos,
-                (None, None),
-            ),
+            Err(refusal) => (Err(serialize(Spend::Unknown.mark(refusal))), None),
         }
     }
 
     /// Wait for the run to end, and say whether broca stopped it. A run that pauses is stopped,
     /// since a tool call can't wait on a person signing in or an account limit resetting, and so
-    /// is one that runs past [`MAX_RUN`].
+    /// is one that runs past [`MAX_RUN`]. A stopped run that is still active or paused after
+    /// `stop_wait` is answered as unread: broca didn't see it end.
     async fn wait(
         &self,
         session: &LineageKey,
@@ -471,6 +583,7 @@ impl Complete {
     ) -> Result<(RunResultResponse, Option<Stop>), Refusal> {
         let deadline = tokio::time::Instant::now() + MAX_RUN;
         let mut stop = None;
+        let mut stop_by = None;
         loop {
             let result = self
                 .sessions
@@ -483,14 +596,23 @@ impl Complete {
                     )
                 })?;
             match (result.state.as_str(), &stop) {
-                ("active" | "paused", Some(_)) => {}
+                ("active" | "paused", Some(_)) => {
+                    if stop_by.is_some_and(|by| tokio::time::Instant::now() >= by) {
+                        return Err(refused(
+                            batch::PROVIDER_ERROR,
+                            "the completion's run did not stop when broca cancelled it",
+                        ));
+                    }
+                }
                 ("active", None) if tokio::time::Instant::now() < deadline => {}
                 ("active", None) => {
                     stop = Some(Stop::TimedOut);
+                    stop_by = Some(tokio::time::Instant::now() + self.stop_wait);
                     let _ = self.sessions.cancel(session, run_id.clone()).await;
                 }
                 ("paused", None) => {
                     stop = Some(Stop::Paused(result.reason.clone().unwrap_or_default()));
+                    stop_by = Some(tokio::time::Instant::now() + self.stop_wait);
                     let _ = self.sessions.cancel(session, run_id.clone()).await;
                 }
                 _ => return Ok((result, stop)),
@@ -498,6 +620,13 @@ impl Complete {
             tokio::time::sleep(self.poll).await;
         }
     }
+}
+
+/// What an attempt whose run ended spent, in nanodollars, and its measured input and output
+/// tokens.
+struct Ended {
+    spend_nanos: u64,
+    tokens: (Option<u64>, Option<u64>),
 }
 
 /// Why broca stopped a completion's run before it ended on its own.
@@ -659,7 +788,12 @@ fn cost_bound(request: &complete::Request, frozen: &Frozen) -> u64 {
 }
 
 /// The select answer's price as integer rates, rounded up so a cost is never lowered.
-fn freeze(model: complete::Model, decision_id: String, price: &Price) -> Result<Frozen, Refusal> {
+fn freeze(
+    model: complete::Model,
+    decision_id: String,
+    auth: Option<RunnerAuth>,
+    price: &Price,
+) -> Result<Frozen, Refusal> {
     let unpriceable = || {
         refused(
             COST_UNPRICEABLE,
@@ -683,6 +817,7 @@ fn freeze(model: complete::Model, decision_id: String, price: &Price) -> Result<
         cache_write_rate: rates.cache_write.as_ref().and_then(rate),
         basis: basis.to_owned(),
         decision_id,
+        auth,
         model,
     })
 }
@@ -694,19 +829,25 @@ fn route_key(model: &complete::Model) -> String {
     }
 }
 
-/// The session attempt `attempt` of call `key` runs in. It is in broca's folderless namespace:
-/// a completion reads no files, and its spend is attributed by the caller's scope.
-fn session_of(key: &str, attempt: u64) -> LineageKey {
+/// The session attempt `attempt` of call `key` runs in. `admitted_at` is the record's first
+/// admission, in milliseconds: a session outlives the record it ran for (its seven days count
+/// from its run's end, the record's from the call's admission), so a key used again after its
+/// record expired must name new sessions rather than reach the old call's run. It is in
+/// broca's folderless namespace: a completion reads no files, and its spend is attributed by
+/// the caller's scope.
+fn session_of(key: &str, admitted_at: i64, attempt: u64) -> LineageKey {
     BindIdentity::new(
         broca_protocol::session::UNSCOPED_SESSION_ROOT,
         SESSION_HARNESS,
-        format!("llm-complete:{key}:{attempt}"),
+        format!("llm-complete:{key}:{admitted_at}:{attempt}"),
     )
 }
 
 /// The attempt's one send: the caller's text on the frozen route, no tools, the output cap,
 /// no prompt cache, a JSON answer when the call has a schema, and the caller's principal and
-/// scope, so the run's spend is the caller's.
+/// scope, so the run's spend is the caller's. It names routing's decision and the key pool and
+/// credential routing chose with it, so the account the run is admitted on is the one its
+/// price was frozen for.
 fn send_request(
     session: &LineageKey,
     call: &Admitted,
@@ -726,7 +867,18 @@ fn send_request(
         "cache": {"ttl": "none"},
         "retention": RETENTION_SECS,
         "one_shot": true,
+        "route_decision_id": frozen.decision_id,
     });
+    // Routing names a key pool and credential only for a provider whose policy pools API keys,
+    // so the hints go with the API-key method; a route without them (a subscription account)
+    // is tied to its account by the decision alone.
+    if let Some(auth) = &frozen.auth {
+        params["auth"] = json!({
+            "method": "apikey",
+            "pool": auth.pool,
+            "credential_id": auth.credential_id,
+        });
+    }
     if let Some(system) = &request.system {
         params["system"] = json!(system);
     }
@@ -1042,6 +1194,22 @@ fn key_reused() -> Refusal {
     )
 }
 
+/// Whether a record first admitted at `admitted_at` is past its seven days at `now`. The store
+/// hides only routed rows past their window, and its sweep runs hourly, so a completion checks
+/// the age itself.
+fn expired(admitted_at: i64, now: i64) -> bool {
+    now.saturating_sub(admitted_at) >= broca_store::system_one::RETENTION_MS
+}
+
+/// The refusal for a key whose record is past its seven days but not yet removed. A repeat
+/// after seven days is a new call, which can't start until the old record is gone.
+fn being_cleared() -> Refusal {
+    refused(
+        batch::PROVIDER_ERROR,
+        "this call_key's record has expired and is being cleared; repeat the call shortly",
+    )
+}
+
 fn serialize(refusal: Refusal) -> Vec<u8> {
     serde_json::to_vec(&refusal).expect("a refusal encodes")
 }
@@ -1050,16 +1218,15 @@ fn unspent(refusal: Refusal) -> Vec<u8> {
     serialize(Spend::Nothing.mark(refusal))
 }
 
-/// The recorded answer, if the record holds a final one: an answer, or a refusal that is
-/// permanent or spent something. A transient attempt's failure is not final.
+/// The recorded outcome, if the record holds one. Every outcome is final for its key, a
+/// transient refusal too: the cortexkit-llm-tools contract answers a repeat of a key with the
+/// same refusal and the same spend mark, and never bills it twice. A caller that wants another
+/// try sends a new `call_key`.
 fn replay(outcomes: &[StoredOutcome]) -> Option<Answer> {
     let last = outcomes.iter().max_by_key(|outcome| outcome.index)?;
     match &last.outcome {
         Outcome::Answered(text) => Some(Ok(RawValue::from_string(text.clone()).ok()?)),
-        Outcome::Failed(body) => {
-            let refusal: Refusal = serde_json::from_str(body).ok()?;
-            (refusal.detail.class != ErrorClass::Transient).then(|| Err(body.clone().into_bytes()))
-        }
+        Outcome::Failed(body) => Some(Err(body.clone().into_bytes())),
     }
 }
 

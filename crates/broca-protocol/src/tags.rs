@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub mod compaction;
+
 pub mod v1 {
     pub use cortexkit_role_llm_runner_v1::tags::{
         anchor, parse_tag, truncate_part, Anchor, Marker, MarkerCheckpoint, PartContainer,

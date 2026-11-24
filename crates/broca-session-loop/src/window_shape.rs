@@ -3,16 +3,12 @@
 //! `WindowMessage`). Each reader here gives the same answer for a released message as for the
 //! held one.
 
-use broca_core::compaction_v2::metadata::{numbered_parts_of, NumberingKind};
 use broca_core::compaction_v2::systems::is_global_role;
 use broca_protocol::ids::ToolCallId;
 use broca_protocol::tags::{cleans, number_kinds, ComputedRules, NumberingOverflow};
-use broca_session_store::fold::conversation::{BlockKind, BlockRef, WindowMessage};
+use broca_session_store::fold::conversation::{BlockKind, WindowMessage};
 
-/// How many part numbers the message takes (see `metadata::numbered_parts`).
-pub(crate) fn numbered_parts(message: &WindowMessage) -> u64 {
-    numbered_parts_of(message.role(), message.blocks().map(numbering_kind))
-}
+pub(crate) use broca_session_store::placement::window_numbered_parts as numbered_parts;
 
 /// Whether the message is a global system message (see `systems::is_global`).
 pub(crate) fn is_global(message: &WindowMessage) -> bool {
@@ -51,12 +47,4 @@ pub(crate) fn runner_high(
         .map(|block| block.runner_kind(message.role(), clean));
     let parts = number_kinds(kinds, rules.render, high)?;
     Ok(parts.into_iter().flatten().max().unwrap_or(high))
-}
-
-fn numbering_kind(block: BlockRef<'_>) -> NumberingKind {
-    match block.kind() {
-        BlockKind::Text | BlockKind::TextWithState if !block.text_empty() => NumberingKind::Text,
-        BlockKind::ToolCall => NumberingKind::ToolCall,
-        _ => NumberingKind::Other,
-    }
 }

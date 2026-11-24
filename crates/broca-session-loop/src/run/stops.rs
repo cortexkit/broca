@@ -25,13 +25,15 @@ pub(super) fn stop_before_batch<W: Writer>(
 
 /// Ends the run at a step that met `stop` before its batch: each of `calls` closes as not run
 /// (max steps for a step limit), and the batch, the budget firings the calls made due and the
-/// run's end are one barrier.
+/// run's end are one barrier. With `started`, the step's batch is already durable, holding the
+/// results of the calls the provider cut, and `calls` are the others.
 pub(super) async fn hard_stop<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
     run_id: &str,
     step_id: u64,
     calls: &[ToolCall],
+    started: bool,
     stop: &StopCondition,
 ) -> Result<Finished, LoopError> {
     let (outcome, message, reason) = match stop {
@@ -47,14 +49,17 @@ pub(super) async fn hard_stop<W: Writer, P, T>(
         ),
     };
     let batch_id = format!("{run_id}-b{step_id}");
-    let mut records = vec![Record::BatchStart(BatchStart {
-        run_id: run_id.into(),
-        batch_id: batch_id.clone(),
-        step_id,
-        planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
-        mid: None,
-        shown_tags: Vec::new(),
-    })];
+    let mut records = Vec::new();
+    if !started {
+        records.push(Record::BatchStart(BatchStart {
+            run_id: run_id.into(),
+            batch_id: batch_id.clone(),
+            step_id,
+            planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
+            mid: None,
+            shown_tags: Vec::new(),
+        }));
+    }
     let now = (seams.now_ms)();
     for call in calls {
         let result = ToolResult {

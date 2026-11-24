@@ -19,6 +19,7 @@ cipher_tests!(
     a_ledger_seal_keeps_the_whole_transcript_open,
     a_live_writer_releases_copied_messages_after_a_seal,
     a_historical_ledger_only_log_replays_its_copied_transcript,
+    a_published_log_cut_at_a_batch_boundary_refuses_reads_and_writes,
     a_cut_that_does_not_start_an_entry_refuses_and_changes_nothing,
     the_replaced_log_is_deleted_only_after_the_grace_period,
     a_session_no_writer_holds_is_collected_once_each_grace_is_over,
@@ -406,6 +407,40 @@ fn a_historical_ledger_only_log_replays_its_copied_transcript(cipher: Cipher) {
         };
         assert_eq!(inputs(&before), [a, b, c]);
         assert_eq!(inputs(&after), [a, b, c], "historical log's inputs");
+    });
+}
+
+fn a_published_log_cut_at_a_batch_boundary_refuses_reads_and_writes(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let (mut session, _) = history(&backend, cipher).await;
+        let log = session.seal(None, 1_000).await.unwrap().change;
+        let published = session.head().open_log.as_ref().unwrap().synced_len;
+        drop(session);
+        let head = backend.read_head(&addr()).await.unwrap();
+        let mut bytes = backend.read_log(&addr(), &log, 0..published).await.unwrap();
+        // Leave the checkpoint intact, but lose the complete batches of copied transcript.
+        let cut = u64::from(crate::log::first_frame_len(&bytes).unwrap());
+        assert!(cut < published);
+        bytes.truncate(cut as usize);
+        backend.set_log(&addr(), &log, bytes);
+
+        let view = Session::view(&backend, addr(), &triple(), &deployment(cipher)).await;
+        assert!(
+            matches!(view, Err(SessionError::Corrupt { at, durable_bound })
+            if at == cut && durable_bound == published),
+            "read opened or misclassified a log cut from {published} to {cut} bytes: {:?}",
+            view.err()
+        );
+        let writer = Session::load(&backend, addr(), &triple(), &deployment(cipher)).await;
+        assert!(
+            matches!(writer, Err(SessionError::Corrupt { at, durable_bound })
+            if at == cut && durable_bound == published),
+            "writer opened or misclassified the short log: {:?}",
+            writer.err()
+        );
+        assert_eq!(backend.log_end(&addr(), &log).await.unwrap(), cut);
+        assert_eq!(backend.read_head(&addr()).await.unwrap(), head);
     });
 }
 

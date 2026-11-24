@@ -2391,8 +2391,11 @@ impl broca_module_serve::system_one::ClassifierProvider for TransientThenAnswer 
     }
 }
 
+/// A transient refusal is final for its call key, like any recorded outcome: a repeat returns
+/// the same refusal with the same spend members, before any catalog lookup, and sends nothing.
+/// Another attempt needs a new call key.
 #[tokio::test]
-async fn memory_nonfinal_transient_outcome_resumes_under_its_frozen_admission() {
+async fn memory_transient_outcome_is_final_for_its_call_key() {
     use broca_module_serve::system_one::{
         BatchCatalog, Config, ModelPin, SystemOne, LLM_CLASSIFY_STORE_ROLE,
     };
@@ -2420,30 +2423,25 @@ async fn memory_nonfinal_transient_outcome_resumes_under_its_frozen_admission() 
         Arc::new(broca_module_serve::llm_tools::NoPrivateContent),
     ));
     let body = direct_body(args(), Some("transient"));
-    let failure: Value = serde_json::from_slice(
-        &tools
-            .answer(&body, Some(&owner()), &stamped(1, "owner"))
-            .await
-            .unwrap_err(),
-    )
-    .unwrap();
+    let first = tools
+        .answer(&body, Some(&owner()), &stamped(1, "owner"))
+        .await
+        .unwrap_err();
+    let failure: Value = serde_json::from_slice(&first).unwrap();
     assert_eq!(failure["code"], "provider_error");
     assert_eq!(failure["detail"]["class"], "transient");
     *catalog.0.lock().unwrap() = None;
-    let answer = tools
-        .answer(&body, Some(&owner()), &stamped(1, "owner"))
-        .await
-        .unwrap();
-    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 2);
-    assert_eq!(
-        tools
-            .answer(&body, Some(&owner()), &stamped(1, "owner"))
-            .await
-            .unwrap()
-            .get(),
-        answer.get()
-    );
-    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    for _ in 0..2 {
+        assert_eq!(
+            tools
+                .answer(&body, Some(&owner()), &stamped(1, "owner"))
+                .await
+                .unwrap_err(),
+            first,
+            "a repeat returns the recorded refusal byte for byte"
+        );
+    }
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[derive(Default)]

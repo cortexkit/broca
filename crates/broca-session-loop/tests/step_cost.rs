@@ -104,12 +104,16 @@ fn answer_step(id: &str) -> Vec<NormalizedEvent> {
 #[derive(Default)]
 struct Reads {
     run_start: AtomicUsize,
+    send_records: AtomicUsize,
+    entry_at: AtomicUsize,
 }
 
 /// A session's writer that counts the reads the loop makes through it.
 struct Counting<'s, 'b> {
     session: &'s mut Session<&'b MemoryBackend>,
     reads: Arc<Reads>,
+    /// Serve no queued send's records, as for a send whose records can't be found.
+    hide_sends: bool,
 }
 
 impl Writer for Counting<'_, '_> {
@@ -122,6 +126,10 @@ impl Writer for Counting<'_, '_> {
     }
 
     async fn send_records(&mut self, submission_id: &str) -> Result<Vec<Record>, SessionError> {
+        self.reads.send_records.fetch_add(1, Ordering::SeqCst);
+        if self.hide_sends {
+            return Ok(Vec::new());
+        }
         Writer::send_records(&mut *self.session, submission_id).await
     }
 
@@ -229,6 +237,7 @@ impl Writer for Counting<'_, '_> {
         &self,
         ordinal: u64,
     ) -> Result<Option<broca_session_store::session::StoredEntry>, SessionError> {
+        self.reads.entry_at.fetch_add(1, Ordering::SeqCst);
         Writer::entry_at(&*self.session, ordinal).await
     }
 
@@ -265,15 +274,30 @@ async fn run_on(
     run_id: &str,
     steps: Vec<Vec<NormalizedEvent>>,
 ) -> Arc<Reads> {
+    run_with(session, parts, run_id, steps, false, None).await
+}
+
+/// [`run_on`], its writer serving no queued send's records when `hide_sends` is set. The request
+/// declares a `read` tool its policy doesn't allow, so the run offers no tool, unless `offered`
+/// names a tool it declares and allows instead.
+async fn run_with(
+    session: &mut Session<&MemoryBackend>,
+    parts: &mut MemoryParts,
+    run_id: &str,
+    steps: Vec<Vec<NormalizedEvent>>,
+    hide_sends: bool,
+    offered: Option<&str>,
+) -> Arc<Reads> {
     let provider = StubProvider::new(steps);
     let request: SubmissionRequest = serde_json::from_value(json!({
         "model": {"provider_module_id": "stub", "model_id": "m"},
         "input": [{"role": "user", "content": [{"type": "text", "text": format!("task {run_id}")}]}],
         "tools": [{
-            "name": "read",
+            "name": offered.unwrap_or("read"),
             "description": "Reads a file.",
             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
         }],
+        "policy_allowed": offered.into_iter().collect::<Vec<_>>(),
         "stop_when": [{"type": "step_count", "n": 50}],
     }))
     .unwrap();
@@ -326,6 +350,7 @@ async fn run_on(
     let mut writer = Counting {
         session,
         reads: Arc::clone(&reads),
+        hide_sends,
     };
     broca_session_loop::run::run(&mut writer, parts, admission, &seams)
         .await
@@ -418,4 +443,149 @@ async fn a_step_reads_no_record_back_from_the_open_log() {
     let found = session.find_id(IdKind::CallKey, "h0-key").await.unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(open_record_reads(), before + 1);
+}
+
+/// The records queuing ordered send `id`, which only an idle session can start: a running run
+/// reads it at every boundary and leaves it waiting.
+fn waiting_send(id: &str) -> Vec<Record> {
+    use broca_session_store::record::{DeliveryOrdered, QueuedSend};
+    let order: broca_protocol::DeliveryOrder =
+        serde_json::from_value(json!({"modes": ["idle_start"]})).unwrap();
+    vec![
+        Record::DeliveryOrdered(DeliveryOrdered {
+            submission_id: id.into(),
+            order: serde_json::to_value(&order).unwrap(),
+            sent_by: None,
+        }),
+        Record::QueuedSend(QueuedSend {
+            media: Vec::new(),
+            named_speaker: None,
+            kept_notice: None,
+            message_marks: None,
+            submission_id: id.into(),
+            send_id: None,
+            input: vec![broca_protocol::Message::new(
+                broca_protocol::content::Role::User,
+                vec![ContentBlock::Text {
+                    text: "later".into(),
+                }],
+            )],
+            setup: Vec::new(),
+            written_at_ms: Some(1_000),
+            ts_ms: None,
+            request: Some(
+                json!({
+                    "model": {"provider_module_id": "stub", "model_id": "m"},
+                    "policy_allowed": [],
+                    "tool_choice": {"type": "auto"},
+                    "generation": {},
+                    "stop_when": [],
+                })
+                .into(),
+            ),
+            delivery: None,
+            receipt: None,
+        }),
+    ]
+}
+
+/// An ordered send waiting through a run's boundaries is read once, not at every boundary and
+/// batch close: its records never change while it waits.
+#[tokio::test]
+async fn a_waiting_ordered_send_is_read_once_per_run() {
+    let backend = MemoryBackend::default();
+    let mut session = session(&backend).await;
+    let mut parts = MemoryParts::default();
+    session.append(&waiting_send("q1"), true).await.unwrap();
+    let mut steps: Vec<_> = (0..4).map(|n| tool_step(&format!("c{n}"))).collect();
+    steps.push(answer_step("last"));
+    let reads = run_on(&mut session, &mut parts, "measured", steps).await;
+    assert!(
+        Writer::operations(&session)
+            .queue
+            .iter()
+            .any(|pending| pending.submission_id == "q1"),
+        "the send still waits"
+    );
+    assert_eq!(
+        reads.send_records.load(Ordering::SeqCst),
+        1,
+        "the waiting send's records are read again"
+    );
+}
+
+/// An ordered send whose records can't be found is ended at the boundary that finds it, as a
+/// send whose run failed for it, and the run goes on: it no longer fails every boundary of every
+/// run while the send waits.
+#[tokio::test]
+async fn an_ordered_send_without_its_records_ends_and_the_run_goes_on() {
+    let backend = MemoryBackend::default();
+    let mut session = session(&backend).await;
+    let mut parts = MemoryParts::default();
+    session.append(&waiting_send("q1"), true).await.unwrap();
+    let steps = vec![tool_step("c0"), answer_step("last")];
+    let reads = run_with(&mut session, &mut parts, "measured", steps, true, None).await;
+    assert!(
+        Writer::operations(&session).queue.is_empty(),
+        "the send left the queue"
+    );
+    assert_eq!(reads.send_records.load(Ordering::SeqCst), 1);
+    let failure = session
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .find_map(|(_, record)| match record {
+            Record::Retraction(retraction) if retraction.submission_id == "q1" => {
+                retraction.failure
+            }
+            _ => None,
+        })
+        .expect("the send is retracted with a failure");
+    let failure: broca_records::record::QueuedAdmissionFailure =
+        serde_json::from_value(failure).unwrap();
+    assert_eq!(failure.run_id.0, "measured");
+    assert_eq!(failure.error.class, broca_protocol::ErrorClass::Permanent);
+    assert_eq!(failure.error.provider_code.as_deref(), Some("runner_error"));
+}
+
+/// A session whose earlier run offered a tool the next doesn't, so the session has a signed floor,
+/// and a run on it taking `tool_steps` tool steps before its answer: the entry reads by place
+/// that last run made.
+async fn floor_reads_of_a_run(tool_steps: usize) -> usize {
+    let backend = MemoryBackend::default();
+    let mut session = session(&backend).await;
+    let mut parts = MemoryParts::default();
+    run_with(
+        &mut session,
+        &mut parts,
+        "h0",
+        vec![answer_step("a0")],
+        false,
+        Some("list"),
+    )
+    .await;
+    let mut steps: Vec<_> = (0..tool_steps)
+        .map(|n| tool_step(&format!("c{n}")))
+        .collect();
+    steps.push(answer_step("last"));
+    let reads = run_on(&mut session, &mut parts, "measured", steps).await;
+    let floor = broca_session_loop::run::signed_floor(&session, &parts, &mut Default::default())
+        .await
+        .unwrap();
+    assert!(
+        floor.is_some_and(|floor| floor > 0),
+        "a signed floor: {floor:?}"
+    );
+    reads.entry_at.load(Ordering::SeqCst)
+}
+
+/// Every step states the entry the session's signed floor goes through, by its id. A placed
+/// message keeps its id, so a run reads that entry from the session once, not at every step.
+#[tokio::test]
+async fn the_signed_floor_entry_is_read_once_per_run() {
+    let short = floor_reads_of_a_run(1).await;
+    let long = floor_reads_of_a_run(6).await;
+    assert!(short > 0, "the run reads the floor's entry");
+    assert_eq!(long, short, "five more steps read the floor's entry again");
 }

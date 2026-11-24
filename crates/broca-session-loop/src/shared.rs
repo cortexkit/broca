@@ -335,6 +335,9 @@ impl Writer for ActorWriter {
     }
 
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
+        // A batch that ends or pauses the run is a barrier whatever the caller asked, as in
+        // `append_with`: only then is it durable when the run reports it.
+        let barrier = barrier || crate::writer::ends_run(records);
         let (missed, first) = self
             .ask(|reply| Request::Append {
                 records: records.to_vec(),
@@ -344,7 +347,7 @@ impl Writer for ActorWriter {
             .await?;
         self.catch_up(missed)?;
         self.fold_own(first, records)?;
-        if !records.is_empty() && (barrier || crate::writer::ends_run(records)) {
+        if barrier && !records.is_empty() {
             self.durable_through(first + records.len() as u64 - 1);
         }
         Ok(first)
@@ -821,6 +824,32 @@ mod tests {
         assert_eq!(writer.operations().encode(), session.operations().encode());
     }
 
+    /// A batch that pauses or ends the run is a barrier even when its caller didn't ask for one,
+    /// so the actor syncs it before the run reports it durable.
+    #[tokio::test]
+    async fn an_append_that_pauses_the_run_is_always_a_barrier() {
+        let backend = MemoryBackend::default();
+        let session = session(&backend).await;
+        let (mut writer, mut link) = ActorWriter::new(&session, None);
+        let pause = Record::Pause(broca_session_store::record::Pause {
+            run_id: "r".into(),
+            reason: broca_protocol::caller::PauseReason::Restart,
+            ts_ms: None,
+            error: None,
+            account_limit: None,
+        });
+        let records = [pause];
+        let request = tokio::select! {
+            _ = writer.append(&records, false) => unreachable!("the actor never answers"),
+            request = link.next() => request,
+        };
+        let asked = match request {
+            Some(super::Request::Append { barrier, .. }) => barrier,
+            _ => panic!("the run asked for an append"),
+        };
+        assert!(asked, "the pause was appended without a barrier");
+    }
+
     /// A batch built during a hold sees what the actor appended just before it: the property
     /// that makes `append_with` safe when another appender shares the session.
     #[tokio::test]
@@ -949,6 +978,7 @@ mod tests {
                 calls: Default::default(),
                 rich_ui: None,
                 runner: None,
+                floor_mid: Default::default(),
             };
             placed.append(&[input("placed")], true).await.unwrap();
         };

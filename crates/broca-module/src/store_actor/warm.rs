@@ -361,7 +361,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
                     if let Some(registry) = &self.registry {
                         registry.stop_idle_warm(&self.key, "billing_failed");
                     }
-                    let _ = pending.reply.send(WarmOutcome::Error(error));
+                    let _ = pending.reply.send(WarmOutcome::Error(error.to_string()));
                     return;
                 }
             }

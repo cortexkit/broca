@@ -380,7 +380,7 @@ struct SealedTranscript(std::sync::Mutex<SealedParts>);
 
 #[derive(Default)]
 struct SealedParts {
-    /// Each sealed entry read so far, by message id.
+    /// Each sealed entry the views last asked for name, by message id.
     by_mid: std::collections::HashMap<String, SealedEntry>,
 }
 
@@ -554,6 +554,13 @@ async fn sealed_entries<W: Writer>(
     }
     let mut parts = kept.0.lock().expect("sealed transcript");
     parts.by_mid.extend(read);
+    // Only what the current views name is kept: an entry an earlier view named and these don't
+    // would otherwise stay held for as long as the session is open.
+    let named_now: std::collections::HashSet<&str> =
+        wanted.iter().map(|mid| mid.as_str()).collect();
+    parts
+        .by_mid
+        .retain(|mid, _| named_now.contains(mid.as_str()));
     if let Some(mid) = cuts
         .iter()
         .find(|mid| !in_window.contains(mid.as_str()) && !parts.by_mid.contains_key(*mid))
@@ -1109,10 +1116,7 @@ pub async fn floor_through<W: Writer>(
     if let Some(mid) = v2::host::floor_entry(Some(through), entries) {
         return Ok(Some(mid.to_owned()));
     }
-    Ok(writer
-        .entry_at(through)
-        .await?
-        .and_then(|entry| entry.state.facts.as_ref().map(|facts| facts.mid.clone())))
+    Ok(writer.entry_mid_at(through).await?)
 }
 
 /// The version of the view under which the request whose usage `entry` reports was rendered,
@@ -1405,8 +1409,13 @@ pub async fn notice<W: Writer, P, T>(
         .unwrap_or_else(|error| error.into_inner())
         .configure(&frozen(admission), admission.manifest.as_deref());
     let floor = floor_through(writer, &entries, signed_floor).await?;
-    let conditions = conditions_for(writer, admission, &entries, false, floor.as_deref())
-        .map_err(LoopError::Parts)?;
+    // Conditions that can't be stated announce nothing either: the next step's boundary meets
+    // the same failure and ends the run `compaction_unavailable` (`apply_boundary`), once the
+    // step's tool batch has closed, rather than failing the run here with its tool turn open.
+    let Ok(conditions) = conditions_for(writer, admission, &entries, false, floor.as_deref())
+    else {
+        return Ok(());
+    };
     let applied = ctx.session.state.lock().await.applied_identity();
     let mut setup =
         v2::conditions::setup_request(&ctx.preset, &conditions, (seams.now_ms)(), false);

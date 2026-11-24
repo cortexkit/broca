@@ -54,9 +54,13 @@ impl StoreBilling {
         bind: &BindIdentity,
         parts: &dyn Parts,
         run_id: &str,
-    ) -> Result<(), String> {
-        let (records, attempts) =
-            broca_session_loop::billing::run_billing_inputs(session, run_id, bind, parts).await?;
+    ) -> Result<(), BillingFailure> {
+        let records = broca_session_loop::billing::session_records(session, run_id)
+            .await
+            .map_err(BillingFailure::Failed)?;
+        let attempts = broca_session_loop::billing::attempt_evidence(&records, run_id);
+        let records = broca_session_loop::billing::billing_records(&records, run_id, bind, parts)
+            .map_err(BillingFailure::Unbillable)?;
         let index = Arc::clone(&self.index);
         let resolver = Arc::clone(&self.resolver);
         let run_id = RunId(run_id.to_owned());
@@ -64,7 +68,27 @@ impl StoreBilling {
             index.emit_run_with_attempts(&records, &run_id, &attempts, resolver.as_ref())
         })
         .await
-        .map_err(|error| format!("the usage export task failed: {error}"))?
-        .map_err(|error| format!("the usage export refused the facts: {error}"))
+        .map_err(|error| BillingFailure::Failed(format!("the usage export task failed: {error}")))?
+        .map_err(|error| {
+            BillingFailure::Failed(format!("the usage export refused the facts: {error}"))
+        })
+    }
+}
+
+/// Why a run's spend facts weren't written.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BillingFailure {
+    /// The run's own records don't build its facts. They never change, so trying again builds
+    /// nothing either.
+    Unbillable(String),
+    /// Reading the records or the insert failed; a later try may succeed.
+    Failed(String),
+}
+
+impl std::fmt::Display for BillingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unbillable(reason) | Self::Failed(reason) => f.write_str(reason),
+        }
     }
 }

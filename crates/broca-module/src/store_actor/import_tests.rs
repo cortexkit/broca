@@ -2423,6 +2423,86 @@ async fn a_view_naming_800_sealed_messages_reads_them_once() {
     .unwrap();
 }
 
+/// The sealed entries a session keeps for its compaction transcript follow the views that name
+/// them: once a newer view stops naming a sealed message, the transcript no longer holds it, so
+/// a session whose views name different messages over time doesn't keep every one it ever read.
+#[tokio::test]
+async fn sealed_messages_a_view_stops_naming_are_let_go() {
+    const NAMED: u64 = 6;
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let source = Source::of("many", many_exchanges(NAMED + 1), None);
+    let (commands, served) = serve(create(backend).await.unwrap());
+    imported(ask(&commands, source.import(source.params("imp-1"))).await);
+    drop(commands);
+    let mut session = served.await.unwrap();
+    let compactor = Compactor::default();
+    let mut parts = MemoryParts::default();
+    run_once(&mut session, &mut parts, &compactor, ("r1", "m"), "Next.").await;
+    let cut = || EditOp::Cut {
+        through: format!("msg_a{NAMED}"),
+    };
+    let mut edits: Vec<(u64, EditOp)> = (1..=NAMED)
+        .map(|n| (1, drop_part(&format!("msg_a{n}"), "1")))
+        .collect();
+    edits.push((1, cut()));
+    compactor.answer_next_ride(view_of(1, edits));
+    run_once(&mut session, &mut parts, &compactor, ("r2", "m2"), "After.").await;
+    drop(session);
+    let session = load(backend).await.unwrap();
+
+    let state = broca_session_loop::compaction::restore(
+        &Writer::open_log_records(&session).await.unwrap(),
+        &bind(),
+        Writer::operations(&session),
+    )
+    .unwrap();
+    let compaction = Arc::new(broca_core::compaction_v2::session::Session::default());
+    *compaction.state.lock().await = state;
+    let ctx = broca_session_loop::compaction::Ctx {
+        session: compaction.clone(),
+        provider: "compactor".into(),
+        preset: "head".into(),
+        earlier: None,
+        window: Default::default(),
+    };
+    let first = broca_session_loop::compaction::transcript(&session, &ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.sealed.len() as u64,
+        NAMED,
+        "every named sealed message"
+    );
+    let read: Vec<(u64, std::sync::Weak<broca_protocol::Message>)> = first
+        .sealed
+        .iter()
+        .map(|(ordinal, message)| (*ordinal, Arc::downgrade(message)))
+        .collect();
+    drop(first);
+
+    // A newer view keeps only the cut: the messages the first view dropped parts of are no
+    // longer named.
+    let mut narrower = broca_core::compaction_v2::state::State::default();
+    let only_cut = view_of(2, vec![(2, cut())]);
+    narrower.restore_accepted(only_cut.clone()).unwrap();
+    narrower.restore_applied(&only_cut.applied()).unwrap();
+    *compaction.state.lock().await = narrower;
+    let later = broca_session_loop::compaction::transcript(&session, &ctx)
+        .await
+        .unwrap();
+    assert_eq!(later.sealed.len(), 1, "only the cut target is named");
+    let cut_ordinal = later.sealed[0].0;
+    let still_held: Vec<u64> = read
+        .iter()
+        .filter(|(ordinal, message)| *ordinal != cut_ordinal && message.upgrade().is_some())
+        .map(|(ordinal, _)| *ordinal)
+        .collect();
+    assert_eq!(
+        still_held,
+        Vec::<u64>::new(),
+        "sealed messages no view names any more are still held"
+    );
+}
 /// One of Thalamus's published exports (`ck-session-import`'s `thalamus-export-v1` fixtures),
 /// imported through `session.import` into a new session: the reply, the session as a reload
 /// finds it, and Thalamus's own export reply.

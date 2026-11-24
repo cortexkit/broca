@@ -73,6 +73,7 @@ pub mod interned;
 pub mod keys;
 pub mod log;
 pub mod metrics;
+pub mod placement;
 pub mod prune;
 pub mod record;
 pub mod segment;

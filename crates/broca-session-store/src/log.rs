@@ -526,16 +526,13 @@ pub enum Damage {
 /// How a log ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEnd {
+    /// The bytes end on a complete batch boundary. The damage verdict still checks the
+    /// published minimum length.
     Clean,
     /// The batch starting at `at` is incomplete: a write that never finished.
-    TornTail {
-        at: u64,
-    },
+    TornTail { at: u64 },
     /// Reading stopped at the frame starting at `at`.
-    Damaged {
-        at: u64,
-        damage: Damage,
-    },
+    Damaged { at: u64, damage: Damage },
 }
 
 /// A log as read: its checkpoint, its records with their seqs, and how it ends.

@@ -99,6 +99,168 @@ async fn create_in(root: &Path, class: StorageClass, key: &BindIdentity) {
     );
 }
 
+#[tokio::test]
+async fn the_first_read_repairs_a_closed_sessions_damaged_log() {
+    use crate::serve::{ServeHandler, SessionReadRequest};
+    use broca_protocol::{ContentBlock, ToolOutput};
+    use broca_session_store::backend::MemoryBackend;
+    use broca_session_store::record::Record;
+    use broca_session_store::session::SessionError;
+    use broca_session_store::synthetic::{self, Shape};
+
+    let root = state_root("repair-on-read");
+    let key = key(&root, "damaged");
+    let addr = SessionAddr(broca_core::session_addr(&key));
+    let store = StorageClass::Ordinary.store_root(&root);
+    let memory = MemoryBackend::default();
+    let mut source = Session::create(&memory, addr.clone(), triple(&key), &deployment(), false)
+        .await
+        .unwrap();
+    let shape = Shape {
+        runs: 1,
+        calls_per_1000: 1,
+        ..Shape::production(4)
+    };
+    synthetic::write(&mut source, &shape).await.unwrap();
+    let records: Vec<_> = source
+        .open_log_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, mut record)| {
+            if let Record::RunStart(start) = &mut record {
+                start.compaction_plan_version = Some(cortexkit_compaction_view::PLAN_VERSION);
+            }
+            record
+        })
+        .collect();
+    let reply = records
+        .iter()
+        .position(|record| matches!(record, Record::ToolReply(_)))
+        .unwrap();
+    assert!(matches!(records[reply + 1], Record::ToolOutcome(_)));
+    let later = records[reply + 2..]
+        .iter()
+        .find(|record| matches!(record, Record::StepStart(_)))
+        .unwrap();
+    let mid = records[..reply]
+        .iter()
+        .find_map(|record| match record {
+            Record::BatchStart(start) => start.mid.as_deref(),
+            _ => None,
+        })
+        .unwrap();
+
+    let mut session = Session::create(
+        LocalBackend::new(&store),
+        addr.clone(),
+        triple(&key),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    session.append(&records[..reply], true).await.unwrap();
+    let (log, from) = session.open_log();
+    session
+        .append(&records[reply..reply + 2], false)
+        .await
+        .unwrap();
+    let (_, to) = session.open_log();
+    session
+        .append(std::slice::from_ref(later), false)
+        .await
+        .unwrap();
+    drop(session);
+
+    // The dispatch is synced. Lose the unsynced result and outcome while the next frame is intact.
+    let path = store
+        .join("logs")
+        .join(&addr.0)
+        .join(broca_session_store::codec::hex(&log.0));
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[from as usize + 60] ^= 0x40;
+    bytes[to as usize - 20] ^= 0x40;
+    std::fs::write(path, bytes).unwrap();
+    let view = Session::view(
+        LocalBackend::new(&store),
+        addr.clone(),
+        &triple(&key),
+        &deployment(),
+    )
+    .await;
+    assert!(matches!(view, Err(SessionError::NeedsRecovery)));
+
+    let (_, registry) = module(&root, runtime(&root).await);
+    assert!(registry.slot_state(&key).is_none());
+    let page = registry
+        .read(SessionReadRequest::new(key.clone(), Some(1), Some(10)))
+        .await
+        .expect("the read opens a writer and repairs the damaged log");
+    assert_eq!(
+        page.history_version,
+        crate::store_exposure::served_history_version(1)
+    );
+    assert_eq!(page.messages.len(), 4, "{:?}", page.messages);
+    let [results, notice] = &page.messages[2..] else {
+        unreachable!()
+    };
+    assert_eq!(results.mid, mid);
+    assert!(
+        matches!(results.message.content.as_slice(), [ContentBlock::ToolResult(result)]
+        if result.is_error && matches!(&result.output, ToolOutput::Error { message, .. } if message.starts_with("outcome_unknown:"))),
+        "{:?}",
+        results.message.content
+    );
+    assert!(
+        matches!(notice.message.content.as_slice(), [ContentBlock::Text { text }]
+        if text.starts_with("Storage damage removed records"))
+    );
+    assert_ne!(notice.mid, results.mid);
+
+    let stored = Session::view(
+        LocalBackend::new(&store),
+        addr,
+        &triple(&key),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let entries = stored.entries(3, 2).await.unwrap();
+    let facts: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.state.facts.as_ref().unwrap())
+        .collect();
+    assert!(facts.iter().all(|facts| facts.native
+        && facts.render_tags
+        && facts.runner_tag_base.is_none()
+        && facts.run_id.as_deref() == Some("run-0000")));
+    assert!(facts[0].written_at_ms.is_some());
+    assert_eq!(facts[0].written_at_ms, facts[1].written_at_ms);
+    assert!(facts[0].notice.is_none());
+    assert_eq!(facts[1].notice.as_ref().unwrap().sender, "broca");
+    let tagged = stored
+        .tagged_entry(u64::MAX)
+        .await
+        .unwrap()
+        .expect("the kept assistant has a base");
+    assert_eq!(
+        tagged.ordinal, 2,
+        "repair entries must not claim a runner tag base"
+    );
+    assert_eq!(facts[0].tag_base, 6);
+    assert_eq!(facts[1].tag_base, 6);
+    assert_eq!(
+        stored
+            .compaction_tagged_entry(7)
+            .await
+            .unwrap()
+            .unwrap()
+            .ordinal,
+        4
+    );
+}
+
 #[cfg(feature = "test-clock")]
 async fn closed_read_fixture(
     name: &str,
