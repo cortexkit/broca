@@ -764,6 +764,25 @@ for i in "${!CLIENT_NAMES[@]}"; do
   CLIENT_BACKUPS[$i]="$client_backup"
 done
 
+# Only the newest ROLLBACK_KEEP snapshots of each binary stay, the one just written among them,
+# with their sidecars and dSYMs. Every placement writes one per binary (about 15 MB each, plus a
+# dSYM for the module), and with several deploys a day the shared staging folder grew past a
+# gigabyte in a week. Names are matched exactly, so other modules' snapshots are never touched.
+ROLLBACK_KEEP="${ROLLBACK_KEEP:-3}"
+prune_rollbacks() { # <binary name>
+  local snapshot
+  ( cd "$ROLLBACK_DIR" && ls -1 ) \
+    | grep -E "^${1//./\\.}\.rollback-[0-9]{8}T[0-9]{6}Z(\.[0-9]+)?$" \
+    | sort -r | tail -n +$((ROLLBACK_KEEP + 1)) \
+    | while IFS= read -r snapshot; do
+        rm -rf -- "$ROLLBACK_DIR/$snapshot" "$ROLLBACK_DIR/$snapshot.sha256" "$ROLLBACK_DIR/$snapshot.dSYM"
+      done
+}
+prune_rollbacks "$(basename "$DEST")"
+for name in "${CLIENT_NAMES[@]}"; do
+  prune_rollbacks "$name"
+done
+
 write_report
 
 BEFORE_INODE="$(broca_file_inode "$DEST")"

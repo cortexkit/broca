@@ -476,6 +476,7 @@ async fn stored_read_future_stays_small() {
             &registry,
             &key,
             crate::store_reads::StoreReadRequest::Page(Default::default()),
+            None,
         )
     });
     eprintln!("stored read future bytes={bytes}");

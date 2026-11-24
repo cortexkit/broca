@@ -24,6 +24,7 @@
 //! names anything here and answers `unknown_ref`, exactly like an id that never existed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use base64::Engine;
 use broca_protocol::content::{ContentBlock, Message, Role, ToolOutput, ToolOutputPart};
@@ -606,7 +607,7 @@ pub async fn message_output_refs<H: ServeHandler + ?Sized>(
         cache: BTreeMap::new(),
         locations: BTreeMap::new(),
     };
-    let manifest = handler.frozen_manifest(session).await?;
+    let manifest = message_manifest(handler, session, &entry, &mut BTreeMap::new()).await?;
     let refs = derive_message(&mut messages, &entry, manifest.as_deref()).await?;
     Ok(Some((lineage, refs)))
 }
@@ -638,10 +639,11 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
             .collect(),
         locations: BTreeMap::new(),
     };
-    let manifest = handler.frozen_manifest(session).await?;
+    let mut manifests = BTreeMap::new();
     let mut sets = BTreeMap::new();
     for entry in entries.iter().filter(|entry| has_sets(entry)) {
         let entry = native_entry(entry.clone());
+        let manifest = message_manifest(handler, session, &entry, &mut manifests).await?;
         sets.insert(
             entry.ordinal,
             derive_message(&mut messages, &entry, manifest.as_deref())
@@ -650,6 +652,26 @@ pub async fn page_output_refs<H: ServeHandler + ?Sized>(
         );
     }
     Ok(sets)
+}
+
+/// The plan manifest the run that wrote `entry` was admitted under, which decides the calls its
+/// output references read: a later run may have been admitted under a refreshed plan. Read once
+/// per run, kept in `manifests`.
+async fn message_manifest<H: ServeHandler + ?Sized>(
+    handler: &H,
+    session: &LineageKey,
+    entry: &SessionReadMessage,
+    manifests: &mut BTreeMap<String, Option<Arc<broca_records::record::PlanManifest>>>,
+) -> Result<Option<Arc<broca_records::record::PlanManifest>>, ServeError> {
+    let Some(run) = entry.run.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(manifest) = manifests.get(&run.run_id) {
+        return Ok(manifest.clone());
+    }
+    let manifest = handler.run_manifest(session, &run.run_id).await?;
+    manifests.insert(run.run_id.clone(), manifest.clone());
+    Ok(manifest)
 }
 
 async fn derive_message<H: ServeHandler + ?Sized>(

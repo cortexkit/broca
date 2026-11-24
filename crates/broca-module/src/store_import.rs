@@ -47,6 +47,9 @@ pub struct ImportRoots {
     roots: Vec<PathBuf>,
     /// Broca's own import folder: the only place a source file is ever deleted from.
     delete_folder: Option<PathBuf>,
+    /// A private folder under the state root where an SQLite source is copied to be read (see
+    /// [`read_source`]). `None` refuses an SQLite source.
+    scratch: Option<PathBuf>,
 }
 
 impl ImportRoots {
@@ -55,7 +58,15 @@ impl ImportRoots {
         Self {
             roots,
             delete_folder,
+            scratch: None,
         }
+    }
+
+    /// These roots, copying an SQLite source into `scratch` to read it. The folder must be
+    /// private to broca, and cleared of copies a crash left whenever the session store opens.
+    pub fn with_scratch(mut self, scratch: PathBuf) -> Self {
+        self.scratch = Some(scratch);
+        self
     }
 
     /// The configured roots, broca's own import folder under `home` by default.
@@ -117,28 +128,142 @@ impl ImportRoots {
 
 /// Deletes what fed an import once its session is durable: an OpenCode extract/export and its side
 /// files, or for Pi only the side files, never the journal, wherever it lies. Each only when
-/// [`ImportRoots::deletable`] allows it. A failed delete is logged: the session is durable, so
-/// the import stands.
-pub fn delete_sources(roots: &ImportRoots, harness: ImportHarness, source: &Path) {
-    let sends = ck_session_import::head::sends_path(source);
-    let calls = ck_session_import::head::calls_path(source);
-    let mut doomed = vec![sends, calls];
+/// [`ImportRoots::deletable`] allows it, and only while its path still names the file the import
+/// read: a producer may have written a newer export, or a side file, at the same path while the
+/// import was staging, and that file fed nothing. A failed delete is logged: the session is
+/// durable, so the import stands.
+pub fn delete_sources(roots: &ImportRoots, harness: ImportHarness, sources: &ImportSources) {
+    let mut doomed: Vec<&ReadFile> = sources.side_files.iter().collect();
     if harness != ImportHarness::Pi {
-        doomed.push(source.to_path_buf());
+        doomed.push(&sources.source);
     }
-    for path in doomed {
-        if !roots.deletable(&path) {
+    for file in doomed {
+        if !roots.deletable(&file.path) || !file.unchanged() {
             continue;
         }
-        if let Err(error) = std::fs::remove_file(&path) {
+        if let Err(error) = std::fs::remove_file(&file.path) {
             tracing::warn!(
                 target: "broca.store_import",
-                path = %path.display(),
+                path = %file.path.display(),
                 error = %error,
                 "an import's source could not be deleted after its session became durable",
             );
         }
     }
+}
+
+/// What fed an import: its source file, and the side files read with it.
+#[derive(Debug, Clone)]
+pub struct ImportSources {
+    pub source: ReadFile,
+    pub side_files: Vec<ReadFile>,
+}
+
+/// A file an import read, and how it stood when it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFile {
+    pub path: PathBuf,
+    stamp: FileStamp,
+}
+
+impl ReadFile {
+    /// The file at `path` as it stands now.
+    pub fn now(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            stamp: FileStamp::of(&std::fs::metadata(path)?),
+        })
+    }
+
+    /// Whether the path still names the file as it was read: the same file, at the same length,
+    /// last changed at the same time.
+    fn unchanged(&self) -> bool {
+        std::fs::metadata(&self.path).is_ok_and(|meta| FileStamp::of(&meta) == self.stamp)
+    }
+}
+
+/// What tells one file at a path from another written there later: its device and inode where
+/// the platform has them, its length and its modification time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            #[cfg(unix)]
+            device: meta.dev(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+}
+
+/// Reads the whole file at `path` through one handle, with how it stood when read.
+fn read_whole(path: &Path) -> std::io::Result<(Vec<u8>, ReadFile)> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let stamp = FileStamp::of(&file.metadata()?);
+    let read = ReadFile {
+        path: path.to_path_buf(),
+        stamp,
+    };
+    Ok((bytes, read))
+}
+
+/// A private copy of an SQLite source, removed when it is dropped, whatever ends the read.
+struct SourceCopy(PathBuf);
+
+impl Drop for SourceCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Copies the file at `path`, through one handle, into a new private file in `scratch`, hashing
+/// the bytes as they are copied, so the copy holds exactly the bytes the digest covers. SQLite
+/// reads a file by its path, and a producer may replace the source between two opens of it.
+fn copy_hashed(path: &Path, scratch: &Path) -> std::io::Result<(SourceCopy, String, ReadFile)> {
+    use std::io::{Read as _, Write as _};
+    let mut source = std::fs::File::open(path)?;
+    broca_owner_only::create_dir_all(scratch)?;
+    let name = format!(
+        "source-{}.db",
+        broca_session_store::codec::hex(&broca_session_store::keys::random_id().0)
+    );
+    let copy = SourceCopy(scratch.join(name));
+    let mut file = broca_owner_only::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&copy.0)?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let n = source.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buffer[..n]);
+        file.write_all(&buffer[..n])?;
+    }
+    let stamp = FileStamp::of(&source.metadata()?);
+    let read = ReadFile {
+        path: path.to_path_buf(),
+        stamp,
+    };
+    Ok((copy, format!("{:x}", digest.finalize()), read))
 }
 
 /// An import or install refused, by code.
@@ -237,11 +362,12 @@ pub fn seed_run_id(import_id: &str) -> String {
 }
 
 /// What an import reads before it writes: the history, its media and the side file's facts,
-/// from the file `params` names, once the path guard and its digest admit it.
+/// from the file `params` names, once the path guard and its digest admit it. Returns the files
+/// read, each as it stood when read, so only those are deleted once the import is durable.
 pub fn read_source(
     params: &FileImportParams,
     roots: &ImportRoots,
-) -> Result<(PathBuf, HeadHistory), ImportRefusal> {
+) -> Result<(ImportSources, HeadHistory), ImportRefusal> {
     let path = roots.admit(Path::new(&params.source.path))?;
     let unreadable = |error| {
         ImportRefusal::new(
@@ -249,18 +375,22 @@ pub fn read_source(
             format!("the source file could not be read: {error}"),
         )
     };
-    // SQLite reads its own extract. JSON/JSONL sources are hashed from the very bytes parsed,
-    // so those readers never observe a second read with different bytes.
+    // Every reader reads the very bytes hashed. JSON/JSONL sources are parsed from the buffer
+    // hashed; SQLite reads a private copy written as it was hashed, since it opens a path.
     let sqlite = params.source.harness == ImportHarness::OpenCode1;
-    let bytes = if sqlite {
-        Vec::new()
+    let (bytes, digest, copy, source) = if sqlite {
+        let scratch = roots.scratch.as_deref().ok_or_else(|| {
+            ImportRefusal::new(
+                "import_source_unreadable",
+                "no private folder to read an SQLite source from",
+            )
+        })?;
+        let (copy, digest, source) = copy_hashed(&path, scratch).map_err(unreadable)?;
+        (Vec::new(), digest, Some(copy), source)
     } else {
-        std::fs::read(&path).map_err(unreadable)?
-    };
-    let digest = if sqlite {
-        ck_session_import::opencode_extract::sha256_file(&path).map_err(unreadable)?
-    } else {
-        format!("{:x}", Sha256::digest(&bytes))
+        let (bytes, source) = read_whole(&path).map_err(unreadable)?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        (bytes, digest, None, source)
     };
     if !digest.eq_ignore_ascii_case(&params.source.sha256) {
         return Err(ImportRefusal::new(
@@ -278,13 +408,18 @@ pub fn read_source(
             ck_session_import::head::pi::read(&bytes, &params.source.session, &mut check)?
         }
         ImportHarness::OpenCode1 => {
-            ck_session_import::head::opencode1::read(&path, &params.source.session, &mut check)?
+            let copy = copy
+                .as_ref()
+                .expect("an SQLite source is read from its copy");
+            ck_session_import::head::opencode1::read(&copy.0, &params.source.session, &mut check)?
         }
     };
+    drop(copy);
+    let mut side_files = Vec::new();
     let calls = ck_session_import::head::calls_path(&path);
     if calls.exists() {
         let calls = roots.admit(&calls)?;
-        let bytes = std::fs::read(&calls).map_err(|error| {
+        let (bytes, read) = read_whole(&calls).map_err(|error| {
             ImportRefusal::new(
                 "import_calls_unreadable",
                 format!("the calls side file could not be read: {error}"),
@@ -292,12 +427,13 @@ pub fn read_source(
         })?;
         let rows = ck_session_import::head::read_calls(&bytes)?;
         ck_session_import::head::apply_calls(&mut history, &rows)?;
+        side_files.push(read);
     }
     // A send delivered with a tool result names the opaque key supplied by the calls file.
     let sends = ck_session_import::head::sends_path(&path);
     if sends.exists() {
         let sends = roots.admit(&sends)?;
-        let bytes = std::fs::read(&sends).map_err(|error| {
+        let (bytes, read) = read_whole(&sends).map_err(|error| {
             ImportRefusal::new(
                 "import_sends_unreadable",
                 format!("the side file could not be read: {error}"),
@@ -305,8 +441,9 @@ pub fn read_source(
         })?;
         let rows = ck_session_import::head::read_sends(&bytes)?;
         ck_session_import::head::apply_sends(&mut history, rows)?;
+        side_files.push(read);
     }
-    Ok((path, history))
+    Ok((ImportSources { source, side_files }, history))
 }
 
 /// The highest part number the protocol's integers carry.

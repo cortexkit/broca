@@ -55,6 +55,7 @@ sha256:04661badca66be22115d02e19556b8692235f2e483f51349207795557a3a85e7 (2731 by
 sha256:4b20dae144e3bbe52a622973475c0ea5d97c35fbeedbaad6dd720f6c0ae4187c (2166 bytes)
 == cut after record 14 of 24: tool calls
 [
+    "\"terminal_synced c1\"",
     "\"withdraw c1 after_run_end=false\"",
 ]
 == cut after record 18 of 24: request count
@@ -151,6 +152,7 @@ sha256:04661badca66be22115d02e19556b8692235f2e483f51349207795557a3a85e7 (2731 by
 sha256:4b20dae144e3bbe52a622973475c0ea5d97c35fbeedbaad6dd720f6c0ae4187c (2166 bytes)
 == cut after record 14 of 24: tool calls
 [
+    "\"terminal_synced c1\"",
     "\"withdraw c1 after_run_end=false\"",
 ]
 == cut after record 18 of 24: request count
@@ -247,6 +249,7 @@ sha256:c11d0aa7005415b9bd8bc1dc8045bbfb14b90e3d65da982a0070e82e4d3fb86a (2731 by
 sha256:236160f391cb05615432285d22fb24044e697e79673d5a60ae018ee88ade71ab (2166 bytes)
 == cut after record 14 of 24: tool calls
 [
+    "\"terminal_synced c1\"",
     "\"withdraw c1 after_run_end=false\"",
 ]
 == cut after record 18 of 24: request count
@@ -343,6 +346,7 @@ sha256:c11d0aa7005415b9bd8bc1dc8045bbfb14b90e3d65da982a0070e82e4d3fb86a (2731 by
 sha256:236160f391cb05615432285d22fb24044e697e79673d5a60ae018ee88ade71ab (2166 bytes)
 == cut after record 14 of 24: tool calls
 [
+    "\"terminal_synced c1\"",
     "\"withdraw c1 after_run_end=false\"",
 ]
 == cut after record 18 of 24: request count

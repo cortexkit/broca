@@ -919,6 +919,36 @@ impl OpenIds {
             .map(|at| transcript[at].1)
     }
 
+    /// The frames this index places nearest `seq` in the open log, of the transcript records and
+    /// the records read back by place: the last one before `seq` and the first one after it. A
+    /// log's seqs grow frame by frame, so the frame of a record at `seq`, if the log holds one,
+    /// lies between the two.
+    pub fn places_around(&self, seq: u64) -> (Option<FramePlace>, Option<FramePlace>) {
+        let around = |placed: &[(u64, FramePlace)]| {
+            let at = placed.partition_point(|(placed, _)| *placed < seq);
+            let before = at.checked_sub(1).map(|before| placed[before]);
+            let after = placed[at..]
+                .iter()
+                .find(|(placed, _)| *placed > seq)
+                .copied();
+            (before, after)
+        };
+        let (transcript_before, transcript_after) = around(&self.0.transcript);
+        let (placed_before, placed_after) = around(&self.0.places);
+        let before = [transcript_before, placed_before]
+            .into_iter()
+            .flatten()
+            .max_by_key(|(placed, _)| *placed);
+        let after = [transcript_after, placed_after]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(placed, _)| *placed);
+        (
+            before.map(|(_, place)| place),
+            after.map(|(_, place)| place),
+        )
+    }
+
     /// Files the ids `record`, at `seq` with its frame at `place`, names. Returns whether a
     /// lookup takes the record from memory: the caller then either leaves it with the kept
     /// records and says so ([`Self::kept_holds`]), or hands it over ([`Self::hold`]).

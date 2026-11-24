@@ -754,14 +754,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_claude_model_freezes_v9() {
+    fn a_claude_model_freezes_v9_and_a_gemini_model_v10() {
         assert_eq!(
             crate::families::google_codeassist_renderer_version("claude-sonnet-5-5-high"),
             9
         );
         assert_eq!(
             crate::families::google_codeassist_renderer_version("gemini-3.5-flash-low"),
-            7
+            10
         );
         assert_eq!(
             crate::families::google_codeassist_frozen_config("claude-opus-5-5-thinking")
@@ -770,7 +770,7 @@ mod tests {
         );
         assert_eq!(
             crate::families::google_codeassist_frozen_config("gemini-2.5-flash").renderer_version,
-            7
+            10
         );
     }
 

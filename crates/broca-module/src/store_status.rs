@@ -1235,7 +1235,7 @@ impl StoreRead<'_> {
         {
             Some(StoreReadReply::RunAdmission(answer)) => answer,
             None => Ok(None),
-            _ => unreachable!("run admission read answered another request"),
+            Some(_) => Err(crate::store_reads::mismatched()),
         }
     }
 

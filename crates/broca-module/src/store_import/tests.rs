@@ -87,14 +87,18 @@ fn only_files_inside_the_import_folder_are_ever_deleted() {
     );
     assert!(!roots.deletable(&folder));
     // An OpenCode 2 export and its side file go; a file outside the folder stays.
-    delete_sources(&roots, ImportHarness::OpenCode2, &folder.join("head.json"));
+    delete_sources(
+        &roots,
+        ImportHarness::OpenCode2,
+        &read_now(&folder.join("head.json")),
+    );
     assert!(!folder.join("head.json").exists());
     assert!(!folder.join("head.sends.json").exists());
     assert!(!folder.join("head.calls.json").exists());
     delete_sources(
         &roots,
         ImportHarness::OpenCode2,
-        &other.join("elsewhere.json"),
+        &read_now(&other.join("elsewhere.json")),
     );
     assert!(other.join("elsewhere.json").exists());
     assert!(other.join("elsewhere.sends.json").exists());
@@ -103,12 +107,79 @@ fn only_files_inside_the_import_folder_are_ever_deleted() {
     write(&folder.join("pi.jsonl"), b"{}\n");
     write(&folder.join("pi.sends.json"), b"[]");
     write(&folder.join("pi.calls.json"), b"{\"calls\":[]}");
-    delete_sources(&roots, ImportHarness::Pi, &folder.join("pi.jsonl"));
+    delete_sources(
+        &roots,
+        ImportHarness::Pi,
+        &read_now(&folder.join("pi.jsonl")),
+    );
     assert!(folder.join("pi.jsonl").exists());
     assert!(!folder.join("pi.sends.json").exists());
     assert!(!folder.join("pi.calls.json").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The files an import of `source` read, as they stand now: the source and each side file
+/// beside it.
+#[cfg(unix)]
+fn read_now(source: &Path) -> ImportSources {
+    let side_files = [
+        ck_session_import::head::sends_path(source),
+        ck_session_import::head::calls_path(source),
+    ]
+    .into_iter()
+    .filter(|path| path.exists())
+    .map(|path| ReadFile::now(&path).unwrap())
+    .collect();
+    ImportSources {
+        source: ReadFile::now(source).unwrap(),
+        side_files,
+    }
+}
+
+/// An OpenCode 1 extract is read from a private copy of the bytes its digest covers, which is
+/// gone once the read ends; with no private folder to copy into, it isn't read at all.
+#[test]
+fn an_sqlite_source_is_read_from_a_private_copy_that_is_then_removed() {
+    let dir = scratch("sqlite");
+    let folder = dir.join("import-sources");
+    std::fs::create_dir_all(&folder).unwrap();
+    let host = dir.join("host.db");
+    let db = rusqlite::Connection::open(&host).unwrap();
+    db.execute_batch(include_str!(
+        "../../../ck-session-import/tests/fixtures/head/opencode1.sql"
+    ))
+    .unwrap();
+    drop(db);
+    let source =
+        ck_session_import::opencode_extract::extract(&host, "ses_synthetic", &folder).unwrap();
+    let mut params = params(
+        ImportHarness::OpenCode1,
+        Path::new(&source.path),
+        source.sha256.clone(),
+    );
+    params.source.session = "ses_synthetic".into();
+    let copies = dir.join("copies");
+    let roots = ImportRoots::new(vec![folder.clone()], Some(folder.clone()));
+    assert_eq!(
+        read_source(&params, &roots).unwrap_err().code,
+        "import_source_unreadable"
+    );
+    let roots = roots.with_scratch(copies.clone());
+    let (read, history) = read_source(&params, &roots).unwrap();
+    assert!(!history.messages.is_empty());
+    assert_eq!(
+        read.source.path,
+        std::fs::canonicalize(&source.path).unwrap()
+    );
+    assert_eq!(
+        std::fs::read_dir(&copies).unwrap().count(),
+        0,
+        "the private copy is removed once read"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+mod replaced_tests;
 
 #[test]
 fn a_source_whose_digest_differs_is_refused_before_it_is_read() {

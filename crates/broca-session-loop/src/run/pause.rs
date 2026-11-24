@@ -98,75 +98,21 @@ pub(super) async fn pause_for_sign_in<W: Writer, P, T>(
     admission: &Admission,
     error: ProviderError,
 ) -> Result<Finished, LoopError> {
-    if let (Some(lifecycle), Some(batch)) = (seams.held, run_state(writer).open_batch.as_ref()) {
-        let ctx = BatchCtx {
-            batch_id: BatchId(batch.batch_id.clone()),
-            bind: seams.bind.clone(),
-            run_id: RunId(admission.run_id.clone()),
-            scope: admission.send.scope.clone(),
-            media_capture: writer.media(),
-        };
-        // A deposited result is taken as a held wait takes it: its media checked against what
-        // the batch captured, then through the post-tool hooks subscribed for its tool.
-        let hook_plan = hook_plan(admission, seams)?;
-        let hooks = hook_plan
+    if take_deposited(writer, seams, admission).await? {
+        let batch_id = run_state(writer)
+            .open_batch
             .as_ref()
-            .map(|plan| broca_core::hooks::HookRuntime {
-                plan,
-                plane: seams.hook_plane.as_ref().expect("checked with the plan"),
-                bind: &seams.bind,
-                scope: admission.send.scope.as_ref(),
-                cancel: Some(&seams.cancel),
-                stop: Some(&seams.stop),
-                seal: None,
-            });
-        let step_id = batch.step_id;
-        let planned = planned_calls(writer);
-        let mut records = Vec::new();
-        let mut delivered = Vec::new();
-        for held in known_calls(writer).into_iter().filter_map(|call| call.held) {
-            let Some(result) = lifecycle.deposited_result(&ctx, &held) else {
-                continue;
-            };
-            let Some(call) = planned
-                .iter()
-                .find(|call| call.tool_call_id == held.tool_call_id)
-            else {
-                continue;
-            };
-            let resolved = match checked(&ctx, DispatchResult::Completed(result)) {
-                DispatchResult::Completed(result) => {
-                    post_tool(hooks.as_ref(), step_id, call, &held.call_key, result).await
-                }
-                other => resolve(call, other).into(),
-            };
-            terminal_with_reason(
-                &mut records,
-                &admission.run_id,
-                &ctx.batch_id.0,
-                resolved.result,
-                resolved.outcome,
-                resolved.reason,
-                Some((seams.now_ms)()),
-            );
-            if let Some(Record::ToolOutcome(record)) = records.last_mut() {
-                record.hooks = resolved.hooks.map(Into::into);
-            }
-            delivered.push(held.tool_call_id);
-        }
-        // Acknowledge only after the terminal barrier, independently of the auth pause.
-        writer.append(&records, true).await?;
-        for id in delivered {
-            lifecycle.terminal_synced(&ctx, &id).await;
-        }
-        if run_state(writer).open_batch.as_ref().is_some_and(|batch| {
-            (0..batch.calls.len()).all(|position| batch.state(position) == CallState::Terminated)
-        }) {
+            .filter(|batch| {
+                (0..batch.calls.len())
+                    .all(|position| batch.state(position) == CallState::Terminated)
+            })
+            .map(|batch| batch.batch_id.clone());
+        if let Some(batch_id) = batch_id {
             writer
                 .append(
                     &[Record::BatchEnd(BatchEnd {
                         run_id: admission.run_id.clone(),
-                        batch_id: ctx.batch_id.0,
+                        batch_id,
                     })],
                     true,
                 )
@@ -183,6 +129,111 @@ pub(super) async fn pause_for_sign_in<W: Writer, P, T>(
         None,
     )
     .await
+}
+
+/// Writes, durably, the result each held call's provider has already deposited, without sending
+/// anything: the result is taken as a held wait takes it, its media checked against what the
+/// batch captured, then through the post-tool hooks subscribed for its tool. Each result is
+/// acknowledged to its provider once durable. False when the run has no open batch or no held
+/// calls' lifecycle.
+///
+/// A call queued behind a sequential held call has an intent but was never sent. Once that held
+/// call has its result, the records alone would read the queued call as one that may have run,
+/// so it is closed as never run in the same write: nothing here sends it, and nothing after this
+/// may.
+pub(super) async fn take_deposited<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+) -> Result<bool, LoopError> {
+    let (Some(lifecycle), Some(batch)) = (seams.held, run_state(writer).open_batch.clone()) else {
+        return Ok(false);
+    };
+    let ctx = BatchCtx {
+        batch_id: BatchId(batch.batch_id.clone()),
+        bind: seams.bind.clone(),
+        run_id: RunId(admission.run_id.clone()),
+        scope: admission.send.scope.clone(),
+        media_capture: writer.media(),
+    };
+    let hook_plan = hook_plan(admission, seams)?;
+    let hooks = hook_plan
+        .as_ref()
+        .map(|plan| broca_core::hooks::HookRuntime {
+            plan,
+            plane: seams.hook_plane.as_ref().expect("checked with the plan"),
+            bind: &seams.bind,
+            scope: admission.send.scope.as_ref(),
+            cancel: Some(&seams.cancel),
+            stop: Some(&seams.stop),
+            seal: None,
+        });
+    let planned = planned_calls(writer);
+    // The batch as it reads once the deposited results are written.
+    let mut after = batch.clone();
+    let mut records = Vec::new();
+    let mut delivered = Vec::new();
+    for held in known_calls(writer).into_iter().filter_map(|call| call.held) {
+        let Some(result) = lifecycle.deposited_result(&ctx, &held) else {
+            continue;
+        };
+        let Some(call) = planned
+            .iter()
+            .find(|call| call.tool_call_id == held.tool_call_id)
+        else {
+            continue;
+        };
+        let resolved = match checked(&ctx, DispatchResult::Completed(result)) {
+            DispatchResult::Completed(result) => {
+                post_tool(hooks.as_ref(), batch.step_id, call, &held.call_key, result).await
+            }
+            other => resolve(call, other).into(),
+        };
+        if let Some(answered) = after
+            .calls
+            .iter_mut()
+            .find(|call| call.id == held.tool_call_id && call.terminal.is_none())
+        {
+            answered.terminal = Some(resolved.outcome);
+        }
+        terminal_with_reason(
+            &mut records,
+            &admission.run_id,
+            &ctx.batch_id.0,
+            resolved.result,
+            resolved.outcome,
+            resolved.reason,
+            Some((seams.now_ms)()),
+        );
+        if let Some(Record::ToolOutcome(record)) = records.last_mut() {
+            record.hooks = resolved.hooks.map(Into::into);
+        }
+        delivered.push(held.tool_call_id);
+    }
+    // The store refuses an empty write, and with nothing deposited there is nothing to write.
+    if delivered.is_empty() {
+        return Ok(true);
+    }
+    for position in 0..batch.calls.len() {
+        if batch.state(position) == CallState::HeldSuccessor
+            && after.state(position) == CallState::Dispatched
+        {
+            terminal_with_reason(
+                &mut records,
+                &admission.run_id,
+                &ctx.batch_id.0,
+                error_result(batch.id(position), NOT_RUN_INTERRUPTED),
+                CallOutcome::Interrupted,
+                None,
+                Some((seams.now_ms)()),
+            );
+        }
+    }
+    writer.append(&records, true).await?;
+    for id in delivered {
+        lifecycle.terminal_synced(&ctx, &id).await;
+    }
+    Ok(true)
 }
 
 /// Pauses the run at a boundary, durably, before the run reports it. A caller's cancel wins

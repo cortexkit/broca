@@ -167,10 +167,13 @@ impl StoreRuntime {
             billing: None,
             run_events: None,
             send_states: None,
-            import_roots: Arc::new(crate::store_import::ImportRoots::with_default(
-                None,
-                Some(&crate::store_import::default_import_folder(state_root)),
-            )),
+            import_roots: Arc::new(
+                crate::store_import::ImportRoots::with_default(
+                    None,
+                    Some(&crate::store_import::default_import_folder(state_root)),
+                )
+                .with_scratch(crate::store_import_stage::import_staging_root(state_root)),
+            ),
             settled: Arc::default(),
             views: crate::store_reads::ViewCache::new(
                 crate::store_reads::ViewCache::MAX_ENTRIES,
@@ -278,12 +281,19 @@ impl StoreRuntime {
     /// boot) instead of broca's own import folder alone. That folder stays the only place an
     /// import deletes its source from.
     pub fn with_import_roots(mut self, roots: Option<Vec<PathBuf>>) -> Self {
-        self.import_roots = Arc::new(crate::store_import::ImportRoots::with_default(
-            roots,
-            Some(&crate::store_import::default_import_folder(
+        self.import_roots = Arc::new(
+            crate::store_import::ImportRoots::with_default(
+                roots,
+                Some(&crate::store_import::default_import_folder(
+                    &self.state_root,
+                )),
+            )
+            // An SQLite source is copied where import staging lives: private to broca, and
+            // cleared of what a crash left whenever the session store opens.
+            .with_scratch(crate::store_import_stage::import_staging_root(
                 &self.state_root,
             )),
-        ));
+        );
         self
     }
 
@@ -658,14 +668,63 @@ impl StoreRuntime {
     ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
         // Recovery can open an actor. Keep that large future off every caller's stack,
         // including callers that compose several reads into one request future.
-        Box::pin(self.read_inner(registry, key, request)).await
+        Box::pin(self.read_inner(registry, key, request, None)).await
     }
 
+    /// The session `key` as stored up to its durable end, for a read that runs its own code over
+    /// the session rather than one [`execute`](crate::store_reads::execute) runs. It passes the
+    /// same checks as [`read`](Self::read): the expiry check, a recovery before a closed
+    /// session that needs one is read, and an open actor making its records durable first, so
+    /// the view never holds records a power loss could still take back. `reason` counts a load
+    /// in the memory report. `None` for a session whose creation never committed.
+    pub(crate) async fn durable_view(
+        &self,
+        registry: &crate::LineageRegistry,
+        key: &BindIdentity,
+        reason: &'static str,
+    ) -> Result<Option<Arc<crate::store_read::StoredView<LocalBackend>>>, crate::serve::ServeError>
+    {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        let Some(class) = self.class_of(key)? else {
+            return Ok(None);
+        };
+        for _ in 0..POSITION_TRIES {
+            let mut served = None;
+            let read = self.read_inner(
+                registry,
+                key,
+                StoreReadRequest::DurableView(reason),
+                Some(&mut served),
+            );
+            let position = match Box::pin(read).await? {
+                Some(StoreReadReply::Position(position)) => position,
+                None => return Ok(None),
+                Some(_) => return Err(crate::store_reads::mismatched()),
+            };
+            // A closed session was read from a view loaded at that position: serve it again
+            // rather than load it twice when it was too large to keep.
+            if let Some(view) = served.filter(|view| view.position() == position) {
+                return Ok(Some(view));
+            }
+            match self.view_at(key, class, position, reason).await {
+                Ok(view) => return Ok(Some(view)),
+                // The actor sealed after naming its position: ask it again.
+                Err(SessionError::Moved) => continue,
+                Err(SessionError::Missing) => return Ok(None),
+                Err(error) => return Err(view_error(error).into()),
+            }
+        }
+        Err(view_error(SessionError::Moved).into())
+    }
+
+    /// [`read`](Self::read), keeping in `served` the view a closed session's read was served
+    /// from, when it was served from one.
     async fn read_inner(
         &self,
         registry: &crate::LineageRegistry,
         key: &BindIdentity,
         request: crate::store_reads::StoreReadRequest,
+        served: Option<&mut Option<Arc<crate::store_read::StoredView<LocalBackend>>>>,
     ) -> Result<Option<crate::store_reads::StoreReadReply>, crate::serve::ServeError> {
         let run = match &request {
             crate::store_reads::StoreReadRequest::RunAdmission(run)
@@ -741,10 +800,13 @@ impl StoreRuntime {
             // snapshot; a later read will reopen it through the same barrier.
             return Err(view_error(SessionError::NeedsRecovery).into());
         }
-        Ok(Some(
-            self.read_stored(key, class, &view, registry.slot_state(key), &request)
-                .await,
-        ))
+        let reply = self
+            .read_stored(key, class, &view, registry.slot_state(key), &request)
+            .await;
+        if let Some(served) = served {
+            *served = Some(view);
+        }
+        Ok(Some(reply))
     }
 
     /// Serves `request`, a read broca makes for itself (see `StoreReadRequest::is_internal`), on

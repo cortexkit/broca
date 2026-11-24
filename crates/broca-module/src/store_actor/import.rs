@@ -234,7 +234,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             let roots = std::sync::Arc::clone(&roots);
             tokio::task::spawn_blocking(move || read_source(&params, &roots)).await
         };
-        let (path, history) = match read {
+        let (sources, history) = match read {
             Ok(Ok(read)) => read,
             Ok(Err(refusal)) => return (StoreOutcome::Refused(refusal), false),
             Err(error) => {
@@ -276,7 +276,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(receipt) => receipt,
             Err((refusal, exit)) => return (StoreOutcome::Refused(refusal), exit),
         };
-        delete_sources(&roots, params.source.harness, &path);
+        delete_sources(&roots, params.source.harness, &sources);
         (self.reply_from_receipt(&receipt).await, false)
     }
 

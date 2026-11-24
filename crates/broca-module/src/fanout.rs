@@ -192,21 +192,12 @@ pub(crate) use display_replay::DisplaySender;
 
 /// Successful subscriber deliveries by lane, and successful wire encodes, since boot.
 ///
-/// THE FAN-OUT PATH HAD NO COUNTERS AT ALL. I first wrote that it counted ONLY failures,
-/// citing `frames_dropped_stale_epoch` and `frames_dropped_unmatched_terminal` — THAT WAS
-/// WRONG. Those two live in `broca-subc`'s connection (`FRAME_DROPS`) and count INBOUND
-/// frames on the client socket; they have nothing to do with subscriber fan-out. They sit
-/// beside these on `health.check`, which is the whole reason I read them as this path's
-/// failure counters without checking. The real state was WORSE than the one I argued
-/// from: no success signal and no loss signal —
-/// so a healthy reading was zero on both and said nothing about whether anything was being
-/// delivered at all. A zero meaning "nothing bad happened" and a zero meaning "I cannot see
-/// the thing" are indistinguishable at the surface, and only one of them is health.
-///
-/// It also made the path unmeasurable. A perf round measured the fan-out seam at ~420 ns per
-/// subscriber delivery, payload-independent because the payload is Arc-shared, and could not
-/// turn that into a deployed cost because nothing counts deliveries. `stream_chunks` is the
-/// wrong denominator: one decoded SSE payload normalizes to zero or several display events.
+/// They give `health.check` a positive signal that fan-out is delivering anything at all, and
+/// a denominator for turning the per-delivery cost of the fan-out seam into a deployed cost.
+/// `stream_chunks` can't serve as that denominator: one decoded SSE payload normalizes to zero
+/// or several display events. The `frames_dropped_*` counters reported beside these are
+/// unrelated: they live in `broca-subc`'s connection and count inbound frames on the client
+/// socket, not subscriber fan-out.
 ///
 /// Process-local and lifetime; they reset on restart, so diff two readings carrying the SAME
 /// `launch_id` to get a rate. Relaxed ordering: these are counters, not fences, and no

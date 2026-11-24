@@ -46,7 +46,7 @@ use broca_diagnostics::{spawn_blocking, JobKind};
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::keys::CursorKey;
 use broca_session_store::record::Record;
-use broca_session_store::session::{Appended, LogFrom, Session, StoredRecords};
+use broca_session_store::session::{replay_start, Appended, LogFrom, Session, StoredRecords};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -682,7 +682,8 @@ struct Attach<R> {
 
 /// A replay of a session's records for an attach from `from`, fed in order a chunk at a time:
 /// it keeps the projection, the resume cursor's check and the record whose successor the next
-/// chunk brings, so a long catch-up never holds more than one chunk of records.
+/// chunk brings, so the replay itself keeps no more than the chunk it is being fed; how many
+/// records that chunk holds is up to the reader that feeds it.
 struct Replayer<'a> {
     control: StoreControl,
     from: AttachFrom,
@@ -751,6 +752,13 @@ impl<'a> Replayer<'a> {
     /// Final once the replay has passed the cursor's record.
     fn cursor_valid(&self) -> bool {
         self.cursor_valid && self.found
+    }
+
+    /// Whether every record through seq `seq` is projected: a record past it was fed. Seqs a
+    /// replay reads skip (a record sealed into the checkpoint, one a revert removed), so the
+    /// record after `seq` may be far past it.
+    fn past(&self, seq: u64) -> bool {
+        self.carried.as_ref().is_some_and(|(at, _)| *at > seq)
     }
 
     fn project(
@@ -933,9 +941,10 @@ enum CatchUp {
     Failed(String),
 }
 
-/// Replays `reader`'s records from `start` through `head` for an attach from `from`, a chunk at
-/// a time, sending each chunk's units on `chunks`. A resume cursor is checked before any unit
-/// goes: its record is the first the replay reaches. Stops when the subscriber stops reading.
+/// Replays `reader`'s records through `head` for an attach from `from`, from the start of the log
+/// holding `start`, a chunk at a time, sending each chunk's units on `chunks`. A resume cursor is
+/// checked before any unit goes: its record is the first the replay reaches. Stops when the
+/// subscriber stops reading.
 #[allow(clippy::too_many_arguments)]
 fn catch_up<R: SessionBackend>(
     runtime: &tokio::runtime::Handle,
@@ -950,18 +959,31 @@ fn catch_up<R: SessionBackend>(
     let failed = |error: broca_session_store::session::SessionError| {
         CatchUp::Failed(format!("the session's records can't be read: {error:?}"))
     };
-    let mut through = head.min(start.saturating_add(CATCH_UP_CHUNK));
-    let log = match runtime.block_on(reader.from_log_holding(start, through)) {
-        Ok(log) => log,
+    // The log holding `start` is replayed from its checkpoint a chunk at a time, its records
+    // before `start` included: they build the projection the units after it come from.
+    let checkpoint = match runtime.block_on(reader.log_start(start)) {
+        Ok(checkpoint) => checkpoint,
         Err(error) => {
             let _ = chunks.blocking_send(failed(error));
             return;
         }
     };
-    let mut replayer = Replayer::new(&log.checkpoint, from, head, identity, labels);
-    let mut fed = replayer.feed(log.records);
+    let mut replayer = Replayer::new(&checkpoint, from, head, identity, labels);
+    let mut through = replay_start(&checkpoint).saturating_sub(1);
     let mut checked = false;
+    // Units of records before the cursor's: none pass a cursor attach's filter, so this stays
+    // empty, yet none may go before the cursor is checked.
+    let mut held = Vec::new();
     loop {
+        let first = through + 1;
+        through = head.min(through.saturating_add(CATCH_UP_CHUNK));
+        let mut fed = match runtime.block_on(reader.replay_between(&checkpoint, first, through)) {
+            Ok(records) => replayer.feed(records),
+            Err(error) => {
+                let _ = chunks.blocking_send(failed(error));
+                return;
+            }
+        };
         let finished = through >= head;
         if finished {
             fed = fed.and_then(|mut units| {
@@ -978,13 +1000,25 @@ fn catch_up<R: SessionBackend>(
         };
         // The cursor's record is projected once its successor is fed, so past it the check is
         // final; no unit is sent before it is.
-        if !checked && (through > start || finished) {
-            checked = true;
-            if !replayer.cursor_valid() {
-                let _ = chunks.blocking_send(CatchUp::CursorExpired);
-                return;
+        if !checked {
+            if replayer.past(start) || finished {
+                checked = true;
+                if !replayer.cursor_valid() {
+                    let _ = chunks.blocking_send(CatchUp::CursorExpired);
+                    return;
+                }
+            } else {
+                held.extend(units);
+                continue;
             }
         }
+        let units = if held.is_empty() {
+            units
+        } else {
+            let mut all = std::mem::take(&mut held);
+            all.extend(units);
+            all
+        };
         if !units.is_empty() && chunks.blocking_send(CatchUp::Units(units)).is_err() {
             return;
         }
@@ -992,15 +1026,6 @@ fn catch_up<R: SessionBackend>(
             let _ = chunks.blocking_send(CatchUp::Done);
             return;
         }
-        let first = through + 1;
-        through = head.min(through.saturating_add(CATCH_UP_CHUNK));
-        fed = match runtime.block_on(reader.records_between(first, through)) {
-            Ok(records) => replayer.feed(records),
-            Err(error) => {
-                let _ = chunks.blocking_send(failed(error));
-                return;
-            }
-        };
     }
 }
 

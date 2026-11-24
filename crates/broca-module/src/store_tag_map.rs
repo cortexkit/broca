@@ -12,9 +12,9 @@
 //!
 //! Both are recorded beside each message when it is placed, so a page reads only its own
 //! messages, sealed history included, and never replays the session. The read runs over a
-//! read-only view of the session as stored (`StoreRuntime::current_view`): it never commands the
-//! session's actor and never takes its lease, so it serves alike whether an actor holds the
-//! session open or not. With an actor open, it sees what the actor has made durable.
+//! read-only view of the session as stored (`StoreRuntime::durable_view`), and never takes the
+//! session's lease. With an actor open, the actor first makes its records durable and names
+//! where they end, so the read sees only what a power loss can't take back.
 
 use std::collections::HashMap;
 
@@ -37,11 +37,10 @@ pub async fn serve(
     key: &BindIdentity,
     params: &TagMapParams,
 ) -> Result<TagMapResponse, ServeError> {
-    registry.check_expired(key, None).await?;
     let Some(class) = store.class_of(key)? else {
         return Ok(TagMapResponse::unnumbered());
     };
-    let Some(view) = store.current_view_for(key, "session.tag_map").await? else {
+    let Some(view) = store.durable_view(registry, key, "session.tag_map").await? else {
         return Ok(TagMapResponse::unnumbered());
     };
     let parts = store.parts_for(class, view.head().cipher());

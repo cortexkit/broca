@@ -1101,3 +1101,80 @@ async fn a_call_without_opt_in_has_no_set() {
     assert_eq!(result(&reply), json!({"records": []}));
     rig.finish().await;
 }
+
+/// A run admitted under a refreshed plan has its calls scanned under that plan, not the first
+/// one: a plan that didn't opt in, refreshed to one that does, gives the next run's call a set.
+#[tokio::test]
+async fn a_call_after_a_plan_refresh_is_scanned_under_the_refreshed_plan() {
+    let (mut rig, admitter) = plan_rig("refs-call-refreshed").await;
+    admitter.admit_output_refs();
+    admitter.answer_reference_slots(json!([{"name": "data", "kind": "token"}]));
+    rig.script.push(&[Step::Text("first")]);
+    send_plan(
+        &mut rig,
+        "turn-1",
+        "hi",
+        &tagged_plan(json!({"output_refs": false})),
+    )
+    .await;
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    let refreshed = rig
+        .request(
+            7,
+            json!({"method": "session.refresh", "params": {
+                "plan": tagged_plan(json!({"output_refs": true})),
+                "generation": 1, "policy": "immediately",
+            }}),
+        )
+        .await;
+    result(&refreshed);
+    rig.script.push(&[
+        Step::Call("call-1"),
+        Step::Usage {
+            content: vec![broca_protocol::content::ContentBlock::ToolCall(
+                broca_protocol::ToolCall {
+                    tool_call_id: broca_protocol::ToolCallId("call-2".into()),
+                    tool_name: "work".into(),
+                    input: json!({"data": "$$tc(2)"}).into(),
+                    thought_signature: None,
+                    provider_state: None,
+                },
+            )],
+            usage: Default::default(),
+        },
+        Step::Text("done"),
+    ]);
+    let next = rig
+        .request(
+            7,
+            json!({"method": "session.send", "params": {
+                "send_id": "turn-2", "prompt": "again",
+                "model": {"provider": "fake", "model": "fake"},
+            }}),
+        )
+        .await;
+    result(&next);
+    rig.wait_for_finished(2).await;
+    rig.wait_idle().await;
+    let mut found = None;
+    for ordinal in 0..12 {
+        let Some((_, sets)) = broca_module::output_refs::message_output_refs(
+            rig.registry().as_ref(),
+            &rig.session,
+            ordinal,
+            None,
+        )
+        .await
+        .unwrap() else {
+            continue;
+        };
+        if !sets.calls.is_empty() {
+            found = Some(sets);
+        }
+    }
+    let sets = found.expect("the refreshed run's call has a set");
+    assert_eq!(sets.calls.len(), 1);
+    assert_eq!(sets.calls[0].0, "call-2");
+    rig.finish().await;
+}

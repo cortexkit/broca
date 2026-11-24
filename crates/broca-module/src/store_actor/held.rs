@@ -35,7 +35,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             self.held_resume_owed = true;
             return Ok(());
         }
-        if self.stopping {
+        // A module shutting down doesn't take up a held run: it stays parked for the next
+        // process, which a resume under the stop would only find already stopping.
+        if self.restart_stopping() {
             return Err("session actor is closing".into());
         }
         let Some(run) = self.session.operations().run.as_ref().filter(|run| {

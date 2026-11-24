@@ -119,6 +119,8 @@ async fn new_only(
                 inner: ScriptedProvider::new(steps),
                 calls: Default::default(),
                 reports_attempts: false,
+                drifted: Default::default(),
+                cancel_at_render_check: Default::default(),
                 steers: Mutex::new(steers),
                 sink: Arc::new(NewSink {
                     injected: Arc::clone(&injected),

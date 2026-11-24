@@ -32,6 +32,7 @@ use crate::store_reads::{
 use crate::store_status::SettledRuns;
 
 mod capability_tests;
+mod durable_view_tests;
 
 /// A memory backend that records how far the session's log is written and how far a barrier
 /// made it durable, and can fail the next barrier.
@@ -886,12 +887,14 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::Media(media) => format!("{media:?}"),
         StoreReadReply::TagLocation(location) => format!("{location:?}"),
         StoreReadReply::WritingView(view) => format!("{view:?}"),
+        StoreReadReply::RunManifest(manifest) => format!("{manifest:?}"),
         StoreReadReply::OutputRefNamespace(namespace) => namespace,
         StoreReadReply::PlanChange(read) => format!("{:?}", read.map(|read| read.0)),
         StoreReadReply::PlanIdentities(identities) => format!("{identities:?}"),
         StoreReadReply::Baseline(facts) => format!("{facts:?}"),
         StoreReadReply::PlanView(reply) => format!("{reply:?}"),
         StoreReadReply::HeldCalls(held) => format!("{held:?}"),
+        StoreReadReply::Position(position) => format!("{position:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::AuthorizationOwnership(ownership) => format!("{ownership:?}"),
         StoreReadReply::AuthorizationRead(admitted) => format!("{admitted:?}"),

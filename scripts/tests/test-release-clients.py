@@ -178,6 +178,42 @@ class ClientPlacementTests(gate.GateBase):
                                    text=True, capture_output=True)
             self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
+    def test_placement_keeps_only_the_newest_rollbacks_of_each_binary(self):
+        rollback = self.rollback
+        rollback.mkdir(parents=True, exist_ok=True)
+        seeded = {}
+        for name in ("ck-broca", "broca-session"):
+            seeded[name] = []
+            for day in range(1, 6):
+                snapshot = rollback / f"{name}.rollback-202001{day:02d}T000000Z"
+                snapshot.write_text("old")
+                (rollback / f"{snapshot.name}.sha256").write_text("sum")
+                if name == "ck-broca":
+                    (rollback / f"{snapshot.name}.dSYM").mkdir()
+                seeded[name].append(snapshot.name)
+        others = ["ck-broca.current", "ck-other.rollback-20200101T000000Z",
+                  "broca-session.rollback-notes"]
+        for other in others:
+            (rollback / other).write_text("keep")
+        result = self.place("--restart", PLACE_RELEASE_WAIT_SECONDS="0", BROCA_TEST_BIN=str(self.dest))
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        names = {path.name for path in rollback.iterdir()}
+        for name, old in seeded.items():
+            snapshots = sorted(n for n in names
+                               if n.startswith(f"{name}.rollback-") and n not in others
+                               and not n.endswith((".sha256", ".dSYM")))
+            # The snapshot this placement wrote, and the two newest before it.
+            self.assertEqual(len(snapshots), 3, sorted(names))
+            self.assertEqual(snapshots[:2], old[-2:])
+            for gone in old[:-2]:
+                self.assertNotIn(gone, names)
+                self.assertNotIn(f"{gone}.sha256", names)
+                self.assertNotIn(f"{gone}.dSYM", names)
+            for kept in snapshots:
+                self.assertIn(f"{kept}.sha256", names)
+        for other in others:
+            self.assertIn(other, names)
+
     def test_client_rename_failure_stops_before_module_placement_and_restart(self):
         before = self.dest.read_bytes()
         mv = self.fake_bin / "mv"

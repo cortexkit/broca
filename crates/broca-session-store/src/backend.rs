@@ -348,6 +348,8 @@ pub struct MemoryBackend {
     /// How many log reads read only a log's checkpoint frame (see
     /// [`crate::log::reads_checkpoint_frame_only`]). Tests only.
     checkpoint_frame_reads: std::sync::atomic::AtomicUsize,
+    /// How many log bytes the log reads so far returned, checkpoint frames included. Tests only.
+    log_bytes_read: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default, Clone)]
@@ -447,6 +449,12 @@ impl MemoryBackend {
     /// checkpoint frame. Tests only.
     pub fn log_reads(&self) -> usize {
         self.log_reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many log bytes the log reads so far returned, checkpoint frames included. Tests only.
+    pub fn log_bytes_read(&self) -> usize {
+        self.log_bytes_read
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// How many log reads this backend has served so far that read only a log's checkpoint
@@ -568,6 +576,10 @@ impl SessionBackend for MemoryBackend {
             &self.log_reads
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(read) = &read {
+            self.log_bytes_read
+                .fetch_add(read.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         read
     }
 

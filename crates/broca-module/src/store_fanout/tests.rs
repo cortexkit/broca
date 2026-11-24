@@ -190,6 +190,67 @@ fn step_start(step: u64) -> Record {
 }
 
 #[tokio::test]
+async fn catch_up_reads_a_long_open_log_once_after_sealed_history() {
+    let mut session = session().await;
+    let steps = 40 * CATCH_UP_CHUNK;
+    let split = 4 * CATCH_UP_CHUNK;
+    let sealed: Vec<_> = (1..=split).map(step_start).collect();
+    let first = session.append(&sealed, true).await.unwrap();
+    session.seal(None, 0).await.unwrap();
+    // One record per append, as a session's writer appends them: a read of part of the open log
+    // reads whole batches, so the smallest part it reads is one batch.
+    let open_first = session.next_seq();
+    for step in split + 1..=steps {
+        session.append(&[step_start(step)], true).await.unwrap();
+    }
+    let head = session.next_seq() - 1;
+    let open_len = session.position().len as usize;
+    let backend = session.backend().snapshot();
+    let before = backend.log_bytes_read();
+    let runtime = tokio::runtime::Handle::current();
+    let reader = session.stored_records(&backend);
+    let identity = CursorIdentity::of(&session);
+    let (tx, mut rx) = mpsc::channel(1);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            catch_up(
+                &runtime,
+                &reader,
+                first,
+                head,
+                AttachFrom::Cursor(FromCursor::Start),
+                &identity,
+                Default::default(),
+                &tx,
+            );
+        });
+        let actual = futures::executor::block_on(async {
+            let mut actual = Vec::new();
+            loop {
+                match rx.recv().await.unwrap() {
+                    CatchUp::Units(units) => {
+                        actual.extend(units.into_iter().map(|unit| unit.0.wal_seq))
+                    }
+                    CatchUp::Done => break,
+                    CatchUp::CursorExpired => panic!("a start attach has no cursor to expire"),
+                    CatchUp::Failed(why) => panic!("catch-up failed: {why}"),
+                }
+            }
+            actual
+        });
+        let expected: Vec<_> = (first..first + split).chain(open_first..=head).collect();
+        assert_eq!(actual, expected);
+    });
+    // The open log is read whole once, to learn where its records lie, and then each chunk reads
+    // only the bytes holding it: not the whole log once per chunk.
+    let read = backend.log_bytes_read() - before;
+    assert!(
+        read <= 2 * open_len + open_len / 4,
+        "the catch-up read {read} log bytes of an open log of {open_len}"
+    );
+}
+
+#[tokio::test]
 async fn live_attaches_between_steps_and_after_a_boundary_keep_no_previous_controls() {
     let mut session = session().await;
     let mut fanout = fanout(&mut session);

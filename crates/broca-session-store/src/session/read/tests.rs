@@ -33,6 +33,7 @@ cipher_tests!(
     a_ledger_record_reads_back_by_its_seq_from_the_open_log_and_sealed_history,
     ledger_tail_stops_before_older_segments_and_reads_the_open_log_once,
     a_sealed_message_read_fetches_its_block_not_the_segment,
+    entries_refuse_a_sealed_segment_that_does_not_place_the_requested_message,
     the_entry_numbering_a_compaction_tag_is_found_by_a_search,
 );
 
@@ -435,6 +436,15 @@ fn a_sealed_message_read_fetches_its_block_not_the_segment(cipher: Cipher) {
             "a later read fetched {second} bytes"
         );
 
+        assert_eq!(loaded.entries(3, 1).await.unwrap()[0].ordinal, 3);
+        let objects = backend.object_reads();
+        assert_eq!(loaded.entries(200, 1).await.unwrap()[0].ordinal, 200);
+        assert_eq!(
+            backend.object_reads() - objects,
+            1,
+            "a later page of entries reuses the directory and fetches just its block"
+        );
+
         // A range of records, read by a freshly loaded session, fetches the layout and the
         // blocks holding the range, not the whole segment.
         let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
@@ -448,6 +458,91 @@ fn a_sealed_message_read_fetches_its_block_not_the_segment(cipher: Cipher) {
         assert!(
             range < segment_bytes / 4,
             "the range read fetched {range} of the segment's {segment_bytes} bytes"
+        );
+
+        // A reader apart from the writer fetches the same blocks, not the whole segment.
+        let reader = loaded.stored_records(&backend);
+        let bytes = backend.object_bytes_read();
+        assert_eq!(reader.records_between(9, 12).await.unwrap(), records);
+        let bytes = backend.object_bytes_read() - bytes;
+        assert!(
+            bytes < segment_bytes / 4,
+            "the detached range read fetched {bytes} of the segment's {segment_bytes} bytes"
+        );
+        // Once it has read the open log, it knows the log starts past a sealed range, and reads
+        // no log for one.
+        let expected = loaded.records_between(13, 16).await.unwrap();
+        let logs = backend.log_reads();
+        assert_eq!(reader.records_between(13, 16).await.unwrap(), expected);
+        assert_eq!(backend.log_reads(), logs, "log reads for a sealed range");
+    });
+}
+
+fn entries_refuse_a_sealed_segment_that_does_not_place_the_requested_message(cipher: Cipher) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        session
+            .append(&[input("one".into()), input("two".into())], true)
+            .await
+            .unwrap();
+        let cut = session
+            .append(&[input("three".into())], true)
+            .await
+            .unwrap();
+        session.seal(Some(cut), 0).await.unwrap();
+
+        let key = session.key.frame_key();
+        let pages = crate::directory::Pages {
+            backend: &backend,
+            addr: &session.addr,
+            session: session.head.session_id,
+            key: &key,
+            fanout: crate::directory::FANOUT,
+        };
+        let mut entry = pages
+            .find_ordinal(session.head.transcript_dir.as_ref(), 2)
+            .await
+            .unwrap()
+            .unwrap();
+        // The directory says this segment places two messages, but keeps only the first one.
+        entry.last_seq = entry.first_seq;
+        let object = entry.object.clone();
+        session.head.transcript_dir = Some(
+            pages
+                .append(None, entry, "short-segment-directory", session.version)
+                .await
+                .unwrap()
+                .root,
+        );
+        let before = backend.object_reads();
+        let done = AtomicBool::new(false);
+        let read = std::thread::scope(|scope| {
+            let reading = scope.spawn(|| {
+                let read = block_on(session.entries(2, 1));
+                done.store(true, Ordering::Release);
+                read
+            });
+            broca_test_support::wait_until_sync("sealed segment read completes", || {
+                if done.load(Ordering::Acquire) {
+                    Ok(())
+                } else if backend.object_reads() - before > 12 {
+                    // Break a runaway retry even if the read future never yields.
+                    backend.set_object(&addr(), &object, Vec::new());
+                    Ok(())
+                } else {
+                    Err("the sealed read is still running".into())
+                }
+            });
+            reading.join().unwrap()
+        });
+        assert!(
+            matches!(&read, Err(crate::session::SessionError::Fold(reason)) if reason == "no sealed segment places message 2"),
+            "expected a refusal for message 2, got {read:?}"
         );
     });
 }
@@ -488,10 +583,24 @@ fn a_ledger_record_reads_back_by_its_seq_from_the_open_log_and_sealed_history(ci
             }
         }
         let (at, transcript) = (at.unwrap(), transcript.unwrap());
+        // The writer doesn't keep the event's run, so the event is read back from the open log:
+        // the stretch between the frames the session knows around it, not the whole log.
+        let (logs, bytes) = (backend.log_reads(), backend.log_bytes_read());
         assert_eq!(
             session.ledger_record(at).await.unwrap().as_ref(),
             Some(&event)
         );
+        let (logs, bytes) = (backend.log_reads() - logs, backend.log_bytes_read() - bytes);
+        let log_len = session.position().len as usize;
+        assert_eq!(logs, 1, "one read of the open ledger record");
+        assert!(
+            bytes < log_len / 10,
+            "the open ledger lookup read {bytes} of the log's {log_len} bytes"
+        );
+        let logs = backend.log_reads();
+        assert_eq!(session.ledger_record(transcript).await.unwrap(), None);
+        assert_eq!(session.ledger_record(u64::MAX).await.unwrap(), None);
+        assert_eq!(backend.log_reads(), logs, "open-ledger misses read nothing");
         let segments = |backend: &MemoryBackend| -> Vec<String> {
             backend
                 .object_names(&addr())

@@ -50,6 +50,30 @@ static RUN_RULES: std::sync::LazyLock<KeptRules> = std::sync::LazyLock::new(Defa
 
 const RUN_RULES_KEPT: usize = 16_384;
 
+/// The plan manifest run `run_id` was admitted under: the one its start froze, which after a plan
+/// refresh is the refreshed plan's, not the session's first. A run the session holds no start
+/// for (an import's seeded messages) reads under the first run's manifest. `None` for a run
+/// admitted without a plan.
+pub async fn run_manifest<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+    run_id: &str,
+) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, String> {
+    use broca_session_loop::writer::Writer;
+    let start = match Writer::run_start(session, run_id)
+        .await
+        .map_err(|error| format!("run {run_id}'s start: {error:?}"))?
+    {
+        Some(start) => start,
+        None => match session.operations.owner.first_start.clone() {
+            Some(first) => first,
+            None => return Ok(None),
+        },
+    };
+    broca_session_loop::run::frozen_manifest(&start, parts)
+        .map_err(|error| format!("run {run_id}'s plan manifest: {error:?}"))
+}
+
 type RulesKey = (broca_session_store::codec::Id128, String);
 
 #[derive(Default)]

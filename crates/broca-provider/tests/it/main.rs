@@ -56,6 +56,7 @@ mod gemini_media_render;
 mod gemini_merged_text_regression;
 mod gemini_render_golden;
 mod gemini_thought_parts;
+mod gemini_unsigned_steps;
 mod google_codeassist_render_golden;
 mod media_profile_frozen;
 #[cfg(feature = "live")]

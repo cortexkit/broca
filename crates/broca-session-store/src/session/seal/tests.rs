@@ -18,6 +18,7 @@ cipher_tests!(
     sealed_records_read_back_and_finished_runs_lose_their_opaque_reasoning,
     a_ledger_seal_keeps_the_whole_transcript_open,
     a_live_writer_releases_copied_messages_after_a_seal,
+    a_historical_ledger_only_log_replays_its_copied_transcript,
     a_cut_that_does_not_start_an_entry_refuses_and_changes_nothing,
     the_replaced_log_is_deleted_only_after_the_grace_period,
     a_session_no_writer_holds_is_collected_once_each_grace_is_over,
@@ -372,6 +373,39 @@ fn a_ledger_seal_keeps_the_whole_transcript_open(cipher: Cipher) {
             texts(&loaded.conversation.held_messages().unwrap()),
             ["ask a", "a", "ask b", "b", "ask c", "c"]
         );
+    });
+}
+
+fn a_historical_ledger_only_log_replays_its_copied_transcript(cipher: Cipher) {
+    let backend = MemoryBackend::default();
+    block_on(async {
+        let mut session = Session::create(&backend, addr(), triple(), &deployment(cipher), false)
+            .await
+            .unwrap();
+        let a = session.append(&[input("a", "A")], true).await.unwrap();
+        let b = session.append(&[input("b", "B")], true).await.unwrap();
+        session.seal(None, 1_000).await.unwrap();
+        let c = session.append(&[input("c", "C")], true).await.unwrap();
+        let before = session
+            .stored_records(&backend)
+            .from_log_holding(c, c)
+            .await
+            .unwrap();
+        session.seal(None, 2_000).await.unwrap();
+        let after = session
+            .stored_records(&backend)
+            .from_log_holding(c, c)
+            .await
+            .unwrap();
+        assert_eq!(before.checkpoint.encode(), after.checkpoint.encode());
+        let inputs = |log: &crate::session::LogFrom| {
+            log.records
+                .iter()
+                .filter_map(|(seq, record)| matches!(record, Record::Input(_)).then_some(*seq))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(inputs(&before), [a, b, c]);
+        assert_eq!(inputs(&after), [a, b, c], "historical log's inputs");
     });
 }
 

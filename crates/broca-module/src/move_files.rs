@@ -518,8 +518,12 @@ impl CutArtifacts for FileCutArtifacts {
         let cut_id = cut_id(request)?;
         let locked = self.locked(&cut_id)?;
         let op = request.op();
-        for plan in &locked.plans {
-            self.store_apply(&cut_id, plan, op, request).await?;
+        // An abort's store step runs inside `rollback`, per plan, before that plan's
+        // streams and staging are removed; applying it here as well would run it twice.
+        if op != Op::Abort {
+            for plan in &locked.plans {
+                self.store_apply(&cut_id, plan, op, request).await?;
+            }
         }
         match op {
             Op::Export => {

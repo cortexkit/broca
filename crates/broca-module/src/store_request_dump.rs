@@ -9,9 +9,10 @@
 //! `s<step>.mismatch.json`, beside the length the step sent, so what differs can be found. A request carrying media isn't rebuilt: rendering it needs the media
 //! delivery only the session's actor holds while a run runs.
 //!
-//! The read runs over a read-only view of the session as stored (`StoreRuntime::current_view`),
-//! taking no lease and commanding no actor. The bodies go to `request-dumps/<session address>/
-//! <run id>/` under the state root, in folders and files only the owner can read.
+//! The read runs over a read-only view of the session as stored (`StoreRuntime::durable_view`),
+//! taking no lease; an open actor only makes its records durable first. The bodies go to
+//! `request-dumps/<session address>/<run id>/` under the state root, in folders and files only
+//! the owner can read.
 
 use std::path::{Path, PathBuf};
 
@@ -28,21 +29,17 @@ pub const DUMP_FOLDER: &str = "request-dumps";
 /// Rebuild and write the requests of run `run_id` of the session `key`. `Ok(None)` when the new
 /// storage doesn't keep the session.
 pub async fn serve(
+    registry: &crate::LineageRegistry,
     runtime: &StoreRuntime,
     key: &BindIdentity,
     run_id: &str,
 ) -> Result<Option<RequestDumpResponse>, ServeError> {
-    let unreadable = |what: &str, error: String| ServeError::Transient(format!("{what}: {error}"));
-    let Some(class) = runtime
-        .class_of(key)
-        .map_err(|error| unreadable("find the session", format!("{error:?}")))?
-    else {
+    let Some(class) = runtime.class_of(key)? else {
         return Ok(None);
     };
     let Some(view) = runtime
-        .current_view_for(key, "session.request_dump")
-        .await
-        .map_err(|error| unreadable("read the session", format!("{error:?}")))?
+        .durable_view(registry, key, "session.request_dump")
+        .await?
     else {
         return Ok(None);
     };
@@ -50,11 +47,12 @@ pub async fn serve(
     let parts = runtime.parts_for(class, view.head().cipher());
     // A step is rebuilt as the session stood then, from every record before it (see
     // `recorded_warm::request_as_of`), so the whole history is read, sealed segments included.
+    // Only a backend failure is worth a retry; a damaged log reads the same again.
     let records = view
         .stored_records(&readers)
         .records_between(1, view.next_seq().saturating_sub(1))
         .await
-        .map_err(|error| unreadable("read the session's history", format!("{error:?}")))?;
+        .map_err(crate::store_read::read_failed)?;
     if !starts(&records, run_id) {
         return Err(ServeError::UnknownRun(run_id.to_owned()));
     }
@@ -67,8 +65,10 @@ pub async fn serve(
         .join(DUMP_FOLDER)
         .join(broca_core::session_addr(key))
         .join(file_safe(run_id));
+    // The state root's own folder failing to appear is the machine's state (a full disk, a
+    // transient I/O failure), not the session's, so a later try may succeed.
     broca_owner_only::create_dir_all(&folder)
-        .map_err(|error| unreadable("create the dump folder", error.to_string()))?;
+        .map_err(|error| ServeError::Transient(format!("create the dump folder: {error}")))?;
     let mut dumps = Vec::with_capacity(steps.len());
     for (step, recorded_sha256, recorded_len) in steps {
         dumps.push(

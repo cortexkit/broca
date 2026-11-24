@@ -210,6 +210,16 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/google_codeassist_v8.json"))
             .expect("Code Assist v8 pins are JSON"),
     );
+    // The same Claude config frozen at v9, and a Gemini config frozen at Gemini v4, each
+    // rendered by the code before Code Assist v10 and Gemini v5 marked unsigned steps.
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/google_codeassist_v9.json"))
+            .expect("Code Assist v9 pins are JSON"),
+    );
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/gemini_v4.json"))
+            .expect("Gemini v4 pins are JSON"),
+    );
     pins.extend(
         serde_json::from_str::<Vec<Value>>(include_str!(
             "../fixtures/pre_chat_reasoning_policy.json"
@@ -422,7 +432,9 @@ fn openai_without_media_keep_their_pinned_old_version_bytes() {
 }
 
 /// The explicit media hook must preserve the existing golden bytes for runs admitted before
-/// media profiles existed, including Code Assist's deterministic envelope.
+/// media profiles existed, including Code Assist's deterministic envelope. The current goldens
+/// carry the thought-signature placeholder newer versions add, so the old versions are checked
+/// against the golden bytes recorded before it.
 #[test]
 fn gemini_and_codeassist_without_media_keep_their_pinned_old_version_bytes() {
     use crate::{gemini_render_golden as gemini, google_codeassist_render_golden as codeassist};
@@ -431,14 +443,14 @@ fn gemini_and_codeassist_without_media_keep_their_pinned_old_version_bytes() {
             WireFamilyId::Gemini,
             gemini::golden_frozen(),
             gemini::fixed_request(),
-            gemini::GOLDEN,
+            include_str!("../fixtures/gemini_render_golden_v4.json"),
             4,
         ),
         (
             WireFamilyId::GoogleCodeAssist,
             codeassist::golden_frozen(),
             codeassist::fixed_request(),
-            codeassist::GOLDEN,
+            include_str!("../fixtures/google_codeassist_render_golden_v9.json"),
             7,
         ),
     ] {

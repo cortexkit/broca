@@ -85,6 +85,9 @@ pub enum StoreReadRequest {
     /// The compaction view the model step that wrote message `ordinal` (counting from 0) was
     /// rendered under, for output references (see `store_output_refs::writing_view`).
     WritingView { ordinal: u64 },
+    /// The plan manifest run `run_id` was admitted under, for output references (see
+    /// `store_output_refs::run_manifest`).
+    RunManifest(RunId),
     /// The namespace of output references: the source log's lineage after conversion, otherwise
     /// the store incarnation. It is independent of the public history cursor's incarnation.
     OutputRefNamespace,
@@ -106,6 +109,11 @@ pub enum StoreReadRequest {
     /// `call_keys` by (see `late_results_puller::stored::held_call_records`). Broca reads it for
     /// itself, for no caller.
     HeldCalls { call_keys: Vec<String> },
+    /// Where the session stands, for a read that runs its own code over the session as stored
+    /// (`StoreRuntime::durable_view`), counted in the memory report under the name it carries.
+    /// An actor answers it like any caller read, after making its records durable, so the
+    /// position it names is durable.
+    DurableView(&'static str),
 }
 
 impl StoreReadRequest {
@@ -141,13 +149,15 @@ impl StoreReadRequest {
             Self::Compaction { .. } => "compaction",
             Self::HistoryHead { .. } => "session.history",
             Self::Media { .. } => "session.media_read",
-            Self::TagLocation(_) | Self::WritingView { .. } | Self::OutputRefNamespace => {
-                "output_refs"
-            }
+            Self::TagLocation(_)
+            | Self::WritingView { .. }
+            | Self::OutputRefNamespace
+            | Self::RunManifest(_) => "output_refs",
             Self::PlanChange { .. } | Self::PlanIdentities => "plan_change",
             Self::Baseline => "session.baseline",
             Self::PlanView => "session.plan_view",
             Self::HeldCalls { .. } => "held_calls",
+            Self::DurableView(reason) => reason,
         }
     }
 }
@@ -217,6 +227,7 @@ pub enum StoreReadReply {
     Media(Result<Option<StoredMedia>, ServeError>),
     TagLocation(Result<broca_core::TagLocation, ServeError>),
     WritingView(Result<Option<broca_core::compaction_provider::view::CompactionView>, ServeError>),
+    RunManifest(Result<Option<Arc<broca_records::record::PlanManifest>>, ServeError>),
     OutputRefNamespace(String),
     PlanChange(Result<PlanChangeRead, String>),
     PlanIdentities(Result<RefreshedIdentities, String>),
@@ -224,6 +235,8 @@ pub enum StoreReadReply {
     Baseline(Result<Option<Box<crate::store_plan_change::BaselineFacts>>, String>),
     PlanView(Result<broca_wire::plan_view::PlanViewResponse, crate::store_plan_view::Error>),
     HeldCalls(Result<crate::late_results_puller::HeldCallRecords, String>),
+    /// The position of the session the read ran over.
+    Position(Position),
 }
 
 /// A medium a record of the session names: its reference, and its bytes or why they couldn't be
@@ -457,6 +470,11 @@ pub async fn execute<B: SessionBackend>(
                 .await
                 .map_err(output_refs_failed),
         ),
+        StoreReadRequest::RunManifest(run_id) => StoreReadReply::RunManifest(
+            crate::store_output_refs::run_manifest(session, ctx.parts, &run_id.0)
+                .await
+                .map_err(output_refs_failed),
+        ),
         StoreReadRequest::PlanChange {
             generation,
             send_id,
@@ -484,6 +502,7 @@ pub async fn execute<B: SessionBackend>(
                 .await
                 .map_err(|error| format!("{error:?}")),
         ),
+        StoreReadRequest::DurableView(_) => StoreReadReply::Position(session.position()),
     }
 }
 

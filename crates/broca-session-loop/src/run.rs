@@ -70,8 +70,10 @@ mod close_out;
 use close_out::{held_close_result, never_dispatched_close_out, open_batch_close_out};
 mod call_plan;
 use call_plan::{hook_plan, plan_calls, CallPlan};
+mod dispatch;
+use dispatch::{dispatch_all, DispatchPlan, Dispatched};
 mod pause;
-use pause::{pause, sign_in_at_start, sign_in_refused};
+use pause::{pause, sign_in_at_start, sign_in_refused, take_deposited};
 mod plan_notes;
 use plan_notes::{removed_tools, with_plan_notes, with_plan_system};
 mod resolved;
@@ -968,7 +970,7 @@ where
     if let (Some(error), Resolution::ProviderHeld(_)) = (&drift, &resolution) {
         let mut error = error.clone();
         error.provider_code = Some("held_resume_refused".into());
-        return close_interrupted(writer, seams, &admission.run_id, Some((&error, resumed))).await;
+        return close_interrupted(writer, seams, &admission, Some((&error, resumed))).await;
     }
     // The refreezes come first, durable with the resume, so nothing the resume does renders or
     // bills under the old config or account.
@@ -1018,39 +1020,7 @@ where
         _ => admission,
     };
     if cancelling_held {
-        // Closing a held obligation needs neither a renderer nor model admission. Use the
-        // frozen transcript rules to place its synthetic result, then withdraw after the end.
-        let ctx = BatchCtx {
-            batch_id: BatchId(
-                run_state(writer)
-                    .open_batch
-                    .as_ref()
-                    .expect("a held batch is open")
-                    .batch_id
-                    .clone(),
-            ),
-            bind: seams.bind.clone(),
-            run_id: RunId(admission.run_id.clone()),
-            scope: admission.send.scope.clone(),
-            media_capture: writer.media(),
-        };
-        let now = (seams.now_ms)();
-        let (mut records, withdrawn) =
-            open_batch_close_out(writer, &admission.run_id, now, RunFinishReason::Cancelled);
-        records.push(run_end(
-            writer,
-            &admission.run_id,
-            RunFinishReason::Cancelled,
-            now,
-        ));
-        append_end(writer, &admission.run_id, records).await?;
-        if let Some(lifecycle) = seams.held {
-            for reply in &withdrawn {
-                lifecycle.terminal_synced(&ctx, &reply.tool_call_id).await;
-            }
-        }
-        withdraw(seams, &withdrawn).await;
-        return Ok(finished(writer, RunFinishReason::Cancelled));
+        return close_held_cancelled(writer, seams, &admission).await;
     }
     if let Some((frozen, pending)) = submit {
         return submitted(writer, seams, &admission.run_id, &frozen, &pending).await;
@@ -1062,9 +1032,7 @@ where
     let finished = match resolution {
         Resolution::Resume => drive(writer, parts, &admission, seams, compaction.as_ref()).await,
         Resolution::Idle(reason) => finish_idle(writer, seams, &admission, reason).await,
-        Resolution::Interrupted(_) => {
-            close_interrupted(writer, seams, &admission.run_id, None).await
-        }
+        Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission, None).await,
         // A held call's late result arrived: the run goes on from its open batch, waiting on
         // each held call again rather than sending it.
         Resolution::ProviderHeld(_) => {
@@ -1102,9 +1070,11 @@ const NOT_RUN_INTERRUPTED: &str =
 async fn close_interrupted<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
-    run_id: &str,
+    admission: &Admission,
     refused: Option<(&ProviderError, Resumed)>,
 ) -> Result<Finished, LoopError> {
+    let run_id = admission.run_id.as_str();
+    let ctx = held_batch_ctx(writer, seams, admission);
     let now = (seams.now_ms)();
     let (mut records, withdrawn) =
         open_batch_close_out(writer, run_id, now, RunFinishReason::Interrupted);
@@ -1121,8 +1091,67 @@ async fn close_interrupted<W: Writer, P, T>(
     }
     records.push(end);
     append_end(writer, run_id, records).await?;
+    synced_closed(seams, ctx.as_ref(), &withdrawn).await;
     withdraw(seams, &withdrawn).await;
     Ok(finished(writer, RunFinishReason::Interrupted))
+}
+
+/// Ends a run cancelled while a provider holds calls of its open batch, sending nothing. A
+/// result a provider already deposited is that call's result: it is written and acknowledged
+/// first ([`take_deposited`]). Each call still held then gets its close result, durable with
+/// the batch's and the run's end; its slot is released and its provider asked to withdraw it.
+/// Closing a held obligation needs neither a renderer nor model admission.
+async fn close_held_cancelled<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+) -> Result<Finished, LoopError> {
+    take_deposited(writer, seams, admission).await?;
+    let ctx = held_batch_ctx(writer, seams, admission);
+    let now = (seams.now_ms)();
+    let (mut records, withdrawn) =
+        open_batch_close_out(writer, &admission.run_id, now, RunFinishReason::Cancelled);
+    records.push(run_end(
+        writer,
+        &admission.run_id,
+        RunFinishReason::Cancelled,
+        now,
+    ));
+    append_end(writer, &admission.run_id, records).await?;
+    synced_closed(seams, ctx.as_ref(), &withdrawn).await;
+    withdraw(seams, &withdrawn).await;
+    Ok(finished(writer, RunFinishReason::Cancelled))
+}
+
+/// The context of the run's open batch, as its held calls' lifecycle knows it.
+fn held_batch_ctx<W: Writer, P, T>(
+    writer: &W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+) -> Option<BatchCtx> {
+    let batch = run_state(writer).open_batch.as_ref()?;
+    Some(BatchCtx {
+        batch_id: BatchId(batch.batch_id.clone()),
+        bind: seams.bind.clone(),
+        run_id: RunId(admission.run_id.clone()),
+        scope: admission.send.scope.clone(),
+        media_capture: writer.media(),
+    })
+}
+
+/// Tells the held calls' lifecycle that each of `closed` has its close result durably, so a
+/// late result already deposited for one is released rather than kept waiting for a run that
+/// will never take it.
+async fn synced_closed<P, T>(
+    seams: &Seams<'_, P, T>,
+    ctx: Option<&BatchCtx>,
+    closed: &[ProviderHeldReply],
+) {
+    if let (Some(lifecycle), Some(ctx)) = (seams.held, ctx) {
+        for reply in closed {
+            lifecycle.terminal_synced(ctx, &reply.tool_call_id).await;
+        }
+    }
 }
 
 /// Ends the session's unfinished latest run `Interrupted`, sending nothing, with the records
@@ -1293,6 +1322,7 @@ fn known_calls<W: Writer>(writer: &W) -> Vec<Known> {
         .map(|position| Known {
             id: batch.id(position).clone(),
             key: batch.key(position).map(str::to_owned),
+            held_sequential: batch.calls[position].held == Some(true),
             args: batch.args(position).map(broca_protocol::json::Json::parse),
             held: batch.held_reply(position).map(|held| ProviderHeldReply {
                 tool_call_id: held.tool_call_id.clone(),
@@ -2223,6 +2253,25 @@ where
             return hard_stop(writer, seams, &admission.run_id, step_id, &planned, &stop).await;
         }
         if cancelled_now || seams.stop.is_cancelled() {
+            // A call a provider holds was sent, so it is never closed as not run. A cancel
+            // takes any result already deposited and closes the rest as held calls close; a
+            // stop leaves the batch parked on them, for the next process to take up.
+            if known.iter().any(|known| known.held.is_some()) {
+                if cancelled_now {
+                    return close_held_cancelled(writer, seams, admission).await;
+                }
+                let ctx = held_batch_ctx(writer, seams, admission);
+                return pause(
+                    writer,
+                    seams,
+                    &admission.run_id,
+                    PauseReason::ToolHeld,
+                    None,
+                    None,
+                    ctx.as_ref(),
+                )
+                .await;
+            }
             let calls = if started { &unsent } else { &planned };
             return stopped_batch_in(
                 writer,
@@ -4371,6 +4420,9 @@ pub(crate) struct Known {
     pub id: ToolCallId,
     pub key: Option<String>,
     pub held: Option<ProviderHeldReply>,
+    /// The provider held it while its batch ran one call at a time (`ToolHeld::sequential`), so
+    /// the calls after it wait for its result.
+    pub held_sequential: bool,
     /// The input its intent recorded, when an approval policy narrowed it; sent instead of the
     /// model's.
     pub args: Option<serde_json::Value>,
@@ -4453,11 +4505,15 @@ where
         refusal,
         Some(broca_core::tool_plane::ToolPlaneError::ScopeDrained { .. })
     );
-    let sequential = calls.iter().any(|call| {
-        manifest
-            .get(&call.tool_name)
-            .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
-    });
+    // A resumed batch runs in the order its first dispatch did. Only its unanswered calls are
+    // given here, and the call that made it sequential may already be answered; a held call
+    // recorded whether later calls wait for it, and they still do.
+    let sequential = known.iter().any(|known| known.held_sequential)
+        || calls.iter().any(|call| {
+            manifest
+                .get(&call.tool_name)
+                .is_some_and(|tool| tool.execution_mode == ExecutionMode::Sequential)
+        });
     let known_of = |call: &ToolCall| known.iter().find(|known| known.id == call.tool_call_id);
     // The policy may narrow a call's input, so the batch works from its own copy of the calls. A
     // call a resume already knows goes out with the input its intent recorded.
@@ -5605,342 +5661,6 @@ fn turn_system_input(send: &OrderedSend, submission_id: &str) -> Vec<Message> {
 const NOT_DISPATCHED: &str =
     "tool not run: the run was interrupted before this call was dispatched";
 
-/// A held reply on its way to the batch's writer, with where to say it's durable.
-type HeldRequest = (ProviderHeldReply, oneshot::Sender<Result<(), String>>);
-
-/// The held-reply recorder the loop hands the plane. The plane's dispatch future runs while
-/// the batch driver owns the writer, so the recorder doesn't write: it asks the driver to
-/// append the held record durably and waits for the answer.
-struct HeldChannel {
-    requests: futures::channel::mpsc::UnboundedSender<HeldRequest>,
-}
-
-#[async_trait::async_trait]
-impl ProviderHeldRecorder for HeldChannel {
-    async fn sync_held(&self, reply: &ProviderHeldReply) -> Result<(), String> {
-        let (answer, answered) = oneshot::channel();
-        self.requests
-            .unbounded_send((reply.clone(), answer))
-            .map_err(|_| "the batch no longer takes held replies".to_string())?;
-        answered
-            .await
-            .map_err(|_| "the batch stopped before the held reply was durable".to_string())?
-    }
-}
-
-/// What a batch's dispatch works from.
-struct DispatchPlan<'p> {
-    ctx: &'p BatchCtx,
-    calls: &'p [ToolCall],
-    keys: &'p [(ToolCallId, String)],
-    /// Per call, in order: the provider's held reply when the call was held before the run
-    /// paused; that call waits for its late result again instead of being sent.
-    held: &'p [Option<&'p ProviderHeldReply>],
-    guard: &'p ToolOpenGuard,
-    batch_id: &'p str,
-    run_id: &'p str,
-    sequential: bool,
-    hooks: Option<&'p broca_core::hooks::HookRuntime<'p>>,
-    step_id: u64,
-    /// Tells the compaction provider once a held call's result is durable.
-    changes: Option<&'p crate::compaction::Changes<'p>>,
-}
-
-/// One call's answer, once it is appended. The batch's end needs only how the call ended.
-struct Answer {
-    outcome: CallOutcome,
-}
-
-/// How a batch's dispatch ended. Answers are in call order; `None` for a call still waiting.
-enum Dispatched {
-    /// Every call answered. `closed` are the held calls a cancel closed, whose providers are
-    /// asked to withdraw them once the run's end is durable.
-    All {
-        answers: Vec<Option<Answer>>,
-        closed: Vec<ProviderHeldReply>,
-    },
-    /// Only calls a provider holds were still waiting.
-    Held(Vec<Option<Answer>>),
-}
-
-/// Dispatches every call, in parallel unless one of them must run alone, and collects their
-/// answers:
-/// - each call carries its key and the batch's held-reply recorder; a held reply is appended,
-///   durably, while the other calls keep running;
-/// - every call's answer is appended as soon as it arrives, so a reader sees it while the
-///   batch's other calls still run; a held or handed-back call's answer durably, before any call
-///   queued behind it is sent, and the plane is then told it's durable;
-/// - after a call whose outcome is unknown, no later call is sent: each gets the interrupted
-///   result;
-/// - when every call still running is held, the dispatch stops and the run pauses.
-async fn dispatch_all<W: Writer, P, T: ToolPlane>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    plan: &DispatchPlan<'_>,
-) -> Result<Dispatched, LoopError> {
-    use futures::stream::FuturesUnordered;
-    let calls = plan.calls;
-    let (requests, mut held_requests) = futures::channel::mpsc::unbounded::<HeldRequest>();
-    let recorder = HeldChannel { requests };
-    let recorder = &recorder;
-    let key_of = |call: &ToolCall| {
-        plan.keys
-            .iter()
-            .find(|(id, _)| *id == call.tool_call_id)
-            .map(|(_, key)| key.as_str())
-            .expect("every dispatched call has an intent with a key")
-    };
-    let mut open_held: Vec<ToolCallId> = calls
-        .iter()
-        .zip(plan.held)
-        .filter(|(_, held)| held.is_some())
-        .map(|(call, _)| call.tool_call_id.clone())
-        .collect();
-    let mut answers: Vec<Option<Answer>> = calls.iter().map(|_| None).collect();
-    let mut jobs = FuturesUnordered::new();
-    let mut next = 0;
-    let mut tripped = false;
-    let mut closed: Vec<ProviderHeldReply> = Vec::new();
-    loop {
-        // A caller's cancel closes every call a provider holds: it gets the close result, durable
-        // at once, and its provider is asked to withdraw it after the run's end. Calls still
-        // running finish as usual.
-        //
-        // A batch with a call whose outcome is unknown closes its held calls the same way once
-        // only they still run: the run ends interrupted for review, and a late answer can't
-        // resume a run in doubt, so waiting on them would wait forever.
-        let in_doubt = tripped && jobs.len() == open_held.len();
-        if (seams.cancel.is_cancelled() || in_doubt) && !open_held.is_empty() {
-            let reason = if seams.cancel.is_cancelled() {
-                RunFinishReason::Cancelled
-            } else {
-                RunFinishReason::Interrupted
-            };
-            for id in std::mem::take(&mut open_held) {
-                let index = calls
-                    .iter()
-                    .position(|call| call.tool_call_id == id)
-                    .expect("a held call is one of the batch's");
-                let (result, outcome, code) = held_close_result(&id, reason);
-                let mut records = Vec::new();
-                terminal_with_reason(
-                    &mut records,
-                    plan.run_id,
-                    plan.batch_id,
-                    result.clone(),
-                    outcome,
-                    Some(code.into()),
-                    Some((seams.now_ms)()),
-                );
-                writer.append(&records, true).await?;
-                if let Some(lifecycle) = seams.held {
-                    lifecycle.terminal_synced(plan.ctx, &id).await;
-                }
-                closed.push(held_reply_of(writer, plan, &id));
-                answers[index] = Some(Answer { outcome });
-            }
-        }
-        while next < calls.len() && (!plan.sequential || jobs.is_empty()) {
-            let index = next;
-            next += 1;
-            let call = &calls[index];
-            let held = plan.held[index];
-            let interrupted = tripped && held.is_none();
-            let key = key_of(call);
-            jobs.push(async move {
-                let answer: Resolved = if interrupted {
-                    (
-                        interrupted_result(&call.tool_call_id),
-                        CallOutcome::Interrupted,
-                    )
-                        .into()
-                } else if let Some(reply) = held {
-                    match seams.held {
-                        Some(lifecycle) => {
-                            let waited =
-                                checked(plan.ctx, lifecycle.wait(plan.ctx, call, reply).await);
-                            answered(plan, call, key, waited).await
-                        }
-                        None => std::future::pending().await,
-                    }
-                } else {
-                    dispatch_one(seams.tools, plan, call, key, recorder).await
-                };
-                (index, answer)
-            });
-        }
-        if answers.iter().all(Option::is_some) {
-            return Ok(Dispatched::All { answers, closed });
-        }
-        if !tripped && !open_held.is_empty() && jobs.len() == open_held.len() {
-            // Only held calls wait. Anything already answered is taken first, then the run pauses.
-            if let Some(Some((index, answer))) = futures::FutureExt::now_or_never(jobs.next()) {
-                settle(
-                    writer,
-                    seams,
-                    plan,
-                    &mut open_held,
-                    &mut answers,
-                    &mut tripped,
-                    index,
-                    answer,
-                )
-                .await?;
-                continue;
-            }
-            // A cancel that came in meanwhile closes the held calls instead of pausing on them.
-            if seams.cancel.is_cancelled() {
-                continue;
-            }
-            return Ok(Dispatched::Held(answers));
-        }
-        // While a provider holds a call, a cancel also wakes the dispatch, to close it.
-        let hold_open = !open_held.is_empty();
-        let cancel = async {
-            if !hold_open {
-                std::future::pending::<()>().await;
-            }
-            seams.cancel.cancelled().await;
-        };
-        let cancel = std::pin::pin!(cancel);
-        let woke = futures::future::select(
-            futures::future::select(jobs.next(), held_requests.next()),
-            cancel,
-        )
-        .await;
-        let futures::future::Either::Left((woke, _)) = woke else {
-            continue;
-        };
-        match woke {
-            futures::future::Either::Left((Some((index, answer)), _)) => {
-                if answers[index].is_some() {
-                    // A held call a cancel already closed: its late answer is ignored.
-                    continue;
-                }
-                settle(
-                    writer,
-                    seams,
-                    plan,
-                    &mut open_held,
-                    &mut answers,
-                    &mut tripped,
-                    index,
-                    answer,
-                )
-                .await?;
-            }
-            futures::future::Either::Left((None, _)) => {
-                unreachable!("jobs run until every call has an answer")
-            }
-            futures::future::Either::Right((Some((reply, answered)), _)) => {
-                let record = Record::ToolHeld(ToolHeld {
-                    batch_id: plan.batch_id.into(),
-                    tool_call_id: reply.tool_call_id.clone(),
-                    call_key: reply.call_key.clone(),
-                    module: reply.module.clone(),
-                    reason: reply.reason.clone(),
-                    detail_digest: reply.detail_digest.clone(),
-                    held_at_ms: (seams.now_ms)(),
-                    sequential: plan.sequential,
-                });
-                let durable = writer
-                    .append(&[record], true)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| format!("{error:?}"));
-                if durable.is_ok() {
-                    open_held.push(reply.tool_call_id.clone());
-                }
-                let _ = answered.send(durable);
-            }
-            futures::future::Either::Right((None, _)) => {
-                unreachable!("the recorder lives as long as the dispatches")
-            }
-        }
-    }
-}
-
-/// Takes call `index`'s answer. A held call's answer is appended durably at once, and the plane
-/// told so, before any call behind it is sent.
-#[allow(clippy::too_many_arguments)]
-async fn settle<W: Writer, P, T: ToolPlane>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    plan: &DispatchPlan<'_>,
-    open_held: &mut Vec<ToolCallId>,
-    answers: &mut [Option<Answer>],
-    tripped: &mut bool,
-    index: usize,
-    resolved: Resolved,
-) -> Result<(), LoopError> {
-    let Resolved {
-        result,
-        outcome,
-        reason,
-        detail,
-        hooks,
-        yielded_by,
-    } = resolved;
-    *tripped |= outcome == CallOutcome::Unknown;
-    let id = plan.calls[index].tool_call_id.clone();
-    // A handed-back call is durable at once too, naming its provider: from then on the
-    // provider's terminal for it is a notice, even across a crash before the batch ends.
-    let yielded = yielded_by.is_some();
-    let durable = open_held.contains(&id) || yielded;
-    if durable {
-        let mut records = Vec::new();
-        terminal_with_reason(
-            &mut records,
-            plan.run_id,
-            plan.batch_id,
-            result,
-            outcome,
-            reason,
-            Some((seams.now_ms)()),
-        );
-        if let Some(Record::ToolOutcome(record)) = records.last_mut() {
-            record.hooks = hooks.map(Into::into);
-            record.detail = detail.map(Into::into);
-            record.yielded_by = yielded_by.clone();
-        }
-        writer.append(&records, true).await?;
-        open_held.retain(|held| *held != id);
-        if let Some(changes) = plan.changes {
-            changes.tell(writer, seams).await;
-        }
-        if let Some(lifecycle) = seams.held {
-            match &yielded_by {
-                // The provider still owes the handed-back call its own terminal, which arrives
-                // on the provider's late-results feed; a handed-back call was never in a
-                // waiting slot, so there is nothing to release.
-                Some(carrier) => lifecycle.yielded_synced(plan.ctx, carrier).await,
-                None => lifecycle.terminal_synced(plan.ctx, &id).await,
-            }
-        }
-    } else {
-        // Written and synced now: a reader sees it while the batch's other calls run (a `say` by a
-        // long `bash`), and a crash can't lose a result a reader saw, which would make it unknown.
-        // The next request still lists the batch's results in the order its calls were planned.
-        let mut records = Vec::new();
-        terminal_with_reason(
-            &mut records,
-            plan.run_id,
-            plan.batch_id,
-            result,
-            outcome,
-            reason,
-            Some((seams.now_ms)()),
-        );
-        if let Some(Record::ToolOutcome(record)) = records.last_mut() {
-            record.hooks = hooks.map(Into::into);
-            record.detail = detail.map(Into::into);
-        }
-        writer.append(&records, true).await?;
-    }
-    answers[index] = Some(Answer { outcome });
-    Ok(())
-}
-
 /// Asks each held call's provider to withdraw it, once the run's end is durable. Best effort:
 /// a failure can't reopen the call, and a late answer for it is already ignored.
 async fn withdraw<P, T>(seams: &Seams<'_, P, T>, closed: &[ProviderHeldReply]) {
@@ -5948,112 +5668,6 @@ async fn withdraw<P, T>(seams: &Seams<'_, P, T>, closed: &[ProviderHeldReply]) {
         for reply in closed {
             let _ = lifecycle.withdraw_held(reply).await;
         }
-    }
-}
-
-/// The provider's held reply for the open held call `id`, as the run recorded it.
-fn held_reply_of<W: Writer>(
-    writer: &W,
-    plan: &DispatchPlan<'_>,
-    id: &ToolCallId,
-) -> ProviderHeldReply {
-    if let Some(reply) = plan
-        .held
-        .iter()
-        .flatten()
-        .find(|reply| reply.tool_call_id == *id)
-    {
-        return (*reply).clone();
-    }
-    let batch = run_state(writer)
-        .open_batch
-        .as_ref()
-        .expect("a held call's batch is open");
-    let position = (0..batch.calls.len())
-        .find(|position| batch.id(*position) == id)
-        .expect("a held call is planned");
-    let held = batch.held_reply(position).expect("the call is held");
-    ProviderHeldReply {
-        tool_call_id: held.tool_call_id.clone(),
-        call_key: held.call_key.clone(),
-        module: held.module.clone(),
-        reason: held.reason.clone(),
-        detail_digest: held.detail_digest.clone(),
-    }
-}
-
-/// The result a call gets when an earlier call of its batch may have run without an answer,
-/// so it was never sent.
-fn interrupted_result(id: &ToolCallId) -> ToolResult {
-    ToolResult {
-        tool_call_id: id.clone(),
-        output: ToolOutput::error("tool not run: batch interrupted"),
-        is_error: true,
-    }
-}
-
-/// Sends one call with its key and the batch's held-reply recorder, and resolves the answer. A
-/// result the provider returned goes through the post-tool hooks the plan subscribes for its
-/// tool, before the batch takes it.
-async fn dispatch_one<T: ToolPlane>(
-    tools: &T,
-    plan: &DispatchPlan<'_>,
-    call: &ToolCall,
-    call_key: &str,
-    recorder: &HeldChannel,
-) -> Resolved {
-    let key = DispatchKey {
-        call_key,
-        held_recorder: Some(recorder),
-    };
-    let sent = checked(
-        plan.ctx,
-        tools
-            .dispatch_guarded(plan.ctx, call, Some(key), plan.guard)
-            .await,
-    );
-    answered(plan, call, call_key, sent).await
-}
-
-/// What a call's provider answered, as the batch takes it. A result goes through the post-tool
-/// hooks the plan subscribes for its tool, whether it came back on the dispatch or later, after
-/// a hold: a hook that edits or withholds a result must see every result the model will.
-async fn answered(
-    plan: &DispatchPlan<'_>,
-    call: &ToolCall,
-    call_key: &str,
-    answer: DispatchResult,
-) -> Resolved {
-    match answer {
-        DispatchResult::Completed(result) => {
-            post_tool(plan.hooks, plan.step_id, call, call_key, result).await
-        }
-        // The interim content a hand-back answered with is the call's result, as any result is.
-        DispatchResult::Yielded { result, carrier } => Resolved {
-            yielded_by: Some(carrier),
-            ..post_tool(plan.hooks, plan.step_id, call, call_key, result).await
-        },
-        // The refusal's code is the outcome's reason unless a post-tool hook gave one.
-        DispatchResult::Refused {
-            result,
-            code,
-            detail,
-        } => {
-            let resolved = post_tool(plan.hooks, plan.step_id, call, call_key, result).await;
-            Resolved {
-                reason: resolved.reason.clone().or(Some(code)),
-                detail: Some(detail),
-                ..resolved
-            }
-        }
-        DispatchResult::ScopeDrained { ref reason, .. } => {
-            let reason = Some(reason.clone());
-            Resolved {
-                reason,
-                ..resolve(call, answer).into()
-            }
-        }
-        other => resolve(call, other).into(),
     }
 }
 

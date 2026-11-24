@@ -28,7 +28,7 @@ use crate::directory::Pages;
 use crate::fold::conversation::{Conversation, EntryState, NotHeld};
 use crate::idindex::{self, IdKind, IndexPages, IndexRoot};
 use crate::record::Record;
-use crate::segment::{SegmentLayout, FOOTER, OPEN_PREFIX};
+use crate::segment::SegmentLayout;
 
 use super::{Session, SessionError};
 
@@ -308,30 +308,12 @@ impl<B: SessionBackend> Session<B> {
             return Ok(kept);
         }
         let version = self.operations.history_version;
-        let Some(size) = self.backend.object_size(&self.addr, object).await? else {
+        let Some(layout) =
+            super::stored::read_layout(&self.backend, &self.addr, object, key).await?
+        else {
             return Ok(None);
         };
-        let read = |range: std::ops::Range<u64>| async move {
-            self.backend
-                .get_object_range(&self.addr, object, range)
-                .await?
-                .ok_or_else(|| SessionError::Fold(format!("sealed segment {object} is missing")))
-        };
-        let prefix = read(0..size.min(OPEN_PREFIX)).await?;
-        let header_end = SegmentLayout::header_end(&prefix).map_err(SessionError::Segment)?;
-        let header = if header_end <= prefix.len() as u64 {
-            prefix
-        } else {
-            read(0..header_end.min(size)).await?
-        };
-        let footer = read(size.saturating_sub(FOOTER)..size).await?;
-        let (offset, len) =
-            SegmentLayout::index_span(&footer, size).map_err(SessionError::Segment)?;
-        let sealed = read(offset..offset + len).await?;
-        let layout = Arc::new(
-            SegmentLayout::open(&header, &sealed, key, object.as_bytes())
-                .map_err(SessionError::Segment)?,
-        );
+        let layout = Arc::new(layout);
         let mut caches = self.sealed_caches();
         if caches.version == version {
             let layouts = &mut caches.kept.get_or_insert_with(Box::default).layouts;
@@ -352,15 +334,7 @@ impl<B: SessionBackend> Session<B> {
         position: usize,
         key: &crate::frame::FrameKey,
     ) -> Result<Vec<(u64, Record)>, SessionError> {
-        let (offset, len) = layout.block_span(position).map_err(SessionError::Segment)?;
-        let sealed = self
-            .backend
-            .get_object_range(&self.addr, object, offset..offset + len)
-            .await?
-            .ok_or_else(|| SessionError::Fold(format!("sealed segment {object} is missing")))?;
-        layout
-            .block(position, &sealed, key, object.as_bytes())
-            .map_err(SessionError::Segment)
+        super::stored::read_block(&self.backend, &self.addr, object, layout, position, key).await
     }
 
     /// The directory pages the session keeps, taken for one read, which hands them back with
@@ -551,11 +525,15 @@ impl<B: SessionBackend> Session<B> {
             fanout: crate::directory::FANOUT,
         };
         let window = self.conversation.window_start();
+        // Directory pages come from those the session keeps, so a page of entries after the first
+        // reads only its blocks. A read that fails hands none back; the next starts with none.
+        let mut memo = self.take_pages();
         while next < window && out.len() < limit {
             self.storage_read()?;
             let damaged = || SessionError::Fold(format!("no sealed segment places message {next}"));
+            let sought = next;
             let entry = pages
-                .find_ordinal(self.head.transcript_dir.as_ref(), next)
+                .find_ordinal_in(self.head.transcript_dir.as_ref(), next, &mut memo)
                 .await
                 .map_err(SessionError::Directory)?
                 .ok_or_else(damaged)?;
@@ -593,7 +571,15 @@ impl<B: SessionBackend> Session<B> {
                 // on to the next block.
                 next = next.max(conversation.placed + 1);
             }
+            // The directory named this segment for `sought`, yet none of its blocks placed it: the
+            // directory and the segment disagree, and finding the segment again would loop forever.
+            if next == sought {
+                return Err(SessionError::Fold(format!(
+                    "no sealed segment places message {sought}"
+                )));
+            }
         }
+        self.keep_pages(memo);
         if out.len() < limit {
             out.extend(self.window_entries_whole(next, limit - out.len()).await?);
         }
@@ -1253,8 +1239,8 @@ impl<B: SessionBackend> Session<B> {
     /// The ledger record with `seq`, by lookup, never a scan: a sealed one from the one block of
     /// the one segment the ledger directory names for it (the directory's pages above it, then
     /// that segment), an open one from the records the session keeps in memory, else from the
-    /// open log, which a seal bounds. `None` when the session holds no record with that seq, or
-    /// the one it holds is a transcript record.
+    /// stretch of the open log around its frame (see [`Self::open_ledger_record`]). `None` when
+    /// the session holds no record with that seq, or the one it holds is a transcript record.
     pub async fn ledger_record(&self, seq: u64) -> Result<Option<Record>, SessionError> {
         let sealed = self
             .head
@@ -1282,18 +1268,51 @@ impl<B: SessionBackend> Session<B> {
                 }
             }
         }
-        let kept = self
-            .reads_kept()
-            .then(|| self.kept.between(seq, seq))
-            .flatten();
-        let open = match kept {
-            Some(kept) => kept,
-            None => self.open_log_records().await?,
-        };
-        Ok(open
-            .into_iter()
-            .find(|(at, record)| *at == seq && record.stream() == crate::record::Stream::Ledger)
-            .map(|(_, record)| record))
+        if self.reads_kept() {
+            if let Some(kept) = self.kept.between(seq, seq) {
+                return Ok(kept
+                    .into_iter()
+                    .find(|(at, record)| {
+                        *at == seq && record.stream() == crate::record::Stream::Ledger
+                    })
+                    .map(|(_, record)| record));
+            }
+        }
+        self.open_ledger_record(seq).await
+    }
+
+    /// The ledger record at `seq` in the open log, if the log holds one, read back from the
+    /// stretch of the log between the nearest frames the session knows the places of on either
+    /// side ([`idindex::OpenIds::places_around`]): one ranged read, usually of a few frames, never
+    /// the whole log. The writer appended every frame there, so one that doesn't read back is
+    /// damage.
+    async fn open_ledger_record(&self, seq: u64) -> Result<Option<Record>, SessionError> {
+        // A seq past the log's last record, or one a transcript record takes, names no ledger
+        // record there.
+        if seq >= self.encoder.next_seq() || self.open_ids.transcript_place(seq).is_some() {
+            return Ok(None);
+        }
+        self.storage_read()?;
+        let (before, after) = self.open_ids.places_around(seq);
+        let start = before.map_or(0, |place| place.at + u64::from(place.len));
+        let end = after.map_or(self.encoder.offset(), |place| place.at);
+        let bytes = self
+            .backend
+            .read_log(&self.addr, &self.log, start..end)
+            .await?;
+        let key = self.key.frame_key();
+        let bind = super::log_bind(&self.head.session_id, &self.log);
+        let mut found = None;
+        super::stored::read_frames(&bytes, start, &key, &bind, |at, header, body| {
+            if header.seq < seq {
+                return Ok(true);
+            }
+            if header.seq == seq && header.stream == crate::frame::FrameStream::Ledger {
+                found = Some(super::stored::decode_frame(at, header, &body)?);
+            }
+            Ok(false)
+        })?;
+        Ok(found)
     }
 
     /// The sealed records of `first` through `last`, as [`Place::sealed_between`] reads them,

@@ -374,6 +374,15 @@ fn convert_contents_with_provenance<'a>(
     // stored call id each result names.
     let names_calls = super::google_codeassist::sends_claude_call_ids(frozen);
     let mut current_call_ids: BTreeMap<String, String> = BTreeMap::new();
+    // Gemini checks thought signatures only in the current exchange: the steps after the last
+    // user message that isn't only tool results.
+    let marks_unsigned = replays_signed_parts && marks_unsigned_steps(frozen);
+    let exchange_start = non_system.iter().rposition(|m| {
+        m.role == Role::User
+            && m.content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::ToolResult(_)))
+    });
 
     let mut i = 0;
     while i < non_system.len() {
@@ -426,11 +435,13 @@ fn convert_contents_with_provenance<'a>(
                         m.origin.as_ref(),
                         target_model,
                     );
+                let in_exchange = exchange_start.is_none_or(|start| i > start);
                 let parts = convert_model_parts(
                     &m.content,
                     frozen.tool_id,
                     call_ids.as_deref(),
                     echo_safe,
+                    marks_unsigned && in_exchange,
                     name_map,
                     |format| {
                         replays_signed_parts
@@ -541,13 +552,34 @@ fn text_part(text: &str) -> Node<'_> {
     Node::object([("text", Node::str(text))])
 }
 
+/// The value Google documents for a function call whose own thought signature can't be replayed
+/// (<https://ai.google.dev/gemini-api/docs/thought-signatures>). Gemini refuses a step of the
+/// current exchange whose calls carry no signature ("Function call is missing a
+/// thought_signature"). That happens when a compaction view drops the step's first call, which
+/// is the only one Gemini signs in a parallel step, or when the step came from another model.
+/// The model loses that step's replayed reasoning either way; this keeps the request valid.
+const UNSIGNED_STEP_SIGNATURE: &str = "skip_thought_signature_validator";
+
+/// Whether `frozen` marks an unsigned step of the current exchange with
+/// [`UNSIGNED_STEP_SIGNATURE`]: Gemini v5 and Code Assist v10 and later. An earlier frozen
+/// config renders its steps as it always did, so its runs resume byte for byte.
+fn marks_unsigned_steps(frozen: &FrozenRenderConfig) -> bool {
+    match frozen.family_id {
+        crate::spec::WireFamilyId::Gemini => frozen.renderer_version >= 5,
+        crate::spec::WireFamilyId::GoogleCodeAssist => frozen.renderer_version >= 10,
+        _ => false,
+    }
+}
+
 /// `call_ids`, when given, names each tool call in order (`claude_call_ids`) in place of the
-/// family's own id policy.
+/// family's own id policy. `mark_unsigned_step` gives the step's first call
+/// [`UNSIGNED_STEP_SIGNATURE`] when none of its calls carries a signature of its own.
 fn convert_model_parts<'a>(
     blocks: &'a [ContentBlock],
     tool_id: ToolIdPolicy,
     call_ids: Option<&[String]>,
     signed_calls_are_echo_safe: bool,
+    mark_unsigned_step: bool,
     name_map: &crate::tool_name_alias::ToolNameMap,
     text_state_is_echo_safe: impl Fn(broca_protocol::content::TextProviderFormat) -> bool,
 ) -> Vec<Node<'a>> {
@@ -555,6 +587,8 @@ fn convert_model_parts<'a>(
 
     let mut parts: Vec<Node<'a>> = Vec::new();
     let mut call_index: u32 = 0;
+    let mut first_call_part: Option<usize> = None;
+    let mut signed_call = false;
     for (idx, b) in blocks.iter().enumerate() {
         match b {
             ContentBlock::Media(media) => parts.push(Node::object([(
@@ -645,13 +679,20 @@ fn convert_model_parts<'a>(
                 if signed_calls_are_echo_safe {
                     if let Some(signature) = &tc.thought_signature {
                         part.insert("thoughtSignature", Node::str(signature));
+                        signed_call = true;
                     }
                 }
+                first_call_part.get_or_insert(parts.len());
                 parts.push(part);
             }
             ContentBlock::ToolResult(_) => {}
             // Anthropic's server-side fallback handoff means nothing to this family's API: dropped.
             ContentBlock::ProviderFallback { .. } => {}
+        }
+    }
+    if mark_unsigned_step && !signed_call {
+        if let Some(index) = first_call_part {
+            parts[index].insert("thoughtSignature", Node::str(UNSIGNED_STEP_SIGNATURE));
         }
     }
     parts

@@ -919,6 +919,7 @@ impl<B: SessionBackend> Session<B> {
             head: &self.head,
             key: &self.key,
             log: &self.log,
+            kept: None,
         }
     }
 
@@ -1407,7 +1408,7 @@ pub use read::{
     served_window, window_entries, window_entries_with, StoredEntry, SEALED_ENTRIES_MAX_BYTES,
 };
 mod stored;
-pub use stored::{LogFrom, StoredRecords};
+pub use stored::{replay_start, LogFrom, StoredRecords};
 mod cold;
 pub use cold::Cold;
 mod recover;

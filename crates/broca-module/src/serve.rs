@@ -2091,8 +2091,6 @@ pub trait ServeHandler: Send + Sync {
     /// acquiring the session lease.
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError>;
 
-    /// The plan manifest the session froze at admission. `None` for a session admitted without a
-    /// plan, and from a handler that cannot read the session's history.
     /// Locate a stored part for output-reference reads without scanning the transcript.
     async fn tag_location(
         &self,
@@ -2102,9 +2100,13 @@ pub trait ServeHandler: Send + Sync {
         Ok(None)
     }
 
-    async fn frozen_manifest(
+    /// The plan manifest run `run_id` of the session was admitted under, which decides the
+    /// calls whose arguments output references read. `None` for a run admitted without a plan,
+    /// and from a handler that cannot read the session's history.
+    async fn run_manifest(
         &self,
         _session: &LineageKey,
+        _run_id: &str,
     ) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, ServeError> {
         Ok(None)
     }
@@ -2792,10 +2794,22 @@ impl ServeHandler for crate::LineageRegistry {
         }
     }
 
-    async fn frozen_manifest(
+    async fn run_manifest(
         &self,
         session: &LineageKey,
+        run_id: &str,
     ) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, ServeError> {
+        use crate::store_reads::{StoreReadReply, StoreReadRequest};
+        if let Some(store) = self.store_holding(session)? {
+            let request = StoreReadRequest::RunManifest(broca_protocol::RunId(run_id.into()));
+            return match store.read(self, session, request).await? {
+                Some(StoreReadReply::RunManifest(manifest)) => manifest,
+                Some(_) => Err(crate::store_reads::mismatched()),
+                None => Ok(None),
+            };
+        }
+        // A session outside the session store has no run starts to read here: its ownership
+        // keeps the first episode's manifest.
         Ok(self
             .session_ownership_for_bind(session)
             .await
@@ -3354,7 +3368,7 @@ impl ServeHandler for crate::LineageRegistry {
             });
         };
         crate::store_tag_read::check_owner(self, session, request, principal, scope).await?;
-        let Some(view) = store.current_view_for(session, "tag_read").await? else {
+        let Some(view) = store.durable_view(self, session, "tag_read").await? else {
             return Err(ServeError::TagReadRefused {
                 code: cortexkit_role_llm_runner::errors::UNKNOWN_CALL,
                 message: format!("no call has key {}", request.call_key),
@@ -3396,7 +3410,7 @@ impl ServeHandler for crate::LineageRegistry {
         run_id: &str,
     ) -> Result<Option<broca_wire::request_dump::RequestDumpResponse>, ServeError> {
         match self.store_holding(session)? {
-            Some(store) => crate::store_request_dump::serve(&store, session, run_id).await,
+            Some(store) => crate::store_request_dump::serve(self, &store, session, run_id).await,
             // A session the store doesn't hold has no run to rebuild.
             None => Err(ServeError::UnknownRun(run_id.to_owned())),
         }

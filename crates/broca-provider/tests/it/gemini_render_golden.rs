@@ -135,11 +135,12 @@ fn json_tool_result_request(value: Value) -> CallOptions {
     ])
 }
 
+/// Rendered at v4, which the pinned bytes below come from: from v5 the request's unsigned call
+/// also carries Google's placeholder signature (`gemini_unsigned_steps`).
 fn render_json_tool_result(value: Value) -> Vec<u8> {
-    Gemini.render(
-        &gemini_frozen_config("gemini-2.0-flash"),
-        &json_tool_result_request(value),
-    )
+    let mut frozen = gemini_frozen_config("gemini-2.0-flash");
+    frozen.renderer_version = 4;
+    Gemini.render(&frozen, &json_tool_result_request(value))
 }
 
 fn function_response(rendered: &[u8]) -> Value {
@@ -299,7 +300,10 @@ fn gemini_scopes_repeated_tool_call_ids_to_their_own_assistant_group() {
 
 #[test]
 fn gemini_distinct_tool_call_ids_keep_pinned_multi_turn_bytes() {
-    let frozen = gemini_frozen_config("gemini-2.0-flash");
+    // Pinned at v4: from v5 the unsigned steps of the current exchange also carry Google's
+    // placeholder signature (`gemini_unsigned_steps`), which these bytes predate.
+    let mut frozen = gemini_frozen_config("gemini-2.0-flash");
+    frozen.renderer_version = 4;
     let rendered = Gemini.render(&frozen, &two_tool_turn_request("call_search", "call_read"));
 
     assert_eq!(
@@ -383,10 +387,11 @@ fn gemini_cross_model_strips_function_call_thought_signature() {
     let rendered: Value =
         serde_json::from_slice(&Gemini.render(&frozen, &signed_call_request(MODEL_Y))).unwrap();
 
-    assert!(
-        rendered["contents"][1]["parts"][0]
-            .get("thoughtSignature")
-            .is_none(),
+    // A signature minted by a different model is never replayed. The step is in the current
+    // exchange, so it carries Google's placeholder in its place (`gemini_unsigned_steps`).
+    assert_eq!(
+        rendered["contents"][1]["parts"][0]["thoughtSignature"],
+        json!("skip_thought_signature_validator"),
         "a signature minted by a different model must not be replayed"
     );
     assert_eq!(
@@ -472,13 +477,15 @@ fn gemini_same_model_echoes_signed_reasoning_and_calls_in_source_order() {
 
 #[test]
 fn gemini_unsafe_origins_strip_reasoning_and_call_signatures() {
+    // The stripped call is in the current exchange, so it carries Google's placeholder.
     let expected = json!([
         {"text": "visible answer"},
         {
             "functionCall": {
                 "name": "get_weather",
                 "args": {"city": "Madrid"}
-            }
+            },
+            "thoughtSignature": "skip_thought_signature_validator"
         }
     ]);
     let cases = [

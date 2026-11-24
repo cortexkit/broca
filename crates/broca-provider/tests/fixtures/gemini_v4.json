@@ -1,0 +1,21 @@
+[
+  {
+    "body": "{\"contents\":[{\"parts\":[{\"text\":\"question\"}],\"role\":\"user\"},{\"parts\":[{\"text\":\"commentary\"},{\"text\":\"answer\"}],\"role\":\"model\"}],\"generationConfig\":{\"maxOutputTokens\":2048}}",
+    "frozen": {
+      "family_id": "gemini",
+      "max_output_tokens": 2048,
+      "provider_text_state": true,
+      "reasoning": {
+        "mode": "none"
+      },
+      "renderer_version": 4,
+      "system_prompt": {
+        "mode": "system_instruction_field"
+      },
+      "token_limit_field": "gemini_max_output_tokens",
+      "tool_id": "synthetic_index",
+      "usage": "gemini_usage_metadata",
+      "wire_model_id": "gemini-3.5-flash-low"
+    }
+  }
+]

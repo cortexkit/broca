@@ -438,6 +438,8 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
             ),
             // v4 echoes signed text parts only under `provider_text_state`, which v3 configs lack.
             (3, Reproducible),
+            // v5 marks unsigned steps only in requests whose config was frozen at v5.
+            (4, Reproducible),
         ],
         WireFamilyId::GoogleCodeAssist => &[
             (
@@ -469,6 +471,8 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
             (7, Reproducible),
             // v9 changes a request only when its config was frozen at v9.
             (8, Reproducible),
+            // v10 marks unsigned steps only in requests whose config was frozen at v10.
+            (9, Reproducible),
         ],
         WireFamilyId::OpenAiResponsesChatgpt => &[
             (
@@ -976,7 +980,9 @@ pub fn openai_responses_frozen_config(wire_model_id: impl Into<String>) -> Froze
 /// `CallOptions.generation`.
 /// v3: normalize model-visible tool names at the render edge.
 /// v4: echo signed text parts, including signature-only empty text.
-pub const GEMINI_RENDERER_VERSION: u32 = 4;
+/// v5: a step of the current exchange whose calls carry no thought signature gets Google's
+/// documented placeholder on its first call, which Gemini otherwise refuses.
+pub const GEMINI_RENDERER_VERSION: u32 = 5;
 
 /// Build the frozen render config for Google AI Gemini `generateContent`. Quirks come
 /// from `default_quirks` (the same source the catalog uses).
@@ -1022,18 +1028,19 @@ pub fn frozen_config_for_family(
 /// config freezes v8 ([`google_codeassist_renderer_version`]).
 /// v9: a request to a Claude model names each replayed tool call and its result by one id,
 /// which Claude requires.
-pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 9;
+/// v10: a request to a Gemini model gives a step of the current exchange whose calls carry no
+/// thought signature Google's documented placeholder on its first call, as Gemini v5 does.
+pub const GOOGLE_CODEASSIST_RENDERER_VERSION: u32 = 10;
 
-/// The Code Assist render ABI version a config for `wire_model_id` freezes: the current version
-/// for a Claude model, v7 otherwise.
-///
-/// v8 and v9 change only a Claude model's requests, so recording them for any other model would
-/// make a later rollback refuse to resume runs whose bytes are unchanged.
+/// The Code Assist render ABI version a config for `wire_model_id` freezes: the version that last
+/// changed that model's requests. v8 and v9 changed only a Claude model's requests and v10 only a
+/// Gemini model's, so a Claude model freezes v9 and any other model v10. Recording a version
+/// that didn't change a model's bytes would make a later rollback refuse to resume its runs.
 pub fn google_codeassist_renderer_version(wire_model_id: &str) -> u32 {
     if google_codeassist::is_claude_wire_model(wire_model_id) {
-        GOOGLE_CODEASSIST_RENDERER_VERSION
+        9
     } else {
-        7
+        GOOGLE_CODEASSIST_RENDERER_VERSION
     }
 }
 

@@ -14,7 +14,7 @@
 //! projects it) finds the part the request showed under it.
 //!
 //! The read runs over a read-only view of the session as stored, as `session.tag_map` does: it
-//! never commands the session's actor and never takes its lease.
+//! never takes the session's lease, and an open actor only makes its records durable first.
 
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::idindex::IdKind;

@@ -757,7 +757,7 @@ impl ToolPlane for Spy {
             keyed.as_deref().unwrap_or("unkeyed")
         ));
         if let (
-            "hold" | "hold_brief" | "hold_cancel",
+            "hold" | "hold_brief" | "hold_cancel" | "hold_slow",
             Some(DispatchKey {
                 call_key,
                 held_recorder: Some(recorder),
@@ -994,6 +994,25 @@ tokio::task_local! {
     /// When set, a run [`new_with_actions`] resumes finds its account signed out at the start of
     /// the resume, so it pauses for sign-in instead of going on.
     static SIGNED_OUT_ON_RESUME: ();
+}
+
+tokio::task_local! {
+    /// When set, what happens as [`new_with_actions`] resumes a run that paused.
+    static AT_HELD_RESUME: AtHeldResume;
+}
+
+/// What happens to a paused run as [`new_with_actions`] resumes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AtHeldResume {
+    /// No held call's provider has deposited its late result.
+    NoDeposit,
+    /// The runner is stopping: the resume's stop token is already tripped.
+    Stop,
+    /// The caller cancelled before the resume began.
+    CancelBefore,
+    /// The caller cancels while the resume is under way, after it has looked at the cancel
+    /// token once: when it checks the provider's render config.
+    CancelMidResume,
 }
 
 tokio::task_local! {
@@ -4633,6 +4652,12 @@ struct SteeringProvider {
     /// Whether it reports attempt evidence, as a transport does: when one of its calls is
     /// cancelled mid-stream.
     reports_attempts: bool,
+    /// Whether it renders with another config than the run froze, as a provider rebuilt from a
+    /// changed catalog would: set for a resume under `DRIFT`.
+    drifted: std::sync::atomic::AtomicBool,
+    /// A cancel it trips the next time a run checks its render config, which a resume does
+    /// after deciding how to take up a held batch and before taking it up.
+    cancel_at_render_check: Mutex<Option<CancellationToken>>,
 }
 
 /// Whether `steers` cancel a call mid-stream.
@@ -4661,6 +4686,12 @@ impl Provider for SteeringProvider {
     /// checks against the run's. Every other comparison keeps the default stateless config
     /// here, as it always has.
     fn render_config_blob(&self) -> Value {
+        if let Some(cancel) = self.cancel_at_render_check.lock().unwrap().take() {
+            cancel.cancel();
+        }
+        if self.drifted.load(std::sync::atomic::Ordering::SeqCst) {
+            return json!({ "render_config": "stateless", "drifted": true });
+        }
         match ride_placement::frozen_route() {
             Some(_) => self.inner.render_config_blob(),
             None => json!({ "render_config": "stateless" }),
@@ -4817,6 +4848,8 @@ async fn new_with_actions(
         inner: ScriptedProvider::new(scenario.steps.clone()),
         calls: Default::default(),
         reports_attempts: cancels_mid_stream(&steers),
+        drifted: Default::default(),
+        cancel_at_render_check: Default::default(),
         steers: Mutex::new(steers),
         sink: Arc::new(NewSink {
             injected: Arc::clone(&injected),
@@ -4884,12 +4917,28 @@ async fn new_with_actions(
     .expect("the new loop runs");
     let mut reports = vec![(first.reason, first.paused)];
     if first.paused.is_some() {
-        if first.paused == Some(PauseReason::ToolHeld) {
+        let at_resume = AT_HELD_RESUME.try_with(|at| *at).ok();
+        if first.paused == Some(PauseReason::ToolHeld) && at_resume != Some(AtHeldResume::NoDeposit)
+        {
             plane.held.deposit_all();
+        }
+        if drift() {
+            provider
+                .drifted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let stop = CancellationToken::new();
+        match at_resume {
+            Some(AtHeldResume::Stop) => stop.cancel(),
+            Some(AtHeldResume::CancelBefore) => seams.cancel.cancel(),
+            Some(AtHeldResume::CancelMidResume) => {
+                *provider.cancel_at_render_check.lock().unwrap() = Some(seams.cancel.clone());
+            }
+            Some(AtHeldResume::NoDeposit) | None => {}
         }
         let restarted = Seams {
             person_steers: None,
-            stop: Default::default(),
+            stop,
             pause_for_auth_at_start: SIGNED_OUT_ON_RESUME
                 .try_with(|()| {
                     serde_json::from_value(json!({
@@ -6205,6 +6254,397 @@ async fn every_cut_of_a_sequential_held_call_resumes_alike() {
     .await;
 }
 
+/// The ledger state the run's records fold to, and what a resume of that run must do.
+fn resolution_of(records: &[Record]) -> broca_session_store::fold::operations::Resolution {
+    let mut operations = Operations::default();
+    for record in records {
+        if record.stream() == broca_session_store::record::Stream::Ledger {
+            operations.apply(record).expect("the run's records fold");
+        }
+    }
+    operations
+        .run
+        .as_ref()
+        .expect("the session has a run")
+        .resolution()
+}
+
+/// The outcome recorded for call `id`, if any.
+fn outcome_of(records: &[Record], id: &str) -> Option<broca_session_store::record::CallOutcome> {
+    records.iter().find_map(|record| match record {
+        Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == id => Some(outcome.outcome),
+        _ => None,
+    })
+}
+
+/// The result recorded for call `id`, as text, if any.
+fn reply_of(records: &[Record], id: &str) -> Option<String> {
+    records.iter().find_map(|record| match record {
+        Record::ToolReply(reply) if reply.result.tool_call_id.0 == id => {
+            Some(format!("{:?}", reply.result.output))
+        }
+        _ => None,
+    })
+}
+
+/// Where the first entry of the tool plane's log that contains `needle` is.
+fn logged_at(calls: &[String], needle: &str) -> Option<usize> {
+    calls.iter().position(|call| call.contains(needle))
+}
+
+/// When the run ended, why.
+fn end_reason(records: &[Record]) -> Option<RunFinishReason> {
+    records.iter().find_map(|record| match record {
+        Record::RunEnd(end) => Some(end.reason),
+        _ => None,
+    })
+}
+
+/// A batch made sequential by one call stays sequential when it resumes on a held call, though
+/// that call is answered: the call queued behind the held one is sent only once the held call's
+/// result is durable. Sent earlier, a crash before either result is written leaves the queued
+/// call reading as never sent, and the redelivered late result would send it again.
+#[tokio::test]
+async fn a_resumed_held_call_keeps_the_batchs_order_after_the_call_that_made_it_sequential() {
+    let tools = vec![
+        tool("read", ExecutionMode::Sequential),
+        tool("hold_slow", ExecutionMode::Parallel),
+        tool("grep", ExecutionMode::Parallel),
+    ];
+    let scenario = Scenario {
+        input: vec![user("run in order")],
+        manifest: Some(hooked_manifest_with(&tools, &["hold_slow"])),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "read", json!({"path": "a"})),
+                    call("c2", "hold_slow", json!({"job": 1})),
+                    call("c3", "grep", json!({"pattern": "b"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = Box::pin(new_with_actions(&scenario, Vec::new(), None, false)).await;
+    let calls = &ran.source.outcome.calls;
+    let synced = logged_at(calls, "terminal_synced c2")
+        .unwrap_or_else(|| panic!("the held call's result was never synced: {calls:#?}"));
+    let sent = logged_at(calls, "dispatch_guarded c3 ")
+        .unwrap_or_else(|| panic!("the queued call was never sent: {calls:#?}"));
+    assert!(
+        synced < sent,
+        "the queued call was sent before the held call's result was durable: {calls:#?}"
+    );
+}
+
+/// A resumed held call whose late result is in, but whose post-tool hook hasn't answered yet,
+/// is no longer waiting on its provider: the run waits for the hook and takes the result, as
+/// for any call. Parking again would leave the result in its slot with nothing to wake the run.
+#[tokio::test]
+async fn a_resumed_held_result_still_in_its_hook_is_taken_not_parked_again() {
+    let tools = vec![tool("hold_slow", ExecutionMode::Parallel)];
+    let scenario = Scenario {
+        input: vec![user("hold it")],
+        manifest: Some(hooked_manifest_with(&tools, &["hold_slow"])),
+        tools,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "hold_slow", json!({"job": 1}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = Box::pin(new_with_actions(&scenario, Vec::new(), None, false)).await;
+    let records = &ran.source.records;
+    assert_eq!(
+        end_reason(records),
+        Some(RunFinishReason::Completed),
+        "the resumed run didn't take its held result: {records:#?}"
+    );
+    let held = reply_of(records, "c1")
+        .unwrap_or_else(|| panic!("the held call has no result: {records:#?}"));
+    assert!(
+        held.contains("late result for c1") && held.contains("[checked by the harness hook]"),
+        "{held}"
+    );
+}
+
+/// A cancel that lands as a sequential batch's first call is held closes that call, and the
+/// batch goes on to its end: the closed call's wait, which its provider may never answer, no
+/// longer holds back the calls queued behind it.
+#[tokio::test]
+async fn a_cancel_as_a_sequential_batchs_first_call_is_held_ends_the_run() {
+    let scenario = Scenario {
+        input: vec![user("run in order")],
+        tools: vec![
+            tool("hold_cancel", ExecutionMode::Sequential),
+            tool("read", ExecutionMode::Sequential),
+        ],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![answer(
+            "a1",
+            vec![
+                call("c1", "hold_cancel", json!({"job": 1})),
+                call("c2", "read", json!({"path": "a"})),
+            ],
+            FinishReason::ToolCalls,
+        )],
+    };
+    let ran = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+    )
+    .await
+    .expect("the cancelled run waited forever on its closed held call");
+    let records = &ran.source.records;
+    assert_eq!(
+        end_reason(records),
+        Some(RunFinishReason::Cancelled),
+        "{records:#?}"
+    );
+    let calls = &ran.source.outcome.calls;
+    assert!(
+        logged_at(calls, "withdraw c1 after_run_end=true").is_some(),
+        "the closed held call wasn't withdrawn after the run's end: {calls:#?}"
+    );
+}
+
+/// A held call's result taken at a sign-in pause frees the call queued behind it, which was
+/// never sent: it closes as not run, so the run reads as paused for sign-in, not as one with a
+/// call that may have run.
+#[tokio::test]
+async fn a_sign_in_pause_closes_the_call_queued_behind_a_held_result_as_not_run() {
+    use broca_session_store::fold::operations::Resolution;
+    let scenario = Scenario {
+        input: vec![user("run in order")],
+        tools: vec![
+            tool("hold", ExecutionMode::Sequential),
+            tool("read", ExecutionMode::Sequential),
+        ],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![
+                    call("c1", "hold", json!({"job": 1})),
+                    call("c2", "read", json!({"path": "a"})),
+                ],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = SIGNED_OUT_ON_RESUME
+        .scope(
+            (),
+            Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+        )
+        .await;
+    let records = &ran.source.records;
+    assert_eq!(
+        resolution_of(records),
+        Resolution::Paused(PauseReason::AuthRequired),
+        "{records:#?}"
+    );
+    assert_eq!(
+        outcome_of(records, "c2"),
+        Some(broca_session_store::record::CallOutcome::Interrupted)
+    );
+    let calls = &ran.source.outcome.calls;
+    assert!(
+        logged_at(calls, "dispatch_guarded c2 ").is_none(),
+        "the queued call was sent: {calls:#?}"
+    );
+}
+
+/// A resume that finds the account signed out with no held call's result deposited writes
+/// nothing for the batch, and pauses for sign-in.
+#[tokio::test]
+async fn a_sign_in_pause_with_no_held_result_deposited_pauses() {
+    let scenario = Scenario {
+        input: vec![user("hold it")],
+        tools: vec![tool("hold", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "hold", json!({"job": 1}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = AT_HELD_RESUME
+        .scope(
+            AtHeldResume::NoDeposit,
+            SIGNED_OUT_ON_RESUME.scope(
+                (),
+                Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+            ),
+        )
+        .await;
+    let records = &ran.source.records;
+    assert!(
+        matches!(
+            records.last(),
+            Some(Record::Pause(pause)) if pause.reason == PauseReason::AuthRequired
+        ),
+        "the resume didn't pause for sign-in: {records:#?}"
+    );
+    assert_eq!(outcome_of(records, "c1"), None);
+}
+
+/// A held resume refused because the provider no longer renders the run's config closes the
+/// held call and tells its late-result slot so, which releases the deposited result.
+#[tokio::test]
+async fn a_refused_held_resume_releases_the_deposited_result() {
+    let scenario = Scenario {
+        input: vec![user("hold it")],
+        tools: vec![tool("hold", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "hold", json!({"job": 1}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = DRIFT
+        .scope(
+            true,
+            Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+        )
+        .await;
+    let records = &ran.source.records;
+    assert_eq!(
+        end_reason(records),
+        Some(RunFinishReason::Interrupted),
+        "{records:#?}"
+    );
+    let calls = &ran.source.outcome.calls;
+    let synced = logged_at(calls, "terminal_synced c1")
+        .unwrap_or_else(|| panic!("the held call's slot was never told of its close: {calls:#?}"));
+    let withdrawn = logged_at(calls, "withdraw c1")
+        .unwrap_or_else(|| panic!("the held call was never withdrawn: {calls:#?}"));
+    assert!(synced < withdrawn, "{calls:#?}");
+}
+
+/// A held resume while the runner stops leaves the run parked on its held call: the call was
+/// sent, so it never closes as not run, and its late result stays deposited for the next
+/// process.
+#[tokio::test]
+async fn a_held_resume_under_a_stop_stays_parked() {
+    use broca_session_store::fold::operations::Resolution;
+    let scenario = Scenario {
+        input: vec![user("hold it")],
+        tools: vec![tool("hold", ExecutionMode::Parallel)],
+        manifest: None,
+        stop_when: Vec::new(),
+        steps: vec![
+            answer(
+                "a1",
+                vec![call("c1", "hold", json!({"job": 1}))],
+                FinishReason::ToolCalls,
+            ),
+            text_step("a2", "done"),
+        ],
+    };
+    let ran = AT_HELD_RESUME
+        .scope(
+            AtHeldResume::Stop,
+            Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+        )
+        .await;
+    let records = &ran.source.records;
+    assert_eq!(outcome_of(records, "c1"), None, "{records:#?}");
+    assert_eq!(end_reason(records), None, "{records:#?}");
+    assert_eq!(
+        resolution_of(records),
+        Resolution::ProviderHeld(vec![ToolCallId("c1".into())])
+    );
+    let calls = &ran.source.outcome.calls;
+    assert!(
+        logged_at(calls, "terminal_synced c1").is_none()
+            && logged_at(calls, "withdraw c1").is_none(),
+        "the parked call was released: {calls:#?}"
+    );
+}
+
+/// A cancel of a resume taking up a held batch: the held call's deposited result is its result,
+/// written and acknowledged, and the call queued behind it, never sent, closes as not run. The
+/// same whether the cancel came before the resume began or while it was under way.
+#[tokio::test]
+async fn a_cancelled_held_resume_records_the_deposited_result() {
+    for at in [AtHeldResume::CancelBefore, AtHeldResume::CancelMidResume] {
+        let scenario = Scenario {
+            input: vec![user("run in order")],
+            tools: vec![
+                tool("hold", ExecutionMode::Sequential),
+                tool("read", ExecutionMode::Sequential),
+            ],
+            manifest: None,
+            stop_when: Vec::new(),
+            steps: vec![
+                answer(
+                    "a1",
+                    vec![
+                        call("c1", "hold", json!({"job": 1})),
+                        call("c2", "read", json!({"path": "a"})),
+                    ],
+                    FinishReason::ToolCalls,
+                ),
+                text_step("a2", "done"),
+            ],
+        };
+        let ran = AT_HELD_RESUME
+            .scope(
+                at,
+                Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+            )
+            .await;
+        let records = &ran.source.records;
+        assert_eq!(
+            end_reason(records),
+            Some(RunFinishReason::Cancelled),
+            "{at:?}: {records:#?}"
+        );
+        let held = reply_of(records, "c1")
+            .unwrap_or_else(|| panic!("{at:?}: the held call has no result: {records:#?}"));
+        assert!(
+            held.contains("late result for c1"),
+            "{at:?}: the deposited result wasn't recorded: {held}"
+        );
+        assert_eq!(
+            outcome_of(records, "c2"),
+            Some(broca_session_store::record::CallOutcome::Interrupted),
+            "{at:?}"
+        );
+        let calls = &ran.source.outcome.calls;
+        assert!(
+            logged_at(calls, "terminal_synced c1").is_some(),
+            "{at:?}: the deposited result was never acknowledged: {calls:#?}"
+        );
+        assert!(
+            logged_at(calls, "withdraw c1").is_none()
+                && logged_at(calls, "dispatch_guarded c2 ").is_none(),
+            "{at:?}: {calls:#?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_call_to_a_tool_the_run_was_not_given() {
     compare(Scenario {
@@ -6572,6 +7012,11 @@ impl broca_core::hooks::HookPlane for HarnessHooks {
             });
         }
         if let Subject::PostTool { tool, .. } = &call.subject {
+            // `hold_slow`'s hook takes a moment to answer, as a hook called over the network
+            // does: a held result it checks is not taken on the first look.
+            if tool == "hold_slow" {
+                tokio::task::yield_now().await;
+            }
             return match tool.as_str() {
                 "post_down" => Err(broca_core::hooks::HookUnavailable),
                 _ => Ok(HookAnswer::Ops {
