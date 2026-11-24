@@ -51,9 +51,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_runtime<F: std::future::Future>(work: F) -> std::io::Result<F::Output> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    // The heap profiler walks the stack inside the allocator, on top of whatever a worker was
+    // doing, and a debug build's workers overflowed their 2 MiB under it; give them room.
+    #[cfg(feature = "heap-profile")]
+    builder.thread_stack_size(8 * 1024 * 1024);
+    let runtime = builder.build()?;
     let result = runtime.block_on(work);
     // The main future explicitly joins durability work before returning. Startup export
     // catch-up is replayable from the durable outbox, and archive prewarm is only a cache;
