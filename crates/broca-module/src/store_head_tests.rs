@@ -124,48 +124,46 @@ fn kept_heads_forget_the_least_recently_used_first() {
     assert_eq!(counts.kept.get("read"), Some(&(HEADS_KEPT as u64 + 3)));
 }
 
-/// Heads whose read policies share one plan manifest count it once: the memory report shows
-/// what the kept heads hold, not the manifest again for every head that points at it.
+/// A kept head's read policy keeps its plans' JSON, not the decoded manifests they came from:
+/// a manifest's tools and system text are released once the head is built, and the memory
+/// report counts only the plan. Before, every kept head of a planned session held its
+/// manifest decoded for as long as it was kept.
 #[test]
-fn kept_heads_count_a_shared_plan_manifest_once() {
+fn kept_heads_hold_no_decoded_plan_manifest() {
     use broca_session_store::codec::Id128;
     use broca_session_store::session::Position;
     use std::sync::Arc;
-    let manifest = || -> Arc<broca_records::record::PlanManifest> {
-        Arc::new(
-            serde_json::from_value(json!({
-                "plan": "{}", "plan_identity": "plan", "composition_digest": "composition",
-                "tools": [], "system_text": "x".repeat(100_000), "system_digest": "system",
-                "join_version": 1, "role_versions": {}, "declarations": [], "fetches": []
-            }))
-            .unwrap(),
-        )
-    };
-    let head = |manifest: Arc<broca_records::record::PlanManifest>| StoreHead {
+    let manifest: Arc<broca_records::record::PlanManifest> = Arc::new(
+        serde_json::from_value(json!({
+            "plan": "{}", "plan_identity": "plan", "composition_digest": "composition",
+            "tools": [], "system_text": "x".repeat(100_000), "system_digest": "system",
+            "join_version": 1, "role_versions": {}, "declarations": [], "fetches": []
+        }))
+        .unwrap(),
+    );
+    let released = Arc::downgrade(&manifest);
+    let head = StoreHead {
         reply: Default::default(),
         input: InputSource::Unknown,
         ownership: serde_json::from_value(json!({})).unwrap(),
         senders: Vec::new(),
         read_policy: Some(crate::reader_admission::ReadPolicy::with_manifest(manifest)),
     };
+    let heads = KeptHeads::default();
     let at = Position {
         version: 1,
         log: Id128([1; 16]),
         len: 1,
     };
-    let held = |manifests: [Arc<broca_records::record::PlanManifest>; 2]| {
-        let heads = KeptHeads::default();
-        for (n, manifest) in manifests.into_iter().enumerate() {
-            heads.keep(format!("s{n}"), at, &head(manifest), "read");
-        }
-        heads.memory().estimated_bytes
-    };
-    let shared = manifest();
-    let once = held([Arc::clone(&shared), shared]);
-    let twice = held([manifest(), manifest()]);
-    assert!(once > 100_000, "the manifest is counted: {once}");
+    heads.keep("s0".into(), at, &head, "read");
+    drop(head);
     assert!(
-        twice - once >= 100_000,
-        "a shared manifest is counted once: {once} shared, {twice} separate"
+        released.upgrade().is_none(),
+        "a kept head holds its plan's decoded manifest"
+    );
+    let held = heads.memory().estimated_bytes;
+    assert!(
+        held < 10_000,
+        "the kept head counts its manifest's text: {held}"
     );
 }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use broca_protocol::{BindPrincipal, RunId};
-use broca_records::record::PlanManifest;
+use broca_records::record::{OpaqueJson, PlanManifest};
 use broca_session_loop::parts::Parts;
 use broca_session_store::{backend::SessionBackend, session::Session};
 use cortexkit_role_llm_runner::app_readers::{self, ReadAdmission};
@@ -54,13 +54,11 @@ pub fn check_plan(plan: &Map<String, Value>, supported: bool) -> Result<(), Serv
     })
 }
 
-fn plan(
-    manifest: Option<&broca_records::record::PlanManifest>,
-) -> Result<Map<String, Value>, ServeError> {
-    manifest.map_or_else(
+fn plan(plan: Option<&OpaqueJson>) -> Result<Map<String, Value>, ServeError> {
+    plan.map_or_else(
         || Ok(Map::new()),
-        |manifest| {
-            serde_json::from_str(manifest.plan.as_json_text()).map_err(|error| {
+        |plan| {
+            serde_json::from_str(plan.as_json_text()).map_err(|error| {
                 ServeError::Transient(format!("the stored read policy is invalid: {error}"))
             })
         },
@@ -70,12 +68,14 @@ fn plan(
 /// What a read's admission reads from a session: its ownership, the plan in force for reads
 /// (the latest run's, else the first run's) and the latest accepted plan, whose reader list
 /// governs. A kept head holds it too, so a closed session's read can be admitted without loading
-/// the session (see `store_head::KeptHeads`).
+/// the session (see `store_head::KeptHeads`). It keeps each plan's JSON only, never the decoded
+/// manifest it came from, whose tools and system text a kept head would otherwise hold for as
+/// long as it is kept.
 #[derive(Clone)]
 pub struct ReadPolicy {
     ownership: broca_core::SessionOwnershipV1,
-    effective: Option<Arc<PlanManifest>>,
-    accepted: Option<Arc<PlanManifest>>,
+    effective: Option<OpaqueJson>,
+    accepted: Option<OpaqueJson>,
 }
 
 impl ReadPolicy {
@@ -105,37 +105,27 @@ impl ReadPolicy {
         };
         Ok(Self {
             ownership,
-            effective,
-            accepted,
+            effective: effective.map(|manifest| manifest.plan.clone()),
+            accepted: accepted.map(|manifest| manifest.plan.clone()),
         })
     }
 
-    /// A policy whose plan in force and accepted plan are both `manifest`.
+    /// A policy whose plan in force and accepted plan are both `manifest`'s.
     #[cfg(test)]
     pub(crate) fn with_manifest(manifest: Arc<PlanManifest>) -> Self {
         Self {
             ownership: serde_json::from_value(serde_json::json!({})).expect("empty ownership"),
-            effective: Some(Arc::clone(&manifest)),
-            accepted: Some(manifest),
+            effective: Some(manifest.plan.clone()),
+            accepted: Some(manifest.plan.clone()),
         }
     }
 
-    /// What the policy holds, walked as `broca_session_store::held` walks values. A plan
-    /// manifest is shared by every policy (and setup-part cache entry) that read the same part,
-    /// so it is counted only when `seen` doesn't hold it yet, and added to `seen`.
-    pub(crate) fn heap_bytes(&self, seen: &mut std::collections::HashSet<usize>) -> usize {
+    /// What the policy holds, walked as `broca_session_store::held` walks values.
+    pub(crate) fn heap_bytes(&self) -> usize {
         use broca_session_store::held::serde_heap_bytes;
-        let mut manifest = |manifest: &Option<Arc<PlanManifest>>| {
-            manifest.as_ref().map_or(0, |manifest| {
-                if !seen.insert(Arc::as_ptr(manifest) as usize) {
-                    return 0;
-                }
-                std::mem::size_of::<PlanManifest>() + serde_heap_bytes(&**manifest)
-            })
-        };
-        let effective = manifest(&self.effective);
-        let accepted = manifest(&self.accepted);
-        serde_heap_bytes(&self.ownership) + effective + accepted
+        let plan =
+            |plan: &Option<OpaqueJson>| plan.as_ref().map_or(0, |plan| plan.as_json_text().len());
+        serde_heap_bytes(&self.ownership) + plan(&self.effective) + plan(&self.accepted)
     }
 }
 
@@ -200,11 +190,11 @@ pub fn decide(
         access.principal.as_ref(),
         (ownership.episodes > 0).then_some(ownership.first_principal.as_ref()),
     );
-    let effective = match plan(policy.effective.as_deref()) {
+    let effective = match plan(policy.effective.as_ref()) {
         Ok(effective) => effective,
         Err(error) => return Some(Err(error)),
     };
-    let accepted = match plan(policy.accepted.as_deref()) {
+    let accepted = match plan(policy.accepted.as_ref()) {
         Ok(accepted) => accepted,
         Err(error) => return Some(Err(error)),
     };
