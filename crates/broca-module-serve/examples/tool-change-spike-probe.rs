@@ -1,16 +1,21 @@
 //! Prompt-cache and tool/instruction-change spike. No vault or network access in --dry-run.
 //!
-//! Usage: tool-change-spike-probe [--dry-run] --provider openai|chatgpt|kimi|deepseek|xai|gemini
-//! --credential <id> --model <model> --out <file.jsonl> [--case 1|2|3|4|all]
+//! Usage: tool-change-spike-probe [--dry-run] --provider openai|chatgpt|kimi|deepseek|xai|gemini|anthropic
+//! [--credential <id>] --model <model> --out <file.jsonl> [--case 1|2|3|4|all]
 //! [--form a|b] [--place before-user|after-user] [--steps 3|4] [--max-requests N]. T4 is the
 //! request after the tools or instructions change. On OpenAI and Kimi, `--form` runs one of
 //! case 1's two forms (`a` the added-tools declaration, `b` the allowed-tools list).
 //! ChatGPT requires `--case 1 --form a` and the `chatgpt:openai` credential for live runs.
 //! The ChatGPT lane uses HTTPS to measure the request form, not the WebSocket transport.
-//! Placement defaults to `before-user`; `after-user` requires case 1 form a on OpenAI, ChatGPT
-//! or Kimi. `--steps 3` omits T3, the second ordinary question, so T1, T2 and T4 measure
+//! Anthropic requires `--case 1 --form a --place after-user` and stops at T4's first response.
+//! Use `apikey:anthropic` or `oauth:anthropic` for live runs, or one account's credential id
+//! such as `oauth:anthropic:<account label>`.
+//! Its dry-run needs no credential and prints the API-key shape, with only header names and
+//! JSON bodies.
+//! Placement defaults to `before-user`; `after-user` requires case 1 form a on OpenAI, ChatGPT,
+//! Kimi or Anthropic. `--steps 3` omits T3, the second ordinary question, so T1, T2 and T4 measure
 //! the cache with three requests per form. The output contains prompt text and model responses,
-//! never headers.
+//! never header values.
 //! Gemini uses VALIDATED with a fixed mode so only its allowed list changes; support
 //! depends on model/API version. Its appended instruction changes systemInstruction
 //! at request level, not a nonexistent mid-conversation system role.
@@ -23,7 +28,7 @@ use broca_protocol::{
 use broca_provider::{
     families::{
         gemini_frozen_config, openai_chat_frozen_config, openai_responses_chatgpt_frozen_config,
-        openai_responses_frozen_config, Gemini, OpenAiChat, OpenAiResponses,
+        openai_responses_frozen_config, AnthropicMessages, Gemini, OpenAiChat, OpenAiResponses,
         OpenAiResponsesChatgpt,
     },
     wire::{AuthHandle, FrozenRenderConfig, HttpRequest, WireFamily},
@@ -35,6 +40,9 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[path = "tool_change_spike_probe/anthropic.rs"]
+mod anthropic;
 
 const REQUEST_CAP: usize = 30;
 const NEW_TOOL: &str = "lookup_orbit_code";
@@ -50,6 +58,7 @@ enum Provider {
     Deepseek,
     Xai,
     Gemini,
+    Anthropic,
 }
 
 impl Provider {
@@ -58,6 +67,7 @@ impl Provider {
             Self::Openai => &OpenAiResponses,
             Self::Chatgpt => &OpenAiResponsesChatgpt,
             Self::Gemini => &Gemini,
+            Self::Anthropic => &AnthropicMessages,
             _ => &OpenAiChat,
         }
     }
@@ -71,6 +81,7 @@ impl Provider {
                 frozen
             }
             Self::Gemini => gemini_frozen_config(model),
+            Self::Anthropic => return anthropic::frozen(model, None),
             _ => openai_chat_frozen_config(model),
         };
         frozen.max_output_tokens = 2048;
@@ -85,6 +96,7 @@ impl Provider {
                 Self::Kimi => "https://api.kimi.ai/coding/v1",
                 Self::Deepseek => "https://api.deepseek.com/v1",
                 Self::Xai => "https://api.x.ai/v1",
+                Self::Anthropic => unreachable!("the Anthropic endpoint is configured above"),
             }
             .into(),
         );
@@ -99,8 +111,9 @@ impl Provider {
             "deepseek" => Ok(Self::Deepseek),
             "xai" => Ok(Self::Xai),
             "gemini" => Ok(Self::Gemini),
+            "anthropic" => Ok(Self::Anthropic),
             _ => Err(format!(
-                "unknown provider {value}; expected openai|chatgpt|kimi|deepseek|xai|gemini"
+                "unknown provider {value}; expected openai|chatgpt|kimi|deepseek|xai|gemini|anthropic"
             )),
         }
     }
@@ -113,6 +126,7 @@ impl Provider {
             Self::Deepseek => "deepseek",
             Self::Xai => "xai",
             Self::Gemini => "gemini",
+            Self::Anthropic => "anthropic",
         }
     }
 
@@ -121,6 +135,7 @@ impl Provider {
             Self::Openai => "openai-responses",
             Self::Chatgpt => "openai-responses-chatgpt",
             Self::Gemini => "gemini",
+            Self::Anthropic => "anthropic-messages",
             _ => "openai-chat",
         }
     }
@@ -128,7 +143,7 @@ impl Provider {
     fn additional_tools_key(self) -> Option<&'static str> {
         match self {
             Self::Openai | Self::Chatgpt => Some("input"),
-            Self::Kimi => Some("messages"),
+            Self::Kimi | Self::Anthropic => Some("messages"),
             _ => None,
         }
     }
@@ -254,12 +269,15 @@ impl Args {
                 _ => unreachable!(),
             }
         }
+        let credential = match credential.filter(|v| !v.is_empty()) {
+            Some(credential) => credential,
+            None if dry_run && provider == Some(Provider::Anthropic) => String::new(),
+            None => return Err("--credential is required".into()),
+        };
         let result = Self {
             dry_run,
             provider: provider.ok_or("--provider is required")?,
-            credential: credential
-                .filter(|v| !v.is_empty())
-                .ok_or("--credential is required")?,
+            credential,
             model: model
                 .filter(|v| !v.is_empty())
                 .ok_or("--model is required")?,
@@ -274,11 +292,18 @@ impl Args {
         if result.provider == Provider::Chatgpt && !only_form_a {
             return Err("--provider chatgpt supports only --case 1 --form a".into());
         }
+        if result.provider == Provider::Anthropic
+            && !(only_form_a && placement == Placement::AfterUser)
+        {
+            return Err(
+                "--provider anthropic supports only --case 1 --form a --place after-user".into(),
+            );
+        }
         if placement == Placement::AfterUser
             && !(only_form_a && result.provider.additional_tools_key().is_some())
         {
             return Err(
-                "--place after-user requires a separate tool declaration: use --case 1 --form a with openai, chatgpt or kimi"
+                "--place after-user requires a separate tool declaration: use --case 1 --form a with openai, chatgpt, kimi or anthropic"
                     .into(),
             );
         }
@@ -399,6 +424,9 @@ fn options(
         prompt.insert(t4, instruction);
     }
     let mut opts = CallOptions::new(prompt);
+    if provider == Provider::Anthropic {
+        opts.marker_order_version = Some(broca_session_loop::run::MARKER_ORDER_VERSION);
+    }
     let mut tools = vec![
         tool(CHANGED_TOOL, changed && variant.case == 3),
         tool("lookup_river", false),
@@ -420,7 +448,7 @@ fn options(
 }
 
 /// The encoder, endpoint, authentication, transport, and decoder remain production.
-/// Only changes the production family cannot express are patched into its rendered body.
+/// Only experimental body changes and their required headers are applied to the family's request.
 struct ProbeFamily {
     provider: Provider,
     variant: Variant,
@@ -440,6 +468,9 @@ impl ProbeFamily {
             }
             (Provider::Kimi, 1) if !self.variant.alternate && self.changed => {
                 paths.push("/messages/- (system.tools)")
+            }
+            (Provider::Anthropic, 1) if !self.variant.alternate && self.changed => {
+                paths.push("/messages/- (system.content: tool_addition)")
             }
             (Provider::Openai, 1) if self.variant.alternate => {
                 paths.push("/tool_choice (allowed_tools)")
@@ -483,6 +514,7 @@ impl ProbeFamily {
                 Provider::Kimi => Some(
                     json!({"role":"system", "tools":[{"type":"function", "function":{"name":NEW_TOOL, "description":tool(NEW_TOOL, false).description, "parameters":tool(NEW_TOOL, false).input_schema}}]}),
                 ),
+                Provider::Anthropic => Some(anthropic::tool_addition(&tool(NEW_TOOL, false))),
                 _ => None,
             }
         } else {
@@ -549,6 +581,7 @@ struct Answer {
     content: Vec<ContentBlock>,
     usage: broca_protocol::Usage,
     status: Option<u16>,
+    stop_reason: Option<String>,
     error: Option<&'static str>,
 }
 
@@ -563,9 +596,9 @@ async fn send(
 ) -> Answer {
     use broca_core::Provider as _;
     use broca_protocol::{NormalizedEvent, ProviderControl, StepId};
-    let chatgpt = family.provider == Provider::Chatgpt;
+    let provider = family.provider;
     let live = broca_provider::LiveProvider::new(family, frozen, auth).with_credential_hosts(hosts);
-    if chatgpt {
+    if provider == Provider::Chatgpt {
         live.set_chatgpt_https_policy(Arc::new(|| true));
     }
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -605,6 +638,10 @@ async fn send(
                 NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
                     answer.content = message.content
                 }
+                NormalizedEvent::Control(ProviderControl::StepFinished {
+                    raw_finish_reason,
+                    ..
+                }) => answer.stop_reason = raw_finish_reason,
                 NormalizedEvent::Control(ProviderControl::Finished { usage, .. }) => {
                     answer.usage = usage;
                     finished = true;
@@ -615,10 +652,17 @@ async fn send(
                     }
                     // The class, status and codes name the failure without the provider's
                     // text, which can echo the request.
-                    eprintln!(
-                        "provider failure: class={:?} status={:?} provider_code={:?} cause={:?}",
-                        error.class, error.status, error.provider_code, error.cause
-                    );
+                    if provider == Provider::Anthropic {
+                        eprintln!(
+                            "provider failure: class={:?} status={:?}",
+                            error.class, error.status
+                        );
+                    } else {
+                        eprintln!(
+                            "provider failure: class={:?} status={:?} provider_code={:?} cause={:?}",
+                            error.class, error.status, error.provider_code, error.cause
+                        );
+                    }
                     answer.error = Some("provider failure; error text withheld");
                 }
                 _ => {}
@@ -720,14 +764,32 @@ fn write_row(
             json!("request-level systemInstruction; Gemini has no mid-conversation system role");
     }
     if step == 4 {
-        row["request_body"] = serde_json::from_slice(body)?;
+        let mut request_body = serde_json::from_slice(body)?;
+        if args.provider == Provider::Anthropic && !args.dry_run {
+            // The subscription body also carries IDs used in its request headers.
+            anthropic::redact_persona(&mut request_body);
+        }
+        row["request_body"] = request_body;
     }
     if let Some(answer) = answer {
+        let (read_key, write_key) = if args.provider == Provider::Anthropic {
+            if let Some(reason) = &answer.stop_reason {
+                row["stop_reason"] = json!(reason);
+            }
+            if answer.error.is_none() {
+                row["called_lookup_orbit_code"] = json!(answer.content.iter().any(|block| {
+                    matches!(block, ContentBlock::ToolCall(call) if call.tool_name == NEW_TOOL)
+                }));
+            }
+            ("cache_read_input_tokens", "cache_creation_input_tokens")
+        } else {
+            ("cached_tokens", "cache_write_tokens")
+        };
         for (key, value) in [
             ("http_status", answer.status.map(u64::from)),
             ("input_tokens", answer.usage.input_tokens),
-            ("cached_tokens", answer.usage.cached_input_tokens),
-            ("cache_write_tokens", answer.usage.cache_write_tokens),
+            (read_key, answer.usage.cached_input_tokens),
+            (write_key, answer.usage.cache_write_tokens),
             ("output_tokens", answer.usage.output_tokens),
         ] {
             if let Some(value) = value {
@@ -793,6 +855,7 @@ fn auth_headers(
 /// transport checks before every send.
 async fn credentials(
     args: &Args,
+    frozen: &mut FrozenRenderConfig,
 ) -> Result<
     (
         AuthHandle,
@@ -806,6 +869,9 @@ async fn credentials(
     {
         return Err("--provider chatgpt requires a chatgpt:openai credential".into());
     }
+    let anthropic_method = (args.provider == Provider::Anthropic)
+        .then(|| anthropic::method(&id))
+        .transpose()?;
     let handle = load_devtools_handle(&id).map_err(|_| "devtools credential handle unavailable")?;
     let subc = std::env::var_os("BROCA_LIVE_SUBC")
         .or_else(|| std::env::var_os("SUBC_SOCKET"))
@@ -828,20 +894,21 @@ async fn credentials(
         &identity,
         Duration::from_secs(10),
     );
+    // Only read the vault credential. The probe must not invalidate a shared login on rejection.
     let secret = vault
         .get(&handle, None, false)
         .await
         .result
         .map_err(|_| "vault credential.get refused")?;
+    if anthropic_method == Some(AuthMethod::Oauth) {
+        let bind = probe_persona_bind()?;
+        let persona = anthropic::persona(&id, secret.account_id.as_deref(), &bind)?;
+        *frozen = anthropic::frozen(&args.model, Some(persona));
+    }
     let hosts = secret.hosts.unwrap_or_else(|| {
-        // A dev-tools handle's reply carries no host list, which would refuse every send. This
-        // probe's endpoints are constants in this file rather than catalog rows, so the host of
-        // its own fixed endpoint stands in for the record's list.
-        let url = args
-            .provider
-            .frozen(&args.model)
-            .base_url
-            .unwrap_or_default();
+        // A dev-tools reply may omit the record's host list. Allow only the host of the probe's
+        // fixed endpoint in that case, rather than disabling the transport's host check.
+        let url = frozen.base_url.as_deref().unwrap_or_default();
         let host = url
             .trim_start_matches("https://")
             .split(['/', ':'])
@@ -851,9 +918,18 @@ async fn credentials(
         vec![host]
     });
     let hosts = broca_provider::credential_hosts::CredentialHosts::from_record(Some(&hosts));
-    Ok((
-        auth_headers(args.provider, secret.token, secret.account_id)?,
-        hosts,
+    let auth = match anthropic_method {
+        Some(method) => anthropic::auth(method, secret.token),
+        None => auth_headers(args.provider, secret.token, secret.account_id)?,
+    };
+    Ok((auth, hosts))
+}
+
+fn probe_persona_bind() -> std::io::Result<BindIdentity> {
+    Ok(BindIdentity::new(
+        std::env::current_dir()?,
+        "tool-change-spike-probe",
+        format!("tool-change-spike-probe-{}", std::process::id()),
     ))
 }
 
@@ -871,12 +947,15 @@ fn fake_reply(step: u8) -> Message {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(std::env::args().skip(1))?;
-    // This branch precedes even credential-id parsing and vault-handle loading.
+    let mut frozen = args.provider.frozen(&args.model);
     let auth = if args.dry_run {
         None
     } else {
-        Some(credentials(&args).await?)
+        Some(credentials(&args, &mut frozen).await?)
     };
+    // Used only to render the header names; the dry-run branch never calls the transport.
+    let preview_auth = (args.dry_run && args.provider == Provider::Anthropic)
+        .then(|| anthropic::auth(AuthMethod::ApiKey, "dry-run".into()));
     let mut out = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -907,11 +986,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     body: body.clone(),
                 };
                 let patches = family.patches();
-                let frozen = args.provider.frozen(&args.model);
                 let answer = if let Some(auth) = &auth {
-                    Some(send(family, frozen, auth.clone(), &opts).await)
+                    Some(send(family, frozen.clone(), auth.clone(), &opts).await)
                 } else {
-                    family.render(&frozen, &opts);
+                    let rendered = family.render(&frozen, &opts);
+                    if let Some(preview_auth) = &preview_auth {
+                        let request = family.endpoint(&frozen, preview_auth, rendered);
+                        let names: Vec<_> = request.headers.iter().map(|(name, _)| name).collect();
+                        println!("T{step} header names: {}", serde_json::to_string(&names)?);
+                        println!(
+                            "T{step} request body: {}",
+                            std::str::from_utf8(&request.body)?
+                        );
+                    }
                     None
                 };
                 requests += 1;
@@ -956,6 +1043,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         variant.name()
                     )
                     .into());
+                }
+                if args.provider == Provider::Anthropic && step == 4 {
+                    break;
                 }
                 let results = tool_results(&answer.content);
                 prompt.push(Message::new(Role::Assistant, answer.content));
@@ -1002,6 +1092,12 @@ impl WireFamily for ProbeFamily {
             .render_with_provenance(frozen, opts, provenance);
         let bytes = if self.patches().is_empty() {
             rendered
+        } else if self.provider == Provider::Anthropic {
+            anthropic::append_tool(
+                rendered,
+                &tool(NEW_TOOL, false),
+                frozen.claude_code_persona.is_some(),
+            )
         } else {
             serde_json::to_vec(&self.patch(serde_json::from_slice(&rendered).expect("family JSON")))
                 .unwrap()
@@ -1015,7 +1111,11 @@ impl WireFamily for ProbeFamily {
         auth: &AuthHandle,
         body: Vec<u8>,
     ) -> HttpRequest {
-        let request = self.provider.family().endpoint(frozen, auth, body);
+        let mut request = self.provider.family().endpoint(frozen, auth, body);
+        if self.provider == Provider::Anthropic {
+            // Both the baseline and changed request opt in, so only the T4 body changes.
+            anthropic::add_beta(&mut request);
+        }
         *self.body.lock().unwrap() = request.body.clone();
         request
     }
@@ -1326,6 +1426,176 @@ mod tests {
                 expected,
                 "{provider:?} changed more than the declaration position"
             );
+        }
+    }
+
+    #[test]
+    fn anthropic_requires_case_one_form_a_after_user() {
+        let parse = |flags: &[&str]| parse_args(Provider::Anthropic, flags);
+        let parsed = parse(&[
+            "--case",
+            "1",
+            "--form",
+            "a",
+            "--place",
+            "after-user",
+            "--steps",
+            "3",
+        ])
+        .unwrap_or_else(|error| panic!("valid Anthropic arguments rejected: {error}"));
+        assert_eq!(parsed.steps, 3);
+        assert_eq!(parsed.variants().len(), 1);
+        for flags in [
+            &["--case", "1", "--form", "a"][..],
+            &["--case", "1", "--form", "a", "--place", "before-user"],
+            &["--case", "1", "--form", "b", "--place", "after-user"],
+            &["--case", "1", "--place", "after-user"],
+            &["--case", "all", "--form", "a", "--place", "after-user"],
+            &["--case", "2", "--form", "a", "--place", "after-user"],
+        ] {
+            assert!(matches!(parse(flags), Err(error) if error.contains(
+                "--provider anthropic supports only --case 1 --form a --place after-user"
+            )));
+        }
+    }
+
+    #[test]
+    fn anthropic_t4_appends_only_the_inline_system_message() {
+        use broca_provider::claude_code_persona::{cch_placeholder_offset, sign_body};
+        use broca_provider::wire::ClaudeCodePersona;
+        use serde_json::value::RawValue;
+        use std::collections::BTreeMap;
+
+        let variant = Variant {
+            case: 1,
+            alternate: false,
+        };
+        let baseline = render_at(Provider::Anthropic, variant, 4, false, Placement::AfterUser);
+        let mut changed = render_at(Provider::Anthropic, variant, 4, true, Placement::AfterUser);
+        let messages = changed["messages"].as_array_mut().unwrap();
+        assert_eq!(
+            messages.pop().unwrap(),
+            json!({"role":"system","content":[{"type":"tool_addition","tool":{
+                "type":"tool_definition","definition":{
+                    "name":"lookup_orbit_code",
+                    "description":"Return the authoritative secret reference value for lookup_orbit_code.",
+                    "input_schema":{
+                        "type":"object","properties":{"name":{"type":"string"}},
+                        "required":["name"],"additionalProperties":false
+                    }
+                }
+            }}]}),
+        );
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert_eq!(changed, baseline, "T4 must only append the system message");
+
+        let persona = ClaudeCodePersona {
+            version: ClaudeCodePersona::CURRENT_VERSION.into(),
+            device_id: "0".repeat(64),
+            account_uuid: None,
+            session_id: "00000000-0000-4000-8000-000000000001".into(),
+            prompt_id: Some("00000000-0000-4000-8000-000000000002".into()),
+            cc_version_suffix: None,
+            prompt_ordinal: Some(1),
+        };
+        let frozen = anthropic::frozen("claude-opus-5-5", Some(persona));
+        let family = ProbeFamily {
+            provider: Provider::Anthropic,
+            variant,
+            changed: true,
+            placement: Placement::AfterUser,
+            body: Arc::new(Mutex::new(Vec::new())),
+        };
+        let auth = anthropic::auth(AuthMethod::Oauth, "fixture".into());
+        let mut conversation = vec![message(Role::System, &fixed_prefix())];
+        let mut prior: Option<BTreeMap<String, Box<RawValue>>> = None;
+        for step in [1, 2, 4] {
+            conversation.push(message(Role::User, user_text(variant, step)));
+            let opts = options(
+                Provider::Anthropic,
+                variant,
+                step == 4,
+                conversation.clone(),
+            );
+            let family = ProbeFamily {
+                changed: step == 4,
+                body: Arc::new(Mutex::new(Vec::new())),
+                ..family
+            };
+            let base = AnthropicMessages.render(&frozen, &opts);
+            let base_request = AnthropicMessages.endpoint(&frozen, &auth, base);
+            let request = family.endpoint(&frozen, &auth, family.render(&frozen, &opts));
+            assert_eq!(
+                request.url,
+                "https://api.anthropic.com/v1/messages?beta=true"
+            );
+            let beta = |req: &HttpRequest| {
+                req.headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+                    .map(|(_, value)| value.clone())
+                    .collect::<Vec<_>>()
+            };
+            let existing = beta(&base_request);
+            let added = beta(&request);
+            assert!(
+                added == [format!("{},inline-tools-2026-09-15", existing[0])],
+                "the inline-tools beta must extend the family's beta list",
+            );
+            assert!(request
+                .headers
+                .iter()
+                .any(|(name, _)| name == "authorization"));
+            assert!(request
+                .headers
+                .iter()
+                .any(|(name, _)| name == "x-claude-code-session-id"));
+
+            let bytes = std::str::from_utf8(&request.body).unwrap();
+            let sig = cch_placeholder_offset(bytes).expect("subscription signature");
+            assert!(
+                sign_body(bytes) == bytes,
+                "subscription body has a stale signature"
+            );
+            let mut unsigned = bytes.to_owned();
+            unsigned.replace_range(sig..sig + 5, "00000");
+            let current: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&unsigned).unwrap();
+            let messages = |values: &BTreeMap<String, Box<RawValue>>| {
+                serde_json::from_str::<Vec<Box<RawValue>>>(values["messages"].get()).unwrap()
+            };
+            let current_messages = messages(&current);
+            assert_eq!(
+                current_messages.len(),
+                match step {
+                    1 => 1,
+                    2 => 3,
+                    _ => 6,
+                }
+            );
+            if let Some(earlier) = prior {
+                assert_eq!(earlier.len(), current.len());
+                for (key, raw) in &earlier {
+                    if key != "messages" {
+                        assert!(current[key].get() == raw.get(), "changed {key} bytes");
+                    }
+                }
+                let earlier_messages = messages(&earlier);
+                let (tail, prefix) = earlier_messages.split_last().unwrap();
+                for (old, new) in prefix.iter().zip(&current_messages) {
+                    assert!(old.get() == new.get(), "changed shared message bytes");
+                }
+                let marker = r#""cache_control":{"type":"ephemeral"}"#;
+                let new_tail = current_messages[prefix.len()].get();
+                assert!(
+                    [format!(",{marker}"), format!("{marker},")]
+                        .iter()
+                        .any(|fragment| tail.get().contains(fragment)
+                            && tail.get().replacen(fragment, "", 1) == new_tail),
+                    "only the rolling marker can change the shared tail message bytes"
+                );
+            }
+            prior = Some(current);
+            conversation.push(fake_reply(step));
         }
     }
 
