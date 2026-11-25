@@ -140,7 +140,7 @@ async fn rebuild_registrations(
         .filter(|call| call.intent && call.terminal.is_none())
         .filter_map(|call| call.key.as_ref())
         .collect();
-    if waiting.is_empty() && !latest.start.as_ref().is_none_or(&recent) {
+    if waiting.is_empty() && !latest.start.as_ref().is_none_or(recent) {
         return Ok(Vec::new());
     }
     // Back to the oldest run started within the window, or to the open run's start, whichever
