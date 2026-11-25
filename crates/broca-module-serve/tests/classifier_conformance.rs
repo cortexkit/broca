@@ -117,9 +117,11 @@ async fn serve_one(mut stream: tokio::net::TcpStream, state: Arc<StandIn>) -> st
         buffer.extend_from_slice(&chunk[..n]);
     }
     let request: Value = serde_json::from_slice(&buffer[body_start..]).unwrap_or(Value::Null);
-    if let Some(routing) = &state.routing {
-        routing.provider_request(&head, &path, &request);
-    }
+    let wait_for_renewal = state.routing.as_ref().and_then(|routing| {
+        routing
+            .provider_request(&head, &path, &request)
+            .then_some(routing)
+    });
     let key = state_key(&request["state"]);
     state
         .received
@@ -127,6 +129,9 @@ async fn serve_one(mut stream: tokio::net::TcpStream, state: Arc<StandIn>) -> st
         .unwrap()
         .push((path.clone(), request.clone()));
     *state.calls.lock().unwrap().entry(key.clone()).or_default() += 1;
+    if let Some(routing) = wait_for_renewal {
+        routing.await_renewal_request().await;
+    }
     let hold = state.hold_next.lock().unwrap().remove(&key);
     if let Some(release) = hold {
         let released = release.notified();

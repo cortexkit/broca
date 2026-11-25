@@ -51,7 +51,7 @@ struct Admission {
 struct Inner {
     admission_refusal: Option<cortexkit_role_classifier_conformance::RoutingRefusalFixture>,
     renewal_refusal: Option<cortexkit_role_classifier_conformance::RoutingRefusalFixture>,
-    renewal_due: Option<u64>,
+    renewal_received: bool,
     script: Option<Vec<RoutingOutcome>>,
     cursor: usize,
     next_decision: usize,
@@ -84,7 +84,7 @@ impl State {
         inner.observations = RoutingObservations::default();
         inner.admission_refusal = None;
         inner.renewal_refusal = None;
-        inner.renewal_due = None;
+        inner.renewal_received = false;
     }
 
     pub(super) fn admission_refusal(
@@ -107,31 +107,17 @@ impl State {
         inner.renewal_refusal = Some(refusal);
     }
 
-    fn renewal_deadline(&self, request: &Value) -> Option<u64> {
-        let mut inner = self.0.lock().unwrap();
-        if request["method"] == "route.account_observe"
-            && request["params"]["kind"] == "attempt"
-            && inner.observations.provider_requests.len() == 1
-        {
-            inner.renewal_due.take()
-        } else {
-            None
-        }
-    }
-
-    async fn await_renewal_window(&self, request: &Value) {
-        if let Some(due) = self.renewal_deadline(request) {
-            // Attempt observations are flushed after the paid answer commits. Hold its
-            // acknowledgement until the lease expires, so the next item must renew before dispatch.
-            broca_test_support::wait_until("fixture lease renewal window", || async {
-                if now() >= due {
-                    Ok(())
-                } else {
-                    Err(format!("renewal due at {due}, now {}", now()))
-                }
-            })
-            .await;
-        }
+    pub(super) async fn await_renewal_request(&self) {
+        // An in-flight provider answer survives a refused renewal. Wait for the
+        // renewal so that broca stops before dispatching the rest of the batch.
+        broca_test_support::wait_until("the router to receive a renewal", || async {
+            if self.0.lock().unwrap().renewal_received {
+                Ok(())
+            } else {
+                Err("no renewal request yet".to_owned())
+            }
+        })
+        .await;
     }
 
     pub(super) fn finish(&self) {
@@ -139,14 +125,15 @@ impl State {
         inner.script = None;
         inner.admission_refusal = None;
         inner.renewal_refusal = None;
-        inner.renewal_due = None;
+        inner.renewal_received = false;
     }
 
     pub(super) fn observations(&self) -> RoutingObservations {
         self.0.lock().unwrap().observations.clone()
     }
 
-    pub(super) fn provider_request(&self, head: &str, path: &str, request: &Value) {
+    /// Record the request and return whether its response must wait for a renewal.
+    pub(super) fn provider_request(&self, head: &str, path: &str, request: &Value) -> bool {
         let token = head
             .lines()
             .find_map(|line| line.strip_prefix("authorization: bearer "))
@@ -193,6 +180,7 @@ impl State {
                 decision_id: choice.decision_id,
             });
         }
+        inner.renewal_refusal.is_some() && inner.observations.provider_requests.len() == 1
     }
 
     fn request(&self, request: Value) -> FixtureReply {
@@ -291,8 +279,9 @@ impl State {
                 assert_eq!(params["model"], model);
                 let renewing = params["mode"] == "renew";
                 if renewing {
-                    if let Some(refusal) = &inner.renewal_refusal {
-                        return FixtureReply::Refused(refusal.clone());
+                    if let Some(refusal) = inner.renewal_refusal.clone() {
+                        inner.renewal_received = true;
+                        return FixtureReply::Refused(refusal);
                     }
                 }
                 let pin_id = if renewing {
@@ -323,14 +312,14 @@ impl State {
                     .as_u64()
                     .map_or(1, |old| old + 1);
                 let lease_ms = if inner.renewal_refusal.is_some() {
-                    1_200
+                    // Renewal starts at about 6 s - 6 s / 3 = 4 s, leaving room for
+                    // slow journal writes before the first provider call. The first
+                    // provider response waits for renewal so later items cannot dispatch.
+                    6_000
                 } else {
                     120_000
                 };
                 let admitted_at = now();
-                if inner.renewal_refusal.is_some() {
-                    inner.renewal_due = Some(admitted_at + lease_ms);
-                }
                 let answer = json!({"admission":{"id":id,"state":"admitted"},
                     "account":{"provider":provider,"method":"apikey","account_id":choice.account,"credential_id":choice.account},
                     "pin":{"id":pin_id,"generation":generation,"affinity_expires_at_ms":admitted_at+3_600_000,"admission_valid_until_ms":admitted_at+120_000,"lease_valid_until_ms":admitted_at+lease_ms,"mode":if renewing {"renew"} else {"admit"}},
@@ -505,7 +494,6 @@ impl ModuleHandler for Router {
             Some(&true)
         );
         let request: Value = serde_json::from_slice(&body).unwrap();
-        self.state.await_renewal_window(&request).await;
         match self.state.request(request) {
             FixtureReply::Response(result) => {
                 HandlerOutcome::Response(serde_json::to_vec(&json!({"result":result})).unwrap())
@@ -783,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn routed_fixture_refusal_hooks_preserve_detail_and_renew_after_paid_item() {
+    fn routed_fixture_refusal_hooks_preserve_detail_and_signal_renewal() {
         use cortexkit_role_classifier_conformance::RoutingRefusalFixture;
         let refusal =
             RoutingRefusalFixture::new("account_hold", "held").with_detail(json!({"until_ms":123}));
@@ -803,32 +791,15 @@ mod tests {
         })]);
         state.renewal_refusal(refusal);
         let admitted = admit(&state);
-        state.provider_request(
+        assert!(state.provider_request(
             &format!(
                 "authorization: bearer synthetic-classifier-key-{}\r\n",
                 ACCOUNTS[0]
             ),
             "/v1/systemone",
             &json!({"model":"jev-1.13.0"}),
-        );
-        assert_eq!(
-            state.renewal_deadline(
-                &json!({"method":"route.account_observe","params":{"kind":"admission_started"}})
-            ),
-            None
-        );
-        assert_eq!(
-            state.renewal_deadline(
-                &json!({"method":"route.account_observe","params":{"kind":"attempt"}})
-            ),
-            Some(admitted["pin"]["lease_valid_until_ms"].as_u64().unwrap())
-        );
-        assert_eq!(
-            state.renewal_deadline(
-                &json!({"method":"route.account_observe","params":{"kind":"attempt"}})
-            ),
-            None
-        );
+        ));
+        assert!(!state.0.lock().unwrap().renewal_received);
         let mut request = state
             .0
             .lock()
@@ -849,9 +820,11 @@ mod tests {
             panic!("renewal hook did not refuse");
         };
         assert_eq!(answer.detail, json!({"until_ms":123}));
+        assert!(state.0.lock().unwrap().renewal_received);
         assert_eq!(state.observations().provider_requests.len(), 1);
         state.finish();
         assert!(state.0.lock().unwrap().renewal_refusal.is_none());
+        assert!(!state.0.lock().unwrap().renewal_received);
     }
 
     #[test]
