@@ -1702,7 +1702,7 @@ keep their existing behavior and omit this diagnostic.
   Terminal{run_id, reason} | Error{run_id, detail}`. `run.status(session)` resolves the
   in-process active run first, then the session's records.
 - **Timed account pauses:** the root `broca.jsonc` setting `max_same_account_wait` defaults to
-  `15`. A non-negative integer caps the wait in minutes; `0` never pauses, and `"max"` removes
+  `15`. A non-negative integer caps the same-account wait in minutes; `0` disables that wait, and `"max"` removes
   the cap but still respects cache expiry. Other values refuse boot by name. The obsolete
   `account_limit_pause` key is ignored with one boot warning naming the replacement.
   The setting is loaded once at boot; changes take effect at the next restart, like other
@@ -1715,8 +1715,7 @@ keep their existing behavior and omit this diagnostic.
   `cap = now + setting` (`"max"` has no cap). Pause only if
   `wake <= min(cache_expiry, cap)`. A 2xx response counts even if its stream did not complete;
   a refusal cannot refresh the cache. No accepted response on this account means no pause.
-  A declined wait ends with the existing transient `account_limit_exhausted` error and reset
-  time, allowing Core to revive the worker and routing to choose an account. A committed pause
+  A declined wait can lead the run to ask routing for another account. A committed pause
   replays its recorded wake without re-deciding these bounds and resumes on the same frozen
   selection, never through a routing account switch. `run.status` reports `state: paused`,
   `reason: account_limit`, `pause_reason: account_limit`, the original structured error and
@@ -1729,6 +1728,15 @@ keep their existing behavior and omit this diagnostic.
   health metric `account_limit_stale_resets`. `health.check.metrics.account_limit_pause_declined`
   always reports lifetime counts for `disabled`, `no_accepted_response`, `cache_expires_first`
   and `beyond_cap`; each decline logs reset, wake, cache expiry, cap and reason at info level.
+- **Routing capacity wait:** when routing refuses a mid-run quota continuation with `no_route`,
+  `detail.reason: concurrency_full` and a future `detail.reset_at_ms`, the step can pause once
+  with `pause_reason: account_limit`. `awaits.party: runner` and `resume_not_before_ms` describe
+  a wake at the reset, capped at 30 minutes. The original routing reset and reason appear in
+  `error.account_continue.until_ms` and `.reason`, separate from the provider's reset and retry
+  hints. At the wake the step re-enters on its frozen account; another wall can ask routing to
+  move it. A second refusal cannot renew the wait in that step, even after a restart. An
+  ordered send refused at admission does not pause: its run-shaped error retains the original
+  routing detail at `error.detail.routing_detail`.
 - **Run ids survive restart:** run-keyed ops find a run through the session store's id index,
   and a resumed run keeps its original `run_id`.
 - **Busy-vs-stale:** `session.send` on a live-active lineage returns `session_busy{run_id,

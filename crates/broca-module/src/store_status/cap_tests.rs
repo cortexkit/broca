@@ -8,6 +8,7 @@ use super::{fresh_state, RunFacts, SettledRuns};
 /// The facts of a completed run whose final message holds `text`.
 fn completed(n: u64, text: String) -> RunFacts {
     RunFacts {
+        admission_error_detail: None,
         wait: Default::default(),
         state: fresh_state(RunIndexState::Completed),
         interrupt_reason: None,
@@ -74,6 +75,7 @@ fn errored(text: String) -> RunFacts {
     );
     state.undelivered_steers = Some(vec![text]);
     RunFacts {
+        admission_error_detail: None,
         wait: Default::default(),
         state,
         interrupt_reason: None,

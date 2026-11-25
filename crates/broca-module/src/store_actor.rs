@@ -3639,9 +3639,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         run_id: &RunId,
         error: broca_core::RunError,
     ) -> Result<(), String> {
+        let (error, detail) = crate::serve::admission_refusal::queued_admission_error(error);
         let failure = broca_records::record::QueuedAdmissionFailure {
             run_id: run_id.clone(),
-            error: crate::serve::admission_refusal::queued_admission_error(error),
+            error,
         };
         // Its sender was answered `pending`, so the refusal reaches it only through the send's
         // status. Logged beside the refusals answered on the send itself (`session.send
@@ -3655,9 +3656,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             class = ?failure.error.class,
             "queued send ended refused at its run's start"
         );
+        let mut failure = serde_json::to_value(failure).map_err(|error| error.to_string())?;
+        if let Some(detail) = detail {
+            failure["error"]["detail"] = detail;
+        }
         let record = Record::Retraction(Retraction {
             submission_id: submission.0.clone(),
-            failure: Some(serde_json::to_value(failure).map_err(|error| error.to_string())?),
+            failure: Some(failure),
         });
         Writer::append(&mut self.durable(), std::slice::from_ref(&record), true)
             .await

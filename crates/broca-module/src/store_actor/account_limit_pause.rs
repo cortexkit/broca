@@ -123,19 +123,62 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         {
             return Err("account-limit pause does not carry a transient source error".into());
         }
+        let routing_wait = error.as_ref().is_some_and(|error| {
+            error
+                .account_continue
+                .as_ref()
+                .is_some_and(|answer| answer.is_concurrency_refusal())
+        });
+        if routing_wait
+            && !error.as_ref().is_some_and(|error| {
+                error.is_account_limit_exhausted()
+                    && matches!(
+                        error.limit_window.as_deref(),
+                        Some("five_hour" | "seven_day")
+                    )
+                    && pause.disposition
+                        == broca_protocol::provider::AccountLimitDisposition::ACCOUNT
+                    && broca_core::account_limit_pause::routing_pause_deadline(
+                        error,
+                        pause.paused_at_ms,
+                    ) == Some(pause.resume_not_before_ms)
+            })
+        {
+            return Err(
+                "routing pause does not carry its classified quota error and bounded wake".into(),
+            );
+        }
         let matched_attempt = records.iter().any(|(seq, record)| {
             if *seq != pause.failed_attempt_seq || *seq >= pause_seq {
                 return false;
             }
-            matches!(record, Record::Attempt(attempt)
-                if attempt.run_id == run.run_id
-                    && attempt.step_id == pause.failed_step.0
-                    && attempt.attempt == pause.attempt
-                    && attempt.request_body_len == pause.request_body_len
-                    && broca_session_store::codec::hex(&attempt.request_body_sha256.0) == pause.request_body_sha256
-                    && pause.attempt_id.as_ref().is_none_or(|id| Some(id.as_str()) == attempt.attempt_id.as_deref())
-                    && attempt.billing.as_ref().map(broca_protocol::json::Json::parse).as_ref().and_then(|billing| billing.get("account_limit_disposition"))
-                        == serde_json::to_value(pause.disposition).ok().as_ref())
+            let Record::Attempt(attempt) = record else {
+                return false;
+            };
+            // Routing waits use the pause's classified error instead of billing evidence, so a
+            // rolled-back reader can read the pause but cannot wake it without that evidence.
+            let source_matches = if routing_wait {
+                matches!(attempt.outcome.as_str(), "http_error" | "provider_error")
+            } else {
+                attempt
+                    .billing
+                    .as_ref()
+                    .map(broca_protocol::json::Json::parse)
+                    .as_ref()
+                    .and_then(|billing| billing.get("account_limit_disposition"))
+                    == serde_json::to_value(pause.disposition).ok().as_ref()
+            };
+            source_matches
+                && attempt.run_id == run.run_id
+                && attempt.step_id == pause.failed_step.0
+                && attempt.attempt == pause.attempt
+                && attempt.request_body_len == pause.request_body_len
+                && broca_session_store::codec::hex(&attempt.request_body_sha256.0)
+                    == pause.request_body_sha256
+                && pause
+                    .attempt_id
+                    .as_ref()
+                    .is_none_or(|id| Some(id.as_str()) == attempt.attempt_id.as_deref())
         });
         if !matched_attempt {
             return Err(

@@ -187,9 +187,8 @@ pub fn send_field_of(differing: &str) -> Option<&'static str> {
     })
 }
 
-/// Preserve the same typed refusal a direct start would send, but in the existing durable
-/// terminal shape. That shape has no field for routing's `routing_detail` or `decision_id`.
-pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
+/// Preserve the direct refusal's error and routing detail for the queued send's terminal JSON.
+pub(crate) fn queued_admission_error(error: RunError) -> (ProviderError, Option<Value>) {
     let class = error.admission_error_class();
     let served = match error {
         RunError::Upload(error) => ServeError::Upload(error),
@@ -221,34 +220,40 @@ pub(crate) fn queued_admission_error(error: RunError) -> ProviderError {
         error => ServeError::Open(error.to_string(), Some(class)),
     };
     let refusal = admission_refusal(&served).expect("run admission errors have a wire refusal");
-    let (code, message, retry_after_secs, resets_at_ms) = match refusal {
+    let (code, message, retry_after_secs, resets_at_ms, detail) = match refusal {
         AdmissionRefusal::AccountSelection(body) => (
             body.code,
             body.message,
             body.detail.retry_after_secs,
             body.detail.resets_at_ms,
+            body.detail
+                .routing_detail
+                .map(|detail| json!({"routing_detail": detail})),
         ),
-        AdmissionRefusal::RoutingUnavailable(body) => (body.code, body.message, None, None),
-        AdmissionRefusal::Other(body) => (body.code, body.message, None, None),
+        AdmissionRefusal::RoutingUnavailable(body) => (body.code, body.message, None, None, None),
+        AdmissionRefusal::Other(body) => (body.code, body.message, None, None, None),
     };
-    ProviderError {
-        class,
-        message,
-        provider_code: Some(code),
-        retry_after_secs,
-        resets_at_ms,
-        status: None,
-        cause: None,
-        provider_subcode: None,
-        refusal: None,
-        resets_at_source: None,
-        limit_window: None,
-        account_ref: None,
-        credential_id: None,
-        affordable_max_tokens: None,
-        account_continue: None,
-        provider_details: None,
-    }
+    (
+        ProviderError {
+            class,
+            message,
+            provider_code: Some(code),
+            retry_after_secs,
+            resets_at_ms,
+            status: None,
+            cause: None,
+            provider_subcode: None,
+            refusal: None,
+            resets_at_source: None,
+            limit_window: None,
+            account_ref: None,
+            credential_id: None,
+            affordable_max_tokens: None,
+            account_continue: None,
+            provider_details: None,
+        },
+        detail,
+    )
 }
 
 #[cfg(test)]
@@ -318,7 +323,8 @@ mod tests {
                 ErrorClass::Permanent,
             ),
         ] {
-            let queued = queued_admission_error(error);
+            let (queued, detail) = queued_admission_error(error);
+            assert_eq!(detail, None);
             assert_eq!(queued.provider_code.as_deref(), Some(code));
             assert_eq!(queued.class, class);
         }
@@ -332,12 +338,14 @@ mod tests {
             ErrorClass::Auth,
             ErrorClass::ContextOverflow,
         ] {
-            let error = queued_admission_error(RunError::AccountSelectionRefused(
+            let (error, detail) = queued_admission_error(RunError::AccountSelectionRefused(
                 broca_core::AccountSelectionRefusal {
                     routing_code: "account_hold".into(),
                     retry_after_s: Some(17),
                     resets_at_ms: Some(123_456),
-                    routing_detail: Some(Box::new(json!({"future": "kept on the direct reply"}))),
+                    routing_detail: Some(Box::new(
+                        json!({"reason":"concurrency_full", "reset_at_ms":123_456}),
+                    )),
                     decision_id: Some("decision".into()),
                     class,
                 },
@@ -350,6 +358,12 @@ mod tests {
             assert_eq!(error.message, "the routing module refused to choose a provider account for this send (account_hold); retry after 17 s");
             assert_eq!(error.retry_after_secs, Some(17.0));
             assert_eq!(error.resets_at_ms, Some(123_456));
+            assert_eq!(
+                detail,
+                Some(
+                    json!({"routing_detail":{"reason":"concurrency_full", "reset_at_ms":123_456}})
+                )
+            );
         }
     }
 
@@ -394,14 +408,14 @@ mod tests {
 
     #[test]
     fn queued_permanent_and_transient_refusals_use_the_direct_send_code_and_message() {
-        let permanent = queued_admission_error(RunError::Config("unknown model".into()));
+        let (permanent, _) = queued_admission_error(RunError::Config("unknown model".into()));
         assert_eq!(permanent.class, ErrorClass::Permanent);
         assert_eq!(permanent.provider_code.as_deref(), Some("open_failed"));
         assert_eq!(
             permanent.message,
             "open failed: run resolution failed: unknown model"
         );
-        let transient = queued_admission_error(RunError::Transient("catalog offline".into()));
+        let (transient, _) = queued_admission_error(RunError::Transient("catalog offline".into()));
         assert_eq!(transient.class, ErrorClass::Transient);
         assert_eq!(transient.provider_code.as_deref(), Some("transient"));
         assert_eq!(

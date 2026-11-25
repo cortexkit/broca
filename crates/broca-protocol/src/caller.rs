@@ -170,6 +170,7 @@ pub enum ControlUnit {
 pub struct SharedProviderError {
     inner: Box<ProviderError>,
     wire_class: Option<OpenErrorClass>,
+    admission_detail: Option<Box<serde_json::Value>>,
 }
 
 impl SharedProviderError {
@@ -177,6 +178,7 @@ impl SharedProviderError {
         let mut shared = Self {
             inner: Box::new(error),
             wire_class,
+            admission_detail: None,
         };
         if shared.inner.provider_code.is_none() {
             // Served errors require a code even when older stored records have none: the class
@@ -191,6 +193,12 @@ impl SharedProviderError {
             shared.inner.provider_code = Some(code.to_owned());
         }
         shared
+    }
+
+    /// Attach detail from a queued send refused at admission, rather than from a model attempt.
+    pub fn with_admission_detail(mut self, detail: Option<Box<serde_json::Value>>) -> Self {
+        self.admission_detail = detail;
+        self
     }
 
     /// Borrow the provider error retained after deserializing a caller-facing response.
@@ -234,6 +242,10 @@ impl<'de> Deserialize<'de> for SharedProviderError {
         D: Deserializer<'de>,
     {
         let mut value = serde_json::Value::deserialize(deserializer)?;
+        let admission_detail = value
+            .as_object_mut()
+            .and_then(|error| error.remove("detail"))
+            .map(Box::new);
         let raw_class = value
             .get("class")
             .and_then(serde_json::Value::as_str)
@@ -245,7 +257,7 @@ impl<'de> Deserialize<'de> for SharedProviderError {
         .is_ok();
         if known {
             let inner = serde_json::from_value(value).map_err(D::Error::custom)?;
-            return Ok(Self::from_stored(inner, None));
+            return Ok(Self::from_stored(inner, None).with_admission_detail(admission_detail));
         }
 
         let Some(object) = value.as_object_mut() else {
@@ -256,10 +268,10 @@ impl<'de> Deserialize<'de> for SharedProviderError {
             serde_json::Value::String("permanent".into()),
         );
         let inner = serde_json::from_value(value).map_err(D::Error::custom)?;
-        Ok(Self::from_stored(
-            inner,
-            Some(OpenErrorClass::from_wire(raw_class)),
-        ))
+        Ok(
+            Self::from_stored(inner, Some(OpenErrorClass::from_wire(raw_class)))
+                .with_admission_detail(admission_detail),
+        )
     }
 }
 
@@ -288,7 +300,7 @@ impl Serialize for SharedProviderError {
     where
         S: Serializer,
     {
-        if let Some(class) = &self.wire_class {
+        if self.wire_class.is_some() || self.admission_detail.is_some() {
             let mut value = serde_json::to_value(&self.inner).map_err(serde::ser::Error::custom)?;
             let Some(object) = value.as_object_mut() else {
                 return Err(serde::ser::Error::custom(
@@ -297,8 +309,11 @@ impl Serialize for SharedProviderError {
             };
             object.insert(
                 "class".into(),
-                serde_json::Value::String(class.as_str().to_owned()),
+                serde_json::Value::String(self.class_wire().to_owned()),
             );
+            if let Some(detail) = &self.admission_detail {
+                object.insert("detail".into(), (**detail).clone());
+            }
             value.serialize(serializer)
         } else {
             let shared_class = self.inner.class.shared_class();

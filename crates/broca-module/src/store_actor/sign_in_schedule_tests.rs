@@ -81,12 +81,14 @@ impl AccountContinue<Box<dyn Provider>> for Continuation<'_> {
                 Answer::Hold(broca_protocol::error::AccountContinueAnswer {
                     routing_code: "pool_wait".into(),
                     until_ms,
+                    reason: None,
                 })
             }
             RoutingReply::Refuse => {
                 Answer::Stay(Some(broca_protocol::error::AccountContinueAnswer {
                     routing_code: "pin_unavailable".into(),
                     until_ms: None,
+                    reason: None,
                 }))
             }
             RoutingReply::Move => Answer::Move(Box::new(Move {

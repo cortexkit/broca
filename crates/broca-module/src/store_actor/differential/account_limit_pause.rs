@@ -2,7 +2,8 @@
 use super::*;
 use crate::serve::ServeHandler;
 use broca_core::{Clock, Provider, StubToolPlane};
-use broca_protocol::{provider::ProviderControl, StepId};
+use broca_protocol::{error::AccountContinueAnswer, provider::ProviderControl, StepId};
+use broca_session_loop::account_move::{AccountContinue, Answer, Move, Wall};
 use broca_session_loop::writer::Writer;
 use broca_session_store::keys::{Cipher, DeploymentKey};
 use serde_json::{json, Value};
@@ -56,9 +57,29 @@ struct Limited {
     bound: AtomicBool,
     clock: Clock,
     calls: AtomicUsize,
+    quota_calls: AtomicUsize,
+    routing_enabled: AtomicBool,
     release_limit: Arc<Notify>,
     release_success: Arc<Notify>,
     sent: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl Limited {
+    fn new(clock: Clock, first_call: usize) -> Self {
+        Self {
+            reset_at: std::sync::atomic::AtomicU64::new(RESET),
+            accepted_at: std::sync::atomic::AtomicU64::new(1000),
+            require_bind: AtomicBool::new(false),
+            bound: AtomicBool::new(false),
+            clock,
+            calls: AtomicUsize::new(first_call),
+            quota_calls: AtomicUsize::new(1),
+            routing_enabled: AtomicBool::new(false),
+            release_limit: Arc::default(),
+            release_success: Arc::default(),
+            sent: Default::default(),
+        }
+    }
 }
 
 #[async_trait]
@@ -95,7 +116,12 @@ impl Provider for Limited {
     ) -> mpsc::Receiver<NormalizedEvent> {
         let bytes = self.render_request(&opts);
         self.sent.lock().unwrap().push(bytes.clone());
-        let limited = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        let limited =
+            self.calls.fetch_add(1, Ordering::SeqCst) < self.quota_calls.load(Ordering::SeqCst);
+        let window = self
+            .routing_enabled
+            .load(Ordering::SeqCst)
+            .then_some("seven_day");
         let mut attempt: broca_protocol::ModelAttempt = serde_json::from_value(json!({
             "attempt": runtime.first_attempt, "request_body_len": bytes.len(),
             "request_body_sha256": broca_core::render::request_digest_hex(&bytes),
@@ -109,7 +135,7 @@ impl Provider for Limited {
                 observed_at_ms: self.clock.now_ms(),
                 resets_at_ms: Some(self.reset_at.load(Ordering::SeqCst)),
                 resets_at_source: Some("body".into()),
-                limit_window: None,
+                limit_window: window.map(Into::into),
             });
         }
         let mut events = vec![NormalizedEvent::Control(ProviderControl::AttemptFinished {
@@ -119,7 +145,7 @@ impl Provider for Limited {
             events.push(NormalizedEvent::Control(ProviderControl::Error {
                 error: serde_json::from_value(
                     json!({"class":"transient", "message":"account window exhausted",
-                    "status":429, "provider_code":"account_limit_exhausted", "resets_at_ms":self.reset_at.load(Ordering::SeqCst)}),
+                    "status":429, "provider_code":"account_limit_exhausted", "resets_at_ms":self.reset_at.load(Ordering::SeqCst), "limit_window":window}),
                 )
                 .unwrap(),
                 retries_used: 0,
@@ -172,6 +198,49 @@ struct Executor {
     refuse_transient: AtomicBool,
     signed_out: AtomicBool,
     requests: std::sync::Mutex<Vec<FrozenRequest>>,
+    routing: std::sync::Mutex<std::collections::VecDeque<RouteReply>>,
+    refuse_account: AtomicBool,
+}
+
+enum RouteReply {
+    Refuse(AccountContinueAnswer),
+    Offer,
+}
+
+fn routed_selection(account: &str, run_id: &str) -> broca_records::record::AuthSelection {
+    serde_json::from_value(json!({
+        "credential_id": format!("oauth:stub:{account}"), "auth_method": "oauth", "account_ref": account,
+        "account_decision": {"path":"routed", "admission_id":run_id, "decision_id":account, "conversation_key":"routing-wait"}
+    })).unwrap()
+}
+
+#[async_trait]
+impl AccountContinue<Limited> for Executor {
+    async fn ask(&self, wall: &Wall<'_>) -> Answer<Limited> {
+        assert_eq!(wall.account, "acct-a");
+        match self
+            .routing
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("scripted routing reply")
+        {
+            RouteReply::Refuse(refusal) => Answer::Stay(Some(refusal)),
+            RouteReply::Offer => {
+                let provider = Limited::new(self.provider.clock.clone(), 1);
+                provider.release_success.notify_one();
+                Answer::Move(Box::new(Move {
+                    selection: routed_selection("acct-b", wall.run_id),
+                    account: "acct-b".into(),
+                    valid_until_ms: self.provider.clock.now_ms() + 60_000,
+                    render: None,
+                    provider,
+                }))
+            }
+        }
+    }
+
+    fn adopted(&self, _: &broca_records::record::AuthSelection) {}
 }
 
 #[async_trait]
@@ -196,6 +265,20 @@ impl RunExecutor for Executor {
             req.on_restart,
         ));
         let result = async {
+            if self.refuse_account.swap(false, Ordering::SeqCst) {
+                return Err(StoreRunError::Admission(RunError::AccountSelectionRefused(
+                    broca_core::AccountSelectionRefusal {
+                        routing_code: "no_route".into(),
+                        retry_after_s: Some(60),
+                        resets_at_ms: Some(RESET),
+                        routing_detail: Some(Box::new(
+                            json!({"reason":"concurrency_full", "reset_at_ms":RESET}),
+                        )),
+                        decision_id: None,
+                        class: broca_protocol::ErrorClass::Transient,
+                    },
+                )));
+            }
             if self.refuse.swap(false, Ordering::SeqCst) {
                 return Err(StoreRunError::Admission(RunError::Config(
                     "provider unavailable for resume".into(),
@@ -204,8 +287,14 @@ impl RunExecutor for Executor {
             if self.refuse_transient.swap(false, Ordering::SeqCst) {
                 return Err(StoreRunError::Admission(RunError::CredentialsUnavailable));
             }
-            control.account_limit_pause = true;
-            control.auth_selection = Some(selection());
+            let routing_enabled = self.provider.routing_enabled.load(Ordering::SeqCst);
+            let selection = if routing_enabled {
+                routed_selection("acct-a", &req.run_id.0)
+            } else {
+                selection()
+            };
+            control.account_limit_pause = !routing_enabled;
+            control.auth_selection = Some(selection.clone());
             let admission = if mode == StoreRunMode::Fresh {
                 Some(
                     broca_session_loop::admit::admission(
@@ -240,11 +329,11 @@ impl RunExecutor for Executor {
                 keep_warm: None,
                 account_reports: None,
                 max_same_account_wait: Default::default(),
-                auth_selection: Some(selection()),
+                auth_selection: Some(selection),
                 step_progress: control.step_progress,
                 model_call_ready: None,
                 pause_for_auth_at_start: self.sign_in_error(),
-                account_continue: None,
+                account_continue: routing_enabled.then_some(self as &dyn AccountContinue<Limited>),
             };
             match (admission, mode) {
                 (Some(admission), _) => {
@@ -283,21 +372,13 @@ impl Side {
         let service =
             Arc::new(crate::retention::RetentionService::new(&dir, leases.clone()).unwrap());
         let executor = Arc::new(Executor {
-            provider: Limited {
-                reset_at: std::sync::atomic::AtomicU64::new(RESET),
-                accepted_at: std::sync::atomic::AtomicU64::new(1000),
-                require_bind: AtomicBool::new(false),
-                bound: AtomicBool::new(false),
-                clock: service.clock.clone(),
-                calls: AtomicUsize::new(first_call),
-                release_limit: Arc::default(),
-                release_success: Arc::default(),
-                sent: Default::default(),
-            },
+            provider: Limited::new(service.clock.clone(), first_call),
             refuse: AtomicBool::new(false),
             refuse_transient: AtomicBool::new(false),
             signed_out: AtomicBool::new(false),
             requests: Default::default(),
+            routing: Default::default(),
+            refuse_account: AtomicBool::new(false),
         });
         let runtime = crate::store_open::StoreRuntime::open(
             &dir,
@@ -341,6 +422,14 @@ impl Side {
         self.executor.provider.clock.refresh().unwrap();
     }
     async fn send(&self, run: &str, delivery: broca_protocol::Delivery) -> SendOutcome {
+        self.send_ordered(run, delivery, None).await
+    }
+    async fn send_ordered(
+        &self,
+        run: &str,
+        delivery: broca_protocol::Delivery,
+        order: Option<broca_protocol::DeliveryOrder>,
+    ) -> SendOutcome {
         let mut request = request("hello");
         request.tools = None;
         request.policy_allowed.clear();
@@ -360,7 +449,7 @@ impl Side {
                 None,
                 None,
                 false,
-                None,
+                order,
             )
             .await
             .unwrap()
@@ -496,6 +585,182 @@ impl Drop for Side {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+const ROUTING_NOW: u64 = 2_000_000_000_000;
+
+fn concurrency_refusal(until_ms: Option<u64>) -> RouteReply {
+    RouteReply::Refuse(AccountContinueAnswer {
+        routing_code: "no_route".into(),
+        until_ms,
+        reason: Some("concurrency_full".into()),
+    })
+}
+
+fn script_routing(side: &Side, replies: impl IntoIterator<Item = RouteReply>) {
+    let provider = &side.executor.provider;
+    provider.routing_enabled.store(true, Ordering::SeqCst);
+    provider
+        .reset_at
+        .store(ROUTING_NOW + 86_400_000, Ordering::SeqCst);
+    provider.quota_calls.store(2, Ordering::SeqCst);
+    side.executor.routing.lock().unwrap().extend(replies);
+}
+
+async fn start_routed_run(side: &Side) {
+    side.set_time(ROUTING_NOW);
+    assert!(matches!(
+        side.send("r1", broca_protocol::Delivery::Queue).await,
+        SendOutcome::Active { .. }
+    ));
+    side.executor.provider.release_limit.notify_one();
+    side.idle().await;
+}
+
+#[tokio::test]
+async fn routing_wait_uses_the_reset_or_cap_and_moves_after_the_wake() {
+    for (reset_in, wait_ms) in [(60_000, 60_000), (40 * 60_000, 30 * 60_000)] {
+        let side = Side::new(true).await;
+        let reset = ROUTING_NOW + reset_in;
+        let deadline = ROUTING_NOW + wait_ms;
+        script_routing(&side, [concurrency_refusal(Some(reset)), RouteReply::Offer]);
+        start_routed_run(&side).await;
+        let state = side.state("r1").await;
+        assert_eq!(state["state"], "paused", "{state}");
+        assert_eq!(state["pause_reason"], "account_limit");
+        assert_eq!(state["resume_not_before_ms"], deadline);
+        assert_eq!(state["awaits"]["party"], "runner");
+        assert_eq!(state["awaits"]["next_ms"], deadline);
+        assert_eq!(state["error"]["account_continue"]["until_ms"], reset);
+        side.set_time(deadline - 1);
+        side.idle().await;
+        assert_eq!(side.executor.provider.calls.load(Ordering::SeqCst), 1);
+        side.set_time(deadline);
+        side.calls(2).await;
+        side.executor.provider.release_limit.notify_one();
+        side.wait_state("r1", "completed").await;
+        assert!(side.executor.routing.lock().unwrap().is_empty());
+        assert_eq!(
+            side.state("r1").await["auth_selection"],
+            "oauth:stub:acct-b"
+        );
+        side.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn routing_wait_survives_stop_and_reopen_but_a_second_refusal_ends_the_step() {
+    let side = Side::new(true).await;
+    let reset = ROUTING_NOW + 60_000;
+    script_routing(&side, [concurrency_refusal(Some(reset))]);
+    start_routed_run(&side).await;
+    assert_eq!(side.state("r1").await["state"], "paused");
+    side.stop().await;
+    let reopened = Side::open(side.dir.clone(), side.key.clone(), true, 1).await;
+    let second_reset = reset + 60_000;
+    script_routing(&reopened, [concurrency_refusal(Some(second_reset))]);
+    reopened.registry.actor_for(&reopened.key).await.unwrap();
+    reopened.idle().await;
+    assert_eq!(reopened.state("r1").await["resume_not_before_ms"], reset);
+    assert_eq!(reopened.executor.provider.calls.load(Ordering::SeqCst), 1);
+    reopened.set_time(reset);
+    reopened.calls(2).await;
+    reopened.executor.provider.release_limit.notify_one();
+    reopened.idle().await;
+    let status = reopened.state("r1").await;
+    assert_eq!(status["state"], "error", "{status}");
+    assert_eq!(
+        status["error"]["account_continue"],
+        json!({
+            "routing_code": "no_route", "reason": "concurrency_full", "until_ms": second_reset,
+        })
+    );
+    let records = reopened.records().await;
+    let kinds: Vec<_> = records
+        .iter()
+        .map(|record| record[0].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["start", "pause", "resume", "end"]);
+    reopened.stop().await;
+}
+
+#[tokio::test]
+async fn routing_wait_cancels_without_another_provider_call() {
+    let side = Side::new(true).await;
+    let reset = ROUTING_NOW + 60_000;
+    script_routing(&side, [concurrency_refusal(Some(reset))]);
+    start_routed_run(&side).await;
+    assert_eq!(side.state("r1").await["state"], "paused");
+    assert_eq!(
+        side.registry
+            .route_cancel(&side.key, RunId("r1".into()))
+            .await
+            .unwrap(),
+        crate::actor::CancelOutcome::Ack
+    );
+    side.wait_state("r1", "cancelled").await;
+    side.set_time(reset);
+    side.idle().await;
+    assert_eq!(side.executor.provider.calls.load(Ordering::SeqCst), 1);
+    assert!(!side
+        .registry
+        .idle_holds(&side.key)
+        .contains(&"account_limit_pause"));
+    side.stop().await;
+}
+
+#[tokio::test]
+async fn routing_refusal_without_a_future_concurrency_reset_ends_at_once() {
+    for (refusal, answer) in [
+        (
+            concurrency_refusal(None),
+            json!({"routing_code":"no_route", "reason":"concurrency_full"}),
+        ),
+        (
+            concurrency_refusal(Some(ROUTING_NOW - 1)),
+            json!({"routing_code":"no_route", "reason":"concurrency_full", "until_ms":ROUTING_NOW - 1}),
+        ),
+        (
+            RouteReply::Refuse(AccountContinueAnswer {
+                routing_code: "no_route".into(),
+                reason: Some("no_compatible_account".into()),
+                until_ms: None,
+            }),
+            json!({"routing_code":"no_route", "reason":"no_compatible_account"}),
+        ),
+    ] {
+        let side = Side::new(true).await;
+        script_routing(&side, [refusal]);
+        start_routed_run(&side).await;
+        let state = side.state("r1").await;
+        assert_eq!(state["state"], "error", "{state}");
+        assert_eq!(state["error"]["account_continue"], answer);
+        assert_eq!(side.executor.provider.calls.load(Ordering::SeqCst), 1);
+        side.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn ordered_admission_refusal_status_keeps_routing_detail() {
+    let side = Side::new(true).await;
+    side.executor.refuse_account.store(true, Ordering::SeqCst);
+    let order = serde_json::from_value(json!({"modes":["steer","idle_start"]})).unwrap();
+    assert!(matches!(
+        side.send_ordered("r1", broca_protocol::Delivery::Queue, Some(order))
+            .await,
+        SendOutcome::Pending { .. }
+    ));
+    let status = side.wait_state("r1", "error").await;
+    assert_eq!(
+        status["error"]["provider_code"],
+        "account_selection_refused"
+    );
+    assert_eq!(
+        status["error"]["detail"]["routing_detail"],
+        json!({"reason":"concurrency_full", "reset_at_ms":RESET})
+    );
+    assert_eq!(side.executor.provider.calls.load(Ordering::SeqCst), 0);
+    side.stop().await;
 }
 
 #[tokio::test]

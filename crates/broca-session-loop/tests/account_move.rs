@@ -459,10 +459,12 @@ impl AccountContinue<Box<dyn Provider>> for Routing {
             Scripted::Hold(code, until_ms) => Answer::Stay(Some(AccountContinueAnswer {
                 routing_code: code.into(),
                 until_ms,
+                reason: None,
             })),
             Scripted::Refuse(code) => Answer::Stay(Some(AccountContinueAnswer {
                 routing_code: code.into(),
                 until_ms: None,
+                reason: None,
             })),
             Scripted::Nothing => Answer::Stay(None),
             Scripted::StopWhileAsked(stop) => {

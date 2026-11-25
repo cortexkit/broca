@@ -58,7 +58,9 @@ use crate::entries::{Placed, Tags};
 use crate::parts::{canonical, Parts};
 use crate::writer::Writer;
 
+mod account_limit;
 mod attempt;
+use account_limit::{account_limit_of, account_limit_pause, waited_for_routing};
 use attempt::{attempt_record, AttemptContext, RequestFacts};
 mod display;
 use display::restream;
@@ -3078,21 +3080,31 @@ where
                 if let Some(pause_on) = limited.as_deref().and_then(|limited| {
                     account_limit_pause(seams, admission, step_id, limited, &error)
                 }) {
-                    return pause(
-                        writer,
-                        seams,
-                        &admission.run_id,
-                        PauseReason::AccountLimit,
-                        Some(*error),
-                        Some(pause_on),
-                        None,
-                    )
-                    .await;
+                    // After a routing wait, a repeat wall on that account asks routing again
+                    // even if the provider's own reset is now close enough to wait for.
+                    if seams.account_continue.is_none()
+                        || !waited_for_routing(
+                            writer,
+                            &admission.run_id,
+                            step_id,
+                            Some(&pause_on.credential_id),
+                        )
+                        .await?
+                    {
+                        return pause(
+                            writer,
+                            seams,
+                            &admission.run_id,
+                            PauseReason::AccountLimit,
+                            Some(*error),
+                            Some(pause_on),
+                            None,
+                        )
+                        .await;
+                    }
                 }
-                // No timed pause, so the run would end here: when the refused attempt hit a quota
-                // wall, routing may move the run to another account instead, and the step is
-                // entered again there. Otherwise routing's answer, if it gave one, goes on the
-                // error the run ends with.
+                // Without a same-account wait, routing may move the run at a quota wall or tell
+                // it when capacity will be back. Its answer stays on the pause or terminal error.
                 let mut error = error;
                 if let Some(limited) = limited.as_deref() {
                     // The accounts that already refused this step: carried across a move in
@@ -3140,11 +3152,29 @@ where
                             crate::account_move::AtWall::Stayed(Some(answer))
                             | crate::account_move::AtWall::Held(answer),
                         ) => {
-                            crate::account_move::with_routing_answer(
-                                &mut error,
-                                answer,
-                                (seams.now_ms)(),
-                            );
+                            let now = (seams.now_ms)();
+                            crate::account_move::with_routing_answer(&mut error, answer, now);
+                            if let Some(pause_on) = limited.pause_for_routing(
+                                StepId(step_id),
+                                now,
+                                &error,
+                                run_selection(seams, admission),
+                            ) {
+                                if !waited_for_routing(writer, &admission.run_id, step_id, None)
+                                    .await?
+                                {
+                                    return pause(
+                                        writer,
+                                        seams,
+                                        &admission.run_id,
+                                        PauseReason::AccountLimit,
+                                        Some(*error),
+                                        Some(pause_on),
+                                        None,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                         // A cancel ends the run as cancelled. A stop pauses it for the restart when
                         // its policy is to resume, and the resume asks for this step again; without
@@ -5115,18 +5145,6 @@ fn reserve_for<W: Writer>(
     crate::output::reserve(writer.operations(), step_id, opts)
 }
 
-/// The timed same-account pause the run's state holds, if it is paused on one.
-fn account_limit_of<W: Writer>(
-    writer: &W,
-) -> Result<Option<broca_records::record::AccountLimitPause>, LoopError> {
-    run_state(writer)
-        .account_limit_pause
-        .clone()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| LoopError::Parts(format!("account-limit pause: {e}")))
-}
-
 /// Ends the run as `reason` with `error` on its end, as today ends a run that can't go on.
 async fn end_with_error<W: Writer, P, T>(
     writer: &mut W,
@@ -5136,38 +5154,6 @@ async fn end_with_error<W: Writer, P, T>(
     error: &ProviderError,
 ) -> Result<Finished, LoopError> {
     end_run_with_error(writer, run_id, reason, error, (seams.now_ms)(), seams.held).await
-}
-
-/// The timed pause on the run's own account that `limited`, the step's attempt the provider refused
-/// for the account's limit, allows: only for a transient error, only when the run consented at
-/// admission, and only when the account resets before the session's cache on it expires and within
-/// the boot cap.
-fn account_limit_pause<P: Provider, T>(
-    seams: &Seams<'_, P, T>,
-    admission: &Admission,
-    step_id: u64,
-    limited: &FailedAccountLimitAttempt,
-    error: &ProviderError,
-) -> Option<Box<broca_records::record::AccountLimitPause>> {
-    let selection = run_selection(seams, admission);
-    let last_accepted = limited
-        .attempt
-        .served_account_ref
-        .as_deref()
-        .or_else(|| selection.and_then(|selection| selection.account_ref.as_deref()))
-        .and_then(|account| seams.provider.last_accepted_at_ms(account));
-    let budget = broca_core::account_limit_pause::PauseBudget {
-        setting: if admission.account_limit_pause {
-            seams.max_same_account_wait
-        } else {
-            broca_core::SameAccountWait::Minutes(0)
-        },
-        cache_expiry_ms: broca_core::session_account_cache_expiry_ms(
-            last_accepted,
-            &admission.render_config,
-        ),
-    };
-    limited.pause(StepId(step_id), (seams.now_ms)(), error, selection, &budget)
 }
 
 /// The cache lifetime the run's requests ask the provider for, when they ask for one it honours, is

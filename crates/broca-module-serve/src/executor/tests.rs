@@ -1592,3 +1592,21 @@ fn only_auth_class_401_403_are_reportable_wire_auth_failures() {
         assert_eq!(wire_auth_status(&err_with_status(s)), None, "status {s:?}");
     }
 }
+#[test]
+fn continuation_refusal_keeps_reason_but_only_concurrency_no_route_has_a_deadline() {
+    use cortexkit_role_routing::account_continue::ContinueRefusal;
+    for (code, reason, deadline) in [
+        ("no_route", "concurrency_full", Some(70_000)),
+        ("no_route", "no_compatible_account", None),
+        ("pin_unavailable", "concurrency_full", None),
+    ] {
+        let refusal = ContinueRefusal::new(
+            code,
+            serde_json::json!({"reason":reason, "reset_at_ms":70_000}),
+        );
+        let answer = super::continuation_refusal_answer(refusal);
+        assert_eq!(answer.routing_code, code);
+        assert_eq!(answer.reason.as_deref(), Some(reason));
+        assert_eq!(answer.until_ms, deadline);
+    }
+}

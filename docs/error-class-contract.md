@@ -56,8 +56,8 @@ A quota-429 is indistinguishable only after provider-code discrimination.
 ### Timed account-limit recovery
 
 The root `broca.jsonc` setting `max_same_account_wait` does not add a fifth error class.
-It defaults to `15`: non-negative integers cap same-account waits in minutes, `0` never
-pauses, and `"max"` waits only up to cache expiry. Other values refuse boot. The obsolete
+It defaults to `15`: non-negative integers cap same-account waits in minutes, `0` disables
+same-account waiting, and `"max"` waits only up to cache expiry. Other values refuse boot. The obsolete
 `account_limit_pause` key is ignored with one boot warning naming `max_same_account_wait`.
 The setting is loaded once at boot; changes take effect at the next restart, like other
 `broca.jsonc` settings. The existing frozen consent boolean is `setting != 0`; new pause
@@ -72,9 +72,12 @@ frozen cache TTL (explicit 5 minutes or 1 hour, otherwise 5 minutes), and `cap =
 (unbounded for `"max"`). A valid, non-stale floor pauses only when
 `wake <= min(cache_expiry, cap)` and consent is enabled. A 2xx stream need not complete to
 refresh the cache; a refused attempt cannot refresh it. Without an accepted attempt on that
-account there is no pause. Declines end the run with the unchanged transient
-`account_limit_exhausted` error and reset time, so Core can revive it and routing can switch
-accounts. Committed pauses replay their recorded wake, never re-decide these bounds.
+account there is no same-account pause. When that wait is declined, routing may move a run at a
+quota wall or, on `no_route` with `reason: concurrency_full` and a future routing reset, trigger
+a separate wait once per step, capped at 30 minutes. Otherwise the run ends with the transient
+`account_limit_exhausted` error. Routing's reason and reset, when given for that wait, are
+`error.account_continue.reason` and `.until_ms`, not the spent account's own reset or retry
+hint. Committed pauses replay their recorded wake, never re-decide these bounds.
 Untimed walls, resets beyond the cache/cap bounds,
 generic 429s, payment exhaustion, authentication and context overflow keep their earlier paths.
 Newly stale floors end the run and increment `health.check.metrics.account_limit_stale_resets`;

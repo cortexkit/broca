@@ -68,6 +68,9 @@ enum RoutingMode {
         code: &'static str,
         retry_after_s: Option<u64>,
     },
+    ConcurrencyFull {
+        reset_at_ms: u64,
+    },
     Hold {
         detail: Value,
     },
@@ -77,6 +80,12 @@ enum RoutingMode {
     /// Never answer `route.account_for`, as a stuck routing module would.
     Hang,
 }
+
+fn concurrency_full_detail(reset_at_ms: u64) -> Value {
+    json!({"reason": "concurrency_full", "reset_at_ms": reset_at_ms})
+}
+
+const CONCURRENCY_FULL_MESSAGE: &str = "all eligible accounts are at their concurrency limit";
 
 struct Routing {
     continuations: Continuations,
@@ -313,6 +322,13 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
                     "exclusions": [],
                 }),
             },
+            RoutingMode::ConcurrencyFull { reset_at_ms } => {
+                subc_client_rs::HandlerOutcome::ErrorWithDetail {
+                    code: "no_route".into(),
+                    message: CONCURRENCY_FULL_MESSAGE.into(),
+                    detail: concurrency_full_detail(reset_at_ms),
+                }
+            }
             RoutingMode::Hold { detail } => subc_client_rs::HandlerOutcome::ErrorWithDetail {
                 code: "account_hold".into(),
                 message: "account route is held".into(),
@@ -1409,6 +1425,16 @@ impl Rig {
     /// One request on a fresh management route to session `name`: the result, or the whole
     /// refusal body (code, message and detail, which carries a classified refusal's `class`).
     async fn raw_request(&self, name: &str, method: &str, params: Value) -> Result<Value, Value> {
+        Self::decode_reply(self.request_bytes(name, method, params).await)
+    }
+
+    /// The exact terminal frame body, before any client-side decoding.
+    async fn request_bytes(
+        &self,
+        name: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Vec<u8>, Vec<u8>> {
         let conn = SubcConnection::connect(&self.connection_file)
             .await
             .unwrap();
@@ -1423,7 +1449,7 @@ impl Rig {
             )
             .await
             .unwrap();
-        Self::request_on(&conn, &route, method, params).await
+        Self::request_bytes_on(&conn, &route, method, params).await
     }
 
     async fn request_on(
@@ -1432,14 +1458,25 @@ impl Rig {
         method: &str,
         params: Value,
     ) -> Result<Value, Value> {
-        match conn
-            .route_request_terminal(
-                route,
-                serde_json::to_vec(&json!({"method": method, "params": params})).unwrap(),
-            )
-            .await
-            .unwrap()
-        {
+        Self::decode_reply(Self::request_bytes_on(conn, route, method, params).await)
+    }
+
+    async fn request_bytes_on(
+        conn: &SubcConnection,
+        route: &broca_subc::RouteHandle,
+        method: &str,
+        params: Value,
+    ) -> Result<Vec<u8>, Vec<u8>> {
+        conn.route_request_terminal(
+            route,
+            serde_json::to_vec(&json!({"method": method, "params": params})).unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn decode_reply(reply: Result<Vec<u8>, Vec<u8>>) -> Result<Value, Value> {
+        match reply {
             Ok(bytes) => Ok(serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone()),
             Err(bytes) => Err(serde_json::from_slice(&bytes).unwrap()),
         }
@@ -2128,6 +2165,254 @@ async fn account_continue_request_bytes_and_offered_account_observations_through
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0]["params"]["admission_id"], run_id);
     assert_eq!(rig.routing.continuations.requests().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capture_concurrency_full_reader_replies() {
+    use sha2::{Digest, Sha256};
+
+    let samples = std::env::var_os("BROCA_CAPACITY_REFUSAL_SAMPLES").map(PathBuf::from);
+    if !cfg!(feature = "test-clock") {
+        assert!(
+            samples.is_none(),
+            "sample capture requires the test-clock feature"
+        );
+        return;
+    }
+    let Some(rig) = Rig::start().await else {
+        assert!(samples.is_none(), "sample capture requires the real daemon");
+        return;
+    };
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let set_clock = |now_ms| {
+        let temp = rig.state_root.join("test-clock.capacity.tmp");
+        std::fs::write(&temp, json!({"now_ms": now_ms}).to_string()).unwrap();
+        std::fs::rename(temp, rig.state_root.join("test-clock")).unwrap();
+    };
+    let paused_at_ms = now_ms();
+    set_clock(paused_at_ms);
+    let plain = broca_session_store::keys::DeploymentKey::unloaded(1);
+
+    // Advertise continuation and list both credentials before broca can cache either answer.
+    // The provider's distant quota reset will rule out waiting on the current account.
+    let routing_reset = paused_at_ms + 120_000;
+    let concurrency_full = |reset| ContinuePlan::ErrorWithDetail {
+        code: "no_route",
+        message: CONCURRENCY_FULL_MESSAGE,
+        detail: concurrency_full_detail(reset),
+    };
+    rig.script_continuation_wall(concurrency_full(routing_reset), true);
+    let second_reset = routing_reset + 120_000;
+    rig.routing
+        .continuations
+        .script_next(concurrency_full(second_reset));
+
+    let reset_at_ms = now_ms() + 30_000;
+    rig.routing
+        .set(RoutingMode::ConcurrencyFull { reset_at_ms });
+    let (direct, direct_bytes) = rig.refused_send("capacity-direct", "capacity-send").await;
+    assert_eq!(direct["code"], "account_selection_refused", "{direct}");
+    let detail = &direct["detail"];
+    assert_eq!(detail["class"], "transient");
+    assert_eq!(detail["routing_code"], "no_route");
+    assert_eq!(detail["resets_at_ms"], reset_at_ms);
+    assert_eq!(
+        detail["routing_detail"],
+        concurrency_full_detail(reset_at_ms)
+    );
+    let retry = detail["retry_after_s"].as_u64().unwrap();
+    assert!((reset_at_ms.saturating_sub(now_ms()).div_ceil(1000)..=30).contains(&retry));
+    assert_eq!(detail["retry_after_secs"], retry as f64);
+
+    // Ordered delivery can have a send receipt without a durable run start.
+    let name = "capacity-ordered";
+    rig.create_held(&rig.served_identity(name).await, &plain)
+        .await;
+    let reset_at_ms = now_ms() + 30_000;
+    rig.routing
+        .set(RoutingMode::ConcurrencyFull { reset_at_ms });
+    let ordered_bytes = rig
+        .request_bytes(
+            name,
+            "session.send",
+            json!({"prompt": "hello", "model": {"provider": "anthropic", "model": MODEL},
+                "tools": [], "send_id": "capacity-send", "delivery": ["steer", "idle_start"]}),
+        )
+        .await
+        .unwrap();
+    let ordered: Value = serde_json::from_slice(&ordered_bytes).unwrap();
+    assert_eq!(ordered["result"]["state"], "pending", "{ordered}");
+    let submission = ordered["result"]["submission_id"].as_str().unwrap();
+    let ordered_send_status = broca_test_support::wait_until("ordered send finished", || async {
+        let bytes = rig
+            .request_bytes(
+                name,
+                "session.send_status",
+                json!({"send_id": "capacity-send"}),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        if body["result"]["state"] == "pending" {
+            return Err(body.to_string());
+        }
+        assert_eq!(body["result"]["state"], "finished", "{body}");
+        assert_eq!(body["result"]["reason"], "error", "{body}");
+        Ok(bytes)
+    })
+    .await;
+    let send_status: Value = serde_json::from_slice(&ordered_send_status).unwrap();
+    let run_id = send_status["result"]["run_id"].as_str().unwrap();
+    assert_eq!(submission.strip_prefix("sub-"), Some(run_id));
+    let ordered_run_status = rig
+        .request_bytes(name, "run.status", json!({"run_id": run_id}))
+        .await
+        .unwrap();
+    let ordered_status: Value = serde_json::from_slice(&ordered_run_status).unwrap();
+    assert_eq!(
+        ordered_status["result"]["state"], "error",
+        "{ordered_status}"
+    );
+    let error = &ordered_status["result"]["error"];
+    assert_eq!(error["class"], "transient");
+    assert_eq!(error["provider_code"], "account_selection_refused");
+    assert_eq!(error["resets_at_ms"], reset_at_ms);
+    assert_eq!(
+        error["detail"]["routing_detail"],
+        concurrency_full_detail(reset_at_ms)
+    );
+    assert!(rig
+        .frames(name)
+        .await
+        .iter()
+        .all(|frame| !matches!(frame.record, Record::RunStart(_))));
+    assert!(rig.upstream.authorized_as.lock().unwrap().is_empty());
+
+    rig.routing.set(RoutingMode::Choose {
+        account_id: "acct1",
+        credential_id: "oauth:anthropic:acct1",
+    });
+    let name = "capacity-continuation";
+    rig.create_held(&rig.served_identity(name).await, &plain)
+        .await;
+    let sent = rig
+        .raw_send(
+            name,
+            "capacity-wall",
+            json!({"conversation_key": "capacity:continuation"}),
+        )
+        .await
+        .unwrap();
+    let run_id = sent["run_id"].as_str().unwrap();
+    let paused_status = broca_test_support::wait_until("continued run paused for routing", || async {
+        let bytes = rig
+            .request_bytes(name, "run.status", json!({"run_id": run_id}))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        if body["result"]["state"] == "active" {
+            return Err(body.to_string());
+        }
+        let status = &body["result"];
+        assert_eq!(status["state"], "paused", "{body}");
+        assert_eq!(status["pause_reason"], "account_limit", "{body}");
+        assert_eq!(status["resume_not_before_ms"], routing_reset, "{body}");
+        assert_eq!(status["awaits"]["party"], "runner", "{body}");
+        assert_eq!(status["awaits"]["next_ms"], routing_reset, "{body}");
+        assert_eq!(status["error"]["account_continue"], json!({
+            "routing_code": "no_route", "reason": "concurrency_full", "until_ms": routing_reset,
+        }));
+        Ok(bytes)
+    })
+    .await;
+    let frames = rig.frames(name).await;
+    let pause = frames
+        .iter()
+        .find_map(|frame| match &frame.record {
+            Record::Pause(pause) => pause
+                .account_limit
+                .as_ref()
+                .map(|evidence| evidence.parse()),
+            _ => None,
+        })
+        .expect("durable routing pause");
+    assert_eq!(pause["resume_not_before_ms"], routing_reset);
+    assert_eq!(rig.routing.continuations.requests().len(), 1);
+    set_clock(routing_reset);
+    let run_status = broca_test_support::wait_until("continued run ended", || async {
+        let bytes = rig
+            .request_bytes(name, "run.status", json!({"run_id": run_id}))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        if body["result"]["state"] == "active" || body["result"]["state"] == "paused" {
+            return Err(body.to_string());
+        }
+        assert_eq!(body["result"]["state"], "error", "{body}");
+        Ok(bytes)
+    })
+    .await;
+    let status: Value = serde_json::from_slice(&run_status).unwrap();
+    let requests = rig.routing.continuations.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one continue request per wall for {status}"
+    );
+    for request in requests {
+        let question: Value = serde_json::from_slice(&request).unwrap();
+        assert_eq!(question["method"], "route.account_for");
+        assert_eq!(question["params"]["run_id"], run_id);
+    }
+    let error = &status["result"]["error"];
+    assert_eq!(error["class"], "transient");
+    assert_eq!(error["provider_code"], "account_limit_exhausted");
+    assert_eq!(error["resets_at_ms"], 4_102_444_800_000_u64);
+    assert_eq!(error["retry_after_secs"], 604_800.0);
+    assert_eq!(
+        error["account_continue"],
+        json!({"routing_code": "no_route", "reason": "concurrency_full", "until_ms": second_reset})
+    );
+    let awaits = &status["result"]["awaits"];
+    assert_eq!(awaits["party"], "caller");
+    assert_eq!(awaits["message"]["from"], "provider");
+    let run_result = rig
+        .request_bytes(name, "run.result", json!({"run_id": run_id}))
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_slice(&run_result).unwrap();
+    assert_eq!(result["result"]["state"], "error", "{result}");
+    assert_eq!(&result["result"]["error"], error);
+    assert_eq!(&result["result"]["awaits"], awaits);
+
+    if let Some(dir) = samples {
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut sums = String::new();
+        for (name, bytes) in [
+            ("admission-direct.session.send.json", direct_bytes),
+            ("admission-ordered.session.send.json", ordered_bytes),
+            (
+                "admission-ordered.session.send_status.json",
+                ordered_send_status,
+            ),
+            ("admission-ordered.run.status.json", ordered_run_status),
+            ("continuation-paused.run.status.json", paused_status),
+            ("continuation.run.status.json", run_status),
+            ("continuation.run.result.json", run_result),
+        ] {
+            std::fs::write(dir.join(name), &bytes).unwrap();
+            sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
+        }
+        std::fs::write(dir.join("SHA256SUMS"), sums).unwrap();
+    }
+    let root = rig.root.clone();
+    drop(rig);
+    broca_test_support::remove_rig_dir(root);
 }
 
 fn selection(frames: &[FramedRecord]) -> Value {

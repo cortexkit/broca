@@ -19,6 +19,11 @@ use serde_json::Value;
 #[derive(Clone)]
 pub enum ContinuePlan {
     Answer(ContinueAnswer),
+    ErrorWithDetail {
+        code: &'static str,
+        message: &'static str,
+        detail: Value,
+    },
     NoAnswer,
 }
 
@@ -177,6 +182,15 @@ impl Continuations {
             ContinuePlan::Answer(answer) => subc_client_rs::HandlerOutcome::Response(
                 serde_json::to_vec(&serde_json::json!({"result": answer})).unwrap(),
             ),
+            ContinuePlan::ErrorWithDetail {
+                code,
+                message,
+                detail,
+            } => subc_client_rs::HandlerOutcome::ErrorWithDetail {
+                code: code.into(),
+                message: message.into(),
+                detail,
+            },
             ContinuePlan::NoAnswer => std::future::pending().await,
         }
     }

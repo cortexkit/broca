@@ -328,8 +328,8 @@ pub struct ProviderError {
     pub provider_details: Option<Box<GoogleRpcErrorDetails>>,
     /// Why the run did not move to another account at this limit: routing's answer when the
     /// run asked it for one and routing held or refused. Set only on an
-    /// [`ACCOUNT_LIMIT_EXHAUSTED`] error that ended a run, and only when routing answered; absent
-    /// on every other error, so their serialized bytes are unchanged by this field's existence.
+    /// [`ACCOUNT_LIMIT_EXHAUSTED`] error that paused or ended a run, or on an auth pause when
+    /// routing answered the sign-in continuation request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_continue: Option<Box<AccountContinueAnswer>>,
 }
@@ -342,10 +342,19 @@ pub struct AccountContinueAnswer {
     /// Routing's code for why it offered no account: a hold (no account has room now) or a
     /// refusal (this run may not move).
     pub routing_code: String,
-    /// For a hold, when routing expects an account to have room, as an absolute UTC epoch in
-    /// milliseconds. Absent when routing didn't say, which means unknown, not now.
+    /// When routing expects an account to have room, as an absolute UTC epoch in milliseconds.
+    /// Absent when routing didn't say, which means unknown, not now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ms: Option<u64>,
+    /// Routing's finer-grained reason, when a refusal supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AccountContinueAnswer {
+    pub fn is_concurrency_refusal(&self) -> bool {
+        self.routing_code == "no_route" && self.reason.as_deref() == Some("concurrency_full")
+    }
 }
 
 /// The `provider_code` of a rate-limit refusal that means ONE provider account has used up a

@@ -615,7 +615,7 @@ pub fn with_routing_answer(
     answer: AccountContinueAnswer,
     now_ms: u64,
 ) {
-    if let Some(until_ms) = answer.until_ms {
+    if let Some(until_ms) = answer.until_ms.filter(|_| !answer.is_concurrency_refusal()) {
         let retry = until_ms.saturating_sub(now_ms).div_ceil(1000) as f64;
         if error.retry_after_secs.is_none_or(|own| retry < own) {
             error.retry_after_secs = Some(retry);
@@ -723,6 +723,7 @@ mod tests {
         AccountContinueAnswer {
             routing_code: "no_compatible_account".into(),
             until_ms,
+            reason: None,
         }
     }
 
@@ -771,6 +772,7 @@ mod tests {
             let refusal = AccountContinueAnswer {
                 routing_code: "account_pinned".into(),
                 until_ms: None,
+                reason: None,
             };
             let mut refused = limit_error(own);
             with_routing_answer(&mut refused, refusal.clone(), NOW);

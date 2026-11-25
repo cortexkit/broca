@@ -115,6 +115,8 @@ fn decode<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T
 pub struct RunFacts {
     pub wait: crate::store_awaits::RunWait,
     pub state: ReconciledRunState,
+    /// The routing detail retained in the error JSON of a refused queued send.
+    admission_error_detail: Option<Box<Value>>,
     /// Why an interrupted run was interrupted, as its end recorded it.
     pub interrupt_reason: Option<String>,
     /// Whether the run's start asked for the trailing `wake` directive of its final message.
@@ -222,7 +224,7 @@ struct Settled {
 /// the serde walk sizes them. A run that ended in error keeps its error text in its state, and a
 /// paused or waiting one its wait, so those count as a final message does.
 fn settled_bytes(key: &SettledKey, facts: &RunFacts) -> usize {
-    use broca_session_store::held::HeldBytes;
+    use broca_session_store::held::{serde_heap_bytes, HeldBytes};
     let (address, _, _, run_id) = key;
     let key_heap = address.heap_bytes() + run_id.heap_bytes();
     let message = match &facts.final_message {
@@ -236,6 +238,10 @@ fn settled_bytes(key: &SettledKey, facts: &RunFacts) -> usize {
         + facts.interrupt_reason.heap_bytes()
         + message
         + state_heap_bytes(&facts.state)
+        + facts
+            .admission_error_detail
+            .as_ref()
+            .map_or(0, serde_heap_bytes)
         + facts.wait.heap_bytes()
 }
 
@@ -490,6 +496,7 @@ struct Walk<'a> {
     indeterminate: broca_core::projection::IndeterminateToolCalls,
     pending_steer_ids: Vec<String>,
     found: Option<ReconciledRunState>,
+    admission_error_detail: Option<Box<Value>>,
     auth_selection: Option<broca_records::record::AuthSelection>,
     title: Option<String>,
     budget_detail: Option<broca_protocol::BudgetExhaustedDetail>,
@@ -528,6 +535,7 @@ impl<'a> Walk<'a> {
             indeterminate: Default::default(),
             pending_steer_ids: Vec::new(),
             found: None,
+            admission_error_detail: None,
             auth_selection: None,
             title: None,
             budget_detail: None,
@@ -740,11 +748,13 @@ impl<'a> Walk<'a> {
                 );
             }
             Record::Retraction(retraction) => {
-                if let Some(failure) = retraction.failure.as_ref() {
+                if let Some(stored) = retraction.failure.as_ref() {
                     let failure: broca_records::record::QueuedAdmissionFailure =
-                        decode(failure, "a queued send's admission failure")?;
+                        decode(stored, "a queued send's admission failure")?;
                     if failure.run_id.0 == self.run_id {
                         self.found = Some(admission_failed(failure.error));
+                        self.admission_error_detail =
+                            stored["error"].get("detail").cloned().map(Box::new);
                     }
                 }
             }
@@ -757,6 +767,7 @@ impl<'a> Walk<'a> {
         let mine = start.run_id == self.run_id;
         self.usage_active = mine;
         if mine {
+            self.admission_error_detail = None;
             let config = broca_session_loop::run::run_frozen_facts(start, self.parts)
                 .map_err(|error| damaged(format!("the run's start: {error:?}")))?;
             self.steps
@@ -904,6 +915,7 @@ impl<'a> Walk<'a> {
     /// The run's state once every record is walked.
     fn finish(self) -> Option<(ReconciledRunState, WalkRest)> {
         let rest = WalkRest {
+            admission_error_detail: self.admission_error_detail,
             interrupt_reason: self.interrupt_reason,
             wake_directive: self.wake_directive,
             cleans_text: self.cleans_text,
@@ -934,6 +946,7 @@ impl<'a> Walk<'a> {
 
 /// What a walk found besides the run's state.
 struct WalkRest {
+    admission_error_detail: Option<Box<Value>>,
     interrupt_reason: Option<String>,
     wake_directive: bool,
     cleans_text: bool,
@@ -1099,6 +1112,7 @@ pub async fn run_facts<B: SessionBackend>(
     let facts = RunFacts {
         wait,
         state,
+        admission_error_detail: rest.admission_error_detail,
         interrupt_reason: rest.interrupt_reason,
         wake_directive: rest.wake_directive,
         final_message,
@@ -1624,6 +1638,7 @@ impl Reader<'_> {
             .awaits;
         let RunFacts {
             state,
+            admission_error_detail,
             interrupt_reason,
             wake_directive,
             final_message,
@@ -1668,7 +1683,7 @@ impl Reader<'_> {
                 run_id: run_id.0.clone(),
                 state,
                 reason,
-                error,
+                error: error.map(|error| error.with_admission_detail(admission_error_detail)),
                 final_message,
                 structured_output,
             },
@@ -1724,8 +1739,12 @@ pub(crate) fn status_response(
                 *reason = wait.reason;
             }
         }
-        RunStatusResponse::Paused { awaits, .. } | RunStatusResponse::Error { awaits, .. } => {
+        RunStatusResponse::Paused { awaits, .. } => *awaits = wait.awaits,
+        RunStatusResponse::Error { error, awaits, .. } => {
             *awaits = wait.awaits;
+            *error = error
+                .take()
+                .map(|error| error.with_admission_detail(facts.admission_error_detail));
         }
         RunStatusResponse::Interrupted { reason, .. } => *reason = facts.interrupt_reason,
         RunStatusResponse::Completed { directives, .. } if facts.wake_directive => {

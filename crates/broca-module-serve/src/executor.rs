@@ -1484,6 +1484,7 @@ impl<'a> AccountMoves<'a> {
                 Err(Answer::Hold(broca_protocol::error::AccountContinueAnswer {
                     routing_code: hold.routing_code,
                     until_ms: hold.until_ms,
+                    reason: None,
                 }))
             }
             ContinueAnswer::Refuse(refusal) => {
@@ -1494,12 +1495,7 @@ impl<'a> AccountMoves<'a> {
                     limit_window = wall.limit_window,
                     "routing refused the run's account-continuation request"
                 );
-                Err(Answer::Stay(Some(
-                    broca_protocol::error::AccountContinueAnswer {
-                        routing_code: refusal.routing_code,
-                        until_ms: None,
-                    },
-                )))
+                Err(Answer::Stay(Some(continuation_refusal_answer(refusal))))
             }
             other => {
                 tracing::warn!(
@@ -1565,6 +1561,20 @@ impl<'a> AccountMoves<'a> {
         }
         Ok(config)
     }
+}
+
+fn continuation_refusal_answer(
+    refusal: cortexkit_role_routing::account_continue::ContinueRefusal,
+) -> broca_protocol::error::AccountContinueAnswer {
+    let mut answer = broca_protocol::error::AccountContinueAnswer {
+        routing_code: refusal.routing_code,
+        until_ms: None,
+        reason: refusal.detail["reason"].as_str().map(str::to_owned),
+    };
+    if answer.is_concurrency_refusal() {
+        answer.until_ms = refusal.detail["reset_at_ms"].as_u64();
+    }
+    answer
 }
 
 #[async_trait]

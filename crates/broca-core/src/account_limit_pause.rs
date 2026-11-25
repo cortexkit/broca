@@ -226,6 +226,51 @@ impl FailedAccountLimitAttempt {
         selection: Option<&AuthSelection>,
         budget: &PauseBudget,
     ) -> Option<Box<AccountLimitPause>> {
+        self.pause_with(step, paused_at_ms, error, selection, |source| {
+            let resume_not_before_ms = match resume_floor(
+                paused_at_ms,
+                source.observed_at_ms,
+                source.resets_at_ms,
+                error.retry_after_secs,
+            ) {
+                Ok(floor) => floor,
+                Err(TimingRefusal::Stale) => {
+                    STALE_RESETS.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                Err(_) => return None,
+            };
+            if let Err(reason) = budget.decide(paused_at_ms, resume_not_before_ms) {
+                DECLINED[reason as usize].fetch_add(1, Ordering::Relaxed);
+                tracing::info!(reset = ?source.resets_at_ms, wake = resume_not_before_ms,
+                    cache_expiry = ?budget.cache_expiry_ms, cap = ?budget.setting.cap(paused_at_ms),
+                    reason = reason.name(), "account-limit pause declined");
+                return None;
+            }
+            Some(resume_not_before_ms)
+        })
+    }
+
+    pub fn pause_for_routing(
+        &self,
+        step: StepId,
+        paused_at_ms: u64,
+        error: &ProviderError,
+        selection: Option<&AuthSelection>,
+    ) -> Option<Box<AccountLimitPause>> {
+        self.pause_with(step, paused_at_ms, error, selection, |_| {
+            routing_pause_deadline(error, paused_at_ms)
+        })
+    }
+
+    fn pause_with(
+        &self,
+        step: StepId,
+        paused_at_ms: u64,
+        error: &ProviderError,
+        selection: Option<&AuthSelection>,
+        deadline: impl FnOnce(&broca_protocol::provider::AttemptAccountLimit) -> Option<u64>,
+    ) -> Option<Box<AccountLimitPause>> {
         if error.class != ErrorClass::Transient {
             return None;
         }
@@ -243,26 +288,7 @@ impl FailedAccountLimitAttempt {
                 .split_once(':')
                 .map(|(method, _)| method.to_owned())
         })?;
-        let resume_not_before_ms = match resume_floor(
-            paused_at_ms,
-            source.observed_at_ms,
-            source.resets_at_ms,
-            error.retry_after_secs,
-        ) {
-            Ok(floor) => floor,
-            Err(TimingRefusal::Stale) => {
-                STALE_RESETS.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            Err(_) => return None,
-        };
-        if let Err(reason) = budget.decide(paused_at_ms, resume_not_before_ms) {
-            DECLINED[reason as usize].fetch_add(1, Ordering::Relaxed);
-            tracing::info!(reset = ?source.resets_at_ms, wake = resume_not_before_ms,
-                cache_expiry = ?budget.cache_expiry_ms, cap = ?budget.setting.cap(paused_at_ms),
-                reason = reason.name(), "account-limit pause declined");
-            return None;
-        }
+        let resume_not_before_ms = deadline(source)?;
         Some(Box::new(AccountLimitPause {
             failed_step: step,
             failed_attempt_seq: self.seq,
@@ -288,6 +314,15 @@ impl FailedAccountLimitAttempt {
             next_routing_check_ms: None,
         }))
     }
+}
+
+/// Routing's reset is a runner wake, not the spent account's reset. Bound the wait even if
+/// routing does not expect capacity back for longer.
+pub fn routing_pause_deadline(error: &ProviderError, paused_at_ms: u64) -> Option<u64> {
+    let answer = error.account_continue.as_ref()?;
+    let reset = answer.until_ms?;
+    (answer.is_concurrency_refusal() && reset > paused_at_ms)
+        .then(|| reset.min(paused_at_ms.saturating_add(30 * 60_000)))
 }
 
 #[cfg(test)]
