@@ -315,7 +315,7 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             name: OP_ROLE_DESCRIBE.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some(
-                "Describe the role the route was opened for: on an llm-runner/v1 route its ops, capability groups and read byte cap; on a classifier/v1 route its limits and the models it serves."
+                "Describe the role the route was opened for: on an llm-runner/v1 route its ops, capability groups and read byte cap; on a classifier/v1 or extractor/v1 route its limits and the models it serves."
                     .to_string(),
             ),
         },
@@ -324,6 +324,14 @@ pub(crate) fn management_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Mutate,
             description: Some(
                 "classifier/v1 routes only: answer a batch of items against a set of questions with one hosted decision model, idempotent by batch_id; no session is involved."
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: cortexkit_role_extractor::ops::EXTRACT_RUN.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "extractor/v1 routes only: extract typed fields from a batch with one pinned model, idempotent by batch_id; no session is involved."
                     .to_string(),
             ),
         },
@@ -691,6 +699,7 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
             // `classifier` role. A caller finds broca by this entry, then picks it for a model
             // its classifier `role.describe` lists.
             cortexkit_role_classifier::PROVIDES.to_string(),
+            cortexkit_role_extractor::PROVIDES.to_string(),
             "tool-provider/v1".to_string(),
             "permissions/v1".to_string(),
             subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
@@ -1046,7 +1055,7 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "compaction-runner/v1", "agent-data/v1", "classifier/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1", "bind-no-project/v1"],
+                "provides": ["llm-runner/v1", "compaction-runner/v1", "agent-data/v1", "classifier/v1", "extractor/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1", "bind-no-project/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),

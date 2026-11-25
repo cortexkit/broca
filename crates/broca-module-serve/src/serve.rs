@@ -1541,8 +1541,8 @@ where
                 }));
                 return Ok(true);
             }
-            if bind.role == RouteRole::Classifier {
-                spawn_classifier_request(
+            if matches!(bind.role, RouteRole::Classifier | RouteRole::Extractor) {
+                system_one_route::spawn_request(
                     frame.body,
                     bind.clone(),
                     session,
@@ -1864,6 +1864,10 @@ async fn handle_control_request(
                 &target,
                 role_versions.as_ref(),
                 routes.system_one.is_some(),
+                routes
+                    .system_one
+                    .as_ref()
+                    .is_some_and(|service| service.serves_extractor()),
             ) {
                 Ok(role) => role,
                 Err(message) => {
@@ -6060,6 +6064,7 @@ enum RouteRole {
     #[default]
     LlmRunner,
     Classifier,
+    Extractor,
     ToolProvider,
     Permissions,
     /// A session's compaction provider reading entries and pushing views. Session-bound like
@@ -6091,9 +6096,10 @@ fn bind_target_role(
     target: &subc_protocol::RouteTarget,
     role_versions: Option<&std::collections::BTreeMap<String, String>>,
     serves_classifier: bool,
+    serves_extractor: bool,
 ) -> Result<RouteRole, String> {
     if !matches!(target, subc_protocol::RouteTarget::ToolProvider { .. }) {
-        return bind_role(role_versions, serves_classifier);
+        return bind_role(role_versions, serves_classifier, serves_extractor);
     }
     if let Some(roles) = role_versions {
         if let Some(other) = roles.keys().find(|role| role.as_str() != "tool-provider") {
@@ -6102,7 +6108,7 @@ fn bind_target_role(
             ));
         }
     }
-    bind_role(role_versions, serves_classifier)?;
+    bind_role(role_versions, serves_classifier, serves_extractor)?;
     Ok(RouteRole::ToolProvider)
 }
 
@@ -6110,12 +6116,18 @@ fn bind_target_role(
 fn bind_role(
     role_versions: Option<&std::collections::BTreeMap<String, String>>,
     serves_classifier: bool,
+    serves_extractor: bool,
 ) -> Result<RouteRole, String> {
     let Some(roles) = role_versions else {
         return Ok(RouteRole::LlmRunner);
     };
     let supported = [
         ("classifier", "v1", RouteRole::Classifier),
+        (
+            cortexkit_role_extractor::ROLE,
+            cortexkit_role_extractor::VERSION,
+            RouteRole::Extractor,
+        ),
         ("llm-runner", "v1", RouteRole::LlmRunner),
         ("tool-provider", "v1", RouteRole::ToolProvider),
         ("permissions", "v1", RouteRole::Permissions),
@@ -6138,7 +6150,9 @@ fn bind_role(
             "a route serves one role; this one declares both {role} and {other}"
         ));
     }
-    if selected == RouteRole::Classifier && !serves_classifier {
+    if (selected == RouteRole::Classifier && !serves_classifier)
+        || (selected == RouteRole::Extractor && !serves_extractor)
+    {
         return Err(format!("this build does not serve {role} {version}"));
     }
     Ok(selected)
@@ -6148,74 +6162,8 @@ fn bind_role(
 #[path = "serve_role_selection_tests.rs"]
 mod role_selection_tests;
 
-/// Answer one request on a classifier route, on tasks of its own: never the frame loop, and
-/// none of the connection's request slots, so a slow provider cannot hold up any session's
-/// work. The answer runs on a separate task from the one that writes the reply, so a panic
-/// while answering becomes this request's `internal_error` instead of a failed request task
-/// (which would end the connection).
-fn spawn_classifier_request(
-    body: Vec<u8>,
-    bind: BindObservation,
-    session: BrocaBindIdentity,
-    service: Option<Arc<crate::system_one::SystemOne>>,
-    writer: &EgressSender<Frame>,
-    request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
-    (ver, channel, epoch, corr): (u8, u16, u32, u64),
-) {
-    let writer = writer.clone();
-    request_tasks.spawn(async move {
-        let operation = request_operation(&body);
-        let caller = caller_module(&bind).map(str::to_owned);
-        log_served_request(
-            &operation,
-            &session,
-            caller.as_deref(),
-            "reply",
-            async move {
-                let answered = match service {
-                    Some(service) => {
-                        tokio::spawn(async move {
-                            service
-                                .answer(&body, bind.principal.as_ref(), &bind.scope)
-                                .await
-                        })
-                        .await
-                    }
-                    None => Ok(Err(serde_json::to_vec(&subc_protocol::ErrorBody::new(
-                        "unknown_method",
-                        "this build serves no classifier/v1 role",
-                    ))
-                    .unwrap_or_default())),
-                };
-                match answered {
-                    Ok(Ok(result)) => {
-                        send_json_response(&writer, ver, channel, epoch, corr, &result).await
-                    }
-                    Ok(Err(body)) => {
-                        send_error_bytes(&writer, ver, channel, epoch, corr, body).await
-                    }
-                    Err(error) => {
-                        tracing::error!(target: "system_one", %error,
-                    "answering a classifier request failed; it is answered internal_error");
-                        let refusal = crate::system_one::internal_refusal(
-                            "serving this request failed inside broca; send it again",
-                        );
-                        send_error_bytes(
-                            &writer,
-                            ver,
-                            channel,
-                            epoch,
-                            corr,
-                            crate::system_one::refusal_body(&refusal),
-                        )
-                        .await
-                    }
-                }
-            },
-        )
-        .await
-    });
-}
+#[path = "system_one/route.rs"]
+mod system_one_route;
 
 /// `role.describe` params: none.
 #[derive(Debug, Default, serde::Deserialize)]

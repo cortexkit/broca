@@ -88,9 +88,9 @@ impl SystemOne {
         send: &SendScope,
         stored: Option<&broca_store::system_one::StoredBatch>,
     ) -> Result<PreparedImages, Refusal> {
-        let Some(resolver) = &self.image_resolver else {
+        if !self.image_references() {
             return Ok(PreparedImages::default());
-        };
+        }
         cortexkit_role_classifier::request::check_request_bytes(
             params.len(),
             &cortexkit_role_classifier::describe::Limits::new(
@@ -155,81 +155,11 @@ impl SystemOne {
                 prepared.push(None);
                 continue;
             }
-            let mut resolved = Vec::new();
-            let mut has_reference = false;
-            for (j, image) in item.images.iter().flatten().enumerate() {
-                let field = format!("items[{i}].images[{j}]");
-                let decoded = if let Image::Reference(reference) = image {
-                    has_reference = true;
-                    let SendScope::Stamped(bind) = send else {
-                        return Err(ResolveFailure::Unavailable.refusal(&field));
-                    };
-                    let parent = if bind.scope.flow_id.is_some()
-                        || bind.parent_state != Some(broca_protocol::ParentState::Linked)
-                    {
-                        None
-                    } else {
-                        bind.parent.as_ref().map(|parent| parent.scope_ref.as_str())
-                    };
-                    let reply = resolver
-                        .resolve(&reference.handle, &bind.scope.scope_ref, parent)
-                        .await
-                        .map_err(|error| match error {
-                            broca_subc::ImageResolveError::SourceUnavailable => {
-                                ResolveFailure::SourceUnavailable {
-                                    retry_after_ms: 1_000,
-                                }
-                                .refusal(&field)
-                            }
-                            broca_subc::ImageResolveError::Unavailable => {
-                                ResolveFailure::Unavailable.refusal(&field)
-                            }
-                            broca_subc::ImageResolveError::InvalidReply => invalid_reply(&field),
-                            // An inline image this large gets invalid_params, so a resolved one
-                            // does too: the handle is valid, but the picture is too big to send.
-                            broca_subc::ImageResolveError::TooLarge => {
-                                tracing::warn!(
-                                    target: "system_one",
-                                    "image.resolve reply was too large for the daemon to deliver"
-                                );
-                                Refusal::invalid_params(
-                                    &field,
-                                    "the resolved image is larger than an image reference can carry",
-                                )
-                            }
-                        })?;
-                    DecodedImage::new(reply.content_type, reply.bytes)
-                } else {
-                    image
-                        .decode()
-                        .ok_or_else(|| Refusal::invalid_params(&field, "unsupported image"))?
-                        .map_err(|reason| Refusal::invalid_params(&field, reason))?
-                };
-                resolved.push(decoded);
-            }
+            let images = item.images.as_deref().unwrap_or_default();
+            let resolved = self.resolve_images(images, send, i).await?;
             check_resolved_item_images(&entry, i, &resolved)?;
-            for (j, decoded) in resolved.iter().enumerate() {
-                let field = format!("items[{i}].images[{j}]");
-                let media = broca_core::media_validation::validate_media(
-                    &decoded.bytes,
-                    &decoded.content_type,
-                )
-                .map_err(|_| {
-                    Refusal::invalid_params(&field, "image bytes have no readable image dimensions")
-                })?;
-                if media.mime != decoded.content_type
-                    || media
-                        .width
-                        .zip(media.height)
-                        .is_none_or(|(w, h)| u64::from(w) * u64::from(h) > IMAGE_MAX_PIXELS)
-                {
-                    return Err(Refusal::invalid_params(
-                        &field,
-                        "image content type or pixel limit is invalid",
-                    ));
-                }
-            }
-            prepared.push(if has_reference {
+            validate_dimensions(i, &resolved)?;
+            prepared.push(if images.iter().any(|image| image.reference().is_some()) {
                 Some(
                     serde_json::to_string(
                         &resolved
@@ -245,6 +175,91 @@ impl SystemOne {
         }
         Ok(PreparedImages(prepared))
     }
+
+    /// Decode inline images and resolve handles using the caller's daemon-stamped scope.
+    pub(super) async fn resolve_images(
+        &self,
+        images: &[Image],
+        send: &SendScope,
+        i: usize,
+    ) -> Result<Vec<DecodedImage>, Refusal> {
+        let mut resolved = Vec::with_capacity(images.len());
+        for (j, image) in images.iter().enumerate() {
+            let field = format!("items[{i}].images[{j}]");
+            let decoded = if let Image::Reference(reference) = image {
+                let (Some(resolver), SendScope::Stamped(bind)) = (&self.image_resolver, send)
+                else {
+                    return Err(ResolveFailure::Unavailable.refusal(&field));
+                };
+                let parent = if bind.scope.flow_id.is_some()
+                    || bind.parent_state != Some(broca_protocol::ParentState::Linked)
+                {
+                    None
+                } else {
+                    bind.parent.as_ref().map(|parent| parent.scope_ref.as_str())
+                };
+                let reply = resolver
+                    .resolve(&reference.handle, &bind.scope.scope_ref, parent)
+                    .await
+                    .map_err(|error| match error {
+                        broca_subc::ImageResolveError::SourceUnavailable => {
+                            ResolveFailure::SourceUnavailable {
+                                retry_after_ms: 1_000,
+                            }
+                            .refusal(&field)
+                        }
+                        broca_subc::ImageResolveError::Unavailable => {
+                            ResolveFailure::Unavailable.refusal(&field)
+                        }
+                        broca_subc::ImageResolveError::InvalidReply => invalid_reply(&field),
+                        // An inline image this large gets invalid_params, so a resolved one
+                        // does too: the handle is valid, but the picture is too big to send.
+                        broca_subc::ImageResolveError::TooLarge => {
+                            tracing::warn!(
+                                target: "system_one",
+                                "image.resolve reply was too large for the daemon to deliver"
+                            );
+                            Refusal::invalid_params(
+                                &field,
+                                "the resolved image is larger than an image reference can carry",
+                            )
+                        }
+                    })?;
+                DecodedImage::new(reply.content_type, reply.bytes)
+            } else {
+                image
+                    .decode()
+                    .ok_or_else(|| Refusal::invalid_params(&field, "unsupported image"))?
+                    .map_err(|reason| Refusal::invalid_params(&field, reason))?
+            };
+            resolved.push(decoded);
+        }
+        Ok(resolved)
+    }
+}
+
+/// The spend estimate bounds a decoded image by its pixel count, not its compressed bytes.
+pub(super) fn validate_dimensions(i: usize, resolved: &[DecodedImage]) -> Result<(), Refusal> {
+    for (j, decoded) in resolved.iter().enumerate() {
+        let field = format!("items[{i}].images[{j}]");
+        let media =
+            broca_core::media_validation::validate_media(&decoded.bytes, &decoded.content_type)
+                .map_err(|_| {
+                    Refusal::invalid_params(&field, "image bytes have no readable image dimensions")
+                })?;
+        if media.mime != decoded.content_type
+            || media
+                .width
+                .zip(media.height)
+                .is_none_or(|(w, h)| u64::from(w) * u64::from(h) > IMAGE_MAX_PIXELS)
+        {
+            return Err(Refusal::invalid_params(
+                &field,
+                "image content type or pixel limit is invalid",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn invalid_reply(field: &str) -> Refusal {

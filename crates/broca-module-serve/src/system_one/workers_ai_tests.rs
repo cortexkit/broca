@@ -21,12 +21,12 @@ use super::workers_ai::{WorkersAi, CLEF_FLASH_MODEL_PATH, CLEF_MODEL_PATH, CREDE
 use super::*;
 
 /// A Cloudflare account id shaped like a real one (32 hex digits).
-const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
+pub(super) const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
 const TOKEN: &str = "cf-test-token-not-a-real-secret";
 
 /// What the stand-in answers for one item, by the JCS of its `state`.
 #[derive(Clone)]
-enum Answer {
+pub(super) enum Answer {
     /// HTTP 200 with the success envelope around this exact `result` text.
     Result(String),
     /// This status with Cloudflare's error envelope naming `code`, and a `Retry-After` in
@@ -42,14 +42,14 @@ enum Answer {
 
 /// One request the stand-in received.
 #[derive(Clone, Debug)]
-struct Received {
+pub(super) struct Received {
     path: String,
     authorization: Option<String>,
-    body: String,
+    pub(super) body: String,
 }
 
 #[derive(Default)]
-struct Cloudflare {
+pub(super) struct Cloudflare {
     scripts: Mutex<HashMap<String, Vec<Answer>>>,
     calls: Mutex<HashMap<String, usize>>,
     received: Mutex<Vec<Received>>,
@@ -61,14 +61,14 @@ fn key(state: &Value) -> String {
 
 impl Cloudflare {
     /// Script the answers for a string `state`, one per call; the last repeats.
-    fn script(&self, state: &str, answers: Vec<Answer>) {
+    pub(super) fn script(&self, state: &str, answers: Vec<Answer>) {
         self.scripts
             .lock()
             .unwrap()
             .insert(key(&json!(state)), answers);
     }
 
-    fn calls(&self, state: &str) -> usize {
+    pub(super) fn calls(&self, state: &str) -> usize {
         self.calls
             .lock()
             .unwrap()
@@ -77,7 +77,7 @@ impl Cloudflare {
             .unwrap_or(0)
     }
 
-    fn received(&self) -> Vec<Received> {
+    pub(super) fn received(&self) -> Vec<Received> {
         self.received.lock().unwrap().clone()
     }
 
@@ -107,7 +107,7 @@ impl Cloudflare {
 
 /// Start the stand-in; returns the base URL a client takes in place of
 /// `https://api.cloudflare.com/client/v4`.
-async fn start(cloudflare: Arc<Cloudflare>) -> String {
+pub(super) async fn start(cloudflare: Arc<Cloudflare>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -204,8 +204,8 @@ async fn serve_one(
 
 /// A vault credential as the vault resolves `apikey:cloudflare-workers-ai`: a token and the
 /// account id beside it.
-struct Vaulted {
-    account_id: Option<String>,
+pub(super) struct Vaulted {
+    pub(super) account_id: Option<String>,
 }
 
 #[async_trait]

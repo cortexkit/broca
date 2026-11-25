@@ -979,6 +979,8 @@ pub struct SubcConnection {
     route_open_attempts: Option<Arc<Mutex<Vec<time::Instant>>>>,
 }
 
+mod extractor;
+
 impl SubcConnection {
     /// Open the classifier role under a daemon-held work scope. The selector is resolved by
     /// the daemon, not trusted as caller-supplied attribution by the classifier.

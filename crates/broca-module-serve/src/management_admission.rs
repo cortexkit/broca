@@ -36,6 +36,9 @@ pub fn admit(
             .map_err(Refusal::Session)?;
     } else if method == crate::system_one::OP_CLASSIFY_RUN {
         crate::system_one::caller_scope(principal, scope).map_err(Refusal::Classifier)?;
+    } else if method == crate::system_one::OP_EXTRACT_RUN {
+        crate::system_one::caller_scope_for(principal, scope, "extractor")
+            .map_err(Refusal::Classifier)?;
     } else if method.starts_with("permissions.")
         && !crate::llm_tools::permissions::operator_admitted(principal)
     {

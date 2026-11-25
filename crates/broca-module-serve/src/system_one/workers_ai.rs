@@ -1,8 +1,8 @@
-//! Cloudflare Workers AI's decision models, Clef and Clef-flash.
+//! Cloudflare Workers AI transport for the System One models.
 //!
 //! One item is one `POST {base}/accounts/{account_id}/ai/run/@cf/cloudflare/{model}` with
 //! `authorization: Bearer <token>`, `base` being `https://api.cloudflare.com/client/v4`.
-//! The body is the classifier role's provider request, `{model, state, questions, images?}`,
+//! For Clef the body is the classifier role's provider request, `{model, state, questions, images?}`,
 //! with `model` `"clef"` or `"clef-flash"`. Sources, read 2026-10-22:
 //!
 //! - the model pages, <https://developers.cloudflare.com/workers-ai/models/clef/> and
@@ -66,7 +66,8 @@ pub struct WorkersAi {
 
 impl WorkersAi {
     /// A client for the model at `model_path` ([`CLEF_MODEL_PATH`] or
-    /// [`CLEF_FLASH_MODEL_PATH`]), under `base_url` (`None` for [`DEFAULT_BASE_URL`]).
+    /// [`CLEF_FLASH_MODEL_PATH`], or Clairic's path), under `base_url` (`None` for
+    /// [`DEFAULT_BASE_URL`]).
     pub fn new(
         base_url: Option<&str>,
         model_path: &'static str,
@@ -196,9 +197,39 @@ impl ClassifierProvider for WorkersAi {
     }
 
     async fn call(&self, body: String) -> ProviderReply {
+        self.send(body, |response| {
+            match reply_from(response.status, response.retry_after_ms, response.body) {
+                ProviderReply::Answered(body) => ProviderReply::AttributedAnswer {
+                    body,
+                    auth_selection: response.auth_selection,
+                    account_ref: response.account_ref,
+                },
+                reply => reply,
+            }
+        })
+        .await
+        .unwrap_or_else(|failure| *failure)
+    }
+}
+
+pub(super) struct HttpResponse<'a> {
+    pub status: u16,
+    pub retry_after_ms: Option<u64>,
+    pub body: &'a [u8],
+    pub auth_selection: Option<String>,
+    pub account_ref: Option<String>,
+}
+
+impl WorkersAi {
+    /// Each role reads its own wire reply. The HTTP request and its credential checks are shared.
+    pub(super) async fn send<T>(
+        &self,
+        body: String,
+        read: impl FnOnce(HttpResponse<'_>) -> T,
+    ) -> Result<T, Box<ProviderReply>> {
         let secret = match self.credential.secret().await {
             Ok(secret) => secret,
-            Err(error) => return error.into(),
+            Err(error) => return Err(Box::new(error.into())),
         };
         let auth_selection = secret.as_ref().and_then(|s| s.auth_selection.clone());
         let account_ref = secret.as_ref().and_then(|s| s.account_id.clone());
@@ -206,22 +237,22 @@ impl ClassifierProvider for WorkersAi {
             Some(secret) => match secret.account_id {
                 Some(account_id) => (Some(secret.token), account_id, Some(secret.hosts)),
                 None => {
-                    return ProviderReply::Credential(format!(
+                    return Err(Box::new(ProviderReply::Credential(format!(
                         "the credential {} carries no Cloudflare account id",
                         self.credential
                             .credential_id()
                             .unwrap_or_else(|| CREDENTIAL_ID.to_owned())
-                    ))
+                    ))))
                 }
             },
             None => (None, NO_CREDENTIAL_ACCOUNT.to_owned(), None),
         };
         let endpoint = match self.endpoint_for(&account_id) {
             Ok(endpoint) => endpoint,
-            Err(message) => return ProviderReply::Credential(message),
+            Err(message) => return Err(Box::new(ProviderReply::Credential(message))),
         };
         if let Some(Err(refused)) = hosts.map(|hosts| hosts.check_url(endpoint.as_str())) {
-            return ProviderReply::Credential(refused.message);
+            return Err(Box::new(ProviderReply::Credential(refused.message)));
         }
         let mut request = self
             .http
@@ -239,32 +270,29 @@ impl ClassifierProvider for WorkersAi {
             Ok::<_, reqwest::Error>((status, retry_after, body))
         };
         match tokio::time::timeout(self.attempt_timeout, attempt).await {
-            Err(_) => ProviderReply::Transport(format!(
+            Err(_) => Err(Box::new(ProviderReply::Transport(format!(
                 "no reply within {} ms",
                 self.attempt_timeout.as_millis()
-            )),
+            )))),
             // reqwest's error text names the URL, which holds the account id: only the kind of
             // failure is kept.
             // A connect error comes from the connector, before any request byte is written.
             // A connect that timed out stays a transport failure, like every timeout.
-            Ok(Err(error)) if error.is_connect() && !error.is_timeout() => {
-                ProviderReply::Unconnected("the connection failed".to_owned())
-            }
-            Ok(Err(error)) => ProviderReply::Transport(if error.is_timeout() {
+            Ok(Err(error)) if error.is_connect() && !error.is_timeout() => Err(Box::new(
+                ProviderReply::Unconnected("the connection failed".to_owned()),
+            )),
+            Ok(Err(error)) => Err(Box::new(ProviderReply::Transport(if error.is_timeout() {
                 "the request timed out".to_owned()
             } else {
                 "the request failed in transport".to_owned()
-            }),
-            Ok(Ok((status, retry_after_ms, body))) => {
-                match reply_from(status, retry_after_ms, &body) {
-                    ProviderReply::Answered(body) => ProviderReply::AttributedAnswer {
-                        body,
-                        auth_selection,
-                        account_ref,
-                    },
-                    reply => reply,
-                }
-            }
+            }))),
+            Ok(Ok((status, retry_after_ms, body))) => Ok(read(HttpResponse {
+                status,
+                retry_after_ms,
+                body: &body,
+                auth_selection,
+                account_ref,
+            })),
         }
     }
 }

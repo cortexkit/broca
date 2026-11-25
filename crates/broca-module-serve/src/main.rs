@@ -828,6 +828,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         let clef = workers_ai(broca_module_serve::system_one::workers_ai::CLEF_MODEL_PATH)?;
         let clef_flash =
             workers_ai(broca_module_serve::system_one::workers_ai::CLEF_FLASH_MODEL_PATH)?;
+        let clairic = workers_ai(broca_module_serve::system_one::CLAIRIC_MODEL_PATH)?;
         let service = broca_module_serve::system_one::SystemOne::new(
             store,
             broca_module_serve::serve::process_launch_id(),
@@ -863,8 +864,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             service
         };
-        let service =
-            Arc::new(service.with_export(run_index.as_ref().unwrap().clone(), charge_basis_table));
+        let service = Arc::new(
+            service
+                .with_export(run_index.as_ref().unwrap().clone(), charge_basis_table)
+                .with_clairic(clairic),
+        );
         // The previous process may still be closing its files, so the release waits a little
         // for a batch owner that holds its lock (see `release_abandoned_within`).
         let (released, held) = {

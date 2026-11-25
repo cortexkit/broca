@@ -347,13 +347,17 @@ pub(super) fn batch_cost(
 }
 
 /// The refusal a batch-level code met on the call's first provider call becomes (RULES §14).
-fn first_call_refusal(error: &ItemError, model: &str, pin: &ModelPin) -> Refusal {
+pub(super) fn first_call_refusal(
+    error: &ItemError,
+    model: &str,
+    provider: &dyn super::ClassifierProvider,
+) -> Refusal {
     match error.code.as_str() {
         errors::AUTH_FAILED => {
             let mut refusal = Refusal::auth_failed();
             refusal.message = error.message.clone();
             refusal.detail.class = error.class.clone();
-            if let Some(credential) = pin.provider.credential_id() {
+            if let Some(credential) = provider.credential_id() {
                 refusal.detail.credential = Some(credential);
             }
             refusal
@@ -1153,7 +1157,7 @@ async fn serve_claimed(
                     let refusal = first_call_refusal(
                         error,
                         request.model.as_deref().unwrap_or_default(),
-                        pin,
+                        pin.provider.as_ref(),
                     );
                     return Err(if is_tool {
                         Spend::from(*spend).mark(refusal)
@@ -1282,7 +1286,7 @@ async fn record(
     record_paid(service, batch_id, outcome, spend_nanos, None).await
 }
 
-async fn record_paid(
+pub(super) async fn record_paid(
     service: &Arc<SystemOne>,
     batch_id: &str,
     outcome: &StoredOutcome,

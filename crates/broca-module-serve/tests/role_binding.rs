@@ -181,20 +181,34 @@ struct Rig {
 }
 
 impl Rig {
-    async fn start(classifier: bool) -> Self {
+    async fn start(model_batches: bool) -> Self {
         let (daemon, module) = tokio::io::duplex(1 << 20);
         let (reader, writer) = tokio::io::split(module);
         let opens = Arc::new(NoLineages::default());
         let history = Arc::new(PoisonAddresses::new());
-        let system_one = classifier.then(|| {
-            Arc::new(SystemOne::new(
-                Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
-                "test",
-                Arc::new(EmptyCatalog),
-                vec![],
-                Config::default(),
-                Arc::new(AtomicUsize::new(0)),
-            ))
+        let system_one = model_batches.then(|| {
+            use broca_module_serve::system_one::{
+                credential::NoCredential, workers_ai::WorkersAi, CLAIRIC_MODEL_PATH,
+            };
+            let config = Config::default();
+            let adapter = WorkersAi::new(
+                None,
+                CLAIRIC_MODEL_PATH,
+                Arc::new(NoCredential),
+                config.attempt_timeout,
+            )
+            .unwrap();
+            Arc::new(
+                SystemOne::new(
+                    Arc::new(broca_store::SystemOneStore::open_in_memory().unwrap()),
+                    "test",
+                    Arc::new(EmptyCatalog),
+                    vec![],
+                    config,
+                    Arc::new(AtomicUsize::new(0)),
+                )
+                .with_clairic(Arc::new(adapter)),
+            )
         });
         let serve = tokio::spawn(serve_connection_with_services(
             reader,
@@ -422,6 +436,7 @@ async fn classifier_binding_remains_sessionless_and_role_isolated() {
     assert_eq!(reply.header.ty, FrameType::Response);
     assert_eq!(body(&reply)["result"]["role"], "classifier/v1");
     for method in [
+        "extract.run",
         "session.send",
         "session.read",
         "session.subscribe",
@@ -433,6 +448,27 @@ async fn classifier_binding_remains_sessionless_and_role_isolated() {
         "permissions.revoke",
     ] {
         assert_unknown(&rig.request(1, method).await, method);
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn extractor_binding_is_sessionless_but_extract_run_requires_a_scope() {
+    let mut rig = Rig::start(true).await;
+    for (channel, stamped, code) in [(1, true, "invalid_params"), (2, false, "scope_required")] {
+        let bind = rig
+            .bind_with_stamp(channel, Some(&[("extractor", "v1")]), true, stamped)
+            .await;
+        assert_eq!(bind.header.ty, FrameType::Response);
+        let describe = rig.request(channel, "role.describe").await;
+        assert_eq!(body(&describe)["result"]["role"], "extractor/v1");
+        assert_eq!(
+            body(&rig.request(channel, "extract.run").await)["code"],
+            code
+        );
+        for method in ["classify.run", "session.read", "tool.call"] {
+            assert_unknown(&rig.request(channel, method).await, method);
+        }
     }
     rig.finish().await;
 }
@@ -508,7 +544,13 @@ async fn mixed_roles_are_refused_as_one_role_per_route() {
 #[tokio::test]
 async fn unsupported_role_versions_are_refused() {
     let mut rig = Rig::start(true).await;
-    for role in ["llm-runner", "classifier", "tool-provider", "permissions"] {
+    for role in [
+        "llm-runner",
+        "classifier",
+        "extractor",
+        "tool-provider",
+        "permissions",
+    ] {
         let reply = rig.bind(1, Some(&[(role, "v2")]), false).await;
         assert_eq!(reply.header.ty, FrameType::Error);
         assert_eq!(body(&reply)["code"], "role_versions_unsupported");
@@ -541,6 +583,7 @@ fn manifest_does_not_advertise_unimplemented_roles_or_operations() {
     for capability in [
         "llm-runner/v1",
         "classifier/v1",
+        "extractor/v1",
         "tool-provider/v1",
         "permissions/v1",
     ] {
@@ -561,6 +604,7 @@ fn manifest_does_not_advertise_unimplemented_roles_or_operations() {
         })
         .unwrap();
     for name in [
+        "extract.run",
         "tool.catalog",
         "late_results",
         "late_results.ack",

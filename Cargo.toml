@@ -107,6 +107,8 @@ cortexkit-compaction-view = "=0.4.0"
 # System One: the one-pass decision-model role and the batch rules it shares with extraction.
 cortexkit-role-classifier = "=0.6.3"
 cortexkit-role-classifier-conformance = "=0.8.3"
+cortexkit-role-extractor = "=0.3.0"
+cortexkit-role-extractor-conformance = "=0.5.0"
 cortexkit-role-routing = "=0.7.40"
 cortexkit-model-batch = "=0.3.4"
 

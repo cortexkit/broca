@@ -1,6 +1,6 @@
 //! The durable batch record of System One, broca's one-pass decision and extraction models.
 //!
-//! A model-batch call (`classify.run`, later `extract.run`) admits a batch under a caller's
+//! A model-batch call (`classify.run` or `extract.run`) admits a batch under a caller's
 //! `batch_id` and records each item's outcome before it replies, so a re-send of the same
 //! batch serves the stored outcomes and asks the provider only for items still needing one.
 //! `system-one.db` is the authority for these batches. It keeps them separate from the run

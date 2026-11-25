@@ -1,4 +1,4 @@
-# System One classifier routing
+# System One classification and extraction
 
 The `classifier/v1` route serves sessionless batches of decision-model requests.
 Its contract is `cortexkit-role-classifier` 0.6.3, using the shared model-batch
@@ -151,6 +151,39 @@ routed rows, so cleanup timing never exposes content past retention.
 `llm.classify/v1` results include the model used, as required by llm-tools 0.3.2.
 Unlike `classify.run`, `llm_classify` requires a model pin: the tool must know
 the provider before checking consent to send content or spend money.
+
+## `extractor/v1`
+
+Open a broca management route with `role_versions: {"extractor":"v1"}` and a
+daemon-stamped agent/run or flow scope. The route serves `role.describe` and
+`extract.run`, not session or classifier operations. Like the classifier route,
+it requires a flow scope for Basal and creates no session, lease, or consent
+card. It is not the `llm_extract` tool.
+
+An extraction batch names its model, typed fields, and items. Broca serves only
+`cloudflare-workers-ai/@cf/cloudflare/clairic`, and only while the catalog lists
+it as `extraction`. There is no routing or model substitution. It uses the same
+Workers AI credential and account as Clef. `role.describe` lists the nine field
+types in `cortexkit-role-extractor` 0.3.0, up to 64 fields and 16 items, and an
+8,192-byte limit per answer. When `llm_tools.image_references` is enabled, both
+batch roles declare `image_reference` and resolve handles under the caller's
+scope before dispatch. Clairic receives the image bytes, not the handle.
+
+`extract.run` validates the request and its worst-case reply size before dispatch.
+The spend guard checks each item against the retained batch ceiling using byte
+bounds for state and fields. An item that crosses the ceiling returns
+`cost_exceeded`; any other item within it can still run. The ledger and usage
+facts price only measured Clairic input tokens, not output tokens, passes or
+retry tokens. Missing input measurements do not become zero or estimated spend.
+
+Extraction uses a separate role key in `system-one.db`, so the same `batch_id`
+under `classifier/v1` is independent. A resend in the original scope keeps the
+recorded model and price and may tighten, not loosen, the ceiling. Stored answers
+and permanent errors replay without provider calls; retryable items can run again.
+An oversized field answer is a stored `answer_too_large` item error, but any
+measured input cost still counts against the ceiling and is exported. As for
+classification, the first admission starts a seven-day retention window, and
+the same sweeper removes expired batches with their outcomes.
 
 ## `llm.complete/v1`
 

@@ -23,7 +23,9 @@
 //! - Each running batch call raises broca's busy gauge, so a drain waits for it within the
 //!   existing grace, and never longer.
 
+mod clairic;
 mod classify;
+mod extract;
 mod images;
 mod routed;
 pub use images::ImageResolver;
@@ -61,6 +63,8 @@ pub const LLM_CLASSIFY_STORE_ROLE: &str = "llm.classify";
 /// The method names this surface answers.
 pub const OP_ROLE_DESCRIBE: &str = cortexkit_role_classifier::ops::ROLE_DESCRIBE;
 pub const OP_CLASSIFY_RUN: &str = cortexkit_role_classifier::ops::CLASSIFY_RUN;
+pub const OP_EXTRACT_RUN: &str = cortexkit_role_extractor::ops::EXTRACT_RUN;
+pub use cortexkit_role_extractor::provider::models::CLAIRIC as CLAIRIC_MODEL_PATH;
 
 /// The catalog id of TypeSafe's Jev 1.13.0.
 pub const JEV_1_13_0: &str = cortexkit_role_classifier::provider::catalog_ids::JEV_1_13_0;
@@ -342,6 +346,7 @@ struct FactFlush {
 /// The System One service: the batch store, the routing pins, and the concurrency caps.
 pub struct SystemOne {
     routing: Option<Routing>,
+    extractor: Option<extract::Extractor>,
     image_resolver: Option<Arc<dyn ImageResolver>>,
     store: Arc<SystemOneStore>,
     /// The store role every batch this service claims, records and releases is keyed under.
@@ -358,7 +363,7 @@ pub struct SystemOne {
     model_slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     in_flight: Arc<AtomicUsize>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
-    metrics: Mutex<Metrics>,
+    metrics: Arc<Mutex<Metrics>>,
     export: Option<Arc<broca_store::SqliteStore>>,
     fact_flush: Arc<Mutex<FactFlush>>,
     charge_basis: Arc<crate::billing_routing::ChargeBasisTable>,
@@ -446,6 +451,7 @@ impl SystemOne {
     ) -> Self {
         Self {
             routing: None,
+            extractor: None,
             image_resolver: None,
             store,
             role: STORE_ROLE.to_owned(),
@@ -458,7 +464,7 @@ impl SystemOne {
             model_slots: Mutex::new(HashMap::new()),
             in_flight,
             clock: Arc::new(now_ms),
-            metrics: Mutex::new(Metrics::default()),
+            metrics: Arc::default(),
             export: None,
             fact_flush: Arc::default(),
             charge_basis: Arc::new(crate::billing_routing::ChargeBasisTable::shipped_defaults()),
@@ -1014,7 +1020,7 @@ impl SystemOne {
             Ok(Err(refusal)) => Err(refusal),
             Err(error) => {
                 tracing::error!(target: "system_one", %error,
-                    "a classify.run task ended abnormally; the call is answered internal_error");
+                    "a System One batch task ended abnormally; the call is answered internal_error");
                 Err(refusal_body(&internal_refusal(
                     "serving this call failed inside broca; re-send the batch",
                 )))
@@ -1034,6 +1040,14 @@ pub(crate) fn caller_scope(
     principal: Option<&broca_protocol::BindPrincipal>,
     send: &broca_protocol::SendScope,
 ) -> Result<broca_store::system_one::BatchScope, Refusal> {
+    caller_scope_for(principal, send, "classifier")
+}
+
+pub(crate) fn caller_scope_for(
+    principal: Option<&broca_protocol::BindPrincipal>,
+    send: &broca_protocol::SendScope,
+    role: &str,
+) -> Result<broca_store::system_one::BatchScope, Refusal> {
     use broca_store::system_one::BatchScope;
     let stamp = match send {
         broca_protocol::SendScope::Stamped(bind) => Some(&bind.scope),
@@ -1044,7 +1058,7 @@ pub(crate) fn caller_scope(
     {
         return Err(Refusal::new(
             "flow_scope_required",
-            "Basal classifier calls require a daemon-stamped flow scope",
+            format!("Basal {role} calls require a daemon-stamped flow scope"),
         ));
     }
     if let Some(stamp) = stamp {
@@ -1062,7 +1076,7 @@ pub(crate) fn caller_scope(
     }
     Err(Refusal::new(
         "scope_required",
-        "classifier calls require a daemon-stamped agent/run or flow scope",
+        format!("{role} calls require a daemon-stamped agent/run or flow scope"),
     ))
 }
 

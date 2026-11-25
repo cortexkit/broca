@@ -466,6 +466,8 @@ dependencies = [
  "cortexkit-role-agent-data",
  "cortexkit-role-classifier",
  "cortexkit-role-classifier-conformance",
+ "cortexkit-role-extractor 0.3.0",
+ "cortexkit-role-extractor-conformance",
  "cortexkit-role-harness",
  "cortexkit-role-llm-runner 0.9.6",
  "cortexkit-role-llm-runner-conformance",
@@ -1124,7 +1126,7 @@ checksum = "9e2170466d5c0df821489ec87e8764541902cdd81616e8199e110675d86e0ced"
 dependencies = [
  "cortexkit-model-batch",
  "cortexkit-role-classifier",
- "cortexkit-role-extractor",
+ "cortexkit-role-extractor 0.2.1",
  "indexmap",
  "serde",
  "serde_json",
@@ -1241,6 +1243,31 @@ dependencies = [
  "indexmap",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-extractor"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6aac383a18aac43441eebbd82f8cbfae5bedc3f3a5ad39492211360d76f30da"
+dependencies = [
+ "cortexkit-model-batch",
+ "indexmap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-extractor-conformance"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b52b3f879a2234ecd3297ec01012d54fd9bac89dc5b6e3caf2f9168662dfe1aa"
+dependencies = [
+ "async-trait",
+ "cortexkit-role-extractor 0.3.0",
+ "serde",
+ "serde_json",
+ "subc-protocol 0.37.5",
 ]
 
 [[package]]
