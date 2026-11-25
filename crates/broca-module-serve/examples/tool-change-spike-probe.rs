@@ -62,13 +62,19 @@ impl Provider {
             _ => openai_chat_frozen_config(model),
         };
         frozen.max_output_tokens = 2048;
-        frozen.base_url = match self {
-            // The only Kimi key is the coding plan, served on its own endpoint.
-            Self::Kimi => Some("https://api.kimi.ai/coding/v1".into()),
-            Self::Deepseek => Some("https://api.deepseek.com/v1".into()),
-            Self::Xai => Some("https://api.x.ai/v1".into()),
-            _ => None,
-        };
+        // Every endpoint is named here, the family's default included, because a dev-tools
+        // handle's reply carries no host list and the probe allows only its endpoint's host.
+        frozen.base_url = Some(
+            match self {
+                Self::Openai => "https://api.openai.com/v1",
+                Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+                // The only Kimi key is the coding plan, served on its own endpoint.
+                Self::Kimi => "https://api.kimi.ai/coding/v1",
+                Self::Deepseek => "https://api.deepseek.com/v1",
+                Self::Xai => "https://api.x.ai/v1",
+            }
+            .into(),
+        );
         frozen
     }
 

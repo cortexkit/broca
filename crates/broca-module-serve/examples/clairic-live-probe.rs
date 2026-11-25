@@ -71,6 +71,9 @@ const LIVE_MARKER: &str = "live-run.started";
 enum ProbePlan {
     Original,
     OpenReadings,
+    /// The original plan's requests 5 and 6 (the 40-clause body and the one-pass control),
+    /// unchanged, to compare today's usage with the first run's.
+    Controls,
 }
 
 impl ProbePlan {
@@ -78,6 +81,7 @@ impl ProbePlan {
         match self {
             Self::Original => MAX_REQUESTS,
             Self::OpenReadings => OPEN_READINGS_MAX_REQUESTS,
+            Self::Controls => CONTROL_NAMES.len(),
         }
     }
 }
@@ -1157,6 +1161,7 @@ async fn run(args: Args) -> Result<(), String> {
             (probes, Some(fixture))
         }
         ProbePlan::OpenReadings => (open_readings_plan(), None),
+        ProbePlan::Controls => (controls_plan(), None),
     };
     let cap = args.plan.cap();
     if probes.len() > cap {
@@ -1251,9 +1256,12 @@ async fn run(args: Args) -> Result<(), String> {
         captures.push(capture);
     }
     let sent = budget.sent;
-    let mut summary = match fixture {
-        Some(fixture) => summarize(&probes, &captures, &fixture, sent, account_present),
-        None => summarize_open_readings(&probes, &captures, sent, account_present),
+    let mut summary = match (fixture, args.plan) {
+        (Some(fixture), _) => summarize(&probes, &captures, &fixture, sent, account_present),
+        (None, ProbePlan::Controls) => {
+            summarize_controls(&probes, &captures, sent, account_present)
+        }
+        (None, _) => summarize_open_readings(&probes, &captures, sent, account_present),
     };
     // Count the summary's own redactions too, then state the final total in it.
     summary = scrub.text(&summary);
@@ -2319,6 +2327,92 @@ fn report_image_usage(w: &mut String, reply: Option<&Reply>) -> Option<i64> {
             None
         }
     }
+}
+
+/// The original plan's requests the controls plan resends, by name.
+const CONTROL_NAMES: [&str; 2] = ["multi-pass", "one-pass-control"];
+
+/// The original plan's requests 5 and 6, byte for byte. Clairic's usage figures changed between
+/// the first run and the open-readings run, and these two bodies, sent without images, show what
+/// changed: the first run reported 40 passes (26,488 schema tokens, 29,888 input) and 1 pass
+/// (656 schema tokens, 741 input) for them.
+fn controls_plan() -> Vec<Probe> {
+    let (probes, _) = plan();
+    probes
+        .into_iter()
+        .filter(|probe| CONTROL_NAMES.contains(&probe.name))
+        .collect()
+}
+
+/// For each control: its usage, the billing formula the contract pins checked against its input
+/// tokens, the same with the state counted once, and the retry tokens its answers report, so the
+/// summary shows which accounting the provider now uses.
+fn summarize_controls(
+    probes: &[Probe],
+    captures: &[Capture],
+    sent: usize,
+    account_present: bool,
+) -> String {
+    let mut out = String::new();
+    let w = &mut out;
+    let _ = writeln!(
+        w,
+        "# Clairic live probe: controls\n\nRun finished {}. Model `{MODEL}`. Requests sent: {sent} \
+         of a {}-request cap. No request was retried. Account id returned by the vault with the \
+         token: {account_present}.",
+        utc_now(),
+        CONTROL_NAMES.len()
+    );
+    for (probe, capture) in probes.iter().zip(captures) {
+        let reply = Reply::new(probe, capture);
+        let _ = writeln!(w, "\n## {:02} {}\n", probe.number, probe.name);
+        let _ = writeln!(w, "{}.", reply.status());
+        let usage = USAGE_KEYS
+            .iter()
+            .map(|key| format!("`{key}` {}", fig(reply.usage_int(key))))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(w, "Usage: {usage}.");
+        let int = |key| reply.usage_int(key);
+        if let (Some(input), Some(schema), Some(state), Some(passes)) = (
+            int("input_tokens"),
+            int("schema_tokens"),
+            int("state_tokens"),
+            int("passes"),
+        ) {
+            let image = int("image_tokens").unwrap_or(0);
+            let per_pass = schema + passes * state + image;
+            let once = schema + state + image;
+            let _ =
+                writeln!(
+                w,
+                "`schema + passes x state + image` = {per_pass} ({}); `schema + state + image` = \
+                 {once} ({}).",
+                if per_pass == input { "equals input" } else { "differs from input" },
+                if once == input { "equals input" } else { "differs from input" },
+            );
+        }
+        let retries: Vec<i64> = reply
+            .answers()
+            .map(|answers| {
+                answers
+                    .0
+                    .iter()
+                    .filter_map(|(_, raw)| {
+                        let answer = Members::parse(raw.get())?;
+                        serde_json::from_str(answer.get("retry_input_tokens")?.get()).ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            w,
+            "Answers reporting `retry_input_tokens`: {}, summing to {}.",
+            retries.len(),
+            retries.iter().sum::<i64>()
+        );
+    }
+    out
 }
 
 fn summarize_open_readings(
