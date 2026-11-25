@@ -117,7 +117,16 @@ struct Subject {
     connection: PathBuf,
     project: PathBuf,
     nonce: PathBuf,
-    image_fixtures: PathBuf,
+    image_fixtures: Option<PathBuf>,
+}
+
+fn image_surface(path: PathBuf, windows: bool) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path);
+    }
+    // The stand-in uses Unix APIs and the Windows fixture build omits it.
+    assert!(windows, "extractor image rig needs {}", path.display());
+    None
 }
 
 impl Subject {
@@ -133,16 +142,14 @@ impl Subject {
             return None;
         }
         let stub = broca_test_support::subc_bin("fake-aft-stub", "FAKE_AFT_STUB_BIN");
-        let surface = broca_test_support::subc_bin("fake-surface", "FAKE_SURFACE_BIN");
         assert!(
             stub.exists(),
             "extractor scoped rig needs {}",
             stub.display()
         );
-        assert!(
-            surface.exists(),
-            "extractor image rig needs {}",
-            surface.display()
+        let surface = image_surface(
+            broca_test_support::subc_bin("fake-surface", "FAKE_SURFACE_BIN"),
+            cfg!(windows),
         );
         let scratch = broca_test_support::scratch_root();
         let root = scratch.join(format!("extractor-conformance-{}", std::process::id()));
@@ -169,7 +176,7 @@ impl Subject {
         write_json(
             &config.join("cortexkit/broca.jsonc"),
             &json!({
-                "llm_tools": {"image_references": true},
+                "llm_tools": {"image_references": surface.is_some()},
                 "providers": {"cloudflare-workers-ai": {"base_url": base}},
             }),
         );
@@ -199,38 +206,39 @@ impl Subject {
                 "ref": SCOPE, "scope_epoch": 1, "kind":"head", "attributes": {"agent_id":"extractor-agent", "run_id":SCOPE},
             }]),
         );
-        let image_fixtures = root.join("images.fixtures.json");
         let image_requests = root.join("images.requests");
-        write_json(&image_fixtures, &json!([]));
-        let encoded_path = |path: &Path| {
-            path.to_string_lossy()
-                .bytes()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        write_json(
-            &config.join("cortexkit/subc.jsonc"),
-            &json!({
-                "version": 1, "scope_authority_owners": [OWNER],
-                "modules": {
-                    OWNER: {
-                        "program": broca_test_support::ckdev_binary(&stub, &scratch),
-                        "args": [], "reserved": true, "enabled": true,
-                        "env": {"FAKE_AFT_MODULE_ID": OWNER, "FAKE_AFT_SCOPE_SYNC_PATH": scopes,
-                               "FAKE_AFT_EVENTS_PATH": owner_events, "FAKE_AFT_LAUNCH_NONCE_PATH": nonce},
-                    },
-                    "cerebellum": {
-                        "program": broca_test_support::ckdev_binary(&surface, &scratch),
-                        "args": ["--module-id", "cerebellum", format!("--SURFACE_FIXTURES={}", encoded_path(&image_fixtures)), format!("--SURFACE_REQUESTS={}", encoded_path(&image_requests))],
-                        "reserved": true, "enabled": true, "env": {"SUBC_CONNECTION": connection},
-                    },
-                    "broca": {
-                        "program": broca_test_support::ckdev_binary(Path::new(env!("CARGO_BIN_EXE_ck-broca")), &scratch),
-                        "args": [], "enabled": true, "env": {"BROCA_STATE_ROOT": state, "XDG_DATA_HOME": data, "CK_LOG":"info"},
-                    },
+        let mut subc_config = json!({
+            "version": 1, "scope_authority_owners": [OWNER],
+            "modules": {
+                OWNER: {
+                    "program": broca_test_support::ckdev_binary(&stub, &scratch),
+                    "args": [], "reserved": true, "enabled": true,
+                    "env": {"FAKE_AFT_MODULE_ID": OWNER, "FAKE_AFT_SCOPE_SYNC_PATH": scopes,
+                           "FAKE_AFT_EVENTS_PATH": owner_events, "FAKE_AFT_LAUNCH_NONCE_PATH": nonce},
                 },
-            }),
-        );
+                "broca": {
+                    "program": broca_test_support::ckdev_binary(Path::new(env!("CARGO_BIN_EXE_ck-broca")), &scratch),
+                    "args": [], "enabled": true, "env": {"BROCA_STATE_ROOT": state, "XDG_DATA_HOME": data, "CK_LOG":"info"},
+                },
+            },
+        });
+        let image_fixtures = surface.map(|surface| {
+            let fixtures = root.join("images.fixtures.json");
+            write_json(&fixtures, &json!([]));
+            let encoded_path = |path: &Path| {
+                path.to_string_lossy()
+                    .bytes()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            };
+            subc_config["modules"]["cerebellum"] = json!({
+                "program": broca_test_support::ckdev_binary(&surface, &scratch),
+                "args": ["--module-id", "cerebellum", format!("--SURFACE_FIXTURES={}", encoded_path(&fixtures)), format!("--SURFACE_REQUESTS={}", encoded_path(&image_requests))],
+                "reserved": true, "enabled": true, "env": {"SUBC_CONNECTION": connection},
+            });
+            fixtures
+        });
+        write_json(&config.join("cortexkit/subc.jsonc"), &subc_config);
 
         let child = broca_test_support::retry_executable_file_busy(|| {
             broca_test_support::tokio_rig_command(
@@ -254,7 +262,7 @@ impl Subject {
         })
         .unwrap();
         let daemon = broca_test_support::RigChild::new(child, &root, "daemon");
-        broca_test_support::wait_until("extractor scope and image source ready", || async {
+        broca_test_support::wait_until("extractor rig ready", || async {
             if connection.exists()
                 && std::fs::read_to_string(&owner_events).is_ok_and(|text| {
                     text.lines().any(|line| {
@@ -262,13 +270,14 @@ impl Subject {
                             .is_ok_and(|event| event["kind"] == "scope_sync_response")
                     })
                 })
-                && std::fs::read_to_string(&image_requests)
-                    .is_ok_and(|text| text.contains("hello-ack"))
+                && (image_fixtures.is_none()
+                    || std::fs::read_to_string(&image_requests)
+                        .is_ok_and(|text| text.contains("hello-ack")))
                 && std::fs::read_to_string(&nonce).is_ok_and(|text| !text.trim().is_empty())
             {
                 Ok(())
             } else {
-                Err("daemon, scope owner or image source still starting".to_owned())
+                Err("daemon or a configured rig module still starting".to_owned())
             }
         })
         .await;
@@ -400,8 +409,9 @@ impl ExtractorSubject for Subject {
     }
 
     async fn issue_image_reference(&self, content_type: &str, bytes: Vec<u8>) -> Option<String> {
+        let path = self.image_fixtures.as_ref()?;
         let mut fixtures: Vec<Value> =
-            serde_json::from_slice(&std::fs::read(&self.image_fixtures).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         let handle = format!("ih{:032x}", fixtures.len());
         // The image resolver's binary reply starts with a length-prefixed JSON header; the test
         // surface returns the fixture's base64-decoded bytes without interpreting them.
@@ -412,14 +422,18 @@ impl ExtractorSubject for Subject {
         body.extend(head);
         body.extend(bytes);
         fixtures.push(json!({"match": {"method":"image.resolve", "scope_ref":SCOPE, "handle":handle}, "stdout":STANDARD.encode(body)}));
-        let temporary = self.image_fixtures.with_extension("new");
+        let temporary = path.with_extension("new");
         std::fs::write(&temporary, serde_json::to_vec(&fixtures).unwrap()).unwrap();
-        std::fs::rename(temporary, &self.image_fixtures).unwrap();
+        std::fs::rename(temporary, path).unwrap();
         Some(handle)
     }
 
     async fn set_image_source_down(&self, down: bool) {
-        let flag = self.image_fixtures.with_extension("down");
+        let flag = self
+            .image_fixtures
+            .as_ref()
+            .expect("image source configured")
+            .with_extension("down");
         if down {
             std::fs::write(flag, "").unwrap()
         } else {
@@ -444,6 +458,47 @@ async fn extractor_conformance_suite_passes_against_the_real_daemon() {
         "extractor conformance: {passed}/{} checks passed",
         CHECKS.len()
     );
-    assert_eq!(report.verdict, SuiteVerdict::Passed, "{}", report.render());
-    assert_eq!(passed, CHECKS.len());
+    if subject.image_fixtures.is_some() {
+        assert_eq!(report.verdict, SuiteVerdict::Passed, "{}", report.render());
+        assert_eq!(passed, CHECKS.len());
+    } else {
+        // Inline images and the refusal of an unsupported handle still apply.
+        let not_applicable = vec![
+            "image_reference_resolved_and_answered",
+            "image_reference_oversized_refused_like_inline",
+            "image_source_down_refused_transient",
+            "image_reference_identity_is_its_handle",
+        ];
+        assert_eq!(passed, CHECKS.len() - not_applicable.len());
+        for check in &not_applicable {
+            assert_eq!(
+                report.outcome(check),
+                Some(&CheckOutcome::NotApplicable {
+                    reason: "role.describe does not declare image_reference".into(),
+                }),
+                "{check}"
+            );
+        }
+        assert_eq!(
+            report.verdict,
+            SuiteVerdict::PassedExceptNotApplicable { not_applicable },
+            "{}",
+            report.render()
+        );
+    }
+}
+
+#[test]
+fn extractor_image_surface_is_optional_on_windows() {
+    let missing = broca_test_support::scratch_root().join("missing-fake-surface.exe");
+    assert_eq!(image_surface(missing, true), None);
+    let present = std::env::current_exe().unwrap();
+    assert_eq!(image_surface(present.clone(), true), Some(present));
+}
+
+#[test]
+#[should_panic(expected = "extractor image rig needs")]
+fn extractor_image_surface_is_required_off_windows() {
+    let missing = broca_test_support::scratch_root().join("missing-fake-surface");
+    image_surface(missing, false);
 }
