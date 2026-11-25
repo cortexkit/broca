@@ -1,26 +1,30 @@
 //! Prompt-cache and tool/instruction-change spike. No vault or network access in --dry-run.
 //!
-//! Usage: tool-change-spike-probe [--dry-run] --provider openai|kimi|deepseek|xai|gemini
+//! Usage: tool-change-spike-probe [--dry-run] --provider openai|chatgpt|kimi|deepseek|xai|gemini
 //! --credential <id> --model <model> --out <file.jsonl> [--case 1|2|3|4|all]
-//! [--form a|b] [--steps 3|4] [--max-requests N]. Each conversation's requests are labelled T1
-//! to T4 in the output; T4 is the request after the tools or instructions change. `--form` runs
-//! one of case 1's two forms on OpenAI and Kimi (`a` the added-tools declaration, `b` the
-//! allowed-tools list). `--steps 3` leaves out T3, the second ordinary question, so T1, its
-//! repeat T2 and the changed T4 measure the cache with three requests per form. The output
-//! contains prompt text and model responses, never headers.
+//! [--form a|b] [--place before-user|after-user] [--steps 3|4] [--max-requests N]. T4 is the
+//! request after the tools or instructions change. On OpenAI and Kimi, `--form` runs one of
+//! case 1's two forms (`a` the added-tools declaration, `b` the allowed-tools list).
+//! ChatGPT requires `--case 1 --form a` and the `chatgpt:openai` credential for live runs.
+//! The ChatGPT lane uses HTTPS to measure the request form, not the WebSocket transport.
+//! Placement defaults to `before-user`; `after-user` requires case 1 form a on OpenAI, ChatGPT
+//! or Kimi. `--steps 3` omits T3, the second ordinary question, so T1, T2 and T4 measure
+//! the cache with three requests per form. The output contains prompt text and model responses,
+//! never headers.
 //! Gemini uses VALIDATED with a fixed mode so only its allowed list changes; support
 //! depends on model/API version. Its appended instruction changes systemInstruction
 //! at request level, not a nonexistent mid-conversation system role.
 
-use broca_module_serve::{vault_config::load_devtools_handle, CredentialId};
+use broca_module_serve::{vault_config::load_devtools_handle, AuthMethod, CredentialId};
 use broca_protocol::{
     request::{CallOptions, Tool},
     BindIdentity, ContentBlock, Message, Role,
 };
 use broca_provider::{
     families::{
-        gemini_frozen_config, openai_chat_frozen_config, openai_responses_frozen_config, Gemini,
-        OpenAiChat, OpenAiResponses,
+        gemini_frozen_config, openai_chat_frozen_config, openai_responses_chatgpt_frozen_config,
+        openai_responses_frozen_config, Gemini, OpenAiChat, OpenAiResponses,
+        OpenAiResponsesChatgpt,
     },
     wire::{AuthHandle, FrozenRenderConfig, HttpRequest, WireFamily},
 };
@@ -36,10 +40,12 @@ const REQUEST_CAP: usize = 30;
 const NEW_TOOL: &str = "lookup_orbit_code";
 const CHANGED_TOOL: &str = "lookup_station";
 const INSTRUCTION: &str = "From now on, end every plain-text reply with the word KITE.";
+const CHATGPT_CACHE_KEY: &str = "tool-change-spike-probe";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
     Openai,
+    Chatgpt,
     Kimi,
     Deepseek,
     Xai,
@@ -50,6 +56,7 @@ impl Provider {
     fn family(self) -> &'static dyn WireFamily {
         match self {
             Self::Openai => &OpenAiResponses,
+            Self::Chatgpt => &OpenAiResponsesChatgpt,
             Self::Gemini => &Gemini,
             _ => &OpenAiChat,
         }
@@ -58,6 +65,11 @@ impl Provider {
     fn frozen(self, model: &str) -> FrozenRenderConfig {
         let mut frozen = match self {
             Self::Openai => openai_responses_frozen_config(model),
+            Self::Chatgpt => {
+                let mut frozen = openai_responses_chatgpt_frozen_config(model);
+                frozen.prompt_cache_key = Some(CHATGPT_CACHE_KEY.into());
+                frozen
+            }
             Self::Gemini => gemini_frozen_config(model),
             _ => openai_chat_frozen_config(model),
         };
@@ -67,6 +79,7 @@ impl Provider {
         frozen.base_url = Some(
             match self {
                 Self::Openai => "https://api.openai.com/v1",
+                Self::Chatgpt => "https://chatgpt.com/backend-api/codex",
                 Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
                 // The only Kimi key is the coding plan, served on its own endpoint.
                 Self::Kimi => "https://api.kimi.ai/coding/v1",
@@ -81,12 +94,13 @@ impl Provider {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "openai" => Ok(Self::Openai),
+            "chatgpt" => Ok(Self::Chatgpt),
             "kimi" => Ok(Self::Kimi),
             "deepseek" => Ok(Self::Deepseek),
             "xai" => Ok(Self::Xai),
             "gemini" => Ok(Self::Gemini),
             _ => Err(format!(
-                "unknown provider {value}; expected openai|kimi|deepseek|xai|gemini"
+                "unknown provider {value}; expected openai|chatgpt|kimi|deepseek|xai|gemini"
             )),
         }
     }
@@ -94,6 +108,7 @@ impl Provider {
     fn name(self) -> &'static str {
         match self {
             Self::Openai => "openai",
+            Self::Chatgpt => "chatgpt",
             Self::Kimi => "kimi",
             Self::Deepseek => "deepseek",
             Self::Xai => "xai",
@@ -104,8 +119,40 @@ impl Provider {
     fn route(self) -> &'static str {
         match self {
             Self::Openai => "openai-responses",
+            Self::Chatgpt => "openai-responses-chatgpt",
             Self::Gemini => "gemini",
             _ => "openai-chat",
+        }
+    }
+
+    fn additional_tools_key(self) -> Option<&'static str> {
+        match self {
+            Self::Openai | Self::Chatgpt => Some("input"),
+            Self::Kimi => Some("messages"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    BeforeUser,
+    AfterUser,
+}
+
+impl Placement {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "before-user" => Ok(Self::BeforeUser),
+            "after-user" => Ok(Self::AfterUser),
+            _ => Err("--place must be before-user|after-user".into()),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::BeforeUser => "before-user",
+            Self::AfterUser => "after-user",
         }
     }
 }
@@ -121,6 +168,7 @@ struct Args {
     /// Case 1's form on OpenAI and Kimi: `Some(false)` runs only form a, `Some(true)` only
     /// form b, and `None` both.
     alternate: Option<bool>,
+    placement: Placement,
     /// Requests per conversation: 4, or 3 without the second ordinary question. The tools
     /// change at the last one, T4, either way.
     steps: u8,
@@ -137,6 +185,7 @@ impl Args {
         let mut case = None;
         let mut max_requests = REQUEST_CAP;
         let mut alternate = None;
+        let mut placement = Placement::BeforeUser;
         let mut steps = 4;
         while let Some(flag) = args.next() {
             if flag == "--dry-run" {
@@ -152,6 +201,7 @@ impl Args {
                     | "--case"
                     | "--max-requests"
                     | "--form"
+                    | "--place"
                     | "--steps"
             ) {
                 return Err(format!(
@@ -193,6 +243,7 @@ impl Args {
                         _ => return Err("--form must be a|b".into()),
                     });
                 }
+                "--place" => placement = Placement::parse(&value)?,
                 "--steps" => {
                     steps = match value.as_str() {
                         "3" => 3,
@@ -216,8 +267,21 @@ impl Args {
             case,
             max_requests,
             alternate,
+            placement,
             steps,
         };
+        let only_form_a = result.case == Some(1) && result.alternate == Some(false);
+        if result.provider == Provider::Chatgpt && !only_form_a {
+            return Err("--provider chatgpt supports only --case 1 --form a".into());
+        }
+        if placement == Placement::AfterUser
+            && !(only_form_a && result.provider.additional_tools_key().is_some())
+        {
+            return Err(
+                "--place after-user requires a separate tool declaration: use --case 1 --form a with openai, chatgpt or kimi"
+                    .into(),
+            );
+        }
         let minimum = result.variants().len() * usize::from(result.steps);
         if minimum > result.max_requests {
             return Err(format!("selected cases need at least {minimum} requests; narrow --case or raise --max-requests"));
@@ -344,9 +408,7 @@ fn options(
         || variant.case == 1
             && (provider == Provider::Gemini
                 || (provider == Provider::Openai && variant.alternate)
-                || (changed
-                    && (variant.alternate
-                        || provider != Provider::Openai && provider != Provider::Kimi)))
+                || (changed && (variant.alternate || provider.additional_tools_key().is_none())))
     {
         tools.push(tool(NEW_TOOL, false));
     }
@@ -363,6 +425,7 @@ struct ProbeFamily {
     provider: Provider,
     variant: Variant,
     changed: bool,
+    placement: Placement,
     body: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -370,7 +433,9 @@ impl ProbeFamily {
     fn patches(&self) -> Vec<&'static str> {
         let mut paths = Vec::new();
         match (self.provider, self.variant.case) {
-            (Provider::Openai, 1) if !self.variant.alternate && self.changed => {
+            (Provider::Openai | Provider::Chatgpt, 1)
+                if !self.variant.alternate && self.changed =>
+            {
                 paths.push("/input/- (additional_tools)")
             }
             (Provider::Kimi, 1) if !self.variant.alternate && self.changed => {
@@ -412,7 +477,7 @@ impl ProbeFamily {
         }
         let addition = if changed && variant.case == 1 && !variant.alternate {
             match provider {
-                Provider::Openai => Some(
+                Provider::Openai | Provider::Chatgpt => Some(
                     json!({"type":"additional_tools", "role":"developer", "tools":[{"type":"function", "name":NEW_TOOL, "description":tool(NEW_TOOL, false).description, "parameters":tool(NEW_TOOL, false).input_schema}]}),
                 ),
                 Provider::Kimi => Some(
@@ -424,19 +489,22 @@ impl ProbeFamily {
             None
         };
         if let Some(addition) = addition {
-            let key = if provider == Provider::Openai {
-                "input"
-            } else {
-                "messages"
-            };
+            let key = provider
+                .additional_tools_key()
+                .expect("separate tool declaration");
             let messages = body[key].as_array_mut().unwrap();
-            // The change belongs immediately before T4's user message and stays
-            // there if a tool-result continuation adds further messages.
+            // Keep the declaration adjacent to T4's user message even when a tool-result
+            // continuation adds further items.
             let t4 = messages
                 .iter()
-                .position(|item| item.to_string().contains(user_text(variant, 4)))
+                .rposition(|item| {
+                    item["role"] == "user" && item.to_string().contains(user_text(variant, 4))
+                })
                 .expect("T4 user message");
-            messages.insert(t4, addition);
+            messages.insert(
+                t4 + usize::from(self.placement == Placement::AfterUser),
+                addition,
+            );
         }
         body
     }
@@ -495,7 +563,11 @@ async fn send(
 ) -> Answer {
     use broca_core::Provider as _;
     use broca_protocol::{NormalizedEvent, ProviderControl, StepId};
+    let chatgpt = family.provider == Provider::Chatgpt;
     let live = broca_provider::LiveProvider::new(family, frozen, auth).with_credential_hosts(hosts);
+    if chatgpt {
+        live.set_chatgpt_https_policy(Arc::new(|| true));
+    }
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut events = live
         .step_with_runtime(
@@ -639,7 +711,7 @@ fn write_row(
         },
         answer,
     );
-    let mut row = json!({"provider":args.provider.name(), "model":args.model, "route":args.provider.route(), "case":variant.case, "variant":variant.name(), "step":format!("T{step}"), "ts_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis(), "behaviour":assessment["result"], "why":assessment["why"], "patched":!patches.is_empty(), "patched_paths":patches, "continuation":completing, "usage_semantics":"broca normalized: input_tokens is fresh input; cached and writes are separate; output includes reasoning"});
+    let mut row = json!({"provider":args.provider.name(), "model":args.model, "route":args.provider.route(), "case":variant.case, "variant":variant.name(), "placement":args.placement.name(), "step":format!("T{step}"), "ts_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis(), "behaviour":assessment["result"], "why":assessment["why"], "patched":!patches.is_empty(), "patched_paths":patches, "continuation":completing, "usage_semantics":"broca normalized: input_tokens is fresh input; cached and writes are separate; output includes reasoning"});
     if let Some(tail) = assessment.get("reply_tail") {
         row["reply_tail"] = tail.clone();
     }
@@ -695,6 +767,28 @@ fn tool_results(content: &[ContentBlock]) -> Option<Message> {
     }
 }
 
+fn auth_headers(
+    provider: Provider,
+    token: String,
+    account_id: Option<String>,
+) -> Result<AuthHandle, &'static str> {
+    let headers = match provider {
+        Provider::Chatgpt => vec![
+            ("authorization".into(), format!("Bearer {token}")),
+            (
+                "ChatGPT-Account-Id".into(),
+                account_id
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or("vault reply is missing the ChatGPT account id")?,
+            ),
+            ("session-id".into(), CHATGPT_CACHE_KEY.into()),
+        ],
+        Provider::Gemini => vec![("x-goog-api-key".into(), token)],
+        _ => vec![("authorization".into(), format!("Bearer {token}"))],
+    };
+    Ok(AuthHandle::Headers(headers))
+}
+
 /// The credential's auth header and the hosts its vault record lets it go to, which the
 /// transport checks before every send.
 async fn credentials(
@@ -707,6 +801,11 @@ async fn credentials(
     Box<dyn std::error::Error>,
 > {
     let id = CredentialId::parse(&args.credential).ok_or("invalid credential id")?;
+    if args.provider == Provider::Chatgpt
+        && (id.method != AuthMethod::Chatgpt || id.provider != "openai")
+    {
+        return Err("--provider chatgpt requires a chatgpt:openai credential".into());
+    }
     let handle = load_devtools_handle(&id).map_err(|_| "devtools credential handle unavailable")?;
     let subc = std::env::var_os("BROCA_LIVE_SUBC")
         .or_else(|| std::env::var_os("SUBC_SOCKET"))
@@ -753,19 +852,7 @@ async fn credentials(
     });
     let hosts = broca_provider::credential_hosts::CredentialHosts::from_record(Some(&hosts));
     Ok((
-        AuthHandle::Headers(vec![(
-            if args.provider == Provider::Gemini {
-                "x-goog-api-key"
-            } else {
-                "authorization"
-            }
-            .into(),
-            if args.provider == Provider::Gemini {
-                secret.token
-            } else {
-                format!("Bearer {}", secret.token)
-            },
-        )]),
+        auth_headers(args.provider, secret.token, secret.account_id)?,
         hosts,
     ))
 }
@@ -816,6 +903,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     provider: args.provider,
                     variant,
                     changed: step == 4,
+                    placement: args.placement,
                     body: body.clone(),
                 };
                 let patches = family.patches();
@@ -840,16 +928,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if args.dry_run {
                     let rendered: Value = serde_json::from_slice(&bytes)?;
                     println!(
-                        "{} {} T{step}: {} body bytes; patched paths={patches:?}",
+                        "{} {} T{step} ({}): {} body bytes; patched paths={patches:?}",
                         args.provider.name(),
                         variant.name(),
+                        args.placement.name(),
                         bytes.len()
                     );
                     if step == 4 {
                         let mut changes = Vec::new();
                         diff(&before, &rendered, "", &mut changes);
                         println!(
-                            "T4 against the request before it: {}",
+                            "T4 against the request before it ({}): {}",
+                            args.placement.name(),
                             serde_json::to_string(&changes)?
                         );
                     } else {
@@ -965,8 +1055,9 @@ fn diff(before: &Value, after: &Value, path: &str, changes: &mut Vec<Value>) {
 mod tests {
     use super::*;
 
-    const PROVIDERS: [Provider; 5] = [
+    const PROVIDERS: [Provider; 6] = [
         Provider::Openai,
+        Provider::Chatgpt,
         Provider::Kimi,
         Provider::Deepseek,
         Provider::Xai,
@@ -974,6 +1065,15 @@ mod tests {
     ];
 
     fn args(provider: Provider) -> Args {
+        let extra: &[&str] = if provider == Provider::Chatgpt {
+            &["--case", "1", "--form", "a"]
+        } else {
+            &[]
+        };
+        parse_args(provider, extra).unwrap()
+    }
+
+    fn parse_args(provider: Provider, extra: &[&str]) -> Result<Args, String> {
         Args::parse(
             [
                 "--dry-run",
@@ -987,9 +1087,9 @@ mod tests {
                 "unused.jsonl",
             ]
             .into_iter()
+            .chain(extra.iter().copied())
             .map(str::to_owned),
         )
-        .unwrap()
     }
 
     fn prompt(variant: Variant, step: u8) -> Vec<Message> {
@@ -1003,10 +1103,21 @@ mod tests {
     }
 
     fn render(provider: Provider, variant: Variant, step: u8, changed: bool) -> Value {
+        render_at(provider, variant, step, changed, Placement::BeforeUser)
+    }
+
+    fn render_at(
+        provider: Provider,
+        variant: Variant,
+        step: u8,
+        changed: bool,
+        placement: Placement,
+    ) -> Value {
         let family = ProbeFamily {
             provider,
             variant,
             changed,
+            placement,
             body: Arc::new(Mutex::new(Vec::new())),
         };
         let opts = options(provider, variant, changed, prompt(variant, step));
@@ -1027,7 +1138,7 @@ mod tests {
 
     fn conversation_key(provider: Provider) -> &'static str {
         match provider {
-            Provider::Openai => "input",
+            Provider::Openai | Provider::Chatgpt => "input",
             Provider::Gemini => "contents",
             _ => "messages",
         }
@@ -1067,22 +1178,24 @@ mod tests {
                 let baseline = render(provider, variant, 4, false);
                 let mut changed = render(provider, variant, 4, true);
                 match variant.case {
-                    1 if provider == Provider::Openai && !variant.alternate
-                        || provider == Provider::Kimi && !variant.alternate =>
+                    1 if matches!(
+                        provider,
+                        Provider::Openai | Provider::Chatgpt | Provider::Kimi
+                    ) && !variant.alternate =>
                     {
                         assert_eq!(declarations(provider, &changed).len(), 3);
                         let messages = changed[key].as_array_mut().unwrap();
                         let addition = messages.remove(messages.len() - 2);
                         assert_eq!(
                             addition["role"],
-                            if provider == Provider::Openai {
-                                "developer"
-                            } else {
+                            if provider == Provider::Kimi {
                                 "system"
+                            } else {
+                                "developer"
                             }
                         );
                         assert_eq!(addition["tools"].as_array().unwrap().len(), 1);
-                        if provider == Provider::Openai {
+                        if provider != Provider::Kimi {
                             assert_eq!(addition["type"], "additional_tools");
                             assert_eq!(addition["tools"][0]["name"], NEW_TOOL);
                         } else {
@@ -1193,6 +1306,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn after_user_moves_only_the_declaration_to_the_end() {
+        let variant = Variant {
+            case: 1,
+            alternate: false,
+        };
+        for provider in [Provider::Openai, Provider::Kimi, Provider::Chatgpt] {
+            let mut expected = render(provider, variant, 4, true);
+            let messages = expected[conversation_key(provider)].as_array_mut().unwrap();
+            let addition = messages.remove(messages.len() - 2);
+            assert_eq!(messages.last().unwrap()["role"], "user");
+            assert_eq!(addition["tools"].as_array().unwrap().len(), 1);
+            messages.push(addition);
+            assert_eq!(
+                render_at(provider, variant, 4, true, Placement::AfterUser),
+                expected,
+                "{provider:?} changed more than the declaration position"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_requires_a_separate_declaration_and_chatgpt_requires_form_a() {
+        for provider in PROVIDERS {
+            let flags = ["--case", "1", "--form", "a", "--place", "after-user"];
+            let parsed = parse_args(provider, &flags);
+            if matches!(
+                provider,
+                Provider::Openai | Provider::Chatgpt | Provider::Kimi
+            ) {
+                assert_eq!(parsed.unwrap().placement, Placement::AfterUser);
+            } else {
+                assert!(
+                    matches!(parsed, Err(error) if error.contains("separate tool declaration"))
+                );
+            }
+        }
+        for flags in [
+            &["--case", "1", "--form", "b", "--place", "after-user"][..],
+            &["--case", "1", "--place", "after-user"],
+            &["--case", "4", "--form", "a", "--place", "after-user"],
+        ] {
+            assert!(
+                matches!(parse_args(Provider::Openai, flags), Err(error) if error.contains("separate tool declaration"))
+            );
+        }
+        for flags in [
+            &["--case", "1", "--form", "b"][..],
+            &["--case", "1"],
+            &["--case", "2", "--form", "a"],
+        ] {
+            assert!(
+                matches!(parse_args(Provider::Chatgpt, flags), Err(error) if error.contains("supports only --case 1 --form a"))
+            );
+        }
+        assert_eq!(args(Provider::Openai).placement, Placement::BeforeUser);
+        assert_eq!(
+            parse_args(Provider::Openai, &["--place", "before-user"])
+                .unwrap()
+                .placement,
+            Placement::BeforeUser
+        );
+    }
+
+    #[test]
+    fn chatgpt_uses_the_vault_account_as_a_header_on_the_codex_endpoint() {
+        let provider = Provider::Chatgpt;
+        let auth =
+            auth_headers(provider, "test-token".into(), Some("test-account".into())).unwrap();
+        let frozen = provider.frozen("test-model");
+        let variant = Variant {
+            case: 1,
+            alternate: false,
+        };
+        let opts = options(provider, variant, false, prompt(variant, 1));
+        let body = provider.family().render(&frozen, &opts);
+        let request = provider.family().endpoint(&frozen, &auth, body.clone());
+        assert_eq!(
+            request.url,
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(request.body, body);
+        for (name, value) in [
+            ("authorization", "Bearer test-token"),
+            ("chatgpt-account-id", "test-account"),
+            ("session-id", CHATGPT_CACHE_KEY),
+        ] {
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .any(|(key, found)| key.eq_ignore_ascii_case(name) && found == value),
+                "missing {name}"
+            );
+        }
+        let json_body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json_body["store"], false);
+        assert_eq!(json_body["prompt_cache_key"], CHATGPT_CACHE_KEY);
+        assert!(json_body.get("max_output_tokens").is_none());
+        assert!(!std::str::from_utf8(&body).unwrap().contains("test-account"));
+        assert!(matches!(
+            auth_headers(provider, "test-token".into(), None),
+            Err("vault reply is missing the ChatGPT account id")
+        ));
     }
 
     #[test]
@@ -1311,6 +1530,7 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         for row in &rows {
+            assert_eq!(row["placement"], "before-user");
             for field in [
                 "http_status",
                 "input_tokens",
