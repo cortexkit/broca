@@ -1234,6 +1234,17 @@ impl GeminiNormalizer {
         if let Some(fr) = candidate.get("finishReason").and_then(Value::as_str) {
             self.raw_finish_reason = Some(fr.to_owned());
             self.finish_reason = map_finish_reason(fr);
+            if self.finish_reason == FinishReason::Other {
+                // A caller sees only `Other`, which can't tell a stop at an output limit from
+                // anything else, and the provider's own token is kept only in the step's
+                // records. Logging it names the token the mapping is missing the next time
+                // one arrives.
+                tracing::info!(
+                    target: "broca.provider",
+                    raw_finish_reason = fr,
+                    "Gemini sent a finish reason broca does not map; reported as Other"
+                );
+            }
             if let Some(evidence) = &self.response_evidence {
                 evidence.lock().unwrap().finish_reason = Some(self.finish_reason);
             }
