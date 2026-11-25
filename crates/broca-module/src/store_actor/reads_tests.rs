@@ -1115,8 +1115,9 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
     .await;
     m.opt_ins_stay_in_memory("r3 in flight over sealed history")
         .await;
-    // The running run and the newest page are in memory; the first page is sealed, and is read
-    // from storage at the position the actor names.
+    // The running run and the newest page are in memory. The first page is sealed: the actor
+    // reads a page of a few sealed messages itself, a few blocks of sealed objects, while a read
+    // of more sealed messages is read from storage at the position the actor names.
     assert!(matches!(
         m.ask_actor(StoreReadRequest::RunStatusReply(RunId("r3".into())))
             .await,
@@ -1126,15 +1127,27 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
         m.ask_actor(StoreReadRequest::Head).await,
         StoreReadOutcome::Served(_)
     ));
+    let first_page = StoreReadRequest::Page(PageRequest {
+        from_ordinal: Some(1),
+        limit: Some(3),
+        ..PageRequest::default()
+    });
+    let many_sealed = StoreReadRequest::Entries { from: 1, limit: 33 };
     assert!(matches!(
-        m.ask_actor(StoreReadRequest::Page(PageRequest {
-            from_ordinal: Some(1),
-            limit: Some(3),
-            ..PageRequest::default()
-        }))
-        .await,
+        m.ask_actor(first_page.clone()).await,
+        StoreReadOutcome::Served(_)
+    ));
+    assert!(matches!(
+        m.ask_actor(many_sealed.clone()).await,
         StoreReadOutcome::Stored { .. }
     ));
+    for request in [first_page, many_sealed] {
+        assert_eq!(
+            shape(m.served(&request).await),
+            shape(m.fresh(&request).await),
+            "{request:?}"
+        );
+    }
     // A status read that looks ids up in the sealed id index is answered by the actor, both for
     // a sealed run and for a send the session never took, asked by a module as a sender asks
     // after its sends: such a lookup is a few small reads of sealed objects, not a load of the

@@ -723,8 +723,8 @@ fn message_ids_resolve_in_the_window_and_sealed_history(cipher: Cipher) {
 }
 
 /// An answer whose id its step's start announced (`StepStart::mid`, minted from that record's
-/// seq) resolves by that id in the window, once sealed and after a reload. A step's start whose
-/// step wrote no message announces an id that resolves to nothing.
+/// seq) resolves by that id in the window, once sealed (from memory only too) and after a
+/// reload. A step's start whose step wrote no message announces an id that resolves to nothing.
 fn an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
@@ -791,6 +791,13 @@ fn an_id_a_steps_start_announced_resolves_in_the_window_and_sealed_history(ciphe
         session.seal(Some(cut), 0).await.unwrap();
         assert!(session.conversation.window_start() > ordinal);
         check(&session, &announced, ordinal, &unused).await;
+        // Resolving a sealed id reads a few blocks of sealed facts and the message they name,
+        // from memory only too.
+        {
+            let memory = session.in_memory();
+            check(&session, &announced, ordinal, &unused).await;
+            assert!(!memory.refused(), "{:?}", memory.refused_at());
+        }
         session.close().await.unwrap();
         let loaded = Session::load(&backend, addr(), &triple(), &deployment(cipher))
             .await

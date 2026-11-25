@@ -271,10 +271,10 @@ fn a_sealed_views_open_log_reads_back_only_its_checkpoint_frame(cipher: Cipher) 
     });
 }
 
-/// After a seal the sealed history is read from storage: reading from memory only refuses a page of
-/// it, while a lookup of an id that names a few sealed records still reads them, and the records
-/// kept before the seal are dropped, since the new log was copied, not appended. A run started
-/// after the seal is kept again.
+/// After a seal the sealed history is read from storage: reading from memory only refuses a long
+/// page of it, while a short page and a lookup of an id that names a few sealed records still
+/// read them, and the records kept before the seal are dropped, since the new log was copied, not
+/// appended. A run started after the seal is kept again.
 fn a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
@@ -285,9 +285,10 @@ fn a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history(cipher: 
         let found = {
             let _memory = session.in_memory();
             assert!(matches!(
-                session.entries(1, 1).await,
+                session.entries(1, 33).await,
                 Err(SessionError::NotInMemory)
             ));
+            assert_eq!(session.entries(1, 1).await.unwrap().len(), 1);
             // An id lookup reads the sealed id index and the few blocks holding its records.
             let found = session.find_id(IdKind::RunId, "a").await.unwrap();
             assert!(!found.is_empty());
@@ -496,20 +497,20 @@ fn an_id_lookup_reads_the_log_only_outside_the_latest_run(cipher: Cipher) {
             "the latest run's ids, every run's records and a send's records are read from memory"
         );
 
-        // A call of an earlier run: its intent is read back from the open log, one record.
+        // A call of an earlier run, whose records the session doesn't keep: its intent is read
+        // back as one record, from memory only too, rather than refused and left to a load of the
+        // whole session.
         let earlier_call = call_key("r0", 2);
-        {
-            let _memory = session.in_memory();
-            assert!(matches!(
-                session.find_id(IdKind::CallKey, &earlier_call).await,
-                Err(SessionError::NotInMemory)
-            ));
-        }
         let before = reads(&backend);
-        let found = session
-            .find_id(IdKind::CallKey, &earlier_call)
-            .await
-            .unwrap();
+        let found = {
+            let memory = session.in_memory();
+            let found = session
+                .find_id(IdKind::CallKey, &earlier_call)
+                .await
+                .unwrap();
+            assert!(!memory.refused());
+            found
+        };
         assert_eq!(reads(&backend), (before.0 + 1, before.1 + 1));
         assert_eq!(found.len(), 1);
         assert_eq!(

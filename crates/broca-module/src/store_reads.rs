@@ -624,7 +624,7 @@ pub async fn answer_in_memory<B: SessionBackend>(
     match reply {
         Some(reply) if !needs_storage => StoreReadOutcome::Served(Box::new(reply)),
         _ => {
-            count_stored_read(request.name(), refused_at);
+            count_stored_read(&stored_read_name(request), refused_at);
             StoreReadOutcome::Stored {
                 position: session.position(),
                 live_step: ctx.live_step.cloned(),
@@ -640,6 +640,30 @@ pub async fn answer_in_memory<B: SessionBackend>(
 /// `broca_wire::MemoryCache::stored_reads`). Process-wide, like the other load counts.
 static STORED_READS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// How the memory report names a read an actor sent to storage: its name, and for a compaction
+/// operation also its method and the `select.by` of its parameters, since one name covers every
+/// compaction operation and each reads differently.
+fn stored_read_name(request: &StoreReadRequest) -> String {
+    let StoreReadRequest::Compaction { method, params, .. } = request else {
+        return request.name().to_owned();
+    };
+    #[derive(serde::Deserialize)]
+    struct Select {
+        by: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Params {
+        select: Option<Select>,
+    }
+    let by = serde_json::from_str::<Params>(params.get())
+        .ok()
+        .and_then(|params| params.select?.by);
+    match by {
+        Some(by) => format!("compaction {method} by {by}"),
+        None => format!("compaction {method}"),
+    }
+}
 
 /// Counts one read an actor couldn't answer from memory: `at` is where it needed storage, or
 /// `None` for a read that would have waited without asking for storage.
@@ -1125,6 +1149,37 @@ mod tests {
     use broca_session_store::session::Position;
 
     use super::{CachedBytes, ViewCache};
+
+    /// A compaction read sent to storage is named with its method and selector; any other read
+    /// by its name alone.
+    #[test]
+    fn a_stored_compaction_read_names_its_method_and_selector() {
+        let compaction = |method: &str, params: &str| super::StoreReadRequest::Compaction {
+            key: broca_protocol::BindIdentity {
+                project_root: "/p".into(),
+                harness: "h".into(),
+                session: "s".into(),
+            },
+            caller: None,
+            method: method.into(),
+            params: serde_json::value::RawValue::from_string(params.into()).unwrap(),
+        };
+        assert_eq!(
+            super::stored_read_name(&compaction(
+                "session.entries",
+                r#"{"select": {"by": "after", "mid": "g1"}}"#
+            )),
+            "compaction session.entries by after"
+        );
+        assert_eq!(
+            super::stored_read_name(&compaction("session.view_state", "{}")),
+            "compaction session.view_state"
+        );
+        assert_eq!(
+            super::stored_read_name(&super::StoreReadRequest::Head),
+            "session.head"
+        );
+    }
 
     /// A test view whose number is its size.
     impl CachedBytes for u64 {

@@ -332,8 +332,12 @@ impl<B: SessionBackend> Session<B> {
     /// Answers reads from memory only until the returned guard drops: a read that would touch
     /// the backend refuses with [`SessionError::NotInMemory`] before it starts. The session's
     /// owner takes this around a read it answers between its own writes, so the read never waits
-    /// on storage. Writes are never refused by it. One read is let through: a lookup of an id in
-    /// the sealed id index that names only a few records (see `Session::sealed_found`).
+    /// on storage. Writes are never refused by it. Small reads are let through, because refusing
+    /// them sent the whole read to a load of the whole session: a lookup of an id in the sealed
+    /// id index that names only a few records (see `Session::sealed_found`), one record read back
+    /// from the open log (`Session::open_record`), a message id's ordinal from sealed facts
+    /// (`Session::facts_ordinal`), one sealed message (`Session::message`) and a page of a few
+    /// sealed messages (`Session::unjoined_entries`).
     pub fn in_memory(&self) -> InMemory<'_> {
         *self.memory_refused.lock() = None;
         self.memory_only.store(true, Ordering::SeqCst);

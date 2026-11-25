@@ -191,6 +191,11 @@ const RUN_STARTS_KEPT: usize = 16;
 /// reads as many blocks, and refuses there as before.
 const SEALED_LOOKUP_IN_MEMORY: usize = 32;
 
+/// How many sealed messages a read may take from sealed segments while reads come from memory
+/// only (see `Session::unjoined_entries`): a few blocks of sealed objects that never change. A
+/// longer page refuses there, and is read from storage by the session's reader.
+const SEALED_ENTRIES_IN_MEMORY: usize = 32;
+
 /// How many directory pages a session keeps while open: enough for the transcript and ledger
 /// directories' paths that one page read walks.
 const DIRECTORY_PAGES_KEPT: usize = 32;
@@ -533,8 +538,10 @@ impl<B: SessionBackend> Session<B> {
         // Directory pages come from those the session keeps, so a page of entries after the first
         // reads only its blocks. A read that fails hands none back; the next starts with none.
         let mut memo = self.take_pages();
-        while next < window && out.len() < limit {
+        if next < window && limit > SEALED_ENTRIES_IN_MEMORY {
             self.storage_read()?;
+        }
+        while next < window && out.len() < limit {
             let damaged = || SessionError::Fold(format!("no sealed segment places message {next}"));
             let sought = next;
             let entry = pages
@@ -869,11 +876,14 @@ impl<B: SessionBackend> Session<B> {
     /// The ordinal of the message with id `mid`, whose id names seq `seq`: the `EntryFacts`
     /// record at `seq`, or the first `EntryFacts` carrying `mid` after the step's or batch's
     /// start at `seq` that announced it. Read from the window, else from sealed segments.
+    ///
+    /// The sealed read goes to the backend even while reads come from memory only (see
+    /// [`Session::in_memory`]): it starts at the block holding `seq` and stops after
+    /// [`ANNOUNCED_FACTS_READ`] facts, a few small reads of sealed objects that never change.
     async fn facts_ordinal(&self, seq: u64, mid: &str) -> Result<Option<u64>, SessionError> {
         if let Some(ordinal) = self.window.facts.get(&seq) {
             return Ok(Some(*ordinal));
         }
-        self.storage_read()?;
         let key = self.key.frame_key();
         let pages = Pages {
             backend: &self.backend,
@@ -930,7 +940,7 @@ impl<B: SessionBackend> Session<B> {
             // A window message whose content was released reads back from the open log.
             return Box::pin(self.window_message_whole(ordinal)).await.map(Some);
         }
-        self.storage_read()?;
+        // One sealed message: a few blocks, read from memory only too.
         let key = self.key.frame_key();
         let pages = Pages {
             backend: &self.backend,
@@ -1042,13 +1052,16 @@ impl<B: SessionBackend> Session<B> {
     /// The record of `stream` at `seq` of the open log, read back from where its frame lies:
     /// one ranged read of the log. The writer appended it, so a frame that doesn't read back as
     /// that record is damage.
+    ///
+    /// This read goes to the backend even while reads come from memory only (see
+    /// [`Session::in_memory`]): it reads one record's bytes, where refusing it sent the whole
+    /// read to a load of the whole session.
     async fn open_record(
         &self,
         seq: u64,
         place: crate::log::FramePlace,
         stream: crate::frame::FrameStream,
     ) -> Result<Record, SessionError> {
-        self.storage_read()?;
         idindex::count_open_record_read();
         let bytes = self
             .backend
