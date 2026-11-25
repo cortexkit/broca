@@ -271,9 +271,10 @@ fn a_sealed_views_open_log_reads_back_only_its_checkpoint_frame(cipher: Cipher) 
     });
 }
 
-/// After a seal the sealed history is read from storage: reading from memory only refuses it, and
-/// the records kept before the seal are dropped, since the new log was copied, not appended. A run
-/// started after the seal is kept again.
+/// After a seal the sealed history is read from storage: reading from memory only refuses a page of
+/// it, while a lookup of an id that names a few sealed records still reads them, and the records
+/// kept before the seal are dropped, since the new log was copied, not appended. A run started
+/// after the seal is kept again.
 fn a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history(cipher: Cipher) {
     let backend = MemoryBackend::default();
     block_on(async {
@@ -281,21 +282,22 @@ fn a_seal_drops_the_kept_records_and_memory_only_refuses_sealed_history(cipher: 
         session.seal(Some(starts[2] + 1), 1_000).await.unwrap();
         assert_eq!(session.kept_records(), 0);
         assert_eq!(session.kept_run_start("c"), None);
-        {
+        let found = {
             let _memory = session.in_memory();
             assert!(matches!(
                 session.entries(1, 1).await,
                 Err(SessionError::NotInMemory)
             ));
-            assert!(matches!(
-                session.find_id(IdKind::RunId, "a").await,
-                Err(SessionError::NotInMemory)
-            ));
+            // An id lookup reads the sealed id index and the few blocks holding its records.
+            let found = session.find_id(IdKind::RunId, "a").await.unwrap();
+            assert!(!found.is_empty());
             // The window is in memory.
             let window = session.conversation.window_start();
             assert_eq!(session.entries(window, 1).await.unwrap().len(), 1);
-        }
-        // The guard is gone: storage is read again.
+            found
+        };
+        // The guard is gone: storage is read again, and the lookup finds the same records.
+        assert_eq!(session.find_id(IdKind::RunId, "a").await.unwrap(), found);
         assert_eq!(session.entries(1, 1).await.unwrap().len(), 1);
 
         session.append(&[end("c")], true).await.unwrap();

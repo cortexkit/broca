@@ -1135,6 +1135,31 @@ async fn every_read_equals_a_fresh_views_at_every_step() {
         .await,
         StoreReadOutcome::Stored { .. }
     ));
+    // A status read that looks ids up in the sealed id index is answered by the actor, both for
+    // a sealed run and for a send the session never took, asked by a module as a sender asks
+    // after its sends: such a lookup is a few small reads of sealed objects, not a load of the
+    // whole session.
+    for request in [
+        StoreReadRequest::RunStatusReply(RunId("r1".into())),
+        StoreReadRequest::SendStatus {
+            own_run: RunId("never-sent".into()),
+            send_id: "never-sent".into(),
+            principal: Some(super::differential::core()),
+        },
+    ] {
+        assert!(
+            matches!(
+                m.ask_actor(request.clone()).await,
+                StoreReadOutcome::Served(_)
+            ),
+            "{request:?} is answered by the actor"
+        );
+        assert_eq!(
+            shape(m.served(&request).await),
+            shape(m.fresh(&request).await),
+            "{request:?}"
+        );
+    }
     m.gate.notify_one();
     m.ended("r3", "completed").await;
     m.compare(&reads(&["r1", "r2", "r3"]), "r3 ended over sealed history")

@@ -186,6 +186,11 @@ struct KeptReads {
 /// How many sealed run starts a session keeps while open: the few runs its callers ask about.
 const RUN_STARTS_KEPT: usize = 16;
 
+/// How many sealed records an id may name for its lookup to read them while reads come from
+/// memory only (see `Session::sealed_found`). An id that names more, such as a long run's id,
+/// reads as many blocks, and refuses there as before.
+const SEALED_LOOKUP_IN_MEMORY: usize = 32;
+
 /// How many directory pages a session keeps while open: enough for the transcript and ledger
 /// directories' paths that one page read walks.
 const DIRECTORY_PAGES_KEPT: usize = 32;
@@ -1145,6 +1150,13 @@ impl<B: SessionBackend> Session<B> {
     }
 
     /// The sealed ledger records that name `id` as a `kind`, through the sealed id index.
+    ///
+    /// This lookup reads the backend even while reads come from memory only (see
+    /// [`Session::in_memory`]), as long as the id names at most [`SEALED_LOOKUP_IN_MEMORY`]
+    /// records: the index pages and the blocks holding those records are a few small reads of
+    /// sealed objects that never change. Most lookups find nothing there (a status poll asks
+    /// after ids a session never used), and refusing them sent every such read on a session with
+    /// sealed history to a load of the whole session.
     async fn sealed_found(
         &self,
         kind: IdKind,
@@ -1152,7 +1164,6 @@ impl<B: SessionBackend> Session<B> {
     ) -> Result<Vec<(u64, Record)>, SessionError> {
         let mut found = Vec::new();
         if let Some(root_name) = &self.head.id_index {
-            self.storage_read()?;
             let key = self.key.frame_key();
             let index = IndexPages {
                 backend: &self.backend,
@@ -1166,6 +1177,9 @@ impl<B: SessionBackend> Session<B> {
                 .lookup(&root, &hash)
                 .await
                 .map_err(SessionError::Index)?;
+            if seqs.len() > SEALED_LOOKUP_IN_MEMORY {
+                self.storage_read()?;
+            }
             for (seq, record) in self.ledger_records(&seqs).await? {
                 if idindex::names(&record, kind, id) {
                     found.push((seq, record));
