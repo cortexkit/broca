@@ -250,6 +250,7 @@ impl FileCutArtifacts {
                 )
                 .map_err(unavailable)?
                 .map_err(unavailable)?;
+                self.registry.end_parked_subscribers(&plan.session);
                 moves::freeze(&backend, &addr, version, cut, runtime.deployment())
                     .await
                     .map_err(failure)?;
@@ -272,6 +273,7 @@ impl FileCutArtifacts {
                 )
                 .await
                 .map_err(failure)?;
+                self.registry.end_parked_subscribers(&plan.session);
                 move_fence::release(&self.state_root, &sidecar, cut, &holder)
                     .map_err(unavailable)?
                     .map_err(unavailable)?;

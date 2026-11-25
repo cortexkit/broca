@@ -1646,8 +1646,10 @@ One in-process actor per open session, reached through a registry; every `sessio
 `run.*` op for the session goes through it. The registry's slot states, the actor's lease and
 when it closes, and how races between a send, a close and a reopen resolve are described in
 [session actors](session-actors.md) §2-3. A subscriber across a close has its route closed and
-resubscribes from its durable cursor on re-open. Durable queued work also wakes the actor, even
-when the latest run has already finished, so a crash cannot leave the queue idle.
+resubscribes from its durable cursor on re-open. Parking an idle actor is the exception: the
+subscriber's route stays open while the registry waits for the actor to reopen. Durable queued
+work also wakes the actor, even when the latest run has already finished, so a crash cannot
+leave the queue idle.
 
 ## 13. Cancel token + provider watchdog (core change)
 

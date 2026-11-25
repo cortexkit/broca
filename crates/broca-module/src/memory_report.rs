@@ -1,7 +1,7 @@
 //! `memory.report`: what the daemon's open sessions and shared caches hold in memory.
 //!
-//! Every number is an estimate made by walking the structures when the report is asked for (see
-//! `broca_session_store::held`); nothing on a step's or an append's path keeps a count for it.
+//! Held sizes are estimated by walking the structures when the report is asked for (see
+//! `broca_session_store::held`). The report also includes registry counts.
 //! The report carries sizes and counts only: no content, no message ids, nothing from a
 //! transcript. A session is named by its store address.
 
@@ -115,6 +115,8 @@ pub fn assemble(
         settled_runs,
         setup_stores: Vec::new(),
         kept_heads: None,
+        parked_subscribers: Default::default(),
+        actor_close_reasons: Default::default(),
     }
 }
 
@@ -155,6 +157,8 @@ impl crate::LineageRegistry {
         let mut report = assemble(answers, unanswered, views, settled);
         report.setup_stores = setup_stores;
         report.kept_heads = kept_heads;
+        report.parked_subscribers = self.parked_subscriber_counts();
+        report.actor_close_reasons = self.actor_close_reasons();
         report
     }
 }

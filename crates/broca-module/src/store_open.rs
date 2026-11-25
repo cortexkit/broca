@@ -1239,6 +1239,7 @@ impl StoreRuntime {
         let first_episode = actor
             .first_episode_handle(&registry)
             .map_err(OpenError::Open)?;
+        let actor = actor.with_parked(registry.take_parked_subscribers(key));
         let (tx, commands) = mpsc::channel(COMMANDS);
         let run_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let life = Lifecycle {

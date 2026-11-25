@@ -1,7 +1,6 @@
-//! A subscriber keeps an idle session in the session store open, as on today's storage: its actor
-//! doesn't close at an idle deadline or an idle tick while the subscriber holds its stream, and
-//! closes at the first idle deadline after the subscriber has gone. A module stop still closes
-//! it and ends the subscription.
+//! A subscriber keeps an idle session open past its ordinary idle deadline, before it is old
+//! enough to park. If the subscriber leaves first, the actor closes on the next deadline.
+//! A module stop closes the actor and ends the subscription.
 
 use std::time::Duration;
 

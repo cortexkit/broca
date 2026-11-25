@@ -270,6 +270,7 @@ enum Exit {
     Closed,
     /// The session went idle at its idle deadline.
     Idle,
+    Parked(Vec<crate::store_fanout::ParkedSubscription>),
     /// The module is stopping.
     Stop,
     Expired(u64),
@@ -634,9 +635,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// Work that keeps this session open past its idle deadline: a run, an owed sign-in
     /// probe, a warm, an account-limit timer, or a subscriber.
-    /// A subscriber keeps the session open while its stream is attached, so a caller
-    /// watching an idle session isn't cut off at its idle deadline; the first idle deadline after
-    /// the last one has gone closes it. Empty when the session may close.
+    /// A subscriber holds the actor until the stream can be parked without losing any controls.
     fn idle_holds(&mut self) -> Vec<&'static str> {
         let mut holds = Vec::new();
         if self.sign_in_open_owed
@@ -713,8 +712,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     /// Serves the session as the module's actor for it, until it closes idle or the module
-    /// stops, then gives its registry slot up. A subscriber attached to the session keeps it
-    /// from closing idle; a module stop still closes it, ending every subscription. The
+    /// stops, then gives its registry slot up. Idle subscribers can wait in the registry instead
+    /// of keeping the actor open; a module stop still ends every subscription. The
     /// session is closed and the executor told before the lease goes, and only then does the
     /// slot read closed, so a reopen never finds another writer still on the session.
     pub async fn serve_in_registry(mut self, commands: impl Into<Commands>, life: Lifecycle) {
@@ -735,7 +734,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             self.finish_pending_warm().await;
         }
         let stop_reason = match &exit {
-            Exit::Idle => None,
+            Exit::Idle | Exit::Parked(_) => None,
             Exit::Expired(_) => Some("expired"),
             Exit::Cut(_) => Some("released_or_moving"),
             Exit::Closed => Some("released"),
@@ -745,7 +744,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             life.registry.stop_idle_warm(&self.key, reason);
         }
         let close = match &exit {
-            Exit::Idle | Exit::Expired(_) | Exit::Cut(_) => {
+            Exit::Idle | Exit::Parked(_) | Exit::Expired(_) | Exit::Cut(_) => {
                 life.registry.begin_close(&self.key, life.gen)
             }
             Exit::Closed | Exit::Stop => None,
@@ -787,7 +786,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if !self.session.unsynced() {
             self.retire_recovery();
         }
-        if matches!(exit, Exit::Idle) && !untouched {
+        if matches!(exit, Exit::Idle | Exit::Parked(_)) && !untouched {
             self.keep_closing_head(&life.registry);
         }
         let release_waiter = self.release_waiter.take();
@@ -818,19 +817,28 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             };
             let _ = reply.send(crate::actor::ReleaseOutcome::Released(state));
         }
-        if let Exit::Cut(reply) = exit {
-            if let Some(close) = close {
-                let (release, _) = oneshot::channel();
-                let _ = reply.send(crate::actor::CutLockReply {
-                    busy: None,
-                    release,
-                    retired: Some(crate::actor::RetiredForCut {
-                        tenure: Some(crate::actor::CutTenure::store(life.lease)),
-                        close,
-                    }),
-                });
-                return;
+        life.registry.note_actor_close(exit.close_reason());
+        match exit {
+            Exit::Cut(reply) => {
+                if let Some(close) = close {
+                    let (release, _) = oneshot::channel();
+                    let _ = reply.send(crate::actor::CutLockReply {
+                        busy: None,
+                        release,
+                        retired: Some(crate::actor::RetiredForCut {
+                            tenure: Some(crate::actor::CutTenure::store(life.lease)),
+                            close,
+                        }),
+                    });
+                    return;
+                }
             }
+            Exit::Parked(parked) if close.is_some() && !untouched => {
+                // Publish under the lease, so a sweep cannot delete this session before it
+                // can find its subscribers, or a reopening actor start without them.
+                life.registry.park_subscribers(&key, parked);
+            }
+            _ => {}
         }
         drop(life.lease);
         match close {
@@ -876,7 +884,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self.collect_due = true;
         self.report_open_pause().await;
         let idle_after = |now: tokio::time::Instant| idle_ttl.map(|ttl| now + ttl);
-        let mut idle_deadline = idle_after(tokio::time::Instant::now());
+        let mut idle_since = tokio::time::Instant::now();
+        let mut idle_deadline = idle_after(idle_since);
         // What the registry was last told holds the session open; `None` until it took a note,
         // which it refuses until this actor's slot reads open.
         let mut noted: Option<Vec<&'static str>> = None;
@@ -980,12 +989,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     }, if !has_warm => Event::IdleDeadline,
                 },
             };
+            let worked = !matches!(event, Event::IdleDeadline | Event::Collect);
             match event {
-                // A subscriber still attached keeps the session open: the next deadline closes
-                // it once every subscriber has gone.
                 Event::IdleDeadline => {
-                    if self.idle_holds().is_empty() {
-                        return Exit::Idle;
+                    if let Some(exit) = self.at_idle_deadline(idle_since.elapsed()).await {
+                        return exit;
                     }
                     idle_deadline = idle_after(tokio::time::Instant::now());
                 }
@@ -1038,6 +1046,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         {
                             let _ = released.await;
                         }
+                        idle_since = tokio::time::Instant::now();
                         continue;
                     }
                     if self.handle(command).await {
@@ -1055,6 +1064,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 }
             }
             self.retry_views().await;
+            if worked {
+                idle_since = tokio::time::Instant::now();
+            }
             if self.closes_now().await {
                 return Exit::Idle;
             }
@@ -4735,6 +4747,7 @@ mod keep_warm;
 mod memory;
 mod moved_here;
 mod ordered;
+mod park;
 mod pauses;
 mod queued;
 pub(crate) mod recorded_warm;
@@ -4778,6 +4791,8 @@ mod memory_tests;
 mod moved_here_tests;
 #[cfg(test)]
 mod new_heads_tests;
+#[cfg(test)]
+mod parked_tests;
 #[cfg(test)]
 mod pauses_tests;
 #[cfg(test)]

@@ -49,10 +49,15 @@ process cannot open the session while it is held.
 
 **When it closes.** An actor that has been idle for its idle period (30 seconds by default)
 closes, unless something holds it open: a running run, a live subscriber, a warm-up the
-caller asked for (requests that keep the provider's prompt cache from expiring), the timer that resumes a run paused on an account limit, or a sign-in check
-that is still owed. A queued send that will start a run keeps the actor serving through that
-run. An actor also stops when its command channel closes, at shutdown, when retention expires
-its session, and when a move to another computer cuts the session.
+caller asked for (requests that keep the provider's prompt cache from expiring), the timer that
+resumes a run paused on an account limit, or a sign-in check that is still owed. If subscribers
+are the only hold for a session idle for five minutes, the actor closes once they finish catching
+up and the registry keeps their streams open. On reopen the new actor attaches them before any
+command, after the last control it delivered (or from the original attach point if it delivered
+none). Only the actor can write records, so none are missed while the session is closed.
+A queued send that will start a run keeps the actor serving through that run. An actor also stops
+when its command channel closes, at shutdown, when retention expires its session, and when a
+move to another computer cuts the session.
 
 **Teardown order.** The actor marks its slot `Closing`, stops its work, runs the executor's close
 hook (bounded at five seconds), closes the session, releases the lease, and only then clears the

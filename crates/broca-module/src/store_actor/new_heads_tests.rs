@@ -117,6 +117,16 @@ pub(super) async fn send(
 }
 
 impl Module {
+    pub(super) fn leases(&self) -> FileLeaseStore {
+        FileLeaseStore::new(self.dir.join("leases"))
+    }
+
+    pub(super) fn install_retention(&self) {
+        self.registry.set_retention_service(Arc::new(
+            crate::retention::RetentionService::new(&self.dir, Arc::new(self.leases())).unwrap(),
+        ));
+    }
+
     /// Waits until the session's actor has closed and left the registry.
     pub(super) async fn closed(&self) {
         for _ in 0..1000 {

@@ -418,6 +418,7 @@ pub trait SessionInventoryReadiness: Send + Sync {
 
 mod idle_warm;
 pub(crate) mod media_head;
+mod parked;
 pub mod store_move;
 pub mod store_restore;
 
@@ -1274,6 +1275,8 @@ impl LineageRegistry {
                 tool_route_health: std::sync::OnceLock::new(),
                 actor_idle_holds: Mutex::new(HashMap::new()),
                 waiting_subscribers: Mutex::new(HashMap::new()),
+                parked_subscribers: parked::Parked::default(),
+                actor_close_reasons: Mutex::default(),
                 idle_warms: Mutex::new(HashMap::new()),
                 idle_warm_stops: Mutex::new(HashSet::new()),
                 batches_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -2632,6 +2635,7 @@ impl LineageRegistry {
             .await;
         }
         self.inner.seal.cancel();
+        self.clear_parked_subscribers();
         self.inner.opener.retire_all_transports();
         loop {
             let counts = self.slot_counts();
@@ -3112,13 +3116,14 @@ impl LineageRegistry {
     /// uses the same expiry clock.
     pub fn set_retention_service(&self, service: Arc<crate::retention::RetentionService>) {
         let inner = Arc::downgrade(&self.inner);
-        service.set_evictor(Arc::new(move |key| {
+        service.set_evictor(Arc::new(move |key, expired_at_ms| {
             if let Some(inner) = inner.upgrade() {
                 let registry = LineageRegistry { inner };
                 // Deletion invokes this callback while it still holds the session lease.
                 // Repeated cache eviction after that lease is released must not close routes
                 // belonging to a session recreated at the same address.
                 if registry.evict_retention_caches(key) {
+                    registry.expire_parked_subscribers(key, expired_at_ms);
                     registry.inner.opener.on_session_deleted(key);
                 }
             }
@@ -3303,6 +3308,8 @@ struct Inner {
     /// Subscribers to sessions nothing has written yet, by session. They are attached from the
     /// session's start once its first send creates it.
     waiting_subscribers: Mutex<HashMap<LineageKey, Vec<mpsc::Sender<crate::fanout::Delivery>>>>,
+    parked_subscribers: parked::Parked,
+    actor_close_reasons: Mutex<std::collections::BTreeMap<&'static str, u64>>,
     idle_warms: Mutex<HashMap<LineageKey, idle_warm::Scheduled>>,
     idle_warm_stops: Mutex<HashSet<LineageKey>>,
     /// Raised and lowered by the System One batch service (`classify.run` on the classifier

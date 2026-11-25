@@ -57,6 +57,10 @@ use crate::fanout::{
 };
 use crate::store_control::{StoreControl, StoreUnit};
 
+mod park;
+pub(crate) use park::ParkedSubscription;
+use park::{LiveRing, Progress, Subscriber};
+
 /// What a store session's cursors carry besides their position.
 #[derive(Clone)]
 pub(crate) struct CursorIdentity {
@@ -165,7 +169,7 @@ pub(crate) struct Publisher {
     /// Batches appended without a barrier, published once a barrier makes them durable.
     unsynced: Vec<(u64, Vec<Record>)>,
     live_attaches: LiveAttaches,
-    ring: broadcast::Sender<LiveItem>,
+    ring: LiveRing,
     display: DisplaySender,
     /// The id of the message the current step writes, which its display deltas name.
     display_mid: Arc<Mutex<Option<String>>>,
@@ -207,7 +211,7 @@ impl Publisher {
                     match publish(
                         projection,
                         &self.identity,
-                        &self.ring,
+                        &mut self.ring,
                         first,
                         &records,
                         &mut self.live_attaches,
@@ -250,7 +254,7 @@ impl Publisher {
         for (_, answer) in std::mem::take(&mut self.live_attaches) {
             let _ = answer.send(Err(SEED_FAILED.into()));
         }
-        let _ = self.ring.send(LiveItem::Detach);
+        self.ring.send(LiveItem::Detach);
     }
 
     /// Starts seeding the live projection from a catch-up through the barrier just taken, when
@@ -288,7 +292,7 @@ impl Publisher {
             match publish(
                 &mut projection,
                 &self.identity,
-                &self.ring,
+                &mut self.ring,
                 first,
                 &records,
                 &mut self.live_attaches,
@@ -325,7 +329,7 @@ impl Publisher {
 fn publish(
     projection: &mut LiveProjection,
     identity: &CursorIdentity,
-    ring: &broadcast::Sender<LiveItem>,
+    ring: &mut LiveRing,
     first: u64,
     records: &[Record],
     attaches: &mut LiveAttaches,
@@ -333,7 +337,7 @@ fn publish(
     for (offset, record) in records.iter().enumerate() {
         let seq = first + offset as u64;
         for event in projection.project(seq, record, records.get(offset + 1), identity)? {
-            let _ = ring.send(LiveItem::Unit(event));
+            ring.send(LiveItem::Unit(event));
         }
         projection.answer_attaches(attaches);
     }
@@ -348,13 +352,7 @@ pub(crate) struct StoreFanout<B> {
     display_mid: Arc<Mutex<Option<String>>>,
     /// Handles on the session's storage that only read, one per catch-up.
     readers: Arc<dyn Fn() -> B + Send + Sync>,
-    // Only expiry upgrades the weak sender, before stopping the task. Keeping a strong sender
-    // here would leave a finished stream's channel open until the fanout itself was dropped.
-    subscribers: Vec<(
-        CancellationToken,
-        JoinHandle<()>,
-        mpsc::WeakSender<Delivery>,
-    )>,
+    subscribers: Vec<Subscriber>,
     /// Holds each seeding until notified, so a test can read while nothing is seeded.
     #[cfg(test)]
     seed_gate: Option<Arc<tokio::sync::Notify>>,
@@ -401,7 +399,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             seedings: 0,
             unsynced: Vec::new(),
             live_attaches: Vec::new(),
-            ring: broadcast::channel(crate::fanout::RING_CAPACITY).0,
+            ring: LiveRing::new(),
             display: display.clone(),
             display_mid: Arc::clone(&display_mid),
             identity: CursorIdentity::of(session),
@@ -490,10 +488,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         from: AttachFrom,
         sink: mpsc::Sender<Delivery>,
     ) {
-        self.subscribers.retain(|(_, task, _)| !task.is_finished());
+        self.has_live_subscribers();
         // The live projection a subscriber's stream continues from.
         self.ensure_seeded(session);
-        let (rx, identity, head, live_replay) = {
+        let (rx, position, identity, head, live_replay) = {
             let mut publisher = self.publisher.lock().unwrap();
             let rx = publisher.ring.subscribe();
             let head = publisher.durable_end(session.next_seq().saturating_sub(1));
@@ -515,24 +513,39 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             } else {
                 None
             };
-            (rx, publisher.identity.clone(), head, live_replay)
+            (
+                rx,
+                publisher.ring.position(),
+                publisher.identity.clone(),
+                head,
+                live_replay,
+            )
         };
         let cancel = CancellationToken::new();
         let terminal = sink.downgrade();
-        let task = subscriber(Attach {
-            labels: self.labels.clone(),
-            from,
-            head,
-            rx,
+        let progress = Arc::new(Progress::default());
+        let task = subscriber(
+            Attach {
+                labels: self.labels.clone(),
+                from,
+                head,
+                rx,
+                position,
+                progress: Arc::clone(&progress),
+                reader: session.stored_records((self.readers)()),
+                identity,
+                display: self.display.clone(),
+                cancel: cancel.clone(),
+                live_replay,
+            },
             sink,
-            reader: session.stored_records((self.readers)()),
-            identity,
-            display: self.display.clone(),
-            cancel: cancel.clone(),
-            live_replay,
+        );
+        self.subscribers.push(Subscriber {
+            cancel,
+            task: tokio::spawn(task),
+            terminal,
+            progress,
         });
-        self.subscribers
-            .push((cancel, tokio::spawn(task), terminal));
     }
 
     /// Whether any subscriber is still attached. A subscriber's task is all there is of it: the
@@ -540,7 +553,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
     /// read access ending) or when this fanout is dropped. Finished tasks are let go of here, so
     /// a session held open for its subscribers keeps no entry for the ones that left.
     pub(crate) fn has_live_subscribers(&mut self) -> bool {
-        self.subscribers.retain(|(_, task, _)| !task.is_finished());
+        self.subscribers.retain(|sub| !sub.task.is_finished());
         !self.subscribers.is_empty()
     }
 
@@ -573,12 +586,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
             + live
             + publisher.unsynced.heap_bytes()
             + publisher.ring.len() * std::mem::size_of::<LiveItem>()
-            + self.subscribers.capacity()
-                * std::mem::size_of::<(
-                    CancellationToken,
-                    JoinHandle<()>,
-                    mpsc::WeakSender<Delivery>,
-                )>()
+            + self.subscribers.capacity() * std::mem::size_of::<Subscriber>()
     }
 
     /// The display lane's sender and the step its deltas belong to, for a run's output drain.
@@ -592,7 +600,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         let subscribers: Vec<_> = self
             .subscribers
             .drain(..)
-            .map(|(cancel, task, sink)| (cancel, task, sink.upgrade()))
+            .map(|sub| (sub.cancel, sub.task, sub.terminal.upgrade()))
             .collect();
         for (cancel, _, _) in &subscribers {
             cancel.cancel();
@@ -616,8 +624,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
     /// changes the owner.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn end_read_access(&mut self, refusal: broca_core::ScopeRefusal) {
-        let publisher = self.publisher.lock().unwrap();
-        let _ = publisher
+        let mut publisher = self.publisher.lock().unwrap();
+        publisher
             .ring
             .send(LiveItem::AccessEnded(Box::new(refusal)));
     }
@@ -625,8 +633,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
     /// Wake idle streams after durable policy acceptance. Each route checks its own caller,
     /// leaving subscribers whose admission is unchanged connected.
     pub(crate) fn recheck_read_access(&self) {
-        let _ = self
-            .publisher
+        self.publisher
             .lock()
             .unwrap()
             .ring
@@ -639,8 +646,8 @@ impl<B> Drop for StoreFanout<B> {
         for (_, answer) in std::mem::take(&mut self.publisher.lock().unwrap().live_attaches) {
             let _ = answer.send(Err(SEED_FAILED.into()));
         }
-        for (cancel, _, _) in &self.subscribers {
-            cancel.cancel();
+        for sub in &self.subscribers {
+            sub.cancel.cancel();
         }
     }
 }
@@ -672,7 +679,8 @@ struct Attach<R> {
     /// The barrier: the session's durable end when the subscriber's receiver was registered.
     head: u64,
     rx: broadcast::Receiver<LiveItem>,
-    sink: mpsc::Sender<Delivery>,
+    position: u64,
+    progress: Arc<Progress>,
     reader: StoredRecords<R>,
     identity: CursorIdentity,
     display: DisplaySender,
@@ -1030,13 +1038,28 @@ fn catch_up<R: SessionBackend>(
 }
 
 /// One subscriber: its catch-up through the barrier, then the live stream.
-async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>) {
+async fn subscriber<R: SessionBackend + Send + Sync + 'static>(
+    attach: Attach<R>,
+    sink: mpsc::Sender<Delivery>,
+) -> Option<ParkedSubscription> {
+    let mut resume = attach.from;
+    let progress = Arc::clone(&attach.progress);
+    subscriber_stream(attach, &sink, &mut resume).await;
+    (progress.parking() && !sink.is_closed()).then_some(ParkedSubscription { sink, from: resume })
+}
+
+async fn subscriber_stream<R: SessionBackend + Send + Sync + 'static>(
+    attach: Attach<R>,
+    sink: &mpsc::Sender<Delivery>,
+    resume: &mut AttachFrom,
+) {
     let Attach {
         labels,
         from,
         head,
         mut rx,
-        sink,
+        mut position,
+        progress,
         reader,
         identity,
         display,
@@ -1059,7 +1082,7 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
             }
         };
         for unit in units {
-            if deliver(&sink, &cancel, Delivery::Control(unit))
+            if park::deliver_control(sink, &cancel, unit, resume)
                 .await
                 .is_break()
             {
@@ -1104,7 +1127,7 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
             match chunk {
                 Some(CatchUp::Units(units)) => {
                     for unit in units {
-                        if deliver(&sink, &cancel, Delivery::Control(Arc::new(unit)))
+                        if park::deliver_control(sink, &cancel, Arc::new(unit), resume)
                             .await
                             .is_break()
                         {
@@ -1114,16 +1137,16 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
                 }
                 Some(CatchUp::Done) => break,
                 Some(CatchUp::CursorExpired) => {
-                    let _ = deliver(&sink, &cancel, Delivery::CursorExpired).await;
+                    let _ = deliver(sink, &cancel, Delivery::CursorExpired).await;
                     return;
                 }
                 Some(CatchUp::Failed(error)) => {
-                    let _ = deliver(&sink, &cancel, Delivery::Error(error)).await;
+                    let _ = deliver(sink, &cancel, Delivery::Error(error)).await;
                     return;
                 }
                 None => {
                     let error = "the catch-up task failed".to_owned();
-                    let _ = deliver(&sink, &cancel, Delivery::Error(error)).await;
+                    let _ = deliver(sink, &cancel, Delivery::Error(error)).await;
                     return;
                 }
             }
@@ -1135,7 +1158,7 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
     };
     let (mut display_rx, snapshot) = display.subscribe_snapshot();
     for event in snapshot {
-        if deliver(&sink, &cancel, Delivery::Display(Arc::new(event)))
+        if deliver(sink, &cancel, Delivery::Display(Arc::new(event)))
             .await
             .is_break()
         {
@@ -1143,49 +1166,53 @@ async fn subscriber<R: SessionBackend + Send + Sync + 'static>(attach: Attach<R>
         }
     }
     let mut display_open = true;
+    progress.reached(position);
     loop {
         tokio::select! {
             // A queued read-policy change must reach the forwarder before another display delta.
             biased;
             _ = cancel.cancelled() => return,
             _ = sink.closed() => return,
-            item = rx.recv() => match item {
-                Ok(LiveItem::Unit(event)) => {
-                    // The barrier: a unit at or before the head came with the catch-up.
-                    if !deliver_from_ring(event.0, head, from) {
-                        continue;
+            item = rx.recv() => {
+                match item {
+                    Ok(LiveItem::Unit(event)) => {
+                        // The barrier: a unit at or before the head came with the catch-up.
+                        if deliver_from_ring(event.0, head, from)
+                            && park::deliver_control(sink, &cancel, event, resume).await.is_break()
+                        {
+                            return;
+                        }
                     }
-                    if deliver(&sink, &cancel, Delivery::Control(event)).await.is_break() {
+                    Ok(LiveItem::AdmissionChanged) => {
+                        if deliver(sink, &cancel, Delivery::AdmissionChanged).await.is_break() {
+                            return;
+                        }
+                    }
+                    // A control unit was missed: never deliver what follows as contiguous.
+                    Ok(LiveItem::Detach) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = deliver(sink, &cancel, Delivery::Detached).await;
                         return;
                     }
-                }
-                Ok(LiveItem::AdmissionChanged) => {
-                    if deliver(&sink, &cancel, Delivery::AdmissionChanged).await.is_break() {
+                    Ok(LiveItem::AccessEnded(refusal)) => {
+                        let _ = deliver(sink, &cancel, Delivery::AccessEnded(refusal)).await;
                         return;
                     }
+                    // The session closed.
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
-                // A control unit was missed: never deliver what follows as contiguous.
-                Ok(LiveItem::Detach) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let _ = deliver(&sink, &cancel, Delivery::Detached).await;
-                    return;
-                }
-                Ok(LiveItem::AccessEnded(refusal)) => {
-                    let _ = deliver(&sink, &cancel, Delivery::AccessEnded(refusal)).await;
-                    return;
-                }
-                // The session closed.
-                Err(broadcast::error::RecvError::Closed) => return,
+                position += 1;
+                progress.reached(position);
             },
             event = display_rx.recv(), if display_open => match event {
                 Ok(event) => {
-                    if deliver(&sink, &cancel, Delivery::Display(event)).await.is_break() {
+                    if deliver(sink, &cancel, Delivery::Display(event)).await.is_break() {
                         return;
                     }
                 }
                 // Display is lossy: a gap is reported in band, never a detach.
                 Err(broadcast::error::RecvError::Lagged(dropped)) => {
                     let gap = broca_protocol::display::DisplayEvent::DisplayGap { dropped };
-                    if deliver(&sink, &cancel, Delivery::Display(Arc::new(gap))).await.is_break() {
+                    if deliver(sink, &cancel, Delivery::Display(Arc::new(gap))).await.is_break() {
                         return;
                     }
                 }

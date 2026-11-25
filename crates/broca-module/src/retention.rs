@@ -142,7 +142,7 @@ impl PolicyFold {
     }
 }
 
-type EvictCaches = dyn Fn(&BindIdentity) + Send + Sync;
+type EvictCaches = dyn Fn(&BindIdentity, u64) + Send + Sync;
 
 type AcquireLease = dyn Fn(&BindIdentity) -> Result<Box<dyn LeaseHandle>, String> + Send + Sync;
 

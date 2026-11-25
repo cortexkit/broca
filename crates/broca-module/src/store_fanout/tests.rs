@@ -46,7 +46,7 @@ fn unit(seq: u64) -> LiveItem {
 }
 
 fn publish(fanout: &StoreFanout<&'static MemoryBackend>, item: LiveItem) {
-    let _ = fanout.publisher.lock().unwrap().ring.send(item);
+    fanout.publisher.lock().unwrap().ring.send(item);
 }
 
 /// The control deliveries `deliveries` holds until it ends or stays quiet, display left out.

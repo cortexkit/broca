@@ -132,6 +132,9 @@ impl LineageRegistry {
         let busy = guard.busy.iter().find_map(|(_, reason)| reason.clone());
         let handed = guard.holds_tenure(key);
         fence.guard = Some(guard);
+        if let Some(reason) = self.restore_subscriber_busy(key) {
+            return Err(FenceRefusal::Busy(reason.into()));
+        }
         if let Some(reason) = busy {
             return Err(FenceRefusal::Busy(reason));
         }

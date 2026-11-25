@@ -44,6 +44,18 @@ pub struct MemoryReport {
     /// kept, and what the kept heads hold. Absent from a broca that keeps no heads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_heads: Option<KeptHeadCounts>,
+    /// Subscriptions waiting for a closed session to reopen.
+    #[serde(default)]
+    pub parked_subscribers: ParkedSubscriberCounts,
+    /// Lifetime store actor closes, by reason (`parked` means subscribers kept their streams).
+    #[serde(default)]
+    pub actor_close_reasons: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedSubscriberCounts {
+    pub sessions: u64,
+    pub subscriptions: u64,
 }
 
 /// `session.head` reads of sessions no actor holds since broca started: those a kept head
@@ -280,4 +292,41 @@ pub struct ViewLoads {
     /// Reads for this reason served a kept view, or a load already started, instead of loading.
     #[serde(default)]
     pub hits: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parking_counts_round_trip_and_default_for_older_memory_reports() {
+        let report = MemoryReport {
+            parked_subscribers: ParkedSubscriberCounts {
+                sessions: 1,
+                subscriptions: 2,
+            },
+            actor_close_reasons: [("parked".into(), 7)].into(),
+            ..MemoryReport::default()
+        };
+        let mut wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            wire["parked_subscribers"],
+            serde_json::json!({"sessions": 1, "subscriptions": 2})
+        );
+        assert_eq!(
+            wire["actor_close_reasons"],
+            serde_json::json!({"parked": 7})
+        );
+        assert_eq!(
+            serde_json::from_value::<MemoryReport>(wire.clone()).unwrap(),
+            report
+        );
+        let fields = wire.as_object_mut().unwrap();
+        fields.remove("parked_subscribers");
+        fields.remove("actor_close_reasons");
+        assert_eq!(
+            serde_json::from_value::<MemoryReport>(wire).unwrap(),
+            MemoryReport::default()
+        );
+    }
 }

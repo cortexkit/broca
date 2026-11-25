@@ -1471,6 +1471,22 @@ fn memory_table(report: &broca_module_serve::wire::MemoryReport) -> String {
         report.running_sessions,
         report.unanswered_sessions
     ));
+    out.push_str(&format!(
+        "Parked subscribers: {} subscriptions across {} closed sessions.\n",
+        report.parked_subscribers.subscriptions, report.parked_subscribers.sessions,
+    ));
+    let parked = report
+        .actor_close_reasons
+        .get("parked")
+        .copied()
+        .unwrap_or_default();
+    out.push_str(&format!("Actor closes since boot: parked={parked}"));
+    for (reason, count) in &report.actor_close_reasons {
+        if reason != "parked" {
+            out.push_str(&format!(", {reason}={count}"));
+        }
+    }
+    out.push('\n');
     if !report.setup_parts.is_empty() {
         out.push_str("\nsetup part      decoded MiB  copies  sessions\n");
         for part in &report.setup_parts {

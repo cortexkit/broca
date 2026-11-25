@@ -1010,7 +1010,7 @@ impl RetentionService {
             .remove(&addr.0);
         // Still under the lease, so no session created at the address afterwards loses its routes.
         if let Some(evict) = self.evict.get() {
-            evict(key);
+            evict(key, deleted_at_ms);
         }
         crate::diagnostics::retention_deleted(key);
         Ok(())

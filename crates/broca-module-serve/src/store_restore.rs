@@ -154,16 +154,12 @@ impl StoreRestore {
             Ok(Some(Finding::Lacks(_))) => {}
             Err(error) => return report.error(error),
         }
-        // An actor serving the session refuses to be held, and asking it would only keep it
-        // from going idle, so restore waits for it to close by itself. A subscriber still
-        // attached keeps it from ever doing so, which the operator is told.
+        // Restore waits for an actor to close on its own and does not break a live stream,
+        // even when the stream is waiting in the registry rather than holding the actor open.
+        if let Some(reason) = self.registry.restore_subscriber_busy(&bind) {
+            return report.busy(reason);
+        }
         if let Some(state) = self.registry.slot_state(&bind) {
-            if self.registry.idle_holds(&bind).contains(&"live_subscriber") {
-                return report.busy(
-                    "the session has live subscribers, which keep its actor open; stop the \
-                     subscriber or restart broca first",
-                );
-            }
             return report.busy(&format!("an actor serves it ({state})"));
         }
         let fence = match self
