@@ -1259,15 +1259,24 @@ class ArtifactWait(unittest.TestCase):
                            {'jobs': [self.job('fixtures / Fixtures (Windows)', 'completed', 'failure')]}])
 
     def test_completed_producers_without_artifacts_refuse(self):
+        finished = {'jobs': [self.job('Archive (windows)', 'completed', 'success')]}
         with self.assertRaisesRegex(RuntimeError, 'Producers finished without artifacts: integration-windows'):
-            self.run_wait([self.artifacts('fixtures-Windows'),
-                           {'jobs': [self.job('Archive (windows)', 'completed', 'success')]}])
+            self.run_wait([self.artifacts('fixtures-Windows'), finished] * 3)
+
+    def test_an_archive_listed_after_its_producer_finished_is_ready(self):
+        # The artifacts are listed before the jobs: a producer that finishes between the two
+        # reads looks finished without its archive once. The next poll lists it.
+        api = self.run_wait([self.artifacts('fixtures-Windows'),
+                             {'jobs': [self.job('Archive (windows)', 'completed', 'success')]},
+                             self.artifacts('fixtures-Windows', 'integration-windows')])
+        self.assertEqual(api.call_count, 3)
 
     def test_expired_archive_is_not_replayed(self):
         response = self.artifacts('fixtures-Windows', 'integration-windows')
         response['artifacts'][1]['expired'] = True
+        finished = {'jobs': [self.job('Archive (windows)', 'completed', 'success')]}
         with self.assertRaisesRegex(RuntimeError, 'without artifacts: integration-windows'):
-            self.run_wait([response, {'jobs': [self.job('Archive (windows)', 'completed', 'success')]}])
+            self.run_wait([response, finished] * 3)
 
     def test_queued_producer_has_bounded_wait(self):
         with self.assertRaisesRegex(RuntimeError, 'Timed out waiting for artifacts: integration-windows'):

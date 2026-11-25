@@ -46,6 +46,12 @@ def main():
     base = f"repos/{repository}/actions/runs/{run_id}"
     deadline = time.monotonic() + args.timeout
     wanted = set(args.names)
+    # How many polls in a row must find every producer finished and an artifact still missing
+    # before the wait gives up. The artifacts are listed before the jobs, so a producer that
+    # finishes between the two reads looks finished without its artifact once; on 25 Nov 2026 a
+    # shard gave up that way while its archive was being listed. Each later poll lists the
+    # artifacts after the finish was seen, and allows for the artifacts list lagging the job.
+    finished_polls = 0
     producers = {
         "fixtures-Linux": "Fixtures (Linux)",
         "fixtures-Windows": "Fixtures (Windows)",
@@ -94,11 +100,18 @@ def main():
                 break
             page += 1
         if seen_producers == needed_producers and not active_producers:
-            raise RuntimeError("Producers finished without artifacts: " + ", ".join(sorted(missing)))
+            finished_polls += 1
+            if finished_polls >= FINISHED_POLLS:
+                raise RuntimeError("Producers finished without artifacts: " + ", ".join(sorted(missing)))
+        else:
+            finished_polls = 0
         if time.monotonic() >= deadline:
             raise RuntimeError("Timed out waiting for artifacts: " + ", ".join(sorted(missing)))
         print("Waiting for: " + ", ".join(sorted(missing)), flush=True)
         time.sleep(min(args.poll_seconds, max(0, deadline - time.monotonic())))
+
+
+FINISHED_POLLS = 3
 
 
 def list_artifacts(base):
