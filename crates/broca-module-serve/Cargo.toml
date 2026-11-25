@@ -22,7 +22,6 @@ path = "src/bin/broca-session.rs"
 [dependencies]
 os_info = "=3.14.0"
 broca-heap-profile = { path = "../broca-heap-profile", optional = true }
-mimalloc = { version = "0.1.52", optional = true }
 broca-owner-only.workspace = true
 broca-diagnostics = { path = "../broca-diagnostics" }
 broca-memory-relief = { path = "../broca-memory-relief" }
@@ -157,9 +156,6 @@ libc = "0.2"
 test-route-close = ["broca-subc/test-route-close"]
 test-attachments = ["broca-protocol/test-attachments", "broca-core/test-attachments", "broca-provider/test-attachments", "broca-module/test-attachments", "broca-subc/test-attachments"]
 heap-profile = ["dep:broca-heap-profile"]
-# Development deploys only: measures mimalloc against the system allocator, which keeps freed
-# pages in broca's footprint. Never in a published build.
-mimalloc-trial = ["dep:mimalloc"]
 test-clock = ["broca-module/test-clock", "broca-core/test-clock"]
 # Real-daemon rigs only (the native release suites turn it on): credentials may also reach the
 # local machine, where the rigs' stand-in providers listen. See broca-provider's feature.

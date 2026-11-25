@@ -55,14 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_runtime(serve_main())?
 }
 
-// A development deploy's trial of mimalloc against the system allocator, which keeps about a fifth
-// of broca's footprint as freed pages it never hands back to the system.
-#[cfg(all(feature = "mimalloc-trial", not(feature = "heap-profile")))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-#[cfg(all(feature = "mimalloc-trial", feature = "heap-profile"))]
-compile_error!("mimalloc-trial and heap-profile each install the global allocator; build one");
-
 fn run_runtime<F: std::future::Future>(work: F) -> std::io::Result<F::Output> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
