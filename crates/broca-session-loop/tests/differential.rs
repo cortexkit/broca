@@ -2880,7 +2880,7 @@ async fn new_source(
     let cancel = TEST_CANCEL.try_with(Clone::clone).unwrap_or_default();
     let display_out = DISPLAY_OUT.try_with(Clone::clone).ok();
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
@@ -4169,7 +4169,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
     let now = harness_now;
     let bind = bind();
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
@@ -4884,7 +4884,7 @@ async fn new_with_actions(
     let now = harness_now;
     let bind = bind();
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
@@ -4919,7 +4919,7 @@ async fn new_with_actions(
     }));
     plane.cancel_on_hold(cancel.clone());
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         held: Some(&*lifecycle),
         cancel,
         ..seams
@@ -4949,7 +4949,7 @@ async fn new_with_actions(
             Some(AtHeldResume::NoDeposit) | None => {}
         }
         let restarted = Seams {
-            person_steers: None,
+            steer_yields: None,
             stop,
             pause_for_auth_at_start: SIGNED_OUT_ON_RESUME
                 .try_with(|()| {
@@ -5473,7 +5473,7 @@ async fn compare_auth_pause_in_once(
     let now = harness_now;
     let bind = bind();
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &plane,
         bind: bind.clone(),
@@ -5511,7 +5511,7 @@ async fn compare_auth_pause_in_once(
     provider.resuming();
     let refrozen_to = resume_account.clone();
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         auth_selection: resume_account.or(seams.auth_selection.clone()),
         // A resume waits for its requests as a new run does.
         model_call_ready: provider.model_call_ready(),
@@ -10425,7 +10425,7 @@ async fn enroll_run_with(
     let bind = bind();
     let now = harness_now;
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider,
         tools: &tools,
         bind: bind.clone(),
@@ -10487,7 +10487,7 @@ async fn enroll_resume_with(
     let bind = bind();
     let now = harness_now;
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider,
         tools: &tools,
         bind: bind.clone(),

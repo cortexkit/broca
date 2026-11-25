@@ -252,7 +252,7 @@ async fn run(rebuild_point: bool, refuse: bool) -> (Vec<String>, Vec<Record>) {
         refuse,
     };
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &tools,
         bind,

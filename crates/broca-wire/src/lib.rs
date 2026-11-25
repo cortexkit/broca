@@ -264,6 +264,9 @@ pub struct SendParams {
         deserialize_with = "deserialize_delivery"
     )]
     pub delivery: Option<SendDelivery>,
+    /// A steer-first send may ask eligible calls to hand back if the plan grants it.
+    #[serde(default, rename = "yield", skip_serializing_if = "std::ops::Not::not")]
+    pub urgent_yield: bool,
     /// `delivery_order` group: a newer send from the same sender with the same key replaces a
     /// queued, undelivered one, which then ends `superseded`. Distinct from `send_id`: a retry
     /// with the same `send_id` is the same send, not a replacement.
@@ -299,22 +302,8 @@ pub struct SendParams {
 /// Check the shared run parameters before broca's legacy parameter decoder can lose a
 /// nested field name. Legacy stop-condition lists remain accepted beside the role object.
 pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
-    // Undeclared notice permissions must not fall through the permissive send decoder:
-    // silently dropping even a false member would accept a request broca cannot honour.
-    // `keep` is declared: it is checked with the send's other marks, against the session's owner.
-    if params.get("yield").is_some() {
+    if params.get("yield").is_some_and(|value| !value.is_boolean()) {
         return Err("yield".into());
-    }
-    if let Some(index) = params
-        .pointer("/plan/senders")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|senders| {
-            senders
-                .iter()
-                .position(|sender| sender.get("yields").is_some())
-        })
-    {
-        return Err(format!("plan.senders[{index}].yields"));
     }
     if let Some(route) = params.get("account_route") {
         serde_json::from_value::<cortexkit_role_llm_runner::send::AccountRoute>(route.clone())
@@ -4297,6 +4286,7 @@ mod tests {
                 "service_tier",
                 "one_shot",
                 "delivery",
+                "yield",
                 "dedupe_key",
                 "expires_at_ms",
                 "template",

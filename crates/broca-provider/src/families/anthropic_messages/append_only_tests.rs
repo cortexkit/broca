@@ -272,7 +272,7 @@ async fn run_episode(
     let (tx, mut rx) = mpsc::channel(512);
     let collector = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let seams = broca_session_loop::Seams {
-        person_steers: None,
+        steer_yields: None,
         provider,
         tools: plane,
         bind: req.session.clone(),

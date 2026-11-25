@@ -498,6 +498,10 @@ pub fn broca_role_describe_with_writers(
             at + 1,
             cortexkit_role_llm_runner::capabilities::CALL_YIELD.into(),
         );
+        capabilities.insert(
+            at + 2,
+            cortexkit_role_llm_runner::capabilities::NOTICE_YIELD.into(),
+        );
     }
     if broca_core::scope_admission::NOTICE_WITH_SPEAKS_FOR {
         // Admission reads the same constant: a notice may carry a speaker, and a speaker may
@@ -1566,7 +1570,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "02bc19fdb98a7b62814b394d20b8e6898e2f2106bb63c1bd9ccfdce7a89648ff",
+            "338a911f4d92dd0ebe2131a7e4cbd03798131b71ff579daa3c0bc407c462d41b",
         );
     }
 
@@ -1766,7 +1770,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "3001de4e526c4ddf1a1929452bae1ba2f3e8b426455d6f18575753fdcf2eb9bb";
+        "6adbe2f178d85bb257eccaba637bbd4eb20fc87fc5f233e6f7222a46947b7110";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

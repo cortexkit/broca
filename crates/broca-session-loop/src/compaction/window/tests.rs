@@ -177,7 +177,7 @@ async fn compacted_run(
     .unwrap();
     let tools = StubToolPlane::new().with_canned_text("read", "fn main() {}");
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &tools,
         bind: bind(),

@@ -73,6 +73,10 @@ struct ResultObservation {
 }
 
 impl Cases {
+    pub(super) fn active_name(&self) -> Option<&'static str> {
+        self.active.as_ref().map(|case| case.name)
+    }
+
     pub(super) fn progress(&mut self, event: &SuiteProgress) {
         match event {
             SuiteProgress::CaseStarted { case, .. } => {

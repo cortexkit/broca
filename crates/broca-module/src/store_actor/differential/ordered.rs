@@ -1400,10 +1400,142 @@ fn person_plan() -> Arc<PlanManifest> {
 
 /// The count of the person's steers the actor hands the running run, which the run's waiting
 /// calls hand back on.
-fn person_steers(pair: &Pair) -> u64 {
-    let steers = pair.store.person_steers.lock().unwrap();
-    let count = *steers.as_ref().expect("the run took a count").0.borrow();
+fn steer_yields(pair: &Pair) -> u64 {
+    let steers = pair.store.steer_yields.lock().unwrap();
+    let count = steers
+        .as_ref()
+        .expect("the run took a count")
+        .0
+        .borrow()
+        .count();
     count
+}
+
+fn urgent_plan() -> Arc<PlanManifest> {
+    let mut manifest = (*plan()).clone();
+    manifest.plan = OpaqueJson::from_json_text(
+        json!({"senders": [
+            {"module": "prefrontal-core", "yields": true},
+            {"module": "voice", "yields": true},
+            {"module": AFT},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    Arc::new(manifest)
+}
+
+#[tokio::test]
+async fn notice_yield_refuses_an_unscoped_plan_at_the_actor() {
+    let pair = Pair::new(hello(), false, Cipher::None).await;
+    let reply = pair
+        .send("r1", from(core(), "first"), None, Some(urgent_plan()), None)
+        .await;
+    assert!(matches!(reply, SendOutcome::PlanRefused(refusal)
+        if refusal == broca_fetch_plan::Refusal::invalid("plan.senders[0].yields")));
+}
+
+#[tokio::test]
+async fn notice_yield_admits_owner_and_peer_but_not_an_unmarked_sender() {
+    use broca_core::tool_plane::{SteerYield, ToolOpenGuard};
+
+    let pair = Pair::new(reading(), true, Cipher::None).await;
+    let reply = pair
+        .send("r1", scoped("first"), None, Some(urgent_plan()), None)
+        .await;
+    assert!(matches!(reply, SendOutcome::Active { .. }), "{reply:?}");
+    let signals = ToolOpenGuard::new(None, None)
+        .with_steer_yields(pair.store.steer_yields.lock().unwrap().clone())
+        .signals();
+    let ordered = || Some(json!({"modes": ["steer"]}));
+    let mark = |mut request: SubmissionRequest| {
+        request.urgent_yield = true;
+        request
+    };
+    let unmarked = pair
+        .send(
+            "unmarked",
+            mark(from(module(AFT), "no grant")),
+            ordered(),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(&unmarked, SendOutcome::StructuredOutputInvalid { field } if field == "yield"),
+        "{unmarked:?}"
+    );
+    let queue_first = pair
+        .send(
+            "bad-order",
+            mark(scoped("not a steer")),
+            Some(json!({"modes": ["idle_start", "steer"]})),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(&queue_first, SendOutcome::StructuredOutputInvalid { field } if field == "yield"),
+        "{queue_first:?}"
+    );
+    assert_eq!(steer_yields(&pair), 0);
+
+    let owner = mark(scoped("urgent owner steer"));
+    let first = pair
+        .send_as(
+            "owner",
+            owner.clone(),
+            Delivery::Steer,
+            None,
+            None,
+            Some("owner"),
+        )
+        .await;
+    assert!(matches!(first, SendOutcome::Active { .. }), "{first:?}");
+    assert_eq!(steer_yields(&pair), 1);
+    assert_eq!(
+        futures::FutureExt::now_or_never(signals.steer_yield_after(0)),
+        Some(SteerYield::UrgentNotice)
+    );
+
+    let retry = pair
+        .send_as("owner", owner, Delivery::Steer, None, None, Some("owner"))
+        .await;
+    assert!(matches!(retry, SendOutcome::Active { .. }), "{retry:?}");
+    let changed = pair
+        .send_as(
+            "owner",
+            scoped("urgent owner steer"),
+            Delivery::Steer,
+            None,
+            None,
+            Some("owner"),
+        )
+        .await;
+    assert!(
+        matches!(changed, SendOutcome::SendIdReuse { differing: "yield" }),
+        "{changed:?}"
+    );
+    assert_eq!(
+        steer_yields(&pair),
+        1,
+        "keyed retries never hand the call back again"
+    );
+
+    let voice = mark(marked(
+        from(module("voice"), "urgent notice"),
+        json!({"notice":true}),
+    ));
+    let other = pair.send("voice", voice, ordered(), None, None).await;
+    assert!(matches!(other, SendOutcome::Pending { .. }), "{other:?}");
+    assert_eq!(steer_yields(&pair), 2);
+    assert_eq!(
+        futures::FutureExt::now_or_never(signals.steer_yield_after(1)),
+        Some(SteerYield::UrgentNotice)
+    );
+    pair.release();
+    pair.release();
+    pair.idle().await;
 }
 
 /// Only the person's own steer asks the running run's waiting calls to hand back: a steer from
@@ -1416,7 +1548,7 @@ async fn only_the_persons_own_steer_hands_calls_back() {
         .send("r1", from(core(), "first"), None, Some(person_plan()), None)
         .await;
     assert!(matches!(reply, SendOutcome::Active { .. }), "{reply:?}");
-    assert_eq!(person_steers(&pair), 0);
+    assert_eq!(steer_yields(&pair), 0);
     let steer = || Some(json!({"modes": ["steer"]}));
     let other = pair
         .send(
@@ -1449,7 +1581,7 @@ async fn only_the_persons_own_steer_hands_calls_back() {
         .await;
     assert!(matches!(queued, SendOutcome::Pending { .. }), "{queued:?}");
     assert_eq!(
-        person_steers(&pair),
+        steer_yields(&pair),
         0,
         "none of those is the person's steer"
     );
@@ -1463,7 +1595,7 @@ async fn only_the_persons_own_steer_hands_calls_back() {
         )
         .await;
     assert!(matches!(person, SendOutcome::Pending { .. }), "{person:?}");
-    assert_eq!(person_steers(&pair), 1);
+    assert_eq!(steer_yields(&pair), 1);
     pair.release();
     pair.release();
     pair.idle().await;

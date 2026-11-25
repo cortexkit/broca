@@ -1300,7 +1300,7 @@ fn test_connection(
     SubcConnection {
         shared: Arc::new(ConnectionShared {
             aft_harness_answer: Mutex::new(None),
-            person_yields: Mutex::default(),
+            steer_yields: Mutex::default(),
             catalog: Default::default(),
             #[cfg(test)]
             late_goodbye_handoff: Mutex::new(None),
@@ -3308,7 +3308,7 @@ async fn unreachable_reconnect_attempts_back_off_instead_of_spinning() {
     let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
     let shared = Arc::new(ConnectionShared {
         aft_harness_answer: Mutex::new(None),
-        person_yields: Mutex::default(),
+        steer_yields: Mutex::default(),
         catalog: Default::default(),
         #[cfg(test)]
         late_goodbye_handoff: Mutex::new(None),

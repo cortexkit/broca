@@ -192,7 +192,7 @@ async fn run_batch(crash: bool) -> &'static MemoryBackend {
         crash,
     };
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &tools,
         bind,

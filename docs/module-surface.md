@@ -1084,6 +1084,14 @@ cache, a refresh adding a compaction provider), once the oldest pending change i
 once when it changes the system text on a route with no system-role turn (`no_note_form`). Tool
 additions and changed definitions get no note; they wait for that full apply.
 
+With `notice_yield`, the scope owner may mark its own or another module's plan sender
+`yields: true`. An unscoped session refuses the plan member, even if it is false.
+Only a marked, attested sender may send `yield: true`, and only with `"steer"` or a
+delivery list beginning with `"steer"`. Notice and speaker marks keep their usual
+rules. After the steer is durable, eligible waiting calls are asked to hand back
+with reason `urgent_notice`, using the same mechanism as `call_yield`. No call is
+asked twice, and if no call is waiting the send follows its ordinary delivery.
+
 In `session.baseline`, top-level composition and absence facts describe the frozen prefix.
 After a refresh applies, `effective.composition_digest` copies the applied manifest's composition
 digest (omitted when unavailable), and `effective.absent_items` reports its absent optional items

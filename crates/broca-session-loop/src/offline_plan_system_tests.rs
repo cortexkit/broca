@@ -156,7 +156,7 @@ async fn a_rebuilt_step_renders_the_applied_plans_system_text_as_sent() {
     .unwrap();
     let tools = StubToolPlane::new();
     let seams = Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &tools,
         bind: bind.clone(),

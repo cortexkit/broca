@@ -37,7 +37,7 @@ pub struct RunControl {
     /// waiting on to answer now with what the call has so far (`tool.yield`), so the model can
     /// read the person's message; the call's final result arrives later as a notice. Only calls
     /// whose provider declared it can do this are asked. `None` asks nothing.
-    pub person_steers: Option<crate::tool_plane::PersonSteers>,
+    pub steer_yields: Option<crate::tool_plane::SteerYields>,
     /// Clock shared with the coordinator's expiry decisions, used for `RunStarted`,
     /// `RunFinished` and `RunPaused` timestamps. Unset uses the system clock.
     pub clock: Option<crate::Clock>,
@@ -176,7 +176,7 @@ impl Default for RunControl {
             moved_here: false,
             provider_held_lifecycle: None,
             step_progress: None,
-            person_steers: None,
+            steer_yields: None,
             clock: None,
             account_limit_pause: false,
             max_same_account_wait: crate::SameAccountWait::default(),

@@ -1934,6 +1934,23 @@ impl LineageRegistry {
         }
         crate::retention::validate_retention(retention, None, false)
             .map_err(OpenError::RetentionInvalid)?;
+        let proposed = plan.as_ref().and_then(|plan| plan.manifest.as_deref());
+        // Opening a new actor writes its log header. Refuse an invalid hand-back request
+        // or an unscoped plan with hand-back grants before that write.
+        if (request.urgent_yield || proposed.is_some()) && self.store_holding(key)?.is_none() {
+            let scope_owner = crate::notice_yield::scope_owner(None, &request.scope);
+            if let Err(outcome) = crate::notice_yield::check(
+                proposed,
+                scope_owner.as_deref(),
+                request.urgent_yield,
+                request.principal.as_ref(),
+                delivery,
+                order.as_ref(),
+                &[],
+            ) {
+                return Ok(outcome);
+            }
+        }
         if let Some(manifest) = plan.as_ref().and_then(|plan| plan.manifest.as_ref()) {
             let policy: serde_json::Value = serde_json::from_str(manifest.plan.as_json_text())
                 .expect("an opaque plan is valid JSON");

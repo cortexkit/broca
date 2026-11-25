@@ -1035,6 +1035,7 @@ async fn compaction_preset_is_required_before_provider_fetch_or_actor_open() {
         &plan,
         None,
         None,
+        |_, _| Ok(()),
     )
     .await;
     let Err(refusal) = result else {

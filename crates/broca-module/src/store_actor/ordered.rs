@@ -14,6 +14,7 @@
 //! one never starts a run and stays queued across runs until a boundary delivers it or a drain
 //! finds it expired.
 
+use broca_core::tool_plane::SteerYield;
 use broca_protocol::{BindPrincipal, DeliveryMode, DeliveryOrder, SubmissionId, SubmissionRequest};
 use broca_records::record::SendEndReason;
 use broca_session_loop::queue;
@@ -86,6 +87,35 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         })
     }
 
+    pub(super) fn check_notice_yield(
+        &self,
+        request: &SubmissionRequest,
+        delivery: broca_protocol::Delivery,
+        order: Option<&DeliveryOrder>,
+        proposed: Option<&broca_records::record::PlanManifest>,
+    ) -> Result<(), SendOutcome> {
+        let ownership = self.ownership().map_err(SendOutcome::Transient)?;
+        // A repeat can carry a manifest fetched before the first run froze its plan. Once
+        // admitted, only the stored policy (including a pending refresh) can grant a yield.
+        let proposed = proposed.filter(|_| self.session.operations().owner.needs_admission());
+        let senders = if request.urgent_yield && proposed.is_none() {
+            self.plan_senders()?.senders
+        } else {
+            Vec::new()
+        };
+        let scope_owner =
+            crate::notice_yield::scope_owner(ownership.scope.as_ref(), &request.scope);
+        crate::notice_yield::check(
+            proposed,
+            scope_owner.as_deref(),
+            request.urgent_yield,
+            request.principal.as_ref(),
+            delivery,
+            order,
+            &senders,
+        )
+    }
+
     /// Whether a steer from `sender` carrying `marks` is the person's own message (llm-runner
     /// `call_yield`): `sender` is a module the session's plan marks `person`, and the message is
     /// neither a notice nor words spoken for an agent. A plan that can't be read names no one.
@@ -107,12 +137,28 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         })
     }
 
-    /// Tells the running run that the person's own steer is durable: each of its waiting calls
-    /// whose provider can hand calls back is asked to, so the steer lands at the next step
-    /// boundary without waiting for that call's work. Without a running run nothing is waiting.
-    pub(super) fn person_steered(&self) {
+    /// Called for steer-first deliveries, after the sender has been checked. Urgent hand-back
+    /// does not depend on who spoke the message or whether it was marked as a notice.
+    pub(super) fn steer_yield(
+        &self,
+        urgent: bool,
+        sender: Option<&BindPrincipal>,
+        marks: Option<&broca_protocol::MessageMarks>,
+    ) -> Option<SteerYield> {
+        if urgent {
+            Some(SteerYield::UrgentNotice)
+        } else {
+            self.is_person_steer(sender, marks)
+                .then_some(SteerYield::PersonMessage)
+        }
+    }
+
+    /// Tell the active run that a steer is durable without waiting for any tool response.
+    pub(super) fn request_call_yield(&self, reason: SteerYield) {
         if let Some(active) = &self.run {
-            active.person_steers.send_modify(|count| *count += 1);
+            active
+                .steer_yields
+                .send_modify(|state| state.record(reason));
         }
     }
 
@@ -781,13 +827,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         self.append_own_batch_with_media(&records, &staged)
             .await
             .map_err(|error| SendOutcome::Error(format!("{error:?}")))?;
-        // The person's steer hands back the running run's waiting calls only once it is durable,
-        // and never waits for them.
-        if !expired
-            && order.modes.first() == Some(&DeliveryMode::Steer)
-            && self.is_person_steer(sender.as_ref(), message_marks.as_ref())
-        {
-            self.person_steered();
+        if !expired && order.modes.first() == Some(&DeliveryMode::Steer) {
+            if let Some(reason) = self.steer_yield(
+                request.urgent_yield,
+                sender.as_ref(),
+                message_marks.as_ref(),
+            ) {
+                self.request_call_yield(reason);
+            }
         }
         if expired {
             return Err(SendOutcome::SendEnded {

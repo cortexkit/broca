@@ -59,7 +59,7 @@ impl SubcConnection {
         let conn = SubcConnection {
             shared: Arc::new(ConnectionShared {
                 aft_harness_answer: Mutex::new(None),
-                person_yields: Mutex::default(),
+                steer_yields: Mutex::default(),
                 catalog: Default::default(),
                 #[cfg(test)]
                 late_goodbye_handoff: Mutex::new(None),

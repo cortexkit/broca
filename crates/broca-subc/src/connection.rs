@@ -935,7 +935,7 @@ struct ConnectionShared {
     aft_harness_answer: Mutex<Option<bool>>,
     /// Keys of calls whose provider accepted a hand-back for the person's steer
     /// (`person_message`), until the plane takes each one with the call's terminal frame.
-    person_yields: Mutex<std::collections::HashSet<String>>,
+    steer_yields: Mutex<std::collections::HashSet<String>>,
     /// The last catalog and the generation the daemon pushed (see [`catalog_watch`]).
     catalog: catalog_watch::CatalogMemo,
     #[cfg(test)]
@@ -1294,12 +1294,12 @@ impl SubcConnection {
         .await
     }
 
-    /// Whether broca asked the call `call_key` to hand back for the person's steer (a
-    /// `person_message` yield), and forgets it. Asked once, when the call's terminal frame
+    /// Whether broca asked the call `call_key` to hand back for a steer, and forgets it.
+    /// Asked once, when the call's terminal frame
     /// arrives; only a held reply marked `yielded` then hands the call back.
-    pub fn took_person_yield(&self, call_key: &str) -> bool {
+    pub fn took_steer_yield(&self, call_key: &str) -> bool {
         self.shared
-            .person_yields
+            .steer_yields
             .lock()
             .expect("person yields")
             .remove(call_key)
@@ -1358,7 +1358,7 @@ impl SubcConnection {
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
             aft_harness_answer: Mutex::new(None),
-            person_yields: Mutex::default(),
+            steer_yields: Mutex::default(),
             catalog: Default::default(),
             #[cfg(test)]
             late_goodbye_handoff: Mutex::new(None),
@@ -1527,7 +1527,7 @@ impl SubcConnection {
         runtime: &ConnectionRuntime,
         frame: Frame,
         signals: &broca_core::tool_plane::DispatchSignals,
-    ) -> Result<(), ApprovedSetupError> {
+    ) -> Result<Option<u64>, ApprovedSetupError> {
         let permit = tokio::select! {
             biased;
             _ = signals.cancelled() => return Err(ApprovedSetupError::Interrupted),
@@ -1549,7 +1549,7 @@ impl SubcConnection {
         permit: mpsc::Permit<'_, Frame>,
         frame: Frame,
         signals: &broca_core::tool_plane::DispatchSignals,
-    ) -> Result<(), ApprovedSetupError> {
+    ) -> Result<Option<u64>, ApprovedSetupError> {
         // A clear final signal observation below is the linearization point: the
         // call is committed to send. Cancellation after that observation, even
         // from another thread before permit.send executes, is treated as after
@@ -1557,8 +1557,10 @@ impl SubcConnection {
         if signals.interrupted() {
             return Err(ApprovedSetupError::Interrupted);
         }
+        // A steer that sees the call already sent must not be mistaken for a pre-dispatch steer.
+        let steers_seen = signals.steer_yields_seen();
         permit.send(frame);
-        Ok(())
+        Ok(steers_seen)
     }
 
     fn spawn_liveness_probe(&self, runtime: &Arc<ConnectionRuntime>) {
@@ -2576,13 +2578,13 @@ impl SubcConnection {
                 body,
             )
             .map_err(|error| ConnError::Transport(error.to_string()))?;
-            self.enqueue_approved(&runtime, frame, signals).await?;
+            let steers_seen = self.enqueue_approved(&runtime, frame, signals).await?;
             // Route-open, bind and writer-capacity waits consume no provider reply budget.
             let wait = ToolReplyWait::enqueued(deadline, declared_reply, route.call_keepalive);
             log_tool_dispatch(route.channel, corr, name);
-            Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr, wait))
+            Ok::<_, ApprovedSetupError>((runtime, registration, rx, corr, wait, steers_seen))
         };
-        let (runtime, _registration, mut rx, corr, wait) =
+        let (runtime, _registration, mut rx, corr, wait, steers_seen) =
             before_push.await.map_err(ApprovedCallError::BeforePush)?;
         let yielding = yield_provider
             .zip(call_key)
@@ -2591,6 +2593,7 @@ impl SubcConnection {
                 provider,
                 tool: name,
                 call_key,
+                steers_seen,
                 accepted: false,
                 settled: false,
             });
@@ -2735,14 +2738,16 @@ impl SubcConnection {
             _ = async {
                 if let (Some(signals), Some(yielding)) = (signals, yielding.as_mut()) {
                     // A call is asked once, for whichever comes first: the runner stopping, or
-                    // a person's steer arriving after the call was sent. Either way its answer
+                    // a steer requesting hand-back after the call was sent. Either way its answer
                     // is still the call's own terminal frame, awaited above.
-                    let reason = match signals.person_steers_seen() {
+                    let reason = match yielding.steers_seen {
                         Some(seen) => tokio::select! {
                             _ = signals.stopping() => "runner_restart",
-                            _ = signals.person_steered(seen) => {
-                                cortexkit_role_tool_provider::call_yield::PERSON_MESSAGE
-                            }
+                             cause = signals.steer_yield_after(seen) => match cause {
+                                 broca_core::tool_plane::SteerYield::PersonMessage =>
+                                     cortexkit_role_tool_provider::call_yield::PERSON_MESSAGE,
+                                 broca_core::tool_plane::SteerYield::UrgentNotice => "urgent_notice",
+                             },
                         },
                         None => {
                             signals.stopping().await;
@@ -2754,9 +2759,9 @@ impl SubcConnection {
                     // may arrive first, which ends this wait before the answer is read. A held
                     // reply saying `yielded` is the provider's own word that it honoured the
                     // request, so the note only has to say which reason it was asked for.
-                    if reason == cortexkit_role_tool_provider::call_yield::PERSON_MESSAGE {
+                    if reason != "runner_restart" {
                         self.shared
-                            .person_yields
+                            .steer_yields
                             .lock()
                             .expect("person yields")
                             .insert(yielding.call_key.to_owned());
@@ -3016,6 +3021,7 @@ struct YieldWatch<'a> {
     provider: &'a str,
     tool: &'a str,
     call_key: &'a str,
+    steers_seen: Option<u64>,
     accepted: bool,
     settled: bool,
 }

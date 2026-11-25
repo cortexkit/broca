@@ -1,6 +1,8 @@
 use super::*;
 use crate::connection::{ApprovedCallError, InProcessModuleEnd, ToolReplyDeadline};
-use broca_core::tool_plane::{DispatchSignals, PersonSteers, ToolOpenGuard};
+use broca_core::tool_plane::{
+    DispatchSignals, SteerYield, SteerYieldState, SteerYields, ToolOpenGuard,
+};
 use subc_protocol::FrameType;
 
 /// Keep the real request, reply, and abandonment machinery; only route discovery is local.
@@ -16,8 +18,8 @@ impl ToolPlaneConnection for Wire {
     fn consumer_module_id(&self) -> Option<&str> {
         Some("broca")
     }
-    fn took_person_yield(&self, call_key: &str) -> bool {
-        self.conn.took_person_yield(call_key)
+    fn took_steer_yield(&self, call_key: &str) -> bool {
+        self.conn.took_steer_yield(call_key)
     }
     async fn catalog_list(&self) -> Result<Arc<Vec<CatalogEntry>>, ConnError> {
         if self.catalog.lock().unwrap().is_some() {
@@ -279,6 +281,15 @@ async fn missing_frozen_yield_facts_never_send_yield() {
 /// registration, since its provider still owes the terminal that becomes the notice.
 #[tokio::test]
 async fn a_person_steer_hands_the_call_back_once_and_its_interim_content_closes_it() {
+    assert_steer_hands_back_once(SteerYield::PersonMessage, "person_message").await;
+}
+
+#[tokio::test]
+async fn an_urgent_notice_hands_the_call_back_once_and_its_interim_content_closes_it() {
+    assert_steer_hands_back_once(SteerYield::UrgentNotice, "urgent_notice").await;
+}
+
+async fn assert_steer_hands_back_once(reason: SteerYield, wire_reason: &str) {
     tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
         let (wire, mut provider) = wire();
         let rig = Rig::new(true, true, true, true);
@@ -298,9 +309,9 @@ async fn a_person_steer_hands_the_call_back_once_and_its_interim_content_closes_
             .register_dispatch_group(&ctx, &[registration(&call, "lineage:1", false)])
             .await
             .unwrap();
-        let (steers, seen) = tokio::sync::watch::channel(0u64);
-        steers.send_replace(1);
-        let guard = ToolOpenGuard::new(None, None).with_person_steers(Some(PersonSteers(seen)));
+        let (steers, seen) = tokio::sync::watch::channel(SteerYieldState::default());
+        steers.send_modify(|state| state.record(reason));
+        let guard = ToolOpenGuard::new(None, None).with_steer_yields(Some(SteerYields(seen)));
         let mut dispatch = Box::pin(plane.dispatch_guarded(
             &ctx,
             &call,
@@ -317,7 +328,7 @@ async fn a_person_steer_hands_the_call_back_once_and_its_interim_content_closes_
             provider.try_frame().is_none(),
             "a steer taken before the call was sent hands nothing back"
         );
-        steers.send_modify(|count| *count += 1);
+        steers.send_modify(|state| state.record(reason));
         assert!(futures::poll!(&mut dispatch).is_pending());
         let yielding = provider.next_request().await;
         assert_eq!(
@@ -328,11 +339,15 @@ async fn a_person_steer_hands_the_call_back_once_and_its_interim_content_closes_
         assert_eq!(body["name"], "tool.yield");
         assert_eq!(
             body["arguments"],
-            json!({"call_key":"lineage:1","reason":"person_message"})
+            json!({"call_key":"lineage:1","reason":wire_reason})
         );
         assert!(provider.reply(&yielding, br#"{"answer":"accepted"}"#.to_vec()));
         assert!(futures::poll!(&mut dispatch).is_pending());
-        steers.send_modify(|count| *count += 1);
+        let other = match reason {
+            SteerYield::PersonMessage => SteerYield::UrgentNotice,
+            SteerYield::UrgentNotice => SteerYield::PersonMessage,
+        };
+        steers.send_modify(|state| state.record(other));
         assert!(futures::poll!(&mut dispatch).is_pending());
         assert!(provider.try_frame().is_none(), "a call is handed back once");
         let interim = json!({"content":[{"type":"text","text":"still building"}],
@@ -414,8 +429,8 @@ async fn a_closed_session_forgets_the_call_keys_its_unfinished_batch_kept() {
         assert!(provider.reply(&original, serde_json::to_vec(&answer).unwrap()));
         assert!(matches!(dispatch.await, DispatchResult::Completed(_)));
 
-        let (steers, seen) = tokio::sync::watch::channel(0u64);
-        let guard = ToolOpenGuard::new(None, None).with_person_steers(Some(PersonSteers(seen)));
+        let (steers, seen) = tokio::sync::watch::channel(SteerYieldState::default());
+        let guard = ToolOpenGuard::new(None, None).with_steer_yields(Some(SteerYields(seen)));
         let mut dispatch = Box::pin(plane.dispatch_guarded(
             &ctx,
             &handed_back,
@@ -427,7 +442,7 @@ async fn a_closed_session_forgets_the_call_keys_its_unfinished_batch_kept() {
         ));
         assert!(futures::poll!(&mut dispatch).is_pending());
         let original = provider.next_request().await;
-        steers.send_modify(|count| *count += 1);
+        steers.send_modify(|state| state.record(SteerYield::PersonMessage));
         assert!(futures::poll!(&mut dispatch).is_pending());
         let yielding = provider.next_request().await;
         assert!(provider.reply(&yielding, br#"{"answer":"accepted"}"#.to_vec()));
@@ -476,8 +491,8 @@ async fn a_handed_back_call_closes_even_when_its_final_frame_beats_the_yield_ans
             .register_dispatch_group(&ctx, &[registration(&call, "lineage:1", false)])
             .await
             .unwrap();
-        let (steers, seen) = tokio::sync::watch::channel(0u64);
-        let guard = ToolOpenGuard::new(None, None).with_person_steers(Some(PersonSteers(seen)));
+        let (steers, seen) = tokio::sync::watch::channel(SteerYieldState::default());
+        let guard = ToolOpenGuard::new(None, None).with_steer_yields(Some(SteerYields(seen)));
         let mut dispatch = Box::pin(plane.dispatch_guarded(
             &ctx,
             &call,
@@ -489,7 +504,7 @@ async fn a_handed_back_call_closes_even_when_its_final_frame_beats_the_yield_ans
         ));
         assert!(futures::poll!(&mut dispatch).is_pending());
         let original = provider.next_request().await;
-        steers.send_modify(|count| *count += 1);
+        steers.send_modify(|state| state.record(SteerYield::PersonMessage));
         assert!(futures::poll!(&mut dispatch).is_pending());
         let yielding = provider.next_request().await;
         let body: serde_json::Value = serde_json::from_slice(&yielding.body).unwrap();
@@ -541,10 +556,10 @@ async fn a_restart_yield_still_holds_the_call() {
             .register_dispatch_group(&ctx, &[registration(&call, "lineage:1", false)])
             .await
             .unwrap();
-        let (_steers, seen) = tokio::sync::watch::channel(0u64);
+        let (_steers, seen) = tokio::sync::watch::channel(SteerYieldState::default());
         let stop = CancellationToken::new();
         let guard =
-            ToolOpenGuard::new(None, Some(&stop)).with_person_steers(Some(PersonSteers(seen)));
+            ToolOpenGuard::new(None, Some(&stop)).with_steer_yields(Some(SteerYields(seen)));
         let mut dispatch = Box::pin(plane.dispatch_guarded(
             &ctx,
             &call,

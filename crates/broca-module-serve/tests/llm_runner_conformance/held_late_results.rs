@@ -158,11 +158,11 @@ pub(super) fn answer_yield(
     if request["name"] != "tool.yield" {
         return None;
     }
-    // Broca asks a call to hand back when it stops for a restart, or on the person's steer.
+    // Broca asks a call to hand back on restart or when an admitted steer requests it.
     assert!(
         matches!(
             request["arguments"]["reason"].as_str(),
-            Some("runner_restart" | "person_message")
+            Some("runner_restart" | "person_message" | "urgent_notice")
         ),
         "{request}"
     );

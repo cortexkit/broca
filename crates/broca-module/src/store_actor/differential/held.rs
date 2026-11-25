@@ -268,7 +268,7 @@ impl RunExecutor for HeldExecutor {
             };
             let now = || broca_core::clock::epoch_millis().unwrap_or(0);
             let seams = broca_session_loop::run::Seams {
-                person_steers: None,
+                steer_yields: None,
                 provider: &self.provider,
                 tools: self.tools.as_ref(),
                 bind: req.session.clone(),

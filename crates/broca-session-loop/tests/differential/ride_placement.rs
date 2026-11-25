@@ -144,7 +144,7 @@ async fn new_only(
             let now = harness_now;
             let bind = bind();
             let seams = Seams {
-                person_steers: None,
+                steer_yields: None,
                 provider: &provider,
                 tools: &plane,
                 bind: bind.clone(),

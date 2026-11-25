@@ -82,7 +82,7 @@ async fn run_import(
     let tools = broca_core::stub_plane::StubToolPlane::new();
     let now = || 10_000;
     let seams = broca_session_loop::run::Seams {
-        person_steers: None,
+        steer_yields: None,
         provider: &provider,
         tools: &tools,
         bind: bind(),

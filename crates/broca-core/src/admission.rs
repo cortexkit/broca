@@ -37,6 +37,7 @@ pub fn submission_difference(
     requested: &SubmissionRequest,
 ) -> Option<&'static str> {
     let SubmissionRequest {
+        urgent_yield: _, // Compared from the stored identity digest, not the queued request.
         message_marks: _,
         // Checked against the session's own policy instead: once frozen it can't change, so a
         // retry carrying another one is refused for that.
@@ -73,6 +74,7 @@ pub fn submission_difference(
         client_message_id: _,
     } = existing;
     let SubmissionRequest {
+        urgent_yield: _,
         message_marks: _,
         retention_policy: _,
         route_decision_id: requested_route_decision_id,
@@ -176,6 +178,8 @@ fn inherited_difference(
 
 #[derive(Serialize, Deserialize)]
 struct SubmissionIdentityDigestV1 {
+    #[serde(default, rename = "yield", skip_serializing_if = "std::ops::Not::not")]
+    urgent_yield: bool,
     /// Normalized display metadata is compared directly, never hashed with message content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message_marks: Option<broca_protocol::MessageMarks>,
@@ -288,6 +292,7 @@ fn identity_digest_v1(
     conversation_key: Option<&str>,
 ) -> SubmissionIdentityDigestV1 {
     let SubmissionRequest {
+        urgent_yield,
         message_marks: _,
         retention_policy: _, // Outside send identity, as `submission_difference` says.
         route_decision_id,
@@ -322,6 +327,7 @@ fn identity_digest_v1(
     let mut policy_allowed: Vec<&str> = policy_allowed.iter().map(String::as_str).collect();
     policy_allowed.sort_unstable();
     SubmissionIdentityDigestV1 {
+        urgent_yield: *urgent_yield,
         message_marks: normalized_message_marks(request),
         route_decision_id: route_decision_id.clone(),
         account_route: account_route
@@ -424,6 +430,7 @@ pub fn send_identity_difference_with_conversation_key(
             stored.route_decision_id != requested.route_decision_id,
             "route_decision_id",
         ),
+        (stored.urgent_yield != requested.urgent_yield, "yield"),
         (
             stored.account_route != requested.account_route,
             "account_route",
@@ -736,6 +743,7 @@ mod tests {
 
     fn request(text: &str) -> SubmissionRequest {
         SubmissionRequest {
+            urgent_yield: false,
             message_marks: Default::default(),
             retention_policy: None,
             account_route: None,

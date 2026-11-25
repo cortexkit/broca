@@ -99,7 +99,7 @@ impl RigSession {
                 .map_or(0, |since| since.as_millis() as u64)
         };
         let seams = broca_session_loop::Seams {
-            person_steers: None,
+            steer_yields: None,
             provider,
             tools: plane,
             bind: req.session.clone(),

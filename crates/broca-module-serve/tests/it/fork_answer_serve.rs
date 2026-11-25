@@ -287,7 +287,7 @@ impl RunExecutor for StoreLoop {
             let tools = broca_core::StubToolPlane::new();
             let now = || 1;
             let seams = broca_session_loop::run::Seams {
-                person_steers: None,
+                steer_yields: None,
                 provider: &self.provider,
                 tools: &tools,
                 bind: req.session.clone(),

@@ -123,7 +123,7 @@ impl RunExecutor for CutExecutor {
                     .as_millis() as u64
             };
             let seams = broca_session_loop::Seams {
-                person_steers: None,
+                steer_yields: None,
                 provider: &provider,
                 tools: &tools,
                 bind: req.session.clone(),

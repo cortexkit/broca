@@ -310,7 +310,7 @@ struct ActiveRun {
     window: broca_session_loop::shared::RunWindow,
     /// Counts the person's steers this run took (llm-runner `call_yield`): each one asks the
     /// run's waiting calls whose provider can hand them back to do so.
-    person_steers: tokio::sync::watch::Sender<u64>,
+    steer_yields: tokio::sync::watch::Sender<broca_core::tool_plane::SteerYieldState>,
 }
 
 /// A run to start: the send's request and what the run's start records about the send.
@@ -1285,7 +1285,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         return false;
                     }
                 }
-                // A send's display marks are admitted first, against the session's owner
+                let proposed = plan.as_ref().and_then(|plan| plan.manifest.as_deref());
+                if request.urgent_yield || proposed.is_some() {
+                    if let Err(outcome) =
+                        self.check_notice_yield(&request, delivery, order.as_deref(), proposed)
+                    {
+                        let _ = reply.send(outcome);
+                        return false;
+                    }
+                }
+                // A send's display marks are admitted against the session's owner
                 // summary and the principal and scope the send came with, before a plan
                 // sender's send goes on under the session's principal. The record that takes
                 // the send's input keeps them.
@@ -2232,9 +2241,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.retention = prepared.retention;
         req.retention_policy = prepared.retention_policy;
         let step: broca_core::provider::LiveStepProgress = Arc::default();
-        let (person_steers, person_steers_seen) = tokio::sync::watch::channel(0);
+        let (steer_yields, steer_yields_seen) = tokio::sync::watch::channel(Default::default());
         let control = RunControl {
-            person_steers: Some(broca_core::tool_plane::PersonSteers(person_steers_seen)),
+            steer_yields: Some(broca_core::tool_plane::SteerYields(steer_yields_seen)),
             clock: self.retention_clock.clone(),
             conversation_key,
             moved_here: self.moved_here(),
@@ -2345,7 +2354,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             tool_media,
             warming,
             window,
-            person_steers,
+            steer_yields,
         });
     }
 
@@ -4235,7 +4244,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .queue_transformed(start, broca_protocol::Delivery::Steer, prepared, &staged)
                 .await;
         }
-        let person = self.is_person_steer(start.sent_by.as_ref(), start.message_marks.as_ref());
+        let hand_back = self.steer_yield(
+            start.request.urgent_yield,
+            start.sent_by.as_ref(),
+            start.message_marks.as_ref(),
+        );
         let receipt = queue::SteerReceipt {
             sent_by: start.sent_by,
             send_id: start.send_id,
@@ -4259,9 +4272,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         if let Err(error) = self.append_own_batch_with_media(&batch, &staged).await {
             return SendOutcome::Error(format!("{error:?}"));
         }
-        // Only once the person's steer is durable are the run's waiting calls handed back.
-        if person {
-            self.person_steered();
+        if let Some(reason) = hand_back {
+            self.request_call_yield(reason);
         }
         SendOutcome::Active {
             run_id: active,

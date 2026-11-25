@@ -32,6 +32,7 @@ pub mod late_results_puller;
 pub mod late_results_store;
 pub mod lease_sweep;
 pub mod memory_report;
+mod notice_yield;
 pub mod opener;
 pub mod output_refs;
 pub mod person_media;

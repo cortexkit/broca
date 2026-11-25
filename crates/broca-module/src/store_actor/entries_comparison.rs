@@ -119,7 +119,7 @@ impl<P: broca_core::provider::Provider + 'static> RunExecutor for Loops<P> {
             let tools = StubToolPlane::new().with_canned_text("read", "file contents");
             let now = || 1;
             let seams = Seams {
-                person_steers: None,
+                steer_yields: None,
                 provider: &self.store,
                 tools: &tools,
                 bind: req.session.clone(),

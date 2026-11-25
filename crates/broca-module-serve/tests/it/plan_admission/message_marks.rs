@@ -472,20 +472,20 @@ async fn queued_marks_retries_compare_normalized_marks_without_writing() {
     rig.finish().await;
 }
 
-async fn assert_undeclared_notice_member(wanted: &str) {
-    let (mut rig, admitter) = scoped_plan_rig(&format!("undeclared-{wanted}"), false).await;
+async fn assert_malformed_notice_member(wanted: &str) {
+    let (mut rig, admitter) = scoped_plan_rig(&format!("malformed-{wanted}"), false).await;
     let plan = vector("plans/broca-head-no-compaction.json");
     for (field, extra, plan) in [
-        ("yield", json!({"yield":false}), plan.clone()),
-        ("yield", json!({"yield":true}), plan.clone()),
+        ("yield", json!({"yield":null}), plan.clone()),
+        ("yield", json!({"yield":"yes"}), plan.clone()),
         ("plan.senders[0].yields", json!({}), {
             let mut plan = plan.clone();
-            plan["senders"] = json!([{"module":"prefrontal-core","yields":false}]);
+            plan["senders"] = json!([{"module":"prefrontal-core","yields":null}]);
             plan
         }),
         ("plan.senders[0].yields", json!({}), {
             let mut plan = plan.clone();
-            plan["senders"] = json!([{"module":"prefrontal-core","yields":true}]);
+            plan["senders"] = json!([{"module":"prefrontal-core","yields":"yes"}]);
             plan
         }),
     ] {
@@ -493,7 +493,7 @@ async fn assert_undeclared_notice_member(wanted: &str) {
             continue;
         }
         let before = rig.records().await;
-        let reply = send_plan(&mut rig, 8, "undeclared", "words", Some(&plan), extra).await;
+        let reply = send_plan(&mut rig, 8, "malformed", "words", Some(&plan), extra).await;
         assert_eq!(
             reply.header.ty,
             subc_protocol::FrameType::Error,
@@ -503,7 +503,7 @@ async fn assert_undeclared_notice_member(wanted: &str) {
         let error: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(error["code"], "invalid_params");
         assert_eq!(error["detail"]["field"], field, "{error}");
-        sample(&format!("undeclared-{field}.after.json"), &reply);
+        sample(&format!("malformed-{field}.after.json"), &reply);
         assert_eq!(rig.records().await, before);
     }
     assert!(admitter.calls().is_empty());
@@ -644,13 +644,51 @@ async fn keep_retry_without_keep_refuses_keep_without_writing() {
 }
 
 #[tokio::test]
-async fn undeclared_yield_refuses_before_any_write() {
-    assert_undeclared_notice_member("yield").await;
+async fn malformed_notice_yield_refuses_before_any_write() {
+    assert_malformed_notice_member("yield").await;
 }
 
 #[tokio::test]
-async fn undeclared_plan_yields_refuses_before_any_write() {
-    assert_undeclared_notice_member("plan.senders[0].yields").await;
+async fn malformed_notice_yield_grant_refuses_before_any_write() {
+    assert_malformed_notice_member("plan.senders[0].yields").await;
+}
+
+#[tokio::test]
+async fn notice_yield_checks_a_first_send_before_fetch_and_can_start_idle() {
+    let (mut rig, admitter) = scoped_plan_rig("notice-yield-first", false).await;
+    let mut plan = vector("plans/broca-head-no-compaction.json");
+    let before = rig.records().await;
+    for delivery in [json!("steer"), json!(["idle_start", "steer"])] {
+        let reply = send_plan(
+            &mut rig,
+            8,
+            "urgent",
+            "words",
+            Some(&plan),
+            json!({"yield":true, "delivery":delivery}),
+        )
+        .await;
+        let error = error_body(&reply);
+        assert_eq!(error["code"], "invalid_params", "{error}");
+        assert_eq!(error["detail"]["field"], "yield", "{error}");
+        assert!(admitter.calls().is_empty());
+        assert_eq!(rig.records().await, before);
+        plan["senders"] = json!([{"module":"prefrontal-core","yields":true}]);
+    }
+    rig.script.push(&[Step::Text("answer")]);
+    let accepted = send_plan(
+        &mut rig,
+        8,
+        "urgent",
+        "words",
+        Some(&plan),
+        json!({"yield":true,"delivery":"steer"}),
+    )
+    .await;
+    assert_eq!(result(&accepted)["state"], "active");
+    rig.wait_for_finished(1).await;
+    rig.wait_idle().await;
+    rig.finish().await;
 }
 
 #[tokio::test]

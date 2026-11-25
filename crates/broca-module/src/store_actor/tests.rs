@@ -327,7 +327,7 @@ pub(super) struct LoopExecutor {
     pub(super) waits_for_media: bool,
     /// The count of the person's steers the actor handed the latest run, as the module's
     /// executor hands it to the run's tool calls.
-    pub(super) person_steers: std::sync::Mutex<Option<broca_core::tool_plane::PersonSteers>>,
+    pub(super) steer_yields: std::sync::Mutex<Option<broca_core::tool_plane::SteerYields>>,
     /// Whether each run the actor started was at a prefix rebuild or applied a pending change
     /// (`RunControl::rebuild_point`), in order.
     pub(super) rebuild_points: Arc<std::sync::Mutex<Vec<bool>>>,
@@ -460,7 +460,7 @@ pub(super) fn executor(
         approval_gate: None,
         tool_text: "file contents".into(),
         waits_for_media: false,
-        person_steers: Default::default(),
+        steer_yields: Default::default(),
         rebuild_points: Default::default(),
         auth_selection: None,
     }
@@ -549,9 +549,9 @@ impl RunExecutor for LoopExecutor {
                 )
             };
             let approval = GatedApproval(self.approval_gate.clone());
-            *self.person_steers.lock().unwrap() = control.person_steers.clone();
+            *self.steer_yields.lock().unwrap() = control.steer_yields.clone();
             let seams = Seams {
-                person_steers: control.person_steers.clone(),
+                steer_yields: control.steer_yields.clone(),
                 provider: &self.provider,
                 tools: &tools,
                 bind: req.session.clone(),

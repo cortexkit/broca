@@ -287,7 +287,7 @@ pub struct Seams<'a, P, T> {
     /// The person's steers the session's owner counts while the run runs. A call waiting on a
     /// provider that can hand calls back (llm-runner `call_yield`) is asked to on each one.
     /// Without it no call is handed back for a steer.
-    pub person_steers: Option<broca_core::tool_plane::PersonSteers>,
+    pub steer_yields: Option<broca_core::tool_plane::SteerYields>,
 }
 
 impl<'a, P, T> Seams<'a, P, T> {
@@ -299,7 +299,7 @@ impl<'a, P, T> Seams<'a, P, T> {
         auth_selection: broca_records::record::AuthSelection,
     ) -> Seams<'b, P, T> {
         Seams {
-            person_steers: self.person_steers.clone(),
+            steer_yields: self.steer_yields.clone(),
             provider,
             tools: self.tools,
             bind: self.bind.clone(),
@@ -4556,7 +4556,7 @@ where
     // record that, with each call's key, before anything is sent. A plane that refuses the batch
     // leaves every call unsent, with a terminal saying why.
     let guard = ToolOpenGuard::new(Some(&seams.cancel), Some(&seams.stop))
-        .with_person_steers(seams.person_steers.clone());
+        .with_steer_yields(seams.steer_yields.clone());
     let refusal = seams
         .tools
         .batch_started_guarded(&ctx, planned, manifest, &guard)

@@ -480,8 +480,8 @@ trait ToolPlaneConnection: Send + Sync {
         None
     }
     /// Whether the call `call_key` was handed back for the person's steer (see
-    /// [`SubcConnection::took_person_yield`]). A connection that sends no yields never was.
-    fn took_person_yield(&self, _call_key: &str) -> bool {
+    /// [`SubcConnection::took_steer_yield`]). A connection that sends no yields never was.
+    fn took_steer_yield(&self, _call_key: &str) -> bool {
         false
     }
 
@@ -596,8 +596,8 @@ impl ToolPlaneConnection for SubcConnection {
     fn consumer_module_id(&self) -> Option<&str> {
         SubcConnection::consumer_module_id(self)
     }
-    fn took_person_yield(&self, call_key: &str) -> bool {
-        SubcConnection::took_person_yield(self, call_key)
+    fn took_steer_yield(&self, call_key: &str) -> bool {
+        SubcConnection::took_steer_yield(self, call_key)
     }
 
     async fn route_open_dispatch(
@@ -2022,7 +2022,7 @@ impl SubcToolPlane {
     ) -> DispatchResult {
         let scope = ctx.scope.as_ref();
         // Taken whatever the outcome, so a yield accepted for a call that then failed is forgotten.
-        let person_yield = key.is_some_and(|key| self.conn.took_person_yield(key.call_key));
+        let person_yield = key.is_some_and(|key| self.conn.took_steer_yield(key.call_key));
         match outcome {
             Ok(raw) => {
                 let content_v1 = self.frozen_tool_is_content_v1(ctx, module_id, &call.tool_name);

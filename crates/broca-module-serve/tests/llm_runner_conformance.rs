@@ -3455,6 +3455,19 @@ impl LlmRunnerSubject for BrocaSubject {
     }
 
     fn owner_stamp(&self) -> RouteStamp {
+        // The kit checks owner_stamp before opening a route for notice_yield, so scoping
+        // only in session_route is too late. The progress callback tracks the active case.
+        // Other cases keep their existing fixture stamps.
+        if self
+            .shared
+            .case_evidence
+            .lock()
+            .unwrap()
+            .active_name()
+            .is_some_and(|name| name.starts_with("notice_yield_"))
+        {
+            return scope_fixture_stamps(PLAIN_SCOPE_REF).1;
+        }
         // A direct caller does not freeze an attested owner, so using one here would make
         // stranger cancellation legitimately admissible on an otherwise unowned session.
         RouteStamp {

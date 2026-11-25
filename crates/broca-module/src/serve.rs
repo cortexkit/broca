@@ -851,6 +851,8 @@ pub fn scope_plan_opener(scope: &broca_protocol::SessionScope) -> Option<String>
     })
 }
 
+pub use crate::notice_yield::check_urgent_yield;
+
 /// A run's final message's text, as `run.result` serves it: its text parts joined in order with
 /// nothing inserted, its reasoning parts left out. `clean` says whether the run that wrote it
 /// cleans the model's text of tag notation on every exposure.
@@ -2420,9 +2422,8 @@ pub trait ServeHandler: Send + Sync {
         PlanState::Unknown
     }
 
-    /// The durable flow/run opener, if this session has frozen one. Reads and ordinary
-    /// unscoped or plain-scoped sessions keep their existing admission policy.
-    async fn frozen_scope_opener(&self, _session: &LineageKey) -> Option<String> {
+    /// The scope the session has already recorded, if any.
+    async fn frozen_scope(&self, _session: &LineageKey) -> Option<broca_protocol::SessionScope> {
         None
     }
 
@@ -3228,12 +3229,10 @@ impl ServeHandler for crate::LineageRegistry {
         }
     }
 
-    async fn frozen_scope_opener(&self, session: &LineageKey) -> Option<String> {
+    async fn frozen_scope(&self, session: &LineageKey) -> Option<broca_protocol::SessionScope> {
         self.session_ownership_for_bind(session)
             .await
             .and_then(|ownership| ownership.scope)
-            .as_ref()
-            .and_then(scope_plan_opener)
     }
 
     fn plan_admitter(&self) -> Option<std::sync::Arc<dyn broca_fetch_plan::PlanAdmitter>> {
@@ -3785,6 +3784,13 @@ impl ServeHandler for crate::LineageRegistry {
             })
             .await?;
         read.check_owner(principal, scope)?;
+        let scope_owner = read
+            .first_run
+            .as_ref()
+            .and_then(|(scope, _)| scope.as_ref())
+            .map(|scope| scope.owner.canonical_owner_string());
+        broca_fetch_plan::check_plan_call_yield(&plan, scope_owner.as_deref())
+            .map_err(SessionChangeError::FetchRefused)?;
         let senders =
             broca_fetch_plan::plan_senders(&plan).map_err(SessionChangeError::FetchRefused)?;
         cortexkit_role_llm_runner::scope_admission::check_plan_senders(

@@ -29,9 +29,9 @@ pub use admit::{
     CATALOG_OP, DECLARE_OP, JOIN_SEPARATOR, JOIN_VERSION,
 };
 pub use plan::{
-    check_later_plan, check_send_members, check_send_members_with, check_zone,
-    names_confined_preset, parse_plan, parse_plan_with, plan_cache, plan_identity, plan_senders,
-    require_compaction_preset, CompactionSupport, OutputRefsSupport, Plan, PlanSender,
-    PlanTemplate, SlotType, CONFINED_TOOL_PRESET, SENDERS_MEMBER,
+    check_later_plan, check_plan_call_yield, check_send_members, check_send_members_with,
+    check_zone, names_confined_preset, parse_plan, parse_plan_with, plan_cache, plan_identity,
+    plan_senders, require_compaction_preset, CompactionSupport, OutputRefsSupport, Plan,
+    PlanSender, PlanTemplate, SlotType, CALL_YIELD_GROUPS, CONFINED_TOOL_PRESET, SENDERS_MEMBER,
 };
 pub use refusal::{Refusal, Unanswered};

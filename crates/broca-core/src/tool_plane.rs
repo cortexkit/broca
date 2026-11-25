@@ -305,8 +305,7 @@ pub struct DispatchSignals {
     /// The run's absolute step deadline, carried so the route-open wait in front of the send
     /// ends with it (see [`ToolOpenGuard`]). It never makes an enqueued call count as unsent.
     deadline: Option<tokio::time::Instant>,
-    /// Counts the person's own steers the run took (see [`PersonSteers`]).
-    person: Option<PersonSteers>,
+    steer_yields: Option<SteerYields>,
 }
 impl DispatchSignals {
     pub fn new(
@@ -317,26 +316,29 @@ impl DispatchSignals {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
             deadline: None,
-            person: None,
+            steer_yields: None,
         }
     }
 
-    /// The person's steers the run has taken so far, or `None` when the run counts none.
-    /// A call reads this as it is sent, then waits in [`Self::person_steered`] for a later one.
-    pub fn person_steers_seen(&self) -> Option<u64> {
-        self.person.as_ref().map(|steers| *steers.0.borrow())
+    /// The hand-back requests the run has taken so far, or `None` when it takes none.
+    /// A call reads this as it is sent, then waits in [`Self::steer_yield_after`] for a later one.
+    pub fn steer_yields_seen(&self) -> Option<u64> {
+        self.steer_yields
+            .as_ref()
+            .map(|steers| steers.0.borrow().count())
     }
 
-    /// Resolves once the run takes a person's steer after the `seen`-th, and never when the run
-    /// counts none (or its count can no longer change).
-    pub async fn person_steered(&self, seen: u64) {
-        let Some(PersonSteers(steers)) = &self.person else {
+    /// Resolves with the reason for a hand-back request after the `seen`-th, or
+    /// waits indefinitely if there can be no further requests.
+    pub async fn steer_yield_after(&self, seen: u64) -> SteerYield {
+        let Some(SteerYields(steers)) = &self.steer_yields else {
             return std::future::pending().await;
         };
         let mut steers = steers.clone();
-        if steers.wait_for(|count| *count > seen).await.is_err() {
-            std::future::pending::<()>().await;
+        if let Ok(state) = steers.wait_for(|state| state.count() > seen).await {
+            return state.reason;
         }
+        std::future::pending().await
     }
     pub fn interrupted(&self) -> bool {
         self.cancel
@@ -386,18 +388,41 @@ impl From<&DispatchSignals> for ToolOpenGuard {
         Self {
             cancel: signals.cancel.clone(),
             stop: signals.stop.clone(),
-            person: signals.person.clone(),
+            steer_yields: signals.steer_yields.clone(),
             deadline: signals.deadline,
         }
     }
 }
 
-/// How many of the person's own steers a run has taken (llm-runner `call_yield`): a steer
-/// whose sender the session's plan marks `person`, carrying no notice mark and no words spoken
-/// for an agent. The session's owner counts them as each one becomes durable; a call waiting on
-/// a provider that can hand calls back asks for that once a steer arrives after it was sent.
+/// Why an admitted steer asks waiting calls to hand back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SteerYield {
+    #[default]
+    PersonMessage,
+    UrgentNotice,
+}
+
+/// Per-run hand-back signal, advanced only after the triggering steer is durable.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SteerYieldState {
+    count: u64,
+    reason: SteerYield,
+}
+
+impl SteerYieldState {
+    pub fn record(&mut self, reason: SteerYield) {
+        self.count += 1;
+        self.reason = reason;
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+/// Each call waits for a later request than the ones seen at dispatch.
 #[derive(Clone, Debug)]
-pub struct PersonSteers(pub tokio::sync::watch::Receiver<u64>);
+pub struct SteerYields(pub tokio::sync::watch::Receiver<SteerYieldState>);
 
 /// What ends a tool-dispatch route-open wait early: the run's cancel and stop/shutdown
 /// tokens, and the run's absolute step deadline when it has one. A batch builds one guard
@@ -410,7 +435,7 @@ pub struct PersonSteers(pub tokio::sync::watch::Receiver<u64>);
 pub struct ToolOpenGuard {
     cancel: Option<tokio_util::sync::CancellationToken>,
     stop: Option<tokio_util::sync::CancellationToken>,
-    person: Option<PersonSteers>,
+    steer_yields: Option<SteerYields>,
     /// The run's step deadline, as an absolute instant: no route-open wait of the batch, and
     /// no open attempt in flight, outlasts it. `None` when the run has none, which leaves the
     /// plane's own patience as the only bound.
@@ -430,13 +455,13 @@ impl ToolOpenGuard {
         Self {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
-            person: None,
+            steer_yields: None,
             deadline: None,
         }
     }
-    /// The same guard, with the count of the person's steers its calls hand back on.
-    pub fn with_person_steers(mut self, person: Option<PersonSteers>) -> Self {
-        self.person = person;
+    /// The same guard, observing steers its calls hand back on.
+    pub fn with_steer_yields(mut self, steer_yields: Option<SteerYields>) -> Self {
+        self.steer_yields = steer_yields;
         self
     }
     /// The send-boundary signals matching this guard: the same tokens and deadline, for
@@ -446,7 +471,7 @@ impl ToolOpenGuard {
             cancel: self.cancel.clone(),
             stop: self.stop.clone(),
             deadline: self.deadline,
-            person: self.person.clone(),
+            steer_yields: self.steer_yields.clone(),
         }
     }
     pub fn cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {

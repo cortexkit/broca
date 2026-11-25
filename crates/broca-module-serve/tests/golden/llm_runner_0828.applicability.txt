@@ -13,13 +13,13 @@ PASS cache_policy_plan_key_non_string_refused
 PASS cache_policy_send_key_non_string_refused
 PASS live_attach_replays_step_controls
 PASS live_attach_idle_unchanged
-N/A notice_yield_without_call_yield: runner does not declare notice_yield
-N/A notice_yield_running_calls_and_steer: runner does not declare notice_yield
-N/A notice_yield_sender_and_delivery_refused: runner does not declare notice_yield
-N/A notice_yield_non_owner_plan_refused: runner does not declare notice_yield
-PASS notice_yield_undeclared_members_refused
-N/A notice_yield_notice_mark_admitted: runner does not declare notice_yield
-N/A notice_yield_second_send_never_reyields: runner does not declare notice_yield
+PASS notice_yield_without_call_yield
+PASS notice_yield_running_calls_and_steer
+PASS notice_yield_sender_and_delivery_refused
+PASS notice_yield_non_owner_steer
+N/A notice_yield_undeclared_members_refused: runner declares notice_yield
+PASS notice_yield_notice_mark_admitted
+PASS notice_yield_second_send_never_reyields
 N/A tag_read_person: adapter cannot seed a person's tagged entry
 N/A tag_read_before_cut: adapter cannot seed a person's tagged entry
 N/A tag_read_before_undo: adapter cannot seed a person's tagged entry

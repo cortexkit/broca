@@ -622,6 +622,10 @@ fn minute_of_day(time: &str) -> Option<u32> {
 /// as the identical request sent when idle).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmissionRequest {
+    /// A request to hand back a waiting call, checked at admission. A queued send loses
+    /// this flag on restart because the call wait it could affect has already ended.
+    #[serde(skip)]
+    pub urgent_yield: bool,
     /// Untrusted display marks, validated before admission and excluded from request bytes.
     #[serde(skip)]
     pub message_marks: serde_json::Map<String, serde_json::Value>,
@@ -1007,6 +1011,7 @@ mod tests {
     #[test]
     fn submission_request_tool_module_round_trips_when_present() {
         let request = SubmissionRequest {
+            urgent_yield: false,
             message_marks: Default::default(),
             retention_policy: None,
             account_route: None,
@@ -1103,6 +1108,7 @@ mod budget_compat_tests {
     #[test]
     fn absent_submission_budget_is_omitted_and_defaults_to_none() {
         let request = SubmissionRequest {
+            urgent_yield: false,
             message_marks: Default::default(),
             retention_policy: None,
             account_route: None,

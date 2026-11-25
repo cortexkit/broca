@@ -142,6 +142,7 @@ impl SendParamsExt for SendParams {
             service_tier,
             one_shot,
             delivery,
+            urgent_yield,
             dedupe_key: _,
             expires_at_ms: _,
             template,
@@ -233,6 +234,7 @@ impl SendParamsExt for SendParams {
             })
             .transpose()?;
         let submission = SubmissionRequest {
+            urgent_yield,
             message_marks: Default::default(),
             retention_policy: None,
             route_decision_id,
@@ -411,6 +413,7 @@ mod tests {
 
     fn make_send_params(system: Option<String>, prompt: &str) -> SendParams {
         SendParams {
+            urgent_yield: false,
             account_route: None,
             route_decision_id: None,
             content: Vec::new(),
@@ -450,6 +453,17 @@ mod tests {
             append_episode: false,
             context_management: None,
         }
+    }
+
+    #[test]
+    fn notice_yield_false_and_absent_decode_and_serialize_identically() {
+        let absent = serde_json::to_value(make_send_params(None, "ordinary steer")).unwrap();
+        let mut explicit = absent.clone();
+        explicit["yield"] = serde_json::Value::Bool(false);
+        assert!(broca_wire::check_run_parameters(&explicit).is_ok());
+        let decoded: SendParams = serde_json::from_value(explicit).unwrap();
+        assert!(!decoded.urgent_yield);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), absent);
     }
 
     #[test]

@@ -411,6 +411,24 @@ pub enum CompactionSupport {
 
 pub use broca_protocol::FORK_ANSWER_SERVED;
 
+pub const CALL_YIELD_GROUPS: &[&str] = &[
+    cortexkit_role_llm_runner::capabilities::CALL_YIELD,
+    cortexkit_role_llm_runner::capabilities::NOTICE_YIELD,
+];
+
+/// Check a new plan's hand-back marks against its attested or recorded scope owner.
+pub fn check_plan_call_yield(
+    plan: &serde_json::Map<String, Value>,
+    scope_owner: Option<&str>,
+) -> Result<(), Refusal> {
+    cortexkit_role_llm_runner::call_yield::check_plan_for_owner(
+        plan,
+        CALL_YIELD_GROUPS,
+        scope_owner,
+    )
+    .map_err(Refusal::invalid)
+}
+
 /// Refuses a `fork_callers` member that is not a list of distinct non-empty strings, naming
 /// `plan.fork_callers`, when `served`. Checked at admission and at refresh, before anything is
 /// fetched or written.
@@ -455,13 +473,10 @@ pub fn parse_plan_with(
         )
         .map_err(Refusal::invalid)?;
         check_fork_callers(object, FORK_ANSWER_SERVED).map_err(Refusal::invalid)?;
-        // Broca declares `call_yield`, so a sender's boolean `person` mark is admitted; it
-        // doesn't declare `notice_yield`, so any `yields` mark is refused by name.
-        cortexkit_role_llm_runner::call_yield::check_plan(
-            object,
-            &[cortexkit_role_llm_runner::capabilities::CALL_YIELD],
-        )
-        .map_err(Refusal::invalid)?;
+        // Re-reading an admitted plan only checks its marks. New plans also need the
+        // scope owner check before fetching providers or storing the plan.
+        cortexkit_role_llm_runner::call_yield::check_plan(object, CALL_YIELD_GROUPS)
+            .map_err(Refusal::invalid)?;
     }
     check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
@@ -830,10 +845,8 @@ mod sender_tests {
         }
     }
 
-    /// Broca declares `call_yield`, so a sender's boolean `person` mark is read; it doesn't
-    /// declare `notice_yield`, so `yields` is refused by name, even false.
     #[test]
-    fn a_person_mark_is_read_and_a_yields_mark_refused() {
+    fn notice_yield_admits_owner_and_peer_entries_in_a_scoped_plan() {
         let composition = json!({"providers": [{"provider": "p", "tools": []}],
             "step_transform_items": []});
         let plan = parse_plan(
@@ -844,20 +857,24 @@ mod sender_tests {
                     cortexkit_role_tool_provider::catalog::composition_digest(&composition)
                         .unwrap(),
                 "composition": composition,
-                "senders": [{"module": "gateway", "person": true}, {"module": "aft"}],
+                "senders": [{"module": "gateway", "person": true, "yields": true},
+                    {"module": "voice", "yields": true}, {"module": "aft"}],
             }),
             CompactionSupport::Unsupported,
         )
         .unwrap();
         assert!(plan.senders[0].person);
         assert!(!plan.senders[1].person);
+        assert!(plan.senders[0].yields);
+        assert!(plan.senders[1].yields);
+        assert!(!plan.senders[2].yields);
         for (senders, field) in [
             (
                 json!([{"module":"gateway","person":"yes"}]),
                 "plan.senders[0].person",
             ),
             (
-                json!([{"module":"gateway","yields":false}]),
+                json!([{"module":"gateway","yields":"yes"}]),
                 "plan.senders[0].yields",
             ),
         ] {
@@ -865,6 +882,19 @@ mod sender_tests {
                 parse_plan(&json!({"senders":senders}), CompactionSupport::Unsupported)
                     .unwrap_err(),
                 Refusal::invalid(field)
+            );
+        }
+    }
+
+    #[test]
+    fn notice_yield_refuses_any_grant_without_a_scope_owner() {
+        for yields in [false, true] {
+            let raw = json!({"senders": [{"module":"other"},{"module":"voice","yields":yields}]});
+            let plan = raw.as_object().unwrap();
+            check_plan_call_yield(plan, Some("owner")).unwrap();
+            assert_eq!(
+                check_plan_call_yield(plan, None).unwrap_err(),
+                Refusal::invalid("plan.senders[1].yields")
             );
         }
     }
