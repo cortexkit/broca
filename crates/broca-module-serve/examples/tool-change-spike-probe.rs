@@ -8,6 +8,8 @@
 //! ChatGPT requires `--case 1 --form a` and the `chatgpt:openai` credential for live runs.
 //! The ChatGPT lane uses HTTPS to measure the request form, not the WebSocket transport.
 //! Anthropic requires `--case 1 --form a --place after-user` and stops at T4's first response.
+//! `--grouped` (Anthropic only) puts a text plan note before the `tool_addition` block in the
+//! same system message, the shape broca sends when a note and an added tool share one turn.
 //! Use `apikey:anthropic` or `oauth:anthropic` for live runs, or one account's credential id
 //! such as `oauth:anthropic:<account label>`.
 //! Its dry-run needs no credential and prints the API-key shape, with only header names and
@@ -187,6 +189,8 @@ struct Args {
     /// Requests per conversation: 4, or 3 without the second ordinary question. The tools
     /// change at the last one, T4, either way.
     steps: u8,
+    /// Anthropic only: T4's system message carries a text plan note before the added tool.
+    grouped: bool,
 }
 
 impl Args {
@@ -202,9 +206,14 @@ impl Args {
         let mut alternate = None;
         let mut placement = Placement::BeforeUser;
         let mut steps = 4;
+        let mut grouped = false;
         while let Some(flag) = args.next() {
             if flag == "--dry-run" {
                 dry_run = true;
+                continue;
+            }
+            if flag == "--grouped" {
+                grouped = true;
                 continue;
             }
             if !matches!(
@@ -287,7 +296,11 @@ impl Args {
             alternate,
             placement,
             steps,
+            grouped,
         };
+        if result.grouped && result.provider != Provider::Anthropic {
+            return Err("--grouped applies only to --provider anthropic".into());
+        }
         let only_form_a = result.case == Some(1) && result.alternate == Some(false);
         if result.provider == Provider::Chatgpt && !only_form_a {
             return Err("--provider chatgpt supports only --case 1 --form a".into());
@@ -454,6 +467,8 @@ struct ProbeFamily {
     variant: Variant,
     changed: bool,
     placement: Placement,
+    /// See [`Args::grouped`].
+    grouped: bool,
     body: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -470,7 +485,11 @@ impl ProbeFamily {
                 paths.push("/messages/- (system.tools)")
             }
             (Provider::Anthropic, 1) if !self.variant.alternate && self.changed => {
-                paths.push("/messages/- (system.content: tool_addition)")
+                paths.push(if self.grouped {
+                    "/messages/- (system.content: text note, tool_addition)"
+                } else {
+                    "/messages/- (system.content: tool_addition)"
+                })
             }
             (Provider::Openai, 1) if self.variant.alternate => {
                 paths.push("/tool_choice (allowed_tools)")
@@ -514,7 +533,10 @@ impl ProbeFamily {
                 Provider::Kimi => Some(
                     json!({"role":"system", "tools":[{"type":"function", "function":{"name":NEW_TOOL, "description":tool(NEW_TOOL, false).description, "parameters":tool(NEW_TOOL, false).input_schema}}]}),
                 ),
-                Provider::Anthropic => Some(anthropic::tool_addition(&tool(NEW_TOOL, false))),
+                Provider::Anthropic => Some(anthropic::tool_addition(
+                    &tool(NEW_TOOL, false),
+                    self.grouped,
+                )),
                 _ => None,
             }
         } else {
@@ -983,6 +1005,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     variant,
                     changed: step == 4,
                     placement: args.placement,
+                    grouped: args.grouped,
                     body: body.clone(),
                 };
                 let patches = family.patches();
@@ -1097,6 +1120,7 @@ impl WireFamily for ProbeFamily {
                 rendered,
                 &tool(NEW_TOOL, false),
                 frozen.claude_code_persona.is_some(),
+                self.grouped,
             )
         } else {
             serde_json::to_vec(&self.patch(serde_json::from_slice(&rendered).expect("family JSON")))
@@ -1218,6 +1242,7 @@ mod tests {
             variant,
             changed,
             placement,
+            grouped: false,
             body: Arc::new(Mutex::new(Vec::new())),
         };
         let opts = options(provider, variant, changed, prompt(variant, step));
@@ -1504,6 +1529,7 @@ mod tests {
             variant,
             changed: true,
             placement: Placement::AfterUser,
+            grouped: false,
             body: Arc::new(Mutex::new(Vec::new())),
         };
         let auth = anthropic::auth(AuthMethod::Oauth, "fixture".into());

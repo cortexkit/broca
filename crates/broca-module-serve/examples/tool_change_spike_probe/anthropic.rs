@@ -53,15 +53,28 @@ pub(super) fn persona(
         .map_err(|_| "Claude Code persona unavailable")
 }
 
-pub(super) fn tool_addition(tool: &Tool) -> Value {
-    json!({"role":"system", "content":[{"type":"tool_addition", "tool":{
+/// The system message that adds `tool`; with `grouped`, a text note comes first in the same
+/// message, the shape broca sends when a plan note and an added tool share one turn.
+pub(super) fn tool_addition(tool: &Tool, grouped: bool) -> Value {
+    let addition = json!({"type":"tool_addition", "tool":{
         "type":"tool_definition", "definition":{
             "name":tool.name, "description":tool.description, "input_schema":tool.input_schema,
         }
-    }}]})
+    }});
+    let content = if grouped {
+        // The text a plan note would carry for this change.
+        let note = format!(
+            "Your tools changed: a new tool, {}, is now available.",
+            tool.name
+        );
+        json!([{"type":"text", "text":note}, addition])
+    } else {
+        json!([addition])
+    };
+    json!({"role":"system", "content":content})
 }
 
-pub(super) fn append_tool(body: Vec<u8>, tool: &Tool, signed: bool) -> Vec<u8> {
+pub(super) fn append_tool(body: Vec<u8>, tool: &Tool, signed: bool, grouped: bool) -> Vec<u8> {
     #[derive(serde::Deserialize)]
     struct Transcript<'a> {
         #[serde(borrow)]
@@ -75,7 +88,7 @@ pub(super) fn append_tool(body: Vec<u8>, tool: &Tool, signed: bool) -> Vec<u8> {
     let raw = transcript.messages.get();
     let end = raw.as_ptr() as usize - body.as_ptr() as usize + raw.len() - 1;
     assert_eq!(body.as_bytes()[end], b']');
-    body.insert_str(end, &format!(",{}", tool_addition(tool)));
+    body.insert_str(end, &format!(",{}", tool_addition(tool, grouped)));
     if signed {
         sign_body_in_place(&mut body);
     }
