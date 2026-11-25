@@ -46,6 +46,18 @@ pub struct Snapshot {
 
 type Reply<T> = oneshot::Sender<Result<T, SessionError>>;
 
+/// The records the run's copy lacks and the private sender for its batch.
+pub struct HoldReply {
+    missed: Missed,
+    batch: oneshot::Sender<HeldBatch>,
+}
+
+struct HeldBatch {
+    records: Vec<Record>,
+    barrier: bool,
+    reply: Reply<u64>,
+}
+
 /// One call a run's writer makes to the actor that owns the session.
 pub enum Request {
     Append {
@@ -53,16 +65,10 @@ pub enum Request {
         barrier: bool,
         reply: Reply<(Missed, u64)>,
     },
-    /// Starts a hold: the actor answers with what the copy lacks, then appends nothing until it
-    /// gets the [`Request::Held`] that follows.
+    /// Starts a hold: the actor sends a private continuation and waits for the batch or for the
+    /// run to drop the continuation. Other requests stay queued until the hold ends.
     Hold {
-        reply: Reply<Missed>,
-    },
-    /// The batch built during a hold, which ends it. An empty batch appends nothing.
-    Held {
-        records: Vec<Record>,
-        barrier: bool,
-        reply: Reply<u64>,
+        reply: Reply<HoldReply>,
     },
     /// Asks for the records the run's copy lacks, appending nothing.
     CaughtUp {
@@ -375,17 +381,19 @@ impl Writer for ActorWriter {
                   + Send),
         barrier: bool,
     ) -> Result<Vec<Record>, SessionError> {
-        let missed = self.ask(|reply| Request::Hold { reply }).await?;
+        let HoldReply { missed, batch } = self.ask(|reply| Request::Hold { reply }).await?;
         self.catch_up(missed)?;
         let records = build(&self.conversation, &self.operations, self.next_seq);
         let barrier = barrier || crate::writer::ends_run(&records);
-        let first = self
-            .ask(|reply| Request::Held {
+        let (reply, receive) = oneshot::channel();
+        batch
+            .send(HeldBatch {
                 records: records.clone(),
                 barrier,
                 reply,
             })
-            .await?;
+            .map_err(|_| SessionError::OwnerGone)?;
+        let first = receive.await.map_err(|_| SessionError::OwnerGone)??;
         self.fold_own(first, &records)?;
         if barrier && !records.is_empty() {
             self.durable_through(first + records.len() as u64 - 1);
@@ -596,29 +604,24 @@ impl RunLink {
                 let _ = reply.send(result.map(|first| (std::mem::take(&mut self.missed), first)));
             }
             Request::Hold { reply } => {
-                let _ = reply.send(Ok(std::mem::take(&mut self.missed)));
-                match self.requests.recv().await {
-                    Some(Request::Held {
-                        records,
-                        barrier,
-                        reply,
-                    }) => {
-                        let result = if records.is_empty() {
-                            Ok(session.next_seq())
-                        } else {
-                            session.append(&records, barrier).await
-                        };
-                        let _ = reply.send(result);
-                    }
-                    // The writer sends nothing else during a hold; a run that dropped its
-                    // writer mid-hold has nothing more to append.
-                    Some(other) => drop(other),
-                    None => {}
+                let (batch, receive) = oneshot::channel();
+                let _ = reply.send(Ok(HoldReply {
+                    missed: std::mem::take(&mut self.missed),
+                    batch,
+                }));
+                if let Ok(HeldBatch {
+                    records,
+                    barrier,
+                    reply,
+                }) = receive.await
+                {
+                    let result = if records.is_empty() {
+                        Ok(session.next_seq())
+                    } else {
+                        session.append(&records, barrier).await
+                    };
+                    let _ = reply.send(result);
                 }
-            }
-            Request::Held { reply, .. } => {
-                // Only a hold may be followed by its batch.
-                let _ = reply.send(Err(SessionError::OwnerGone));
             }
             Request::CaughtUp { reply } => {
                 let _ = reply.send(Ok(std::mem::take(&mut self.missed)));
@@ -719,6 +722,10 @@ impl RunLink {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{poll_fn, Future};
+    use std::pin::{pin, Pin};
+    use std::task::Poll;
+
     use broca_protocol::content::{ContentBlock, Message, Role};
     use broca_session_store::backend::{MemoryBackend, SessionAddr};
     use broca_session_store::codec::Message as _;
@@ -727,7 +734,7 @@ mod tests {
     use broca_session_store::record::{Event, Input, Placement, Record};
     use broca_session_store::session::Session;
 
-    use super::{ActorWriter, RunLink};
+    use super::{ActorWriter, Conversation, Operations, Request, RunLink};
     use crate::writer::Writer;
 
     fn input(text: &str) -> Record {
@@ -760,6 +767,10 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+        poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
     }
 
     async fn session(backend: &MemoryBackend) -> Session<&MemoryBackend> {
@@ -902,6 +913,77 @@ mod tests {
             writer.conversation().encode(),
             session.conversation().encode()
         );
+    }
+
+    #[tokio::test]
+    async fn a_cache_read_queued_during_a_hold_does_not_interrupt_the_batch() {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let (mut writer, mut link) = ActorWriter::new(&session, None);
+        let loader = writer.cache_predecessor_loader();
+        let mut load = pin!(loader.load());
+        {
+            let mut build = |_: &Conversation, _: &Operations, _| vec![input("built")];
+            let mut append = pin!(writer.append_with(&mut build, true));
+            assert!(poll_once(append.as_mut()).await.is_pending());
+            let hold = link.next().await.unwrap();
+            assert!(matches!(hold, Request::Hold { .. }));
+            {
+                let mut serve = pin!(link.serve(&mut session, hold));
+                assert!(poll_once(serve.as_mut()).await.is_pending());
+                assert!(poll_once(load.as_mut()).await.is_pending());
+                assert!(
+                    poll_once(serve.as_mut()).await.is_pending(),
+                    "queuing a cache read must not end the hold"
+                );
+                assert!(poll_once(append.as_mut()).await.is_pending());
+                serve.await;
+            }
+            assert_eq!(append.await.unwrap().len(), 1);
+        }
+        assert_eq!(texts(&session), ["built"]);
+        assert_eq!(texts(&writer), ["built"]);
+
+        // The owning actor answers cache reads outside RunLink::serve.
+        let mut next = pin!(link.next());
+        let Poll::Ready(Some(Request::CachePredecessor { reply })) = poll_once(next.as_mut()).await
+        else {
+            panic!("the cache read must still be queued after the hold");
+        };
+        assert!(reply.send(Ok(None)).is_ok());
+        assert!(load.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_append_before_its_batch_releases_the_hold() {
+        let backend = MemoryBackend::default();
+        let mut session = session(&backend).await;
+        let (mut writer, mut link) = ActorWriter::new(&session, None);
+        let mut serve = {
+            let mut build = |_: &Conversation, _: &Operations, _| {
+                panic!("the dropped append must not build a batch")
+            };
+            let mut append = pin!(writer.append_with(&mut build, true));
+            assert!(poll_once(append.as_mut()).await.is_pending());
+            let hold = link.next().await.unwrap();
+            assert!(matches!(hold, Request::Hold { .. }));
+            let mut serve = Box::pin(link.serve(&mut session, hold));
+            assert!(poll_once(serve.as_mut()).await.is_pending());
+            serve
+        };
+        assert!(
+            poll_once(serve.as_mut()).await.is_ready(),
+            "dropping the append must release the hold without another request or writer drop"
+        );
+        drop(serve);
+
+        let records = [input("after the hold")];
+        let (result, ()) = tokio::join!(writer.append(&records, true), async {
+            let request = link.next().await.unwrap();
+            link.serve(&mut session, request).await;
+        });
+        result.unwrap();
+        assert_eq!(texts(&session), ["after the hold"]);
     }
 
     /// Catching up folds what the actor appended since the run's last call and appends nothing,

@@ -704,15 +704,18 @@ pub(super) async fn serve_websocket(
         };
         // A model hold applies here as on the HTTP stand-in: a case that holds a routed
         // ChatGPT step must see the request arrive and stay unanswered until it releases it.
-        let gate = (!warm)
-            .then(|| shared.model_holds.lock().unwrap().get(&session).cloned())
-            .flatten()
-            .filter(|gate| gate.claim());
+        let gate = (!warm).then(|| shared.claim_model_hold(&session)).flatten();
         if let Some(gate) = gate {
+            shared.model_hold_event(&session, "held before routed response");
             HoldGate::set(&gate.arrived, &gate.arrived_wake);
             tokio::select! {
-                () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
-                () = shared.released.notified() => return Ok(()),
+                () = HoldGate::wait(&gate.released, &gate.released_wake) => {
+                    shared.model_hold_event(&session, "released: routed model resumed");
+                }
+                () = shared.released.notified() => {
+                    shared.model_hold_event(&session, "released: shared kill wake ended the routed request");
+                    return Ok(());
+                }
             }
         }
         let id = format!("routed-{session}-{turn_index}");

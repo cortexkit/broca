@@ -119,7 +119,6 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
     match request {
         Request::Append { .. } => "append",
         Request::Hold { .. } => "hold",
-        Request::Held { .. } => "held",
         Request::CaughtUp { .. } => "caught up",
         Request::SendRecords { .. } => "send records",
         Request::OpenLogRecords { .. } => "open log records",

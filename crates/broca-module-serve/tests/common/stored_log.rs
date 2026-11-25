@@ -14,7 +14,7 @@ use broca_session_store::{
     head::SessionTriple,
     keys::DeploymentKey,
     record::Record,
-    session::Session,
+    session::{Session, SessionView},
 };
 
 /// The settings a real-daemon test merges into broca's config so the sessions it creates are
@@ -36,13 +36,28 @@ pub async fn stored_records(state_root: &Path, identity: &BindIdentity) -> Vec<R
 
 /// [`stored_records`] with each record's log sequence number.
 pub async fn stored_log_records(state_root: &Path, identity: &BindIdentity) -> Vec<(u64, Record)> {
+    match stored_view(state_root, identity)
+        .await
+        .expect("a plain session reads without a writer")
+    {
+        Some(view) => view.open_log_records().await.expect("the open log reads"),
+        None => Vec::new(),
+    }
+}
+
+/// Open the production reader for a plain fixture without masking an earlier test error if the
+/// session can no longer be read.
+pub async fn stored_view(
+    state_root: &Path,
+    identity: &BindIdentity,
+) -> Result<Option<SessionView<LocalBackend>>, String> {
     let address = broca_core::session_addr(identity);
-    let Some(class) =
-        broca_records::session_storage::session_storage_class(state_root, &address).unwrap()
+    let Some(class) = broca_records::session_storage::session_storage_class(state_root, &address)
+        .map_err(|error| error.to_string())?
     else {
-        return Vec::new();
+        return Ok(None);
     };
-    let view = match Session::view(
+    match Session::view(
         LocalBackend::new(class.store_root(state_root)),
         SessionAddr(address),
         &SessionTriple {
@@ -54,13 +69,12 @@ pub async fn stored_log_records(state_root: &Path, identity: &BindIdentity) -> V
     )
     .await
     {
-        Ok(view) => view,
+        Ok(view) => Ok(Some(view)),
         // A refused creating send removes the session it made. Its storage class is found until
         // the removal finishes, so a read in between finds no head: the session doesn't exist.
-        Err(broca_session_store::session::SessionError::Missing) => return Vec::new(),
-        Err(error) => panic!("a plain session reads without a writer: {error:?}"),
-    };
-    view.open_log_records().await.expect("the open log reads")
+        Err(broca_session_store::session::SessionError::Missing) => Ok(None),
+        Err(error) => Err(format!("{error:?}")),
+    }
 }
 
 /// The frozen config of each run `identity`'s session started, in the order the runs started,

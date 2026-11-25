@@ -39,8 +39,9 @@ use cortexkit_role_harness::{
 };
 use cortexkit_role_llm_runner::points;
 use cortexkit_role_llm_runner_conformance::{
-    run_suite, Capability, CaseOutcome, LlmRunnerSubject, Reply, RouteFailure, RunnerRoute, Script,
-    ScriptedLateEntry, ScriptedPart, ScriptedUsage, SubscribeOutcome, SCRIPTED_TOOL,
+    run_suite_with, Capability, CaseOutcome, LlmRunnerSubject, Reply, RouteFailure, RunnerRoute,
+    Script, ScriptedLateEntry, ScriptedPart, ScriptedUsage, SubscribeOutcome, SuiteOptions,
+    SCRIPTED_TOOL,
 };
 use serde_json::{json, Map, Value};
 use subc_control::ConsumerIdentity;
@@ -357,11 +358,6 @@ mod retention_clock;
 mod routed_accounts;
 #[path = "llm_runner_conformance/session_class.rs"]
 mod session_class;
-/// The `it` target's real-daemon diagnostics (log tails, watchdog stall files, decoded session
-/// WALs), included by path so this rig prints the same evidence when a suite case fails.
-#[allow(dead_code)]
-#[path = "it/session_client.rs"]
-mod session_client;
 #[path = "llm_runner_conformance/signed_floor.rs"]
 mod signed_floor;
 #[path = "llm_runner_conformance/step_events.rs"]
@@ -506,11 +502,7 @@ struct Shared {
     /// Adapter clock writes and `settle_compaction` outcomes in the order they happened, each
     /// with its wall-clock time. Printed only when a suite case fails.
     evidence: Mutex<Vec<String>>,
-    /// Per run id: how many `run.result` answers in a row were not terminal, and the latest one.
-    run_polls: Mutex<HashMap<String, (usize, Value)>>,
-    /// Live snapshots of runs that stayed non-terminal for [`evidence::STALL_POLLS`] polls in a
-    /// row, taken while the daemon still answers. Printed only when a suite case fails.
-    stalls: Mutex<Vec<String>>,
+    case_evidence: Mutex<evidence::Cases>,
     /// What each structured-output session's scripted route reports about schema-constrained
     /// output, as a catalog row would: `Some(true)`, `Some(false)` or `None` (not stated).
     structured_output_support: Mutex<HashMap<String, Option<bool>>>,
@@ -560,6 +552,31 @@ impl HoldGate {
 }
 
 impl Shared {
+    fn claim_model_hold(&self, session: &str) -> Option<Arc<HoldGate>> {
+        let gate = self.model_holds.lock().unwrap().get(session).cloned()?;
+        if gate.claim() {
+            Some(gate)
+        } else {
+            self.model_hold_event(session, "later request passed the already-claimed hold");
+            None
+        }
+    }
+
+    async fn wait_model_hold(&self, session: &str, gate: &HoldGate, arrival: &'static str) -> bool {
+        self.model_hold_event(session, arrival);
+        HoldGate::set(&gate.arrived, &gate.arrived_wake);
+        tokio::select! {
+            () = HoldGate::wait(&gate.released, &gate.released_wake) => {
+                self.model_hold_event(session, "released: model resumed");
+                true
+            }
+            () = self.until_killed(session) => {
+                self.model_hold_event(session, "released: killed rig ended the request");
+                false
+            }
+        }
+    }
+
     /// Resolves once a kill has stopped the rig serving `session` (see `killed`).
     async fn until_killed(&self, session: &str) {
         loop {
@@ -1070,22 +1087,17 @@ async fn serve_model_request(
         stream.write_all(response.as_bytes()).await?;
         return Ok(());
     }
-    let model_gate = shared
-        .model_holds
-        .lock()
-        .unwrap()
-        .get(&session)
-        .cloned()
-        .filter(|gate| gate.claim());
+    let model_gate = shared.claim_model_hold(&session);
     // A stream hold belongs to the request its model hold holds.
     let stream_parts = model_gate
         .as_ref()
         .and_then(|_| shared.stream_holds.lock().unwrap().remove(&session));
     if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_none()) {
-        HoldGate::set(&gate.arrived, &gate.arrived_wake);
-        tokio::select! {
-            () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
-            () = shared.until_killed(&session) => return Ok(()),
+        if !shared
+            .wait_model_hold(&session, gate, "held before response headers")
+            .await
+        {
+            return Ok(());
         }
     }
     // The first model request of a run comes right after its start record is durable, and the
@@ -1234,10 +1246,11 @@ async fn serve_model_request(
     if let Some(gate) = model_gate.as_ref().filter(|_| stream_parts.is_some()) {
         stream.write_all(&body.as_bytes()[..prefix_bytes]).await?;
         stream.flush().await?;
-        HoldGate::set(&gate.arrived, &gate.arrived_wake);
-        tokio::select! {
-            () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
-            () = shared.until_killed(&session) => return Ok(()),
+        if !shared
+            .wait_model_hold(&session, gate, "held after response prefix")
+            .await
+        {
+            return Ok(());
         }
         stream.write_all(&body.as_bytes()[prefix_bytes..]).await?;
     } else {
@@ -2595,6 +2608,9 @@ impl RunnerRoute for BrocaRoute {
                 if let Some(run_id) = &polled_run {
                     self.observe_run_result(run_id, &value["result"]).await;
                 }
+                if method == "session.head" {
+                    self.observe_head(&value["result"]);
+                }
                 if method == "session.read" {
                     let mut mids = self.subject.shared.read_mids.lock().unwrap();
                     for entry in value["result"]["messages"].as_array().into_iter().flatten() {
@@ -3222,6 +3238,7 @@ impl LlmRunnerSubject for BrocaSubject {
             .lock()
             .unwrap()
             .insert(session.into(), parts);
+        self.shared.model_hold_event(session, "armed stream hold");
         Ok(())
     }
     async fn hold_next_model_step(&self, session: &str) -> Result<(), HarnessError> {
@@ -3230,6 +3247,7 @@ impl LlmRunnerSubject for BrocaSubject {
             .lock()
             .unwrap()
             .insert(session.into(), Arc::default());
+        self.shared.model_hold_event(session, "armed model hold");
         Ok(())
     }
 
@@ -3258,6 +3276,8 @@ impl LlmRunnerSubject for BrocaSubject {
             .unwrap()
             .remove(session)
             .ok_or_else(|| HarnessError::new("no model hold installed"))?;
+        self.shared
+            .model_hold_event(session, "release requested by case");
         HoldGate::set(&gate.released, &gate.released_wake);
         Ok(())
     }
@@ -3463,6 +3483,8 @@ impl LlmRunnerSubject for BrocaSubject {
             .lock()
             .unwrap()
             .insert(session.to_owned(), handle.state_root.clone());
+        self.shared
+            .evidence_session(session, &handle.state_root, None);
         let identity = self.raw_bind_identity(session);
         let started = Instant::now();
         let route = match &stamp.scope {
@@ -3480,11 +3502,14 @@ impl LlmRunnerSubject for BrocaSubject {
                 .unwrap()
                 .insert(session.into());
         }
+        let storage_identity = self.bind_identity(session);
+        self.shared
+            .evidence_session(session, &handle.state_root, Some(&storage_identity));
         self.shared
             .session_bindings
             .lock()
             .unwrap()
-            .insert(session.into(), self.bind_identity(session));
+            .insert(session.into(), storage_identity);
         eprintln!(
             "route.open session={} channel={} epoch={} elapsed_us={}",
             session,
@@ -5690,7 +5715,11 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     attach_notice_bus(&mut subject, &scratch).await;
     let work_dir = scratch.join("suite");
     std::fs::create_dir_all(&work_dir).unwrap();
-    let report = run_suite(&subject, &work_dir)
+    let shared = subject.shared.clone();
+    let options = SuiteOptions::new().with_progress(move |event| {
+        shared.case_evidence.lock().unwrap().progress(event);
+    });
+    let report = run_suite_with(&subject, &work_dir, options)
         .await
         .expect("the suite set up");
     println!("{}", report.render());
@@ -5702,7 +5731,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     if !failed.is_empty() {
         // Print before asserting: the panic message keeps only the report, and CI keeps only
         // test output, not the scratch directories this evidence is read from.
-        eprintln!("{}", subject.failure_evidence());
+        eprintln!("{}", subject.failure_evidence().await);
     }
     // Report every pin drift even when a failed case would stop the later contract checks.
     let pinned = check_0821_cases(&report.cases);
