@@ -25,6 +25,9 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+#[path = "extractor_conformance/vault.rs"]
+mod vault;
+
 const OWNER: &str = "extractor-owner";
 const SCOPE: &str = "extractor-run";
 const NON_EXTRACTION: &str = "fixture/decision";
@@ -56,11 +59,13 @@ impl StandIn {
         if stream.read_line(&mut line).await? == 0 {
             return Ok(());
         }
-        assert_eq!(
-            line.split_whitespace().nth(1),
-            Some("/client/v4/accounts/no-credential/ai/run/@cf/cloudflare/clairic")
+        let path = format!(
+            "/client/v4/accounts/{}/ai/run/@cf/cloudflare/clairic",
+            vault::ACCOUNT_ID
         );
+        assert_eq!(line.split_whitespace().nth(1), Some(path.as_str()));
         let mut length = None;
+        let mut authorized = false;
         loop {
             line.clear();
             if stream.read_line(&mut line).await? == 0 {
@@ -72,9 +77,15 @@ impl StandIn {
             if let Some((key, value)) = line.split_once(':') {
                 if key.eq_ignore_ascii_case("content-length") {
                     length = value.trim().parse().ok();
+                } else if key.eq_ignore_ascii_case("authorization") {
+                    authorized = value.trim().strip_prefix("Bearer ") == Some(vault::TOKEN);
                 }
             }
         }
+        assert!(
+            authorized,
+            "Workers AI request must carry the vault's bearer token"
+        );
         let mut body = vec![0; length.expect("Workers AI request has a content length")];
         stream.read_exact(&mut body).await?;
         let body = String::from_utf8(body).unwrap();
@@ -100,6 +111,7 @@ impl StandIn {
 }
 
 struct Subject {
+    _vault: vault::Service,
     _daemon: broca_test_support::RigChild,
     provider: Arc<StandIn>,
     connection: PathBuf,
@@ -261,6 +273,7 @@ impl Subject {
         })
         .await;
         Some(Self {
+            _vault: vault::register(&connection).await,
             _daemon: daemon,
             provider,
             connection,
