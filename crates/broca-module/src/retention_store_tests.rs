@@ -902,7 +902,10 @@ async fn retention_pass_expires_old_request_dumps() {
     for path in [&old_run, &mixed_old] {
         crate::store_request_dump::set_directory_modified(path, old).unwrap();
     }
-    std::fs::File::open(&old_file)
+    // Windows needs write access to change a file's times; a read-only handle is refused.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&old_file)
         .unwrap()
         .set_modified(old)
         .unwrap();
