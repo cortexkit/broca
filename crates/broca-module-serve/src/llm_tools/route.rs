@@ -911,7 +911,9 @@ impl LlmTools {
         } else if let Some(extractor) = extractor {
             extractor
                 .admit_tool(&admission.params, stored.as_ref())
-                .map_err(unspent)?
+                .map_err(|refusal| {
+                    crate::system_one::extraction_refusal_body(&Spend::Nothing.mark(refusal))
+                })?
         } else {
             self.system
                 .admit_tool(&admission.params, stored.as_ref())

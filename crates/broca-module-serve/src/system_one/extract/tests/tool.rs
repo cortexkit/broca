@@ -74,6 +74,54 @@ fn refusal(body: &[u8], code: &str, spend: RefusalSpend) -> Refusal {
 }
 
 #[tokio::test]
+async fn capture_unknown_extraction_model_refusal() {
+    let rig = Rig::new().await;
+    let mut args = arguments("unused", 0.02);
+    args["model"] = json!("clairic");
+    let body = call(&tools(&rig), "extract-unknown", args)
+        .await
+        .unwrap_err();
+    refusal(&body, "model_unknown", RefusalSpend::NoSpend);
+    if let Some(path) = std::env::var_os("BROCA_EXTRACT_UNKNOWN_SAMPLE") {
+        std::fs::write(path, &body).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unknown_extraction_model_lists_accepted_models_without_spend() {
+    let rig = Rig::new().await;
+    let tools = tools(&rig);
+    rig.rows
+        .0
+        .lock()
+        .unwrap()
+        .insert("other/extractor".into(), row(Some("extraction".into())));
+    for model in [
+        "clairic",
+        "cloudflare/clairic",
+        "clairic-1",
+        "@cf/clairic",
+        "other/extractor",
+    ] {
+        let mut args = arguments("unused", 0.02);
+        args["model"] = json!(model);
+        let body = call(&tools, model, args).await.unwrap_err();
+        refusal(&body, "model_unknown", RefusalSpend::NoSpend);
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["detail"]["model"], model);
+        assert_eq!(
+            body["detail"]["accepted_models"],
+            json!(["cloudflare-workers-ai/@cf/cloudflare/clairic"])
+        );
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("cloudflare-workers-ai/@cf/cloudflare/clairic"));
+    }
+    assert!(rig.cloudflare.received().is_empty());
+}
+
+#[tokio::test]
 async fn llm_extract_route_replies_and_samples() {
     let rig = Rig::new().await;
     let tools = tools(&rig);

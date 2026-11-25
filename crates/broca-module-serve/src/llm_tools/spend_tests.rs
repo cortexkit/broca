@@ -237,6 +237,12 @@ const SITES: &[(&str, &str, usize, &str)] = &[
         1,
         "the route's `error`: its caller states the spend",
     ),
+    (
+        "route.rs",
+        "extraction_refusal_body(&Spend::Nothing.mark(refusal))",
+        1,
+        "no spend: extraction admission refused before dispatch",
+    ),
     ("route.rs", "to_value(composition)", 1, "not a refusal"),
     ("route.rs", "to_value(&pricing)", 1, "not a refusal"),
     (

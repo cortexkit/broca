@@ -175,6 +175,9 @@ bounds for state and fields. An item that crosses the ceiling returns
 `cost_exceeded`; any other item within it can still run. The ledger and usage
 facts price only measured Clairic input tokens, not output tokens, passes or
 retry tokens. Missing input measurements do not become zero or estimated spend.
+An extraction `model_unknown` refusal names the supported model IDs in its message
+and in `detail.accepted_models`. These IDs still require a matching extraction
+entry in the catalog.
 
 Extraction uses a separate role key in `system-one.db`, so the same `batch_id`
 under `classifier/v1` is independent. A resend in the original scope keeps the
@@ -204,6 +207,8 @@ the measured `cost_usd`. It carries `truncated` only when reported and
 not successful results with missing answers. Refusals identify their spend:
 for example, a ceiling refusal before a provider call marks `detail.no_spend`,
 while a billed item failure with measured cost carries `detail.cost_usd`.
+An unknown extraction model also carries `detail.accepted_models` and
+`detail.no_spend: true`.
 
 ## `llm.complete/v1`
 

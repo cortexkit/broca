@@ -26,6 +26,7 @@
 mod clairic;
 mod classify;
 mod extract;
+pub(crate) use extract::extraction_refusal_body;
 mod images;
 mod routed;
 pub use images::ImageResolver;

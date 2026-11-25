@@ -337,6 +337,10 @@ impl Rig {
     }
 
     async fn request(&mut self, channel: u16, method: &str) -> Frame {
+        self.request_params(channel, method, json!({})).await
+    }
+
+    async fn request_params(&mut self, channel: u16, method: &str, params: Value) -> Frame {
         self.write(
             Frame::build(
                 FrameType::Request,
@@ -344,7 +348,7 @@ impl Rig {
                 channel,
                 1,
                 1,
-                serde_json::to_vec(&json!({"method": method, "params": {}})).unwrap(),
+                serde_json::to_vec(&json!({"method": method, "params": params})).unwrap(),
             )
             .unwrap(),
         )
@@ -362,6 +366,68 @@ impl Rig {
             "a route opened session history"
         );
     }
+}
+
+#[tokio::test]
+async fn capture_extract_unknown_model_on_serve_path() {
+    let mut rig = Rig::start(true).await;
+    assert_eq!(
+        rig.bind(1, Some(&[("extractor", "v1")]), true)
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let reply = rig
+        .request_params(
+            1,
+            "extract.run",
+            json!({
+                "batch_id":"unknown", "model":"clairic", "fields":{"total":{"type":"number"}},
+                "items":[{"state":"unused"}]
+            }),
+        )
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    assert_eq!(body(&reply)["code"], "model_unknown");
+    if let Some(path) = std::env::var_os("BROCA_EXTRACT_SERVE_UNKNOWN_SAMPLE") {
+        std::fs::write(path, &reply.body).unwrap();
+    }
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn extract_unknown_model_serve_refusal_lists_accepted_models() {
+    let mut rig = Rig::start(true).await;
+    assert_eq!(
+        rig.bind(1, Some(&[("extractor", "v1")]), true)
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let reply = rig
+        .request_params(
+            1,
+            "extract.run",
+            json!({
+                "batch_id":"unknown", "model":"clairic", "fields":{"total":{"type":"number"}},
+                "items":[{"state":"unused"}]
+            }),
+        )
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    let body = body(&reply);
+    assert_eq!(body["code"], "model_unknown");
+    assert_eq!(
+        body["detail"]["accepted_models"],
+        json!(["cloudflare-workers-ai/@cf/cloudflare/clairic"])
+    );
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("cloudflare-workers-ai/@cf/cloudflare/clairic"));
+    rig.finish().await;
 }
 
 fn body(frame: &Frame) -> Value {

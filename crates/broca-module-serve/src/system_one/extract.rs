@@ -42,6 +42,21 @@ const STORE_ROLE: &str = "extractor";
 const MAX_FIELDS: u64 = 64;
 const MAX_INSTRUCTION_BYTES: u64 = 60_000;
 const MAX_ANSWER_BYTES: u64 = 8_192;
+/// The extraction models broca serves. A `model_unknown` refusal lists them, so a caller can
+/// correct its call without guessing.
+const ACCEPTED_MODELS: &[&str] = &[CLAIRIC];
+
+/// Encodes an extraction refusal. A `model_unknown` refusal also carries
+/// `detail.accepted_models`, added after encoding because the shared refusal detail type has
+/// no member for it.
+pub(crate) fn extraction_refusal_body(refusal: &Refusal) -> Vec<u8> {
+    if refusal.code != errors::MODEL_UNKNOWN {
+        return refusal_body(refusal);
+    }
+    let mut body = serde_json::to_value(refusal).expect("refusal encodes");
+    body["detail"]["accepted_models"] = serde_json::json!(ACCEPTED_MODELS);
+    serde_json::to_vec(&body).expect("refusal encodes")
+}
 const ITEM_METADATA_BYTES: usize = 1024;
 
 const BOUNDS: ModuleBounds = ModuleBounds {
@@ -150,7 +165,7 @@ impl SystemOne {
                         extractor
                             .run(&params, &scope, &send)
                             .await
-                            .map_err(|e| refusal_body(&e))
+                            .map_err(|e| extraction_refusal_body(&e))
                     })
                     .await
             }
@@ -547,9 +562,22 @@ impl Extractor {
                 .as_deref()
                 .map_or(CatalogRow::Kindless, CatalogRow::Kind),
         };
-        request::check_catalog_row(model, kind)?;
-        if model != CLAIRIC {
-            return Err(Refusal::model_unknown(model));
+        if let Err(mut refusal) = request::check_catalog_row(model, kind) {
+            if refusal.code == errors::MODEL_UNKNOWN {
+                refusal.message.push_str(&format!(
+                    "; accepted extraction models: {}",
+                    ACCEPTED_MODELS.join(", ")
+                ));
+            }
+            return Err(refusal);
+        }
+        if !ACCEPTED_MODELS.contains(&model) {
+            let mut refusal = Refusal::model_unknown(model);
+            refusal.message = format!(
+                "{model} is not a supported extraction model; accepted extraction models: {}",
+                ACCEPTED_MODELS.join(", ")
+            );
+            return Err(refusal);
         }
         Ok(row.expect("catalog admission checked the row"))
     }
