@@ -54,7 +54,7 @@ fn tool(name: &str) -> Tool {
     Tool {
         name: name.into(),
         description: format!("{name} a file"),
-        input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}).into(),
         module: None,
         execution_mode: broca_protocol::request::ExecutionMode::Parallel,
         reply: None,

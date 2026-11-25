@@ -26,7 +26,7 @@ pub fn submit_tool(schema: Value) -> crate::request::Tool {
     crate::request::Tool {
         name: SUBMIT_RESULT_TOOL.to_owned(),
         description: SUBMIT_RESULT_DESCRIPTION.to_owned(),
-        input_schema: schema,
+        input_schema: schema.into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

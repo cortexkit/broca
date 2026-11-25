@@ -35,7 +35,7 @@ fn options() -> CallOptions {
     options.tools = vec![Tool {
         name: CANONICAL.into(),
         description: "List files".into(),
-        input_schema: json!({"type": "object"}),
+        input_schema: json!({"type": "object"}).into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

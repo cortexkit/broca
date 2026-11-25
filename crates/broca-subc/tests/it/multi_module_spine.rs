@@ -162,7 +162,7 @@ fn tool(name: &str, module: &str) -> Tool {
     Tool {
         name: name.into(),
         description: format!("{name} test tool"),
-        input_schema: json!({"type": "object"}),
+        input_schema: json!({"type": "object"}).into(),
         module: Some(module.into()),
         execution_mode: ExecutionMode::Parallel,
         reply: None,

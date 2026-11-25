@@ -117,7 +117,9 @@ impl ChatgptWire {
             }
         }
         let object = body.as_object_mut().unwrap();
-        object.entry("tools").or_insert_with(|| json!([]));
+        if whole.tools.is_empty() {
+            object.entry("tools").or_insert_with(|| json!([]));
+        }
         object.entry("tool_choice").or_insert_with(|| {
             let names = crate::tool_name_alias::ToolNameMap::build_with_aliases(
                 &opts.tools,

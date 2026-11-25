@@ -137,7 +137,7 @@ mod tests {
         let offered = Arc::new(vec![tool("read", Some("aft"), "Read a file.")]);
         let mut current = tool("read", Some("aft"), "Read a file, or part of one.");
         current.input_schema =
-            json!({"type": "object", "properties": {"lines": {"type": "string"}}});
+            json!({"type": "object", "properties": {"lines": {"type": "string"}}}).into();
         let change = CompatibleTool {
             provider: "aft".into(),
             tool: current.clone(),

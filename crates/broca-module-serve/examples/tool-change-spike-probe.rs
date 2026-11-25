@@ -301,7 +301,7 @@ fn tool(name: &str, changed: bool) -> Tool {
     Tool {
         name: name.into(),
         description: format!("Return the authoritative secret reference value for {name}."),
-        input_schema: schema,
+        input_schema: schema.into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

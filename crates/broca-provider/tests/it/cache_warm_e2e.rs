@@ -177,7 +177,9 @@ mod gated {
         Tool {
             name: "read".into(),
             description: "Read a file".into(),
-            input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            input_schema:
+                serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
+                    .into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,

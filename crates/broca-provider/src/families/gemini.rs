@@ -315,11 +315,7 @@ pub(crate) fn with_request_body<R>(
     }
 
     merge_static_options(&mut body, &frozen.static_options);
-    crate::structured_output::finish(
-        frozen,
-        &mut body,
-        name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
-    );
+    crate::structured_output::finish(frozen, &mut body, &mut [], "");
     use_body(GeminiBody {
         rest: body,
         contents,
@@ -856,7 +852,7 @@ fn convert_tool(t: &Tool, name_map: &crate::tool_name_alias::ToolNameMap) -> Val
     json!({
         "name": name_map.wire_name(&t.name),
         "description": t.description,
-        "parameters": sanitize_gemini_schema(&t.input_schema),
+        "parameters": sanitize_gemini_schema(&t.input_schema.parse()),
     })
 }
 

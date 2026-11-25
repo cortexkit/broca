@@ -24,7 +24,7 @@ fn tool(name: &str) -> Tool {
     Tool {
         name: name.into(),
         description: "fault-classification probe".into(),
-        input_schema: json!({"type": "object"}),
+        input_schema: json!({"type": "object"}).into(),
         module: None,
         execution_mode: ExecutionMode::Parallel,
         reply: None,

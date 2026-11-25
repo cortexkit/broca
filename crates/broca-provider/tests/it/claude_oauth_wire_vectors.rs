@@ -263,7 +263,7 @@ fn broca_request(case: &Value) -> CallOptions {
             .map(|tool| Tool {
                 name: host_tool_name(tool["name"].as_str().unwrap()),
                 description: tool["description"].as_str().unwrap().to_string(),
-                input_schema: tool["input_schema"].clone(),
+                input_schema: (&tool["input_schema"]).into(),
                 module: None,
                 execution_mode: Default::default(),
                 reply: None,

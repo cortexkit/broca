@@ -997,7 +997,7 @@ fn session_tool(provider: &str, tool: &cortexkit_role_tool_provider::catalog::Ca
     Tool {
         name: tool.name.clone(),
         description: tool.description.clone().unwrap_or_default(),
-        input_schema: tool.input_schema.clone(),
+        input_schema: (&tool.input_schema).into(),
         module: Some(provider.to_owned()),
         execution_mode: ExecutionMode::default(),
         reply: None,

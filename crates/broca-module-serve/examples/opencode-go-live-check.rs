@@ -227,7 +227,7 @@ fn tool_definition(name: &str) -> Tool {
     Tool {
         name: name.into(),
         description: description.into(),
-        input_schema,
+        input_schema: input_schema.into(),
         module: None,
         execution_mode: ExecutionMode::Sequential,
         reply: None,

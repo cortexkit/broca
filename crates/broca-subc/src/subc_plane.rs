@@ -1025,7 +1025,7 @@ impl SubcToolPlane {
                 // when the module declares one (modules that don't still yield empty —
                 // a caller-supplied tool list remains the authoritative prompt surface).
                 description: t.description.clone().unwrap_or_default(),
-                input_schema: t.schema.clone(),
+                input_schema: (&t.schema).into(),
                 module: Some(module_id.to_owned()),
                 execution_mode: ExecutionMode::Parallel,
                 reply: None,

@@ -212,7 +212,7 @@ impl RunSpec {
         self.tools.push(Tool {
             name: name.to_string(),
             description: format!("The {name} tool."),
-            input_schema: serde_json::json!({"type": "object"}),
+            input_schema: serde_json::json!({"type": "object"}).into(),
             module: None,
             execution_mode: ExecutionMode::Parallel,
             reply: None,

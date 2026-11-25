@@ -182,7 +182,8 @@ fn comprehensive_render_options() -> CallOptions {
                     "properties": {"inner": {"type": "array", "items": {"type": "string"}}}
                 }
             }
-        }),
+        })
+        .into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

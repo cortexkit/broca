@@ -358,7 +358,7 @@ mod tests {
         Tool {
             name: name.into(),
             description: "test tool".into(),
-            input_schema: json!({"type": "object"}),
+            input_schema: json!({"type": "object"}).into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,

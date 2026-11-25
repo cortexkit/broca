@@ -1949,7 +1949,7 @@ fn request_tool(name: &str, module: Option<&str>) -> Tool {
     Tool {
         name: name.into(),
         description: String::new(),
-        input_schema: serde_json::json!({"type": "object"}),
+        input_schema: serde_json::json!({"type": "object"}).into(),
         module: module.map(ToOwned::to_owned),
         execution_mode: broca_protocol::request::ExecutionMode::Parallel,
         reply: None,

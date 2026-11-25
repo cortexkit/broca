@@ -134,7 +134,7 @@ fn a_tool() -> broca_protocol::request::Tool {
     broca_protocol::request::Tool {
         name: "read".into(),
         description: String::new(),
-        input_schema: serde_json::json!({"type": "object"}),
+        input_schema: serde_json::json!({"type": "object"}).into(),
         module: None,
         execution_mode: broca_protocol::request::ExecutionMode::Parallel,
         reply: None,

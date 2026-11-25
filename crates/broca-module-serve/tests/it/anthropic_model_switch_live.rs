@@ -182,7 +182,8 @@ fn tick_tool() -> Tool {
             "type": "object",
             "properties": { "n": { "type": "integer" } },
             "required": ["n"]
-        }),
+        })
+        .into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

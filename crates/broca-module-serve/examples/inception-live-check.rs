@@ -192,7 +192,7 @@ fn tool() -> Tool {
         name: "read_file".into(),
         description: "Read one of three named synthetic files. No real filesystem is accessed."
             .into(),
-        input_schema: json!({"type":"object", "properties":{"path":{"type":"string", "enum":FILES}}, "required":["path"], "additionalProperties":false}),
+        input_schema: json!({"type":"object", "properties":{"path":{"type":"string", "enum":FILES}}, "required":["path"], "additionalProperties":false}).into(),
         module: None,
         execution_mode: ExecutionMode::Sequential,
         reply: None,

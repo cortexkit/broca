@@ -65,7 +65,8 @@ mod tests {
         o.tools = Arc::new(vec![Tool {
             name: "get_time".into(),
             description: "t".into(),
-            input_schema: json!({"type": "object", "properties": {"tz": {"type": "string"}}}),
+            input_schema: json!({"type": "object", "properties": {"tz": {"type": "string"}}})
+                .into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,

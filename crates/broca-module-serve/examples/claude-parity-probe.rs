@@ -58,7 +58,7 @@ fn request_options() -> CallOptions {
     opts.tools = vec![Tool {
         name: TOOL.into(),
         description: "Return the secret number.".into(),
-        input_schema: json!({"type": "object", "properties": {}}),
+        input_schema: json!({"type": "object", "properties": {}}).into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

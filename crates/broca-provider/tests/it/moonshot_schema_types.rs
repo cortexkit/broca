@@ -79,13 +79,13 @@ fn a_kimi_route_types_the_enum_properties_of_tool_schemas() {
 
     // Only the schema changes: with the declared schema put back, the body is the v5 bytes.
     let mut restored = body.clone();
-    restored["tools"][0]["function"]["parameters"] = opts.tools[0].input_schema.clone();
+    restored["tools"][0]["function"]["parameters"] = opts.tools[0].input_schema.parse();
     assert_eq!(
         serde_json::to_string(&restored).unwrap(),
         pins[1]["body"].as_str().unwrap()
     );
     // The stored tool keeps its declared schema.
-    assert!(opts.tools[0].input_schema["properties"]["surface"]
+    assert!(opts.tools[0].input_schema.parse()["properties"]["surface"]
         .get("type")
         .is_none());
 }

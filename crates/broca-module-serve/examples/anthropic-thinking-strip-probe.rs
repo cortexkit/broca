@@ -223,7 +223,8 @@ fn file_tool() -> Tool {
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
             "additionalProperties": false
-        }),
+        })
+        .into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

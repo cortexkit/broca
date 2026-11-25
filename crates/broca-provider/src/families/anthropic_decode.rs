@@ -431,7 +431,7 @@ fn decode_tools(value: Option<&Value>) -> Vec<Tool> {
             description: string_field(tool, "description")
                 .unwrap_or_default()
                 .to_string(),
-            input_schema: tool.get("input_schema").cloned().unwrap_or(Value::Null),
+            input_schema: tool.get("input_schema").unwrap_or(&Value::Null).into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,

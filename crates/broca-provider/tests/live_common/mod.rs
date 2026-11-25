@@ -291,7 +291,7 @@ impl LiveSpec {
         self.tools.push(Tool {
             name: name.to_string(),
             description: format!("The {name} tool."),
-            input_schema: schema,
+            input_schema: schema.into(),
             module: None,
             execution_mode: ExecutionMode::Parallel,
             reply: None,

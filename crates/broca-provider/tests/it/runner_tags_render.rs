@@ -121,7 +121,8 @@ fn options(prompt: Vec<Message>) -> CallOptions {
     options.tools = Arc::new(vec![Tool {
         name: "lookup".into(),
         description: "look something up".into(),
-        input_schema: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+        input_schema: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}})
+            .into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

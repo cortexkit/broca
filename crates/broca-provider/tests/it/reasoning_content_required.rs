@@ -107,7 +107,8 @@ fn tool_loop() -> CallOptions {
             "type": "object",
             "properties": { "path": { "type": "string" } },
             "required": ["path"]
-        }),
+        })
+        .into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

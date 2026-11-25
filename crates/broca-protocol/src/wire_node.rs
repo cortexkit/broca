@@ -25,8 +25,8 @@ pub enum Node<'a> {
     Value(Cow<'a, Value>),
     /// A string, escaped as serde_json escapes it.
     Str(Cow<'a, str>),
-    /// A JSON value held as its canonical text (a tool call's input, a JSON tool output). The
-    /// canonical writer copies the text as it is, which is its canonical form already.
+    /// A JSON value held as its canonical text, such as a tool input schema or call input. The
+    /// canonical writer copies the text directly.
     Json(&'a Json),
     Array(Vec<Node<'a>>),
     /// An object's members. The writer orders them, so their order here is free. A key appears

@@ -931,13 +931,12 @@ fn render_placed<R>(
         }
     }
 
-    if !opts.tools.is_empty() {
-        rest["tools"] = Value::Array(
-            opts.tools
-                .iter()
-                .map(|tool| convert_tool(tool, name_map))
-                .collect(),
-        );
+    let mut tools: Vec<_> = opts
+        .tools
+        .iter()
+        .map(|tool| convert_tool(tool, name_map))
+        .collect();
+    if !tools.is_empty() {
         rest["tool_choice"] = convert_tool_choice(&opts.tool_choice, name_map);
     }
     apply_generation_controls(
@@ -973,6 +972,7 @@ fn render_placed<R>(
     crate::structured_output::finish(
         frozen,
         &mut rest,
+        &mut tools,
         name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
     );
     let Value::Object(rest) = rest else {
@@ -982,6 +982,9 @@ fn render_placed<R>(
         .into_iter()
         .map(|(key, value)| (std::borrow::Cow::Owned(key), Node::value(value)))
         .collect();
+    if !tools.is_empty() {
+        members.push(("tools".into(), Node::Array(tools)));
+    }
     members.push(("system".into(), Node::Array(system)));
     members.push(("messages".into(), Node::Array(messages)));
     use_body(&Node::Object(members))
@@ -1211,8 +1214,12 @@ fn set_anthropic_cache_control(block: &mut Node<'_>, ttl: Option<CacheTtl>) {
     }
 }
 
-fn convert_tool(t: &Tool, name_map: &crate::tool_name_alias::ToolNameMap) -> Value {
-    json!({ "name": name_map.wire_name(&t.name), "description": t.description, "input_schema": t.input_schema })
+fn convert_tool<'a>(t: &'a Tool, name_map: &'a crate::tool_name_alias::ToolNameMap) -> Node<'a> {
+    Node::object([
+        ("name", Node::str(name_map.wire_name(&t.name))),
+        ("description", Node::str(&t.description)),
+        ("input_schema", Node::Json(&t.input_schema)),
+    ])
 }
 
 fn convert_tool_choice(tc: &ToolChoice, name_map: &crate::tool_name_alias::ToolNameMap) -> Value {

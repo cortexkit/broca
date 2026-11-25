@@ -65,6 +65,7 @@ struct MemoState {
     /// The socket and generation of the latest push, while that socket's watch is open.
     pushed: Option<(ConnToken, u64)>,
     /// The last `catalog.list` reply, with the socket that read it and its generation.
+    /// The reply contains parsed JSON schemas, shared through the `Arc` instead of copied.
     held: Option<(ConnToken, u64, Arc<Vec<CatalogEntry>>)>,
 }
 

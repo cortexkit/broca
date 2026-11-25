@@ -22,6 +22,7 @@ use broca_protocol::structured_output::{
     enforcement, reasons, schema_jcs_text, FrozenStructuredOutput, Mode, SchemaDelivery,
     StructuredOutput,
 };
+use broca_protocol::wire_node::{Node, NodeRef};
 use serde_json::{json, Map, Value};
 
 use crate::spec::{CapabilityFlag, WireFamilyId};
@@ -781,8 +782,13 @@ pub use broca_protocol::structured_output::submit_tool;
 
 /// Add the family's schema encoding to a shaped body, and mark the submit tool strict or not.
 /// `body` is the family's own request body: for Code Assist, the inner Gemini body.
-/// `submit_wire_name` is the submit tool's name as the body spells it.
-pub fn finish(frozen: &FrozenRenderConfig, body: &mut Value, submit_wire_name: &str) {
+/// Only Anthropic and Responses need the tool nodes, which keep their schema text borrowed.
+pub(crate) fn finish(
+    frozen: &FrozenRenderConfig,
+    body: &mut Value,
+    tools: &mut [Node<'_>],
+    submit_wire_name: &str,
+) {
     let Some(so) = &frozen.structured_output else {
         return;
     };
@@ -828,41 +834,34 @@ pub fn finish(frozen: &FrozenRenderConfig, body: &mut Value, submit_wire_name: &
             }
         }
         Mode::SubmitTool => {
-            let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+            if tools.is_empty() {
                 return;
-            };
-            match family {
+            }
+            let tool_strict = match family {
                 // Responses tools are strict unless told otherwise on the ChatGPT backend, so
                 // the submit tool always states its strictness explicitly.
                 WireFamilyId::OpenAiResponses | WireFamilyId::OpenAiResponsesChatgpt => {
-                    if let Some(tool) = tools
-                        .iter_mut()
-                        .find(|tool| tool["name"] == submit_wire_name)
-                    {
-                        tool["strict"] = json!(strict);
-                    }
+                    Some(strict)
                 }
-                WireFamilyId::AnthropicMessages => {
-                    if strict {
-                        if let Some(tool) = tools
-                            .iter_mut()
-                            .find(|tool| tool["name"] == submit_wire_name)
-                        {
-                            tool["strict"] = json!(true);
-                        }
-                    }
-                    // Claude Sonnet 5.5 and Opus 5.5 refuse any forcing `tool_choice` (`any`
-                    // or `tool`) with an HTTP 400, with or without thinking, measured. A
-                    // `submit_tool` run never forces: a caller's forcing choice is sent as
-                    // `auto`, so the run still reaches the model with the submit tool offered.
-                    let forcing =
-                        matches!(body["tool_choice"]["type"].as_str(), Some("any" | "tool"));
-                    if forcing {
-                        body["tool_choice"] = json!({ "type": "auto" });
-                    }
-                }
+                WireFamilyId::AnthropicMessages if strict => Some(true),
                 // xAI's tool arguments are always strict; Gemini and Bedrock have no flag.
-                _ => {}
+                _ => None,
+            };
+            if let Some(strict) = tool_strict {
+                if let Some(tool) = tools.iter_mut().find(|tool| {
+                    tool.get("name").and_then(NodeRef::as_str) == Some(submit_wire_name)
+                }) {
+                    tool.insert("strict", Node::value(Value::Bool(strict)));
+                }
+            }
+            // Claude Sonnet 5.5 and Opus 5.5 refuse any forcing `tool_choice` (`any`
+            // or `tool`) with an HTTP 400, with or without thinking, measured. A
+            // `submit_tool` run never forces: a caller's forcing choice is sent as
+            // `auto`, so the run still reaches the model with the submit tool offered.
+            if family == WireFamilyId::AnthropicMessages
+                && matches!(body["tool_choice"]["type"].as_str(), Some("any" | "tool"))
+            {
+                body["tool_choice"] = json!({ "type": "auto" });
             }
         }
         _ => {}

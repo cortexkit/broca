@@ -81,7 +81,8 @@ fn opts(tools: bool) -> CallOptions {
         opts.tools = Arc::new(vec![Tool {
             name: "lookup_city".into(),
             description: "Look a city up.".into(),
-            input_schema: json!({"type": "object", "properties": {"name": {"type": "string"}}}),
+            input_schema: json!({"type": "object", "properties": {"name": {"type": "string"}}})
+                .into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,

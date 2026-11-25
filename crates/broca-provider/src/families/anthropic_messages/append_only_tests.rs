@@ -135,7 +135,7 @@ fn tool(name: &str) -> Tool {
     Tool {
         name: name.into(),
         description: "read a file".into(),
-        input_schema: json!({"type": "object"}),
+        input_schema: json!({"type": "object"}).into(),
         module: None,
         execution_mode: ExecutionMode::Sequential,
         reply: None,

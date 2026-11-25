@@ -221,7 +221,7 @@ fn tools() -> Vec<Tool> {
                 "format": {"type": "string", "enum": ["text", "markdown"], "description": "Preferred reference excerpt format."}
             },
             "required": ["path", "query", "start_line", "max_lines", "case_sensitive", "format"]
-        }),
+        }).into(),
         module: None, execution_mode: Default::default(), reply: None,
     }).collect()
 }

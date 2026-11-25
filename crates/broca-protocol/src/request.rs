@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::content::Message;
+use crate::json::Json;
 
 /// A concrete model handle — the runner is GIVEN this (model selection is the
 /// caller's job). `{provider_module_id, model_id}` identifies which provider
@@ -56,11 +57,12 @@ pub enum ExecutionMode {
 
 /// A tool offered to the model. `execute` is dispatch-to-subc (the runner is the
 /// executor); the provider only sees the declaration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
     pub description: String,
-    pub input_schema: Value,
+    /// Compact JSON text keeps tool lists from retaining a heap node for every schema object.
+    pub input_schema: Json,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
     #[serde(default)]
@@ -76,6 +78,27 @@ pub struct Tool {
         deserialize_with = "deserialize_tool_reply"
     )]
     pub reply: Option<ToolReply>,
+}
+
+impl Tool {
+    /// Compare schemas by JSON value, not just by their serialized text.
+    pub fn has_same_input_schema(&self, other: &Self) -> bool {
+        // Equal text covers the common case without parsing. Values can also compare equal
+        // with different spellings, such as floating-point positive and negative zero.
+        self.input_schema == other.input_schema
+            || self.input_schema.parse() == other.input_schema.parse()
+    }
+}
+
+impl PartialEq for Tool {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.module == other.module
+            && self.execution_mode == other.execution_mode
+            && self.reply == other.reply
+            && self.has_same_input_schema(other)
+    }
 }
 
 /// The largest `reply.max_ms` a declared tool may carry: one day. The same bound the tool
@@ -914,6 +937,38 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn tool_schema_round_trip_keeps_the_value_wire_spelling() {
+        let schema = r#"{ "type" : "object", "properties" : { "z": {"minimum": 2.50, "type": "number"}, "a": {"type": "string"} } }"#;
+        let wire = format!(r#"{{"name":"read","description":"","input_schema":{schema}}}"#);
+        let legacy_schema: Value = serde_json::from_str(schema).unwrap();
+        let legacy_schema = serde_json::to_string(&legacy_schema).unwrap();
+        let legacy_wire = format!(
+            r#"{{"name":"read","description":"","input_schema":{legacy_schema},"execution_mode":"parallel"}}"#,
+        );
+
+        let tool: Tool = serde_json::from_str(&wire).unwrap();
+        assert_eq!(tool.input_schema.text(), legacy_schema);
+        assert_eq!(serde_json::to_string(&tool).unwrap(), legacy_wire);
+    }
+
+    #[test]
+    fn tool_schema_comparison_keeps_value_equality() {
+        let make_tool = |minimum: &str| {
+            serde_json::from_str::<Tool>(&format!(
+                r#"{{"name":"read","description":"","input_schema":{{"minimum":{minimum}}}}}"#,
+            ))
+            .unwrap()
+        };
+        let positive = make_tool("0.0");
+        let negative = make_tool("-0.0");
+        assert_ne!(positive.input_schema.text(), negative.input_schema.text());
+        assert_eq!(
+            positive == negative,
+            positive.input_schema.parse() == negative.input_schema.parse(),
+        );
+    }
+
+    #[test]
     fn ephemeral_session_is_local_only_and_survives_prompt_transforms() {
         let mut opts = CallOptions::new(Vec::new());
         let forever_bytes = serde_json::to_vec(&opts).unwrap();
@@ -969,7 +1024,7 @@ mod tests {
             tools: Some(vec![Tool {
                 name: "edit".into(),
                 description: "edit files".into(),
-                input_schema: json!({"type": "object"}),
+                input_schema: json!({"type": "object"}).into(),
                 module: Some("aft".into()),
                 execution_mode: ExecutionMode::Parallel,
                 reply: None,

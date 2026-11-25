@@ -2081,7 +2081,7 @@ mod approval_wire_tests {
 pub struct SessionReadTool {
     pub name: String,
     pub description: String,
-    pub input_schema: serde_json::Value,
+    pub input_schema: broca_protocol::json::Json,
     /// The module the tool was routed to, when the episode recorded one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,

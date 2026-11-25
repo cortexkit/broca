@@ -71,7 +71,7 @@ pub(crate) async fn build<B: SessionBackend>(
             let planned = PlanViewTool::new(
                 tool.name.clone(),
                 tool.description.clone(),
-                tool.input_schema.clone(),
+                tool.input_schema.parse(),
                 provider,
             );
             Ok(

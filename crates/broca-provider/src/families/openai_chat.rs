@@ -264,12 +264,6 @@ fn with_request_body<R>(
     }
 
     if !opts.tools.is_empty() {
-        body["tools"] = Value::Array(
-            opts.tools
-                .iter()
-                .map(|tool| convert_tool(tool, name_map, frozen.moonshot_schema_types))
-                .collect(),
-        );
         body["tool_choice"] = convert_tool_choice(&opts.tool_choice, name_map);
     }
     apply_generation_controls(
@@ -290,11 +284,7 @@ fn with_request_body<R>(
     if let Some(service_tier) = &frozen.service_tier {
         body["service_tier"] = Value::String(service_tier.clone());
     }
-    crate::structured_output::finish(
-        frozen,
-        &mut body,
-        name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
-    );
+    crate::structured_output::finish(frozen, &mut body, &mut [], "");
     let Value::Object(rest) = body else {
         unreachable!("the OpenAI Chat body is built as an object");
     };
@@ -302,6 +292,14 @@ fn with_request_body<R>(
         .into_iter()
         .map(|(key, value)| (Cow::Owned(key), Node::value(value)))
         .collect();
+    if !opts.tools.is_empty() {
+        let tools = opts
+            .tools
+            .iter()
+            .map(|tool| convert_tool(tool, name_map, frozen.moonshot_schema_types))
+            .collect();
+        members.push(("tools".into(), Node::Array(tools)));
+    }
     members.push(("messages".into(), Node::Array(messages)));
     use_body(&Node::Object(members))
 }
@@ -688,26 +686,29 @@ fn text_content(blocks: &[ContentBlock]) -> Node<'_> {
 
 /// `type_enums` adds a `type` to each typeless `enum` node of the schema, for providers whose
 /// validator refuses such a node (see `crate::tool_schema_enum_types`).
-fn convert_tool(
-    t: &Tool,
-    name_map: &crate::tool_name_alias::ToolNameMap,
+fn convert_tool<'a>(
+    t: &'a Tool,
+    name_map: &'a crate::tool_name_alias::ToolNameMap,
     type_enums: bool,
-) -> Value {
-    let typed;
+) -> Node<'a> {
     let parameters = if type_enums {
-        typed = crate::tool_schema_enum_types::with_enum_types(&t.input_schema);
-        &typed
+        let mut typed = t.input_schema.parse();
+        crate::tool_schema_enum_types::add_enum_types(&mut typed);
+        Node::value(typed)
     } else {
-        &t.input_schema
+        Node::Json(&t.input_schema)
     };
-    json!({
-        "type": "function",
-        "function": {
-            "name": name_map.wire_name(&t.name),
-            "description": t.description,
-            "parameters": parameters,
-        },
-    })
+    Node::object([
+        ("type", Node::str("function")),
+        (
+            "function",
+            Node::object([
+                ("name", Node::str(name_map.wire_name(&t.name))),
+                ("description", Node::str(&t.description)),
+                ("parameters", parameters),
+            ]),
+        ),
+    ])
 }
 
 fn convert_tool_choice(tc: &ToolChoice, name_map: &crate::tool_name_alias::ToolNameMap) -> Value {

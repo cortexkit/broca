@@ -262,14 +262,13 @@ fn with_request_body<R>(
         convert_inference_config(frozen, opts),
     );
 
-    if let Some(tool_config) =
-        convert_tool_config(&opts.tools, &opts.tool_choice, name_map, has_tool_history)
-    {
-        body.insert("toolConfig".to_string(), tool_config);
-    }
-
     merge_top_level_options(&mut body, &frozen.static_options);
     merge_top_level_options(&mut body, &opts.provider_options);
+    let tool_config = if body.contains_key("toolConfig") {
+        None
+    } else {
+        convert_tool_config(&opts.tools, &opts.tool_choice, name_map, has_tool_history)
+    };
     // A caller's options may replace the system blocks or the messages outright.
     let system_option = body.remove("system");
     let messages_option = body.remove("messages");
@@ -305,6 +304,9 @@ fn with_request_body<R>(
         .into_iter()
         .map(|(key, value)| (Cow::Owned(key), Node::value(value)))
         .collect();
+    if let Some(tool_config) = tool_config {
+        members.push(("toolConfig".into(), tool_config));
+    }
     if let Some(system) = system {
         members.push(("system".into(), system));
     }
@@ -847,12 +849,12 @@ fn convert_inference_config(frozen: &FrozenRenderConfig, opts: &CallOptions) -> 
     Value::Object(config)
 }
 
-fn convert_tool_config(
-    tools: &[Tool],
+fn convert_tool_config<'a>(
+    tools: &'a [Tool],
     choice: &ToolChoice,
-    name_map: &crate::tool_name_alias::ToolNameMap,
+    name_map: &'a crate::tool_name_alias::ToolNameMap,
     has_tool_history: bool,
-) -> Option<Value> {
+) -> Option<Node<'a>> {
     if tools.is_empty() {
         // Historical calls without schemas cannot form a valid Bedrock toolConfig. Bedrock's 400
         // remains a permanent `ValidationException` rather than being retried.
@@ -867,20 +869,31 @@ fn convert_tool_config(
     // refuses to dispatch any tool the model might return on a finalize turn.
     // https://docs.aws.amazon.com/bedrock/latest/userguide/tool-use.html
     // https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolChoice.html
-    Some(json!({
-        "tools": tools.iter().map(|tool| convert_tool(tool, name_map)).collect::<Vec<_>>(),
-        "toolChoice": convert_tool_choice(choice, name_map),
-    }))
+    let tools = tools
+        .iter()
+        .map(|tool| convert_tool(tool, name_map))
+        .collect();
+    Some(Node::object([
+        ("tools", Node::Array(tools)),
+        (
+            "toolChoice",
+            Node::value(convert_tool_choice(choice, name_map)),
+        ),
+    ]))
 }
 
-fn convert_tool(tool: &Tool, name_map: &crate::tool_name_alias::ToolNameMap) -> Value {
-    json!({
-        "toolSpec": {
-            "name": name_map.wire_name(&tool.name),
-            "description": tool.description,
-            "inputSchema": { "json": tool.input_schema },
-        }
-    })
+fn convert_tool<'a>(tool: &'a Tool, name_map: &'a crate::tool_name_alias::ToolNameMap) -> Node<'a> {
+    Node::object([(
+        "toolSpec",
+        Node::object([
+            ("name", Node::str(name_map.wire_name(&tool.name))),
+            ("description", Node::str(&tool.description)),
+            (
+                "inputSchema",
+                Node::object([("json", Node::Json(&tool.input_schema))]),
+            ),
+        ]),
+    )])
 }
 
 fn convert_tool_choice(

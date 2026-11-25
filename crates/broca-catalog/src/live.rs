@@ -4896,7 +4896,7 @@ mod responses_tool_admission_tests {
         opts.tools = ["read", "zoom"].into_iter().map(|name| Tool {
             name: name.into(),
             description: name.into(),
-            input_schema: json!({"type":"object","properties":{"filePath":{"type":"string"},"limit":{"type":"integer"}},"required":["filePath"]}),
+            input_schema: json!({"type":"object","properties":{"filePath":{"type":"string"},"limit":{"type":"integer"}},"required":["filePath"]}).into(),
             module: None,
             execution_mode: Default::default(), reply: None,
         }).collect::<Vec<_>>().into();

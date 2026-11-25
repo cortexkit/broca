@@ -72,7 +72,8 @@ fn shared_json_type(values: &Value) -> Option<&'static str> {
 }
 
 /// A copy of `schema` with [`add_enum_types`] applied, leaving the caller's value untouched.
-pub(crate) fn with_enum_types(schema: &Value) -> Value {
+#[cfg(test)]
+fn with_enum_types(schema: &Value) -> Value {
     let mut typed = schema.clone();
     add_enum_types(&mut typed);
     typed

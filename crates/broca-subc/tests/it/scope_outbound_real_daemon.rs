@@ -448,7 +448,7 @@ fn manifest() -> ToolManifest {
     ToolManifest::from_tools(vec![Tool {
         name: TOOL.into(),
         description: String::new(),
-        input_schema: serde_json::json!({"type": "object"}),
+        input_schema: serde_json::json!({"type": "object"}).into(),
         module: Some(PROVIDER.into()),
         execution_mode: ExecutionMode::Parallel,
         reply: None,

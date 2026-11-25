@@ -446,7 +446,7 @@ fn tool(name: &str, mode: ExecutionMode) -> Tool {
     Tool {
         name: name.into(),
         description: format!("{name} something"),
-        input_schema: json!({"type": "object"}),
+        input_schema: json!({"type": "object"}).into(),
         module: None,
         execution_mode: mode,
         reply: None,

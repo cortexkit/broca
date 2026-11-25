@@ -2859,7 +2859,7 @@ mod tests {
             tools: Some(vec![broca_wire::SessionReadTool {
                 name: "lookup".into(),
                 description: "look something up".into(),
-                input_schema: serde_json::json!({"type": "object"}),
+                input_schema: serde_json::json!({"type": "object"}).into(),
                 module: Some("aft".into()),
             }]),
             tools_run_id: Some("run-x".into()),

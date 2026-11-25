@@ -77,7 +77,8 @@ pub(crate) fn fixed_request() -> CallOptions {
                 "type": "object",
                 "properties": { "timezone": { "type": "string" } },
                 "required": ["timezone"]
-            }),
+            })
+            .into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,
@@ -88,7 +89,8 @@ pub(crate) fn fixed_request() -> CallOptions {
             input_schema: json!({
                 "type": "object",
                 "properties": { "city": { "type": "string" } }
-            }),
+            })
+            .into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,

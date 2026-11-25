@@ -102,7 +102,8 @@ fn file_tool() -> Tool {
         name: TOOL.into(),
         description: "Read the fixed sample file at sample.txt.".into(),
         input_schema: json!({"type":"object", "properties":{"path":{"type":"string"}},
-            "required":["path"], "additionalProperties":false}),
+            "required":["path"], "additionalProperties":false})
+        .into(),
         module: None,
         execution_mode: Default::default(),
         reply: None,

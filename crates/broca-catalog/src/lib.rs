@@ -2164,7 +2164,8 @@ mod tests {
                     "type": "object",
                     "properties": { "timezone": { "type": "string" } },
                     "required": ["timezone"]
-                }),
+                })
+                .into(),
                 module: None,
                 execution_mode: Default::default(),
                 reply: None,

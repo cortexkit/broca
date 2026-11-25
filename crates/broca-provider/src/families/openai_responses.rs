@@ -191,14 +191,13 @@ impl WireFamily for OpenAiResponses {
     }
 }
 
-/// A `/responses` request body in two parts: its `input` items, written from the messages as
-/// nodes that borrow their text, and every other member as one JSON object. The other members
-/// are small, so the platform and the ChatGPT backend shape them in place as JSON; the input,
-/// which holds the conversation, is never copied into a tree.
+/// A `/responses` body with nodes that borrow message and schema text. The other members are
+/// small, so the platform and the ChatGPT backend shape them in place as JSON.
 pub(crate) struct ResponsesBody<'a> {
-    /// Every member but `input`, as a JSON object.
+    /// The body without `input` and the rendered tool nodes, as a JSON object.
     pub rest: Value,
     pub input: Vec<Node<'a>>,
+    pub tools: Vec<Node<'a>>,
 }
 
 impl<'a> ResponsesBody<'a> {
@@ -212,6 +211,9 @@ impl<'a> ResponsesBody<'a> {
             .map(|(key, value)| (Cow::Owned(key), Node::value(value)))
             .collect();
         members.push(("input".into(), Node::Array(self.input)));
+        if !self.tools.is_empty() {
+            members.push(("tools".into(), Node::Array(self.tools)));
+        }
         Node::Object(members)
     }
 }
@@ -322,7 +324,7 @@ pub(crate) fn with_prepared_request_body<R>(
 fn render_prepared_body<'a>(
     frozen: &FrozenRenderConfig,
     opts: &'a CallOptions,
-    name_map: &crate::tool_name_alias::ToolNameMap,
+    name_map: &'a crate::tool_name_alias::ToolNameMap,
     updates: &[super::openai_responses_chatgpt::EffortUpdate],
     media: Option<&crate::media_render::MediaRender<'_>>,
     provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
@@ -406,13 +408,12 @@ fn render_prepared_body<'a>(
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
 
-    if !opts.tools.is_empty() {
-        body["tools"] = Value::Array(
-            opts.tools
-                .iter()
-                .map(|tool| convert_tool(tool, name_map, frozen.responses_tools_non_strict))
-                .collect(),
-        );
+    let mut tools: Vec<_> = opts
+        .tools
+        .iter()
+        .map(|tool| convert_tool(tool, name_map, frozen.responses_tools_non_strict))
+        .collect();
+    if !tools.is_empty() {
         body["tool_choice"] = convert_tool_choice(&opts.tool_choice, name_map);
     }
     // `/v1/responses` accepts `temperature` + `top_p`, but no stop field, so
@@ -433,6 +434,7 @@ fn render_prepared_body<'a>(
     crate::structured_output::finish(
         frozen,
         &mut body,
+        &mut tools,
         name_map.wire_name(broca_protocol::structured_output::SUBMIT_RESULT_TOOL),
     );
     // Provider-required request flags are frozen at admission, so enabling stateless reasoning
@@ -442,7 +444,15 @@ fn render_prepared_body<'a>(
             body[key] = value.clone();
         }
     }
-    ResponsesBody { rest: body, input }
+    // An explicit static replacement takes precedence over the rendered declarations.
+    if body.get("tools").is_some() {
+        tools.clear();
+    }
+    ResponsesBody {
+        rest: body,
+        input,
+        tools,
+    }
 }
 
 fn apply_prompt_cache_hints(body: &mut Value, frozen: &FrozenRenderConfig) {
@@ -982,24 +992,24 @@ fn text_content(blocks: &[ContentBlock]) -> Node<'_> {
     run.take()
 }
 
-fn convert_tool(
-    t: &Tool,
-    name_map: &crate::tool_name_alias::ToolNameMap,
+fn convert_tool<'a>(
+    t: &'a Tool,
+    name_map: &'a crate::tool_name_alias::ToolNameMap,
     non_strict: bool,
-) -> Value {
+) -> Node<'a> {
     // Live ChatGPT/Codex probes with read and zoom schemas showed that omitting `strict`
     // made every property required, including optional parameters. OpenAI's function-calling
     // guide says: "To opt out of strict mode in Responses and keep non-strict, best-effort
     // function calling, explicitly set `strict: false`." The admission-time flag keeps
     // pre-flag runs rendering without the field rather than changing their resumed bytes.
-    let mut tool = json!({
-        "type": "function",
-        "name": name_map.wire_name(&t.name),
-        "description": t.description,
-        "parameters": t.input_schema,
-    });
+    let mut tool = Node::object([
+        ("type", Node::str("function")),
+        ("name", Node::str(name_map.wire_name(&t.name))),
+        ("description", Node::str(&t.description)),
+        ("parameters", Node::Json(&t.input_schema)),
+    ]);
     if non_strict {
-        tool["strict"] = json!(false);
+        tool.insert("strict", Node::value(Value::Bool(false)));
     }
     tool
 }

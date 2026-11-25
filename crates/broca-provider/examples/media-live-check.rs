@@ -80,7 +80,7 @@ fn tool() -> Tool {
     Tool {
         name: TOOL_NAME.into(),
         description: "Return synthetic media, never session data.".into(),
-        input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+        input_schema: json!({"type":"object","properties":{},"additionalProperties":false}).into(),
         module: None,
         execution_mode: ExecutionMode::Sequential,
         reply: None,

@@ -189,7 +189,7 @@ fn drifted_tool<'a>(
                 _ => {
                     now.name == tool.name
                         && now.description == tool.description
-                        && now.input_schema == tool.input_schema
+                        && now.has_same_input_schema(tool)
                 }
             };
             (!unchanged).then_some(tool.name.as_str())
@@ -237,7 +237,7 @@ pub(super) fn compatible_tools(
                 .iter()
                 .find(|now| now.name == tool.name)?;
             let unchanged = now.description == tool.description
-                && now.input_schema == tool.input_schema
+                && now.has_same_input_schema(tool)
                 && pin.schema_digest == frozen.schema_digest;
             (!unchanged).then(|| CompatibleTool {
                 provider: provider.to_owned(),

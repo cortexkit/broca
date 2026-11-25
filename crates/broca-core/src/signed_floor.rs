@@ -64,15 +64,11 @@ pub fn tool_set_digest(tools: &[Tool], frozen_render_config: &Value) -> String {
             (
                 tool.name.as_str(),
                 tool.description.as_str(),
-                &tool.input_schema,
+                tool.input_schema.parse(),
                 false,
             )
         })
-        .chain(
-            submit
-                .as_ref()
-                .map(|(name, description, schema, strict)| (*name, *description, schema, *strict)),
-        )
+        .chain(submit)
         .map(|(name, description, schema, strict)| {
             let mut shown = serde_json::json!({
                 "name": wire_name(name),
@@ -198,7 +194,8 @@ mod tests {
         Tool {
             name: name.into(),
             description: description.into(),
-            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}})
+                .into(),
             module: None,
             execution_mode: ExecutionMode::Parallel,
             reply: None,
@@ -236,7 +233,7 @@ mod tests {
         let mut described = read.clone();
         described.description = "read a file, carefully".into();
         let mut schema = read.clone();
-        schema.input_schema = json!({"type": "object"});
+        schema.input_schema = json!({"type": "object"}).into();
         let mut renamed = read.clone();
         renamed.name = "view".into();
         for changed in [

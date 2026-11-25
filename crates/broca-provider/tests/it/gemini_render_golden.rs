@@ -78,7 +78,8 @@ pub(crate) fn fixed_request() -> CallOptions {
                 "type": "object",
                 "properties": { "timezone": { "type": "string" } },
                 "required": ["timezone"]
-            }),
+            })
+            .into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,
@@ -89,7 +90,8 @@ pub(crate) fn fixed_request() -> CallOptions {
             input_schema: json!({
                 "type": "object",
                 "properties": { "city": { "type": "string" } }
-            }),
+            })
+            .into(),
             module: None,
             execution_mode: Default::default(),
             reply: None,
@@ -515,7 +517,8 @@ fn gemini_render_strips_json_schema_meta_keys_from_tool_parameters() {
             }
         },
         "required": ["timezone"]
-    });
+    })
+    .into();
     opts.tools = tools.into();
     let frozen = gemini_frozen_config("gemini-2.0-flash");
 
@@ -524,7 +527,7 @@ fn gemini_render_strips_json_schema_meta_keys_from_tool_parameters() {
 
     assert!(!contains_object_key(parameters, "$schema"));
     assert!(
-        contains_object_key(&opts.tools[0].input_schema, "$schema"),
+        contains_object_key(&opts.tools[0].input_schema.parse(), "$schema"),
         "rendering must not mutate the canonical tool schema"
     );
 }

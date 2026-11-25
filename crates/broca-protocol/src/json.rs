@@ -1,16 +1,16 @@
 //! A JSON value held as its canonical compact text.
 //!
-//! Message content carries JSON in a few places: a tool call's input and a tool result's JSON
-//! output. Held as a parsed `serde_json::Value`, a small object costs a map node of several
-//! hundred bytes plus one allocation per key and string, so a session's tool calls cost many
-//! times their text. [`Json`] holds the text once, shared: cloning it copies a pointer, and its
-//! size in memory is its length.
+//! Tools carry JSON input schemas, and message content carries tool call inputs and JSON results.
+//! Held as a parsed `serde_json::Value`, a small object costs a map node of several hundred bytes
+//! plus one allocation per key and string, so a session's tools and calls can cost many times
+//! their text. [`Json`] holds the text once, shared: cloning it copies a pointer, and its size in
+//! memory is its length.
 //!
 //! The text is the canonical form [`crate::canonical::canonical_json_bytes`] writes (object
 //! keys sorted, compact, serde_json's number spelling), which is also what serializing the
-//! parsed value writes. So serializing a `Json` writes the same bytes the value did, a request
-//! that embeds it renders the same bytes, and two `Json`s are equal exactly when their values
-//! are. Every constructor canonicalizes, so no other text can be held.
+//! parsed value writes. So serializing a `Json` writes the same bytes the value did, and a
+//! request that embeds it renders the same bytes. Equality compares the canonical text.
+//! Every constructor canonicalizes, so no other text can be held.
 //!
 //! A reader that needs a field calls [`Json::parse`] and gets a `Value` it owns.
 
