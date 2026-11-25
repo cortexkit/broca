@@ -488,7 +488,7 @@ pub(crate) struct KeptHeads(std::sync::Mutex<KeptHeadsInner>);
 
 /// How many sessions' heads are kept. Bounded by count, not bytes, because a head's size hardly
 /// varies with its session: it holds no transcript, only the latest run's state, the model, usage
-/// and the plans in force, which sessions of one plan share. The count is far above the closed
+/// and admission metadata, not the full plans. The count is far above the closed
 /// chats an app lists and polls at once, so polling never pushes a polled head out; the memory
 /// report's `kept_heads.held` shows what the kept heads hold.
 const HEADS_KEPT: usize = 4096;

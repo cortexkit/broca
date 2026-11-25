@@ -54,28 +54,77 @@ pub fn check_plan(plan: &Map<String, Value>, supported: bool) -> Result<(), Serv
     })
 }
 
-fn plan(plan: Option<&OpaqueJson>) -> Result<Map<String, Value>, ServeError> {
-    plan.map_or_else(
-        || Ok(Map::new()),
-        |plan| {
-            serde_json::from_str(plan.as_json_text()).map_err(|error| {
-                ServeError::Transient(format!("the stored read policy is invalid: {error}"))
-            })
-        },
-    )
+// Keep this list in sync with what `app_readers::admit` and `decide` read. A kept head must
+// not hold a whole plan just to decide read admission.
+const READ_PLAN_MEMBERS: [&str; 3] = [app_readers::PLAN_READERS, "senders", "compaction_item"];
+
+#[derive(Clone)]
+enum ReadPlan {
+    Missing,
+    Json(Box<str>),
+    // Preserve the decode error for admission without keeping the invalid plan or failing head
+    // construction.
+    Invalid(Box<str>),
+}
+
+impl ReadPlan {
+    fn project(plan: Option<&OpaqueJson>) -> Self {
+        let Some(plan) = plan else {
+            return Self::Missing;
+        };
+        let mut full: Map<String, Value> = match serde_json::from_str(plan.as_json_text()) {
+            Ok(full) => full,
+            Err(error) => return Self::Invalid(error.to_string().into_boxed_str()),
+        };
+        let mut projection = Map::new();
+        for member in READ_PLAN_MEMBERS {
+            let Some(mut value) = full.remove(member) else {
+                continue;
+            };
+            if member == "compaction_item" {
+                let mut item = Map::new();
+                if let Some(provider) = value
+                    .as_object_mut()
+                    .and_then(|item| item.remove("provider"))
+                {
+                    item.insert("provider".into(), provider);
+                }
+                value = Value::Object(item);
+            }
+            projection.insert(member.into(), value);
+        }
+        Self::Json(Value::Object(projection).to_string().into_boxed_str())
+    }
+
+    fn decode(&self) -> Result<Map<String, Value>, ServeError> {
+        match self {
+            Self::Missing => Ok(Map::new()),
+            Self::Json(json) => serde_json::from_str(json).map_err(|error| error.to_string()),
+            Self::Invalid(error) => Err(error.to_string()),
+        }
+        .map_err(|error| {
+            ServeError::Transient(format!("the stored read policy is invalid: {error}"))
+        })
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Missing => 0,
+            Self::Json(text) | Self::Invalid(text) => text.len(),
+        }
+    }
 }
 
 /// What a read's admission reads from a session: its ownership, the plan in force for reads
 /// (the latest run's, else the first run's) and the latest accepted plan, whose reader list
 /// governs. A kept head holds it too, so a closed session's read can be admitted without loading
-/// the session (see `store_head::KeptHeads`). It keeps each plan's JSON only, never the decoded
-/// manifest it came from, whose tools and system text a kept head would otherwise hold for as
-/// long as it is kept.
+/// the session (see `store_head::KeptHeads`). Only the plan members used for admission are held;
+/// tool composition, system text and other plan data aren't needed by a kept head.
 #[derive(Clone)]
 pub struct ReadPolicy {
     ownership: broca_core::SessionOwnershipV1,
-    effective: Option<OpaqueJson>,
-    accepted: Option<OpaqueJson>,
+    effective: ReadPlan,
+    accepted: ReadPlan,
 }
 
 impl ReadPolicy {
@@ -103,29 +152,40 @@ impl ReadPolicy {
                 })?
                 .flatten(),
         };
-        Ok(Self {
+        Ok(Self::from_plans(
             ownership,
-            effective: effective.map(|manifest| manifest.plan.clone()),
-            accepted: accepted.map(|manifest| manifest.plan.clone()),
-        })
+            effective.as_ref().map(|manifest| &manifest.plan),
+            accepted.as_ref().map(|manifest| &manifest.plan),
+        ))
+    }
+
+    fn from_plans(
+        ownership: broca_core::SessionOwnershipV1,
+        effective: Option<&OpaqueJson>,
+        accepted: Option<&OpaqueJson>,
+    ) -> Self {
+        Self {
+            ownership,
+            effective: ReadPlan::project(effective),
+            accepted: ReadPlan::project(accepted),
+        }
     }
 
     /// A policy whose plan in force and accepted plan are both `manifest`'s.
     #[cfg(test)]
-    pub(crate) fn with_manifest(manifest: Arc<PlanManifest>) -> Self {
-        Self {
-            ownership: serde_json::from_value(serde_json::json!({})).expect("empty ownership"),
-            effective: Some(manifest.plan.clone()),
-            accepted: Some(manifest.plan.clone()),
-        }
+    pub(crate) fn with_manifest(manifest: &PlanManifest) -> Self {
+        Self::from_plans(
+            Default::default(),
+            Some(&manifest.plan),
+            Some(&manifest.plan),
+        )
     }
 
     /// What the policy holds, walked as `broca_session_store::held` walks values.
     pub(crate) fn heap_bytes(&self) -> usize {
-        use broca_session_store::held::serde_heap_bytes;
-        let plan =
-            |plan: &Option<OpaqueJson>| plan.as_ref().map_or(0, |plan| plan.as_json_text().len());
-        serde_heap_bytes(&self.ownership) + plan(&self.effective) + plan(&self.accepted)
+        broca_session_store::held::serde_heap_bytes(&self.ownership)
+            + self.effective.heap_bytes()
+            + self.accepted.heap_bytes()
     }
 }
 
@@ -190,11 +250,11 @@ pub fn decide(
         access.principal.as_ref(),
         (ownership.episodes > 0).then_some(ownership.first_principal.as_ref()),
     );
-    let effective = match plan(policy.effective.as_ref()) {
+    let effective = match policy.effective.decode() {
         Ok(effective) => effective,
         Err(error) => return Some(Err(error)),
     };
-    let accepted = match plan(policy.accepted.as_ref()) {
+    let accepted = match policy.accepted.decode() {
         Ok(accepted) => accepted,
         Err(error) => return Some(Err(error)),
     };
@@ -255,4 +315,134 @@ pub fn decide(
         Ok(false) => Err(refusal()),
         Err(error) => Err(error),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn opaque(plan: Value) -> OpaqueJson {
+        OpaqueJson::from_json_text(plan.to_string()).unwrap()
+    }
+
+    #[test]
+    fn projected_plans_make_the_same_read_decisions_as_full_plans() {
+        let effective = opaque(json!({
+            "readers": ["old-reader"], "senders": [{"module": "old-sender"}],
+            "compaction_item": {"provider": "active-compactor", "preset": "worker"},
+            "composition": {"providers": []}
+        }));
+        let pending = opaque(json!({
+            "readers": ["new-reader"], "senders": [{"module": "new-sender"}],
+            "compaction_item": {"provider": "pending-compactor", "params": {"limit": 100}},
+            "tool_items": [{"provider": "aft", "params": {}}]
+        }));
+        let unrestricted = opaque(json!({"system_text_items": []}));
+        let module = |id: &str| BindPrincipal::Reserved {
+            module_id: id.into(),
+        };
+        let ownership = broca_core::SessionOwnershipV1 {
+            episodes: 1,
+            first_principal: Some(module("owner")),
+            ..Default::default()
+        };
+        let read = "session.head";
+        let send = "send.status";
+        let alias = "session.send_status";
+        let cases = [
+            (module("owner"), read, None, Some(true)),
+            (module("new-reader"), read, None, Some(true)),
+            (module("unlisted"), read, None, Some(false)),
+            (module("old-reader"), read, None, Some(false)),
+            (module("active-compactor"), read, None, Some(true)),
+            (module("pending-compactor"), read, None, Some(false)),
+            (BindPrincipal::Direct, read, None, Some(true)),
+            (module("owner"), send, None, Some(true)),
+            (module("new-sender"), send, Some(true), Some(true)),
+            (module("new-sender"), alias, Some(false), Some(false)),
+            (module("new-sender"), send, None, None),
+            (module("old-sender"), send, Some(true), Some(false)),
+            (module("new-reader"), send, Some(true), Some(false)),
+            (BindPrincipal::Direct, alias, Some(true), Some(false)),
+        ];
+        let full_json = |plan: &OpaqueJson| ReadPlan::Json(plan.as_json_text().into());
+        for accepted in [Some(&pending), Some(&unrestricted), None] {
+            let full = ReadPolicy {
+                ownership: ownership.clone(),
+                effective: full_json(&effective),
+                accepted: accepted.map_or(ReadPlan::Missing, full_json),
+            };
+            let projected = ReadPolicy::from_plans(ownership.clone(), Some(&effective), accepted);
+            for (principal, op, own_send, restricted) in &cases {
+                let access = ReadAccess {
+                    principal: Some(principal.clone()),
+                    op: (*op).into(),
+                    send: (*op != read).then(|| (RunId("r1".into()), "s1".into())),
+                };
+                let outcome = |policy| match decide(policy, &access, *own_send) {
+                    Some(Ok(())) => Some(true),
+                    Some(Err(ServeError::ReadAccessRefused)) => Some(false),
+                    None => None,
+                    decision => panic!("unexpected decision for {access:?}: {decision:?}"),
+                };
+                let expected = if accepted == Some(&pending) {
+                    *restricted
+                } else {
+                    Some(true)
+                };
+                let baseline = outcome(&full);
+                assert_eq!(baseline, expected, "full plans, {access:?}, {own_send:?}");
+                assert_eq!(
+                    outcome(&projected),
+                    baseline,
+                    "projection, {access:?}, {own_send:?}"
+                );
+            }
+            let expected_effective = json!({
+                "readers": ["old-reader"], "senders": [{"module": "old-sender"}],
+                "compaction_item": {"provider": "active-compactor"}
+            });
+            let expected_accepted = if accepted == Some(&pending) {
+                json!({
+                    "readers": ["new-reader"], "senders": [{"module": "new-sender"}],
+                    "compaction_item": {"provider": "pending-compactor"}
+                })
+            } else {
+                json!({})
+            };
+            assert_eq!(
+                Value::Object(projected.effective.decode().unwrap()),
+                expected_effective
+            );
+            assert_eq!(
+                Value::Object(projected.accepted.decode().unwrap()),
+                expected_accepted
+            );
+        }
+    }
+
+    #[test]
+    fn projection_preserves_malformed_stored_plan_refusals() {
+        let access = ReadAccess {
+            principal: Some(BindPrincipal::Direct),
+            op: "session.head".into(),
+            send: None,
+        };
+        let malformed = opaque(json!({"readers": null}));
+        let policy = ReadPolicy::from_plans(Default::default(), None, Some(&malformed));
+        assert!(matches!(
+            decide(&policy, &access, None),
+            Some(Err(ServeError::InvalidParams { field, .. })) if field == "plan.readers"
+        ));
+        let non_object = opaque(json!(123));
+        let policy = ReadPolicy::from_plans(Default::default(), Some(&non_object), None);
+        let expected_error =
+            serde_json::from_str::<Map<String, Value>>(non_object.as_json_text()).unwrap_err();
+        assert!(matches!(
+            decide(&policy, &access, None),
+            Some(Err(ServeError::Transient(message)))
+                if message == format!("the stored read policy is invalid: {expected_error}")
+        ));
+    }
 }

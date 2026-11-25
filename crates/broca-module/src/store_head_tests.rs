@@ -124,31 +124,57 @@ fn kept_heads_forget_the_least_recently_used_first() {
     assert_eq!(counts.kept.get("read"), Some(&(HEADS_KEPT as u64 + 3)));
 }
 
-/// A kept head's read policy keeps its plans' JSON, not the decoded manifests they came from:
-/// a manifest's tools and system text are released once the head is built, and the memory
-/// report counts only the plan. Before, every kept head of a planned session held its
-/// manifest decoded for as long as it was kept.
 #[test]
-fn kept_heads_hold_no_decoded_plan_manifest() {
+fn kept_heads_hold_only_read_admission_plan_members() {
     use broca_session_store::codec::Id128;
     use broca_session_store::session::Position;
     use std::sync::Arc;
+    let providers = [
+        "aft",
+        "prefrontal",
+        "broca",
+        "cerebellum",
+        "hippocampus",
+        "motor",
+    ]
+    .map(|provider| {
+        let tools: Vec<_> = (0..80)
+            .map(|n| {
+                json!({"name": format!("{provider}.tool_{n:02}"), "capabilities": [
+                    format!("{provider}:project.read/v1"), "tool-result/v1"
+                ]})
+            })
+            .collect();
+        json!({"provider": provider, "tools": tools})
+    });
+    let plan = json!({
+        "composition": {"providers": providers, "step_transform_items": []},
+        "system_text_items": [{"provider": "prefrontal", "preset": "worker"}],
+        "readers": ["prefrontal"], "senders": [{"module": "prefrontal"}],
+        "compaction_item": {"provider": "ck-mc", "preset": "worker", "params": {}}
+    })
+    .to_string();
+    let full_plan_bytes = plan.len() as u64;
+    assert!(full_plan_bytes > 40_000, "tool composition must be large");
     let manifest: Arc<broca_records::record::PlanManifest> = Arc::new(
         serde_json::from_value(json!({
-            "plan": "{}", "plan_identity": "plan", "composition_digest": "composition",
+            "plan": plan, "plan_identity": "plan", "composition_digest": "composition",
             "tools": [], "system_text": "x".repeat(100_000), "system_digest": "system",
             "join_version": 1, "role_versions": {}, "declarations": [], "fetches": []
         }))
         .unwrap(),
     );
     let released = Arc::downgrade(&manifest);
-    let head = StoreHead {
+    let mut head = StoreHead {
         reply: Default::default(),
         input: InputSource::Unknown,
-        ownership: serde_json::from_value(json!({})).unwrap(),
+        ownership: Default::default(),
         senders: Vec::new(),
-        read_policy: Some(crate::reader_admission::ReadPolicy::with_manifest(manifest)),
+        read_policy: Some(crate::reader_admission::ReadPolicy::with_manifest(
+            &manifest,
+        )),
     };
+    drop(manifest);
     let heads = KeptHeads::default();
     let at = Position {
         version: 1,
@@ -156,14 +182,29 @@ fn kept_heads_hold_no_decoded_plan_manifest() {
         len: 1,
     };
     heads.keep("s0".into(), at, &head, "read");
-    drop(head);
+    head.read_policy = None;
     assert!(
         released.upgrade().is_none(),
         "a kept head holds its plan's decoded manifest"
     );
     let held = heads.memory().estimated_bytes;
-    assert!(
-        held < 10_000,
-        "the kept head counts its manifest's text: {held}"
+    heads.keep("s0".into(), at, &head, "read");
+    let without_policy = heads.memory().estimated_bytes;
+    let projected_plan_bytes = json!({
+        "readers": ["prefrontal"], "senders": [{"module": "prefrontal"}],
+        "compaction_item": {"provider": "ck-mc"}
+    })
+    .to_string()
+    .len() as u64;
+    eprintln!(
+        "worker plan: {full_plan_bytes} -> {projected_plan_bytes} bytes per plan; \
+         full-plan head estimate: {} bytes, projected estimate: {} bytes, held: {held} bytes",
+        without_policy + 2 * full_plan_bytes,
+        without_policy + 2 * projected_plan_bytes
+    );
+    assert_eq!(
+        held - without_policy,
+        2 * projected_plan_bytes,
+        "a kept head should count only the effective and accepted projections"
     );
 }
