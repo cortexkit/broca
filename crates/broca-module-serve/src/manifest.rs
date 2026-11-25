@@ -569,13 +569,15 @@ fn routing_declarations() -> ConsumerDeclarations {
                 BROCA_HARNESS.into(),
                 HarnessLimits::new()
                     .with_capabilities(capped_capabilities)
-                    .with_pairs(capped),
+                    .with_pairs(capped)
+                    .with_exclude(excluded_providers()),
             ),
             (
                 BROCA_UNCAPPED_HARNESS.into(),
                 HarnessLimits::new()
                     .with_capabilities(BROCA_HARNESS_CAPABILITIES.to_vec())
-                    .with_pairs(uncapped),
+                    .with_pairs(uncapped)
+                    .with_exclude(excluded_providers()),
             ),
         ]));
     runner
@@ -592,6 +594,19 @@ fn routing_declarations() -> ConsumerDeclarations {
         .validate_serving(&[cortexkit_role_routing::capabilities::SELECT_WORKLOAD])
         .expect("broca's routing declaration is valid");
     declarations
+}
+
+/// Providers whose models broca never serves, so routing places none of their routes on
+/// [`BROCA_HARNESS`] or [`BROCA_UNCAPPED_HARNESS`]. OpenCode's models run in OpenCode itself,
+/// through Agent Runner: the model catalog carries no request address broca could send them
+/// to, so a pin on broca would only fail at admission.
+const EXCLUDED_PROVIDERS: [&str; 2] = ["opencode", "opencode-go"];
+
+fn excluded_providers() -> Vec<String> {
+    EXCLUDED_PROVIDERS
+        .iter()
+        .map(|&provider| provider.into())
+        .collect()
 }
 
 /// The harness for every route that honors an output cap, which is every route but ChatGPT's.
@@ -1015,8 +1030,8 @@ mod routing_tests {
     fn routing_slot_declares_the_broca_harnesses_and_only_supported_capabilities() {
         let expected = concat!(
             r#"{"consumers":[{"name":"broca.complete","workload":"quick"}],"runner":{"follows_account_choice":true,"harness_limits":{"#,
-            r#""broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans","output_cap"],"pairs":[{"auth_method":"apikey","wire_api":"anthropic.messages"},{"auth_method":"gateway","wire_api":"anthropic.messages"},{"auth_method":"oauth","wire_api":"anthropic.messages"},{"auth_method":"apikey","wire_api":"aws.bedrock_converse"},{"auth_method":"oauth","wire_api":"aws.bedrock_converse"},{"auth_method":"antigravity","wire_api":"google.code_assist"},{"auth_method":"apikey","wire_api":"google.generate_content"},{"auth_method":"oauth","wire_api":"google.generate_content"},{"auth_method":"apikey","wire_api":"openai.chat_completions"},{"auth_method":"oauth","wire_api":"openai.chat_completions"},{"auth_method":"apikey","wire_api":"openai.responses"},{"auth_method":"oauth","wire_api":"openai.responses"}]},"#,
-            r#""broca-uncapped":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"],"pairs":[{"auth_method":"chatgpt","wire_api":"openai.chatgpt_responses"}]}},"#,
+            r#""broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans","output_cap"],"exclude":["opencode","opencode-go"],"pairs":[{"auth_method":"apikey","wire_api":"anthropic.messages"},{"auth_method":"gateway","wire_api":"anthropic.messages"},{"auth_method":"oauth","wire_api":"anthropic.messages"},{"auth_method":"apikey","wire_api":"aws.bedrock_converse"},{"auth_method":"oauth","wire_api":"aws.bedrock_converse"},{"auth_method":"antigravity","wire_api":"google.code_assist"},{"auth_method":"apikey","wire_api":"google.generate_content"},{"auth_method":"oauth","wire_api":"google.generate_content"},{"auth_method":"apikey","wire_api":"openai.chat_completions"},{"auth_method":"oauth","wire_api":"openai.chat_completions"},{"auth_method":"apikey","wire_api":"openai.responses"},{"auth_method":"oauth","wire_api":"openai.responses"}]},"#,
+            r#""broca-uncapped":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"],"exclude":["opencode","opencode-go"],"pairs":[{"auth_method":"chatgpt","wire_api":"openai.chatgpt_responses"}]}},"#,
             r#""harnesses":["broca","broca-uncapped"],"pairs":["#,
             r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
             r#"{"auth_method":"gateway","requires_wire_api":false,"wire_api":"anthropic.messages"},"#,
@@ -1073,6 +1088,13 @@ mod routing_tests {
             .unwrap()
             .contains(&HarnessCapability::OutputCap));
         assert_eq!(narrowed("broca-uncapped"), ["openai.chatgpt_responses"]);
+        for harness in ["broca", "broca-uncapped"] {
+            assert_eq!(
+                limits[harness].exclude.as_deref(),
+                Some(&["opencode".to_owned(), "opencode-go".to_owned()][..]),
+                "{harness} excludes OpenCode's providers"
+            );
+        }
     }
 }
 
