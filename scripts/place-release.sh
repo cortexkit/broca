@@ -205,7 +205,7 @@ drain_started_ms = int(drain_started_ms) if drain_started_ms else None
 sys.path.insert(0, scripts)
 from lib import state_root
 from lib.seal_readback import (CALLER_CANCELLED, CANCELLED, FINISHED, PAUSED, RESUMED, SEALED,
-                               UNCONFIRMED, classify_run, run_facts)
+                               UNCONFIRMED, classify_run, daemon_state, run_bind, run_facts)
 
 
 def live_lines(text):
@@ -217,6 +217,15 @@ def live_lines(text):
             run_id = fields[2] if len(fields) > 2 and fields[2] != "?" else None
             runs.append({"session": fields[1], "run_id": run_id})
     return runs
+
+
+def subc_connection():
+    """The daemon connection file live-runs.py asks through."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("live_runs", f"{scripts}/live-runs.py")
+    live_runs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(live_runs)
+    return str(live_runs.connection_file(live_runs.cortexkit_home()))
 
 
 def live_now():
@@ -243,6 +252,11 @@ if pid:
         active_runs = live_lines(snapshot)
         errors.append(f"cannot read pre-restart run snapshot: {error}")
     run_index = state_root.default_state_root() / "run-index.db"
+    try:
+        subc = subc_connection()
+    except Exception as error:
+        subc = ""
+        errors.append(f"cannot find the daemon connection for run.status: {error}")
     deadline = time.monotonic() + float(resume_wait)
     while True:
         outcomes, pending, round_errors = [], 0, []
@@ -258,6 +272,14 @@ if pid:
                     facts = run_facts(run_index, active["run_id"])
                     status = classify_run(facts, active["run_id"],
                                           drain_started_ms=drain_started_ms, live_after=live_after)
+                    # Neither an ending fact nor the runs in progress settle it: ask its status.
+                    bind = (run_bind(run_index, active["session"])
+                            if status in (PAUSED, UNCONFIRMED) and active.get("session") else None)
+                    if bind:
+                        status = classify_run(
+                            facts, active["run_id"], drain_started_ms=drain_started_ms,
+                            live_after=live_after,
+                            state=daemon_state(broca_session, subc, bind, active["run_id"]))
                 except Exception as error:
                     round_errors.append(f"{active['run_id']}: {error}")
             else:
