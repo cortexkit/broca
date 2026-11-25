@@ -538,24 +538,45 @@ fn routing_runner_pairs() -> Vec<RoutingRunnerPair> {
 }
 
 fn routing_declarations() -> ConsumerDeclarations {
-    let pairs = routing_runner_pairs()
+    let pairs: Vec<RunnerPair> = routing_runner_pairs()
         .into_iter()
         .map(|pair| {
             pair.pair
                 .with_requires_wire_api(pair.opens_through_catalog_endpoint)
         })
         .collect();
+    // Routing places a task on a runner by the harness it names, and a harness may narrow the
+    // runner's pairs and carry its own capabilities. The ChatGPT backend refuses
+    // max_output_tokens, so its pairs sit under a second harness that doesn't promise
+    // output_cap: a task with an output cap then never lands there, and uncapped work still
+    // does. A pair names only its identity here; its endpoint requirement stays on the
+    // runner's pair. A worker's structured result is taken on every route in both modes,
+    // through a submit tool or as the final text: where a provider can't enforce the schema,
+    // broca still checks the result against it when the run ends.
+    let (uncapped, capped): (Vec<RunnerPair>, Vec<RunnerPair>) = pairs
+        .iter()
+        .map(|pair| RunnerPair::new(pair.wire_api.clone(), pair.auth_method.clone()))
+        .partition(|pair| pair.wire_api == routing_wire_api(WireFamilyId::OpenAiResponsesChatgpt));
+    let mut capped_capabilities = BROCA_HARNESS_CAPABILITIES.to_vec();
+    capped_capabilities.push(HarnessCapability::OutputCap);
     let mut runner = RunnerDeclaration::new(pairs);
     runner.follows_account_choice = true;
-    // Routing places a task on a runner by the harness it names, so broca names its own.
-    // ChatGPT routes strip max_output_tokens, so broca cannot promise output_cap. A worker's
-    // structured result is taken on every route in both modes, through a submit tool or as the
-    // final text: where a provider can't enforce the schema, broca still checks the result
-    // against it when the run ends.
-    let limits = HarnessLimits::new().with_capabilities(BROCA_HARNESS_CAPABILITIES.to_vec());
     runner = runner
-        .with_harnesses(vec!["broca".into()])
-        .with_harness_limits(BTreeMap::from([("broca".into(), limits)]));
+        .with_harnesses(vec![BROCA_HARNESS.into(), BROCA_UNCAPPED_HARNESS.into()])
+        .with_harness_limits(BTreeMap::from([
+            (
+                BROCA_HARNESS.into(),
+                HarnessLimits::new()
+                    .with_capabilities(capped_capabilities)
+                    .with_pairs(capped),
+            ),
+            (
+                BROCA_UNCAPPED_HARNESS.into(),
+                HarnessLimits::new()
+                    .with_capabilities(BROCA_HARNESS_CAPABILITIES.to_vec())
+                    .with_pairs(uncapped),
+            ),
+        ]));
     runner
         .typed_harness_limits()
         .expect("broca declares harness limits")
@@ -567,7 +588,14 @@ fn routing_declarations() -> ConsumerDeclarations {
     declarations
 }
 
-/// What broca's own harness can do, as routing places tasks by it (routing contract §16.2).
+/// The harness for every route that honors an output cap, which is every route but ChatGPT's.
+const BROCA_HARNESS: &str = "broca";
+
+/// The harness for ChatGPT routes, whose backend refuses an output cap.
+const BROCA_UNCAPPED_HARNESS: &str = "broca-uncapped";
+
+/// What both of broca's harnesses can do, as routing places tasks by them (routing contract
+/// §16.2). Only [`BROCA_HARNESS`] adds `output_cap`.
 const BROCA_HARNESS_CAPABILITIES: [HarnessCapability; 5] = [
     HarnessCapability::OneOff,
     HarnessCapability::ForkAnswer,
@@ -955,12 +983,16 @@ mod routing_tests {
             .clone()
     }
 
-    /// The slot's exact bytes: the runner pairs, plus broca's harness and its capabilities.
+    /// The slot's exact bytes: the runner pairs, plus broca's two harnesses. `broca` narrows to
+    /// every pair but ChatGPT's and adds `output_cap`; `broca-uncapped` holds ChatGPT's pair.
     /// Explicit pair false values remain present, unlike the omitted runner-level false.
     #[test]
-    fn routing_slot_declares_the_broca_harness_and_only_supported_capabilities() {
+    fn routing_slot_declares_the_broca_harnesses_and_only_supported_capabilities() {
         let expected = concat!(
-            r#"{"runner":{"follows_account_choice":true,"harness_limits":{"broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"]}},"harnesses":["broca"],"pairs":["#,
+            r#"{"runner":{"follows_account_choice":true,"harness_limits":{"#,
+            r#""broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans","output_cap"],"pairs":[{"auth_method":"apikey","wire_api":"anthropic.messages"},{"auth_method":"gateway","wire_api":"anthropic.messages"},{"auth_method":"oauth","wire_api":"anthropic.messages"},{"auth_method":"apikey","wire_api":"aws.bedrock_converse"},{"auth_method":"oauth","wire_api":"aws.bedrock_converse"},{"auth_method":"antigravity","wire_api":"google.code_assist"},{"auth_method":"apikey","wire_api":"google.generate_content"},{"auth_method":"oauth","wire_api":"google.generate_content"},{"auth_method":"apikey","wire_api":"openai.chat_completions"},{"auth_method":"oauth","wire_api":"openai.chat_completions"},{"auth_method":"apikey","wire_api":"openai.responses"},{"auth_method":"oauth","wire_api":"openai.responses"}]},"#,
+            r#""broca-uncapped":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"],"pairs":[{"auth_method":"chatgpt","wire_api":"openai.chatgpt_responses"}]}},"#,
+            r#""harnesses":["broca","broca-uncapped"],"pairs":["#,
             r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
             r#"{"auth_method":"gateway","requires_wire_api":false,"wire_api":"anthropic.messages"},"#,
             r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
@@ -991,19 +1023,27 @@ mod routing_tests {
             .typed_harness_limits()
             .expect("broca declares harness limits")
             .expect("the ungated producer validator accepts the harness facts");
-        assert_eq!(
-            limits,
-            BTreeMap::from([(
-                "broca".into(),
-                HarnessLimits::new().with_capabilities(vec![
-                    HarnessCapability::OneOff,
-                    HarnessCapability::ForkAnswer,
-                    HarnessCapability::SubmitTool,
-                    HarnessCapability::FinalText,
-                    HarnessCapability::Plans,
-                ]),
-            )])
-        );
+        let narrowed = |harness: &str| {
+            limits[harness]
+                .pairs
+                .as_ref()
+                .expect("each harness narrows the runner's pairs")
+                .iter()
+                .map(|pair| pair.wire_api.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert!(limits["broca"]
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .contains(&HarnessCapability::OutputCap));
+        assert!(!narrowed("broca").contains(&"openai.chatgpt_responses"));
+        assert!(!limits["broca-uncapped"]
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .contains(&HarnessCapability::OutputCap));
+        assert_eq!(narrowed("broca-uncapped"), ["openai.chatgpt_responses"]);
     }
 }
 
