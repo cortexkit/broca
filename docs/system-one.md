@@ -148,7 +148,7 @@ The daemon refuses roots marked `broca-state/2`; the removed staging format has 
 System One service. Live snapshots and claims on supported roots refuse expired
 routed rows, so cleanup timing never exposes content past retention.
 
-`llm.classify/v1` results include the model used, as required by llm-tools 0.3.2.
+`llm.classify/v1` results include the model used, as required by llm-tools.
 Unlike `classify.run`, `llm_classify` requires a model pin: the tool must know
 the provider before checking consent to send content or spend money.
 
@@ -158,7 +158,7 @@ Open a broca management route with `role_versions: {"extractor":"v1"}` and a
 daemon-stamped agent/run or flow scope. The route serves `role.describe` and
 `extract.run`, not session or classifier operations. Like the classifier route,
 it requires a flow scope for Basal and creates no session, lease, or consent
-card. It is not the `llm_extract` tool.
+card. Programs and flows that need a single extraction use `llm_extract` below.
 
 An extraction batch names its model, typed fields, and items. Broca serves only
 `cloudflare-workers-ai/@cf/cloudflare/clairic`, and only while the catalog lists
@@ -184,6 +184,26 @@ An oversized field answer is a stored `answer_too_large` item error, but any
 measured input cost still counts against the ceiling and is exported. As for
 classification, the first admission starts a seven-day retention window, and
 the same sweeper removes expired batches with their outcomes.
+
+## `llm.extract/v1`
+
+The model-tools route lists `llm_extract` for codemode and flows whenever broca
+serves the extractor. The arguments name the Clairic model, typed `fields`, one
+`item`, optional extractor `options`, and the required `max_cost_usd` ceiling.
+The tool uses the daemon-stamped run or flow scope for spend attribution. Like
+`llm_classify`, it checks for private content before contacting the provider and
+holds an eligible run's call while consent is pending. Its input schema accepts
+image handles only when broca has the image resolver.
+
+The tool sends that one item through `extract.run` using the envelope's
+`call_key` as the batch ID. For seven days, a repeat of a recorded call returns
+its result or refusal with the original spend and does not call Clairic again.
+A successful result carries `answers`, `usage`, and
+the measured `cost_usd`. It carries `truncated` only when reported and
+`state_text` only when requested and returned. Item failures are tool errors,
+not successful results with missing answers. Refusals identify their spend:
+for example, a ceiling refusal before a provider call marks `detail.no_spend`,
+while a billed item failure with measured cost carries `detail.cost_usd`.
 
 ## `llm.complete/v1`
 

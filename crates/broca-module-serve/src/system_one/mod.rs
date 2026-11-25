@@ -621,6 +621,7 @@ impl SystemOne {
         service.fact_flush = self.fact_flush.clone();
         service.charge_basis = self.charge_basis.clone();
         service.image_resolver = self.image_resolver.clone();
+        self.fork_tool_extractor(&mut service);
         service
     }
 

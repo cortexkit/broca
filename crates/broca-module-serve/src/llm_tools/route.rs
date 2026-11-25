@@ -11,6 +11,7 @@ use subc_protocol::tool_call::ToolCallRequest;
 use tokio::sync::watch;
 
 use super::admission::{admit, hash, refusal, Admission};
+use super::extract;
 use super::observed::Outcome as ConsentOutcome;
 use super::private_content::PrivateContent;
 use super::spend::Spend;
@@ -487,9 +488,13 @@ impl LlmTools {
                 .held
                 .read(&call.arguments, principal, self.system.tool_now()),
             "late_results.ack" => self.held.acknowledge(&call.arguments, principal),
-            CLASSIFY_TOOL_NAME => {
+            CLASSIFY_TOOL_NAME | extract::NAME
+                if call.name == CLASSIFY_TOOL_NAME || self.system.tool_extractor().is_some() =>
+            {
                 let envelope: RawEnvelope<'_> = serde_json::from_slice(body)
                     .map_err(|e| unspent(Refusal::invalid_params("arguments", e.to_string())))?;
+                let is_extract = call.name == extract::NAME;
+                let admit = if is_extract { extract::admit } else { admit };
                 let admission = admit(
                     principal,
                     scope,
@@ -498,7 +503,12 @@ impl LlmTools {
                     self.system.image_references(),
                 )
                 .map_err(unspent)?;
-                self.check_pin(&call, &self.input_schema())?;
+                let schema = if is_extract {
+                    extract::input_schema(self.system.image_references())
+                } else {
+                    self.input_schema()
+                };
+                self.check_pin(&call, &schema)?;
                 let held = if let Some(call_key) = &call.call_key {
                     self.held.replay(
                         &admission,
@@ -527,6 +537,7 @@ impl LlmTools {
                     )
                     .await;
                 match consumer.result_format {
+                    Some(_) if is_extract => answer.and_then(as_extract_tool_result),
                     Some(_) => answer.and_then(as_tool_result),
                     None => answer,
                 }
@@ -644,6 +655,20 @@ impl LlmTools {
             }
             tools.push(complete);
         }
+        if self.system.tool_extractor().is_some() {
+            let schema = extract::input_schema(self.system.image_references());
+            let mut tool = json!({
+                "name":extract::NAME, "schema_digest": cortexkit_role_tool_provider::catalog::schema_digest(&schema).expect("contract schema has a digest"),
+                "semantics":1, "capabilities":[], "description":extract::DESCRIPTION,
+                "input_schema":schema,
+                "modes":cortexkit_llm_tools::MODES,
+                "result_format":result_format.unwrap_or(CONTENT_V1),
+            });
+            if self.config.advertise_tags {
+                tool["capabilities"] = json!([cortexkit_llm_tools::extract::TAG]);
+            }
+            tools.push(tool);
+        }
         let generation = if tools.len() > 1 {
             hash(&json!(tools))
         } else {
@@ -760,10 +785,20 @@ impl LlmTools {
                 }
             }
         }
+        let extractor = if extract::is_key(&admission.batch_id) {
+            Some(self.system.tool_extractor().ok_or_else(|| {
+                unspent(Refusal::model_unavailable(
+                    "cloudflare-workers-ai/@cf/cloudflare/clairic",
+                ))
+            })?)
+        } else {
+            None
+        };
+        let system = extractor.map_or(&self.system, |extractor| &extractor.service);
         // Read replay before catalog, pricing or private-content policy. A changed catalog or
         // policy must never turn an already-paid answer into a new provider attempt.
         let stored = if keyed {
-            self.system
+            system
                 .stored_batch(&admission.batch_id)
                 .await
                 .map_err(|_| {
@@ -786,13 +821,20 @@ impl LlmTools {
             if has_final_outcome(stored) {
                 // Replaying sends nothing, so a failure to read the record spent nothing; the
                 // replayed answer itself carries the spend its first answer carried.
-                let answer = convert(
-                    &self
-                        .system
-                        .replay_tool(&admission.params, stored)
+                let answer = if let Some(extractor) = extractor {
+                    extractor
+                        .replay_tool(stored)
                         .await
-                        .map_err(unspent)?,
-                );
+                        .map_err(|refusal| error(Spend::Nothing.mark_undeclared(refusal), None))
+                } else {
+                    convert(
+                        &self
+                            .system
+                            .replay_tool(&admission.params, stored)
+                            .await
+                            .map_err(unspent)?,
+                    )
+                };
                 if held.is_some() {
                     self.persist_held_answer(&admission.batch_id, &answer, Spend::Nothing, true)?;
                 }
@@ -836,11 +878,15 @@ impl LlmTools {
         };
         let images = match kept.and_then(|kept| kept.images) {
             Some(images) => images,
-            None => match self
-                .system
-                .prepare_images(&admission.params, &image_scope, stored.as_ref())
-                .await
-            {
+            None => match if let Some(extractor) = extractor {
+                extractor
+                    .prepare_tool_images(&admission.params, &image_scope)
+                    .await
+            } else {
+                self.system
+                    .prepare_images(&admission.params, &image_scope, stored.as_ref())
+                    .await
+            } {
                 Ok(images) => Arc::new(images),
                 Err(refusal) => {
                     let answer = Err(unspent(refusal));
@@ -862,6 +908,10 @@ impl LlmTools {
                     "held pricing snapshot is unreadable",
                 ))
             })?
+        } else if let Some(extractor) = extractor {
+            extractor
+                .admit_tool(&admission.params, stored.as_ref())
+                .map_err(unspent)?
         } else {
             self.system
                 .admit_tool(&admission.params, stored.as_ref())
@@ -939,24 +989,42 @@ impl LlmTools {
                     },
                 );
                 let service = self.clone();
+                let is_extract = extractor.is_some();
                 tokio::spawn(async move {
                     let batch_id = admission.batch_id.clone();
                     let system = service.system.clone();
                     let admitted_at = held.as_ref().map(|row| row.admitted_at_ms);
                     let execution = tokio::spawn(async move {
-                        system
-                            .execute_tool(
-                                admission.params,
-                                admission.scope,
-                                admission.args_digest,
-                                pricing,
-                                admitted_at,
-                                images,
-                            )
-                            .await
+                        if is_extract {
+                            let extractor = system
+                                .tool_extractor()
+                                .expect("extractor checked before dispatch");
+                            extractor
+                                .execute_tool(
+                                    &admission.params,
+                                    &admission.scope,
+                                    &admission.args_digest,
+                                    &pricing,
+                                    admitted_at,
+                                    &images,
+                                )
+                                .await
+                        } else {
+                            system
+                                .execute_tool(
+                                    admission.params,
+                                    admission.scope,
+                                    admission.args_digest,
+                                    pricing,
+                                    admitted_at,
+                                    images,
+                                )
+                                .await
+                        }
                     })
                     .await;
                     let answer = match execution {
+                        Ok(Ok(reply)) if is_extract => Ok(reply),
                         Ok(Ok(reply)) => convert(&reply),
                         // `execute_tool` marks every refusal it returns with its spend.
                         Ok(Err(refusal)) => Err(error(refusal, None)),
@@ -991,7 +1059,15 @@ impl LlmTools {
 
     /// Whether the batch has a recorded outcome, which is final for its call key.
     async fn recorded(&self, batch_id: &str) -> bool {
-        self.system
+        let system = if extract::is_key(batch_id) {
+            let Some(extractor) = self.system.tool_extractor() else {
+                return false;
+            };
+            &extractor.service
+        } else {
+            &self.system
+        };
+        system
             .stored_batch(batch_id)
             .await
             .ok()
@@ -1399,6 +1475,23 @@ fn as_tool_result(body: Box<RawValue>) -> Answer {
         Some(Spend::Unknown),
         json!({"content":[{"type":"text","text":body.get()}],"structuredContent":value}),
     )
+}
+
+fn as_extract_tool_result(body: Box<RawValue>) -> Answer {
+    // A consent hold is already a tool-result envelope.
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        held: Option<serde::de::IgnoredAny>,
+    }
+    if serde_json::from_str::<Envelope>(body.get()).is_ok_and(|envelope| envelope.held.is_some()) {
+        return Ok(body);
+    }
+    extract::tool_result(&body).map_err(|_| {
+        error(
+            crate::system_one::internal_refusal("extraction tool reply cannot encode"),
+            Some(Spend::Unknown),
+        )
+    })
 }
 
 /// Encode a reply. `lost` is the spend a failure to encode it states: `None` for the

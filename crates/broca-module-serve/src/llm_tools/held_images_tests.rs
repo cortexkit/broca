@@ -26,10 +26,10 @@ use crate::system_one::{
 const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 const HANDLE: &str = "ih0123456789abcdef0123456789abcdef";
 
-struct Source {
-    present: AtomicBool,
-    calls: AtomicUsize,
-    scopes: Mutex<Vec<(String, Option<String>)>>,
+pub(crate) struct Source {
+    pub(crate) present: AtomicBool,
+    pub(crate) calls: AtomicUsize,
+    pub(crate) scopes: Mutex<Vec<(String, Option<String>)>>,
 }
 
 #[async_trait]
@@ -92,7 +92,7 @@ impl BatchCatalog for Catalog {
     }
 }
 
-pub(super) struct Marked;
+pub(crate) struct Marked;
 #[async_trait]
 impl Asks for Marked {
     async fn marked(&self, _: &str, _: Option<&str>) -> Option<broca_subc::PrivateContent> {
@@ -111,8 +111,8 @@ impl Asks for Marked {
     }
 }
 
-pub(super) struct Io {
-    pub(super) answer: Mutex<Option<ConsentRecord>>,
+pub(crate) struct Io {
+    pub(crate) answer: Mutex<Option<ConsentRecord>>,
     live: Mutex<RunLiveness>,
     feed: Mutex<Vec<Value>>,
     refuse: AtomicBool,
@@ -168,12 +168,12 @@ impl ConsentIo for Io {
     }
 }
 
-pub(super) fn principal() -> BindPrincipal {
+pub(crate) fn principal() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "caller".into(),
     }
 }
-pub(super) fn stamp() -> SendScope {
+pub(crate) fn stamp() -> SendScope {
     SendScope::Stamped(BindScope {
         scope: SessionScope {
             owner: BindPrincipal::Reserved {

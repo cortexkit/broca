@@ -783,7 +783,7 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
             agent_facing: false,
             operations: broca_wire::agent_data::REQUIRED_OPS.iter().map(|op| op.to_string()).collect(),
         }, ProviderRole::ToolProvider {
-            // Both tools the route lists. A caller such as Basal resolves a module's tools from
+            // A caller such as Basal resolves a module's tools from
             // this declaration before it reads the route's catalog, so a tool missing here is
             // refused before broca sees the call.
             tools: vec![
@@ -798,6 +798,12 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
                     description: Some(crate::llm_tools::complete::COMPLETE_DESCRIPTION.into()),
                     execution_mode: subc_protocol::manifest::ExecutionMode::Pure,
                     schema: crate::llm_tools::complete::Complete::input_schema(),
+                },
+                subc_protocol::manifest::Tool {
+                    name: crate::llm_tools::extract::NAME.into(),
+                    description: Some(crate::llm_tools::extract::DESCRIPTION.into()),
+                    execution_mode: subc_protocol::manifest::ExecutionMode::Pure,
+                    schema: cortexkit_llm_tools::extract::input_schema(),
                 },
             ],
             identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
@@ -1159,9 +1165,7 @@ mod provenance_tests {
         );
     }
 
-    /// The tool-provider role declares both tools broca's tool route lists, with the schemas the
-    /// route lists them with. Basal resolves a program's tools from this declaration first, so
-    /// `llm_complete` listed on the route but missing here was refused before reaching broca.
+    /// Basal resolves programs' tools from this declaration before opening broca's tool route.
     #[test]
     fn the_manifest_declares_every_tool_the_route_lists() {
         let declared: Vec<(String, serde_json::Value)> = manifest("broca")
@@ -1184,6 +1188,10 @@ mod provenance_tests {
                 (
                     crate::llm_tools::complete::COMPLETE_TOOL_NAME.to_owned(),
                     crate::llm_tools::complete::Complete::input_schema()
+                ),
+                (
+                    "llm_extract".to_owned(),
+                    cortexkit_llm_tools::extract::input_schema()
                 ),
             ]
         );

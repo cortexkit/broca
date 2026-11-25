@@ -15,6 +15,8 @@ use crate::system_one::{
     BatchCatalog, Config,
 };
 
+mod tool;
+
 const RATE: i64 = 110_000_000;
 
 struct Rows(Mutex<HashMap<String, ModelBatchRow>>);

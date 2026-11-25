@@ -24,6 +24,8 @@ use cortexkit_role_extractor::{
 use serde_json::value::{to_raw_value, RawValue};
 use zeroize::Zeroizing;
 
+use crate::llm_tools::spend::Spend;
+
 use super::{
     caller_scope_for, clairic,
     classify::{self, blocking, Hold},
@@ -32,6 +34,9 @@ use super::{
     ClassifierProvider, SystemOne, BATCH_IN_PROGRESS_RETRY_AFTER_MS, INTERNAL_ERROR,
     OP_EXTRACT_RUN, OP_ROLE_DESCRIBE,
 };
+
+mod tool;
+use tool::ToolCall;
 
 const STORE_ROLE: &str = "extractor";
 const MAX_FIELDS: u64 = 64;
@@ -54,14 +59,19 @@ const BOUNDS: ModuleBounds = ModuleBounds {
 };
 
 #[derive(Clone)]
-pub(super) struct Extractor {
-    service: Arc<SystemOne>,
+pub(crate) struct Extractor {
+    pub(crate) service: Arc<SystemOne>,
     clairic: Arc<WorkersAi>,
 }
 
 impl SystemOne {
     /// Serve Clairic beside the classifiers, sharing the store, process cap and usage outbox.
     pub fn with_clairic(mut self, clairic: Arc<WorkersAi>) -> Self {
+        self.extractor = Some(self.extractor_for(clairic, STORE_ROLE));
+        self
+    }
+
+    fn extractor_for(&self, clairic: Arc<WorkersAi>, store_role: &str) -> Extractor {
         let mut service = Self::new(
             self.store.clone(),
             self.owner.clone(),
@@ -70,7 +80,7 @@ impl SystemOne {
             self.config.clone(),
             self.in_flight.clone(),
         )
-        .with_store_role(STORE_ROLE)
+        .with_store_role(store_role)
         .with_clock(self.clock.clone());
         service.call_slots = self.call_slots.clone();
         service.metrics = self.metrics.clone();
@@ -78,11 +88,10 @@ impl SystemOne {
         service.fact_flush = self.fact_flush.clone();
         service.charge_basis = self.charge_basis.clone();
         service.image_resolver = self.image_resolver.clone();
-        self.extractor = Some(Extractor {
+        Extractor {
             service: Arc::new(service),
             clairic,
-        });
-        self
+        }
     }
 
     pub(crate) fn serves_extractor(&self) -> bool {
@@ -208,6 +217,16 @@ impl Extractor {
         scope: &BatchScope,
         send: &SendScope,
     ) -> Result<Box<RawValue>, Refusal> {
+        self.run_inner(params, scope, send, None).await
+    }
+
+    async fn run_inner(
+        &self,
+        params: &str,
+        scope: &BatchScope,
+        send: &SendScope,
+        tool: Option<&mut ToolCall<'_>>,
+    ) -> Result<Box<RawValue>, Refusal> {
         let service = &self.service;
         let limits = self.limits();
         request::check_request_bytes(params.len(), &limits)?;
@@ -230,7 +249,7 @@ impl Extractor {
             local: true,
         };
         let reply = self
-            .run_held(&request, &limits, scope, send, &mut hold)
+            .run_held(&request, &limits, scope, send, &mut hold, tool)
             .await;
         hold.release().await;
         reply
@@ -273,6 +292,7 @@ impl Extractor {
         scope: &BatchScope,
         send: &SendScope,
         hold: &mut Hold<'_>,
+        tool: Option<&mut ToolCall<'_>>,
     ) -> Result<Box<RawValue>, Refusal> {
         let service = &self.service;
         let snapshot = self.snapshot(&request.batch_id).await?;
@@ -283,21 +303,18 @@ impl Extractor {
             if stored.running {
                 return Err(in_progress());
             }
+            if let Some(tool) = &tool {
+                tool.check_digest(&stored.args_digest)?;
+                if !stored.outcomes.is_empty() {
+                    return self.replay_tool(stored).await;
+                }
+            }
+            None
+        } else if tool.is_some() {
+            // Tool admission already checked the catalog and froze the applicable price.
             None
         } else {
-            let row = service.catalog.row(&request.model);
-            let kind = match &row {
-                None => CatalogRow::Absent,
-                Some(row) => row
-                    .kind
-                    .as_deref()
-                    .map_or(CatalogRow::Kindless, CatalogRow::Kind),
-            };
-            request::check_catalog_row(&request.model, kind)?;
-            if request.model != CLAIRIC {
-                return Err(Refusal::model_unknown(&request.model));
-            }
-            row
+            Some(self.live_row(&request.model)?)
         };
         let model = self.model_entry(row.as_ref());
         check_request_limits(request, &model, limits, service.image_references())?;
@@ -307,7 +324,13 @@ impl Extractor {
             check_identity(&identity, &stored.identity)?;
         }
         let bodies = self
-            .prepare(request, &model, send, snapshot.as_ref())
+            .prepare(
+                request,
+                &model,
+                send,
+                snapshot.as_ref(),
+                tool.as_ref().map(|tool| tool.images),
+            )
             .await?;
         let estimates = (0..request.items.len())
             .map(|index| {
@@ -317,29 +340,38 @@ impl Extractor {
             .collect::<Result<Vec<_>, _>>()?;
 
         service.publish_facts().await?;
-        let admission_rate = row
-            .and_then(|r| r.input_rate_nanos)
-            .filter(|rate| *rate >= 0);
+        let admission_rate = if let Some(tool) = &tool {
+            serde_json::from_str(&tool.admission.frozen_row)
+                .map_err(|_| internal_refusal("the admitted Clairic price does not decode"))?
+        } else {
+            row.and_then(|r| r.input_rate_nanos)
+                .filter(|rate| *rate >= 0)
+        };
         let sent_ceiling = request.max_cost_usd.as_ref().map(|usd| {
             usd_to_nanos(usd, Rounding::Down)
                 .unwrap_or(u64::MAX)
                 .min(i64::MAX as u64)
         });
         let claimed = {
-            let (store, owner, id, model, scope) = (
+            let (store, role, owner, id, model, scope) = (
                 service.store.clone(),
+                service.role.clone(),
                 service.owner.clone(),
                 request.batch_id.clone(),
                 request.model.clone(),
                 scope.clone(),
             );
             let identity = serde_json::to_string(&identity).expect("identity encodes");
-            let digest = classify::sha256_hex(&identity);
+            let digest = tool.as_ref().map_or_else(
+                || classify::sha256_hex(&identity),
+                |tool| tool.args_digest.to_owned(),
+            );
             let frozen = serde_json::to_string(&admission_rate).expect("the input rate encodes");
             let now_ms = (service.clock)();
+            let admitted_at = tool.as_ref().and_then(|tool| tool.admitted_at);
             blocking(move || {
-                store.claim(&BatchClaim {
-                    role: STORE_ROLE,
+                let claim = BatchClaim {
+                    role: &role,
                     batch_id: &id,
                     model: &model,
                     identity: &identity,
@@ -349,7 +381,11 @@ impl Extractor {
                     ceiling_nanos: sent_ceiling,
                     owner: &owner,
                     now_ms,
-                })
+                };
+                match admitted_at {
+                    Some(at) => store.claim_admitted_at(&claim, at),
+                    None => store.claim(&claim),
+                }
             })
             .await?
         };
@@ -357,6 +393,9 @@ impl Extractor {
             Claimed::Expired | Claimed::InProgress => return Err(in_progress()),
             Claimed::ScopeMismatch => return Err(scope_mismatch()),
             Claimed::Reuse { recorded_identity } => {
+                if tool.is_some() {
+                    return Err(Refusal::batch_id_reuse("arguments"));
+                }
                 check_identity(&identity, &recorded_identity)?;
                 return Err(internal_refusal(
                     "stored batch digest does not match its identity",
@@ -384,6 +423,10 @@ impl Extractor {
                         "batch expired during replay; re-send the batch",
                     ));
                 }
+                if tool.is_some() && !record.outcomes.is_empty() {
+                    service.publish_facts().await?;
+                    return tool::replay(&record.outcomes);
+                }
                 let rate = serde_json::from_str(&record.frozen_row)
                     .map_err(|_| internal_refusal("the recorded Clairic price does not decode"))?;
                 (
@@ -402,10 +445,21 @@ impl Extractor {
             rate,
             ceiling,
             spent,
+            tool: tool.is_some(),
+            tool_result: None,
+            spend: Spend::Nothing,
         };
         let items = self
             .dispatch(&mut batch, hold, outcomes, bodies, estimates)
-            .await?;
+            .await;
+        if let Some(tool) = tool {
+            tool.spend = batch.spend;
+            items?;
+            return batch
+                .tool_result
+                .ok_or_else(|| internal_refusal("the extraction has no tool outcome"))?;
+        }
+        let items = items?;
         let answered = || items.iter().filter(|item| item.answers.is_some());
         let cost = input_cost_nanos(
             answered().map(|item| item.usage.as_ref().and_then(|u| u.input_tokens)),
@@ -427,6 +481,7 @@ impl Extractor {
         model: &ModelEntry,
         send: &SendScope,
         snapshot: Option<&StoredBatch>,
+        prepared: Option<&super::images::PreparedImages>,
     ) -> Result<Vec<Option<Zeroizing<String>>>, Refusal> {
         let mut bodies = Vec::with_capacity(request.items.len());
         for (index, item) in request.items.iter().enumerate() {
@@ -439,28 +494,74 @@ impl Extractor {
                 bodies.push(None);
                 continue;
             }
-            let mut body = ProviderRequest::for_item(request, index, super::CLAIRIC_MODEL_PATH)
-                .expect("the item exists");
-            if let Some(images) = &item.images {
-                let resolved = self.service.resolve_images(images, send, index).await?;
-                request::check_resolved_item_images(model, index, &resolved)?;
-                images::validate_dimensions(index, &resolved)?;
-                if images.iter().any(|image| image.reference().is_some()) {
-                    body = body.with_resolved_images(&resolved);
-                    provider::check_provider_body(index, &body, clairic_limits::MAX_BODY_BYTES)?;
-                }
+            if let Some(body) = prepared
+                .and_then(|images| images.0.get(index))
+                .and_then(Option::as_ref)
+            {
+                bodies.push(Some(Zeroizing::new(body.clone())));
+            } else if prepared.is_some()
+                && item
+                    .images
+                    .iter()
+                    .flatten()
+                    .any(|image| image.reference().is_some())
+            {
+                return Err(cortexkit_model_batch::image::ResolveFailure::Unavailable
+                    .refusal(format!("items[{index}].images")));
+            } else {
+                bodies.push(Some(self.prepare_body(request, model, send, index).await?));
             }
-            bodies.push(Some(Zeroizing::new(
-                serde_json::to_string(&body).expect("the request encodes"),
-            )));
         }
         Ok(bodies)
     }
 
+    async fn prepare_body(
+        &self,
+        request: &ExtractRequest,
+        model: &ModelEntry,
+        send: &SendScope,
+        index: usize,
+    ) -> Result<Zeroizing<String>, Refusal> {
+        let mut body = ProviderRequest::for_item(request, index, super::CLAIRIC_MODEL_PATH)
+            .expect("the item exists");
+        if let Some(images) = &request.items[index].images {
+            let resolved = self.service.resolve_images(images, send, index).await?;
+            request::check_resolved_item_images(model, index, &resolved)?;
+            images::validate_dimensions(index, &resolved)?;
+            if images.iter().any(|image| image.reference().is_some()) {
+                body = body.with_resolved_images(&resolved);
+                provider::check_provider_body(index, &body, clairic_limits::MAX_BODY_BYTES)?;
+            }
+        }
+        Ok(Zeroizing::new(
+            serde_json::to_string(&body).expect("the request encodes"),
+        ))
+    }
+
+    fn live_row(&self, model: &str) -> Result<ModelBatchRow, Refusal> {
+        let row = self.service.catalog.row(model);
+        let kind = match &row {
+            None => CatalogRow::Absent,
+            Some(row) => row
+                .kind
+                .as_deref()
+                .map_or(CatalogRow::Kindless, CatalogRow::Kind),
+        };
+        request::check_catalog_row(model, kind)?;
+        if model != CLAIRIC {
+            return Err(Refusal::model_unknown(model));
+        }
+        Ok(row.expect("catalog admission checked the row"))
+    }
+
     async fn discard_fresh(&self, hold: &mut Hold<'_>) -> Result<(), Refusal> {
         let id = hold.batch_id.clone();
-        let (store, owner) = (self.service.store.clone(), self.service.owner.clone());
-        blocking(move || store.discard_fresh(STORE_ROLE, &id, &owner)).await?;
+        let (store, role, owner) = (
+            self.service.store.clone(),
+            self.service.role.clone(),
+            self.service.owner.clone(),
+        );
+        blocking(move || store.discard_fresh(&role, &id, &owner)).await?;
         hold.stored = false;
         Ok(())
     }
@@ -525,7 +626,10 @@ impl Extractor {
                 spend::check_before_call(&estimate, batch.rate, batch.spent, batch.ceiling)
             {
                 let item = ItemResult::failed(i, error);
-                if first_call {
+                if batch.tool {
+                    self.record_tool(batch, &item, Payment::default(), Some(Spend::Nothing))
+                        .await?;
+                } else if first_call {
                     pending.push(item.clone());
                 } else {
                     self.record(&request.batch_id, &item, Payment::default())
@@ -536,19 +640,44 @@ impl Extractor {
             }
 
             let body = body.expect("unanswered items have a prepared provider request");
+            batch.spend = Spend::Unknown;
             let answer = clairic::call(&self.service, &self.clairic, CLAIRIC, &body).await;
             if first_call {
                 first_call = false;
                 if let Err(failed) = &answer {
                     if errors::is_batch_level(&failed.error.code) {
-                        if batch.fresh {
-                            self.discard_fresh(hold).await?
-                        }
-                        return Err(classify::first_call_refusal(
+                        let refusal = classify::first_call_refusal(
                             &bounded_error(failed.error.clone()),
                             CLAIRIC,
                             self.clairic.as_ref(),
-                        ));
+                        );
+                        if batch.tool {
+                            batch.spend = if failed.may_have_spent {
+                                Spend::Unknown
+                            } else {
+                                Spend::Nothing
+                            };
+                            let debit = if failed.may_have_spent {
+                                super::unknown_spend_debit(batch.ceiling)
+                            } else {
+                                0
+                            };
+                            let refusal = batch.spend.mark(refusal);
+                            self.store_tool_outcome(
+                                batch,
+                                Err(refusal),
+                                Payment {
+                                    debit,
+                                    ..Payment::default()
+                                },
+                            )
+                            .await?;
+                            return Ok(items);
+                        }
+                        if batch.fresh {
+                            self.discard_fresh(hold).await?
+                        }
+                        return Err(refusal);
                     }
                 }
                 // A refusal on the first provider call writes no outcomes, even if earlier
@@ -569,10 +698,11 @@ impl Extractor {
                     let item = fit_answer(item, request, MAX_ANSWER_BYTES);
                     // A malformed result can be retried. Unlike a valid but oversized answer,
                     // it does not have a final measurement to publish under this item's id.
-                    let final_outcome = item
-                        .error
-                        .as_ref()
-                        .is_none_or(|error| !error.is_retried_on_resend());
+                    let final_outcome = batch.tool
+                        || item
+                            .error
+                            .as_ref()
+                            .is_none_or(|error| !error.is_retried_on_resend());
                     let usage = usage.as_ref().filter(|_| final_outcome);
                     let measured = batch
                         .rate
@@ -591,8 +721,16 @@ impl Extractor {
                             )
                         })
                         .flatten();
-                    self.record(&request.batch_id, &item, Payment { debit, usage, fact })
-                        .await?;
+                    let paid = Payment { debit, usage, fact };
+                    if batch.tool {
+                        batch.spend = measured.map_or(Spend::Unknown, |nanos| {
+                            crate::llm_tools::spend::ItemSpend::Measured(nanos).into()
+                        });
+                        self.record_tool(batch, &item, paid, measured.map(|_| batch.spend))
+                            .await?;
+                    } else {
+                        self.record(&request.batch_id, &item, paid).await?;
+                    }
                     batch.spent = batch.spent.saturating_add(debit);
                     items.push(item);
                 }
@@ -603,21 +741,27 @@ impl Extractor {
                     }
                     let stored = error.is_stored();
                     let item = ItemResult::failed(i, error);
-                    if stored {
+                    if stored || batch.tool {
                         let debit = if failed.may_have_spent {
                             super::unknown_spend_debit(batch.ceiling)
                         } else {
                             0
                         };
-                        self.record(
-                            &request.batch_id,
-                            &item,
-                            Payment {
-                                debit,
-                                ..Payment::default()
-                            },
-                        )
-                        .await?;
+                        let paid = Payment {
+                            debit,
+                            ..Payment::default()
+                        };
+                        if batch.tool {
+                            batch.spend = if failed.may_have_spent {
+                                Spend::Unknown
+                            } else {
+                                Spend::Nothing
+                            };
+                            self.record_tool(batch, &item, paid, Some(batch.spend))
+                                .await?;
+                        } else {
+                            self.record(&request.batch_id, &item, paid).await?;
+                        }
                         batch.spent = batch.spent.saturating_add(debit);
                     }
                     items.push(item);
@@ -666,6 +810,9 @@ struct Dispatch<'a> {
     rate: Option<i64>,
     ceiling: Option<u64>,
     spent: u64,
+    tool: bool,
+    tool_result: Option<Result<Box<RawValue>, Refusal>>,
+    spend: Spend,
 }
 
 fn in_progress() -> Refusal {

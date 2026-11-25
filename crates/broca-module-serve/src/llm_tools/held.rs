@@ -8,7 +8,7 @@ use std::{
 
 use broca_protocol::{BindPrincipal, SendScope};
 use broca_store::grants::{FinalKind, GrantsStore, HeldCall, HeldState, ScopeIdentity};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, value::RawValue, Value};
 
 use super::spend::Spend;
@@ -333,9 +333,30 @@ impl HeldCalls {
             .iter()
             .map(|entry| late_entry(&entry.call))
             .collect::<Result<Vec<_>, _>>()?;
-        late_raw(
-            json!({"entries":entries, "cursor":{"provider_incarnation":self.caller_incarnation(&principal),"seq":seq},"more":more}),
-        )
+        let cursor = json!({"provider_incarnation":self.caller_incarnation(&principal),"seq":seq});
+        if rows
+            .iter()
+            .any(|entry| super::extract::is_key(&entry.call.batch_id))
+        {
+            #[derive(Serialize)]
+            struct Page {
+                entries: Vec<Box<RawValue>>,
+                cursor: Value,
+                more: bool,
+            }
+            let entries = rows
+                .iter()
+                .zip(entries)
+                .map(|(row, entry)| raw_late_entry(&row.call, entry))
+                .collect::<Result<Vec<_>, _>>()?;
+            return serde_json::value::to_raw_value(&Page {
+                entries,
+                cursor,
+                more,
+            })
+            .map_err(late_internal);
+        }
+        late_raw(json!({"entries":entries, "cursor":cursor,"more":more}))
     }
 
     pub fn acknowledge(&self, arguments: &Value, principal: Option<&BindPrincipal>) -> Answer {
@@ -390,13 +411,22 @@ fn late_entry(row: &HeldCall) -> Result<Value, Vec<u8>> {
         .final_result
         .as_ref()
         .ok_or_else(|| late_refusal("internal", "late result has no stored final outcome"))?;
+    let tool = if super::extract::is_key(&row.batch_id) {
+        "llm.extract"
+    } else {
+        "llm.classify"
+    };
     let mut entry = json!({
         "kind":if result.kind == FinalKind::Result {"result"} else {"not_started"},
         "owner":row.scope.owner, "ref":row.scope.scope_ref, "scope_epoch":row.scope.scope_epoch,
         "custodian":row.principal, "call_key":row.call_key,
-        "event_id":format!("llm.classify:{}:{}",row.batch_id,row.admitted_at_ms),
+        "event_id":format!("{tool}:{}:{}",row.batch_id,row.admitted_at_ms),
         "settled_at":result.settled_at_ms, "reduced":false,
     });
+    if tool == "llm.extract" && result.kind == FinalKind::Result && !result.is_error {
+        // The caller adds structuredContent directly from the stored JSON.
+        return Ok(entry);
+    }
     let body: Value = serde_json::from_str(&result.body).map_err(late_internal)?;
     if result.kind == FinalKind::Result {
         entry["result"] = if body.get("content").is_some() {
@@ -415,6 +445,30 @@ fn late_entry(row: &HeldCall) -> Result<Value, Vec<u8>> {
         entry["outcome"] = body["detail"]["consent"].clone();
     }
     Ok(entry)
+}
+
+fn raw_late_entry(row: &HeldCall, entry: Value) -> Answer {
+    let Some(result) = row.final_result.as_ref().filter(|result| {
+        super::extract::is_key(&row.batch_id)
+            && result.kind == FinalKind::Result
+            && !result.is_error
+    }) else {
+        return late_raw(entry);
+    };
+    #[derive(Serialize)]
+    struct Entry<'a> {
+        #[serde(flatten)]
+        metadata: Value,
+        result: &'a RawValue,
+    }
+    // Late extract replies must keep the same provider number spellings as immediate replies.
+    let body = RawValue::from_string(result.body.clone()).map_err(late_internal)?;
+    let result = super::extract::tool_result(&body).map_err(late_internal)?;
+    serde_json::value::to_raw_value(&Entry {
+        metadata: entry,
+        result: &result,
+    })
+    .map_err(late_internal)
 }
 
 pub fn epoch_ms() -> i64 {

@@ -6,10 +6,11 @@ pub mod complete;
 #[cfg(test)]
 mod complete_consent_tests;
 pub mod consent;
+pub(crate) mod extract;
 pub mod held;
 mod held_images;
 #[cfg(test)]
-mod held_images_tests;
+pub(crate) mod held_images_tests;
 mod observed;
 pub mod permissions;
 mod private_content;
