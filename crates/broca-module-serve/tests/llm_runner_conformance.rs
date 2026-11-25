@@ -490,8 +490,13 @@ struct Shared {
     requests: Mutex<HashMap<String, Vec<Vec<Value>>>>,
     /// Every request's whole body the model received, by session, in order.
     bodies: Mutex<HashMap<String, Vec<Value>>>,
-    /// Woken when a kill is done, so every request the rig was holding gives up.
+    /// Woken when a kill is done, so every request the killed rig was holding gives up (see
+    /// [`Shared::until_killed`]).
     released: Notify,
+    /// The sessions of rigs a kill has stopped. A request held for one of them gives up when
+    /// `released` wakes; one of a rig still running keeps waiting, since cases run side by side
+    /// against one model and one tool module.
+    killed: Mutex<std::collections::HashSet<String>>,
     /// The scripted calls the suite asked to hold, by their arguments' JSON text, and each one's
     /// gate. A held call answers only once the suite releases it.
     holds: Mutex<HashMap<String, Arc<HoldGate>>>,
@@ -555,6 +560,34 @@ impl HoldGate {
 }
 
 impl Shared {
+    /// Resolves once a kill has stopped the rig serving `session` (see `killed`).
+    async fn until_killed(&self, session: &str) {
+        loop {
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.killed.lock().unwrap().contains(session) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Marks every session opened on the rig whose state root is `state_root` as killed, and
+    /// wakes the requests held for them.
+    fn release_killed(&self, state_root: &Path) {
+        let sessions: Vec<String> = self
+            .session_roots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, root)| root.as_path() == state_root)
+            .map(|(session, _)| session.clone())
+            .collect();
+        self.killed.lock().unwrap().extend(sessions);
+        self.released.notify_waiters();
+    }
+
     /// If `point` is armed, take it and say it was reached by `session`. The caller then holds
     /// whatever it was about to answer until the kill releases it.
     fn reach(&self, point: &str, session: &str) -> bool {
@@ -1052,7 +1085,7 @@ async fn serve_model_request(
         HoldGate::set(&gate.arrived, &gate.arrived_wake);
         tokio::select! {
             () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
-            () = shared.released.notified() => return Ok(()),
+            () = shared.until_killed(&session) => return Ok(()),
         }
     }
     // The first model request of a run comes right after its start record is durable, and the
@@ -1067,7 +1100,7 @@ async fn serve_model_request(
             .then_some(points::TOOL_RESULT_RECORDED)
     };
     if point.is_some() {
-        shared.released.notified().await;
+        shared.until_killed(&session).await;
         return Ok(());
     }
 
@@ -1204,7 +1237,7 @@ async fn serve_model_request(
         HoldGate::set(&gate.arrived, &gate.arrived_wake);
         tokio::select! {
             () = HoldGate::wait(&gate.released, &gate.released_wake) => {},
-            () = shared.released.notified() => return Ok(()),
+            () = shared.until_killed(&session) => return Ok(()),
         }
         stream.write_all(&body.as_bytes()[prefix_bytes..]).await?;
     } else {
@@ -1305,7 +1338,7 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         );
         // The call is sent only once its dispatch intent is durable.
         if self.shared.reach(points::DISPATCH_INTENT, &session) {
-            self.shared.released.notified().await;
+            self.shared.until_killed(&session).await;
             return subc_client_rs::HandlerOutcome::Error {
                 code: "conformance_killed".into(),
                 message: "the runner was killed while this call was held".into(),
@@ -1320,7 +1353,7 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
                 HoldGate::set(&gate.arrived, &gate.arrived_wake);
                 tokio::select! {
                     () = HoldGate::wait(&gate.released, &gate.released_wake) => {}
-                    () = self.shared.released.notified() => {
+                    () = self.shared.until_killed(&session) => {
                         return subc_client_rs::HandlerOutcome::Error {
                             code: "conformance_killed".into(),
                             message: "the runner was killed while this call was held".into(),
@@ -2242,14 +2275,16 @@ impl Harness for BrocaSubject {
                 () = reached.notified() => {}
             }
             let session = session.lock().unwrap().clone().expect("set when reached");
+            // The session that reached the point is the killed rig's, whichever rig opened it.
+            self.shared.killed.lock().unwrap().insert(session.clone());
             if let Err(problem) = self.holds_point(&handle, &session, name).await {
                 handle.kill_all();
-                self.shared.released.notify_waiters();
+                self.shared.release_killed(&handle.state_root);
                 return Err(HarnessError::new(problem));
             }
         }
         let killed = handle.kill_all();
-        self.shared.released.notify_waiters();
+        self.shared.release_killed(&handle.state_root);
         drop(handle);
         if !killed {
             return Err(HarnessError::new("no ck-broca process was found to kill"));
