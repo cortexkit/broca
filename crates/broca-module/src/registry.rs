@@ -3138,6 +3138,15 @@ impl LineageRegistry {
         let Some(service) = self.inner.retention.get().cloned() else {
             return Ok(0);
         };
+        // Request dumps expire on the same cadence. The sweep logs its own failures, so even a
+        // panic in it must not stop this pass from deleting due sessions.
+        let dump_root = service.state_root.clone();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || crate::retention::sweep_request_dumps(&dump_root))
+                .await
+        {
+            tracing::warn!(target: "retention", %error, "request dump sweep did not finish");
+        }
         let now_ms = if service
             .clock
             .refresh()

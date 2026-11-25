@@ -2782,7 +2782,8 @@ refused `operator_required` before anything reads the session.
 Request: `{"run_id": "<run id>"}`. A run the session holds no attempt of is refused
 `unknown_run`; an unknown field is refused `invalid_params`. The bodies go to
 `request-dumps/<session address>/<run id>/s<step>.json` under the state root, in a folder and
-files only the owner can read. The reply names the folder and each step, never any content:
+files only the owner can read. Dumps are deleted a day after they are written. The reply names the
+folder and each step, never any content:
 
 ```json
 {"run_id": "r1", "folder": "<state root>/request-dumps/<address>/r1",

@@ -871,6 +871,58 @@ async fn a_pass_between_full_passes_deletes_only_sessions_whose_kept_deadline_ca
     assert!(!rig.holds(&unlisted));
 }
 
+#[tokio::test]
+async fn retention_pass_expires_old_request_dumps() {
+    let rig = Rig::new("request-dump-expiry", Duration::from_secs(600)).await;
+    let root = rig.root.join(crate::store_request_dump::DUMP_FOLDER);
+    let empty_session = root.join("empty-session");
+    let mixed_session = root.join("mixed-session");
+    let old_run = empty_session.join("old-run");
+    let mixed_old = mixed_session.join("old-run");
+    let fresh_run = mixed_session.join("fresh-run");
+    for run in [&old_run, &mixed_old, &fresh_run] {
+        std::fs::create_dir_all(run).unwrap();
+        std::fs::write(run.join("s1.json"), b"body").unwrap();
+    }
+    let old_file = root.join("old.json");
+    let fresh_file = root.join("fresh.json");
+    std::fs::write(&old_file, b"old").unwrap();
+    std::fs::write(&fresh_file, b"fresh").unwrap();
+    #[cfg(unix)]
+    {
+        let outside = rig.root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked-session")).unwrap();
+        std::os::unix::fs::symlink(&outside, mixed_session.join("linked-run")).unwrap();
+        std::os::unix::fs::symlink(&outside, old_run.join("linked-outside")).unwrap();
+        std::os::unix::fs::symlink(outside.join("keep"), root.join("linked-file")).unwrap();
+    }
+    let old = std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+    for path in [&old_run, &mixed_old] {
+        crate::store_request_dump::set_directory_modified(path, old).unwrap();
+    }
+    std::fs::File::open(&old_file)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    rig.registry.sweep_once(0).await.unwrap();
+    assert!(!old_run.exists());
+    assert!(!empty_session.exists());
+    assert!(!mixed_old.exists());
+    assert!(mixed_session.exists());
+    assert!(fresh_run.join("s1.json").exists());
+    assert!(!old_file.exists());
+    assert!(fresh_file.exists());
+    #[cfg(unix)]
+    {
+        assert!(rig.root.join("outside/keep").exists());
+        assert!(root.join("linked-file").is_symlink());
+        assert!(root.join("linked-session").is_symlink());
+        assert!(mixed_session.join("linked-run").is_symlink());
+    }
+}
+
 /// The first pass is full, then one in every `FULL_PASS_EVERY`, and a pass the clock's change
 /// started is full and counts as the latest.
 #[test]

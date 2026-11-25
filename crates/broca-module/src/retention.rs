@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use broca_core::{Clock, LeaseHandle, LeaseStore};
@@ -167,6 +167,7 @@ pub trait WithdrawBeforeDelete: Send + Sync {
 }
 
 pub struct RetentionService {
+    pub(crate) state_root: PathBuf,
     /// Addresses of sessions whose records couldn't be read to decide their expiry.
     unreadable: Mutex<HashSet<String>>,
     pub clock: Clock,
@@ -182,6 +183,7 @@ impl RetentionService {
     /// sessions under leases from `leases`.
     pub fn new<L: LeaseStore + 'static>(state_root: &Path, leases: Arc<L>) -> io::Result<Self> {
         Ok(Self {
+            state_root: state_root.to_owned(),
             unreadable: Mutex::default(),
             clock: Clock::for_state_root(state_root)?,
             evict: std::sync::OnceLock::new(),
@@ -222,7 +224,10 @@ impl RetentionService {
     }
 }
 
+#[path = "retention_dumps.rs"]
+mod dumps;
 #[path = "retention_policy.rs"]
 pub mod policy;
 #[path = "retention_store.rs"]
 pub mod store;
+pub(crate) use dumps::sweep_request_dumps;

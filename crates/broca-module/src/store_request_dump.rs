@@ -12,7 +12,7 @@
 //! The read runs over a read-only view of the session as stored (`StoreRuntime::durable_view`),
 //! taking no lease; an open actor only makes its records durable first. The bodies go to
 //! `request-dumps/<session address>/<run id>/` under the state root, in folders and files only
-//! the owner can read.
+//! the owner can read. Dumps are deleted a day after they are written.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,8 @@ use crate::store_open::StoreRuntime;
 
 /// The folder under the state root that holds every dump.
 pub const DUMP_FOLDER: &str = "request-dumps";
+/// Plaintext dumps can be rebuilt, so retain them for only a day.
+pub const DUMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Rebuild and write the requests of run `run_id` of the session `key`. `Ok(None)` when the new
 /// storage doesn't keep the session.
@@ -223,5 +225,49 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
         .truncate(true)
         .open(path)?;
     file.write_all(body)?;
-    file.sync_all()
+    file.sync_all()?;
+    // Rewriting an existing file does not update its parent directory's modification time.
+    set_directory_modified(
+        path.parent().expect("dump file has a parent"),
+        std::time::SystemTime::now(),
+    )
+}
+
+pub(crate) fn set_directory_modified(
+    path: &Path,
+    time: std::time::SystemTime,
+) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // Windows requires backup semantics to open a directory and write-attributes access to
+        // update its timestamp, even when the directory itself is not opened for writing.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        options
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options.open(path)?.set_modified(time)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewriting_a_dump_refreshes_its_run_directory() {
+        let root =
+            broca_test_support::scratch_root().join(format!("dump-rewrite-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("s1.json");
+        write_private(&file, b"first").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 60 * 60);
+        set_directory_modified(&root, old).unwrap();
+        write_private(&file, b"second").unwrap();
+        assert!(std::fs::metadata(&root).unwrap().modified().unwrap() > old);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
