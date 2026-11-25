@@ -30,6 +30,7 @@ pub mod held_withdrawals;
 pub mod history;
 pub mod late_results_puller;
 pub mod late_results_store;
+pub mod lease_sweep;
 pub mod memory_report;
 pub mod opener;
 pub mod output_refs;

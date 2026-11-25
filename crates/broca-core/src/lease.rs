@@ -58,6 +58,15 @@ pub struct SessionLeaseStore {
     state_root: PathBuf,
 }
 
+impl SessionLeaseStore {
+    /// Removes the lease file `name` in the leases folder if no one holds it, as a lease's own
+    /// removal does: under the file's lock, after checking the file is still the one on disk.
+    /// Answers whether it removed it. Only for a file whose session is known to be gone.
+    pub fn remove_if_free(&self, name: &str) -> std::io::Result<bool> {
+        self.files.remove_if_free(std::ffi::OsStr::new(name))
+    }
+}
+
 impl LeaseStore for SessionLeaseStore {
     fn acquire(&self, key: &LeaseKey) -> Result<Box<dyn LeaseHandle>, LeaseError> {
         let held = self.files.acquire(key)?;

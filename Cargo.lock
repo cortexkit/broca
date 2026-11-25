@@ -1107,9 +1107,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-lease"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6bd0f48720cdf58eac7ad5ac253ab4db8d93891b0d49ecd639c1f34db14c1d7"
+checksum = "8214f0a773b860cf07b233d779fa4adbe920c5f46d9faebe95b8bb8c29da6f5d"
 dependencies = [
  "fs2",
  "libc",

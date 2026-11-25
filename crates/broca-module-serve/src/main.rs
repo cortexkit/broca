@@ -36,6 +36,9 @@ const EMBEDDED_ENGRAM_CATALOG: &[u8] = include_bytes!("../../../engram-catalog.j
 /// opens. When a bind is that slow the caller may time out first, but the route that opens is
 /// cached, so the caller's next attempt finds it ready rather than binding again.
 const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long after a start the one-time lease file sweep waits, so boot recovery and the first
+/// sends read the session store before it lists every session's head.
+const LEASE_SWEEP_DELAY: Duration = Duration::from_secs(300);
 
 /// Whether System One serves OpenAI's Decisions model (`openai/gpt-6-luna-decisions`). Off
 /// until a live request has confirmed OpenAI's answer shapes: the adapter is tested only
@@ -1044,6 +1047,43 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(Some(released)) = released {
                     tracing::info!(target: "lifecycle", "returned freed heap pages: {released:?}");
                 }
+            }
+        })
+    };
+    // Once per state root, a pass removes the lease files of sessions that no longer exist,
+    // left from before broca removed a session's lease file as it let go of the lease (see
+    // `broca_module::lease_sweep`). It waits until a start's own recovery has had its turn, then
+    // runs off the runtime's threads, and stops where it is when the module stops.
+    let _lease_sweep = {
+        let stopping = registry.stopping_signal();
+        let state_root = state_root.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = stopping.cancelled() => return,
+                _ = tokio::time::sleep(LEASE_SWEEP_DELAY) => {}
+            }
+            let leases = broca_core::session_leases(&state_root);
+            let began = std::time::SystemTime::now();
+            let stop = stopping.clone();
+            let swept = tokio::task::spawn_blocking(move || {
+                broca_module::lease_sweep::sweep_once(
+                    &state_root,
+                    began,
+                    |name| leases.remove_if_free(name),
+                    || stop.is_cancelled(),
+                )
+            })
+            .await;
+            match swept {
+                Ok(Ok(Some(swept))) => tracing::info!(target: "lifecycle",
+                    kept = swept.kept, removed = swept.removed, skipped = swept.skipped,
+                    "removed the lease files of sessions that are gone"),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => tracing::warn!(target: "lifecycle",
+                    "the lease file sweep stopped and runs again at the next start: {error}"),
+                Err(error) => tracing::warn!(target: "lifecycle",
+                    "the lease file sweep ended without an answer: {error}"),
             }
         })
     };
