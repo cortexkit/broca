@@ -64,7 +64,7 @@ pub const COMPLETE_DESCRIPTION: &str =
 pub const STORE_ROLE: &str = "llm.complete";
 
 /// The routing consumer every caller's name hangs under.
-const CONSUMER_ROOT: &str = "broca.complete";
+pub(crate) const CONSUMER_ROOT: &str = "broca.complete";
 
 /// The harness of a completion's session. The session name carries the call's key.
 const SESSION_HARNESS: &str = "broca";

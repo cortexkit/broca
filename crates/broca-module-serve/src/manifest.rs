@@ -9,7 +9,8 @@ use crate::catalog_refresh::CATALOG_POLL_INTERVAL;
 use crate::consumer_routes::ConsumerRoutes;
 use broca_catalog::live::WireFamilyId;
 use cortexkit_role_routing::declarations::{
-    ConsumerDeclarations, HarnessLimits, RunnerDeclaration, RunnerPair,
+    ConsumerDeclaration, ConsumerDeclarations, DemandDefaults, HarnessLimits, RunnerDeclaration,
+    RunnerPair,
 };
 use cortexkit_role_routing::placement::HarnessCapability;
 use std::collections::BTreeMap;
@@ -581,9 +582,14 @@ fn routing_declarations() -> ConsumerDeclarations {
         .typed_harness_limits()
         .expect("broca declares harness limits")
         .expect("broca's harness facts are valid producer data");
-    let declarations = ConsumerDeclarations::new().with_runner(runner);
+    let declarations = ConsumerDeclarations::new()
+        .with_consumers(vec![ConsumerDeclaration::new(
+            crate::llm_tools::complete::CONSUMER_ROOT,
+        )
+        .with_defaults(DemandDefaults::default().with_workload("quick"))])
+        .with_runner(runner);
     declarations
-        .validate()
+        .validate_serving(&[cortexkit_role_routing::capabilities::SELECT_WORKLOAD])
         .expect("broca's routing declaration is valid");
     declarations
 }
@@ -863,7 +869,7 @@ fn provider_declarations() -> subc_protocol::provider_declarations::ProviderDecl
 #[cfg(test)]
 mod routing_tests {
     use super::*;
-    use cortexkit_role_routing::declarations::parse_consumer_declarations;
+    use cortexkit_role_routing::declarations::parse_consumer_declarations_serving;
     use std::collections::BTreeSet;
 
     #[test]
@@ -933,8 +939,7 @@ mod routing_tests {
         let manifest = serde_json::to_value(manifest("broca")).unwrap();
         let slot = &manifest["role_declarations"][cortexkit_role_routing::ROLE_DECLARATIONS_KEY];
         assert_eq!(*slot, serialized_routing_slot());
-        // A sample file of the runner declaration, for the routing module to check its
-        // reader against, written only when asked.
+        // Samples for routing to check its reader against, written only when asked.
         if let Some(dir) = std::env::var_os("BROCA_ROUTING_SLOT_SAMPLE_DIR") {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
@@ -942,9 +947,23 @@ mod routing_tests {
                 serde_json::to_vec(&slot["runner"]).unwrap(),
             )
             .unwrap();
+            std::fs::write(
+                std::path::Path::new(&dir).join("routing-slot.json"),
+                serde_json::to_vec(slot).unwrap(),
+            )
+            .unwrap();
         }
-        let parsed = parse_consumer_declarations(slot).expect("the entire routing slot validates");
-        assert!(parsed.consumers.is_empty());
+        let parsed = parse_consumer_declarations_serving(
+            slot,
+            &[cortexkit_role_routing::capabilities::SELECT_WORKLOAD],
+        )
+        .expect("the entire routing slot validates");
+        assert_eq!(parsed.consumers.len(), 1);
+        assert_eq!(parsed.consumers[0].name, "broca.complete");
+        assert_eq!(
+            parsed.consumers[0].defaults.workload.as_deref(),
+            Some("quick")
+        );
         let runner = parsed.runner.as_ref().expect("broca declares its runner");
         assert!(runner.follows_account_choice);
         assert!(!runner.requires_wire_api());
@@ -995,7 +1014,7 @@ mod routing_tests {
     #[test]
     fn routing_slot_declares_the_broca_harnesses_and_only_supported_capabilities() {
         let expected = concat!(
-            r#"{"runner":{"follows_account_choice":true,"harness_limits":{"#,
+            r#"{"consumers":[{"name":"broca.complete","workload":"quick"}],"runner":{"follows_account_choice":true,"harness_limits":{"#,
             r#""broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans","output_cap"],"pairs":[{"auth_method":"apikey","wire_api":"anthropic.messages"},{"auth_method":"gateway","wire_api":"anthropic.messages"},{"auth_method":"oauth","wire_api":"anthropic.messages"},{"auth_method":"apikey","wire_api":"aws.bedrock_converse"},{"auth_method":"oauth","wire_api":"aws.bedrock_converse"},{"auth_method":"antigravity","wire_api":"google.code_assist"},{"auth_method":"apikey","wire_api":"google.generate_content"},{"auth_method":"oauth","wire_api":"google.generate_content"},{"auth_method":"apikey","wire_api":"openai.chat_completions"},{"auth_method":"oauth","wire_api":"openai.chat_completions"},{"auth_method":"apikey","wire_api":"openai.responses"},{"auth_method":"oauth","wire_api":"openai.responses"}]},"#,
             r#""broca-uncapped":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"],"pairs":[{"auth_method":"chatgpt","wire_api":"openai.chatgpt_responses"}]}},"#,
             r#""harnesses":["broca","broca-uncapped"],"pairs":["#,
@@ -1018,9 +1037,13 @@ mod routing_tests {
             String::from_utf8(serde_json::to_vec(&slot).unwrap()).unwrap(),
             expected
         );
-        let parsed = parse_consumer_declarations(&slot).expect("the entire routing slot validates");
+        let parsed = parse_consumer_declarations_serving(
+            &slot,
+            &[cortexkit_role_routing::capabilities::SELECT_WORKLOAD],
+        )
+        .expect("the entire routing slot validates");
         parsed
-            .validate()
+            .validate_serving(&[cortexkit_role_routing::capabilities::SELECT_WORKLOAD])
             .expect("the producer declaration validates");
         let limits = parsed
             .runner
