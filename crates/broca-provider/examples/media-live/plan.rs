@@ -33,12 +33,17 @@ pub struct Args {
     pub subc: Option<PathBuf>,
     pub error_detail: Option<PathBuf>,
     pub timeout_secs: u64,
+    /// Requests per wire family (the plan has one route per family), 1 to `MAX_REQUESTS`: the
+    /// person-media request, the tool-media request, then the repeat that reads the first two
+    /// from the cache. An approved count smaller than three runs the first stages only.
+    pub stages: usize,
 }
 
 impl Args {
     pub fn parse(args: impl Iterator<Item = String>) -> Result<Self, &'static str> {
         let mut result = Self {
             timeout_secs: 180,
+            stages: MAX_REQUESTS,
             ..Self::default()
         };
         let mut dry = false;
@@ -50,11 +55,15 @@ impl Args {
                 "--plan" => result.plan = Some(args.next().ok_or("plan_path_required")?.into()),
                 "--subc" => result.subc = Some(args.next().ok_or("subc_path_required")?.into()),
                 "--error-detail" => result.error_detail = Some(args.next().ok_or("error_detail_path_required")?.into()),
+                "--requests-per-family" => {
+                    result.stages = args.next().ok_or("requests_per_family_required")?.parse().map_err(|_| "invalid_requests_per_family")?;
+                    if !(1..=MAX_REQUESTS).contains(&result.stages) { return Err("requests_per_family_out_of_range"); }
+                }
                 "--timeout-secs" => {
                     result.timeout_secs = args.next().ok_or("timeout_required")?.parse().map_err(|_| "invalid_timeout")?;
                     if !(1..=600).contains(&result.timeout_secs) { return Err("timeout_out_of_range"); }
                 }
-                _ => return Err("usage: media-live-check [--dry-run | --live --plan FILE] [--subc FILE] [--error-detail FILE] [--timeout-secs 1..600]"),
+                _ => return Err("usage: media-live-check [--dry-run | --live --plan FILE] [--subc FILE] [--error-detail FILE] [--timeout-secs 1..600] [--requests-per-family 1..3]"),
             }
         }
         if dry && result.live {

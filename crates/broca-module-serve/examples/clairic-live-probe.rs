@@ -1,19 +1,21 @@
-//! Probe Cloudflare Workers AI's Clairic extraction model to settle the open points of the
-//! `extractor/v1` role draft before that contract is published.
+//! Probe Cloudflare Workers AI's Clairic extraction model to settle open points in the
+//! `extractor/v1` role contract.
 //!
-//! WHAT IT SENDS. A fixed plan of at most twelve requests to
+//! WHAT IT SENDS. One fixed plan per run, to
 //! `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/cloudflare/clairic`.
-//! Each one answers one open question: every answer shape (all nine field types, quantiles on),
+//! The default plan sends twelve requests: every answer shape (all nine field types, quantiles on),
 //! span offsets over non-ASCII text, `decimals` on a number list, a date estimate, a request
 //! split across several 8,192-token passes with its one-pass control and its reversed field
 //! order, an unknown field type, an unknown option key, a 20,000-character `instructions`, an
-//! empty state, and the one-pass control again with one small embedded PNG. The twelve-request
-//! cap is counted and enforced: the sender refuses a thirteenth request. Nothing is retried; a
-//! failed request is recorded with whatever came back.
+//! empty state, and the one-pass control again with one small embedded PNG.
+//! `--plan open-readings` sends eight follow-up requests covering a year step and date forecast
+//! bounds, image cost across passes and at larger sizes, image spelling and count, and
+//! 60,000-character instructions. The sender enforces the selected plan's cap (twelve or eight).
+//! Nothing is retried; a failed request is recorded with whatever came back.
 //!
 //! RUN.
 //!   cargo run -p broca-module-serve --example clairic-live-probe -- --dry-run --out DIR
-//!   cargo run -p broca-module-serve --example clairic-live-probe -- --live --out DIR
+//!   cargo run -p broca-module-serve --example clairic-live-probe -- --live --plan open-readings --out DIR
 //! `--dry-run` (the default) checks that the dev-tools handle file names the credential, builds
 //! and writes every request body, prints each one's size and the body (a preview for bodies over
 //! 1,500 bytes, whose full text is in the written file), and sends nothing. It never contacts the
@@ -41,9 +43,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use broca_module_serve::vault_config::load_devtools_handle;
 use broca_module_serve::CredentialId;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -51,19 +54,36 @@ use sha2::{Digest, Sha256};
 
 const CREDENTIAL_ID: &str = "apikey:cloudflare-workers-ai";
 const MODEL: &str = "@cf/cloudflare/clairic";
-/// The most requests one run may send, retries included (there are none).
+/// The original plan's request cap.
 const MAX_REQUESTS: usize = 12;
+const OPEN_READINGS_MAX_REQUESTS: usize = 8;
 /// Clairic's documented per-pass token budget for the state plus the field definitions.
 const PASS_TOKENS: usize = 8192;
 /// The size of the embedded test image, in pixels per side.
 const PNG_SIDE: u32 = 64;
 /// The length, in characters, of the long `instructions` probe.
 const LONG_INSTRUCTIONS_CHARS: usize = 20_000;
+const OPEN_READINGS_INSTRUCTIONS_CHARS: usize = 60_000;
 /// Present in an output directory once a live run has started sending from it.
 const LIVE_MARKER: &str = "live-run.started";
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ProbePlan {
+    Original,
+    OpenReadings,
+}
+
+impl ProbePlan {
+    fn cap(self) -> usize {
+        match self {
+            Self::Original => MAX_REQUESTS,
+            Self::OpenReadings => OPEN_READINGS_MAX_REQUESTS,
+        }
+    }
+}
+
 #[derive(Parser)]
-#[command(about = "Probe Clairic with a fixed plan of at most twelve requests")]
+#[command(about = "Probe Clairic with a fixed request plan")]
 struct Args {
     /// Build, write and print every request body; send nothing (the default).
     #[arg(long, conflicts_with = "live")]
@@ -71,6 +91,9 @@ struct Args {
     /// Fetch the credential and send the plan.
     #[arg(long)]
     live: bool,
+    /// The original twelve probes or the eight contract follow-ups.
+    #[arg(long, value_enum, default_value = "original")]
+    plan: ProbePlan,
     /// Directory for the request bodies, captured replies and summary. Created if missing.
     #[arg(long)]
     out: PathBuf,
@@ -220,6 +243,30 @@ struct Probe {
 }
 
 impl Probe {
+    fn new(
+        number: usize,
+        name: &'static str,
+        question: &'static str,
+        state: &str,
+        fields: J,
+        options: Option<J>,
+    ) -> Self {
+        Self {
+            number,
+            name,
+            question,
+            state: state.to_string(),
+            fields: fields.text(),
+            body: body_text(state, &fields, options),
+        }
+    }
+
+    fn with_images(mut self, images: Vec<J>) -> Self {
+        self.body.pop(); // Replace the closing brace with the final `images` member.
+        let _ = write!(self.body, ",\"images\":{}}}", J::Arr(images).text());
+        self
+    }
+
     fn file_stem(&self) -> String {
         format!("{:02}-{}", self.number, self.name)
     }
@@ -247,6 +294,43 @@ shaft seal, bearing housing. Measured flow after the repair: 412.5 litres per mi
 water throughput in thousand cubic metres: Oct 2025 118, Nov 2025 121, Dec 2025 125, \
 Jan 2026 129, Feb 2026 132. The previous two shaft seals lasted 14 and 18 months before they \
 needed replacing.";
+
+const DATE_ESTIMATE_STATE: &str =
+    "The kitchen renovation began on 2026-02-02. Demolition and plumbing were expected to \
+take about six weeks. The cabinets were ordered on 2026-03-01, and the supplier says \
+cabinets usually arrive about two months after ordering; fitting takes two more weeks.";
+const DATE_MIN: &str = "2026-03-01";
+const DATE_MAX: &str = "2027-03-01";
+const FORECAST_HORIZON: usize = 3;
+const FORECAST_INTERVAL: &str = "month";
+
+fn completion_date_fields(field_type: &str, options: Vec<(&str, J)>) -> J {
+    let mut members = vec![
+        ("type", s(field_type)),
+        ("min", s(DATE_MIN)),
+        ("max", s(DATE_MAX)),
+    ];
+    members.extend(options);
+    members.push((
+        "instructions",
+        s("Date the kitchen renovation will be finished"),
+    ));
+    o(vec![("completion_date", o(members))])
+}
+
+fn contact_field(chars: usize) -> J {
+    o(vec![(
+        "contact_name",
+        o(vec![
+            ("type", s("text")),
+            ("instructions", s(long_instructions(chars))),
+        ]),
+    )])
+}
+
+fn include_quantiles() -> J {
+    o(vec![("include_quantiles", J::Bool(true))])
+}
 
 const SPAN_TARGET: &str = "QK-58213";
 
@@ -319,6 +403,10 @@ fn long_instructions(chars: usize) -> String {
 
 /// A `PNG_SIDE` x `PNG_SIDE` RGB gradient, encoded in code so the probe needs no image file.
 fn test_png() -> Vec<u8> {
+    rgb_png(PNG_SIDE, |x, y| [(x * 4) as u8, (y * 4) as u8, 128])
+}
+
+fn rgb_png(side: u32, pixel: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write as _;
@@ -333,12 +421,11 @@ fn test_png() -> Vec<u8> {
         out.extend_from_slice(&crc.sum().to_be_bytes());
     }
 
-    let side = PNG_SIDE;
     let mut raw = Vec::with_capacity(((side * 3 + 1) * side) as usize);
     for y in 0..side {
         raw.push(0); // filter type: none
         for x in 0..side {
-            raw.extend_from_slice(&[(x * 4) as u8, (y * 4) as u8, 128]);
+            raw.extend_from_slice(&pixel(x, y));
         }
     }
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -356,6 +443,16 @@ fn test_png() -> Vec<u8> {
     chunk(&mut png, b"IDAT", &compressed);
     chunk(&mut png, b"IEND", &[]);
     png
+}
+
+fn png_object(png: &[u8]) -> J {
+    o(vec![
+        ("content_type", s("image/png")),
+        (
+            "base64",
+            s(base64::engine::general_purpose::STANDARD.encode(png)),
+        ),
+    ])
 }
 
 fn body_text(state: &str, fields: &J, options: Option<J>) -> String {
@@ -380,15 +477,14 @@ impl J {
 fn plan() -> (Vec<Probe>, Fixture) {
     let mut probes = Vec::new();
     let mut add = |name, question, state: &str, fields: J, options: Option<J>| {
-        let number = probes.len() + 1;
-        probes.push(Probe {
-            number,
+        probes.push(Probe::new(
+            probes.len() + 1,
             name,
             question,
-            state: state.to_string(),
-            fields: fields.text(),
-            body: body_text(state, &fields, options),
-        });
+            state,
+            fields,
+            options,
+        ));
     };
     let both_options = || {
         Some(o(vec![
@@ -475,8 +571,8 @@ fn plan() -> (Vec<Probe>, Fixture) {
                     ("type", s("forecast")),
                     ("min", n(50)),
                     ("max", n(300)),
-                    ("horizon", n(3)),
-                    ("interval", s("month")),
+                    ("horizon", n(FORECAST_HORIZON)),
+                    ("interval", s(FORECAST_INTERVAL)),
                     (
                         "instructions",
                         s("Monthly water throughput in thousand cubic metres for the months after Feb 2026"),
@@ -527,23 +623,9 @@ fn plan() -> (Vec<Probe>, Fixture) {
     add(
         "date-estimate",
         "whether an estimate with ISO-date min/max and step: month exists, and its answer shape",
-        "The kitchen renovation began on 2026-02-02. Demolition and plumbing were expected to \
-         take about six weeks. The cabinets were ordered on 2026-03-01, and the supplier says \
-         cabinets usually arrive about two months after ordering; fitting takes two more weeks.",
-        o(vec![(
-            "completion_date",
-            o(vec![
-                ("type", s("estimate")),
-                ("min", s("2026-03-01")),
-                ("max", s("2027-03-01")),
-                ("step", s("month")),
-                (
-                    "instructions",
-                    s("Date the kitchen renovation will be finished"),
-                ),
-            ]),
-        )]),
-        Some(o(vec![("include_quantiles", J::Bool(true))])),
+        DATE_ESTIMATE_STATE,
+        completion_date_fields("estimate", vec![("step", s("month"))]),
+        Some(include_quantiles()),
     );
 
     // 5-7. Passes: many long fields, the one-field control, and the same fields reversed.
@@ -556,7 +638,6 @@ fn plan() -> (Vec<Probe>, Fixture) {
         J::Obj(clauses),
         None,
     );
-    let control_fields = J::Obj(vec![clause_field(1)]);
     add(
         "one-pass-control",
         "the one-pass usage baseline for the multi-pass and image probes",
@@ -611,16 +692,7 @@ fn plan() -> (Vec<Probe>, Fixture) {
         "long-instructions",
         "the provider's bound on instructions, and the usage of a long one",
         SHORT_STATE,
-        o(vec![(
-            "contact_name",
-            o(vec![
-                ("type", s("text")),
-                (
-                    "instructions",
-                    s(long_instructions(LONG_INSTRUCTIONS_CHARS)),
-                ),
-            ]),
-        )]),
+        contact_field(LONG_INSTRUCTIONS_CHARS),
         None,
     );
 
@@ -643,28 +715,17 @@ fn plan() -> (Vec<Probe>, Fixture) {
     // 12. The one-pass control's exact body plus one embedded PNG, appended last, so the only
     // difference from request 6 is the image.
     let png = test_png();
-    let control = &probes[5];
-    let mut body = control.body.clone();
-    body.pop(); // the closing brace
-    {
-        use base64::Engine as _;
-        let image = o(vec![
-            ("content_type", s("image/png")),
-            (
-                "base64",
-                s(base64::engine::general_purpose::STANDARD.encode(&png)),
-            ),
-        ]);
-        let _ = write!(body, ",\"images\":{}}}", J::Arr(vec![image]).text());
-    }
-    probes.push(Probe {
-        number: 12,
-        name: "one-image",
-        question: "the input tokens billed for one embedded image",
-        state: SHORT_STATE.to_string(),
-        fields: control_fields.text(),
-        body,
-    });
+    probes.push(
+        Probe::new(
+            12,
+            "one-image",
+            "the input tokens billed for one embedded image",
+            SHORT_STATE,
+            J::Obj(vec![clause_field(1)]),
+            None,
+        )
+        .with_images(vec![png_object(&png)]),
+    );
 
     (
         probes,
@@ -676,22 +737,119 @@ fn plan() -> (Vec<Probe>, Fixture) {
     )
 }
 
+fn open_readings_plan() -> Vec<Probe> {
+    let png = test_png();
+    let control_with_images = |number, name, question, images| {
+        Probe::new(
+            number,
+            name,
+            question,
+            SHORT_STATE,
+            J::Obj(vec![clause_field(1)]),
+            None,
+        )
+        .with_images(images)
+    };
+    vec![
+        Probe::new(
+            1,
+            "date-year-step",
+            "whether a date estimate accepts step: year",
+            DATE_ESTIMATE_STATE,
+            completion_date_fields("estimate", vec![("step", s("year"))]),
+            Some(include_quantiles()),
+        ),
+        Probe::new(
+            2,
+            "forecast-date-bounds",
+            "whether a forecast accepts ISO-date min/max bounds and returns dates within them",
+            DATE_ESTIMATE_STATE,
+            completion_date_fields(
+                "forecast",
+                vec![
+                    ("horizon", n(FORECAST_HORIZON)),
+                    ("interval", s(FORECAST_INTERVAL)),
+                ],
+            ),
+            Some(include_quantiles()),
+        ),
+        Probe::new(
+            3,
+            "multi-pass-image",
+            "whether an image bills once or on every pass",
+            SHORT_STATE,
+            J::Obj((1..=CLAUSES).map(clause_field).collect()),
+            None,
+        )
+        .with_images(vec![png_object(&png)]),
+        control_with_images(
+            4,
+            "image-512",
+            "the token cost of one 512x512 PNG",
+            vec![png_object(&rgb_png(512, |_, _| [0; 3]))],
+        ),
+        control_with_images(
+            5,
+            "image-1024",
+            "the token cost of one 1024x1024 PNG",
+            vec![png_object(&rgb_png(1024, |_, _| [0; 3]))],
+        ),
+        control_with_images(
+            6,
+            "image-data-url",
+            "whether a data URL is accepted in place of the image object",
+            vec![s(format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&png)
+            ))],
+        ),
+        control_with_images(
+            7,
+            "two-images",
+            "whether one item can carry two images and what they cost",
+            vec![
+                png_object(&png),
+                png_object(&rgb_png(PNG_SIDE, |_, _| [160, 96, 128])),
+            ],
+        ),
+        Probe::new(
+            8,
+            "long-instructions-60k",
+            "whether the provider accepts 60,000 characters of instructions",
+            SHORT_STATE,
+            contact_field(OPEN_READINGS_INSTRUCTIONS_CHARS),
+            None,
+        ),
+    ]
+}
+
 // ---------------------------------------------------------------------------------------------
 // Sending.
 
-/// Counts requests and refuses any beyond `MAX_REQUESTS`.
-#[derive(Default)]
+/// Counts requests and refuses any beyond the selected plan's cap.
 struct Budget {
+    cap: usize,
     sent: usize,
 }
 
+impl Default for Budget {
+    fn default() -> Self {
+        Self::new(MAX_REQUESTS)
+    }
+}
+
 impl Budget {
-    /// Claim one request. Errors, sending nothing, once `MAX_REQUESTS` have been claimed.
+    fn new(cap: usize) -> Self {
+        Self { cap, sent: 0 }
+    }
+
+    /// Claim one request. Errors, sending nothing, once the cap has been reached.
     fn take(&mut self) -> Result<usize, String> {
-        if self.sent >= MAX_REQUESTS {
+        if self.sent >= self.cap {
             return Err(format!(
-                "refusing request {}: a run sends at most {MAX_REQUESTS} requests",
-                self.sent + 1
+                "refusing request {}: a run sends at most {} requests",
+                self.sent + 1,
+                self.cap
             ));
         }
         self.sent += 1;
@@ -925,9 +1083,9 @@ fn preview(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
-fn print_plan(probes: &[Probe], fixture: &Fixture) {
+fn print_plan(probes: &[Probe], fixture: Option<&Fixture>, cap: usize) {
     println!(
-        "{} requests planned (cap {MAX_REQUESTS}); model {MODEL}",
+        "{} requests planned (cap {cap}); model {MODEL}",
         probes.len()
     );
     for probe in probes {
@@ -942,14 +1100,17 @@ fn print_plan(probes: &[Probe], fixture: &Fixture) {
             sha256_hex(probe.body.as_bytes())
         );
         println!("     answers: {}", probe.question);
-        if probe.name == "multi-pass" || probe.name == "multi-pass-reversed" {
+        if matches!(
+            probe.name,
+            "multi-pass" | "multi-pass-reversed" | "multi-pass-image"
+        ) {
             println!(
                 "     rough size check: fields {} bytes / 4 = about {} tokens, against a {PASS_TOKENS}-token pass",
                 probe.fields.len(),
                 probe.fields.len() / 4
             );
         }
-        if probe.name == "one-image" {
+        if let Some(fixture) = fixture.filter(|_| probe.name == "one-image") {
             println!(
                 "     image: one {PNG_SIDE}x{PNG_SIDE} RGB PNG, {} bytes; the body is request 6's body plus `images`",
                 fixture.png.len()
@@ -990,10 +1151,17 @@ fn utc_now() -> String {
 }
 
 async fn run(args: Args) -> Result<(), String> {
-    let (probes, fixture) = plan();
-    if probes.len() > MAX_REQUESTS {
+    let (probes, fixture) = match args.plan {
+        ProbePlan::Original => {
+            let (probes, fixture) = plan();
+            (probes, Some(fixture))
+        }
+        ProbePlan::OpenReadings => (open_readings_plan(), None),
+    };
+    let cap = args.plan.cap();
+    if probes.len() > cap {
         return Err(format!(
-            "the plan has {} requests; the cap is {MAX_REQUESTS}",
+            "the plan has {} requests; the cap is {cap}",
             probes.len()
         ));
     }
@@ -1010,7 +1178,7 @@ async fn run(args: Args) -> Result<(), String> {
         drop(handle);
         let mut scrub = Scrub::new(None);
         write_requests(&args.out, &probes, &mut scrub)?;
-        print_plan(&probes, &fixture);
+        print_plan(&probes, fixture.as_ref(), cap);
         println!();
         println!(
             "dry run: 0 requests sent, vault not contacted; request bodies written to {}",
@@ -1055,7 +1223,7 @@ async fn run(args: Args) -> Result<(), String> {
     let url = format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{MODEL}");
     let client = broca_provider::build_provider_http_client();
     let timeout = Duration::from_secs(args.request_timeout_secs);
-    let mut budget = Budget::default();
+    let mut budget = Budget::new(cap);
     let mut captures = Vec::with_capacity(probes.len());
     for probe in &probes {
         let count = budget.take()?;
@@ -1075,7 +1243,7 @@ async fn run(args: Args) -> Result<(), String> {
             (None, None) => "no reply".into(),
         };
         println!(
-            "[{count:02}/{MAX_REQUESTS}] {}: {outcome}, {} reply bytes, {} ms -> {stem}.json",
+            "[{count:02}/{cap}] {}: {outcome}, {} reply bytes, {} ms -> {stem}.json",
             probe.name,
             capture.body.as_ref().map_or(0, Vec::len),
             capture.elapsed_ms
@@ -1083,7 +1251,10 @@ async fn run(args: Args) -> Result<(), String> {
         captures.push(capture);
     }
     let sent = budget.sent;
-    let mut summary = summarize(&probes, &captures, &fixture, sent, account_present);
+    let mut summary = match fixture {
+        Some(fixture) => summarize(&probes, &captures, &fixture, sent, account_present),
+        None => summarize_open_readings(&probes, &captures, sent, account_present),
+    };
     // Count the summary's own redactions too, then state the final total in it.
     summary = scrub.text(&summary);
     let _ = writeln!(
@@ -1982,9 +2153,372 @@ fn section_overhead(w: &mut String, replies: &[Reply]) {
     }
 }
 
+/// Report the status and raw evidence before drawing any conclusion from the reply.
+fn open_reading_answer(w: &mut String, reply: Option<&Reply>, field: &str) -> Option<Members> {
+    let Some(reply) = reply else {
+        let _ = writeln!(w, "Not answered: no reply was captured.");
+        return None;
+    };
+    let _ = writeln!(
+        w,
+        "{}; `success` {}; `errors` {}; `messages` {}.",
+        reply.status(),
+        reply.envelope_raw("success"),
+        reply.envelope_raw("errors"),
+        reply.envelope_raw("messages"),
+    );
+    let usage = USAGE_KEYS
+        .iter()
+        .map(|key| format!("`{key}` {}", fig(reply.usage_int(key))))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(w, "Usage: {usage}.");
+    if let Some(error) = &reply.capture.error {
+        let _ = writeln!(w, "Not answered: transport error: {error}.");
+        return None;
+    }
+    match reply.capture.status {
+        Some(400 | 413 | 422) => {
+            let _ = writeln!(
+                w,
+                "Request refused. The error above is the evidence for why."
+            );
+        }
+        Some(200..=299) if reply.envelope_raw("success") != "`false`" => {
+            if let Some(raw) = reply.answer_raw(field) {
+                let _ = writeln!(w, "Answer `{field}` as returned:");
+                code_block(w, &raw);
+                if let Some(answer) = Members::parse(&raw) {
+                    let _ = writeln!(w, "Request accepted.");
+                    return Some(answer);
+                }
+            }
+            let _ = writeln!(w, "Not answered: the reply has no `{field}` answer object.");
+        }
+        _ => {
+            let _ = writeln!(
+                w,
+                "Not answered: no successful result or request validation refusal."
+            );
+        }
+    }
+    if let Some(body) = &reply.capture.body {
+        code_block(w, &String::from_utf8_lossy(body));
+    }
+    None
+}
+
+fn report_forecast_bounds(w: &mut String, answer: &Members) {
+    let Some(steps) = answer.get("steps").and_then(raw_list) else {
+        let _ = writeln!(w, "Not answered: the forecast answer has no `steps` array.");
+        return;
+    };
+    let min = DATE_MIN
+        .parse::<chrono::NaiveDate>()
+        .expect("ISO date bound");
+    let max = DATE_MAX
+        .parse::<chrono::NaiveDate>()
+        .expect("ISO date bound");
+    let dates: Vec<_> = steps
+        .iter()
+        .filter_map(|step| {
+            let step = Members::parse(step.get())?;
+            let date: String = serde_json::from_str(step.get("value")?.get()).ok()?;
+            date.parse::<chrono::NaiveDate>().ok()
+        })
+        .collect();
+    let outside = dates
+        .iter()
+        .filter(|date| !(min..=max).contains(*date))
+        .count();
+    let _ = writeln!(
+        w,
+        "Returned {} steps (requested {FORECAST_HORIZON}); {} `value` members are dates, of which \
+         {outside} fall outside {DATE_MIN} through {DATE_MAX} (inclusive).",
+        steps.len(),
+        dates.len(),
+    );
+    if outside > 0 {
+        let _ = writeln!(w, "Not every forecast value falls inside the bounds.");
+    } else if steps.len() != FORECAST_HORIZON || dates.len() != steps.len() {
+        let _ = writeln!(w, "Not answered: the reply did not supply all {FORECAST_HORIZON} forecast values as dates.");
+    } else {
+        let _ = writeln!(
+            w,
+            "Every forecast value falls inside the bounds for this request."
+        );
+    }
+}
+
+// The original plan measured this for the same 64x64 PNG in its one-pass image probe.
+const ONE_PASS_64_IMAGE_TOKENS: i64 = 64;
+
+fn report_multi_pass_image(w: &mut String, reply: Option<&Reply>) {
+    if open_reading_answer(w, reply, "clause_01").is_none() {
+        let _ = writeln!(
+            w,
+            "Not answered: no successful multi-pass image reply to compare."
+        );
+        return;
+    }
+    let usage = |key| reply.and_then(|reply| reply.usage_int(key));
+    let (Some(passes), Some(image_tokens)) = (usage("passes"), usage("image_tokens")) else {
+        let _ = writeln!(w, "Not answered: `passes` or `image_tokens` is missing.");
+        return;
+    };
+    if passes <= 1 {
+        let _ = writeln!(
+            w,
+            "Not answered: the request did not split across multiple passes."
+        );
+        return;
+    }
+    let per_pass = passes.checked_mul(ONE_PASS_64_IMAGE_TOKENS);
+    let _ = writeln!(
+        w,
+        "One-pass reference: {ONE_PASS_64_IMAGE_TOKENS} `image_tokens` for this PNG. Across \
+         {passes} passes, counting it once predicts {ONE_PASS_64_IMAGE_TOKENS}; counting it on \
+         each pass predicts {}.",
+        fig(per_pass)
+    );
+    let verdict = if image_tokens == ONE_PASS_64_IMAGE_TOKENS {
+        "matches counting the image once"
+    } else if Some(image_tokens) == per_pass {
+        "matches counting the image on every pass"
+    } else {
+        "not answered: matches neither prediction"
+    };
+    let _ = writeln!(w, "Reported `image_tokens` {image_tokens}: {verdict}.");
+}
+
+fn report_image_usage(w: &mut String, reply: Option<&Reply>) -> Option<i64> {
+    if open_reading_answer(w, reply, "clause_01").is_none() {
+        let _ = writeln!(
+            w,
+            "Not answered: no successful result to measure image usage."
+        );
+        return None;
+    }
+    let reply = reply.expect("an answer needs a reply");
+    if ["schema_tokens", "input_tokens", "passes"]
+        .iter()
+        .any(|key| reply.usage_int(key).is_none())
+    {
+        let _ = writeln!(
+            w,
+            "Not answered: the reply lacks usage figures for the full input cost or pass count."
+        );
+    }
+    match reply.usage_int("image_tokens") {
+        Some(tokens) if tokens > 0 => Some(tokens),
+        _ => {
+            let _ = writeln!(
+                w,
+                "Not answered: no positive `image_tokens` count to show image processing."
+            );
+            None
+        }
+    }
+}
+
+fn summarize_open_readings(
+    probes: &[Probe],
+    captures: &[Capture],
+    sent: usize,
+    account_present: bool,
+) -> String {
+    let replies: Vec<_> = probes
+        .iter()
+        .zip(captures)
+        .map(|(probe, capture)| Reply::new(probe, capture))
+        .collect();
+    let by_name = |name| replies.iter().find(|reply| reply.probe.name == name);
+    let mut out = String::new();
+    let w = &mut out;
+    let _ = writeln!(
+        w,
+        "# Clairic live probe: open readings\n\nRun finished {}. Model `{MODEL}`. Requests sent: \
+         {sent} of an {OPEN_READINGS_MAX_REQUESTS}-request cap. No request was retried. Account id \
+         returned by the vault with the token: {account_present}.\n\nSee `NN-name.request.json` \
+         for the sent bodies and `NN-name.body` and `NN-name.json` for the captured replies.",
+        utc_now()
+    );
+
+    let _ = writeln!(
+        w,
+        "\n## 1. Date year step and forecast date bounds\n\n### 01 date-year-step\n"
+    );
+    let _ = open_reading_answer(w, by_name("date-year-step"), "completion_date");
+    let _ = writeln!(w, "\n### 02 forecast-date-bounds\n");
+    if let Some(answer) = open_reading_answer(w, by_name("forecast-date-bounds"), "completion_date")
+    {
+        report_forecast_bounds(w, &answer);
+    }
+
+    let _ = writeln!(
+        w,
+        "\n## 2. Image billing across passes (03 multi-pass-image)\n"
+    );
+    report_multi_pass_image(w, by_name("multi-pass-image"));
+
+    let _ = writeln!(
+        w,
+        "\n## 3. Larger images\n\nThe original plan's 64x64 PNG reported {ONE_PASS_64_IMAGE_TOKENS} \
+         `image_tokens` and added 41 `schema_tokens` versus its no-image control. The following \
+         usage blocks report the totals with larger PNGs on the same control body."
+    );
+    for (number, name) in [(4, "image-512"), (5, "image-1024")] {
+        let _ = writeln!(w, "\n### {number:02} {name}\n");
+        if let Some(tokens) = report_image_usage(w, by_name(name)) {
+            let _ = writeln!(w, "This PNG accounts for {tokens} reported `image_tokens`.");
+        }
+    }
+
+    let _ = writeln!(
+        w,
+        "\n## 4. Image spelling and count\n\nThe original plan accepted the object spelling with \
+         one 64x64 image.\n\n### 06 image-data-url\n"
+    );
+    if let Some(tokens) = report_image_usage(w, by_name("image-data-url")) {
+        let _ = writeln!(
+            w,
+            "The data URL spelling was accepted with {tokens} reported `image_tokens`."
+        );
+    }
+    let _ = writeln!(w, "\n### 07 two-images\n");
+    if let Some(tokens) = report_image_usage(w, by_name("two-images")) {
+        let _ =
+            writeln!(
+            w,
+            "An item with two image objects was accepted and reported {tokens} `image_tokens`. \
+             The one-image reference is {ONE_PASS_64_IMAGE_TOKENS}. The total {} counting \
+             both images at the single-image rate.",
+            if tokens == 2 * ONE_PASS_64_IMAGE_TOKENS { "matches" } else { "does not match" },
+        );
+    }
+    let _ = writeln!(
+        w,
+        "Not answered: the maximum image count was not probed above two."
+    );
+
+    let _ = writeln!(w, "\n## 5. Instruction length (08 long-instructions-60k)\n");
+    let answer = open_reading_answer(w, by_name("long-instructions-60k"), "contact_name");
+    let _ = writeln!(
+        w,
+        "The original plan accepted {LONG_INSTRUCTIONS_CHARS} characters."
+    );
+    if answer.is_some() {
+        let _ = writeln!(w, "The provider also accepted {OPEN_READINGS_INSTRUCTIONS_CHARS} characters. \
+            Not answered: this establishes a lower bound on the accepted length, not an exact maximum.");
+    } else {
+        let _ = writeln!(w, "Not answered: no accepted result at {OPEN_READINGS_INSTRUCTIONS_CHARS} \
+            characters. A refusal only indicates a limit on instruction length if the error identifies it.");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_readings_has_eight_requests_and_refuses_a_ninth() {
+        let args = Args::try_parse_from(["probe", "--plan", "open-readings", "--out", "out"])
+            .expect("valid arguments");
+        assert!(matches!(args.plan, ProbePlan::OpenReadings));
+        let probes = open_readings_plan();
+        let names = [
+            "date-year-step",
+            "forecast-date-bounds",
+            "multi-pass-image",
+            "image-512",
+            "image-1024",
+            "image-data-url",
+            "two-images",
+            "long-instructions-60k",
+        ];
+        assert_eq!(probes.len(), names.len());
+        let mut budget = Budget::new(args.plan.cap());
+        for (index, (probe, name)) in probes.iter().zip(names).enumerate() {
+            assert_eq!((probe.number, probe.name), (index + 1, name));
+            assert_eq!(budget.take(), Ok(index + 1));
+        }
+        assert_eq!(
+            budget.take(),
+            Err("refusing request 9: a run sends at most 8 requests".into())
+        );
+        assert_eq!(budget.sent, 8);
+    }
+
+    #[test]
+    fn open_readings_bodies_change_only_the_features_being_probed() {
+        fn json(probe: &Probe) -> serde_json::Value {
+            serde_json::from_str(&probe.body).expect("valid request JSON")
+        }
+        let (original, _) = plan();
+        let probes = open_readings_plan();
+        assert_eq!(
+            probes[0].body,
+            original[3]
+                .body
+                .replace(r#""step":"month""#, r#""step":"year""#)
+        );
+
+        let mut date_fields = json(&original[3]);
+        date_fields["fields"]["completion_date"] = serde_json::json!({
+            "type": "forecast", "min": "2026-03-01", "max": "2027-03-01",
+            "horizon": 3, "interval": "month", "instructions": "Date the kitchen renovation will be finished"
+        });
+        assert_eq!(json(&probes[1]), date_fields);
+
+        let original_png = json(&original[11])["images"][0].clone();
+        for (probe, baseline, side, count) in [
+            (&probes[2], &original[4], 64_u32, 1),
+            (&probes[3], &original[5], 512, 1),
+            (&probes[4], &original[5], 1024, 1),
+            (&probes[6], &original[5], 64, 2),
+        ] {
+            assert!(probe
+                .body
+                .starts_with(baseline.body.strip_suffix('}').expect("object")));
+            let mut image_body = json(probe);
+            let images = image_body
+                .as_object_mut()
+                .unwrap()
+                .remove("images")
+                .unwrap();
+            assert_eq!(image_body, json(baseline));
+            let images = images.as_array().unwrap();
+            assert_eq!(images.len(), count);
+            for image in images {
+                assert_eq!(image["content_type"], "image/png");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(image["base64"].as_str().expect("base64 PNG"))
+                    .expect("valid base64");
+                assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+                assert_eq!(&bytes[16..20], &side.to_be_bytes());
+                assert_eq!(&bytes[20..24], &side.to_be_bytes());
+                assert!(bytes.len() < 12 * 1024, "keep the PNG small");
+            }
+        }
+        assert_eq!(json(&probes[2])["images"][0], original_png);
+        assert_eq!(json(&probes[6])["images"][0], original_png);
+        assert_ne!(json(&probes[6])["images"][1], original_png);
+
+        let mut data_url = json(&original[5]);
+        data_url["images"] = serde_json::json!([format!(
+            "data:image/png;base64,{}",
+            original_png["base64"].as_str().unwrap()
+        )]);
+        assert_eq!(json(&probes[5]), data_url);
+
+        let mut long = json(&probes[7]);
+        let instructions = &mut long["fields"]["contact_name"]["instructions"];
+        let text = instructions.as_str().unwrap();
+        assert_eq!(text.chars().count(), 60_000);
+        *instructions = serde_json::Value::String(text[..20_000].to_string());
+        assert_eq!(long, json(&original[9]));
+    }
 
     #[test]
     fn the_plan_is_twelve_uniquely_named_requests_within_the_cap() {
@@ -2103,6 +2637,76 @@ mod tests {
             error: None,
             elapsed_ms: 1,
         }
+    }
+
+    #[test]
+    fn open_readings_summary_distinguishes_observations_from_missing_evidence() {
+        let probes = open_readings_plan();
+        let image_reply = |tokens, passes| {
+            capture(
+                200,
+                &format!(
+                    r#"{{"success":true,"result":{{"answers":{{"clause_01":{{"value":null}}}},"usage":{{"passes":{passes},"image_tokens":{tokens},"schema_tokens":640,"input_tokens":800}}}}}}"#
+                ),
+            )
+        };
+        let mut captures = vec![
+            capture(
+                200,
+                r#"{"result":{"answers":{"completion_date":{"value":"2027-03-01"}}}}"#,
+            ),
+            capture(
+                200,
+                r#"{"result":{"answers":{"completion_date":{"steps":[{"value":"2026-03-01"},{"value":"2026-09-01"},{"value":"2027-03-01"}]}}}}"#,
+            ),
+            image_reply(192, 3),
+            image_reply(256, 1),
+            capture(503, "temporarily unavailable"),
+            capture(
+                400,
+                r#"{"success":false,"errors":[{"code":5006,"message":"expected object"}]}"#,
+            ),
+            image_reply(128, 1),
+            capture(
+                200,
+                r#"{"result":{"answers":{"contact_name":{"value":"Imogen Hart"}}}}"#,
+            ),
+        ];
+        let summary = summarize_open_readings(&probes, &captures, 8, true);
+        for evidence in [
+            "Every forecast value falls inside the bounds for this request.",
+            "Reported `image_tokens` 192: matches counting the image on every pass.",
+            "This PNG accounts for 256 reported `image_tokens`.",
+            "HTTP 503",
+            "Not answered: no successful result or request validation refusal.",
+            r#"`errors` `[{"code":5006,"message":"expected object"}]`"#,
+            "An item with two image objects was accepted and reported 128 `image_tokens`.",
+            "The provider also accepted 60000 characters.",
+        ] {
+            assert!(
+                summary.contains(evidence),
+                "missing {evidence:?}\n{summary}"
+            );
+        }
+
+        captures[1] = capture(
+            200,
+            r#"{"result":{"answers":{"completion_date":{"steps":[{"value":"2027-04-01"}]}}}}"#,
+        );
+        captures[2] = image_reply(64, 3);
+        let summary = summarize_open_readings(&probes, &captures, 8, true);
+        assert!(summary.contains("Not every forecast value falls inside the bounds."));
+        assert!(summary.contains("Reported `image_tokens` 64: matches counting the image once."));
+
+        captures[1] = capture(
+            200,
+            r#"{"result":{"answers":{"completion_date":{"steps":[{"value":null}]}}}}"#,
+        );
+        captures[2] = image_reply(64, 1);
+        let summary = summarize_open_readings(&probes, &captures, 8, true);
+        assert!(summary
+            .contains("Not answered: the reply did not supply all 3 forecast values as dates."));
+        assert!(summary.contains("Not answered: the request did not split across multiple passes."));
     }
 
     /// A summary over synthetic replies: the span verdict, the re-billing arithmetic and the

@@ -2,7 +2,12 @@
 //!
 //! Usage: tool-change-spike-probe [--dry-run] --provider openai|kimi|deepseek|xai|gemini
 //! --credential <id> --model <model> --out <file.jsonl> [--case 1|2|3|4|all]
-//! [--max-requests N]. The output contains prompt text and model responses, never headers.
+//! [--form a|b] [--steps 3|4] [--max-requests N]. Each conversation's requests are labelled T1
+//! to T4 in the output; T4 is the request after the tools or instructions change. `--form` runs
+//! one of case 1's two forms on OpenAI and Kimi (`a` the added-tools declaration, `b` the
+//! allowed-tools list). `--steps 3` leaves out T3, the second ordinary question, so T1, its
+//! repeat T2 and the changed T4 measure the cache with three requests per form. The output
+//! contains prompt text and model responses, never headers.
 //! Gemini uses VALIDATED with a fixed mode so only its allowed list changes; support
 //! depends on model/API version. Its appended instruction changes systemInstruction
 //! at request level, not a nonexistent mid-conversation system role.
@@ -107,6 +112,12 @@ struct Args {
     out: PathBuf,
     case: Option<u8>,
     max_requests: usize,
+    /// Case 1's form on OpenAI and Kimi: `Some(false)` runs only form a, `Some(true)` only
+    /// form b, and `None` both.
+    alternate: Option<bool>,
+    /// Requests per conversation: 4, or 3 without the second ordinary question. The tools
+    /// change at the last one, T4, either way.
+    steps: u8,
 }
 
 impl Args {
@@ -119,6 +130,8 @@ impl Args {
         let mut out = None;
         let mut case = None;
         let mut max_requests = REQUEST_CAP;
+        let mut alternate = None;
+        let mut steps = 4;
         while let Some(flag) = args.next() {
             if flag == "--dry-run" {
                 dry_run = true;
@@ -126,7 +139,14 @@ impl Args {
             }
             if !matches!(
                 flag.as_str(),
-                "--provider" | "--credential" | "--model" | "--out" | "--case" | "--max-requests"
+                "--provider"
+                    | "--credential"
+                    | "--model"
+                    | "--out"
+                    | "--case"
+                    | "--max-requests"
+                    | "--form"
+                    | "--steps"
             ) {
                 return Err(format!(
                     "unknown option {flag}; see the example's usage comment"
@@ -160,6 +180,20 @@ impl Args {
                         );
                     }
                 }
+                "--form" => {
+                    alternate = Some(match value.as_str() {
+                        "a" => false,
+                        "b" => true,
+                        _ => return Err("--form must be a|b".into()),
+                    });
+                }
+                "--steps" => {
+                    steps = match value.as_str() {
+                        "3" => 3,
+                        "4" => 4,
+                        _ => return Err("--steps must be 3|4".into()),
+                    };
+                }
                 _ => unreachable!(),
             }
         }
@@ -175,8 +209,10 @@ impl Args {
             out: out.ok_or("--out is required")?,
             case,
             max_requests,
+            alternate,
+            steps,
         };
-        let minimum = result.variants().len() * 4;
+        let minimum = result.variants().len() * usize::from(result.steps);
         if minimum > result.max_requests {
             return Err(format!("selected cases need at least {minimum} requests; narrow --case or raise --max-requests"));
         }
@@ -189,11 +225,16 @@ impl Args {
             if self.case.is_some_and(|selected| selected != case) {
                 continue;
             }
-            variants.push(Variant {
-                case,
-                alternate: false,
-            });
-            if case == 1 && matches!(self.provider, Provider::Openai | Provider::Kimi) {
+            if self.alternate != Some(true) {
+                variants.push(Variant {
+                    case,
+                    alternate: false,
+                });
+            }
+            if case == 1
+                && matches!(self.provider, Provider::Openai | Provider::Kimi)
+                && self.alternate != Some(false)
+            {
                 variants.push(Variant {
                     case,
                     alternate: true,
@@ -440,12 +481,15 @@ struct Answer {
 async fn send(
     family: ProbeFamily,
     frozen: FrozenRenderConfig,
-    auth: AuthHandle,
+    (auth, hosts): (
+        AuthHandle,
+        broca_provider::credential_hosts::CredentialHosts,
+    ),
     opts: &CallOptions,
 ) -> Answer {
     use broca_core::Provider as _;
     use broca_protocol::{NormalizedEvent, ProviderControl, StepId};
-    let live = broca_provider::LiveProvider::new(family, frozen, auth);
+    let live = broca_provider::LiveProvider::new(family, frozen, auth).with_credential_hosts(hosts);
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut events = live
         .step_with_runtime(
@@ -491,6 +535,12 @@ async fn send(
                     if answer.status.is_none() {
                         answer.status = error.status;
                     }
+                    // The class, status and codes name the failure without the provider's
+                    // text, which can echo the request.
+                    eprintln!(
+                        "provider failure: class={:?} status={:?} provider_code={:?} cause={:?}",
+                        error.class, error.status, error.provider_code, error.cause
+                    );
                     answer.error = Some("provider failure; error text withheld");
                 }
                 _ => {}
@@ -639,7 +689,17 @@ fn tool_results(content: &[ContentBlock]) -> Option<Message> {
     }
 }
 
-async fn credentials(args: &Args) -> Result<AuthHandle, Box<dyn std::error::Error>> {
+/// The credential's auth header and the hosts its vault record lets it go to, which the
+/// transport checks before every send.
+async fn credentials(
+    args: &Args,
+) -> Result<
+    (
+        AuthHandle,
+        broca_provider::credential_hosts::CredentialHosts,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let id = CredentialId::parse(&args.credential).ok_or("invalid credential id")?;
     let handle = load_devtools_handle(&id).map_err(|_| "devtools credential handle unavailable")?;
     let subc = std::env::var_os("BROCA_LIVE_SUBC")
@@ -668,19 +728,40 @@ async fn credentials(args: &Args) -> Result<AuthHandle, Box<dyn std::error::Erro
         .await
         .result
         .map_err(|_| "vault credential.get refused")?;
-    Ok(AuthHandle::Headers(vec![(
-        if args.provider == Provider::Gemini {
-            "x-goog-api-key"
-        } else {
-            "authorization"
-        }
-        .into(),
-        if args.provider == Provider::Gemini {
-            secret.token
-        } else {
-            format!("Bearer {}", secret.token)
-        },
-    )]))
+    let hosts = secret.hosts.unwrap_or_else(|| {
+        // A dev-tools handle's reply carries no host list, which would refuse every send. This
+        // probe's endpoints are constants in this file rather than catalog rows, so the host of
+        // its own fixed endpoint stands in for the record's list.
+        let url = args
+            .provider
+            .frozen(&args.model)
+            .base_url
+            .unwrap_or_default();
+        let host = url
+            .trim_start_matches("https://")
+            .split(['/', ':'])
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        vec![host]
+    });
+    let hosts = broca_provider::credential_hosts::CredentialHosts::from_record(Some(&hosts));
+    Ok((
+        AuthHandle::Headers(vec![(
+            if args.provider == Provider::Gemini {
+                "x-goog-api-key"
+            } else {
+                "authorization"
+            }
+            .into(),
+            if args.provider == Provider::Gemini {
+                secret.token
+            } else {
+                format!("Bearer {}", secret.token)
+            },
+        )]),
+        hosts,
+    ))
 }
 
 fn fake_reply(step: u8) -> Message {
@@ -710,8 +791,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut requests = 0;
     for variant in args.variants() {
         let mut prompt = vec![message(Role::System, &fixed_prefix())];
-        let mut t3 = Value::Null;
-        for step in 1..=4 {
+        let mut before = Value::Null;
+        let steps: &[u8] = if args.steps == 3 {
+            &[1, 2, 4]
+        } else {
+            &[1, 2, 3, 4]
+        };
+        for &step in steps {
             prompt.push(message(Role::User, user_text(variant, step)));
             let mut completing = false;
             loop {
@@ -753,13 +839,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         variant.name(),
                         bytes.len()
                     );
-                    if step == 3 {
-                        t3 = rendered.clone();
-                    }
                     if step == 4 {
                         let mut changes = Vec::new();
-                        diff(&t3, &rendered, "", &mut changes);
-                        println!("T4 against T3: {}", serde_json::to_string(&changes)?);
+                        diff(&before, &rendered, "", &mut changes);
+                        println!(
+                            "T4 against the request before it: {}",
+                            serde_json::to_string(&changes)?
+                        );
+                    } else {
+                        before = rendered.clone();
                     }
                     prompt.push(fake_reply(step));
                     break;

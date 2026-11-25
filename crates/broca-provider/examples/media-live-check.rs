@@ -28,7 +28,7 @@ use broca_provider::{
     ProviderHttpClient,
 };
 use error_detail::ErrorDetail;
-use plan::{Args, Route, MAX_REQUESTS};
+use plan::{Args, Route};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -632,10 +632,11 @@ fn preview(
     route: &Route,
     frozen: &FrozenRenderConfig,
     fixtures: &[Fixture],
+    stages: usize,
 ) -> Result<(), &'static str> {
     let preview = preview_config(route, frozen)?;
     let mut history = initial_history();
-    for stage in 0..MAX_REQUESTS {
+    for stage in 0..stages {
         if stage < 2 {
             add_exchange(&mut history, frozen, fixtures, stage);
         } else {
@@ -716,7 +717,7 @@ async fn run_live(
     let mut checks = BTreeMap::new();
     let mut previous_body: Option<Vec<u8>> = None;
     let mut prefixes_stable = true;
-    for stage in 0..MAX_REQUESTS {
+    for stage in 0..args.stages {
         if stage < 2 {
             checks = add_exchange(&mut history, frozen, fixtures, stage);
         } else {
@@ -777,14 +778,14 @@ async fn run_live(
 async fn run() -> Result<(), &'static str> {
     let args = Args::parse(std::env::args().skip(1))?;
     let routes = args.routes()?;
-    println!("{}", plan_summary(&routes, args.live)?);
+    println!("{}", plan_summary(&routes, args.live, args.stages)?);
     let fixtures = fixtures();
     // Validate and render the whole plan before any credential access or network activity.
     let prepared = routes
         .iter()
         .map(|route| {
             let frozen = route.frozen()?;
-            preview(route, &frozen, &fixtures)?;
+            preview(route, &frozen, &fixtures, args.stages)?;
             Ok(frozen)
         })
         .collect::<Result<Vec<_>, &'static str>>()?;
@@ -809,7 +810,7 @@ async fn run() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn plan_summary(routes: &[Route], live: bool) -> Result<Value, &'static str> {
+fn plan_summary(routes: &[Route], live: bool, stages: usize) -> Result<Value, &'static str> {
     let not_live_checked = if routes
         .iter()
         .any(|route| route.family == WireFamilyId::BedrockConverse)
@@ -828,7 +829,7 @@ fn plan_summary(routes: &[Route], live: bool) -> Result<Value, &'static str> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(
-        json!({"mode":if live {"live"} else {"dry_run"},"families":routes.len(),"total_planned_requests":routes.len() * MAX_REQUESTS,"max_requests_per_family":MAX_REQUESTS,"retries":0,"not_live_checked":not_live_checked,"live_skips":live_skips}),
+        json!({"mode":if live {"live"} else {"dry_run"},"families":routes.len(),"total_planned_requests":routes.len() * stages,"max_requests_per_family":stages,"retries":0,"not_live_checked":not_live_checked,"live_skips":live_skips}),
     )
 }
 
@@ -851,7 +852,12 @@ mod tests {
 
     #[test]
     fn default_summary_caps_six_families_at_eighteen_and_names_unchecked_bedrock() {
-        let summary = plan_summary(&Args::default().routes().unwrap(), false).unwrap();
+        let summary = plan_summary(
+            &Args::default().routes().unwrap(),
+            false,
+            plan::MAX_REQUESTS,
+        )
+        .unwrap();
         assert_eq!(summary["families"], 6);
         assert_eq!(summary["total_planned_requests"], 18);
         assert_eq!(summary["max_requests_per_family"], 3);
