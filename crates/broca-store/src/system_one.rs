@@ -372,6 +372,35 @@ impl SystemOneStore {
     /// Release only batches whose owner-lifetime locks prove they are abandoned. A live or
     /// unidentifiable owner keeps its claim, so another process receives the transient refusal.
     pub fn release_abandoned(&self) -> Result<usize> {
+        self.release_abandoned_counting()
+            .map(|(released, _)| released)
+    }
+
+    /// [`Self::release_abandoned`], run again until no batch is left running under an owner
+    /// whose lock is still held, for at most `wait`. A broca process starts only once it holds
+    /// the state root's exclusive lock (`broca.lock`), which a broca keeps until it exits,
+    /// so at start every owner still holding its batch-owner lock is a previous process on its
+    /// way out. A killed process closes its files one by one and can let go of the state-root
+    /// lock before its batch-owner lock: a release run in that gap alone would leave its
+    /// batches claimed until the next start. An owner without a marker
+    /// can't be proven dead or alive and isn't waited for. Answers the batches released and
+    /// those still claimed by an owner whose lock was held when `wait` ran out.
+    pub fn release_abandoned_within(&self, wait: std::time::Duration) -> Result<(usize, usize)> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut released = 0;
+        loop {
+            let (now, held) = self.release_abandoned_counting()?;
+            released += now;
+            if held == 0 || std::time::Instant::now() >= deadline {
+                return Ok((released, held));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// Releases what [`Self::release_abandoned`] releases, and counts the running batches whose
+    /// owner has a marker and holds its lock.
+    fn release_abandoned_counting(&self) -> Result<(usize, usize)> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let owners = {
@@ -416,6 +445,7 @@ impl SystemOneStore {
         }
         let mut proofs = Vec::new();
         let mut released = 0;
+        let mut held = 0;
         for path in paths {
             if let Some(proof) = Self::dead_owner_proof(&path) {
                 if let Some(owner) = owners.get(&path) {
@@ -425,6 +455,12 @@ impl SystemOneStore {
                     )?;
                 }
                 proofs.push((path, proof));
+            } else if let Some(owner) = owners.get(&path).filter(|_| path.exists()) {
+                held += tx.query_row(
+                    "SELECT COUNT(*) FROM batch WHERE state='running' AND owner=?1",
+                    [owner],
+                    |row| row.get::<_, i64>(0),
+                )? as usize;
             }
         }
         tx.commit()?;
@@ -442,7 +478,7 @@ impl SystemOneStore {
                 }
             }
         }
-        Ok(released)
+        Ok((released, held))
     }
 
     /// Hold a batch for one call. See [`Claimed`] for the outcomes; only `Fresh` and `Resumed`
@@ -1237,6 +1273,46 @@ mod owner_lifetime_tests {
         );
         assert!(matches!(
             store.claim(&claim_for("other-process", &scope)).unwrap(),
+            Claimed::Resumed(_)
+        ));
+    }
+
+    /// A start that finds a batch claimed by an owner still holding its lock waits for it to
+    /// let go, as a killed process does once its last files close, and then releases the
+    /// batch. An owner holding on past the wait keeps its claim, and is counted.
+    #[test]
+    fn a_start_waits_for_a_dying_owner_to_let_go() {
+        let root =
+            broca_test_support::scratch_root().join(format!("owner-dying-{}", std::process::id()));
+        broca_owner_only::create_dir_all(&root).unwrap();
+        let path = root.join("system-one.db");
+        let scope = BatchScope::Run {
+            agent_id: "agent".into(),
+            run_id: "run".into(),
+        };
+        let dying = SystemOneStore::open(&path).unwrap();
+        dying.claim(&claim_for("dying", &scope)).unwrap();
+        let starting = SystemOneStore::open(&path).unwrap();
+        assert_eq!(
+            starting
+                .release_abandoned_within(Duration::from_millis(100))
+                .unwrap(),
+            (0, 1),
+            "an owner holding its lock keeps its claim, counted"
+        );
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(dying);
+        });
+        assert_eq!(
+            starting
+                .release_abandoned_within(Duration::from_secs(5))
+                .unwrap(),
+            (1, 0)
+        );
+        letting_go.join().unwrap();
+        assert!(matches!(
+            starting.claim(&claim_for("next", &scope)).unwrap(),
             Claimed::Resumed(_)
         ));
     }

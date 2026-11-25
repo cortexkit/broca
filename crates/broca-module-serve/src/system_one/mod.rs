@@ -741,6 +741,16 @@ impl SystemOne {
         self.store.release_abandoned().map_err(|e| e.to_string())
     }
 
+    /// [`Self::release_abandoned`], waiting up to `wait` for an owner still holding its lock to
+    /// let go (see `SystemOneStore::release_abandoned_within`). Blocks the calling thread while
+    /// it waits. Answers the batches released and those still claimed.
+    pub fn release_abandoned_within(&self, wait: Duration) -> Result<(usize, usize), String> {
+        self.flush_facts()?;
+        self.store
+            .release_abandoned_within(wait)
+            .map_err(|e| e.to_string())
+    }
+
     /// Delete batches past retention. Returns how many batches went.
     pub async fn sweep(&self) -> Result<usize, String> {
         let store = Arc::clone(&self.store);

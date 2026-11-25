@@ -36,6 +36,9 @@ const EMBEDDED_ENGRAM_CATALOG: &[u8] = include_bytes!("../../../engram-catalog.j
 /// opens. When a bind is that slow the caller may time out first, but the route that opens is
 /// cached, so the caller's next attempt finds it ready rather than binding again.
 const VAULT_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a start waits for the previous process's System One batch owners to let go of
+/// their locks before it leaves their batches claimed.
+const SYSTEM_ONE_RELEASE_WAIT: Duration = Duration::from_secs(5);
 /// How long after a start the one-time lease file sweep waits, so boot recovery and the first
 /// sends read the session store before it lists every session's head.
 const LEASE_SWEEP_DELAY: Duration = Duration::from_secs(300);
@@ -862,12 +865,24 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let service =
             Arc::new(service.with_export(run_index.as_ref().unwrap().clone(), charge_basis_table));
-        let released = service
-            .release_abandoned()
-            .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?;
+        // The previous process may still be closing its files, so the release waits a little
+        // for a batch owner that holds its lock (see `release_abandoned_within`).
+        let (released, held) = {
+            let service = Arc::clone(&service);
+            tokio::task::spawn_blocking(move || {
+                service.release_abandoned_within(SYSTEM_ONE_RELEASE_WAIT)
+            })
+            .await
+            .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?
+            .map_err(|e| ServeIoError(format!("release System One batches left running: {e}")))?
+        };
         if released > 0 {
             tracing::info!(target: "system_one", released,
                 "released batches a previous process left running; their unanswered items are asked again on re-send");
+        }
+        if held > 0 {
+            tracing::warn!(target: "system_one", held,
+                "batches stay claimed by an owner that still holds its lock; a re-send of each is refused as in progress until that owner is gone");
         }
         service
     };
