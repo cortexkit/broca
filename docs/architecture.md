@@ -38,9 +38,12 @@ and read back on demand. See [the session store](session-store.md).
 
 **Resume** (`broca-session-loop`). Resume rebuilds the next request from the
 session's records and the values admission froze, byte-identical to the request
-first sent. An intent with no outcome is indeterminate: the resumed run stops as
-`Interrupted`, names the calls in `indeterminate_tool_calls` and never dispatches
-them again. See the [durability contract](durability-contract.md).
+first sent. While the runner is live, an indeterminate call is closed with a
+durable `outcome_unknown` result and the turn continues without re-dispatch.
+If the run's own scope has ended, the run stops after settling its batch. On
+restart, sealing a run with a dispatch intent but no recorded outcome still
+names the call in `indeterminate_tool_calls`. See the
+[durability contract](durability-contract.md).
 
 **SQLite stores** (`broca-store`). `run-index.db` holds the session-ref index,
 scope reservations, bus outboxes and usage-export facts. `system-one.db` holds

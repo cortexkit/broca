@@ -361,25 +361,27 @@ pub fn late_entry_tool_result(
         output: broca_protocol::ToolOutput::error(message),
         is_error: true,
     };
+    let unknown =
+        |reason: &str| broca_core::tool_results::live_outcome_unknown_result(tool_call_id, reason);
     match entry.kind() {
         EntryKind::Result if entry.reduced => Some(error(format!(
             "This call finished, but its provider kept only its outcome ({}), not its result.",
             entry.outcome.as_deref().unwrap_or("unknown")
         ))),
         EntryKind::Result => Some(match &entry.result {
-            None => error("Its provider settled this call without a result.".into()),
+            None => unknown("its provider settled the call without a result"),
             Some(body) => {
                 match serde_json::from_value::<cortexkit_role_tool_provider::result::ToolResult>(
                     body.clone(),
                 ) {
                     Ok(reply) => crate::content_v1::map_content_v1_result(tool_call_id, &reply)
                         .unwrap_or_else(|problem| {
-                            error(format!(
-                                "Its provider settled this call with an unreadable result: {problem}"
+                            unknown(&format!(
+                                "its provider settled the call with an unreadable result: {problem}"
                             ))
                         }),
-                    Err(problem) => error(format!(
-                        "Its provider settled this call with an unreadable result: {problem}"
+                    Err(problem) => unknown(&format!(
+                        "its provider settled the call with an unreadable result: {problem}"
                     )),
                 }
             }
@@ -388,10 +390,8 @@ pub fn late_entry_tool_result(
             "This call never ran: its provider settled it as not started ({}).",
             entry.reason.as_deref().unwrap_or("no reason given")
         ))),
-        EntryKind::Expired => Some(error(
-            "This call's result expired at its provider before it was collected, so the result \
-             is lost. The call may have run."
-                .into(),
+        EntryKind::Expired => Some(unknown(
+            "its result expired at the provider before it was collected",
         )),
         _ => None,
     }
@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(
             render(&settled(kinds::EXPIRED)),
             Some(
-                json!({"tool_call_id": "tc_1", "output": {"kind": "error", "message": "This call's result expired at its provider before it was collected, so the result is lost. The call may have run."}, "is_error": true})
+                json!({"tool_call_id": "tc_1", "output": {"kind": "error", "code": "outcome_unknown", "message": "outcome_unknown: this tool call was sent and may have run, but no usable result was received: its result expired at the provider before it was collected. Check before trying again."}, "is_error": true})
             )
         );
         // A late body that is itself held again never reaches the model as interim content.
@@ -753,6 +753,7 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(rehold["is_error"], true);
+        assert_eq!(rehold["output"]["code"], "outcome_unknown");
         assert!(!rehold.to_string().contains("STILL WAITING"), "{rehold}");
         assert_eq!(
             render(&settled(kinds::PROGRESS).with_text("half way")),

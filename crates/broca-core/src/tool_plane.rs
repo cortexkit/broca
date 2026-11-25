@@ -179,6 +179,27 @@ pub enum ToolPlaneError {
     ScopeDrained { reason: String },
 }
 
+/// A run's own scope ending is a host stop, not a tool outcome. A live, changed, or
+/// unverifiable scope does not establish that the host stopped. See llm-runner §14.6 and
+/// `docs/durability-contract.md` for how the batch closes when the scope ends.
+pub fn scope_has_ended(reason: &str) -> bool {
+    matches!(
+        reason,
+        "scope_ended" | "scope_not_live" | "scope_parent_ended"
+    )
+}
+
+impl ToolPlaneError {
+    /// Proof from a scope describe or route-open refusal that the run's scope ended.
+    pub fn ended_scope_reason(&self) -> Option<&str> {
+        match self {
+            Self::ScopeDrained { reason } => Some(reason),
+            Self::ScopeRefused { code, .. } if scope_has_ended(code) => Some(code),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for ToolPlaneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -237,9 +258,8 @@ pub fn permanent_refusal_output(
 ///    normal `is_error` result the model can retry.
 ///  - `SentButOutcomeUnknown` — the request WAS sent but no result came back
 ///    (timeout / connection reset / executor crash AFTER send). The side effect
-///    MAY have applied → AMBIGUOUS → the run stops for review rather than feeding
-///    the unknown back to the model. NEVER a normal "unavailable" error (which the
-///    model would retry = a DUPLICATE side effect) and NEVER an auto-retry.
+///    may have applied. The model gets an `outcome_unknown` result that warns it to check
+///    before trying again. The runner never retries this call.
 #[derive(Debug, Clone)]
 pub enum DispatchResult {
     Completed(ToolResult),
@@ -267,8 +287,8 @@ pub enum DispatchResult {
     /// left decides the outcome, not the reason:
     ///  - `sent: false` — the request never left: the call gets `route_drained` naming the
     ///    reason and is never re-dispatched, not even on a fresh route;
-    ///  - `sent: true` — the request left and no result came back: the outcome is unknown and
-    ///    the run stops Interrupted, never Cancelled.
+    ///  - `sent: true` — the request left and no result came back: the model gets
+    ///    `outcome_unknown`, naming why the route closed.
     ScopeDrained {
         reason: String,
         sent: bool,

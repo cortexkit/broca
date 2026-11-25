@@ -687,6 +687,15 @@ impl ToolPlane for Spy {
                 reason: "scope_ended".into(),
             });
         }
+        if calls
+            .iter()
+            .any(|call| call.tool_name == "scope_open_refused")
+        {
+            return Err(ToolPlaneError::ScopeRefused {
+                code: "scope_not_live".into(),
+                detail: "route.open refused the run's scope".into(),
+            });
+        }
         self.inner
             .batch_started_guarded(ctx, calls, manifest, guard)
             .await
@@ -2193,6 +2202,10 @@ impl Scenario {
                 .with_tool("drained_sent", |_| StubReply::ScopeDrained {
                     reason: "scope_ended".into(),
                     sent: true,
+                })
+                .with_tool("agent_changed", |_| StubReply::ScopeDrained {
+                    reason: "scope_agent_changed".into(),
+                    sent: true,
                 }),
         )
     }
@@ -3512,21 +3525,7 @@ async fn a_call_that_was_never_sent() {
 
 #[tokio::test]
 async fn a_call_whose_outcome_is_unknown() {
-    compare(Scenario {
-        input: vec![user("write a")],
-        tools: vec![tool("write", ExecutionMode::Parallel)],
-        manifest: None,
-        stop_when: Vec::new(),
-        steps: vec![
-            answer(
-                "a1",
-                vec![call("c1", "write", json!({"path": "a"}))],
-                FinishReason::ToolCalls,
-            ),
-            text_step("a2", "should not be reached"),
-        ],
-    })
-    .await;
+    compare(unknown_outcome_scenario()).await;
 }
 
 /// Cuts the new loop's log of `scenario` after each of its records, as a crash could, resumes
@@ -3605,7 +3604,7 @@ async fn compare_every_cut_in_once(scenario: Scenario) {
 /// - It dispatches no call the cut log holds a dispatch intent for: that call may already have
 ///   run, so running it again could repeat its side effect.
 /// - No call gets a second result, and no run a second end.
-/// - A resume that leaves a call's outcome unknown sends no further request.
+/// - A resume that closes a call left indeterminate by the crash sends no further request.
 /// - With [`Requests::Same`], every request a resume sends is the one the uninterrupted run sent
 ///   for that step, so the provider sees the same conversation and its prompt cache still holds.
 ///
@@ -3687,13 +3686,14 @@ fn resume_invariants(
     }
     if let Some(unknown) = added.iter().position(|record| {
         matches!(record, Record::ToolOutcome(outcome)
-            if outcome.outcome == broca_session_store::record::CallOutcome::Unknown)
+            if outcome.outcome == broca_session_store::record::CallOutcome::Unknown
+                && outcome.reason.as_deref() != Some("outcome_unknown"))
     }) {
         assert!(
             !added[unknown..]
                 .iter()
                 .any(|record| matches!(record, Record::Attempt(_))),
-            "{context}: the resume asked the model again after a call's outcome became unknown"
+            "{context}: the resume asked the model again after closing a crash's ambiguous call"
         );
     }
     let requests = RESUME_REQUESTS
@@ -4078,9 +4078,8 @@ async fn every_cut_of_a_tool_call_stop_resumes_alike() {
     .await;
 }
 
-#[tokio::test]
-async fn every_cut_of_an_unknown_outcome_resumes_alike() {
-    compare_every_cut(Scenario {
+fn unknown_outcome_scenario() -> Scenario {
+    Scenario {
         input: vec![user("write a")],
         tools: vec![tool("write", ExecutionMode::Parallel)],
         manifest: None,
@@ -4091,10 +4090,77 @@ async fn every_cut_of_an_unknown_outcome_resumes_alike() {
                 vec![call("c1", "write", json!({"path": "a"}))],
                 FinishReason::ToolCalls,
             ),
-            text_step("a2", "should not be reached"),
+            text_step("a2", "done"),
         ],
-    })
+    }
+}
+
+#[tokio::test]
+async fn every_cut_of_an_unknown_outcome_resumes_alike() {
+    compare_every_cut(unknown_outcome_scenario()).await;
+}
+
+#[tokio::test]
+async fn live_unknown_outcome_reaches_the_next_model_request() {
+    let scenario = unknown_outcome_scenario();
+    let source = new_source(&scenario, None, scenario.steps.clone()).await;
+    assert_eq!(source.outcome.requests.len(), 2);
+    let request = serde_json::to_string(&source.outcome.requests[1].prompt).unwrap();
+    for text in ["c1", "outcome_unknown", "may have run", "connection reset"] {
+        assert!(request.contains(text), "missing {text}: {request}");
+    }
+    assert!(source.records.iter().any(|record| matches!(record,
+        Record::RunEnd(end) if end.reason == RunFinishReason::Completed)));
+}
+
+#[tokio::test]
+async fn a_durable_unknown_result_survives_a_crash_before_the_next_request() {
+    let scenario = unknown_outcome_scenario();
+    let source = new_source(&scenario, None, scenario.steps.clone()).await;
+    let outcome = source
+        .records
+        .iter()
+        .position(|record| {
+            matches!(
+                record, Record::ToolOutcome(outcome) if outcome.is_error
+            )
+        })
+        .expect("the tool outcome is written");
+    let cut = source
+        .batch_ends
+        .iter()
+        .copied()
+        .find(|&end| end > outcome)
+        .expect("the tool outcome is durable");
+    assert_eq!(
+        source.answered(cut),
+        1,
+        "the cut precedes the next model answer"
+    );
+    assert!(!source.records[..cut]
+        .iter()
+        .any(|record| matches!(record, Record::BatchEnd(_))));
+    let resumed = Box::pin(new_source(
+        &scenario,
+        Some(source.cut(cut)),
+        scenario.steps[1..].to_vec(),
+    ))
     .await;
+    assert_eq!(
+        resumed.outcome.requests.len(),
+        1,
+        "resume must use the recorded result"
+    );
+    assert_eq!(resumed.outcome.requests[0], source.outcome.requests[1]);
+    resume_invariants(
+        "crash with a durable tool result",
+        &source,
+        cut,
+        &resumed,
+        Requests::Same,
+    );
+    assert!(resumed.records.iter().any(|record| matches!(record,
+        Record::RunEnd(end) if end.reason == RunFinishReason::Completed)));
 }
 
 fn unsent_call() -> Scenario {
@@ -8899,7 +8965,7 @@ async fn a_batch_ending_in_an_unknown_outcome_still_writes_its_firings() {
                         vec![call("c1", "write", json!({"path": "a"}))],
                         FinishReason::ToolCalls,
                     ),
-                    text_step("a2", "should not be reached"),
+                    text_step("a2", "done"),
                 ],
             }),
         )
@@ -12415,11 +12481,9 @@ async fn a_held_result_taken_at_a_sign_in_pause_goes_through_the_post_tool_hooks
     );
 }
 
-/// A held call beside a call whose outcome is unknown: the run can't pause on the held call
-/// (a late answer can't resume a run in doubt), so it closes the held call and ends interrupted
-/// for review instead of waiting on it forever.
+/// A held call's late result still belongs in the batch when a sibling's outcome is unknown.
 #[tokio::test]
-async fn a_held_call_beside_an_unknown_outcome_ends_the_run_for_review() {
+async fn a_held_call_beside_an_unknown_outcome_can_resume() {
     let scenario = Scenario {
         input: vec![user("hold and write")],
         tools: vec![
@@ -12437,7 +12501,7 @@ async fn a_held_call_beside_an_unknown_outcome_ends_the_run_for_review() {
                 ],
                 FinishReason::ToolCalls,
             ),
-            text_step("a2", "should not be reached"),
+            text_step("a2", "done"),
         ],
     };
     let ran = tokio::time::timeout(
@@ -12454,7 +12518,10 @@ async fn a_held_call_beside_an_unknown_outcome_ends_the_run_for_review() {
             _ => None,
         })
         .unwrap_or_else(|| panic!("the run never ended: {records:?}"));
-    assert_eq!(end, RunFinishReason::Interrupted);
+    assert_eq!(end, RunFinishReason::Completed);
+    let request = serde_json::to_string(&ran.source.outcome.requests[1].prompt).unwrap();
+    assert!(request.contains("late result for c1"), "{request}");
+    assert!(request.contains("outcome_unknown"), "{request}");
     let held = records
         .iter()
         .filter_map(|record| match record {
@@ -12463,106 +12530,186 @@ async fn a_held_call_beside_an_unknown_outcome_ends_the_run_for_review() {
         })
         .find(|outcome| outcome.contains("\"c1\""))
         .expect("the held call is closed");
-    assert!(held.contains("provider_held_interrupted"), "{held}");
+    assert!(held.contains("outcome: Completed"), "{held}");
 }
 
-/// What a run of one step calling `tool_name` beside a `read`, then answering "done", left: its
-/// outcome records, how it ended, and how many answers the model gave.
-async fn ran_one_call(tool_name: &str) -> (Vec<String>, RunFinishReason, usize) {
+async fn scoped_calls(names: &[&str], mode: ExecutionMode) -> Source {
     let scenario = Scenario {
         input: vec![user("call it")],
-        tools: vec![
-            tool(tool_name, ExecutionMode::Parallel),
-            tool("read", ExecutionMode::Parallel),
-        ],
+        tools: names.iter().map(|name| tool(name, mode)).collect(),
         manifest: None,
         stop_when: Vec::new(),
         steps: vec![
             answer(
                 "a1",
-                vec![
-                    call("c1", tool_name, json!({"x": 1})),
-                    call("c2", "read", json!({"path": "a"})),
-                ],
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| call(&format!("c{}", i + 1), name, json!({})))
+                    .collect(),
                 FinishReason::ToolCalls,
             ),
             text_step("a2", "done"),
         ],
     };
-    let ran = Box::pin(new_with_actions(&scenario, Vec::new(), None, false)).await;
-    let records = &ran.source.records;
-    let outcomes = records
-        .iter()
-        .filter_map(|record| match record {
-            Record::ToolOutcome(outcome) => Some(format!("{outcome:?}")),
-            _ => None,
-        })
-        .collect();
-    let end = records
+    SEND_FACTS
+        .scope(
+            true,
+            Box::pin(new_with_actions(&scenario, Vec::new(), None, false)),
+        )
+        .await
+        .source
+}
+
+fn run_end_of(source: &Source) -> &broca_session_store::record::RunEnd {
+    source
+        .records
         .iter()
         .find_map(|record| match record {
-            Record::RunEnd(end) => Some(end.reason),
+            Record::RunEnd(end) => Some(end),
             _ => None,
         })
-        .expect("the run ends");
-    let steps = records
-        .iter()
-        .filter(|record| matches!(record, Record::Assistant(_)))
-        .count();
-    (outcomes, end, steps)
+        .expect("the run ends")
 }
 
-/// A batch whose scope was gone when it started sends nothing: every call gets the error naming
-/// why its route drained, and the run stops interrupted instead of asking the model again.
-#[tokio::test]
-async fn a_batch_whose_scope_was_gone_at_its_start_stops_the_run() {
-    let (outcomes, end, steps) = ran_one_call("scope_gone").await;
-    assert_eq!(end, RunFinishReason::Interrupted);
+fn assert_scope_end(source: &Source, reason: &str) {
+    let end = run_end_of(source);
+    assert_eq!(end.reason, RunFinishReason::Interrupted);
+    assert_eq!(end.interrupt_reason.as_deref(), Some(reason));
     assert_eq!(
-        steps, 1,
-        "the model was asked again after the drained batch"
+        source.outcome.requests.len(),
+        1,
+        "no request after scope end"
     );
-    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
-    // An outcome shows its result only by digest: the drained result is the error naming why
-    // the route drained.
+    let batch_close = source
+        .records
+        .iter()
+        .position(|record| matches!(record, Record::BatchEnd(_)))
+        .unwrap();
+    assert!(source.records[batch_close + 1..]
+        .iter()
+        .any(|record| matches!(record, Record::RunEnd(_))));
+}
+
+fn assert_scope_result(source: &Source, id: &str, text: &str, sent: bool) {
+    use broca_session_store::record::CallOutcome;
+    let close = source
+        .records
+        .iter()
+        .position(|record| matches!(record, Record::BatchEnd(_)))
+        .unwrap();
+    let records = &source.records[..close];
+    let outcome = records
+        .iter()
+        .find_map(|record| match record {
+            Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == id => Some(outcome),
+            _ => None,
+        })
+        .expect("the call's outcome precedes the batch end");
+    assert_eq!(
+        outcome.outcome,
+        if sent {
+            CallOutcome::Unknown
+        } else {
+            CallOutcome::Completed
+        }
+    );
+    let result = records
+        .iter()
+        .find_map(|record| match record {
+            Record::ToolReply(reply) if reply.result.tool_call_id.0 == id => Some(&reply.result),
+            _ => None,
+        })
+        .expect("the call's result precedes the batch end");
+    assert!(result.is_error);
+    let ToolOutput::Error { message, .. } = &result.output else {
+        panic!("{result:?}")
+    };
+    assert!(message.contains(text), "{message}");
     assert!(
-        outcomes
-            .iter()
-            .all(|outcome| outcome.contains("is_error: true")
-                && outcome.contains("reason: Some(\"scope_ended\")")),
-        "{outcomes:?}"
+        message.starts_with(if sent {
+            "outcome_unknown:"
+        } else {
+            "route_drained:"
+        }),
+        "{message}"
     );
 }
 
-/// A call whose route drained before it was sent was definitely not run: the model gets the
-/// error naming why, and the run goes on. Only a drain after the call was sent leaves its
-/// outcome unknown and stops the run.
 #[tokio::test]
-async fn a_drained_call_is_unknown_only_when_it_was_sent() {
-    let (outcomes, end, steps) = ran_one_call("drained").await;
-    assert_eq!(end, RunFinishReason::Completed, "{outcomes:?}");
-    assert_eq!(steps, 2);
-    let unsent = outcomes
+async fn scope_end_before_batch_closes_every_call_and_stops_the_run() {
+    let source = scoped_calls(&["scope_gone", "read"], ExecutionMode::Parallel).await;
+    assert_scope_end(&source, "scope_ended");
+    assert_scope_result(&source, "c1", "scope_ended", false);
+    assert_scope_result(&source, "c2", "scope_ended", false);
+    assert!(!source
+        .outcome
+        .calls
         .iter()
-        .find(|outcome| outcome.contains("\"c1\""))
-        .unwrap();
-    assert!(
-        unsent.contains("outcome: Completed")
-            && unsent.contains("is_error: true")
-            && unsent.contains("reason: Some(\"scope_ended\")"),
-        "{unsent}"
-    );
+        .any(|entry| entry.contains("dispatch_guarded")));
+}
 
-    let (outcomes, end, _) = ran_one_call("drained_sent").await;
-    assert_eq!(end, RunFinishReason::Interrupted, "{outcomes:?}");
-    let sent = outcomes
+#[tokio::test]
+async fn scope_end_refused_at_route_open_closes_every_call_and_stops_the_run() {
+    let source = scoped_calls(&["scope_open_refused", "read"], ExecutionMode::Parallel).await;
+    assert_scope_end(&source, "scope_not_live");
+    assert_scope_result(&source, "c1", "scope_not_live", false);
+    assert_scope_result(&source, "c2", "scope_not_live", false);
+    assert!(!source
+        .outcome
+        .calls
         .iter()
-        .find(|outcome| outcome.contains("\"c1\""))
-        .unwrap();
+        .any(|entry| entry.contains("dispatch_guarded")));
+}
+
+#[tokio::test]
+async fn scope_end_mid_batch_settles_sent_and_unsent_calls_without_another_request() {
+    for (first, sent) in [("drained", false), ("drained_sent", true)] {
+        let source = scoped_calls(&[first, "read"], ExecutionMode::Sequential).await;
+        assert_scope_end(&source, "scope_ended");
+        assert_scope_result(
+            &source,
+            "c1",
+            if sent { "may have run" } else { "scope_ended" },
+            sent,
+        );
+        assert_scope_result(&source, "c2", "scope_ended", false);
+        assert!(source
+            .outcome
+            .calls
+            .iter()
+            .any(|entry| entry.contains("dispatch_guarded c1")));
+        assert!(!source
+            .outcome
+            .calls
+            .iter()
+            .any(|entry| entry.contains("dispatch_guarded c2")));
+    }
+}
+
+#[tokio::test]
+async fn scope_end_mid_batch_closes_and_withdraws_an_unanswered_held_call() {
+    let source = scoped_calls(&["hold", "drained_sent"], ExecutionMode::Parallel).await;
+    assert_scope_end(&source, "scope_ended");
+    assert_scope_result(&source, "c1", "may have run", true);
+    assert_scope_result(&source, "c2", "may have run", true);
     assert!(
-        sent.contains("outcome: Unknown") && sent.contains("reason: Some(\"scope_ended\")"),
-        "{sent}"
+        source
+            .outcome
+            .calls
+            .iter()
+            .any(|entry| entry.contains("withdraw c1 after_run_end=true")),
+        "{:?}",
+        source.outcome.calls
     );
+}
+
+#[tokio::test]
+async fn a_changed_route_agent_is_not_proof_the_runs_scope_ended() {
+    let source = scoped_calls(&["agent_changed", "read"], ExecutionMode::Sequential).await;
+    assert_eq!(run_end_of(&source).reason, RunFinishReason::Completed);
+    assert_eq!(source.outcome.requests.len(), 2);
+    assert_scope_result(&source, "c1", "scope_agent_changed", true);
 }
 
 /// A crash after a `final_text` run's answer is durable and before its end: the resume ends the

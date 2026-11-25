@@ -73,6 +73,23 @@ pub const OUTCOME_UNKNOWN_TEXT: &str = "outcome_unknown: this tool call was sent
      was recorded before the run stopped, so it may or may not have run. It will not be sent \
      again.";
 
+/// A live call whose provider might have acted but returned no usable result.
+pub fn live_outcome_unknown_result(tool_call_id: &ToolCallId, reason: &str) -> ToolResult {
+    let mut output = ToolOutput::error(format!(
+        "outcome_unknown: this tool call was sent and may have run, but no usable result was received: \
+         {reason}. Check before trying again."
+    ));
+    if let ToolOutput::Error { code, .. } = &mut output {
+        *code =
+            Some(cortexkit_role_llm_runner::errors::tool_result_reasons::OUTCOME_UNKNOWN.into());
+    }
+    ToolResult {
+        tool_call_id: tool_call_id.clone(),
+        output,
+        is_error: true,
+    }
+}
+
 /// The text of the result a resume writes for a planned call of the same batch that never left
 /// the process. It definitely did not run.
 pub const NOT_DISPATCHED_TEXT: &str =

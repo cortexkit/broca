@@ -310,9 +310,11 @@ async fn tool_result_v1_empty_content_is_a_named_terminal_error_once() {
         assert!(!legacy.is_error);
         let v1 = record_reply(raw, true).await;
         assert!(v1.is_error);
-        let ToolOutput::Error { message, .. } = v1.output else {
+        let ToolOutput::Error { message, code, .. } = v1.output else {
             panic!("invalid v1 must be a typed tool error")
         };
+        assert_eq!(code.as_deref(), Some("outcome_unknown"));
+        assert!(message.contains("may have run"), "{message}");
         assert!(
             message.contains("malformed tool-result/v1 tool reply"),
             "{message}"

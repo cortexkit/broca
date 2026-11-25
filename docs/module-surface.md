@@ -1118,8 +1118,13 @@ declared directly in `session.send.tools` may carry `reply: {"max_ms": N}`, the 
 its calls may take to answer, with N from 1 to 86,400,000 (the bound a tool provider's catalog
 `reply.max_ms` has). Broca then waits for each call of that tool by the same rule as a catalog
 tool's `reply`: `max_ms`, never less than its default 120-second wait. Without `reply` the tool
-keeps the default wait, after which a call with no answer is indeterminate and the run ends
-`interrupted`. A frozen fetch plan's own `reply` for the tool takes precedence. The deadline is
+keeps the default wait. If a dispatched call passes its deadline, goes silent past the provider
+keepalive bound, loses its route or otherwise has an unknown outcome, broca records a durable
+`outcome_unknown` result naming why and warning that the call may have run. The next model
+request includes that result; broca does not re-dispatch the call. If the daemon confirms that
+the run's own scope or its parent ended, broca records the batch's results and ends the run
+`interrupted` without another model request. For a tool fetched through the
+run's plan, the `reply` bound broca recorded from its catalog at admission takes precedence. The deadline is
 frozen with the tool in the run's `RunStart` (a resume keeps it, and a later send or catalog
 cannot change it); a send that omits `tools` inherits it with the rest of the tool. It is never
 rendered into a provider request and never sent to the tool. `reply` is strict: a non-object,
@@ -2348,7 +2353,7 @@ through exactly the cursor the provider returned. An entry whose call already ha
 (including an inline answer), whose dispatching run has ended, whose kind is unknown, or which
 no registration names is acked as a no-op. A durable intent with no terminal or held record is
 pending only while its dispatching run is open; unreadable session storage remains blocked. An answer
-for an indeterminate call in a sealed run never changes that call or enters a later run.
+for a call already closed as `outcome_unknown` never changes its result or enters a later run.
 A `not_started` entry with `reason: "scope_ended"` is the same never-run error result,
 not a request to dispatch the call again.
 Entries are deduplicated on

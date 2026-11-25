@@ -153,6 +153,10 @@ impl InProcessModuleEnd {
         )
     }
 
+    pub(crate) fn goodbye(&self, request: &Frame) -> bool {
+        self.terminal(request, FrameType::Goodbye, Vec::new())
+    }
+
     pub(super) fn terminal(&self, request: &Frame, ty: FrameType, body: Vec<u8>) -> bool {
         let key = (
             request.header.channel,

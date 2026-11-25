@@ -340,7 +340,7 @@ state! {
             reset: "batch_end",
             bound: Bound::OpenWork("one step's tool calls"),
         },
-        /// Calls whose outcome is unknown, from closed batches.
+        /// Unknown outcomes from a run close-out or from older runs that stopped on unknowns.
         12 rep pub unknown: ToolCallId => {
             owner: "tool router",
             reset: "run_start",
@@ -2243,7 +2243,11 @@ impl Operations {
                         call.key.clone_from(&outcome.call_key);
                     }
                 }
-                if outcome.outcome == CallOutcome::Unknown {
+                // A live outcome_unknown result settled the call. Unlike a stop or crash
+                // close-out, it does not bar resuming the run from that recorded result.
+                if outcome.outcome == CallOutcome::Unknown
+                    && outcome.reason.as_deref() != Some("outcome_unknown")
+                {
                     run.unknown.push(outcome.tool_call_id.clone());
                 }
             }

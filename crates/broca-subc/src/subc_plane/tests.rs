@@ -1622,15 +1622,17 @@ fn reply_without_content_structured_content_or_is_error_is_an_error_quoting_raw_
 
     let result = uncaptured_result(&ToolCallId("t1".into()), &raw);
     assert!(result.is_error);
-    let ToolOutput::Error { message, .. } = result.output else {
+    let ToolOutput::Error { message, code, .. } = result.output else {
         panic!("expected an error output, got {:?}", result.output);
     };
+    assert_eq!(code.as_deref(), Some("outcome_unknown"));
     assert!(
         message.contains("none of `content`, `structuredContent` or `isError`"),
         "{message}"
     );
     assert!(
-        message.ends_with(r#"raw reply: {"result":{"hits":["a","b"]}}"#),
+        message
+            .ends_with(r#"raw reply: {"result":{"hits":["a","b"]}}. Check before trying again."#),
         "{message}"
     );
 }
@@ -1684,7 +1686,10 @@ fn malformed_reply_quote_is_truncated_to_the_bound() {
     assert!(body.starts_with(r#"{"result":"éé"#));
     assert_eq!(
         marker,
-        format!(" [truncated: {} of {full_len} bytes shown]", body.len())
+        format!(
+            " [truncated: {} of {full_len} bytes shown]. Check before trying again.",
+            body.len()
+        )
     );
 }
 
@@ -2931,7 +2936,7 @@ async fn cancel_mid_wait_ends_promptly() {
 }
 
 /// A call already in flight when the route drops is indeterminate and never retried:
-/// the request may have run, so the run stops for review instead of re-sending.
+/// the request may have run, so the plane reports an unknown outcome instead of re-sending.
 #[tokio::test]
 async fn in_flight_call_when_route_drops_is_indeterminate() {
     let catalog = vec![catalog_entry("aft", &["read"])];
@@ -3482,6 +3487,7 @@ fn route_match_rejects_a_replaced_route_even_if_the_channel_number_is_reused() {
 struct InProcessWireConnection {
     conn: SubcConnection,
     route: RouteHandle,
+    close_on_wire: bool,
 }
 
 #[tokio::test]
@@ -3704,8 +3710,12 @@ impl ToolPlaneConnection for InProcessWireConnection {
         true
     }
 
-    async fn route_close(&self, _route: &RouteHandle) -> Result<(), ConnError> {
-        Ok(())
+    async fn route_close(&self, route: &RouteHandle) -> Result<(), ConnError> {
+        if self.close_on_wire {
+            self.conn.route_close(route).await
+        } else {
+            Ok(())
+        }
     }
 
     async fn tool_call(
@@ -3739,7 +3749,11 @@ async fn dispatch_with_slow_aft_reply(
 ) -> (DispatchResult, Duration) {
     let (conn, route, mut module) = SubcConnection::in_process_for_test(7, 1);
     let plane = SubcToolPlane::with_connection(
-        Arc::new(InProcessWireConnection { conn, route }),
+        Arc::new(InProcessWireConnection {
+            conn,
+            route,
+            close_on_wire: false,
+        }),
         crate::tool_deadline::AFT_MODULE_ID,
     );
     plane
@@ -3780,7 +3794,7 @@ async fn dispatch_with_slow_aft_reply(
 /// outlasts a reply arriving after 150 s. Whether AFT really answers in time is AFT's
 /// contract, pinned on their side.
 ///
-/// Completed is what lets the run go on; SentButOutcomeUnknown is what the loop turns into
+/// Completed carries the tool's answer; SentButOutcomeUnknown is what the loop turns into
 /// an Interrupted run, the failure this guards.
 #[tokio::test(start_paused = true)]
 async fn a_waiting_aft_bash_reply_after_120s_completes_the_call() {
@@ -4379,8 +4393,11 @@ mod scope_carrier {
             matches!(&refused, ToolPlaneError::ScopeRefused { code, .. } if code == "scope_not_live")
         );
         match plane.dispatch(&later_batch, &read).await {
-            DispatchResult::NotSent { reason } => {
-                assert!(reason.starts_with("scope_not_live: "), "{reason}")
+            DispatchResult::ScopeDrained {
+                reason,
+                sent: false,
+            } => {
+                assert_eq!(reason, "scope_not_live")
             }
             other => panic!("expected scope_not_live, got {other:?}"),
         }
@@ -4432,7 +4449,7 @@ mod scope_carrier {
     /// `route_drained` naming what describe said, never re-dispatched, and the run's next
     /// batch stops. A describe that answers for a different epoch counts as ended.
     #[tokio::test]
-    async fn an_unsent_call_whose_scope_is_gone_is_route_drained_and_the_run_stops() {
+    async fn an_unsent_call_whose_scope_is_gone_drains_later_tool_batches() {
         for (answer, reason) in [
             (ended(1), "scope_ended"),
             (not_live(true), "scope_not_live"),
@@ -4848,7 +4865,7 @@ mod scope_carrier {
     /// of the run at its next batch, before anything opens. A live scope is ordinary route
     /// loss: the next batch re-opens. A later run is judged afresh.
     #[tokio::test]
-    async fn a_close_with_nothing_in_flight_ends_the_run_only_when_the_scope_is_gone() {
+    async fn a_close_with_nothing_in_flight_drains_later_tool_batches_only_if_the_scope_is_gone() {
         for (answer, reason) in [
             (ended(1), Some("scope_ended")),
             (parent_ended("head", 1), Some("scope_parent_ended")),
@@ -5136,11 +5153,272 @@ mod call_keepalive {
     fn rig() -> (SubcToolPlane, InProcessModuleEnd) {
         let (conn, route, module) = SubcConnection::in_process_for_test(7, 1);
         let plane = SubcToolPlane::with_connection(
-            Arc::new(InProcessWireConnection { conn, route }),
+            Arc::new(InProcessWireConnection {
+                conn,
+                route,
+                close_on_wire: false,
+            }),
             "aft",
         );
         plane.windows.lock().unwrap().insert("aft".into(), 1);
         (plane, module)
+    }
+
+    #[derive(Clone, Copy)]
+    enum Cutoff {
+        Silence,
+        Deadline,
+        RouteClosed,
+        UndecodableReply,
+        SilenceWithSibling,
+    }
+
+    async fn run_through_cutoff(cutoff: Cutoff) {
+        use broca_core::{provider::StubProvider, AllowAll, RunControl, RunRequest};
+        use broca_protocol::content::{AssistantMessage, ContentBlock};
+        use broca_protocol::{FinishReason, MessageId, NormalizedEvent, ProviderControl, Usage};
+        use broca_session_loop::{run, MemoryParts, Seams, Writer};
+        use broca_session_store::{
+            backend::{MemoryBackend, SessionAddr},
+            head::SessionTriple,
+            keys::DeploymentKey,
+            session::Session,
+        };
+
+        let keepalive = matches!(cutoff, Cutoff::Silence | Cutoff::SilenceWithSibling);
+        let parallel = matches!(cutoff, Cutoff::SilenceWithSibling);
+        let (conn, route, mut module) = SubcConnection::in_process_for_test(7, 1);
+        let plane = SubcToolPlane::with_connection(
+            Arc::new(InProcessWireConnection {
+                conn,
+                route,
+                close_on_wire: parallel,
+            }),
+            "aft",
+        );
+        plane
+            .windows
+            .lock()
+            .unwrap()
+            .insert("aft".into(), if parallel { 2 } else { 1 });
+        let plan = frozen_manifest(keepalive, Some(120_000));
+        let submission = serde_json::from_value(serde_json::json!({
+            "model":{"provider_module_id":"stub","model_id":"stub"},
+            "input":[{"role":"user","content":[{"type":"text","text":"read it"}]}],
+            "tools": plan.tools,
+        }))
+        .unwrap();
+        let ctx = batch_ctx("live-cutoff");
+        let mut req = RunRequest::from_submission(
+            submission,
+            ctx.run_id,
+            ctx.bind.clone(),
+            broca_protocol::SubmissionId("s1".into()),
+        );
+        req.submission_id = None;
+        req.policy_allowed.insert("read".into());
+        let control = RunControl {
+            manifest: Some(Arc::new(plan)),
+            ..RunControl::default()
+        };
+        let make_step = |id: &str, content, finish_reason| {
+            vec![
+                NormalizedEvent::Control(ProviderControl::AssistantMessage {
+                    message: AssistantMessage {
+                        message_id: MessageId(id.into()),
+                        content,
+                    },
+                }),
+                NormalizedEvent::Control(ProviderControl::Finished {
+                    finish_reason,
+                    usage: Usage::default(),
+                    retries_used: 0,
+                }),
+            ]
+        };
+        let tool_call = |id: &str| {
+            ContentBlock::ToolCall(ToolCall {
+                tool_call_id: ToolCallId(id.into()),
+                ..call("read")
+            })
+        };
+        let mut calls = vec![tool_call("first")];
+        if parallel {
+            calls.push(tool_call("sibling"));
+        }
+        let provider = StubProvider::new(vec![
+            make_step("tool-step", calls, FinishReason::ToolCalls),
+            make_step(
+                "done-step",
+                vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                FinishReason::Stop,
+            ),
+        ]);
+        let backend = MemoryBackend::default();
+        let mut session = Session::create(
+            &backend,
+            SessionAddr("0123456789abcdef".into()),
+            SessionTriple {
+                project_root: "/project".into(),
+                harness: "runner".into(),
+                session: "cutoff".into(),
+            },
+            &DeploymentKey::new(1, &[7; 32]),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut parts = MemoryParts::default();
+        let admission = broca_session_loop::admit::admission(
+            &mut req,
+            &control,
+            &provider,
+            session.operations(),
+            Some(1),
+        )
+        .unwrap();
+        let seams = Seams {
+            steer_yields: None,
+            provider: &provider,
+            tools: &plane,
+            bind: ctx.bind,
+            out: None,
+            cancel: CancellationToken::new(),
+            stop: CancellationToken::new(),
+            held: None,
+            approval: &AllowAll,
+            hook_plane: None,
+            now_ms: &|| 1,
+            session_address: None,
+            compaction_plane: None,
+            compaction_session: None,
+            compaction_changes: false,
+            keep_warm: None,
+            account_reports: None,
+            max_same_account_wait: Default::default(),
+            auth_selection: None,
+            step_progress: None,
+            model_call_ready: None,
+            pause_for_auth_at_start: None,
+            account_continue: None,
+        };
+        let transport = async {
+            let (first, offered) = bound_request(&mut module).await;
+            assert_eq!(offered, keepalive);
+            let mut requests = vec![first];
+            if parallel {
+                requests.push(module.next_request().await);
+                assert_eq!(requests[0].header.channel, requests[1].header.channel);
+                assert_eq!(requests[0].header.epoch, requests[1].header.epoch);
+                let id = |frame: &subc_protocol::Frame| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+                        ["tool_call_id"]
+                        .clone()
+                };
+                if id(&requests[0]) == "sibling" {
+                    requests.swap(0, 1);
+                }
+                assert_eq!(id(&requests[0]), "first");
+                assert_eq!(id(&requests[1]), "sibling");
+                sleep(Duration::from_secs(45)).await;
+                assert!(module.push(
+                    &requests[1],
+                    cortexkit_role_tool_provider::keepalive_body().to_vec()
+                ));
+            }
+            if matches!(cutoff, Cutoff::RouteClosed) {
+                assert!(module.goodbye(&requests[0]));
+            }
+            if matches!(cutoff, Cutoff::UndecodableReply) {
+                assert!(module.reply(&requests[0], b"not JSON".to_vec()));
+            }
+            requests
+        };
+        let (finished, sent) = tokio::time::timeout(Duration::from_secs(180), async {
+            tokio::join!(
+                Box::pin(run(&mut session, &mut parts, admission, &seams)),
+                transport
+            )
+        })
+        .await
+        .expect("model and tool plane must finish");
+        assert_eq!(
+            finished.unwrap().reason,
+            broca_protocol::RunFinishReason::Completed
+        );
+        let model_calls = provider.calls();
+        assert_eq!(model_calls.len(), 2);
+        let results: Vec<_> = model_calls[1]
+            .prompt
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), sent.len());
+        for result in results {
+            let reason = match (cutoff, result.tool_call_id.0.as_str()) {
+                (Cutoff::Silence | Cutoff::SilenceWithSibling, "first") => "went silent for 90s",
+                (Cutoff::Deadline, "first") => "timed out after 120s",
+                (Cutoff::UndecodableReply, "first") => "decode tool result",
+                (Cutoff::RouteClosed, "first") | (Cutoff::SilenceWithSibling, "sibling") => {
+                    "tool route closed"
+                }
+                _ => panic!("unexpected tool result: {result:?}"),
+            };
+            let ToolOutput::Error { message, code, .. } = &result.output else {
+                panic!("{result:?}")
+            };
+            assert!(result.is_error);
+            assert_eq!(code.as_deref(), Some("outcome_unknown"));
+            assert!(message.starts_with("outcome_unknown:"), "{message}");
+            assert!(
+                message.contains("may have run") && message.contains(reason),
+                "{message}"
+            );
+        }
+        assert!(
+            module
+                .take_written_for_test()
+                .iter()
+                .all(|frame| frame.header.ty != FrameType::Request),
+            "no re-dispatch"
+        );
+        for request in sent {
+            assert!(
+                !module.reply(&request, br#"{"content":[]}"#.to_vec()),
+                "late terminal is not accepted"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_silence_reaches_the_next_model_request() {
+        run_through_cutoff(Cutoff::Silence).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_deadline_reaches_the_next_model_request() {
+        run_through_cutoff(Cutoff::Deadline).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_route_closed_mid_call_reaches_the_next_model_request() {
+        run_through_cutoff(Cutoff::RouteClosed).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn undecodable_tool_reply_reaches_the_next_model_request_as_unknown() {
+        run_through_cutoff(Cutoff::UndecodableReply).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_silence_and_the_sibling_cut_by_route_cleanup_both_reach_the_model() {
+        run_through_cutoff(Cutoff::SilenceWithSibling).await;
     }
 
     fn assert_cancel_and_ignore_late(

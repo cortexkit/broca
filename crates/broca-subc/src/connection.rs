@@ -2807,7 +2807,7 @@ impl SubcConnection {
                 _ = time::sleep_until(silent_at.map_or(reply_at, |silent| reply_at.min(silent))) => {
                     self.spawn_liveness_probe(runtime);
                     let reason = if silent_at.is_some_and(|silent| silent < reply_at) {
-                        format!("tool call silent for {:?}", wait.silence.expect("silence timer configured"))
+                        format!("tool provider went silent for {:?}", wait.silence.expect("silence timer configured"))
                     } else {
                         format!("timed out after {deadline:?}")
                     };

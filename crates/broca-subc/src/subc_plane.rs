@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use broca_core::{
-    tool_plane::{BatchCtx, DispatchResult, ToolOpenGuard, ToolPlane, ToolPlaneError},
+    tool_plane::{
+        scope_has_ended, BatchCtx, DispatchResult, ToolOpenGuard, ToolPlane, ToolPlaneError,
+    },
     ToolManifest,
 };
 use broca_protocol::{
@@ -118,20 +120,10 @@ pub const SCOPE_PARENT_ENDED: &str = "scope_parent_ended";
 /// different epoch) than the route the call was composed under, so the call is not re-sent.
 pub const SCOPE_AGENT_CHANGED: &str = "scope_agent_changed";
 
-/// Whether a scope reason means the scope, or its parent, is gone. When a route closes with
-/// nothing in flight for one of these, the rest of the run's calls stop; any other close of a
-/// live scope is ordinary route loss and the next call re-opens.
-fn drain_ends_run(reason: &str) -> bool {
-    matches!(
-        reason,
-        SCOPE_ENDED | SCOPE_NOT_LIVE_REASON | SCOPE_PARENT_ENDED
-    )
-}
-
 /// What a scoped route's close means, read from a `scope.describe` answer as current state.
 #[derive(Debug, Clone)]
 enum ScopeReading {
-    /// The scope or its parent is gone; the reason names which ([`drain_ends_run`] holds).
+    /// The scope or its parent is gone; the reason names which.
     Gone(&'static str),
     /// The scope is live; this is the stamp a route opened now would carry.
     Live(Box<ScopeStamp>),
@@ -364,10 +356,9 @@ impl RouteKey {
 /// What one run has learned that holds for the rest of its calls.
 #[derive(Clone, Debug)]
 enum RunScopeLatch {
-    /// The daemon refused a route under the run's scope as `scope_not_live`: the rest of the
-    /// run's calls are refused at once, without opening anything. A later run is judged afresh.
+    /// A route open proved the run's scope ended. A later run is judged afresh.
     Refused { code: String, detail: String },
-    /// A scope drain that ends the run's calls (see [`RUN_ENDING_DRAINS`]) closed its route.
+    /// A scope describe proved the run's scope ended after its route closed.
     Drained { reason: String },
 }
 
@@ -1661,6 +1652,18 @@ impl SubcToolPlane {
             .cloned()
     }
 
+    fn stopped_by_scope_end(&self, ctx: &BatchCtx) -> Option<DispatchResult> {
+        ctx.scope.as_ref()?;
+        let reason = match self.run_latch(ctx)? {
+            RunScopeLatch::Refused { code, .. } => code,
+            RunScopeLatch::Drained { reason } => reason,
+        };
+        Some(DispatchResult::ScopeDrained {
+            reason,
+            sent: false,
+        })
+    }
+
     /// Remember what holds for the rest of `ctx`'s run. The first latch wins: once a run's
     /// calls are refused or ended, a later observation does not change the answer.
     fn latch_run(&self, ctx: &BatchCtx, latch: RunScopeLatch) {
@@ -1671,10 +1674,10 @@ impl SubcToolPlane {
             .or_insert(latch);
     }
 
-    /// Latch a route-open refusal that holds for the rest of the run (`scope_not_live`).
+    /// Latch a route-open refusal that proves the run's own scope ended.
     fn latch_open_refusal(&self, ctx: &BatchCtx, error: &ToolPlaneError) {
         if let ToolPlaneError::ScopeRefused { code, detail } = error {
-            if code == SCOPE_NOT_LIVE {
+            if ctx.scope.is_some() && scope_has_ended(code) {
                 self.latch_run(
                     ctx,
                     RunScopeLatch::Refused {
@@ -1737,10 +1740,9 @@ impl SubcToolPlane {
         }
     }
 
-    /// Latch `ctx`'s run to stop at its next batch when `reason` says the scope or its parent is
-    /// gone.
+    /// Prevent further dispatch when the run's scope or its parent is gone.
     fn latch_gone(&self, ctx: &BatchCtx, reason: &str) {
-        if drain_ends_run(reason) {
+        if scope_has_ended(reason) {
             self.latch_run(
                 ctx,
                 RunScopeLatch::Drained {
@@ -1842,7 +1844,7 @@ impl SubcToolPlane {
     /// daemon's `route.closed` push is not used: it names a module and a reason but not the
     /// route, so it cannot say which of several routes to one module closed for which reason.
     /// - the scope or its parent is gone: `route_drained` naming what describe said, never
-    ///   re-dispatched, and the run stops at its next batch;
+    ///   re-dispatched; the run closes its batch and stops;
     /// - it cannot be told: `route_drained` as `scope_unverifiable`, never re-sent, because a
     ///   re-send needs a positive match;
     /// - the scope is live: re-open, and send on the new route only if its stamp has the same
@@ -1975,6 +1977,9 @@ impl SubcToolPlane {
                 }
             }
         };
+        if let Some(drained) = self.stopped_by_scope_end(ctx) {
+            return drained;
+        }
         let reply_deadline = self.reply_deadline(ctx, module_id, call);
         let outcome = match self
             .send_call(
@@ -2084,9 +2089,9 @@ impl SubcToolPlane {
                         let result =
                             crate::content_v1::map_content_v1_result(&call.tool_call_id, &interim)
                                 .unwrap_or_else(|error| {
-                                    route_failure_result(
-                                        call,
-                                        format!("malformed handed-back tool reply: {error:?}"),
+                                    broca_core::tool_results::live_outcome_unknown_result(
+                                        &call.tool_call_id,
+                                        &format!("malformed handed-back tool reply: {error:?}"),
                                     )
                                 });
                         self.fence
@@ -2173,10 +2178,17 @@ impl SubcToolPlane {
                     // Never quote the body: even a malformed held reply contains interim text,
                     // which must not be mistaken for a final answer in a later prompt.
                     (
-                        route_failure_result(
-                            call,
-                            "malformed provider-held reply: prerequisites not met".into(),
-                        ),
+                        if let Some(Err(reason)) = decoded.as_ref() {
+                            broca_core::tool_results::live_outcome_unknown_result(
+                                &call.tool_call_id,
+                                &format!("malformed provider-held reply: {reason}"),
+                            )
+                        } else {
+                            route_failure_result(
+                                call,
+                                "malformed provider-held reply: prerequisites not met".into(),
+                            )
+                        },
                         Vec::new(),
                     )
                 } else if sent_on.reads_tool_result && content_v1 {
@@ -2190,9 +2202,9 @@ impl SubcToolPlane {
                                 .map_err(|error| error.to_string())
                         })
                         .unwrap_or_else(|reason| {
-                            route_failure_result(
-                                call,
-                                format!("malformed tool-result/v1 tool reply: {reason}"),
+                            broca_core::tool_results::live_outcome_unknown_result(
+                                &call.tool_call_id,
+                                &format!("malformed tool-result/v1 tool reply: {reason}"),
                             )
                         });
                     let captures = if ctx.media_capture.is_some()
@@ -2342,14 +2354,11 @@ impl SubcToolPlane {
                 | ConnError::StreamLagged { .. }),
             ) => {
                 // The channel may be reset/closed — INVALIDATE the cached route so the next
-                // dispatch re-opens a fresh one, instead of dispatching to a stale dead
-                // channel. (The outcome is still ambiguous → SentButOutcomeUnknown stops the
-                // run for review; the invalidation is so a future dispatch isn't poisoned.)
+                // dispatch re-opens a fresh one, instead of dispatching to a stale channel.
                 self.remove_batch_call_route(ctx, &call.tool_call_id);
                 // The request was sent, and its scoped route closed while it was in flight. The
                 // outcome is unknown whatever the scope's state. Asking the daemon about the
-                // scope only names why, for the record, and stops the run's later batches when
-                // the scope or its parent is gone.
+                // scope names why and refuses dispatch for future batches under a dead scope.
                 if let Some(drained) = self
                     .sent_call_route_closed(ctx, module_id, sent_on, composed_under.as_ref())
                     .await
@@ -2367,7 +2376,11 @@ impl SubcToolPlane {
                     }
                 }
                 DispatchResult::SentButOutcomeUnknown {
-                    reason: e.to_string(),
+                    reason: if known_dead {
+                        format!("tool route closed: {e}")
+                    } else {
+                        e.to_string()
+                    },
                 }
             }
         }
@@ -3254,6 +3267,15 @@ impl SubcToolPlane {
                 .map(|module_id| self.ensure_batch_route(ctx, module_id, guard)),
         )
         .await;
+        // A live tool outage cannot hide proof that the run's host scope has ended.
+        if let Some(error) = route_results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .find(|error| ctx.scope.is_some() && error.ended_scope_reason().is_some())
+        {
+            self.latch_open_refusal(ctx, error);
+            return Err(error.clone());
+        }
         // join_all retains input order. Check every result in the same BTreeSet order as the
         // former serial loop so completion timing cannot change which module error is returned.
         let mut handles = HashMap::new();
@@ -3416,20 +3438,8 @@ impl SubcToolPlane {
         // composed under. `None` for an unscoped call.
         let mut composed_under = None;
         if scope.is_some() {
-            match self.run_latch(ctx) {
-                Some(RunScopeLatch::Refused { code, detail }) => {
-                    return DispatchResult::NotSent {
-                        reason: ToolPlaneError::ScopeRefused { code, detail }.to_string(),
-                    }
-                }
-                // The run's scope, or its parent, is gone and this call was not yet sent.
-                Some(RunScopeLatch::Drained { reason }) => {
-                    return DispatchResult::ScopeDrained {
-                        reason,
-                        sent: false,
-                    }
-                }
-                None => {}
+            if let Some(drained) = self.stopped_by_scope_end(ctx) {
+                return drained;
             }
             if let Some((handle, stamp)) = self.batch_route(ctx, &module_id) {
                 // This call's intent is already durable, so it is in flight. If the route its
@@ -3481,6 +3491,12 @@ impl SubcToolPlane {
             }
             Err(e) => {
                 self.latch_open_refusal(ctx, &e);
+                if let Some(reason) = scope.and_then(|_| e.ended_scope_reason()) {
+                    return DispatchResult::ScopeDrained {
+                        reason: reason.to_owned(),
+                        sent: false,
+                    };
+                }
                 return DispatchResult::NotSent {
                     reason: e.to_string(),
                 };
@@ -3537,6 +3553,9 @@ impl SubcToolPlane {
                 .await;
         }
         if scope.is_some() {
+            if let Some(drained) = self.stopped_by_scope_end(ctx) {
+                return drained;
+            }
             let current = self.cached_stamp(&ctx.bind, scope, &module_id, route_handle);
             let compatible = composed_under
                 .as_ref()
@@ -3571,12 +3590,13 @@ impl SubcToolPlane {
         //    second `module_reloading` on the one re-send is reported as the module being
         //    unavailable, still never sent (see `finish_dispatch`);
         //  - stale_route_epoch and provider route_not_bound / route_reclaimed share that retry;
-        //    outcome_unknown_root_reclaimed instead interrupts and evicts without a retry;
+        //    outcome_unknown_root_reclaimed means the daemon lost the route's root after the
+        //    request might have arrived. Settle the call as unknown without a retry;
         //  - any other typed Error frame (Rejected) is a DEFINITE negative response — a
         //    graceful is_error result, terminal, never re-dispatched;
         //  - a transport/protocol failure (timeout / reset / closed mid-call) means
         //    the request may have reached the executor with no result coming back,
-        //    so the outcome is ambiguous → SentButOutcomeUnknown (stops the run).
+        //    so the model gets an outcome_unknown result and the call is not retried.
         //
         // That last case is why the reply deadline is sized per call rather than fixed: a
         // deadline shorter than the work turns a healthy call into an ambiguous one.
@@ -3647,7 +3667,7 @@ impl SubcToolPlane {
         // daemon still holds the route, and closing it looks tidier -- but it is not safe. A
         // sibling call in the same batch may still be in flight on it (the drain is waiting for
         // exactly that call), and a GOODBYE would cut its reply off, turning a restart into an
-        // ambiguous outcome that stops the run. Evict only the refused handle: a sibling may
+        // ambiguous outcome for the sibling. Evict only the refused handle: a sibling may
         // already have cached its replacement. The drain owns the old binding's teardown.
         let _ = self.invalidate_route_for_module(&ctx.bind, scope, &module_id, route_handle);
         let reopened = if endpoint_is_reloading {
@@ -4515,11 +4535,10 @@ fn map_text_call_tool_result(
         && raw.get("structuredContent").is_none()
         && raw.get("isError").is_none()
     {
-        return ToolResult {
-            tool_call_id: id.clone(),
-            output: ToolOutput::error(malformed_tool_reply_message(raw)),
-            is_error: true,
-        };
+        return broca_core::tool_results::live_outcome_unknown_result(
+            id,
+            &malformed_tool_reply_message(raw),
+        );
     }
 
     let output = if is_error {

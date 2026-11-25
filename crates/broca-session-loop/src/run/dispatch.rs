@@ -36,6 +36,10 @@ pub(super) struct DispatchPlan<'p> {
     /// Per call, in order: the provider's held reply when the call was held before the run
     /// paused; that call waits for its late result again instead of being sent.
     pub(super) held: &'p [Option<&'p ProviderHeldReply>],
+    /// If registering the group failed, new calls cannot be sent safely.
+    pub(super) registration_error: Option<&'p str>,
+    /// Proof the run's scope had ended when the batch opened.
+    pub(super) scope_end: Option<String>,
     pub(super) guard: &'p ToolOpenGuard,
     pub(super) batch_id: &'p str,
     pub(super) run_id: &'p str,
@@ -46,21 +50,15 @@ pub(super) struct DispatchPlan<'p> {
     pub(super) changes: Option<&'p crate::compaction::Changes<'p>>,
 }
 
-/// One call's answer, once it is appended. The batch's end needs only how the call ended.
-pub(super) struct Answer {
-    pub(super) outcome: CallOutcome,
-}
-
-/// How a batch's dispatch ended. Answers are in call order; `None` for a call still waiting.
+/// How a batch's dispatch ended. A paused batch reports which calls still need an answer.
 pub(super) enum Dispatched {
-    /// Every call answered. `closed` are the held calls a cancel closed, whose providers are
-    /// asked to withdraw them once the run's end is durable.
+    /// Every call answered. Providers are asked to withdraw any closed holds once the run ends.
     All {
-        answers: Vec<Option<Answer>>,
         closed: Vec<ProviderHeldReply>,
+        scope_end: Option<String>,
     },
     /// Only calls a provider holds were still waiting.
-    Held(Vec<Option<Answer>>),
+    Held(Vec<bool>),
 }
 
 /// Dispatches every call, in parallel unless one of them must run alone, and collects their
@@ -70,8 +68,7 @@ pub(super) enum Dispatched {
 /// - every call's answer is appended as soon as it arrives, so a reader sees it while the
 ///   batch's other calls still run; a held or handed-back call's answer durably, before any call
 ///   queued behind it is sent, and the plane is then told it's durable;
-/// - after a call whose outcome is unknown, no later call is sent: each gets the interrupted
-///   result;
+/// - an unknown outcome closes just that call; other calls still run or wait for their answers;
 /// - when every call still running is held and still waiting for its provider's answer, the
 ///   dispatch stops and the run pauses. A held call whose answer is in is only finishing local
 ///   work (its media check and post-tool hooks), and is awaited as any call is.
@@ -98,7 +95,7 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
         .filter(|(_, held)| held.is_some())
         .map(|(call, _)| call.tool_call_id.clone())
         .collect();
-    let mut answers: Vec<Option<Answer>> = calls.iter().map(|_| None).collect();
+    let mut settled = vec![false; calls.len()];
     // Per call, whether its provider has answered: its dispatch or its held wait returned, so
     // what is left of its job is local work. Pausing then would drop an answer already taken
     // from the provider, with nothing left to resume the run for it.
@@ -116,24 +113,14 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
     let mut aborts: Vec<Option<futures::future::AbortHandle>> =
         calls.iter().map(|_| None).collect();
     let mut next = 0;
-    let mut tripped = false;
     let mut closed: Vec<ProviderHeldReply> = Vec::new();
+    let mut scope_end = plan.scope_end.clone();
     loop {
-        // A caller's cancel closes every call a provider holds that is still waiting for its
-        // answer: it gets the close result, durable at once, and its provider is asked to
-        // withdraw it after the run's end. Calls still running, a held call whose answer is in
-        // among them, finish as usual.
-        //
-        // A batch with a call whose outcome is unknown closes its held calls the same way once
-        // only they still run: the run ends interrupted for review, and a late answer can't
-        // resume a run in doubt, so waiting on them would wait forever.
-        let in_doubt = tripped && jobs.len() == open_held.len();
-        if (seams.cancel.is_cancelled() || in_doubt) && !open_held.is_empty() {
-            let reason = if seams.cancel.is_cancelled() {
-                RunFinishReason::Cancelled
-            } else {
-                RunFinishReason::Interrupted
-            };
+        // A cancel or a dead scope closes a hold that still has no answer. Calls already
+        // answering finish as usual; providers are asked to withdraw the closed holds after
+        // the run's end is durable.
+        let cancelled = seams.cancel.is_cancelled();
+        if (cancelled || scope_end.is_some()) && !open_held.is_empty() {
             let (waiting, answered_held): (Vec<_>, Vec<_>) = std::mem::take(&mut open_held)
                 .into_iter()
                 .partition(|id| still_waiting(id));
@@ -143,7 +130,19 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                     .iter()
                     .position(|call| call.tool_call_id == id)
                     .expect("a held call is one of the batch's");
-                let (result, outcome, code) = held_close_result(&id, reason);
+                let (result, outcome, code) = match scope_end.as_ref().filter(|_| !cancelled) {
+                    Some(reason) => (
+                        broca_core::tool_results::live_outcome_unknown_result(
+                            &id,
+                            &format!(
+                                "the run's scope ended while the provider held the call ({reason})"
+                            ),
+                        ),
+                        CallOutcome::Unknown,
+                        cortexkit_role_llm_runner::errors::tool_result_reasons::OUTCOME_UNKNOWN,
+                    ),
+                    None => held_close_result(&id, RunFinishReason::Cancelled),
+                };
                 let mut records = Vec::new();
                 terminal_with_reason(
                     &mut records,
@@ -159,7 +158,7 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                     lifecycle.terminal_synced(plan.ctx, &id).await;
                 }
                 closed.push(held_reply_of(writer, plan, &id));
-                answers[index] = Some(Answer { outcome });
+                settled[index] = true;
                 if let Some(abort) = aborts[index].take() {
                     abort.abort();
                 }
@@ -168,18 +167,15 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
         while next < calls.len() && (!plan.sequential || jobs.is_empty()) {
             let index = next;
             next += 1;
+            if settled[index] {
+                continue;
+            }
             let call = &calls[index];
             let held = plan.held[index];
-            let interrupted = tripped && held.is_none();
+            let scope_end = scope_end.clone();
             let key = key_of(call);
             let (job, abort) = futures::future::abortable(async move {
-                let answer: Resolved = if interrupted {
-                    (
-                        interrupted_result(&call.tool_call_id),
-                        CallOutcome::Interrupted,
-                    )
-                        .into()
-                } else if let Some(reply) = held {
+                if let Some(reply) = held {
                     match seams.held {
                         Some(lifecycle) => {
                             let waited = lifecycle.wait(plan.ctx, call, reply).await;
@@ -188,34 +184,45 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                         }
                         None => std::future::pending().await,
                     }
+                } else if let Some(reason) = scope_end {
+                    Resolved {
+                        reason: Some(reason.clone()),
+                        ..resolve(
+                            call,
+                            DispatchResult::ScopeDrained {
+                                reason,
+                                sent: false,
+                            },
+                        )
+                        .into()
+                    }
+                } else if let Some(reason) = plan.registration_error {
+                    resolve(
+                        call,
+                        DispatchResult::NotSent {
+                            reason: reason.into(),
+                        },
+                    )
+                    .into()
                 } else {
                     dispatch_one(seams.tools, plan, call, key, recorder, &returned[index]).await
-                };
-                answer
+                }
             });
             aborts[index] = Some(abort);
             jobs.push(async move { (index, job.await.ok()) });
         }
-        if answers.iter().all(Option::is_some) {
-            return Ok(Dispatched::All { answers, closed });
+        if settled.iter().all(|&done| done) {
+            return Ok(Dispatched::All { closed, scope_end });
         }
-        if !tripped && !open_held.is_empty() && jobs.len() == open_held.len() {
+        if !open_held.is_empty() && jobs.len() == open_held.len() {
             // Only held calls wait. Anything already answered is taken first, then the run pauses.
             if let Some(Some((index, answer))) = futures::FutureExt::now_or_never(jobs.next()) {
                 let Some(answer) = answer else {
                     continue;
                 };
-                settle(
-                    writer,
-                    seams,
-                    plan,
-                    &mut open_held,
-                    &mut answers,
-                    &mut tripped,
-                    index,
-                    answer,
-                )
-                .await?;
+                let ended = settle(writer, seams, plan, &mut open_held, index, answer).await?;
+                scope_end = scope_end.or(ended);
+                settled[index] = true;
                 continue;
             }
             // The run pauses only while every call left still waits for its provider: a held
@@ -226,7 +233,7 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
                 if seams.cancel.is_cancelled() {
                     continue;
                 }
-                return Ok(Dispatched::Held(answers));
+                return Ok(Dispatched::Held(settled));
             }
         }
         // While a provider holds a call still waiting for its answer, a cancel also wakes the
@@ -251,20 +258,12 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
             futures::future::Either::Left((Some((index, answer)), _)) => {
                 // A held call a cancel already closed: its late answer, or its job's end once
                 // stopped, is ignored.
-                let Some(answer) = answer.filter(|_| answers[index].is_none()) else {
+                let Some(answer) = answer.filter(|_| !settled[index]) else {
                     continue;
                 };
-                settle(
-                    writer,
-                    seams,
-                    plan,
-                    &mut open_held,
-                    &mut answers,
-                    &mut tripped,
-                    index,
-                    answer,
-                )
-                .await?;
+                let ended = settle(writer, seams, plan, &mut open_held, index, answer).await?;
+                scope_end = scope_end.or(ended);
+                settled[index] = true;
             }
             futures::future::Either::Left((None, _)) => {
                 unreachable!("jobs run until every call has an answer")
@@ -299,26 +298,23 @@ pub(super) async fn dispatch_all<W: Writer, P, T: ToolPlane>(
 
 /// Takes call `index`'s answer. A held call's answer is appended durably at once, and the plane
 /// told so, before any call behind it is sent.
-#[allow(clippy::too_many_arguments)]
 async fn settle<W: Writer, P, T: ToolPlane>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
     plan: &DispatchPlan<'_>,
     open_held: &mut Vec<ToolCallId>,
-    answers: &mut [Option<Answer>],
-    tripped: &mut bool,
     index: usize,
     resolved: Resolved,
-) -> Result<(), LoopError> {
+) -> Result<Option<String>, LoopError> {
     let Resolved {
         result,
         outcome,
         reason,
+        scope_end,
         detail,
         hooks,
         yielded_by,
     } = resolved;
-    *tripped |= outcome == CallOutcome::Unknown;
     let id = plan.calls[index].tool_call_id.clone();
     // A handed-back call is durable at once too, naming its provider: from then on the
     // provider's terminal for it is a notice, even across a crash before the batch ends.
@@ -374,8 +370,7 @@ async fn settle<W: Writer, P, T: ToolPlane>(
         }
         writer.append(&records, true).await?;
     }
-    answers[index] = Some(Answer { outcome });
-    Ok(())
+    Ok(scope_end)
 }
 
 /// The provider's held reply for the open held call `id`, as the run recorded it.
@@ -406,16 +401,6 @@ fn held_reply_of<W: Writer>(
         module: held.module.clone(),
         reason: held.reason.clone(),
         detail_digest: held.detail_digest.clone(),
-    }
-}
-
-/// The result a call gets when an earlier call of its batch may have run without an answer,
-/// so it was never sent.
-fn interrupted_result(id: &ToolCallId) -> ToolResult {
-    ToolResult {
-        tool_call_id: id.clone(),
-        output: ToolOutput::error("tool not run: batch interrupted"),
-        is_error: true,
     }
 }
 
@@ -450,7 +435,15 @@ async fn answered(
     call_key: &str,
     answer: DispatchResult,
 ) -> Resolved {
+    use cortexkit_role_llm_runner::errors::tool_result_reasons::OUTCOME_UNKNOWN;
     match answer {
+        // A matched reply can still be unusable (for example, a held result that expired).
+        DispatchResult::Completed(result) if matches!(&result.output, ToolOutput::Error { code: Some(code), .. } if code == OUTCOME_UNKNOWN) => {
+            Resolved {
+                reason: Some(OUTCOME_UNKNOWN.into()),
+                ..(result, CallOutcome::Unknown).into()
+            }
+        }
         DispatchResult::Completed(result) => {
             post_tool(plan.hooks, plan.step_id, call, call_key, result).await
         }
@@ -472,13 +465,25 @@ async fn answered(
                 ..resolved
             }
         }
-        DispatchResult::ScopeDrained { ref reason, .. } => {
-            let reason = Some(reason.clone());
+        DispatchResult::ScopeDrained { ref reason, sent } => {
+            let scope_end = (plan.ctx.scope.is_some()
+                && broca_core::tool_plane::scope_has_ended(reason))
+            .then(|| reason.clone());
+            let reason = Some(if sent {
+                OUTCOME_UNKNOWN.into()
+            } else {
+                reason.clone()
+            });
             Resolved {
                 reason,
+                scope_end,
                 ..resolve(call, answer).into()
             }
         }
+        DispatchResult::SentButOutcomeUnknown { .. } => Resolved {
+            reason: Some(OUTCOME_UNKNOWN.into()),
+            ..resolve(call, answer).into()
+        },
         other => resolve(call, other).into(),
     }
 }

@@ -8,6 +8,8 @@ pub(super) struct Resolved {
     pub(super) result: ToolResult,
     pub(super) outcome: CallOutcome,
     pub(super) reason: Option<String>,
+    /// The tool plane proved the run's own scope or its parent ended.
+    pub(super) scope_end: Option<String>,
     /// The refusal detail a received call's outcome records with its `reason` (see
     /// [`DispatchResult::Refused`]).
     pub(super) detail: Option<Value>,
@@ -23,6 +25,7 @@ impl From<(ToolResult, CallOutcome)> for Resolved {
             result,
             outcome,
             reason: None,
+            scope_end: None,
             detail: None,
             hooks: None,
             yielded_by: None,
@@ -33,8 +36,8 @@ impl From<(ToolResult, CallOutcome)> for Resolved {
 /// A call's result and outcome from what the tool plane said:
 /// - a result is the tool's own answer;
 /// - never sent is safe: the model gets an error result and may try again;
-/// - sent with no result may have had its effect: the model gets an error result, the outcome
-///   is unknown, and the run stops.
+/// - sent with no result may have had its effect: the result warns the model before it acts on
+///   the call again.
 pub(super) fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, CallOutcome) {
     let error = |message: String| ToolResult {
         tool_call_id: call.tool_call_id.clone(),
@@ -50,12 +53,10 @@ pub(super) fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, C
             CallOutcome::Completed,
         ),
         DispatchResult::SentButOutcomeUnknown { reason } => (
-            error(format!(
-                "tool outcome unknown (interrupted for review): {reason}"
-            )),
+            broca_core::tool_results::live_outcome_unknown_result(&call.tool_call_id, &reason),
             CallOutcome::Unknown,
         ),
-        // Never sent, so the refusal is definite: the model sees it and the run goes on.
+        // Never sent, so the refusal is definite even if the scope's state cannot be proved.
         DispatchResult::ScopeDrained {
             reason,
             sent: false,
@@ -65,10 +66,10 @@ pub(super) fn resolve(call: &ToolCall, result: DispatchResult) -> (ToolResult, C
         ),
         // Sent with no result: the side effect may have applied, as with any lost reply.
         DispatchResult::ScopeDrained { reason, sent: true } => (
-            error(format!(
-                "tool outcome unknown (interrupted for review): its route was drained \
-                 ({reason}) after the call was sent"
-            )),
+            broca_core::tool_results::live_outcome_unknown_result(
+                &call.tool_call_id,
+                &format!("its route closed ({reason})"),
+            ),
             CallOutcome::Unknown,
         ),
     }

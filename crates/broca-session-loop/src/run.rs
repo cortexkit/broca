@@ -2326,19 +2326,14 @@ where
         )
         .await?
         {
-            BatchOutcome::Closed { interrupted: false } => {}
-            BatchOutcome::Closed { interrupted: true } => {
-                return finish_in_doubt(writer, seams, &admission.run_id).await;
+            BatchOutcome::Closed => {}
+            BatchOutcome::ScopeEnded { reason, closed } => {
+                return finish_scope_ended(writer, seams, &admission.run_id, reason, &closed).await;
             }
             BatchOutcome::Held(finished) | BatchOutcome::Stopped(finished) => return Ok(finished),
             BatchOutcome::Cancelled(closed) => {
                 let finished =
                     finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await?;
-                withdraw(seams, &closed).await;
-                return Ok(finished);
-            }
-            BatchOutcome::InDoubt(closed) => {
-                let finished = finish_in_doubt(writer, seams, &admission.run_id).await?;
                 withdraw(seams, &closed).await;
                 return Ok(finished);
             }
@@ -3486,19 +3481,14 @@ where
         )
         .await?
         {
-            BatchOutcome::Closed { interrupted: false } => {}
-            BatchOutcome::Closed { interrupted: true } => {
-                return finish_in_doubt(writer, seams, &admission.run_id).await;
+            BatchOutcome::Closed => {}
+            BatchOutcome::ScopeEnded { reason, closed } => {
+                return finish_scope_ended(writer, seams, &admission.run_id, reason, &closed).await;
             }
             BatchOutcome::Held(finished) | BatchOutcome::Stopped(finished) => return Ok(finished),
             BatchOutcome::Cancelled(closed) => {
                 let finished =
                     finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled).await?;
-                withdraw(seams, &closed).await;
-                return Ok(finished);
-            }
-            BatchOutcome::InDoubt(closed) => {
-                let finished = finish_in_doubt(writer, seams, &admission.run_id).await?;
                 withdraw(seams, &closed).await;
                 return Ok(finished);
             }
@@ -4491,20 +4481,19 @@ pub(crate) struct Known {
 
 /// How a tool batch ended.
 enum BatchOutcome {
-    /// Every call has its outcome; `interrupted` when the run must stop for review after the
-    /// batch: a call may have run without its result coming back (feeding that call's failure
-    /// to the model would invite it to run the call again), or the batch's scope was gone when
-    /// it started, so none of its calls could run and later ones won't either.
-    Closed { interrupted: bool },
+    /// Every call has a durable outcome; the run proceeds to its next step boundary.
+    Closed,
+    /// The run's scope ended. The batch has closed and the run cannot start another step.
+    ScopeEnded {
+        reason: String,
+        closed: Vec<ProviderHeldReply>,
+    },
     /// Only calls a provider holds were still waiting, so the run paused for their late
     /// results.
     Held(Finished),
     /// The caller cancelled while a provider held calls: they were closed and the run must end
     /// cancelled, then ask each provider to withdraw its call.
     Cancelled(Vec<ProviderHeldReply>),
-    /// A call's outcome is unknown while a provider held others: they were closed and the run
-    /// must end interrupted for review, then ask each provider to withdraw its call.
-    InDoubt(Vec<ProviderHeldReply>),
     /// A stop or the caller's cancel cut a pre-tool hook short: the batch closed unsent and
     /// the run ended.
     Stopped(Finished),
@@ -4562,12 +4551,20 @@ where
         .batch_started_guarded(&ctx, planned, manifest, &guard)
         .await
         .err();
-    // The scope was gone when the batch started: each call gets its `route_drained` result
-    // (`plan_call`) and the run stops interrupted after the batch.
-    let scope_drained = matches!(
-        refusal,
-        Some(broca_core::tool_plane::ToolPlaneError::ScopeDrained { .. })
-    );
+    use broca_core::tool_plane::ToolPlaneError;
+    // An unscoped run can use a scoped tool route without itself owning that scope.
+    // Losing that route does not end the run.
+    let scope_end = ctx.scope.as_ref().and_then(|_| {
+        refusal
+            .as_ref()
+            .and_then(ToolPlaneError::ended_scope_reason)
+            .map(str::to_owned)
+    });
+    let drained = scope_end
+        .as_ref()
+        .map(|reason| ToolPlaneError::ScopeDrained {
+            reason: reason.clone(),
+        });
     // A resumed batch runs in the order its first dispatch did. Only its unanswered calls are
     // given here, and the call that made it sequential may already be answered; a held call
     // recorded whether later calls wait for it, and they still do.
@@ -4607,7 +4604,7 @@ where
     let Some(plans) = plan_calls(
         &mut calls,
         known,
-        refusal.as_ref(),
+        drained.as_ref().or(refusal.as_ref()),
         manifest,
         seams.approval,
         hooks,
@@ -4801,8 +4798,12 @@ where
         if let Some(changes) = changes {
             changes.tell(writer, seams).await;
         }
-        return Ok(BatchOutcome::Closed {
-            interrupted: scope_drained,
+        return Ok(match scope_end {
+            Some(reason) => BatchOutcome::ScopeEnded {
+                reason,
+                closed: Vec::new(),
+            },
+            None => BatchOutcome::Closed,
         });
     }
     // The calls that are sent, with their keys: a known call's from its intent, a new call's
@@ -4836,13 +4837,16 @@ where
             approved: false,
         })
         .collect();
-    if !registrations.is_empty() {
+    let registration_error = if registrations.is_empty() {
+        None
+    } else {
         seams
             .tools
             .register_dispatch_group(&ctx, &registrations)
             .await
-            .map_err(|error| LoopError::Tools(format!("late-results registration: {error}")))?;
-    }
+            .err()
+            .map(|error| format!("late-results registration: {error}"))
+    };
 
     let held: Vec<Option<&ProviderHeldReply>> = sending
         .iter()
@@ -4853,6 +4857,8 @@ where
         calls: &sending,
         keys: &keys,
         held: &held,
+        registration_error: registration_error.as_deref(),
+        scope_end,
         guard: &guard,
         batch_id: &batch_id,
         run_id,
@@ -4871,35 +4877,32 @@ where
         spend,
     )
     .await?;
-    let (answers, paused, closed) = match dispatched {
-        Dispatched::All { answers, closed } => (answers, false, closed),
-        Dispatched::Held(answers) => (answers, true, Vec::new()),
-    };
     // Calls a provider still holds. A synthesized terminal for a repeat of one of their ids
     // waits until the held call's own result is stored: an outcome names only its id, and
     // reading the session back gives it to the first copy still open, which would be the held
     // call.
-    let still_held: std::collections::HashSet<&ToolCallId> = sending
-        .iter()
-        .zip(&answers)
-        .filter(|(_, answer)| answer.is_none())
-        .map(|(call, _)| &call.tool_call_id)
-        .collect();
+    let (still_held, closed, scope_end) = match dispatched {
+        Dispatched::All { closed, scope_end } => {
+            (std::collections::HashSet::new(), closed, scope_end)
+        }
+        Dispatched::Held(settled) => (
+            sending
+                .iter()
+                .zip(settled)
+                .filter(|(_, done)| !done)
+                .map(|(call, _)| &call.tool_call_id)
+                .collect(),
+            Vec::new(),
+            None,
+        ),
+    };
     // The answers, back in the message's order, with each synthesized terminal in its place.
-    let mut answers = answers.into_iter();
     let mut records = Vec::new();
-    let mut unknown = false;
     for plan in &plans {
         match plan {
             // Its answer was appended when it arrived.
-            CallPlan::Dispatch(_) => {
-                let Some(answer) = answers.next().flatten() else {
-                    continue;
-                };
-                unknown |= answer.outcome == CallOutcome::Unknown;
-            }
-            CallPlan::Synthetic { result, .. }
-                if paused && still_held.contains(&result.tool_call_id) => {}
+            CallPlan::Dispatch(_) => {}
+            CallPlan::Synthetic { result, .. } if still_held.contains(&result.tool_call_id) => {}
             CallPlan::Synthetic { result, reason } => terminal_with_reason(
                 &mut records,
                 run_id,
@@ -4912,7 +4915,7 @@ where
             CallPlan::NoDispatch(..) | CallPlan::HookTerminal { .. } => {}
         }
     }
-    if paused {
+    if !still_held.is_empty() {
         // The answers that came in are durable before the run pauses; the batch stays open.
         if !records.is_empty() {
             writer.append(&records, true).await?;
@@ -4979,17 +4982,37 @@ where
     if let Some(changes) = changes {
         changes.tell(writer, seams).await;
     }
-    if !closed.is_empty() {
-        // Held calls close on the caller's cancel, or because another call's outcome is unknown.
-        return Ok(if unknown && !seams.cancel.is_cancelled() {
-            BatchOutcome::InDoubt(closed)
-        } else {
-            BatchOutcome::Cancelled(closed)
-        });
+    if let Some(reason) = scope_end {
+        return Ok(BatchOutcome::ScopeEnded { reason, closed });
     }
-    Ok(BatchOutcome::Closed {
-        interrupted: unknown || scope_drained,
-    })
+    if !closed.is_empty() {
+        return Ok(BatchOutcome::Cancelled(closed));
+    }
+    Ok(BatchOutcome::Closed)
+}
+
+/// The host scope ended, so stop after recording its batch's results and before another model step.
+async fn finish_scope_ended<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    scope_end: String,
+    closed: &[ProviderHeldReply],
+) -> Result<Finished, LoopError> {
+    let reason = if seams.cancel.is_cancelled() {
+        RunFinishReason::Cancelled
+    } else {
+        RunFinishReason::Interrupted
+    };
+    let mut end = run_end(writer, run_id, reason, (seams.now_ms)());
+    if let Record::RunEnd(end) = &mut end {
+        if reason == RunFinishReason::Interrupted {
+            end.interrupt_reason = Some(scope_end);
+        }
+    }
+    append_end(writer, run_id, vec![end]).await?;
+    withdraw(seams, closed).await;
+    Ok(finished(writer, reason))
 }
 
 /// A call that was never sent: its no-dispatch result in the transcript and its reason in
@@ -5575,6 +5598,7 @@ async fn post_tool(
         result,
         outcome: CallOutcome::Completed,
         reason,
+        scope_end: None,
         detail: None,
         hooks: hooks.map(|hooks| serde_json::to_value(hooks).expect("hook metadata serializes")),
         yielded_by: None,
@@ -5742,30 +5766,6 @@ async fn finish_idle<W: Writer, P, T>(
     }
     records.push(run_end(writer, &admission.run_id, reason, (seams.now_ms)()));
     append_end(writer, &admission.run_id, records).await?;
-    Ok(finished(writer, reason))
-}
-
-/// Ends a run whose batch left a call that may have run without its result: the call is never
-/// sent again, so the run stops. The caller's cancel ends it cancelled, since interrupted names a
-/// stop nobody asked for; the runner's shutdown ends it interrupted, saying so, as a stop at a
-/// boundary does; anything else ends it interrupted.
-async fn finish_in_doubt<W: Writer, P, T>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    run_id: &str,
-) -> Result<Finished, LoopError> {
-    let reason = if seams.cancel.is_cancelled() {
-        RunFinishReason::Cancelled
-    } else {
-        RunFinishReason::Interrupted
-    };
-    let mut record = run_end(writer, run_id, reason, (seams.now_ms)());
-    if let Record::RunEnd(end) = &mut record {
-        if reason == RunFinishReason::Interrupted && seams.stop.is_cancelled() {
-            end.interrupt_reason = Some("runner_shutdown".into());
-        }
-    }
-    append_end(writer, run_id, vec![record]).await?;
     Ok(finished(writer, reason))
 }
 
