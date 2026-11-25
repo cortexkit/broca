@@ -340,7 +340,7 @@ struct Head {
 pub struct ForkManager {
     runtime: Arc<StoreRuntime>,
     clock: broca_core::Clock,
-    leases: broca_core::FileLeaseStore,
+    leases: broca_core::SessionLeaseStore,
     /// The forks some operation holds open, by their session's address.
     open: Arc<OpenForks>,
     /// Where each fork attempt's model call is published as a step event, when anywhere.
@@ -351,7 +351,7 @@ impl ForkManager {
     /// Serves forks of the sessions `runtime` keeps, dated by `clock`: the clock retention
     /// decides by, so a test that moves it moves fork expiry too.
     pub fn new(runtime: Arc<StoreRuntime>, clock: broca_core::Clock) -> Self {
-        let leases = broca_core::FileLeaseStore::new(runtime.state_root().join("leases"));
+        let leases = broca_core::session_leases(runtime.state_root());
         Self {
             runtime,
             clock,

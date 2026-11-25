@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use broca_core::FileLeaseStore;
 use broca_module::LineageRegistry;
 use broca_module_serve::{
     spawn_catalog_poll, CatalogPoller, ChargeBasisTable, ConsumerRoutes, ServeEnd, ServeIoError,
@@ -344,7 +343,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             "could not publish the backup catalog; continuing to serve: {error}"
         );
     }
-    let lease_store = Arc::new(FileLeaseStore::new(state_root.join("leases")));
+    let lease_store = Arc::new(broca_core::session_leases(&state_root));
     // The session classes whose new sessions start in the backed-up root.
     let backup_class_names = backup_classes.0.clone();
 

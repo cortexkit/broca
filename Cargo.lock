@@ -1107,11 +1107,12 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-lease"
-version = "0.1.2"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d02256247fecd266c7d853cf63d85270367abce9925e52c9ee01ac4994ed2293"
+checksum = "d6bd0f48720cdf58eac7ad5ac253ab4db8d93891b0d49ecd639c1f34db14c1d7"
 dependencies = [
  "fs2",
+ "libc",
  "windows-sys 0.61.2",
 ]
 

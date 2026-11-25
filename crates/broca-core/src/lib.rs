@@ -108,7 +108,10 @@ pub use import::{
     ImportError, ImportOrigin, ImportOutcome, ImportRequest, IMPORT_MAX_MESSAGES,
     IMPORT_MAX_SERIALIZED_BYTES,
 };
-pub use lease::{lease_key_for, FileLeaseStore, LeaseError, LeaseHandle, LeaseStore};
+pub use lease::{
+    lease_key_for, session_lease_file, session_leases, FileLeaseStore, LeaseError, LeaseHandle,
+    LeaseStore, SessionLeaseStore,
+};
 pub use projection::Cursor;
 pub use provider::{Provider, StubProvider};
 

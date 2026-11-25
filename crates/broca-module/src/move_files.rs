@@ -4,7 +4,7 @@ use crate::{
     cut_state::{refusal, CutArtifacts, CutGuard, CutState},
     registry::{LineageRegistry, MoveSessionGuard},
 };
-use broca_core::{FileLeaseStore, LeaseHandle, LeaseStore};
+use broca_core::{LeaseHandle, LeaseStore};
 use broca_protocol::BindIdentity;
 use broca_records::move_fence::{self, Freeze, Moved};
 use broca_wire::agent_data::{errors::ErrorBody, refs::Refs, request::Request, Op};
@@ -135,7 +135,7 @@ pub struct FileCutArtifacts {
     /// Where a moved-in session's row is written before it is published, so a later move
     /// finds it by its ref.
     refs: Arc<dyn broca_core::SessionRefIndex>,
-    leases: FileLeaseStore,
+    leases: broca_core::SessionLeaseStore,
     driver: Arc<dyn MoveDriver>,
     plans: Arc<Mutex<HashMap<String, LockedPlans>>>,
 }
@@ -226,7 +226,7 @@ impl FileCutArtifacts {
         driver: Arc<dyn MoveDriver>,
     ) -> Self {
         Self {
-            leases: FileLeaseStore::new(state_root.join("leases")),
+            leases: broca_core::session_leases(&state_root),
             state_root,
             registry,
             refs,

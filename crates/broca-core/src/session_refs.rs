@@ -106,14 +106,18 @@ impl ProjectionRepair {
 /// addresses a different session. Every store computes it here, so a log line, a folder and an
 /// index row always agree.
 pub fn session_addr(session: &BindIdentity) -> String {
-    let key = format!(
+    joined_triple_addr(&format!(
         "{}\u{1f}{}\u{1f}{}",
         session.project_root.display(),
         session.harness,
         session.session
-    );
+    ))
+}
+
+/// [`session_addr`] of a triple already joined by U+001F, as a session's lease key holds it.
+pub(crate) fn joined_triple_addr(joined: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in key.as_bytes() {
+    for b in joined.as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
