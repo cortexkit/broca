@@ -32,7 +32,7 @@ PASS call_yield_marked_message_does_not_yield
 PASS call_yield_unmarked_sender_does_not_yield
 PASS call_yield_held_reply_never_pauses
 PASS call_yield_late_result_is_notice
-N/A call_yield_steer_stored_before_waiting: adapter supplies no scripted call-yield provider
+PASS call_yield_steer_stored_before_waiting
 PASS call_yield_stop_never_withdraws
 PASS fork_answer_base_matches_digest
 N/A fork_answer_refuses_mismatched_base: fork_answer_refuses_mismatched_base requires revert_session: broca serves no transcript revert

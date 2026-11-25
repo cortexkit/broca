@@ -1312,6 +1312,7 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
         let handle = ctx.route_handle();
         if let Some(outcome) =
             held_late_results::answer_yield(&self.shared, (handle.channel, handle.epoch), &request)
+                .await
         {
             return outcome;
         }
@@ -2129,6 +2130,18 @@ impl BrocaSubject {
     /// The records of `session`'s open log on `live`'s state root.
     async fn records(&self, live: &Live, session: &str) -> Vec<Record> {
         stored_log::stored_records(&live.state_root, &self.bind_identity(session)).await
+    }
+
+    async fn call_yield_records(&self, session: &str) -> Result<Vec<Record>, HarnessError> {
+        let root = self
+            .shared
+            .session_roots
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .ok_or_else(|| HarnessError::new(format!("no state root for session {session}")))?;
+        Ok(stored_log::stored_records(&root, &self.bind_identity(session)).await)
     }
 
     /// Whether `session`'s log holds exactly the durable state `point` names: what must be
@@ -4032,19 +4045,36 @@ impl LlmRunnerSubject for BrocaSubject {
         held_late_results::await_held_reply(&self.shared, arguments).await
     }
 
-    /// The provider keeps the call open until broca asks it to hand back. A provider that
-    /// withholds its answer to that request isn't scripted here, so that case doesn't apply.
     async fn install_call_yield(
         &self,
         session: &str,
         arguments: &Value,
         block_answer: bool,
     ) -> Result<bool, HarnessError> {
-        if block_answer {
-            return Ok(false);
-        }
-        held_late_results::install_call_yield(&self.shared, session, arguments);
+        held_late_results::install_call_yield(&self.shared, session, arguments, block_answer);
         Ok(true)
+    }
+
+    async fn send_staged(&self, session: &str, send_id: &str) -> Result<(), HarnessError> {
+        if held_late_results::yields_session(&self.shared, session) {
+            // The conformance suite releases the first yield when the second steer is staged.
+            // Read the store because the send's reply can wait for delivery.
+            broca_test_support::wait_until("the steer is durably staged", || async {
+                let records = self
+                    .call_yield_records(session)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if held_late_results::note_staged_steer(&self.shared, session, send_id, &records) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no durable steer with send id {send_id} in {session}"
+                    ))
+                }
+            })
+            .await;
+        }
+        Ok(())
     }
 
     /// The yields and withdrawals the provider received for the call, and each notice the
@@ -4054,18 +4084,12 @@ impl LlmRunnerSubject for BrocaSubject {
         &self,
         session: &str,
         arguments: &Value,
-        _send_id: &str,
+        send_id: &str,
     ) -> Result<cortexkit_role_llm_runner_conformance::CallYieldObservation, HarnessError> {
-        let (call_key, yield_requests, withdraw_requests) =
-            held_late_results::yields_seen(&self.shared, arguments);
-        let root = self
-            .shared
-            .session_roots
-            .lock()
-            .unwrap()
-            .get(session)
-            .cloned()
-            .ok_or_else(|| HarnessError::new(format!("no state root for session {session}")))?;
+        let records = self.call_yield_records(session).await?;
+        held_late_results::note_staged_steer(&self.shared, session, send_id, &records);
+        let mut observation =
+            held_late_results::yields_seen(&self.shared, session, arguments, send_id);
         // A notice is durable once it is in the conversation: an input message (a steer, or
         // the input of a run it started on an idle session) followed by the facts that name
         // its sender and marks. Read those, as `session.read` serves them with display facts.
@@ -4084,7 +4108,7 @@ impl LlmRunnerSubject for BrocaSubject {
         // A queued send names its module sender on the `DeliveryOrdered` record written just
         // before it, as a principal; take the module id out of it.
         let mut ordered_by: std::collections::HashMap<String, String> = Default::default();
-        for record in stored_log::stored_records(&root, &self.bind_identity(session)).await {
+        for record in records {
             match record {
                 Record::DeliveryOrdered(ordered) => {
                     let sender = match ordered
@@ -4143,11 +4167,6 @@ impl LlmRunnerSubject for BrocaSubject {
                 _ => {}
             }
         }
-        let mut observation =
-            cortexkit_role_llm_runner_conformance::CallYieldObservation::default();
-        observation.call_key = call_key;
-        observation.yield_requests = yield_requests;
-        observation.withdraw_requests = withdraw_requests;
         observation.notices = notices;
         Ok(observation)
     }
@@ -7261,6 +7280,75 @@ mod held_call_tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("the call is not held"));
+    }
+
+    #[tokio::test]
+    async fn blocked_yields_withhold_both_responses_until_each_call_is_released() {
+        use held_late_results::{answer_waiting_yield, answer_yield, note_bind, yields_seen};
+        use subc_client_rs::HandlerOutcome::Response;
+
+        let shared = Arc::new(Shared::default());
+        let subject = subject(shared.clone());
+        let session = "blocked-yields";
+        let route = (4, 1);
+        note_bind(&shared, route, Some(&["call-yield/v1".into()]));
+
+        let first = json!({"nonce":"first"});
+        let second = json!({"nonce":"second"});
+        for arguments in [&first, &second] {
+            assert!(subject
+                .install_call_yield(session, arguments, true)
+                .await
+                .unwrap());
+        }
+        let first_args = first.to_string();
+        let second_args = second.to_string();
+        let first_request = json!({"call_key":"one"});
+        let second_request = json!({"call_key":"two"});
+        let yield_request = |key| json!({"name":"tool.yield","arguments":{"call_key":key,"reason":"urgent_notice"}});
+        let first_yield = yield_request("one");
+        let second_yield = yield_request("two");
+        let first_final = answer_waiting_yield(&shared, route, &first_args, &first_request);
+        let second_final = answer_waiting_yield(&shared, route, &second_args, &second_request);
+        let first_answer = answer_yield(&shared, route, &first_yield);
+        let second_answer = answer_yield(&shared, route, &second_yield);
+        tokio::pin!(first_final, second_final, first_answer, second_answer);
+        assert!(futures::poll!(&mut first_final).is_pending());
+        assert!(futures::poll!(&mut second_final).is_pending());
+        assert!(futures::poll!(&mut first_answer).is_pending());
+        assert!(futures::poll!(&mut second_answer).is_pending());
+        for (args, expected) in [(&first, &first_yield), (&second, &second_yield)] {
+            let observation = yields_seen(&shared, session, args, "steer");
+            assert_eq!(&observation.yield_requests, std::slice::from_ref(expected));
+            assert!(observation.first_yield_answer_sequence.is_none());
+            assert!(observation.steer_stored_sequence.is_none());
+        }
+        for (args, mut answer, mut final_frame) in [
+            (&first, first_answer, first_final),
+            (&second, second_answer, second_final),
+        ] {
+            assert!(futures::poll!(&mut answer).is_pending());
+            assert!(futures::poll!(&mut final_frame).is_pending());
+            subject.release_call_yield(args).await.unwrap();
+            let std::task::Poll::Ready(Some(Response(answer))) = futures::poll!(answer) else {
+                panic!("released yield must answer");
+            };
+            let std::task::Poll::Ready(Some(Response(final_frame))) = futures::poll!(final_frame)
+            else {
+                panic!("released call must finish with a held frame");
+            };
+            assert_eq!(
+                serde_json::from_slice::<Value>(&answer).unwrap(),
+                json!({"answer":"accepted"})
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&final_frame).unwrap()["held"]["yielded"],
+                true
+            );
+            assert!(yields_seen(&shared, session, args, "steer")
+                .first_yield_answer_sequence
+                .is_some());
+        }
     }
 }
 

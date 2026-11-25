@@ -23,14 +23,25 @@ const INCARNATION: &str = "conformance-provider-1";
 /// The interim content of every held reply. It must never reach the model.
 const INTERIM: &str = "HELD INTERIM: the answer comes later";
 
+struct WaitingYield {
+    route: (u16, u32),
+    requested: tokio::sync::oneshot::Sender<()>,
+    blocked: Option<Arc<HoldGate>>,
+}
+
 /// The scripted provider's held calls and its `late_results` feed.
 #[derive(Default)]
 pub(super) struct FeedState {
     yield_sessions: BTreeSet<String>,
-    yield_arguments: BTreeSet<String>,
+    /// Whether each yieldable call (keyed by its minted arguments) withholds its answer.
+    yield_arguments: HashMap<String, bool>,
     yield_routes: BTreeSet<(u16, u32)>,
-    waiting_yields: HashMap<String, ((u16, u32), tokio::sync::oneshot::Sender<()>)>,
+    waiting_yields: HashMap<String, WaitingYield>,
     yield_requests: Vec<Value>,
+    /// One observation order for store reads and provider answers, not the store's log order.
+    yield_sequence: u64,
+    staged_steers: HashMap<(String, String), u64>,
+    yield_answers: HashMap<String, u64>,
     withdrawals: Vec<Value>,
     /// The catalog declares `late_results` and `tool-result/v1`, and calls in `hold` are held.
     enabled: bool,
@@ -150,7 +161,7 @@ pub(super) fn note_bind(shared: &Shared, route: (u16, u32), capabilities: Option
     }
 }
 
-pub(super) fn answer_yield(
+pub(super) async fn answer_yield(
     shared: &Shared,
     route: (u16, u32),
     request: &Value,
@@ -168,15 +179,30 @@ pub(super) fn answer_yield(
     );
     assert!(request.get("call_key").is_none());
     let key = request["arguments"]["call_key"].as_str().unwrap();
-    let mut feed = shared.held_feed.lock().unwrap();
-    feed.yield_requests.push(request.clone());
-    let answer = if feed
-        .waiting_yields
-        .get(key)
-        .is_some_and(|(own_route, _)| *own_route == route)
-    {
-        let (_, sender) = feed.waiting_yields.remove(key).unwrap();
-        sender.send(()).unwrap();
+    let accepted = {
+        let mut feed = shared.held_feed.lock().unwrap();
+        feed.yield_requests.push(request.clone());
+        if feed
+            .waiting_yields
+            .get(key)
+            .is_some_and(|call| call.route == route)
+        {
+            let call = feed.waiting_yields.remove(key).unwrap();
+            // Signal receipt before observers can see the request and release the call.
+            call.requested.send(()).unwrap();
+            Some(call.blocked)
+        } else {
+            None
+        }
+    };
+    let answer = if let Some(blocked) = accepted {
+        if let Some(gate) = blocked {
+            HoldGate::wait(&gate.released, &gate.released_wake).await;
+        }
+        let mut feed = shared.held_feed.lock().unwrap();
+        feed.yield_sequence += 1;
+        let sequence = feed.yield_sequence;
+        feed.yield_answers.entry(key.to_owned()).or_insert(sequence);
         "accepted"
     } else {
         "unknown_call"
@@ -194,22 +220,32 @@ pub(super) async fn answer_waiting_yield(
     arguments: &str,
     request: &Value,
 ) -> Option<subc_client_rs::HandlerOutcome> {
-    let (receiver, key) = {
+    let gate = shared.holds.lock().unwrap().get(arguments).cloned();
+    let (mut requested, key, blocked) = {
         let mut feed = shared.held_feed.lock().unwrap();
-        if !feed.yield_arguments.contains(arguments) || !feed.yield_routes.contains(&route) {
+        if !feed.yield_routes.contains(&route) {
             return None;
         }
+        let block_answer = *feed.yield_arguments.get(arguments)?;
+        let blocked = block_answer.then(|| gate.clone().expect("blocked yield has a release gate"));
         let key = request["call_key"]
             .as_str()
             .expect("yieldable call is keyed")
             .to_owned();
         feed.held_keys.insert(arguments.to_owned(), key.clone());
-        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (sender, requested) = tokio::sync::oneshot::channel();
         assert!(feed
             .waiting_yields
-            .insert(key.clone(), (route, sender))
+            .insert(
+                key.clone(),
+                WaitingYield {
+                    route,
+                    requested: sender,
+                    blocked: blocked.clone(),
+                },
+            )
             .is_none());
-        (receiver, key)
+        (requested, key, blocked)
     };
     *shared
         .invocations
@@ -217,21 +253,27 @@ pub(super) async fn answer_waiting_yield(
         .unwrap()
         .entry(arguments.to_owned())
         .or_default() += 1;
-    // A call the suite holds shows as arrived, and its release ends the wait without a yield:
-    // the provider then answers it as any finished call, with its scripted result.
-    let gate = shared.holds.lock().unwrap().get(arguments).cloned();
+    // If released without a yield request, finish as an ordinary call. Once a yield was
+    // accepted, release must allow the held final frame instead.
     match gate {
         Some(gate) => {
             HoldGate::set(&gate.arrived, &gate.arrived_wake);
             tokio::select! {
-                yielded = receiver => yielded.expect("runner asked the live call to yield"),
+                yielded = &mut requested => yielded.expect("runner asked the live call to yield"),
                 () = HoldGate::wait(&gate.released, &gate.released_wake) => {
-                    shared.held_feed.lock().unwrap().waiting_yields.remove(&key);
-                    return None;
+                    if shared.held_feed.lock().unwrap().waiting_yields.remove(&key).is_some() {
+                        return None;
+                    }
+                    requested.await.expect("accepted yield was signalled");
                 }
             }
         }
-        None => receiver.await.expect("runner asked the live call to yield"),
+        None => requested
+            .await
+            .expect("runner asked the live call to yield"),
+    }
+    if let Some(gate) = blocked {
+        HoldGate::wait(&gate.released, &gate.released_wake).await;
     }
     Some(subc_client_rs::HandlerOutcome::Response(
         serde_json::to_vec(&json!({
@@ -1349,11 +1391,12 @@ async fn graceful_restart_yields_running_tool_and_resumes_same_run_once() {
         return;
     }
     let case = HeldCase::new("held-yield-graceful-restart").await;
-    {
-        let mut feed = case.subject.shared.held_feed.lock().unwrap();
-        feed.yield_sessions.insert(case.session.into());
-        feed.yield_arguments.insert(case.call.arguments.to_string());
-    }
+    install_call_yield(
+        &case.subject.shared,
+        case.session,
+        &case.call.arguments,
+        false,
+    );
     let live = case.subject.spawn(&case.root).await.unwrap();
     let route = case.send(&live).await;
     let key = await_held_reply(&case.subject.shared, &case.call.arguments)
@@ -1438,13 +1481,26 @@ async fn graceful_restart_yields_running_tool_and_resumes_same_run_once() {
     case.finish();
 }
 
-/// Arm the call with `arguments` in `session` to hand back on request (llm-runner
-/// `call_yield`): the provider declares `call.yield/v1` and late results to that session's
-/// routes, and keeps the call open until broca asks it to yield or the suite releases it.
-pub(super) fn install_call_yield(shared: &Shared, session: &str, arguments: &Value) {
+/// Arm a waiting call. Blocked yields share the call's existing release gate, so the kit's
+/// `release_call_yield` can use its default `release_tool_call` without releasing another call.
+pub(super) fn install_call_yield(
+    shared: &Shared,
+    session: &str,
+    arguments: &Value,
+    block_answer: bool,
+) {
     mark_call_yield_session(shared, session);
+    let arguments = arguments.to_string();
+    if block_answer {
+        shared
+            .holds
+            .lock()
+            .unwrap()
+            .entry(arguments.clone())
+            .or_default();
+    }
     let mut feed = shared.held_feed.lock().unwrap();
-    feed.yield_arguments.insert(arguments.to_string());
+    feed.yield_arguments.insert(arguments, block_answer);
 }
 
 /// Declare late results and `call.yield/v1` to `session`'s routes.
@@ -1455,9 +1511,45 @@ pub(super) fn mark_call_yield_session(shared: &Shared, session: &str) {
     feed.yield_sessions.insert(session.into());
 }
 
-/// What the provider saw of the call with `arguments`: its key, and the yields and withdrawals
-/// broca asked for it.
-pub(super) fn yields_seen(shared: &Shared, arguments: &Value) -> (String, Vec<Value>, Vec<Value>) {
+/// Record an observation only after the reader finds the exact steer's durable admission.
+pub(super) fn note_staged_steer(
+    shared: &Shared,
+    session: &str,
+    send_id: &str,
+    records: &[Record],
+) -> bool {
+    // An ordered steer first lands as a queued send; it need not have reached a step boundary.
+    let ordered = records.windows(2).any(|pair| {
+        matches!(pair, [Record::DeliveryOrdered(order), Record::QueuedSend(queued)]
+            if order.submission_id == queued.submission_id
+                && order.order["modes"][0] == "steer"
+                && queued.send_id.as_deref() == Some(send_id))
+    });
+    let found = ordered
+        || records.iter().any(|record| match record {
+            Record::Steer(steer) => steer
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.parse()["send_id"] == send_id),
+            _ => false,
+        });
+    if found {
+        let mut feed = shared.held_feed.lock().unwrap();
+        feed.yield_sequence += 1;
+        let sequence = feed.yield_sequence;
+        feed.staged_steers
+            .entry((session.into(), send_id.into()))
+            .or_insert(sequence);
+    }
+    found
+}
+
+pub(super) fn yields_seen(
+    shared: &Shared,
+    session: &str,
+    arguments: &Value,
+    send_id: &str,
+) -> cortexkit_role_llm_runner_conformance::CallYieldObservation {
     let feed = shared.held_feed.lock().unwrap();
     let key = feed
         .held_keys
@@ -1471,9 +1563,14 @@ pub(super) fn yields_seen(shared: &Shared, arguments: &Value) -> (String, Vec<Va
             .cloned()
             .collect::<Vec<_>>()
     };
-    (
-        key.clone(),
-        of_call(&feed.yield_requests),
-        of_call(&feed.withdrawals),
-    )
+    let mut observation = cortexkit_role_llm_runner_conformance::CallYieldObservation::default();
+    observation.yield_requests = of_call(&feed.yield_requests);
+    observation.withdraw_requests = of_call(&feed.withdrawals);
+    observation.steer_stored_sequence = feed
+        .staged_steers
+        .get(&(session.into(), send_id.into()))
+        .copied();
+    observation.first_yield_answer_sequence = feed.yield_answers.get(&key).copied();
+    observation.call_key = key;
+    observation
 }
