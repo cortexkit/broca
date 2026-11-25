@@ -1,4 +1,4 @@
-//! Shares the first run's frozen tools and plan with the reader that adds a send's baseline.
+//! Shares the first run's tool names and plan facts with the reader that adds a send's baseline.
 
 use std::sync::{Arc, OnceLock};
 
@@ -47,15 +47,11 @@ impl Admission {
                 );
             }
         }
-        let _ = self.0.set(FirstEpisodeV1 {
-            run_id: broca_protocol::RunId(first.run_id.clone()),
-            tool_names: admission
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect(),
-            manifest: admission.manifest,
-        });
+        let _ = self.0.set(FirstEpisodeV1::new(
+            broca_protocol::RunId(admission.run_id),
+            &admission.tools,
+            admission.manifest.as_deref(),
+        ));
         Ok(())
     }
 }

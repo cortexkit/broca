@@ -352,6 +352,61 @@ pub struct PlanManifest {
     pub declarations: Vec<FrozenDeclaration>,
 }
 
+/// The facts a session keeps about the fetch plan its first run froze. It does not keep the
+/// decoded tool schemas or system text from the manifest or any provider answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenPlan {
+    pub plan: OpaqueJson,
+    pub plan_identity: String,
+    pub composition_digest: String,
+    pub fetches: Vec<FrozenFetch>,
+}
+
+/// A provider's fetch facts reported in the session baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenFetch {
+    pub provider: String,
+    pub outcome: FrozenFetchOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrozenFetchOutcome {
+    Answered { catalog_digest: String },
+    Absent { reason: String },
+}
+
+impl PlanManifest {
+    pub fn frozen_plan(&self) -> FrozenPlan {
+        FrozenPlan {
+            plan: self.plan.clone(),
+            plan_identity: self.plan_identity.clone(),
+            composition_digest: self.composition_digest.clone(),
+            fetches: self
+                .fetches
+                .iter()
+                .filter_map(|fetch| {
+                    let outcome = match &fetch.outcome {
+                        FetchOutcome::Answered { catalog_digest, .. } => {
+                            FrozenFetchOutcome::Answered {
+                                catalog_digest: catalog_digest.clone(),
+                            }
+                        }
+                        FetchOutcome::Absent { reason } => FrozenFetchOutcome::Absent {
+                            reason: reason.clone(),
+                        },
+                        // An outcome this build cannot interpret contributes no baseline item.
+                        FetchOutcome::Unknown => return None,
+                    };
+                    Some(FrozenFetch {
+                        provider: fetch.provider.clone(),
+                        outcome,
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A provider's `transform.declare` answer frozen at admission, never fetched again on resume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenDeclaration {

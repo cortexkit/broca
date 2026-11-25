@@ -24,9 +24,9 @@ pub mod session_change;
 mod compaction_tests;
 
 pub use admit::{
-    admit, baseline_facts, compose, join_system_texts, Admitted, BaselineFacts, DescribeAnswer,
-    FetchError, Fetcher, PlanAdmitter, ADMISSION_DEADLINE, CATALOG_OP, DECLARE_OP, JOIN_SEPARATOR,
-    JOIN_VERSION,
+    admit, baseline_facts, baseline_facts_from_plan, compose, join_system_texts, Admitted,
+    BaselineFacts, DescribeAnswer, FetchError, Fetcher, PlanAdmitter, ADMISSION_DEADLINE,
+    CATALOG_OP, DECLARE_OP, JOIN_SEPARATOR, JOIN_VERSION,
 };
 pub use plan::{
     check_later_plan, check_send_members, check_send_members_with, check_zone,

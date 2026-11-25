@@ -786,7 +786,10 @@ pub(crate) fn supported_rungs() -> cortexkit_role_llm_runner::baseline::Rungs {
 pub(crate) fn planned_baseline(
     manifest: &broca_records::record::PlanManifest,
 ) -> broca_wire::BaselineWire {
-    let facts = broca_fetch_plan::baseline_facts(manifest);
+    planned_baseline_wire(broca_fetch_plan::baseline_facts(manifest))
+}
+
+fn planned_baseline_wire(facts: broca_fetch_plan::BaselineFacts) -> broca_wire::BaselineWire {
     let json =
         |value: serde_json::Result<serde_json::Value>| value.expect("a baseline item is JSON");
     broca_wire::BaselineWire::planned(
@@ -2813,13 +2816,9 @@ impl ServeHandler for crate::LineageRegistry {
                 None => Ok(None),
             };
         }
-        // A session outside the session store has no run starts to read here: its ownership
-        // keeps the first episode's manifest.
-        Ok(self
-            .session_ownership_for_bind(session)
-            .await
-            .and_then(|ownership| ownership.first_episode)
-            .and_then(|first| first.manifest))
+        // No stored session existed at the lookup. Re-reading ownership could find a newly
+        // created session whose first episode is not the requested run.
+        Ok(None)
     }
 
     async fn authorize_session(
@@ -3223,8 +3222,8 @@ impl ServeHandler for crate::LineageRegistry {
             Some(ownership) => PlanState::Admitted {
                 frozen: ownership
                     .first_episode
-                    .and_then(|first| first.manifest)
-                    .map(|manifest| manifest.plan_identity.clone()),
+                    .and_then(|first| first.plan)
+                    .map(|plan| plan.plan_identity.clone()),
             },
         }
     }
@@ -3249,17 +3248,17 @@ impl ServeHandler for crate::LineageRegistry {
         self.session_ownership_for_bind(session)
             .await
             .and_then(|ownership| ownership.first_episode)
-            .and_then(|first| first.manifest)
-            .is_some_and(|manifest| broca_core::hooks::has_transforms(&manifest))
+            .and_then(|first| first.plan)
+            .is_some_and(|plan| broca_core::hooks::has_transforms(&plan.plan))
     }
 
     async fn frozen_plan_requires_approval(&self, session: &LineageKey) -> bool {
         self.session_ownership_for_bind(session)
             .await
             .and_then(|ownership| ownership.first_episode)
-            .and_then(|first| first.manifest)
-            .and_then(|manifest| {
-                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
+            .and_then(|first| first.plan)
+            .and_then(|frozen| {
+                serde_json::from_str::<serde_json::Value>(frozen.plan.as_json_text()).ok()
             })
             .and_then(|plan| {
                 plan.get("step_transform_items")
@@ -3724,8 +3723,10 @@ impl ServeHandler for crate::LineageRegistry {
         self.first_episode(session)
             .filter(|first| &first.run_id == run_id)
             .map(|first| {
-                let mut baseline = match &first.manifest {
-                    Some(manifest) => planned_baseline(manifest),
+                let mut baseline = match first.plan {
+                    Some(plan) => planned_baseline_wire(
+                        broca_fetch_plan::baseline_facts_from_plan(&plan, first.tool_names),
+                    ),
                     None => broca_wire::BaselineWire::plan_less(first.tool_names),
                 };
                 baseline.cache = self

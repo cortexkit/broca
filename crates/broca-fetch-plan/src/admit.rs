@@ -14,8 +14,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use broca_protocol::request::{ExecutionMode, Tool};
 use broca_records::{
-    record::FetchOutcome, record::FrozenDeclaration, record::FrozenProviderDeclarations,
-    record::FrozenResultFormat, record::OpaqueJson, record::PlanManifest, record::ProviderFetch,
+    record::FetchOutcome, record::FrozenDeclaration, record::FrozenFetchOutcome,
+    record::FrozenPlan, record::FrozenProviderDeclarations, record::FrozenResultFormat,
+    record::OpaqueJson, record::PlanManifest, record::ProviderFetch,
 };
 use cortexkit_role_llm_runner::baseline::{AbsentItem, BaselineItem};
 use cortexkit_role_step_transform_provider::subscription::{
@@ -1777,15 +1778,27 @@ pub struct BaselineFacts {
 
 /// The [`BaselineFacts`] of `manifest`.
 pub fn baseline_facts(manifest: &PlanManifest) -> BaselineFacts {
+    baseline_facts_from_plan(
+        &manifest.frozen_plan(),
+        manifest
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect(),
+    )
+}
+
+/// The same baseline from the plan facts and ordered tool names kept by an idle session.
+pub fn baseline_facts_from_plan(frozen: &FrozenPlan, tool_names: Vec<String>) -> BaselineFacts {
     let mut items = Vec::new();
     let mut absent_items = Vec::new();
-    let plan: Value = serde_json::from_str(manifest.plan.as_json_text()).expect("frozen JSON plan");
-    for fetch in &manifest.fetches {
+    let plan: Value = serde_json::from_str(frozen.plan.as_json_text()).expect("frozen JSON plan");
+    for fetch in &frozen.fetches {
         match &fetch.outcome {
-            FetchOutcome::Answered { catalog_digest, .. } => {
+            FrozenFetchOutcome::Answered { catalog_digest } => {
                 items.push(BaselineItem::new(&fetch.provider, catalog_digest))
             }
-            FetchOutcome::Absent { reason } => {
+            FrozenFetchOutcome::Absent { reason } => {
                 let (reason, provider_code) = match Unanswered::from_absence(reason) {
                     crate::refusal::AbsenceReason::Known(unanswered) => (
                         unanswered.reason().to_owned(),
@@ -1809,18 +1822,13 @@ pub fn baseline_facts(manifest: &PlanManifest) -> BaselineFacts {
                     }
                 }
             }
-            FetchOutcome::Unknown => {}
         }
     }
     BaselineFacts {
         items,
         absent_items,
-        composition_digest: manifest.composition_digest.clone(),
-        tool_names: manifest
-            .tools
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect(),
+        composition_digest: frozen.composition_digest.clone(),
+        tool_names,
     }
 }
 
@@ -1832,6 +1840,42 @@ mod tests {
     use super::*;
     use crate::plan::parse_plan;
     use async_trait::async_trait;
+
+    #[test]
+    fn frozen_plan_keeps_the_manifest_baseline() {
+        let plan = json!({
+            "tool_items": [{"provider": "files"}, {"provider": "optional"}],
+            "system_text_items": [{"provider": "optional"}]
+        });
+        let tool = |name| {
+            json!({
+                "name": name, "description": "a tool", "input_schema": {"type": "object"}
+            })
+        };
+        let manifest: PlanManifest = serde_json::from_value(json!({
+            "plan": plan.to_string(), "plan_identity": "identity", "composition_digest": "composition",
+            "fetches": [
+                {"provider": "files", "catalog_digest": "catalog", "tools": [tool("write"), tool("read")]},
+                {"provider": "optional", "absent": "timeout"},
+                {"provider": "unknown"}
+            ],
+            "tools": [tool("write"), tool("read")], "system_text": "", "system_digest": "system",
+            "join_version": 1, "role_versions": {}
+        })).unwrap();
+        let facts =
+            baseline_facts_from_plan(&manifest.frozen_plan(), vec!["write".into(), "read".into()]);
+        assert_eq!(facts, baseline_facts(&manifest));
+        assert_eq!(facts.items, vec![BaselineItem::new("files", "catalog")]);
+        assert_eq!(facts.composition_digest, "composition");
+        assert_eq!(facts.tool_names, ["write", "read"]);
+        assert_eq!(
+            json!(facts.absent_items),
+            json!([
+                {"provider":"optional", "kind":"tool", "reason":"timeout"},
+                {"provider":"optional", "kind":"system_text", "reason":"timeout"}
+            ])
+        );
+    }
 
     fn item(provider: &str, optional: bool) -> Item {
         Item {

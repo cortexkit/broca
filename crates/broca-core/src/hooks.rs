@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use broca_protocol::BindIdentity;
-use broca_records::{record::HookOp, record::Hooks, record::PlanManifest};
+use broca_records::{record::HookOp, record::Hooks, record::OpaqueJson, record::PlanManifest};
 pub use cortexkit_role_step_transform_provider::{
     answer::HookAnswer,
     hook::{HookCall, Subject},
@@ -62,8 +62,8 @@ pub struct HookPlan {
     result_ops: std::collections::HashMap<String, Vec<Op>>,
 }
 
-pub fn has_transforms(manifest: &PlanManifest) -> bool {
-    serde_json::from_str::<Value>(manifest.plan.as_json_text())
+pub fn has_transforms(plan: &OpaqueJson) -> bool {
+    serde_json::from_str::<Value>(plan.as_json_text())
         .ok()
         .and_then(|plan| {
             plan.get("step_transform_items")

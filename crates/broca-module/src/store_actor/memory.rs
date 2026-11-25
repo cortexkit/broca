@@ -5,6 +5,7 @@
 
 use broca_core::FirstEpisodeV1;
 use broca_protocol::request::{CallOptions, Tool};
+use broca_records::record::FrozenFetchOutcome;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::held::{serde_heap_bytes, HeldBytes};
 use broca_wire::{MemoryHolders, MemorySession};
@@ -29,10 +30,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let request_in_flight = request.as_deref().map_or(0, request_bytes);
         let media_fold = self.media.held_bytes();
         let first_episode = self.admission.known();
-        let mut setup = first_episode.map_or_else(Vec::new, setup_of);
-        if let Some(request) = &request {
-            setup.push(tools_held(&request.tools, None));
-        }
+        let setup = request
+            .iter()
+            .map(|request| tools_held(&request.tools))
+            .collect();
         let rest = std::mem::size_of::<Self>()
             + session.rest
             + self.fanout.as_ref().map_or(0, |fanout| fanout.held_bytes())
@@ -96,7 +97,7 @@ pub(super) fn request_bytes(options: &CallOptions) -> usize {
 }
 
 /// A decoded tool list, named by its tools' names and size so equal lists group together.
-fn tools_held(tools: &std::sync::Arc<Vec<Tool>>, plan: Option<&str>) -> SetupHeld {
+fn tools_held(tools: &std::sync::Arc<Vec<Tool>>) -> SetupHeld {
     let bytes = 2 * std::mem::size_of::<usize>()
         + std::mem::size_of::<Vec<Tool>>()
         + tools.capacity() * std::mem::size_of::<Tool>()
@@ -104,55 +105,35 @@ fn tools_held(tools: &std::sync::Arc<Vec<Tool>>, plan: Option<&str>) -> SetupHel
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
     SetupHeld {
         kind: "tools",
-        content: format!("{}:{bytes}:{}", plan.unwrap_or(""), names.join(",")),
+        content: format!("{bytes}:{}", names.join(",")),
         copy: std::sync::Arc::as_ptr(tools) as usize,
         bytes,
     }
 }
 
-/// The parts of a frozen plan manifest a session's first episode keeps decoded.
-fn setup_of(first: &FirstEpisodeV1) -> Vec<SetupHeld> {
-    let Some(manifest) = &first.manifest else {
-        return Vec::new();
-    };
-    let plan = manifest.composition_digest.as_str();
-    let copy = std::sync::Arc::as_ptr(manifest) as usize;
-    let tools = tools_held(&manifest.tools, Some(plan));
-    let system = manifest.system_text.heap_bytes();
-    // The manifest besides its tool list and system text, which have rows of their own.
-    let rest = 2 * std::mem::size_of::<usize>()
-        + std::mem::size_of_val(&**manifest)
-        + serde_heap_bytes(&manifest.rich_ui)
-        + serde_heap_bytes(&manifest.plan)
-        + manifest.plan_identity.heap_bytes()
-        + manifest.composition_digest.heap_bytes()
-        + serde_heap_bytes(&manifest.fetches)
-        + manifest.system_digest.heap_bytes()
-        + manifest.role_versions.heap_bytes()
-        + serde_heap_bytes(&manifest.declarations);
-    vec![
-        SetupHeld {
-            kind: "plan_manifest",
-            content: plan.to_owned(),
-            copy,
-            bytes: rest,
-        },
-        SetupHeld {
-            kind: "system_text",
-            content: plan.to_owned(),
-            copy,
-            bytes: system,
-        },
-        // The manifest's tool list matches across sessions on one plan even when the tools
-        // were decoded twice, so the plan names it.
-        SetupHeld {
-            content: plan.to_owned(),
-            ..tools
-        },
-    ]
-}
-
-/// The first episode besides the manifest it shares, which the setup parts count.
+/// The first episode's own facts, not shared decoded setup parts.
 fn first_episode_bytes(first: &FirstEpisodeV1) -> usize {
-    first.run_id.0.heap_bytes() + first.tool_names.heap_bytes()
+    first.run_id.0.heap_bytes()
+        + first.tool_names.heap_bytes()
+        + first.plan.as_deref().map_or(0, |plan| {
+            2 * std::mem::size_of::<usize>()
+                + std::mem::size_of_val(plan)
+                + plan.plan.as_json_text().len()
+                + plan.plan_identity.heap_bytes()
+                + plan.composition_digest.heap_bytes()
+                + slots(&plan.fetches)
+                + plan
+                    .fetches
+                    .iter()
+                    .map(|fetch| {
+                        fetch.provider.heap_bytes()
+                            + match &fetch.outcome {
+                                FrozenFetchOutcome::Answered { catalog_digest } => {
+                                    catalog_digest.heap_bytes()
+                                }
+                                FrozenFetchOutcome::Absent { reason } => reason.heap_bytes(),
+                            }
+                    })
+                    .sum::<usize>()
+        })
 }

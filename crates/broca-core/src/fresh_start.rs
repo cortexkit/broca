@@ -123,7 +123,7 @@ pub fn admitted_hook_plan(
     hook_plane_installed: bool,
 ) -> Result<Option<crate::hooks::HookPlan>, RunError> {
     let hook_plan = plan
-        .filter(|manifest| crate::hooks::has_transforms(manifest))
+        .filter(|manifest| crate::hooks::has_transforms(&manifest.plan))
         .map(|manifest| crate::hooks::HookPlan::from_manifest(manifest))
         .transpose()
         .map_err(RunError::Log)?;

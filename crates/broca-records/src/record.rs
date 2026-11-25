@@ -22,8 +22,9 @@ pub use crate::vault_facts::{
 
 mod plan_manifest;
 pub use plan_manifest::{
-    FetchOutcome, FrozenDeclaration, FrozenHoldArgument, FrozenProviderDeclarations,
-    FrozenReferenceSlot, FrozenReply, FrozenResultFormat, OpaqueJson, PlanManifest, ProviderFetch,
+    FetchOutcome, FrozenDeclaration, FrozenFetch, FrozenFetchOutcome, FrozenHoldArgument,
+    FrozenPlan, FrozenProviderDeclarations, FrozenReferenceSlot, FrozenReply, FrozenResultFormat,
+    OpaqueJson, PlanManifest, ProviderFetch,
 };
 mod compaction;
 pub use compaction::{

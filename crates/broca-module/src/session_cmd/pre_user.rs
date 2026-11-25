@@ -38,7 +38,8 @@ pub(crate) fn input_transforms(
     manifest: Option<&broca_records::record::PlanManifest>,
     plane: Option<Arc<dyn broca_core::HookPlane>>,
 ) -> Result<Option<InputTransforms>, SendOutcome> {
-    let Some(manifest) = manifest.filter(|manifest| broca_core::hooks::has_transforms(manifest))
+    let Some(manifest) =
+        manifest.filter(|manifest| broca_core::hooks::has_transforms(&manifest.plan))
     else {
         return Ok(None);
     };

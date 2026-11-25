@@ -5,8 +5,8 @@
 //! The budget is the one `.cortexkit/internal-docs/designs/session-storage/27-memory-shape.md`
 //! sets: an idle open session holds at most `1.2 x W + 400 B x messages`, where `W` is the
 //! window's messages as compact JSON; a session inside a provider call holds that plus the
-//! request's bytes, plus its compaction entries until they share content with its messages; and
-//! sessions on one plan hold its tool list once. Each limit below is today's measure plus 10%,
+//! request's bytes, plus its compaction entries until they share content with its messages. An
+//! idle actor need not hold its plan's decoded tools. Each limit below is today's measure plus 10%,
 //! with today's measure and the design's target beside it. A change that lowers a holder lowers
 //! its limit; none may raise one.
 //!
@@ -47,13 +47,6 @@ const IDLE_TOTAL: u64 = 1_814;
 /// the window, 1.115. Target: the request's bytes and nothing else on a session without
 /// compaction entries, about 1,000.
 const IN_CALL_ABOVE_IDLE: u64 = 2_991;
-
-/// Decoded copies of one plan's tool list held by `PLAN_SESSIONS` idle sessions on it: each
-/// session's first episode would decode its own, but the decoded setup parts are shared through
-/// the process. Today: 1. Target: 1.
-const PLAN_TOOL_COPIES: u64 = 1;
-/// Sessions in the shared-setup measure.
-const PLAN_SESSIONS: usize = 4;
 
 /// How far an estimate may be from what the allocator measured, in percent.
 const ESTIMATE_TOLERANCE: u64 = 15;
@@ -294,80 +287,93 @@ fn an_actor_inside_a_provider_call_holds_no_more_than_its_budget() {
     runtime.block_on(async { drop(served.await) });
 }
 
-/// Idle sessions on one plan share one decoded copy of its tool list: the report counts the
-/// copies, and the count stays within its budget.
-#[test]
-fn sessions_on_one_plan_hold_no_more_copies_of_its_tool_list_than_the_budget() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+#[tokio::test]
+async fn an_idle_planned_actor_releases_its_first_run_manifest_and_tools() {
     let parts = SharedParts::new(Box::new(MemoryParts::default()));
-    let manifest = plan_manifest("plan-1", serde_json::json!({}));
-    let (answers, _actors) = runtime.block_on(async {
-        // Each actor stays open until every answer is in, so no two copies share an address.
-        let (mut answers, mut actors) = (Vec::new(), Vec::new());
-        for n in 0..PLAN_SESSIONS {
-            let backend: &'static MemoryBackend = Box::leak(Box::default());
-            let session = Session::create(
-                backend,
-                SessionAddr(ADDR.into()),
-                triple(),
-                &deployment(),
-                false,
-            )
-            .await
-            .unwrap();
-            let executor = Arc::new(executor(vec![text_step(&format!("a{n}"), "hello")], None));
-            let actor = StoreActor::new(bind(), session, executor.clone(), Box::new(parts.clone()));
-            let (sender, receiver) = mpsc::unbounded_channel();
-            let commands = Commands::over(sender, backend);
-            let served = tokio::spawn(actor.serve(receiver));
-            assert!(matches!(
-                send_planned(
-                    &commands,
-                    &format!("r{n}"),
-                    untooled("first"),
-                    "plan-1",
-                    Some(manifest.clone())
-                )
-                .await,
-                SendOutcome::Active { .. }
-            ));
-            idle(&commands).await;
-            drop(commands);
-            drop(served.await.unwrap());
-            // Opened again, as a module opens a session it serves: the actor learns the first
-            // episode from the session's records.
-            let session =
-                Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
-                    .await
-                    .unwrap();
-            let actor = StoreActor::new(bind(), session, executor, Box::new(parts.clone()));
-            actor
-                .admission
-                .learn(&actor.session, &actor.parts, &actor.key, None)
-                .unwrap();
-            answers.push(actor.memory());
-            actors.push(actor);
-        }
-        (answers, actors)
+    let mut manifest = plan_manifest("plan-1", serde_json::json!({}));
+    manifest.fetches.push(broca_records::ProviderFetch {
+        provider: "files".into(),
+        outcome: broca_records::FetchOutcome::Answered {
+            catalog_digest: "catalog".into(),
+            tools: Arc::clone(&manifest.tools),
+            text: Some("provider text".into()),
+            result_ops: None,
+            reply: None,
+            declarations_frozen: None,
+            reference_slots: None,
+        },
     });
-    let report = crate::memory_report::assemble(answers, 0, Default::default(), Default::default());
-    let tools = report
-        .setup_parts
-        .iter()
-        .find(|part| part.kind == "tools")
-        .expect("the plan's tool list is held");
-    eprintln!("{:?}", report.setup_parts);
-    assert_eq!(tools.sessions, PLAN_SESSIONS as u64);
-    assert!(
-        tools.decoded_copies <= PLAN_TOOL_COPIES,
-        "{PLAN_SESSIONS} sessions on one plan hold {} decoded copies of its tool list, over the \
-         limit of {PLAN_TOOL_COPIES}: {:?}",
-        tools.decoded_copies,
-        report.setup_parts
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let session = Session::create(
+        backend,
+        SessionAddr(ADDR.into()),
+        triple(),
+        &deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    let runner = Arc::new(executor(vec![text_step("a1", "hello")], None));
+    let actor = StoreActor::new(bind(), session, runner, Box::new(parts.clone()));
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let commands = Commands::over(sender, backend);
+    let served = tokio::spawn(actor.serve(receiver));
+    assert!(matches!(
+        send_planned(&commands, "r1", untooled("first"), "plan-1", Some(manifest)).await,
+        SendOutcome::Active { .. }
+    ));
+    idle(&commands).await;
+    drop(commands);
+    drop(served.await.unwrap());
+
+    // Reopen from the settled run's records and keep the actor alive after it learns admission.
+    let session = Session::load(backend, SessionAddr(ADDR.into()), &triple(), &deployment())
+        .await
+        .unwrap();
+    let actor = StoreActor::new(
+        bind(),
+        session,
+        Arc::new(executor(vec![], None)),
+        Box::new(parts),
     );
+    let start = actor.session.operations.owner.first_start.as_ref().unwrap();
+    let decoded = broca_session_loop::run::frozen_manifest(start, &actor.parts)
+        .unwrap()
+        .unwrap();
+    let broca_records::FetchOutcome::Answered { tools: fetched, .. } = &decoded.fetches[0].outcome
+    else {
+        panic!("the provider answered at admission");
+    };
+    assert_eq!(decoded.tools.len(), 2);
+    assert_eq!(fetched.len(), 2);
+    let (manifest, tools, fetched) = (
+        Arc::downgrade(&decoded),
+        Arc::downgrade(&decoded.tools),
+        Arc::downgrade(fetched),
+    );
+    actor
+        .admission
+        .learn(&actor.session, &actor.parts, &actor.key, None)
+        .unwrap();
+    drop(decoded);
+
+    assert_eq!(
+        actor.admission.known().unwrap().tool_names,
+        ["read", "edit"]
+    );
+    assert!(
+        manifest.upgrade().is_none(),
+        "the idle actor still holds its first run's decoded manifest"
+    );
+    assert!(
+        tools.upgrade().is_none(),
+        "the model's tools are still held"
+    );
+    assert!(
+        fetched.upgrade().is_none(),
+        "the provider's tools are still held"
+    );
+    assert!(actor.memory().setup.is_empty());
 }
 
 /// The estimates the memory report makes of a live projection, an image index and a request in

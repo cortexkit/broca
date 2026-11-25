@@ -57,7 +57,7 @@ impl Default for HeadProjection {
 pub fn head_senders(
     manifest: &broca_records::record::PlanManifest,
 ) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
-    let mut senders = crate::admission::manifest_senders(manifest);
+    let mut senders = crate::admission::plan_senders(&manifest.plan);
     for sender in &mut senders {
         sender.templates.clear();
     }

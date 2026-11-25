@@ -32,7 +32,7 @@ pub fn sender_manifest(
 pub fn senders(operations: &Operations, parts: &dyn Parts) -> Result<Vec<PlanSender>, String> {
     Ok(sender_manifest(operations, parts)?
         .as_deref()
-        .map(broca_core::admission::manifest_senders)
+        .map(|manifest| broca_core::admission::plan_senders(&manifest.plan))
         .unwrap_or_default())
 }
 

@@ -7,9 +7,12 @@
 use std::sync::Arc;
 
 use broca_protocol::{
-    canonical_json_bytes, content::Message, request::SubmissionRequest, BindPrincipal, RunId,
-    SessionScope,
+    canonical_json_bytes,
+    content::Message,
+    request::{SubmissionRequest, Tool},
+    BindPrincipal, RunId, SessionScope,
 };
+use broca_records::record::{FrozenPlan, OpaqueJson, PlanManifest};
 use serde::{Deserialize, Serialize};
 
 fn logical_input(request: &SubmissionRequest) -> std::borrow::Cow<'_, [Message]> {
@@ -520,7 +523,7 @@ pub struct SessionOwnershipV1 {
     /// identity; unchanged sessions omit this field and retain their original checkpoint bytes.
     /// Older summaries also omit it because their episodes shared the first manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_manifest: Option<Arc<broca_records::record::PlanManifest>>,
+    pub latest_manifest: Option<Arc<PlanManifest>>,
     /// Whether the log contains session-change facts. False is omitted so unrefreshed logs
     /// retain their old checkpoint bytes and admission need not probe for change records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -530,7 +533,7 @@ pub struct SessionOwnershipV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_admission: Option<SenderAdmissionV1>,
     /// Whether this summary was folded by a build that records the first episode's frozen
-    /// plan manifest (`FirstEpisodeV1::manifest`). A summary stored by an older build, or
+    /// plan manifest. A summary stored by an older build, or
     /// re-stored by one after a rollback, lacks it and may have dropped a manifest, so it is
     /// treated like a summary that does not exist: admission folds the session's whole log
     /// instead of building on it.
@@ -573,10 +576,26 @@ pub struct FirstEpisodeV1 {
     pub run_id: RunId,
     /// The model-facing names of the tools the episode was admitted with, in their order.
     pub tool_names: Vec<String>,
-    /// The plan manifest the episode froze, when the session was admitted with a fetch plan.
-    /// Later episodes retain it until a session refresh applies a new manifest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<Arc<broca_records::record::PlanManifest>>,
+    /// The first episode's plan facts, derived in memory from its stored start.
+    #[serde(skip)]
+    pub plan: Option<Arc<FrozenPlan>>,
+}
+
+impl FirstEpisodeV1 {
+    /// Capture the first run's baseline without retaining its decoded setup. The planned
+    /// baseline names the manifest's tools in manifest order; only a plan-less one uses the
+    /// run's own tool list.
+    pub fn new(run_id: RunId, tools: &[Tool], manifest: Option<&PlanManifest>) -> Self {
+        Self {
+            run_id,
+            tool_names: manifest
+                .map_or(tools, |manifest| manifest.tools.as_slice())
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect(),
+            plan: manifest.map(|manifest| Arc::new(manifest.frozen_plan())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -585,11 +604,11 @@ pub struct SenderAdmissionV1 {
     pub accepted_senders: Option<Vec<cortexkit_role_llm_runner::delivery_order::PlanSender>>,
 }
 
-/// The senders a session's frozen plan manifest grants, as admission reads them.
-pub fn manifest_senders(
-    manifest: &broca_records::record::PlanManifest,
+/// The senders a session's frozen plan grants, as admission reads them.
+pub fn plan_senders(
+    plan: &OpaqueJson,
 ) -> Vec<cortexkit_role_llm_runner::delivery_order::PlanSender> {
-    serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text())
+    serde_json::from_str::<serde_json::Value>(plan.as_json_text())
         .ok()
         .and_then(|plan| {
             plan.as_object()
@@ -607,15 +626,16 @@ impl SessionOwnershipV1 {
             .and_then(|fold| fold.accepted_senders.clone())
             .unwrap_or_else(|| {
                 self.latest_manifest
-                    .as_deref()
-                    .or_else(|| self.first_episode.as_ref()?.manifest.as_deref())
-                    .map(manifest_senders)
+                    .as_ref()
+                    .map(|manifest| &manifest.plan)
+                    .or_else(|| Some(&self.first_episode.as_ref()?.plan.as_ref()?.plan))
+                    .map(plan_senders)
                     .unwrap_or_default()
             })
     }
 
-    /// Identity-only state for cancel/retract checks. The first episode also carries tool
-    /// names and provider-supplied text, so it must not enter a long-lived owner cache.
+    /// Identity-only state for cancel/retract checks. The owner cache does not need tool
+    /// names or plan facts.
     pub fn for_owner_access(&self) -> Self {
         Self {
             episodes: self.episodes,

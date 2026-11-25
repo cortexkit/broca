@@ -29,9 +29,9 @@ pub(crate) async fn upload(
         ownership
             .first_episode
             .as_ref()
-            .and_then(|episode| episode.manifest.as_ref())
-            .and_then(|manifest| {
-                serde_json::from_str::<serde_json::Value>(manifest.plan.as_json_text()).ok()
+            .and_then(|episode| episode.plan.as_ref())
+            .and_then(|frozen| {
+                serde_json::from_str::<serde_json::Value>(frozen.plan.as_json_text()).ok()
             })
             .and_then(|plan| {
                 plan.as_object()

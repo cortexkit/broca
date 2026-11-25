@@ -5,7 +5,7 @@
 //! session from a `SessionOwnershipV1`. This builds that summary from the fold so a session
 //! in the session store is judged by the rules in `broca_core::scope_admission`.
 
-use broca_core::admission::SessionOwnershipV1;
+use broca_core::admission::{FirstEpisodeV1, SessionOwnershipV1};
 use broca_session_store::fold::operations::Owner;
 
 /// The owner summary `owner` holds, as `SessionOwnershipV1::for_owner_access` gives it: who
@@ -37,7 +37,7 @@ pub fn ownership(owner: &Owner) -> Result<SessionOwnershipV1, String> {
     .for_owner_access())
 }
 
-/// [`ownership`] plus the first run's tools and fetch-plan manifest (`first_episode`), read
+/// [`ownership`] plus the first run's tool names and plan facts (`first_episode`), read
 /// back from the setup parts the first run's start names, as `SessionOwnershipV1` carries them
 /// for `route.bind` and the plan checks. `latest_manifest` stays absent: before a refresh every
 /// run freezes the first run's manifest, and after one [`ownership_with_plan`] carries the
@@ -54,15 +54,11 @@ pub fn ownership_with_first_episode(
     {
         let admission = crate::run::admission_of_start(first, parts)
             .map_err(|error| format!("the first run's start: {error:?}"))?;
-        summary.first_episode = Some(broca_core::admission::FirstEpisodeV1 {
-            run_id: broca_protocol::RunId(admission.run_id.clone()),
-            tool_names: admission
-                .tools
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect(),
-            manifest: admission.manifest,
-        });
+        summary.first_episode = Some(FirstEpisodeV1::new(
+            broca_protocol::RunId(admission.run_id),
+            &admission.tools,
+            admission.manifest.as_deref(),
+        ));
     }
     Ok(summary)
 }
