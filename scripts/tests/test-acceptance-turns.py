@@ -224,13 +224,43 @@ class ScopedTrafficTests(unittest.TestCase):
             self.commands.append(command)
             params = json.loads(command[-1])
             page = ({"messages": self.messages[:1], "next_from_ordinal": 2, "history_version": 1}
-                    if params["from_ordinal"] == 1 else {"messages": self.messages[1:], "history_version": 1})
+                    if params.get("from_ordinal") == 1 else {"messages": self.messages[1:], "history_version": 1})
             return subprocess.CompletedProcess(command, 0, json.dumps({"result": page}), "")
 
         with patch.object(scoped, "invoke", side_effect=reply):
             status, output = self.wait()
         self.assertEqual(status, 0, output)
+        # The newest page first, then the page before it for the call that the result answers.
+        self.assertNotIn("from_ordinal", json.loads(self.commands[0][-1]))
+        self.assertEqual(json.loads(self.commands[1][-1])["from_ordinal"], 1)
         self.assertEqual(json.loads(self.commands[1][-1])["history_version"], 1)
+
+    def test_new_storage_reads_only_back_to_the_restart(self):
+        # A long history: only its newest page holds messages written after the restart, so
+        # the check reads that page alone, never the history before it.
+        self.store()
+        old = {"ordinal": 1, "written_at": 50, "message": {"role": "user", "content": []}}
+        for message, ordinal in zip(self.messages, (1000, 1001)):
+            message["ordinal"] = ordinal
+        self.messages[0]["written_at"] = 99
+        self.messages.insert(0, old)
+        original = self.reply
+
+        def reply(command, timeout):
+            if command[command.index("--op") + 1] != "session.read":
+                return original(command, timeout)
+            self.commands.append(command)
+            params = json.loads(command[-1])
+            rows = self.messages[1:] if "from_ordinal" not in params else self.messages[:1]
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps({"result": {"messages": rows, "history_version": 1}}), "")
+
+        with patch.object(scoped, "invoke", side_effect=reply):
+            status, output = self.wait()
+        self.assertEqual(status, 0, output)
+        reads = [command for command in self.commands
+                 if command[command.index("--op") + 1] == "session.read"]
+        self.assertEqual(len(reads), 1, reads)
 
 
 class DeployScopedTests(unittest.TestCase):
@@ -420,6 +450,29 @@ class StoreWorkerTrafficTests(WorkerTrafficFixture):
                 self.assertIn("class=sidekick", output)
                 self.assertEqual(len(self.commands), 3)
                 self.commands.clear()
+
+    def test_store_sessions_not_written_since_the_last_poll_are_not_asked_again(self):
+        # A session that holds no worker run is asked about once, then not again until its log
+        # is written: each question costs the daemon a read of the session, every poll.
+        self.store()
+        self.admission["session_class"] = "head"
+
+        class Stop(Exception):
+            pass
+
+        sleeps = []
+
+        def sleep(_):
+            sleeps.append(1)
+            if len(sleeps) == 2:
+                raise Stop
+
+        with patch.object(self.worker, "invoke", side_effect=self.reply), \
+                patch.object(self.worker.time, "monotonic", return_value=0), \
+                patch.object(self.worker.time, "sleep", side_effect=sleep), \
+                self.assertRaises(Stop):
+            self.wait(timeout=600)
+        self.assertEqual(len(self.commands), 3, self.commands)
 
     def test_store_missing_frozen_declarations_fails(self):
         self.store()

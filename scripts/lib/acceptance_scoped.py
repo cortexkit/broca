@@ -88,24 +88,38 @@ def query(base, op, params, deadline):
         raise ValueError(f"{op}: invalid daemon reply") from error
 
 
-def read_messages(base, deadline):
-    messages, ordinal, version = [], 1, None
+PAGE = 500
+
+
+def read_messages(base, deadline, after_ms):
+    """The session's messages from its newest back to the first one written by `after_ms`: the
+    newest page, then older pages only while the oldest message read is newer than the restart.
+    Reading a head's whole history instead cost the daemon a full decode of the session for every old
+    page while the head was running, every poll, for the length of the check."""
+    messages, version, params = [], None, {"limit": PAGE}
     while True:
-        params = {"from_ordinal": ordinal, "limit": 500, "include_display_facts": True}
+        params["include_display_facts"] = True
         if version is not None:
             params["history_version"] = version
         page = query(base, "session.read", params, deadline)
         rows = page["messages"]
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise ValueError("session.read: invalid messages")
-        messages.extend(rows)
+        messages[:0] = rows
         version = page.get("history_version")
-        next_ordinal = page.get("next_from_ordinal")
-        if next_ordinal is None:
+        if not rows:
             return messages
-        if not isinstance(next_ordinal, int) or isinstance(next_ordinal, bool) or next_ordinal <= ordinal:
-            raise ValueError("session.read: invalid continuation")
-        ordinal = next_ordinal
+        oldest = rows[0]
+        ordinal, written = oldest.get("ordinal"), oldest.get("written_at")
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 1:
+            raise ValueError("session.read: invalid ordinal")
+        # A message with no write time, or one written by the restart, ends the walk back: the
+        # results the check counts were all written after the restart.
+        if (ordinal == 1 or not isinstance(written, int) or isinstance(written, bool)
+                or written <= after_ms):
+            return messages
+        start = max(1, ordinal - PAGE)
+        params = {"from_ordinal": start, "limit": ordinal - start}
 
 
 def store_scope(admission, run_id, after_ms):
@@ -209,7 +223,7 @@ def scan_store(state_root, after_ms, session_bin, subc, deadline):
                     project, harness, session = binds[0]
                     base = [str(session_bin), "--subc", str(subc), "--project-root", project,
                             "--harness", harness, "--session", session]
-                    messages = read_messages(base, deadline)
+                    messages = read_messages(base, deadline, after_ms)
                     summaries[address] = summarize_store(base, messages, after_ms, deadline)
                 except ValueError as error:
                     unavailable[address] = str(error)

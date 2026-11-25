@@ -23,7 +23,8 @@ FINISH_REASONS = frozenset(("completed", "max_steps", "budget_exhausted", "conte
 
 
 def store_addresses(state_root, after_ms):
-    addresses = set()
+    """The sessions with a log written since `after_ms`, each with when it was last written."""
+    addresses = {}
     # Appending to an existing log changes the file mtime, not its folder's mtime.
     # Stat both; neither the encrypted head nor log bytes belong in this observer.
     for folder in ("session-store", "session-store-durable", "session-store-ephemeral"):
@@ -35,10 +36,11 @@ def store_addresses(state_root, after_ms):
                 continue
             if not (state_root / folder / "heads" / path.name / "head").is_file():
                 continue
-            if (path.stat().st_mtime_ns // 1_000_000 >= after_ms
-                    or any(log.stat().st_mtime_ns // 1_000_000 >= after_ms for log in path.iterdir()
-                           if re.fullmatch(r"[0-9a-f]{32}", log.name) and log.is_file())):
-                addresses.add(path.name)
+            written = max([path.stat().st_mtime_ns] + [
+                log.stat().st_mtime_ns for log in path.iterdir()
+                if re.fullmatch(r"[0-9a-f]{32}", log.name) and log.is_file()])
+            if written // 1_000_000 >= after_ms:
+                addresses[path.name] = written
     return addresses
 
 
@@ -67,8 +69,13 @@ def store_summary(admission, status, after_ms):
             "candidate": bool(aft), "reason": reason, "error": error}
 
 
-def scan_store_workers(state_root, after_ms, session_bin, subc, deadline):
+def scan_store_workers(state_root, after_ms, session_bin, subc, deadline, seen=None):
+    """The latest runs of the sessions written since `after_ms`. `seen` holds when each session
+    was last written as of an earlier scan, and is updated: a session not written since then is
+    not asked about again, since its latest run can't have changed. Each question costs the daemon a
+    read of the session, and a check polls for minutes."""
     summaries = {}
+    seen = {} if seen is None else seen
     try:
         addresses = store_addresses(state_root, after_ms)
     except OSError:
@@ -80,6 +87,8 @@ def scan_store_workers(state_root, after_ms, session_bin, subc, deadline):
         db = sqlite3.connect((state_root / "run-index.db").resolve().as_uri() + "?mode=ro", timeout=1, uri=True)
         try:
             for address in sorted(addresses):
+                if seen.get(address) == addresses[address]:
+                    continue
                 binds = db.execute("SELECT DISTINCT project_root,harness,session FROM agent_data_session_ref "
                                    "WHERE address=?", (address,)).fetchall()
                 if len(binds) != 1 or not all(isinstance(part, str) for part in binds[0]):
@@ -98,6 +107,7 @@ def scan_store_workers(state_root, after_ms, session_bin, subc, deadline):
                                          min(30, remaining)))["result"]
                 latest = (head.get("last_run_state") or {}).get("run_id")
                 if latest is None:
+                    seen[address] = addresses[address]
                     continue
                 if not isinstance(latest, str):
                     return summaries, {"unreadable_store_run_inventory"}
@@ -116,6 +126,7 @@ def scan_store_workers(state_root, after_ms, session_bin, subc, deadline):
                     summary = store_summary(admission, status, after_ms)
                     if summary is not None:
                         summaries[(address, run_id)] = summary
+                seen[address] = addresses[address]
         finally:
             db.close()
     except sqlite3.Error:
@@ -141,11 +152,12 @@ def worker_counts(observed):
 
 def wait_for_worker(state_root, after_ms, timeout=600, poll=5, *, session_bin=None, subc=None):
     deadline = time.monotonic() + timeout
-    observed = {}
+    observed, seen = {}, {}
     while True:
         # A zero wait still takes one snapshot, including bounded daemon reads.
         store_deadline = deadline if timeout else time.monotonic() + 30
-        store, unavailable = scan_store_workers(state_root, after_ms, session_bin, subc, store_deadline)
+        store, unavailable = scan_store_workers(state_root, after_ms, session_bin, subc, store_deadline,
+                                                seen)
         for key, summary in store.items():
             observed[key] = dict(summary, address=key[0])
         counts = worker_counts(observed)
