@@ -235,6 +235,10 @@ pub struct MemoryCache {
     /// session was written since that view loaded. Absent for other caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reloads: Option<u64>,
+    /// For the closed-session view cache: reads served a kept view, or a load another read had
+    /// already started, instead of loading one. Absent for other caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hits: Option<u64>,
     /// For the closed-session view cache: the same counts by the read or check that loaded each
     /// view (`run.result`, `session.read`, `expiry` and so on). Absent for other caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -273,4 +277,7 @@ pub struct ViewLoads {
     pub loaded_bytes: u64,
     /// Of those, the ones that replaced a kept view of a session written since.
     pub reloads: u64,
+    /// Reads for this reason served a kept view, or a load already started, instead of loading.
+    #[serde(default)]
+    pub hits: u64,
 }

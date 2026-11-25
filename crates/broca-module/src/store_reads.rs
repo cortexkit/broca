@@ -721,7 +721,9 @@ struct CacheInner<V> {
     /// Of those loads, the ones that replaced a view of the same session at an older position:
     /// the session was written since its view loaded.
     reloads: u64,
-    /// The same three counts per reason a view was loaded for (see [`ViewCache::view`]).
+    /// Reads served a kept view, or a load another read had started, instead of loading one.
+    hits: u64,
+    /// The same counts per reason a view was loaded for (see [`ViewCache::view`]).
     by_reason: std::collections::BTreeMap<&'static str, broca_wire::ViewLoads>,
     /// The same counts per session, with the reason of its latest load, for at most
     /// [`SESSIONS_COUNTED`] sessions: a new session pushes out the one whose loads read the
@@ -755,6 +757,7 @@ impl<V> Default for CacheInner<V> {
             loads: 0,
             loaded_bytes: 0,
             reloads: 0,
+            hits: 0,
             by_reason: Default::default(),
             by_session: HashMap::new(),
         }
@@ -866,6 +869,7 @@ impl<V: CachedBytes> ViewCache<V> {
                 Some(entry) if entry.position == position => {
                     entry.used = clock;
                     let cell = Arc::clone(&entry.cell);
+                    inner.count_hit(reason);
                     // A kept view's reads may have kept sealed entries and token counts since it
                     // was last served. A view whose load filled the cell but whose loader hasn't
                     // counted it yet is counted here, in full, and the loader then counts nothing.
@@ -966,6 +970,7 @@ impl<V: CachedBytes> ViewCache<V> {
             loads: Some(inner.loads),
             loaded_bytes: Some(inner.loaded_bytes),
             reloads: Some(inner.reloads),
+            hits: Some(inner.hits),
             loads_by_reason: Some(
                 inner
                     .by_reason
@@ -980,8 +985,9 @@ impl<V: CachedBytes> ViewCache<V> {
 
     /// The view kept for the session at `addr` at `position`, if one is, without loading or
     /// keeping one: for a read whose view is of no use to the next one, which still takes a view
-    /// loaded at the same position by an earlier read.
-    pub fn kept(&self, addr: &str, position: Position) -> Option<Arc<V>> {
+    /// loaded at the same position by an earlier read. `reason` names the read, as in
+    /// [`view`](Self::view).
+    pub fn kept(&self, addr: &str, position: Position, reason: &'static str) -> Option<Arc<V>> {
         let mut inner = self.inner.lock().unwrap();
         inner.clock += 1;
         let clock = inner.clock;
@@ -991,6 +997,7 @@ impl<V: CachedBytes> ViewCache<V> {
             .filter(|entry| entry.position == position)?;
         let view = Arc::clone(entry.cell.get()?);
         entry.used = clock;
+        inner.count_hit(reason);
         Some(view)
     }
 
@@ -1066,6 +1073,12 @@ impl<V: CachedBytes> CacheInner<V> {
 }
 
 impl<V> CacheInner<V> {
+    /// Counts one read for `reason` that a kept view or a started load served.
+    fn count_hit(&mut self, reason: &'static str) {
+        self.hits += 1;
+        self.by_reason.entry(reason).or_default().hits += 1;
+    }
+
     /// Counts one load of the session at `addr` (see `by_session`).
     fn count_session(&mut self, addr: &str, loaded: u64, reload: bool, reason: &'static str) {
         if !self.by_session.contains_key(addr) && self.by_session.len() >= SESSIONS_COUNTED {
@@ -1372,7 +1385,7 @@ mod tests {
             *cache.view("s", at(2, 11), "test", load(3)).await.unwrap(),
             3
         );
-        // A reader served the kept view counts no load under its own reason.
+        // A reader served the kept view counts a hit, and no load, under its own reason.
         assert_eq!(
             *cache.view("s", at(2, 11), "expiry", load(9)).await.unwrap(),
             3
@@ -1396,18 +1409,22 @@ mod tests {
         assert_eq!(memory.loads, Some(4));
         assert_eq!(memory.loaded_bytes, Some(1 + 2 + 3 + 4));
         assert_eq!(memory.reloads, Some(2));
-        // And the same counts by the reason of the reader whose load filled the view.
-        let by = |loads, loaded_bytes, reloads| broca_wire::ViewLoads {
+        assert_eq!(memory.hits, Some(1));
+        // And the same counts by the reason of the reader whose load filled the view, or that the
+        // kept view served.
+        let by = |loads, loaded_bytes, reloads, hits| broca_wire::ViewLoads {
             loads,
             loaded_bytes,
             reloads,
+            hits,
         };
         assert_eq!(
             memory.loads_by_reason,
             Some(
                 [
-                    ("run.result".to_owned(), by(1, 2, 1)),
-                    ("test".to_owned(), by(3, 1 + 3 + 4, 1)),
+                    ("expiry".to_owned(), by(0, 0, 0, 1)),
+                    ("run.result".to_owned(), by(1, 2, 1, 0)),
+                    ("test".to_owned(), by(3, 1 + 3 + 4, 1, 0)),
                 ]
                 .into()
             )

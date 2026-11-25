@@ -1010,7 +1010,7 @@ impl StoreRuntime {
                         // a view loaded here serves this read alone: keeping it would only push
                         // closed sessions' views out of the cache. One already kept at this
                         // position still serves.
-                        match self.views.kept(&addr, position) {
+                        match self.views.kept(&addr, position, request.name()) {
                             Some(view) => Ok(view),
                             None => self.load_view(key, class, position, stream_head).await.map(
                                 |view| {

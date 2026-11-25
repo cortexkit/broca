@@ -1534,6 +1534,11 @@ fn memory_table(report: &broca_module_serve::wire::MemoryReport) -> String {
             views.reloads.unwrap_or(0)
         ));
     }
+    if let Some(hits) = views.hits {
+        out.push_str(&format!(
+            "closed-session view reads served without a load since start: {hits}\n"
+        ));
+    }
     out
 }
 
