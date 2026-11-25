@@ -121,6 +121,69 @@ impl Gate for super::private_content::PrivateContent {
     }
 }
 
+/// The held-call key a completion waits under for the person's consent: apart from classify's
+/// batches, which share the grants store's keys.
+pub fn held_batch_id(key: &str) -> String {
+    format!("{STORE_ROLE}:{key}")
+}
+
+/// The completion key a held-call key names, when it is a completion's.
+pub fn held_key(batch_id: &str) -> Option<&str> {
+    batch_id.strip_prefix(STORE_ROLE)?.strip_prefix(':')
+}
+
+/// What became of a call the private-content gate refused for want of the person's consent.
+pub enum Consented {
+    /// A grant the person gave earlier releases it: the call runs now.
+    Released,
+    /// It is refused, or held for the person's answer: this is the caller's answer.
+    Answered(Answer),
+}
+
+/// A completion refused for want of consent, as its consent card and held row record it: an
+/// approval runs it on the route and at the prices it was admitted with, never on a route routing
+/// picks again, since the person consented to that route's provider.
+pub struct ConsentCall<'a> {
+    /// [`held_batch_id`] of the call's key.
+    pub batch_id: String,
+    pub batch_scope: &'a BatchScope,
+    pub provider: &'a str,
+    /// The route as `<provider>/<model>`.
+    pub model: String,
+    /// The arguments as the caller sent them.
+    pub request: &'a str,
+    pub args_digest: &'a str,
+    /// The frozen route and prices, as the completion record keeps them.
+    pub frozen_row: String,
+}
+
+/// Consent holds, shared with classify: a standing deny refuses, a standing grant releases, and
+/// otherwise a consent card is filed and the call held until the person answers. Given only for
+/// a caller that reads held replies and named a `call_key`.
+#[async_trait]
+pub trait Consent: Send + Sync {
+    /// The held call's answer when the call waits under `batch_id` (held, or settled while
+    /// held), so a repeat of its key answers that instead of running.
+    fn held(&self, batch_id: &str) -> Option<Answer>;
+    /// What becomes of `call`, which the gate refused with `refused` under `scope`.
+    async fn consent(
+        &self,
+        refused: Vec<u8>,
+        scope: &SendScope,
+        call: ConsentCall<'_>,
+    ) -> Consented;
+}
+
+/// A held completion the person approved, as its held row recorded it.
+pub struct Approved {
+    pub batch_id: String,
+    pub batch_scope: BatchScope,
+    pub principal: Option<BindPrincipal>,
+    pub request: String,
+    pub args_digest: String,
+    pub frozen_row: String,
+}
+
 /// The session runtime a completion's run goes through: the same calls a `session.send`,
 /// `run.result` and `run.cancel` reach.
 #[async_trait]
@@ -290,8 +353,18 @@ impl Complete {
         arguments: &RawValue,
         call_key: Option<&str>,
         gate: &dyn Gate,
+        consent: Option<&dyn Consent>,
     ) -> Answer {
         let call = admit(principal, scope, arguments, call_key).map_err(unspent)?;
+        // A call held for the person's consent answers as held, or with the answer it settled
+        // with, until its record has an outcome: nothing runs it but the approval.
+        if call.keyed {
+            if let Some(answer) =
+                consent.and_then(|consent| consent.held(&held_batch_id(&call.key)))
+            {
+                return answer;
+            }
+        }
         let flight = {
             let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
             match flights.get(&call.key) {
@@ -323,7 +396,7 @@ impl Complete {
             flights: &self.flights,
             key: &call.key,
         };
-        let answer = self.run(&call, principal, scope, gate).await;
+        let answer = self.run(&call, principal, scope, gate, consent).await;
         drop(landing);
         let _ = sender.send(Some(answer.clone()));
         answer
@@ -335,6 +408,7 @@ impl Complete {
         principal: Option<&BindPrincipal>,
         scope: &SendScope,
         gate: &dyn Gate,
+        consent: Option<&dyn Consent>,
     ) -> Answer {
         let now = (self.clock)();
         // The record is read before routing is asked anything: a recorded answer is final, and
@@ -365,8 +439,99 @@ impl Complete {
             None => self.price(call).await.map_err(unspent)?,
         };
         // Every call that may send text is gated, a resumed one too: a scope may have read the
-        // person's private content since the call was first admitted. A replay is not.
-        gate.admit(scope, &frozen.model.provider).await?;
+        // person's private content since the call was first admitted. A replay is not. A call
+        // the person may still consent to is held for them, when its caller can wait.
+        if let Err(refused) = gate.admit(scope, &frozen.model.provider).await {
+            let Some(consent) = consent.filter(|_| call.keyed) else {
+                return Err(refused);
+            };
+            let held = ConsentCall {
+                batch_id: held_batch_id(&call.key),
+                batch_scope: &call.scope,
+                provider: &frozen.model.provider,
+                model: route_key(&frozen.model),
+                request: &call.identity,
+                args_digest: &call.digest,
+                frozen_row: serde_json::to_string(&frozen).expect("a frozen route encodes"),
+            };
+            match consent.consent(refused, scope, held).await {
+                Consented::Released => {}
+                Consented::Answered(answer) => return answer,
+            }
+        }
+        self.run_on(call, frozen, principal, scope, gate).await
+    }
+
+    /// Whether the call `key` has a recorded outcome: one that every repeat of the key answers.
+    /// A store that can't be read counts as none, so a held call stays approved for another try,
+    /// which finds the record if there is one.
+    pub async fn recorded(&self, key: &str) -> bool {
+        let (store, key, now) = (Arc::clone(&self.store), key.to_owned(), (self.clock)());
+        tokio::task::spawn_blocking(move || store.lookup_live(STORE_ROLE, &key, now))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .is_some_and(|stored| !stored.outcomes.is_empty())
+    }
+
+    /// Runs a held completion the person approved, on the route and at the prices it was held
+    /// with. `scope` is the caller's stamp when this process kept it beside the hold, and
+    /// [`SendScope::Internal`] otherwise: a stamp is the daemon's word and a stored row can't
+    /// carry it, so after a restart the run is not charged to the caller's run or flow.
+    pub async fn approved(self: &Arc<Self>, held: Approved, scope: &SendScope) -> Answer {
+        let call = readmit(&held).map_err(unspent)?;
+        let frozen: Frozen = serde_json::from_str(&held.frozen_row)
+            .map_err(|_| unspent(internal("the held completion's route is unreadable")))?;
+        if matches!(scope, SendScope::Internal) {
+            tracing::info!(target: "llm_tools", key = %call.key,
+                "an approved completion runs without its caller's stamp; its spend is not \
+                 charged to the caller's run or flow");
+        }
+        let flight = {
+            let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
+            if flights.contains_key(&call.key) {
+                return Err(unspent(refused(
+                    batch::PROVIDER_ERROR,
+                    "this call is still running; repeat it with the same call_key later",
+                )));
+            }
+            let (sender, receiver) = watch::channel(None);
+            flights.insert(
+                call.key.clone(),
+                Flight {
+                    digest: call.digest.clone(),
+                    scope: call.scope.clone(),
+                    answer: receiver,
+                },
+            );
+            sender
+        };
+        let landing = Landing {
+            flights: &self.flights,
+            key: &call.key,
+        };
+        // The person approved this route's provider: a record that froze another one (another
+        // process admitted the key differently) is not what they approved.
+        let answer = self
+            .run_on(&call, frozen, held.principal.as_ref(), scope, &Approval)
+            .await;
+        drop(landing);
+        let _ = flight.send(Some(answer.clone()));
+        answer
+    }
+
+    /// Claims the call's record on `frozen` and runs it. `gate` decides a recorded route whose
+    /// provider is not `frozen`'s.
+    async fn run_on(
+        &self,
+        call: &Admitted,
+        frozen: Frozen,
+        principal: Option<&BindPrincipal>,
+        scope: &SendScope,
+        gate: &dyn Gate,
+    ) -> Answer {
+        let now = (self.clock)();
         let frozen_row = serde_json::to_string(&frozen).expect("a frozen route encodes");
         let model_key = route_key(&frozen.model);
         let claim = BatchClaim {
@@ -716,24 +881,68 @@ fn admit(
     let ceiling_nanos = usd_to_nanos(&request.max_cost_usd, Rounding::Down)
         .ok_or_else(|| Refusal::invalid_params("max_cost_usd", "max_cost_usd is out of range"))?;
     let (key, keyed) = super::admission::call_id(principal, stamp, call_key)?;
-    let caller = match principal {
-        Some(BindPrincipal::Reserved { module_id }) => module_id.as_str(),
-        _ => "direct",
-    };
-    let kind = match batch_scope {
-        BatchScope::Flow { .. } => "flow",
-        BatchScope::Run { .. } => "run",
-    };
     Ok(Admitted {
         identity: serde_json::to_string(&value).expect("JSON values encode"),
         digest: super::admission::hash(&value),
         request,
         key,
         keyed,
+        consumer: consumer(principal, &batch_scope),
         scope: batch_scope,
-        consumer: format!("{CONSUMER_ROOT}.{caller}.{kind}"),
         ceiling_nanos,
     })
+}
+
+/// The admission of a held completion the person approved, from its held row: the arguments it
+/// was admitted with, checked again, under the key and scope it was held with.
+fn readmit(held: &Approved) -> Result<Admitted, Refusal> {
+    let key = held_key(&held.batch_id)
+        .ok_or_else(|| internal("the held call is not a completion"))?
+        .to_owned();
+    let value: Value = serde_json::from_str(&held.request)
+        .map_err(|_| internal("the held completion's arguments are unreadable"))?;
+    let request: complete::Request = serde_json::from_value(value)
+        .map_err(|_| internal("the held completion's arguments are unreadable"))?;
+    complete::validate_request(&request).map_err(validation_refusal)?;
+    let ceiling_nanos = usd_to_nanos(&request.max_cost_usd, Rounding::Down)
+        .ok_or_else(|| Refusal::invalid_params("max_cost_usd", "max_cost_usd is out of range"))?;
+    Ok(Admitted {
+        identity: held.request.clone(),
+        digest: held.args_digest.clone(),
+        request,
+        key,
+        keyed: true,
+        consumer: consumer(held.principal.as_ref(), &held.batch_scope),
+        scope: held.batch_scope.clone(),
+        ceiling_nanos,
+    })
+}
+
+/// `broca.complete.<caller>.<run|flow>`: the caller is the module the daemon stamped on the
+/// route's bind, or `direct`.
+fn consumer(principal: Option<&BindPrincipal>, scope: &BatchScope) -> String {
+    let caller = match principal {
+        Some(BindPrincipal::Reserved { module_id }) => module_id.as_str(),
+        _ => "direct",
+    };
+    let kind = match scope {
+        BatchScope::Flow { .. } => "flow",
+        BatchScope::Run { .. } => "run",
+    };
+    format!("{CONSUMER_ROOT}.{caller}.{kind}")
+}
+
+/// The gate of a run the person approved: they approved one route's provider, so a record that
+/// froze another is refused rather than gated again.
+struct Approval;
+
+#[async_trait]
+impl Gate for Approval {
+    async fn admit(&self, _scope: &SendScope, _provider: &str) -> Result<(), Vec<u8>> {
+        Err(unspent(internal(
+            "the completion's record names another route than the one the person approved",
+        )))
+    }
 }
 
 fn validation_refusal(error: cortexkit_llm_tools::ValidationError) -> Refusal {
@@ -1247,4 +1456,4 @@ async fn await_flight(mut receiver: watch::Receiver<Option<Answer>>) -> Answer {
 
 #[cfg(test)]
 #[path = "complete_tests.rs"]
-mod tests;
+pub(super) mod tests;

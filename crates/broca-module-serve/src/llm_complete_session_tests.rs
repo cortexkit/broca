@@ -97,7 +97,7 @@ async fn llm_complete_runs_one_tool_free_run_through_the_session_runtime() {
         "max_cost_usd": 0.01,
     }))
     .unwrap();
-    let call = || complete.answer(Some(&basal), &scope, &arguments, Some("k1"), &AnyProvider);
+    let call = || complete.answer(Some(&basal), &scope, &arguments, Some("k1"), &AnyProvider, None);
     let answer = call().await.unwrap_or_else(|body| {
         panic!("the call was refused: {}", String::from_utf8_lossy(&body))
     });
@@ -233,8 +233,7 @@ async fn llm_complete_asks_routing_for_the_account_its_decision_priced() {
             .with_poll(Duration::from_millis(10)),
         );
         // The stand-in routing refuses every account, so nothing reaches the provider.
-        let refused = complete
-            .answer(Some(&basal), &scope, &arguments, Some(call_key), &AnyProvider)
+        let refused = complete.answer(Some(&basal), &scope, &arguments, Some(call_key), &AnyProvider, None)
             .await;
         assert!(refused.is_err(), "{call_key}");
     }

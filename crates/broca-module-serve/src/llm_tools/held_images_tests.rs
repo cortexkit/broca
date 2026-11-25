@@ -58,7 +58,7 @@ impl ImageResolver for Source {
 }
 
 #[derive(Default)]
-struct Provider(Mutex<Vec<Value>>);
+pub(super) struct Provider(Mutex<Vec<Value>>);
 
 #[async_trait]
 impl ClassifierProvider for Provider {
@@ -77,7 +77,7 @@ impl ClassifierProvider for Provider {
     }
 }
 
-struct Catalog;
+pub(super) struct Catalog;
 impl BatchCatalog for Catalog {
     fn row(&self, _: &str) -> Option<broca_catalog::ModelBatchRow> {
         Some(broca_catalog::ModelBatchRow {
@@ -92,7 +92,7 @@ impl BatchCatalog for Catalog {
     }
 }
 
-struct Marked;
+pub(super) struct Marked;
 #[async_trait]
 impl Asks for Marked {
     async fn marked(&self, _: &str, _: Option<&str>) -> Option<broca_subc::PrivateContent> {
@@ -111,8 +111,8 @@ impl Asks for Marked {
     }
 }
 
-struct Io {
-    answer: Mutex<Option<ConsentRecord>>,
+pub(super) struct Io {
+    pub(super) answer: Mutex<Option<ConsentRecord>>,
     live: Mutex<RunLiveness>,
     feed: Mutex<Vec<Value>>,
     refuse: AtomicBool,
@@ -168,12 +168,12 @@ impl ConsentIo for Io {
     }
 }
 
-fn principal() -> BindPrincipal {
+pub(super) fn principal() -> BindPrincipal {
     BindPrincipal::Reserved {
         module_id: "caller".into(),
     }
 }
-fn stamp() -> SendScope {
+pub(super) fn stamp() -> SendScope {
     SendScope::Stamped(BindScope {
         scope: SessionScope {
             owner: BindPrincipal::Reserved {

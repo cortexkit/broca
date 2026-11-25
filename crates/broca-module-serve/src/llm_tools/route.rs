@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use broca_protocol::{BindPrincipal, SendScope};
+use broca_protocol::{BindPrincipal, BindScope, SendScope};
 use broca_store::grants::{GrantsStore, HeldCall, HeldState, HoldRequest};
 use broca_store::system_one::{BatchScope, StoredBatch};
 use cortexkit_llm_tools::classify;
@@ -124,6 +124,10 @@ pub struct LlmTools {
     released_grants: Mutex<std::collections::VecDeque<String>>,
     /// `llm.complete/v1`, when this broca serves it: listed in the catalog and answered only then.
     complete: Option<Arc<super::complete::Complete>>,
+    /// The daemon stamp of each completion held for consent in this process, by held-call key,
+    /// so its approved run is charged to the caller's run or flow. A stored row can't carry a
+    /// stamp; a hold that outlived a restart runs without one.
+    completion_stamps: Mutex<HashMap<String, (i64, BindScope)>>,
 }
 
 impl LlmTools {
@@ -150,6 +154,7 @@ impl LlmTools {
             reconciled: std::sync::atomic::AtomicU64::new(0),
             released_grants: Mutex::new(std::collections::VecDeque::new()),
             complete: None,
+            completion_stamps: Mutex::new(HashMap::new()),
             held: Arc::new(super::held::HeldCalls::new(
                 Arc::new(GrantsStore::open_in_memory().expect("in-memory grants store opens")),
                 crate::serve::process_launch_id().into(),
@@ -384,6 +389,11 @@ impl LlmTools {
             if !self.held.start_attempt(&row, now) {
                 continue;
             }
+            if super::complete::held_key(&row.batch_id).is_some() {
+                let service = self.clone();
+                tokio::spawn(async move { service.run_approved_completion(row).await });
+                continue;
+            }
             // An authorized row always keeps its validated request. A row without one can't be
             // dispatched, so it stays recorded and is skipped here rather than panicking the task.
             let Some(params) = row.request.clone() else {
@@ -526,6 +536,18 @@ impl LlmTools {
                 let envelope: RawEnvelope<'_> = serde_json::from_slice(body)
                     .map_err(|e| unspent(Refusal::invalid_params("arguments", e.to_string())))?;
                 self.check_pin(&call, &super::complete::Complete::input_schema())?;
+                // As for classify: only a caller that reads held replies, and can name its call
+                // again by its key, can wait for the person's consent.
+                let caller = principal.map(BindPrincipal::as_owner_string);
+                let holds = match (reads_held_reply, caller, call.call_key.clone()) {
+                    (true, Some(caller), Some(call_key)) => Some(CompletionConsent {
+                        tools: self,
+                        stamped_project_id,
+                        caller,
+                        call_key,
+                    }),
+                    _ => None,
+                };
                 let answer = complete
                     .answer(
                         principal,
@@ -533,6 +555,9 @@ impl LlmTools {
                         envelope.arguments,
                         call.call_key.as_deref(),
                         &self.private_content,
+                        holds
+                            .as_ref()
+                            .map(|holds| holds as &dyn super::complete::Consent),
                     )
                     .await;
                 match consumer.result_format {
@@ -848,117 +873,45 @@ impl LlmTools {
         // was admitted by the person's decision instead.
         if held.is_none() {
             if let Err(refusal) = self.private_content.admit(scope, &admission.provider).await {
-                let reason: Value = serde_json::from_slice(&refusal).unwrap_or(Value::Null);
-                let consent_reason = reason["detail"]["consent"].as_str().unwrap_or("");
-                if !matches!(
-                    consent_reason,
-                    "consent_required" | "private_content_unknown" | "private_content_unreachable"
-                ) {
-                    // A marked flow asking for a provider outside its approved set. The other
-                    // refusals here come before any verdict and are not a marked call's outcome.
-                    if reason["code"] == "provider_not_allowed" {
-                        self.count(ConsentOutcome::RefusedByFlowPolicy);
-                    }
-                    return Err(refusal);
-                }
-                let Some(consent) = &self.consent else {
-                    self.count(ConsentOutcome::refused(consent_reason));
-                    return Err(refusal);
+                let model = serde_json::from_str::<Value>(&admission.params)
+                    .ok()
+                    .and_then(|params| params["model"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let frozen_row = serde_json::to_value(&pricing)
+                    .ok()
+                    .and_then(|frozen| frozen["frozen_row"].as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let call = HoldCall {
+                    batch_id: admission.batch_id.clone(),
+                    batch_scope: admission.scope.clone(),
+                    provider: &admission.provider,
+                    model: &model,
+                    request: admission.params.clone(),
+                    args_digest: admission.args_digest.clone(),
+                    frozen_row,
                 };
-                let SendScope::Stamped(bind) = scope else {
-                    self.count(ConsentOutcome::refused(consent_reason));
-                    return Err(refusal);
-                };
-                let agent = bind.scope.agent_id.as_deref().unwrap_or("");
-                let identity = super::consent::identity(&bind.scope);
-                let now = self.system.tool_now();
-                if consent
-                    .store
-                    .denied(agent, &identity, &admission.provider)
-                    .map_err(|e| self.consent_unavailable(e))?
-                {
-                    self.count(ConsentOutcome::DeniedByStandingDeny);
-                    return Err(super::held::not_started("denied").into_bytes());
-                }
-                let grant = consent
-                    .releasing_grant(&bind.scope, stamped_project_id, &admission.provider, now)
-                    .await
-                    .map_err(|e| self.consent_unavailable(e))?;
-                if let Some(grant) = &grant {
-                    self.count(ConsentOutcome::ReleasedByGrant);
-                    self.note_release(grant, &bind.scope.scope_ref);
-                } else {
-                    if consent_reason != "consent_required" {
-                        self.count(ConsentOutcome::refused(consent_reason));
-                        return Err(refusal);
-                    }
-                    let Some((principal, call_key)) = hold_caller else {
-                        self.count(ConsentOutcome::RefusedConsentRequired);
-                        return Err(refusal);
-                    };
-                    let params: Value = serde_json::from_str(&admission.params)
-                        .map_err(|e| self.consent_unavailable(e))?;
-                    let model = params["model"].as_str().unwrap_or("");
-                    let display_row = self.system.tool_model_row(model);
-                    let Some((provider_label, model_label)) = display_row
-                        .as_ref()
-                        .and_then(crate::system_one::consent_model_labels)
-                    else {
-                        self.count(ConsentOutcome::ConsentUnavailable);
-                        return Err(super::held::not_started("consent_unavailable").into_bytes());
-                    };
-                    let sources = self.private_content.card_sources(scope).await;
-                    let dedup_key = consent
-                        .dedup_key(agent, &admission.provider, &identity, now)
-                        .map_err(|e| self.consent_unavailable(e))?;
-                    let body = broca_subc::consent_card::private_content_card_for_project(
-                        provider_label,
-                        model_label,
-                        &sources,
-                        &dedup_key,
-                        stamped_project_id,
+                let retain = |row: &HeldCall, bind: &BindScope| {
+                    self.held.images.retain(
+                        self.held.store.clone(),
+                        row,
+                        bind,
+                        images.clone(),
+                        self.system.tool_now(),
                     )
-                    .map_err(|e| self.consent_unavailable(e))?;
-                    let frozen =
-                        serde_json::to_value(&pricing).map_err(|e| self.consent_unavailable(e))?;
-                    let row = consent
-                        .file_with_admission(
-                            HoldRequest {
-                                project_id: stamped_project_id.map(str::to_owned),
-                                batch_id: admission.batch_id.clone(),
-                                scope: identity,
-                                batch_scope: admission.scope.clone(),
-                                principal: principal.into(),
-                                call_key: call_key.into(),
-                                agent_id: agent.into(),
-                                provider: admission.provider.clone(),
-                                model: model.into(),
-                                request: admission.params.clone(),
-                                args_digest: admission.args_digest.clone(),
-                                frozen_row: frozen["frozen_row"].as_str().unwrap_or("").into(),
-                                dedup_key: dedup_key.clone(),
-                                admitted_at_ms: now,
-                            },
-                            body,
-                            now,
-                            |row| {
-                                self.held.images.retain(
-                                    self.held.store.clone(),
-                                    row,
-                                    bind,
-                                    images.clone(),
-                                    now,
-                                )
-                            },
-                        )
-                        .await
-                        .map_err(|e| self.consent_unavailable(e))?;
-                    self.count(ConsentOutcome::CardFiled);
-                    self.watch_consent(dedup_key);
-                    return match row.state {
-                        HeldState::Final => super::held::HeldCalls::final_reply(&row),
-                        _ => super::held::HeldCalls::held_reply(&row),
-                    };
+                };
+                match self
+                    .consent_or_hold(
+                        refusal,
+                        scope,
+                        stamped_project_id,
+                        hold_caller,
+                        call,
+                        retain,
+                    )
+                    .await
+                {
+                    Held::Released => {}
+                    Held::Answered(answer) => return answer,
                 }
             }
         }
@@ -1096,6 +1049,271 @@ impl LlmTools {
             }
         }
         Ok(())
+    }
+}
+
+/// Consent holds for one completion, on the consent store and held calls classify uses.
+struct CompletionConsent<'a> {
+    tools: &'a Arc<LlmTools>,
+    stamped_project_id: Option<&'a str>,
+    /// Who called, as the held row records it.
+    caller: String,
+    call_key: String,
+}
+
+#[async_trait::async_trait]
+impl super::complete::Consent for CompletionConsent<'_> {
+    fn held(&self, batch_id: &str) -> Option<Answer> {
+        let now = self.tools.system.tool_now();
+        let row = match self.tools.held.store.lookup(batch_id, now) {
+            Ok(row) => row?,
+            // Running a call that may be waiting for the person would run it before they
+            // answered.
+            Err(_) => {
+                return Some(Err(unspent(crate::system_one::internal_refusal(
+                    "held calls are unavailable",
+                ))))
+            }
+        };
+        Some(match row.state {
+            HeldState::Final => super::held::HeldCalls::final_reply(&row),
+            // Waiting for the person, or approved and running: its answer comes as a late result.
+            _ => super::held::HeldCalls::held_reply(&row),
+        })
+    }
+
+    async fn consent(
+        &self,
+        refused: Vec<u8>,
+        scope: &SendScope,
+        call: super::complete::ConsentCall<'_>,
+    ) -> super::complete::Consented {
+        let hold = HoldCall {
+            batch_id: call.batch_id,
+            batch_scope: call.batch_scope.clone(),
+            provider: call.provider,
+            model: &call.model,
+            request: call.request.to_owned(),
+            args_digest: call.args_digest.to_owned(),
+            frozen_row: call.frozen_row,
+        };
+        let retain = |row: &HeldCall, bind: &BindScope| {
+            self.tools
+                .completion_stamps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(row.batch_id.clone(), (row.admitted_at_ms, bind.clone()));
+        };
+        match self
+            .tools
+            .consent_or_hold(
+                refused,
+                scope,
+                self.stamped_project_id,
+                Some((&self.caller, &self.call_key)),
+                hold,
+                retain,
+            )
+            .await
+        {
+            Held::Released => super::complete::Consented::Released,
+            Held::Answered(answer) => super::complete::Consented::Answered(answer),
+        }
+    }
+}
+
+impl LlmTools {
+    /// Runs a completion the person approved, and stores its answer as the held call's result,
+    /// which the caller collects as a late result. An answer the completion record didn't take
+    /// as final (its run's end couldn't be read) leaves the call approved, for a later attempt.
+    async fn run_approved_completion(self: Arc<Self>, row: HeldCall) {
+        let Some(complete) = self.complete.clone() else {
+            tracing::warn!(target: "llm_tools", batch = %row.batch_id,
+                "an approved completion waits: this broca serves no completions");
+            return;
+        };
+        let stamp = self
+            .completion_stamps
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&row.batch_id)
+            .filter(|(admitted_at, _)| *admitted_at == row.admitted_at_ms)
+            .map(|(_, stamp)| stamp);
+        let scope = stamp.map_or(SendScope::Internal, SendScope::Stamped);
+        let principal = serde_json::from_value::<BindPrincipal>(json!(row.principal)).ok();
+        let approved = super::complete::Approved {
+            batch_id: row.batch_id.clone(),
+            batch_scope: row.batch_scope.clone(),
+            principal,
+            request: row.request.clone().unwrap_or_default(),
+            args_digest: row.args_digest.clone(),
+            frozen_row: row.frozen_row.clone(),
+        };
+        let answer = complete.approved(approved, &scope).await;
+        let recorded = match super::complete::held_key(&row.batch_id) {
+            Some(key) => complete.recorded(key).await,
+            None => false,
+        };
+        if let Err(error) =
+            self.persist_held_answer(&row.batch_id, &answer, Spend::Unknown, recorded)
+        {
+            tracing::warn!(target: "llm_tools", batch = %row.batch_id,
+                "an approved completion's answer was not stored: {}",
+                String::from_utf8_lossy(&error));
+        }
+        self.schedule_unsettled(&row, &answer);
+    }
+}
+
+/// A call the private-content gate refused, as a held row and its consent card record it.
+struct HoldCall<'a> {
+    batch_id: String,
+    batch_scope: BatchScope,
+    provider: &'a str,
+    /// The catalog model the card names.
+    model: &'a str,
+    /// The arguments an approval runs the call with.
+    request: String,
+    args_digest: String,
+    /// What the call froze at admission (route and prices), kept for its approved run.
+    frozen_row: String,
+}
+
+/// What became of a call the private-content gate refused.
+enum Held {
+    /// A grant the person gave earlier releases it: the call runs now.
+    Released,
+    /// Refused, or held for the person's answer: the caller's answer.
+    Answered(Answer),
+}
+
+impl LlmTools {
+    /// What becomes of a call the private-content gate refused with `refusal` under `scope`,
+    /// for classify and completion alike. A refusal the person can't lift by consenting (a
+    /// flow asking for a provider outside its approved set, say) stands. Otherwise a standing
+    /// deny refuses, a standing grant releases, and a caller that reads held replies
+    /// (`hold_caller`: who it is and its `call_key`) has a consent card filed and the call held
+    /// until the person answers. `retain` keeps beside the held row what only this process
+    /// holds: the caller's stamp, and any images the call prepared.
+    async fn consent_or_hold(
+        self: &Arc<Self>,
+        refusal: Vec<u8>,
+        scope: &SendScope,
+        stamped_project_id: Option<&str>,
+        hold_caller: Option<(&str, &str)>,
+        call: HoldCall<'_>,
+        retain: impl FnOnce(&HeldCall, &BindScope) + Send,
+    ) -> Held {
+        let refused = |body: Vec<u8>| Held::Answered(Err(body));
+        let reason: Value = serde_json::from_slice(&refusal).unwrap_or(Value::Null);
+        let consent_reason = reason["detail"]["consent"].as_str().unwrap_or("");
+        if !matches!(
+            consent_reason,
+            "consent_required" | "private_content_unknown" | "private_content_unreachable"
+        ) {
+            // A flow that read the person's private content asking for a provider outside the
+            // set the person approved for it. The gate's other refusals come before it has
+            // decided whether the call carries private content, so they aren't counted as a consent outcome.
+            if reason["code"] == "provider_not_allowed" {
+                self.count(ConsentOutcome::RefusedByFlowPolicy);
+            }
+            return refused(refusal);
+        }
+        let Some(consent) = &self.consent else {
+            self.count(ConsentOutcome::refused(consent_reason));
+            return refused(refusal);
+        };
+        let SendScope::Stamped(bind) = scope else {
+            self.count(ConsentOutcome::refused(consent_reason));
+            return refused(refusal);
+        };
+        let agent = bind.scope.agent_id.as_deref().unwrap_or("");
+        let identity = super::consent::identity(&bind.scope);
+        let now = self.system.tool_now();
+        match consent.store.denied(agent, &identity, call.provider) {
+            Ok(false) => {}
+            Ok(true) => {
+                self.count(ConsentOutcome::DeniedByStandingDeny);
+                return refused(super::held::not_started("denied").into_bytes());
+            }
+            Err(error) => return refused(self.consent_unavailable(error)),
+        }
+        match consent
+            .releasing_grant(&bind.scope, stamped_project_id, call.provider, now)
+            .await
+        {
+            Ok(Some(grant)) => {
+                self.count(ConsentOutcome::ReleasedByGrant);
+                self.note_release(&grant, &bind.scope.scope_ref);
+                return Held::Released;
+            }
+            Ok(None) => {}
+            Err(error) => return refused(self.consent_unavailable(error)),
+        }
+        if consent_reason != "consent_required" {
+            self.count(ConsentOutcome::refused(consent_reason));
+            return refused(refusal);
+        }
+        let Some((principal, call_key)) = hold_caller else {
+            self.count(ConsentOutcome::RefusedConsentRequired);
+            return refused(refusal);
+        };
+        let display_row = self.system.tool_model_row(call.model);
+        let Some((provider_label, model_label)) = display_row
+            .as_ref()
+            .and_then(crate::system_one::consent_model_labels)
+        else {
+            self.count(ConsentOutcome::ConsentUnavailable);
+            return refused(super::held::not_started("consent_unavailable").into_bytes());
+        };
+        let sources = self.private_content.card_sources(scope).await;
+        let dedup_key = match consent.dedup_key(agent, call.provider, &identity, now) {
+            Ok(key) => key,
+            Err(error) => return refused(self.consent_unavailable(error)),
+        };
+        let body = match broca_subc::consent_card::private_content_card_for_project(
+            provider_label,
+            model_label,
+            &sources,
+            &dedup_key,
+            stamped_project_id,
+        ) {
+            Ok(body) => body,
+            Err(error) => return refused(self.consent_unavailable(error)),
+        };
+        let filed = consent
+            .file_with_admission(
+                HoldRequest {
+                    project_id: stamped_project_id.map(str::to_owned),
+                    batch_id: call.batch_id,
+                    scope: identity,
+                    batch_scope: call.batch_scope,
+                    principal: principal.into(),
+                    call_key: call_key.into(),
+                    agent_id: agent.into(),
+                    provider: call.provider.into(),
+                    model: call.model.into(),
+                    request: call.request,
+                    args_digest: call.args_digest,
+                    frozen_row: call.frozen_row,
+                    dedup_key: dedup_key.clone(),
+                    admitted_at_ms: now,
+                },
+                body,
+                now,
+                |row| retain(row, bind),
+            )
+            .await;
+        let row = match filed {
+            Ok(row) => row,
+            Err(error) => return refused(self.consent_unavailable(error)),
+        };
+        self.count(ConsentOutcome::CardFiled);
+        self.watch_consent(dedup_key);
+        Held::Answered(match row.state {
+            HeldState::Final => super::held::HeldCalls::final_reply(&row),
+            _ => super::held::HeldCalls::held_reply(&row),
+        })
     }
 }
 

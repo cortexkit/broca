@@ -3,6 +3,8 @@
 
 mod admission;
 pub mod complete;
+#[cfg(test)]
+mod complete_consent_tests;
 pub mod consent;
 pub mod held;
 mod held_images;

@@ -8,7 +8,7 @@ fn number(text: &str) -> serde_json::Number {
 }
 
 /// A route on `provider/model` priced $3 in and $15 out per million tokens.
-fn route(provider: &str, model: &str, price: Option<Price>) -> SelectAnswer {
+pub(crate) fn route(provider: &str, model: &str, price: Option<Price>) -> SelectAnswer {
     let route = RouteRef::new(provider, model);
     let answer = SelectAnswer::new(
         "decision-1",
@@ -25,14 +25,14 @@ fn route(provider: &str, model: &str, price: Option<Price>) -> SelectAnswer {
     }
 }
 
-fn metered() -> Price {
+pub(crate) fn metered() -> Price {
     Price::metered(RatesPerMtok::new(number("3"), number("15")))
 }
 
 type Hook = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// Routing's answer, and every request it got.
-struct FakeSelect {
+pub(crate) struct FakeSelect {
     answer: Mutex<Result<SelectAnswer, RoutingCallError>>,
     asked: Mutex<Vec<SelectRequest>>,
     /// Run before the next select answers: what another process does meanwhile.
@@ -42,7 +42,7 @@ struct FakeSelect {
 }
 
 impl FakeSelect {
-    fn answering(answer: Result<SelectAnswer, RoutingCallError>) -> Arc<Self> {
+    pub(crate) fn answering(answer: Result<SelectAnswer, RoutingCallError>) -> Arc<Self> {
         Arc::new(Self {
             answer: Mutex::new(answer),
             asked: Mutex::new(Vec::new()),
@@ -83,7 +83,7 @@ impl Select for FakeSelect {
 /// `active` the first time it is read. A repeat of a send into a session that already holds a
 /// run answers that run, as a repeated send id does in a real session.
 #[derive(Default)]
-struct FakeSessions {
+pub(crate) struct FakeSessions {
     ends: Mutex<Vec<Value>>,
     sent: Mutex<Vec<SendRequest>>,
     reads: Mutex<HashMap<String, usize>>,
@@ -97,14 +97,14 @@ struct FakeSessions {
 }
 
 impl FakeSessions {
-    fn ending(ends: Vec<Value>) -> Arc<Self> {
+    pub(crate) fn ending(ends: Vec<Value>) -> Arc<Self> {
         Arc::new(Self {
             ends: Mutex::new(ends),
             ..Default::default()
         })
     }
 
-    fn sent(&self) -> Vec<SendRequest> {
+    pub(crate) fn sent(&self) -> Vec<SendRequest> {
         self.sent.lock().unwrap().clone()
     }
 }
@@ -202,7 +202,7 @@ impl Gate for Refuse {
 }
 
 /// A completion run's end: `usage` with one step on `provider/model`.
-fn completed(text: &str, input: Option<u64>, output: Option<u64>) -> Value {
+pub(crate) fn completed(text: &str, input: Option<u64>, output: Option<u64>) -> Value {
     let mut usage = json!({"steps": 1, "unreported_steps": 0, "by_model": [
         {"provider": "anthropic", "model": "claude-sonnet", "steps": 1, "unreported_steps": 0}
     ]});
@@ -298,7 +298,7 @@ fn arguments(value: Value) -> Box<RawValue> {
     serde_json::value::to_raw_value(&value).unwrap()
 }
 
-fn text_call() -> Value {
+pub(crate) fn text_call() -> Value {
     json!({"demand": {"iq": 60, "eq": 20}, "prompt": "Name a colour.", "system": "Be brief.",
            "max_output_tokens": 500, "max_cost_usd": 0.5})
 }
@@ -312,6 +312,7 @@ impl Rig {
                 &arguments(args),
                 call_key,
                 &Allow,
+                None,
             )
             .await
     }
@@ -552,6 +553,7 @@ async fn admission_refuses_bad_arguments_and_unstamped_callers() {
                     &arguments(text_call()),
                     Some("k1"),
                     &Allow,
+                    None,
                 )
                 .await
                 .unwrap_err(),
@@ -664,12 +666,202 @@ async fn a_gated_scope_sends_nothing() {
             &arguments(text_call()),
             Some("k1"),
             &gate,
+            None,
         )
         .await
         .unwrap_err();
     assert_eq!(refusal(&body)["detail"]["no_spend"], true);
     assert_eq!(gate.0.load(Ordering::Relaxed), 1);
     assert!(rig.sessions.sent().is_empty());
+}
+
+/// Consent holds as the route's would decide them: the held calls it already has, the calls it
+/// was asked to decide, and what it decides.
+struct FakeConsent {
+    held: Mutex<HashMap<String, Answer>>,
+    asked: Mutex<Vec<(String, String, String, String)>>,
+    releases: bool,
+}
+
+impl FakeConsent {
+    fn deciding(releases: bool) -> Self {
+        Self {
+            held: Mutex::default(),
+            asked: Mutex::default(),
+            releases,
+        }
+    }
+}
+
+#[async_trait]
+impl Consent for FakeConsent {
+    fn held(&self, batch_id: &str) -> Option<Answer> {
+        self.held.lock().unwrap().get(batch_id).cloned()
+    }
+
+    async fn consent(
+        &self,
+        _refused: Vec<u8>,
+        _scope: &SendScope,
+        call: ConsentCall<'_>,
+    ) -> Consented {
+        self.asked.lock().unwrap().push((
+            call.batch_id.clone(),
+            call.provider.to_owned(),
+            call.model.clone(),
+            call.frozen_row.clone(),
+        ));
+        if self.releases {
+            return Consented::Released;
+        }
+        let held =
+            serde_json::value::to_raw_value(&json!({"held": {"reason": "consent"}})).unwrap();
+        self.held
+            .lock()
+            .unwrap()
+            .insert(call.batch_id, Ok(held.clone()));
+        Consented::Answered(Ok(held))
+    }
+}
+
+/// A call the gate refuses for want of the person's consent is handed to consent holds with the
+/// route routing chose and its frozen prices, and runs nothing until the person answers; a
+/// repeat of its key while it waits answers as held, asking routing nothing. A caller that can't
+/// wait gets the gate's refusal. A grant that releases the call runs it at once.
+#[tokio::test]
+async fn a_call_waiting_for_consent_runs_nothing_and_a_release_runs_it() {
+    let rig = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        FakeSessions::ending(vec![completed("Teal.", Some(1_000), Some(500))]),
+    );
+    let gate = Refuse(AtomicUsize::new(0));
+    let ask = |consent: Option<&'static FakeConsent>, call_key: &'static str| {
+        let complete = rig.complete.clone();
+        let gate = &gate;
+        async move {
+            complete
+                .answer(
+                    Some(&principal()),
+                    &flow_scope(),
+                    &arguments(text_call()),
+                    Some(call_key),
+                    gate,
+                    consent.map(|consent| consent as &dyn Consent),
+                )
+                .await
+        }
+    };
+    let body = ask(None, "k0").await.unwrap_err();
+    assert_eq!(refusal(&body)["detail"]["no_spend"], true);
+
+    let holds: &'static FakeConsent = Box::leak(Box::new(FakeConsent::deciding(false)));
+    let held = ask(Some(holds), "k1").await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(held.get()).unwrap()["held"]["reason"],
+        "consent"
+    );
+    let asked = holds.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    let (batch_id, provider, model, frozen_row) = &asked[0];
+    assert_eq!(batch_id, &held_batch_id(&key_of("k1")));
+    assert_eq!(held_key(batch_id), Some(key_of("k1").as_str()));
+    assert_eq!(
+        (provider.as_str(), model.as_str()),
+        ("anthropic", "anthropic/claude-sonnet")
+    );
+    let frozen: Frozen = serde_json::from_str(frozen_row).unwrap();
+    assert_eq!(frozen.decision_id, "decision-1");
+    let selects = rig.select.asked.lock().unwrap().len();
+    let again = ask(Some(holds), "k1").await.unwrap();
+    assert_eq!(again.get(), held.get());
+    assert_eq!(
+        rig.select.asked.lock().unwrap().len(),
+        selects,
+        "a held repeat asks nothing"
+    );
+    assert!(rig.sessions.sent().is_empty());
+
+    let releases: &'static FakeConsent = Box::leak(Box::new(FakeConsent::deciding(true)));
+    let answer = ask(Some(releases), "k2").await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(answer.get()).unwrap()["text"],
+        "Teal."
+    );
+    assert_eq!(rig.sessions.sent().len(), 1);
+}
+
+/// A completion the person approved runs on the route and prices it was held with, without
+/// asking routing again, under the scope it is given: here none, as after a restart. Its answer
+/// is recorded, so running the approval again answers the record and sends nothing.
+#[tokio::test]
+async fn an_approved_completion_runs_on_its_held_route() {
+    let rig = rig(
+        FakeSelect::answering(Ok(route("anthropic", "claude-sonnet", Some(metered())))),
+        FakeSessions::ending(vec![completed("Teal.", Some(1_000), Some(500))]),
+    );
+    let holds = FakeConsent::deciding(false);
+    rig.complete
+        .answer(
+            Some(&principal()),
+            &flow_scope(),
+            &arguments(text_call()),
+            Some("k1"),
+            &Refuse(AtomicUsize::new(0)),
+            Some(&holds),
+        )
+        .await
+        .unwrap();
+    let (batch_id, _, _, frozen_row) = holds.asked.lock().unwrap()[0].clone();
+    let selects = rig.select.asked.lock().unwrap().len();
+    let approved = |frozen_row: String| Approved {
+        batch_id: batch_id.clone(),
+        batch_scope: admit(
+            Some(&principal()),
+            &flow_scope(),
+            &arguments(text_call()),
+            Some("k1"),
+        )
+        .unwrap()
+        .scope,
+        principal: Some(principal()),
+        request: serde_json::to_string(&text_call()).unwrap(),
+        args_digest: super::super::admission::hash(&text_call()),
+        frozen_row,
+    };
+    assert!(!rig.complete.recorded(&key_of("k1")).await);
+    let answer = rig
+        .complete
+        .approved(approved(frozen_row.clone()), &SendScope::Internal)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(answer.get()).unwrap()["text"],
+        "Teal."
+    );
+    assert_eq!(
+        rig.select.asked.lock().unwrap().len(),
+        selects,
+        "routing isn't asked again"
+    );
+    let sent = rig.sessions.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].request.scope, SendScope::Internal);
+    assert_eq!(sent[0].request.principal, Some(principal()));
+    assert!(rig.complete.recorded(&key_of("k1")).await);
+
+    // Approved on a route other than the one the record froze.
+    let mut other: Frozen = serde_json::from_str(&frozen_row).unwrap();
+    other.model.provider = "openai".into();
+    let refused = rig
+        .complete
+        .approved(
+            approved(serde_json::to_string(&other).unwrap()),
+            &SendScope::Internal,
+        )
+        .await;
+    // The record already holds an outcome: it answers that, and runs nothing more.
+    assert_eq!(refused.unwrap().get(), answer.get());
+    assert_eq!(rig.sessions.sent().len(), 1);
 }
 
 /// The record key of a text call from the test caller under `call_key`.
@@ -809,6 +1001,7 @@ async fn a_call_recorded_after_the_lookup_is_answered_from_the_claimed_record() 
                 &arguments(text_call()),
                 Some("k1"),
                 &Allow,
+                None,
             )
             .await;
         let _ = recorded.send(answer);
@@ -872,6 +1065,7 @@ async fn a_call_that_panicked_does_not_hold_its_key() {
                 &arguments(text_call()),
                 Some("k1"),
                 &Allow,
+                None,
             )
             .await
     })

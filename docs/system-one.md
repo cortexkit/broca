@@ -172,3 +172,10 @@ nothing. A caller that wants another try sends a new `call_key`.
 A repeat after the 7 days is a new call: until the hourly sweep removes the old record it is
 refused as a transient `provider_error` that spent nothing, and once removed it runs in new
 sessions, since the admission time in the session name differs.
+
+A completion from a run or flow that read the person's private content, on a provider not
+approved for that content, waits for the person's consent as a classify call does: broca files
+the same consent card and answers the call as held, when the caller reads held replies and
+names a `call_key`. Nothing is sent until the person answers, and a repeat of the key answers
+as held. Once they allow it, the completion runs on the route and at the prices it was held
+with, without asking routing again, and its answer arrives as the held call's late result.
