@@ -362,6 +362,8 @@ mod session_class;
 mod signed_floor;
 #[path = "llm_runner_conformance/step_events.rs"]
 mod step_events;
+#[path = "llm_runner_conformance/voice_handoff.rs"]
+mod voice_handoff;
 
 fn client_log_dir() -> PathBuf {
     broca_test_support::scratch_root()
