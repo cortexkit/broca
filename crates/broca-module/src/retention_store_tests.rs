@@ -726,6 +726,64 @@ async fn a_restarted_pass_reads_no_session_the_kept_deadlines_already_decide() {
     assert!(rig.holds(&key));
 }
 
+/// Opening a closed session decides its expiry from the deadline a pass kept for its current
+/// head, without loading the session: the open reads it anyway once its actor starts. Before any
+/// pass, nothing is kept and the session is loaded to tell; once the deadline has come, it is
+/// loaded to confirm before anything acts on it.
+#[tokio::test]
+async fn an_open_decides_expiry_from_the_kept_deadline_without_loading_the_session() {
+    let rig = Rig::new("open-kept-deadline", Duration::from_secs(600)).await;
+    let key = rig.key("idle");
+    rig.seed(
+        &key,
+        &[
+            store_start("r1", Some(SECONDS), STARTED_MS),
+            store_end("r1", ENDED_MS),
+            store_billed("r1"),
+        ],
+        false,
+    )
+    .await;
+    let expiry_loads = || {
+        rig.runtime
+            .views()
+            .memory(|_| 0)
+            .loads_by_reason
+            .unwrap_or_default()
+            .get("expiry")
+            .map_or(0, |loads| loads.loads)
+    };
+    let check = || {
+        rig.runtime
+            .expiry_with_view(&key, None, DEADLINE_MS - 1, false, Some(&rig.service), None)
+    };
+    // No pass has run: nothing is known, so the session is loaded to tell.
+    let (expired, view) = check().await.unwrap();
+    assert_eq!((expired, view.is_some()), (None, true));
+    assert_eq!(expiry_loads(), 1);
+
+    assert!(rig
+        .service
+        .sweep_store(&rig.runtime, DEADLINE_MS - 1)
+        .await
+        .is_empty());
+    let (expired, view) = check().await.unwrap();
+    assert_eq!(
+        (expired, view.is_some()),
+        (None, false),
+        "the kept deadline decided it, without the session's records"
+    );
+    assert_eq!(expiry_loads(), 1);
+
+    // Once the deadline has come, the session is loaded to confirm it before anything acts.
+    let (expired, _) = rig
+        .runtime
+        .expiry_with_view(&key, None, DEADLINE_MS, false, Some(&rig.service), None)
+        .await
+        .unwrap();
+    assert_eq!(expired, Some(DEADLINE_MS));
+}
+
 /// A pass decides a session whose head file hasn't changed since the last pass from its kept
 /// deadline, without opening the head: a full pass goes over every session in the ephemeral
 /// root. Once that deadline has passed, the session is read and deleted as before.

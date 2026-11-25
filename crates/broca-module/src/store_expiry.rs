@@ -82,6 +82,22 @@ impl StoreRuntime {
         if class.is_some_and(|class| class != StorageClass::Ephemeral) {
             return Ok((None, None));
         }
+        // A deadline retention already knows for the session's current head decides it without
+        // its records: a pass or an earlier read worked it out, and the head hasn't moved since.
+        // Without this, every open of a closed session in the ephemeral root (by now most of
+        // them) read the whole session here and dropped it, before its actor read it again.
+        if let (Some(class), Some(retention)) = (class, retention) {
+            let addr = SessionAddr(broca_core::session_addr(key));
+            if let Ok(Some(position)) =
+                Session::stored_position(&self.backend(class), &addr, self.deployment()).await
+            {
+                if let Some(deadline) = retention.kept_deadline(&addr.0, &position) {
+                    if deadline.is_none_or(|deadline| deadline > now_ms) {
+                        return Ok((None, None));
+                    }
+                }
+            }
+        }
         let view = match class {
             Some(class) => self
                 .current_view_in(key, class, "expiry")
