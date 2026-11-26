@@ -2587,8 +2587,11 @@ async fn hello_bind_send_status_roundtrip() {
         .role_declarations
         .get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)
         .expect("HELLO publishes the routing runner declaration");
-    let declarations = cortexkit_role_routing::declarations::parse_consumer_declarations(
+    // Parse as the live router does: broca's consumer declares a `workload`, which a reader
+    // accepts only when it serves `select_workload`; an older reader refuses the whole slot.
+    let declarations = cortexkit_role_routing::declarations::parse_consumer_declarations_serving(
         &serde_json::Value::Object(slot.clone()),
+        &[cortexkit_role_routing::capabilities::SELECT_WORKLOAD],
     )
     .expect("the HELLO routing slot validates as a whole");
     let runner = declarations
