@@ -278,7 +278,7 @@ pub(super) fn item_error_json(error: &ItemError) -> String {
 
 /// An item error as it is stored: with its spend mark for a model-tool call, so a replay
 /// answers the same mark, and exactly as before for a `classifier/v1` call (`spend` is `None`).
-fn stored_error_json(error: &ItemError, spend: Option<ItemSpend>) -> String {
+pub(super) fn stored_error_json(error: &ItemError, spend: Option<ItemSpend>) -> String {
     match spend {
         None => item_error_json(error),
         Some(_) => serde_json::to_string(&MarkedItemError::new(error.clone(), spend))
@@ -761,7 +761,10 @@ pub(super) fn replay_tool(
     params: &str,
     stored: &broca_store::system_one::StoredBatch,
 ) -> Result<Box<RawValue>, Refusal> {
-    let request = parse_request(params)?;
+    let mut request = parse_request(params)?;
+    if request.model.is_none() {
+        request.model = Some(stored.model.clone());
+    }
     let frozen: FrozenRow = serde_json::from_str(&stored.frozen_row)
         .map_err(|_| internal_refusal("the stored tool price does not decode"))?;
     reply(

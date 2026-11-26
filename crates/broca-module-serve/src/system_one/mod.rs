@@ -31,6 +31,8 @@ mod images;
 mod routed;
 pub use images::ImageResolver;
 pub(crate) use images::PreparedImages;
+pub(crate) use routed::ToolRoute;
+pub(crate) use routed::CONSUMER_ROOT as ROUTING_CONSUMER_ROOT;
 pub use routed::{Routing, RoutingCredentials, VaultRoutingCredentials};
 pub mod credential;
 pub mod openai_decisions;
@@ -387,7 +389,7 @@ pub struct SystemOne {
 /// call prevents a catalog refresh from changing what was already admitted.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ToolAdmission {
-    frozen_row: String,
+    pub(crate) frozen_row: String,
 }
 
 /// Process-lifetime observations only. No batch ids, questions, states or answers enter health.
@@ -622,6 +624,7 @@ impl SystemOne {
         service.fact_flush = self.fact_flush.clone();
         service.charge_basis = self.charge_basis.clone();
         service.image_resolver = self.image_resolver.clone();
+        service.routing = self.routing.clone();
         self.fork_tool_extractor(&mut service);
         service
     }
@@ -709,6 +712,30 @@ impl SystemOne {
             crate::llm_tools::spend::Spend::Nothing
         };
         answer.map_err(|refusal| spend.mark_undeclared(refusal))
+    }
+
+    pub(crate) async fn execute_routed_tool(
+        self: &Arc<Self>,
+        params: &str,
+        scope: &broca_store::system_one::BatchScope,
+        args_digest: &str,
+        route: ToolRoute,
+        admitted_at_ms: Option<i64>,
+        images: &images::PreparedImages,
+    ) -> Result<Box<RawValue>, Vec<u8>> {
+        let gauge = self.in_flight.clone();
+        gauge.fetch_add(1, Ordering::Relaxed);
+        let _lowered = GaugeGuard(gauge);
+        let _slot = self.call_slots.acquire().await;
+        routed::run_tool(
+            self,
+            params,
+            scope,
+            admitted_at_ms,
+            images,
+            routed::ToolRun { args_digest, route },
+        )
+        .await
     }
 
     /// The batch recorded under this service's role for `batch_id`, with its outcomes; `None`

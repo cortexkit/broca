@@ -28,7 +28,7 @@ use super::{
     internal_refusal, ModelPin, SystemOne,
 };
 use crate::account_routing::{self, Candidates, RoutingCallError, RoutingClient};
-use crate::llm_tools::spend::{ItemSpend, MarkedItemError};
+use crate::llm_tools::spend::{ItemSpend, MarkedItemError, Spend};
 
 /// The routing consumer every classifier caller's name hangs under. Routing matches a dotted
 /// name to its nearest configured entry, so settings on this root cover every caller.
@@ -50,6 +50,7 @@ pub fn consumer_for(principal: Option<&broca_protocol::BindPrincipal>) -> String
     }
 }
 
+#[derive(Clone)]
 pub struct Routing {
     pub client: Arc<RoutingClient>,
     pub credentials: Arc<dyn RoutingCredentials>,
@@ -102,6 +103,7 @@ pub(super) enum Error {
     Classifier(Refusal),
     Routing(Box<RoutingRefusal>),
     Runner(Box<Value>),
+    ToolRefusal(Vec<u8>),
 }
 impl From<Refusal> for Error {
     fn from(error: Refusal) -> Self {
@@ -114,7 +116,22 @@ impl Error {
             Self::Classifier(error) => super::refusal_body(&error),
             Self::Routing(error) => serde_json::to_vec(&error).expect("routing refusal encodes"),
             Self::Runner(error) => serde_json::to_vec(&error).expect("runner refusal encodes"),
+            Self::ToolRefusal(body) => body,
         }
+    }
+
+    fn tool_bytes(self, spend: Spend) -> Vec<u8> {
+        let body = match self {
+            Self::ToolRefusal(body) => return body,
+            Self::Routing(mut error) if error.code != errors::ROUTING_UNAVAILABLE => {
+                error.code = errors::ROUTING_REFUSED.into();
+                let mut body = serde_json::to_value(error).expect("routing refusal encodes");
+                body["detail"]["class"] = json!("permanent");
+                serde_json::to_vec(&body).expect("routing refusal encodes")
+            }
+            other => other.bytes(),
+        };
+        spend.mark_body(body)
     }
 }
 
@@ -151,14 +168,20 @@ fn routing_error(error: RoutingCallError, pin: Option<&str>, now_ms: u64) -> Err
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Choice {
+pub(crate) struct Choice {
     select: SelectAnswer,
-    model: String,
+    pub(crate) model: String,
     frozen: FrozenRow,
-    entry: Option<cortexkit_role_classifier::describe::ModelEntry>,
+    pub(super) entry: Option<cortexkit_role_classifier::describe::ModelEntry>,
     describe: RoleDescribe,
     account: Option<AccountForAnswer>,
-    refusal: Option<Value>,
+    pub(crate) refusal: Option<Value>,
+}
+
+impl Choice {
+    pub(crate) fn provider(&self) -> &str {
+        &self.select.runner.model.provider
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -173,6 +196,8 @@ struct Journal {
     admission_refusal_pending: bool,
     runs: Vec<Run>,
     outbox: Vec<Rpc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_refusal: Option<Vec<u8>>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -466,8 +491,19 @@ async fn select(
         .routing
         .as_ref()
         .expect("readiness checked configuration");
-    let mut query = SelectRequest::new(consumer, requirements(request, estimates, &describe))
-        .with_runners(vec![routing.module_id.clone()]);
+    let mut requirements = requirements(request, estimates, &describe);
+    if service.role == super::LLM_CLASSIFY_STORE_ROLE
+        && requirements
+            .max_cost_usd
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            == Some(0.0)
+    {
+        // Routing only accepts positive caps. A zero tool ceiling still applies before dispatch.
+        requirements.max_cost_usd = None;
+    }
+    let mut query =
+        SelectRequest::new(consumer, requirements).with_runners(vec![routing.module_id.clone()]);
     if let Some(pin) = &request.model {
         query = query.with_pin(pin);
     }
@@ -526,6 +562,82 @@ async fn select(
         account: None,
         refusal,
     })
+}
+
+pub(crate) enum ToolRoute {
+    Chosen(Box<Choice>),
+    Refused(Vec<u8>),
+}
+
+impl SystemOne {
+    pub(crate) async fn select_tool_route(
+        &self,
+        params: &str,
+        consumer: &str,
+    ) -> Result<ToolRoute, Refusal> {
+        cortexkit_role_classifier::request::check_request_bytes(
+            params.len(),
+            &cortexkit_role_classifier::describe::Limits::new(
+                self.config.max_items,
+                self.config.max_request_bytes,
+            ),
+        )?;
+        let request = parse_request(params)?;
+        let mut choice = match select(self, &request, &estimates(&request)?, consumer).await {
+            Ok(choice) => choice,
+            Err(error) => return Ok(ToolRoute::Refused(error.tool_bytes(Spend::Nothing))),
+        };
+        use broca_core::{ChargeBasis, ChargeBasisResolver};
+        let (basis, _) = self
+            .charge_basis
+            .resolve_charge_basis(choice.provider(), "apikey");
+        let problem = if let Some(refusal) = &choice.refusal {
+            refusal["message"].as_str()
+        } else if basis != ChargeBasis::MeteredApi
+            || choice.frozen.input_rate_nanos.is_none_or(|rate| rate < 0)
+            || choice
+                .frozen
+                .output_rate_nanos
+                .is_some_and(|rate| rate != 0)
+            || choice.select.price.as_ref().is_some_and(|price| {
+                price.basis != cortexkit_role_routing::price::PriceBasis::Metered
+            })
+        {
+            Some("the model requires a per-token input price and no positive output price")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            let mut refusal = serde_json::to_value(Refusal::new(
+                errors::ROUTING_REFUSED,
+                format!("routing selected {}: {problem}", choice.model),
+            ))
+            .expect("refusal encodes");
+            refusal["detail"]["routing_answer"] = json!(choice.select);
+            choice.refusal = Some(refusal);
+        }
+        choice.frozen.charge_basis = Some(basis);
+        Ok(ToolRoute::Chosen(Box::new(choice)))
+    }
+
+    pub(crate) async fn stored_tool_route(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<ToolRoute>, Refusal> {
+        let (store, role, id) = (self.store.clone(), self.role.clone(), batch_id.to_owned());
+        let Some(row) = classify::blocking(move || store.routing(&role, &id)).await? else {
+            return Ok(None);
+        };
+        let journal: Journal = serde_json::from_str(&row.runs)
+            .map_err(|_| internal_refusal("stored routing journal does not decode"))?;
+        let choice: Option<Choice> = serde_json::from_str(&row.choice)
+            .map_err(|_| internal_refusal("stored routing choice does not decode"))?;
+        Ok(journal.tool_refusal.map(ToolRoute::Refused).or_else(|| {
+            choice
+                .or(journal.selected)
+                .map(|choice| ToolRoute::Chosen(Box::new(choice)))
+        }))
+    }
 }
 
 async fn prepare_admission(
@@ -1196,12 +1308,19 @@ impl SystemOne {
         stop: tokio_util::sync::CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let service = self.clone();
+        let tools = (self.role == super::STORE_ROLE && self.routing.is_some())
+            .then(|| Arc::new(self.fork_for_tools()));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 tokio::select! { biased; _ = stop.cancelled() => return, _ = tick.tick() => {} }
                 if let Err(error) = service.recover_routing().await {
                     tracing::warn!(target: "system_one", %error, "routing recovery scan failed");
+                }
+                if let Some(tools) = &tools {
+                    if let Err(error) = tools.recover_routing().await {
+                        tracing::warn!(target: "system_one", %error, "model-tool routing recovery scan failed");
+                    }
                 }
             }
         })
@@ -1351,6 +1470,56 @@ pub(super) async fn run(
     prepared: &super::images::PreparedImages,
     consumer: &str,
 ) -> Result<Option<Box<RawValue>>, Error> {
+    run_on(
+        service,
+        params,
+        scope,
+        admitted_at_ms,
+        prepared,
+        consumer,
+        None,
+    )
+    .await
+}
+
+pub(super) struct ToolRun<'a> {
+    pub args_digest: &'a str,
+    pub route: ToolRoute,
+}
+
+pub(super) async fn run_tool(
+    service: &Arc<SystemOne>,
+    params: &str,
+    scope: &BatchScope,
+    admitted_at_ms: Option<i64>,
+    prepared: &super::images::PreparedImages,
+    tool: ToolRun<'_>,
+) -> Result<Box<RawValue>, Vec<u8>> {
+    run_on(
+        service,
+        params,
+        scope,
+        admitted_at_ms,
+        prepared,
+        "",
+        Some(tool),
+    )
+    .await
+    .and_then(|reply| {
+        reply.ok_or_else(|| internal_refusal("routed tool reservation is missing").into())
+    })
+    .map_err(|error| error.tool_bytes(Spend::Nothing))
+}
+
+async fn run_on(
+    service: &Arc<SystemOne>,
+    params: &str,
+    scope: &BatchScope,
+    admitted_at_ms: Option<i64>,
+    prepared: &super::images::PreparedImages,
+    consumer: &str,
+    tool: Option<ToolRun<'_>>,
+) -> Result<Option<Box<RawValue>>, Error> {
     cortexkit_role_classifier::request::check_request_bytes(
         params.len(),
         &cortexkit_role_classifier::describe::Limits::new(
@@ -1407,12 +1576,17 @@ pub(super) async fn run(
             .and_then(|choice| choice.entry)
             .unwrap_or_else(|| validation_entry(service))
     };
-    check_model_request(service, &request, &entry, prepared)?;
+    if tool.is_none() {
+        check_model_request(service, &request, &entry, prepared)?;
+    }
     estimates(&request)?;
     let identity =
         BatchIdentity::of(&request).map_err(|error| Refusal::invalid_params("items", error.0))?;
     let identity_json = serde_json::to_string(&identity).expect("identity encodes");
-    let digest = classify::sha256_hex(&identity_json);
+    let digest = tool.as_ref().map_or_else(
+        || classify::sha256_hex(&identity_json),
+        |tool| tool.args_digest.to_owned(),
+    );
     flush_facts(service).await?;
     {
         let mut claims = service
@@ -1510,6 +1684,36 @@ pub(super) async fn run(
             .map_err(|_| internal_refusal("stored routing choice does not decode"))?;
         let mut journal: Journal = serde_json::from_str(&routing.runs)
             .map_err(|_| internal_refusal("stored routing journal does not decode"))?;
+        let is_tool = tool.is_some();
+        if let Some(tool) = tool {
+            if let Some(refused) = &journal.tool_refusal {
+                return Err(Error::ToolRefusal(refused.clone()));
+            }
+            match tool.route {
+                ToolRoute::Refused(refused) => {
+                    // A concurrently admitted selection wins over a later refusal to select.
+                    if choice.is_some() || journal.selected.is_some() {
+                        return Err(Refusal::batch_in_progress(super::BATCH_IN_PROGRESS_RETRY_AFTER_MS).into());
+                    }
+                    journal.tool_refusal = Some(refused.clone());
+                    save(service, &request.batch_id, &journal).await?;
+                    return Err(Error::ToolRefusal(refused));
+                }
+                ToolRoute::Chosen(selected) => {
+                    if let Some(recorded) = choice.as_ref().or(journal.selected.as_ref()) {
+                        // The consent check (for a run that read private content) admitted this
+                        // selection's provider, not another process's choice. A retry reads the
+                        // recorded route before checking consent again.
+                        if recorded.select.decision_id != selected.select.decision_id {
+                            return Err(Refusal::batch_in_progress(super::BATCH_IN_PROGRESS_RETRY_AFTER_MS).into());
+                        }
+                    } else {
+                        journal.selected = Some(*selected);
+                        save(service, &request.batch_id, &journal).await?;
+                    }
+                }
+            }
+        }
         if let Some(error) = journal.reselection.as_ref().and_then(|selection| selection.error.clone()) {
             return Err(Error::Runner(Box::new(error)));
         }
@@ -1521,15 +1725,15 @@ pub(super) async fn run(
                 return Err(Error::Runner(Box::new(refusal.clone())));
             }
             if stored_outcomes.len() == request.items.len()
-                && stored_outcomes.iter().all(retained)
+                && (is_tool || stored_outcomes.iter().all(retained))
                 && !pending_reselection(&journal)
                 && !journal.admission_refusal_pending
-                && !reselection_due(
+                && (is_tool || !reselection_due(
                     &journal,
                     stored_outcomes
                         .iter()
                         .any(|outcome| matches!(outcome.outcome, Outcome::Answered(_))),
-                )
+                ))
             {
                 let mut answered = request.clone();
                 answered.model = Some(choice.model.clone());
@@ -1540,12 +1744,22 @@ pub(super) async fn run(
                         .into_iter()
                         .map(|outcome| Some(Slot::Stored(outcome)))
                         .collect(),
-                    false,
+                    is_tool,
                     Some(&choice.select.decision_id),
                 )
                 .map(Some)
                 .map_err(Into::into);
             }
+        }
+        if is_tool && stored_outcomes.is_empty() && journal.runs.iter().any(|run| run.dispatched > 0) {
+            // Without a recorded outcome we cannot tell whether the interrupted send was billed.
+            // Finish its routing work, but never send the same call key to the provider again.
+            let refused = Error::from(internal_refusal("model tool execution failed; retry the call"))
+                .tool_bytes(Spend::Unknown);
+            journal.tool_refusal = Some(refused.clone());
+            save(service, &request.batch_id, &journal).await?;
+            recover_claimed(service, &request.batch_id, &mut journal).await?;
+            return Err(Error::ToolRefusal(refused));
         }
         let unadmitted = choice.as_ref().is_none_or(|choice| choice.account.is_none());
         let answer = dispatch(
@@ -1564,6 +1778,22 @@ pub(super) async fn run(
             consumer,
         )
         .await;
+        if is_tool {
+            return match answer {
+                Ok(reply) => Ok(Some(reply)),
+                Err(error) => {
+                    let spend = if journal.runs.iter().any(|run| run.dispatched > 0) {
+                        Spend::Unknown
+                    } else {
+                        Spend::Nothing
+                    };
+                    let refused = error.tool_bytes(spend);
+                    journal.tool_refusal = Some(refused.clone());
+                    save(service, &request.batch_id, &journal).await?;
+                    Err(Error::ToolRefusal(refused))
+                }
+            };
+        }
         if answer.is_err() && (fresh || unadmitted) && journal.runs.is_empty() && journal.outbox.iter().all(|rpc| rpc.closed)
             && journal.pending_admission.is_none()
             && journal.selected.is_none() {
@@ -1687,7 +1917,8 @@ async fn reject_choice(
     // §§2, 7-8), so free its id. If replacement selection fails after an account
     // failure, keep the original admitted batch and replay its account errors rather
     // than routing them again (classifier CONTRACT.md §6.3).
-    if original.is_none()
+    if service.role != super::LLM_CLASSIFY_STORE_ROLE
+        && original.is_none()
         && journal.runs.is_empty()
         && choice.account.is_none()
         && journal.pending_admission.is_none()
@@ -1740,6 +1971,7 @@ async fn reject_replacement_admission(
         Error::Classifier(body) => serde_json::to_value(body).expect("refusal encodes"),
         Error::Routing(body) => serde_json::to_value(body).expect("refusal encodes"),
         Error::Runner(body) => body.as_ref().clone(),
+        Error::ToolRefusal(body) => serde_json::from_slice(body).expect("tool refusal encodes"),
     };
     let selection = journal
         .reselection
@@ -1780,12 +2012,13 @@ async fn dispatch(
     prepared: &super::images::PreparedImages,
     consumer: &str,
 ) -> Result<Box<RawValue>, Error> {
+    let is_tool = service.role == super::LLM_CLASSIFY_STORE_ROLE;
     let raw: RawParams<'_> = serde_json::from_str(params)
         .map_err(|_| Refusal::invalid_params("params", "request did not decode"))?;
     let mut estimates = estimates(request)?;
     let mut slots: Vec<Option<Slot>> = (0..request.items.len()).map(|_| None).collect();
     for outcome in stored {
-        if retained(&outcome) {
+        if is_tool || retained(&outcome) {
             let index = outcome.index as usize;
             if index < slots.len() {
                 slots[index] = Some(Slot::Stored(outcome));
@@ -1797,6 +2030,9 @@ async fn dispatch(
         None => match journal.selected.clone() {
             Some(choice) => choice,
             None => {
+                if is_tool {
+                    return Err(internal_refusal("the admitted tool has no frozen route").into());
+                }
                 let choice = select(service, request, &estimates, consumer).await?;
                 journal.selected = Some(choice.clone());
                 // Persist a newly selected model's validation refusal and its report
@@ -1838,7 +2074,9 @@ async fn dispatch(
         )
     });
     let mut previous_choice = None;
-    let replacement = if pending_reselection(journal) {
+    let replacement = if is_tool {
+        None
+    } else if pending_reselection(journal) {
         journal
             .reselection
             .as_ref()
@@ -1856,7 +2094,7 @@ async fn dispatch(
         .last()
         .filter(|run| run.choice.select.decision_id == choice.select.decision_id)
         .and_then(|run| run.error.as_ref())
-        .filter(|error| account_error(error))
+        .filter(|error| !is_tool && account_error(error))
         .cloned()
     {
         // A process can stop between committing the account failure and recording the
@@ -1934,7 +2172,10 @@ async fn dispatch(
                     );
                     let outcome = StoredOutcome {
                         index: index as u64,
-                        outcome: Outcome::Failed(classify::item_error_json(&error)),
+                        outcome: Outcome::Failed(classify::stored_error_json(
+                            &error,
+                            is_tool.then_some(ItemSpend::Nothing),
+                        )),
                         input_tokens: None,
                         output_tokens: None,
                     };
@@ -1948,7 +2189,7 @@ async fn dispatch(
                     &answered,
                     &choice.frozen,
                     slots,
-                    false,
+                    is_tool,
                     Some(&choice.select.decision_id),
                 )
                 .map_err(Into::into);
@@ -2025,7 +2266,6 @@ async fn dispatch(
             }
         };
         let old_account = choice.account.is_some();
-        journal.pending_admission = None;
         choice.account = Some(account.clone());
         if let Some(selection) = &mut journal.reselection {
             selection.finished = true;
@@ -2042,6 +2282,7 @@ async fn dispatch(
             .provider
             .with_credential(routing.credentials.source(&account.account.credential_id))
             .ok_or_else(|| internal_refusal("the adapter cannot bind a routed credential"))?;
+        journal.pending_admission = None;
         let run_index = journal.runs.len();
         journal.runs.push(Run {
             id: id.clone(),
@@ -2093,7 +2334,10 @@ async fn dispatch(
             return Err(error);
         }
         let failure = journal.runs[run_index].error.clone();
-        if let Some(error) = failure.as_ref().filter(|error| account_error(error)) {
+        if let Some(error) = failure
+            .as_ref()
+            .filter(|error| !is_tool && account_error(error))
+        {
             cascade_account_error(service, &request.batch_id, journal, &mut slots, error).await?;
         }
         let any_answer = slots.iter().any(|slot| {
@@ -2105,16 +2349,18 @@ async fn dispatch(
                 }))
             )
         });
-        let should_reselect = failure.as_ref().is_some_and(|error| {
-            matches!(
-                error.code.as_str(),
-                errors::AUTH_FAILED | errors::ACCOUNT_NOT_ENTITLED
-            )
-        }) && !any_answer
+        let should_reselect = !is_tool
+            && failure.as_ref().is_some_and(|error| {
+                matches!(
+                    error.code.as_str(),
+                    errors::AUTH_FAILED | errors::ACCOUNT_NOT_ENTITLED
+                )
+            })
+            && !any_answer
             && !journal.reselected
             && !journal.runs[run_index].renew_failed;
         let final_batch = slots.iter().all(|slot| match slot {
-            Some(Slot::Stored(outcome)) => retained(outcome),
+            Some(Slot::Stored(outcome)) => is_tool || retained(outcome),
             _ => false,
         });
         finish_run(
@@ -2137,7 +2383,7 @@ async fn dispatch(
             &answered,
             &choice.frozen,
             slots,
-            false,
+            is_tool,
             Some(&choice.select.decision_id),
         )
         .map_err(Into::into);
@@ -2209,6 +2455,9 @@ async fn reselect(
                     Error::Classifier(body) => serde_json::to_value(body).expect("refusal encodes"),
                     Error::Routing(body) => serde_json::to_value(body).expect("refusal encodes"),
                     Error::Runner(body) => body.as_ref().clone(),
+                    Error::ToolRefusal(body) => {
+                        serde_json::from_slice(body).expect("tool refusal encodes")
+                    }
                 });
                 selection.finished = true;
             }
@@ -2319,6 +2568,7 @@ async fn dispatch_items(
     journal: &mut Journal,
     run_index: usize,
 ) -> Result<(), Error> {
+    let is_tool = service.role == super::LLM_CLASSIFY_STORE_ROLE;
     let mut stop: Option<ItemError> = None;
     for index in 0..request.items.len() {
         if slots[index].is_some() {
@@ -2348,7 +2598,10 @@ async fn dispatch_items(
             );
             let outcome = StoredOutcome {
                 index: index as u64,
-                outcome: Outcome::Failed(classify::item_error_json(&error)),
+                outcome: Outcome::Failed(classify::stored_error_json(
+                    &error,
+                    is_tool.then_some(ItemSpend::Nothing),
+                )),
                 input_tokens: None,
                 output_tokens: None,
             };
@@ -2403,10 +2656,20 @@ async fn dispatch_items(
                     account_ref,
                     cost,
                 );
+                let outcome = if is_tool && measured.is_none() {
+                    let refusal = crate::llm_tools::unmeasured_cost_refusal();
+                    Outcome::Failed(classify::item_error_json(&ItemError::new(
+                        refusal.code,
+                        refusal.detail.class,
+                        refusal.message,
+                    )))
+                } else {
+                    Outcome::Answered(answers)
+                };
                 (
                     StoredOutcome {
                         index: index as u64,
-                        outcome: Outcome::Answered(answers),
+                        outcome,
                         input_tokens,
                         output_tokens,
                     },
@@ -2427,7 +2690,7 @@ async fn dispatch_items(
                     run.output.push(usage.and_then(|usage| usage.output_tokens));
                     run.costs.push(Some(nanos));
                 }
-                if first_provider_call && error.code == errors::MODEL_UNAVAILABLE {
+                if !is_tool && first_provider_call && error.code == errors::MODEL_UNAVAILABLE {
                     // Account failures freeze as item errors, but a missing model still
                     // refuses admission. dispatch releases and reports the run before
                     // returning the refusal.
@@ -2436,11 +2699,11 @@ async fn dispatch_items(
                 if account_error(&error) || error.stops_the_call() {
                     stop = Some(error.clone());
                 }
-                if !account_error(&error) && !error.is_stored() {
+                if !is_tool && !account_error(&error) && !error.is_stored() {
                     unstored = Some(error.clone());
                 }
                 let fact = reported
-                    .filter(|_| !error.is_retried_on_resend())
+                    .filter(|_| is_tool || !error.is_retried_on_resend())
                     .and_then(|r| {
                         classify::fact_context(
                             service,
@@ -2453,7 +2716,10 @@ async fn dispatch_items(
                 (
                     StoredOutcome {
                         index: index as u64,
-                        outcome: Outcome::Failed(classify::item_error_json(&error)),
+                        outcome: Outcome::Failed(classify::stored_error_json(
+                            &error,
+                            is_tool.then_some(spend),
+                        )),
                         input_tokens: usage.and_then(|usage| usage.input_tokens),
                         output_tokens: usage.and_then(|usage| usage.output_tokens),
                     },

@@ -497,7 +497,7 @@ fn admission(row: &HeldCall) -> super::admission::Admission {
         batch_id: row.batch_id.clone(),
         args_digest: row.args_digest.clone(),
         params: row.request.clone().expect("held request"),
-        provider: row.provider.clone(),
+        routing_consumer: None,
     }
 }
 

@@ -1984,9 +1984,9 @@ fn args() -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn contract03_unpinned_tool_refusal_changes_no_artifact() {
+async fn an_unpinned_tool_refuses_when_routing_is_unavailable_but_a_pin_still_runs() {
     let Some(rig) = Rig::start(
-        "contract03-missing-pin",
+        "routing-unavailable",
         true,
         true,
         Some(42_000_000),
@@ -1998,11 +1998,38 @@ async fn contract03_unpinned_tool_refusal_changes_no_artifact() {
         return;
     };
     let route = rig.open(true, false).await;
+    let mut invalid = args();
+    invalid["model"] = Value::Null;
+    let invalid =
+        refused_without_writes(&rig, &route, invalid, "null-model", "invalid_params").await;
+    assert_eq!(invalid["detail"]["field"], "model");
+
     let mut arguments = args();
     arguments.as_object_mut().unwrap().remove("model");
-    let error =
-        refused_without_writes(&rig, &route, arguments, "missing-model", "invalid_params").await;
-    assert_eq!(error["detail"]["field"], "model");
+    let before = artifacts(&rig);
+    let calls = rig.calls();
+    let error = route
+        .call(arguments.clone(), Some("missing-model"))
+        .await
+        .unwrap_err();
+    assert_eq!(error["code"], "routing_unavailable");
+    assert_eq!(error["detail"]["no_spend"], true);
+    assert_eq!(
+        route
+            .call(arguments, Some("missing-model"))
+            .await
+            .unwrap_err(),
+        error
+    );
+    let after = artifacts(&rig);
+    // A keyed refusal may store its replay record, but it must not record spend or seek consent.
+    assert_eq!(
+        after["system-one.db"]["usage_outbox"],
+        before["system-one.db"]["usage_outbox"]
+    );
+    assert_eq!(after["run-index.db"], before["run-index.db"]);
+    assert_eq!(after["grants.db"], before["grants.db"]);
+    assert_eq!(rig.calls(), calls);
     let call = route.call(args(), Some("pinned")).await.unwrap();
     let result: cortexkit_llm_tools::classify::Result = serde_json::from_slice(&call).unwrap();
     cortexkit_llm_tools::classify::validate_result(&result).unwrap();

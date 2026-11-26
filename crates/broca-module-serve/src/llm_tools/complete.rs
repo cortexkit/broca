@@ -921,15 +921,7 @@ fn readmit(held: &Approved) -> Result<Admitted, Refusal> {
 /// `broca.complete.<caller>.<run|flow>`: the caller is the module the daemon stamped on the
 /// route's bind, or `direct`.
 fn consumer(principal: Option<&BindPrincipal>, scope: &BatchScope) -> String {
-    let caller = match principal {
-        Some(BindPrincipal::Reserved { module_id }) => module_id.as_str(),
-        _ => "direct",
-    };
-    let kind = match scope {
-        BatchScope::Flow { .. } => "flow",
-        BatchScope::Run { .. } => "run",
-    };
-    format!("{CONSUMER_ROOT}.{caller}.{kind}")
+    super::admission::scoped_consumer(CONSUMER_ROOT, principal, scope)
 }
 
 /// The gate of a run the person approved: they approved one route's provider, so a record that

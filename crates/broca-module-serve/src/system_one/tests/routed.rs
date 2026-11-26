@@ -106,6 +106,7 @@ struct Router {
     check_pending: Mutex<Option<Arc<SystemOneStore>>>,
     pending_seen: AtomicBool,
     calls: Mutex<Vec<Value>>,
+    select_bytes: Mutex<Vec<Vec<u8>>>,
     describe: Mutex<RoleDescribe>,
     models: Mutex<Vec<String>>,
     selects: AtomicUsize,
@@ -171,6 +172,7 @@ impl Router {
             check_pending: Mutex::new(None),
             pending_seen: AtomicBool::new(false),
             calls: Mutex::new(vec![]),
+            select_bytes: Mutex::new(vec![]),
             describe: Mutex::new(describe),
             models: Mutex::new(vec![JEV.into()]),
             selects: AtomicUsize::new(0),
@@ -228,7 +230,11 @@ impl Router {
 #[async_trait]
 impl RoutingTransport for Router {
     async fn request(&self, body: Vec<u8>) -> Result<Result<Vec<u8>, Vec<u8>>, String> {
-        let body: Value = serde_json::from_slice(&body).unwrap();
+        let decoded: Value = serde_json::from_slice(&body).unwrap();
+        if decoded["method"] == "route.select" {
+            self.select_bytes.lock().unwrap().push(body);
+        }
+        let body = decoded;
         self.calls.lock().unwrap().push(body.clone());
         if self.unreachable.load(Ordering::SeqCst) {
             return Err("route closed".into());
@@ -2932,6 +2938,9 @@ mod exits;
 
 #[path = "routed/refusals.rs"]
 mod refusals;
+
+#[path = "routed/tool.rs"]
+mod tool;
 
 async fn call(rig: &RoutedRig, params: &str) -> Result<Box<serde_json::value::RawValue>, Value> {
     rig.service

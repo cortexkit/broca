@@ -94,7 +94,7 @@ pub(super) fn admit(
         batch_id,
         args_digest: hash(&value),
         params,
-        provider: request.model.split('/').next().unwrap_or_default().into(),
+        routing_consumer: None,
     })
 }
 

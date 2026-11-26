@@ -88,6 +88,26 @@ impl SystemOne {
         send: &SendScope,
         stored: Option<&broca_store::system_one::StoredBatch>,
     ) -> Result<PreparedImages, Refusal> {
+        self.prepare_images_on(params, send, stored, None).await
+    }
+
+    pub(crate) async fn prepare_routed_tool_images(
+        &self,
+        params: &str,
+        send: &SendScope,
+        route: &super::routed::Choice,
+    ) -> Result<PreparedImages, Refusal> {
+        self.prepare_images_on(params, send, None, route.entry.as_ref())
+            .await
+    }
+
+    async fn prepare_images_on(
+        &self,
+        params: &str,
+        send: &SendScope,
+        stored: Option<&broca_store::system_one::StoredBatch>,
+        chosen: Option<&cortexkit_role_classifier::describe::ModelEntry>,
+    ) -> Result<PreparedImages, Refusal> {
         if !self.image_references() {
             return Ok(PreparedImages::default());
         }
@@ -98,7 +118,7 @@ impl SystemOne {
                 self.config.max_request_bytes,
             ),
         )?;
-        let request = if self.role == super::STORE_ROLE {
+        let request = if self.role == super::STORE_ROLE || chosen.is_some() {
             parse_request(params)?
         } else {
             cortexkit_role_classifier::request::parse_request_for(
@@ -113,7 +133,9 @@ impl SystemOne {
             )?
         };
         let model = request.model.as_deref().unwrap_or_default();
-        let entry = if self.role == super::STORE_ROLE {
+        let entry = if let Some(entry) = chosen {
+            entry.clone()
+        } else if self.role == super::STORE_ROLE {
             if stored.is_none() {
                 super::routed::pinned_entry(self, &request)?
                     .unwrap_or_else(|| super::routed::validation_entry(self))

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use broca_protocol::{BindPrincipal, BindScope, SendScope};
 use broca_store::grants::{GrantsStore, HeldCall, HeldState, HoldRequest};
@@ -15,6 +15,7 @@ use super::extract;
 use super::observed::Outcome as ConsentOutcome;
 use super::private_content::PrivateContent;
 use super::spend::Spend;
+use crate::system_one::{PreparedImages, ToolAdmission, ToolRoute};
 
 /// The private-content answer for a route with no cerebellum or Basal behind it, which is what
 /// a test that drives this route directly gets: the scope counts as marked and its sources are
@@ -102,11 +103,32 @@ struct Flight {
     result: watch::Receiver<Option<Answer>>,
 }
 
+impl Flight {
+    fn join(&self, admission: &Admission) -> Result<watch::Receiver<Option<Answer>>, Vec<u8>> {
+        if self.scope != admission.scope {
+            return Err(unspent(refusal(
+                "batch_scope_mismatch",
+                "batch_id is executing under another scope",
+            )));
+        }
+        if self.digest != admission.args_digest {
+            return Err(unspent(Refusal::batch_id_reuse("arguments")));
+        }
+        Ok(self.result.clone())
+    }
+}
+
+enum Pricing {
+    Pinned(ToolAdmission),
+    Routed(ToolRoute),
+}
+
 pub struct LlmTools {
     system: Arc<crate::system_one::SystemOne>,
     config: crate::config::LlmToolsConfig,
     private_content: PrivateContent,
     flights: Mutex<HashMap<String, Flight>>,
+    routing_calls: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     held: Arc<super::held::HeldCalls>,
     consent: Option<Arc<super::consent::Consent>>,
     consent_workers: Mutex<std::collections::HashSet<String>>,
@@ -147,6 +169,7 @@ impl LlmTools {
             config,
             private_content,
             flights: Mutex::new(HashMap::new()),
+            routing_calls: Mutex::new(HashMap::new()),
             consent: None,
             consent_workers: Mutex::new(std::collections::HashSet::new()),
             consent_stop: tokio_util::sync::CancellationToken::new(),
@@ -408,7 +431,7 @@ impl LlmTools {
                     scope: row.batch_scope.clone(),
                     batch_id: row.batch_id.clone(),
                     args_digest: row.args_digest.clone(),
-                    provider: row.provider.clone(),
+                    routing_consumer: None,
                     params,
                 };
                 let _ = service
@@ -509,6 +532,27 @@ impl LlmTools {
                     self.input_schema()
                 };
                 self.check_pin(&call, &schema)?;
+                // Serialize repeats before the held and batch lookups, so overlapping calls
+                // cannot both select or skip a hold one of them is still filing.
+                let _routing_call = if admission.routing_consumer.is_some()
+                    && call.call_key.is_some()
+                {
+                    let slot = {
+                        let mut calls =
+                            self.routing_calls.lock().unwrap_or_else(|p| p.into_inner());
+                        calls.retain(|_, lock| lock.strong_count() > 0);
+                        if let Some(lock) = calls.get(&admission.batch_id).and_then(Weak::upgrade) {
+                            lock
+                        } else {
+                            let lock = Arc::new(tokio::sync::Mutex::new(()));
+                            calls.insert(admission.batch_id.clone(), Arc::downgrade(&lock));
+                            lock
+                        }
+                    };
+                    Some(slot.lock_owned().await)
+                } else {
+                    None
+                };
                 let held = if let Some(call_key) = &call.call_key {
                     self.held.replay(
                         &admission,
@@ -785,6 +829,7 @@ impl LlmTools {
                 }
             }
         }
+        let pinned_model = admission.model();
         let extractor = if extract::is_key(&admission.batch_id) {
             Some(self.system.tool_extractor().ok_or_else(|| {
                 unspent(Refusal::model_unavailable(
@@ -813,11 +858,30 @@ impl LlmTools {
         } else {
             None
         };
+        let mut recorded_route = None;
         if let Some(stored) = &stored {
             // A refusal about the recorded batch reports this invocation's spend, which is
             // nothing: it sent no request. The recorded call's own cost reaches the caller
             // through its replayed answer, so it is never charged twice.
             check_replay(stored, &admission).map_err(unspent)?;
+            if pinned_model.is_none() {
+                recorded_route = system
+                    .stored_tool_route(&admission.batch_id)
+                    .await
+                    .map_err(unspent)?;
+                if let Some(ToolRoute::Refused(refused)) = recorded_route {
+                    let answer = Err(refused);
+                    if held.is_some() {
+                        self.persist_held_answer(
+                            &admission.batch_id,
+                            &answer,
+                            Spend::Nothing,
+                            true,
+                        )?;
+                    }
+                    return answer;
+                }
+            }
             if has_final_outcome(stored) {
                 // Replaying sends nothing, so a failure to read the record spent nothing; the
                 // replayed answer itself carries the spend its first answer carried.
@@ -841,26 +905,59 @@ impl LlmTools {
                 return answer;
             }
         }
-        let running = {
-            let flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(flight) = flights.get(&admission.batch_id) {
-                if flight.scope != admission.scope {
-                    return Err(unspent(refusal(
-                        "batch_scope_mismatch",
-                        "batch_id is executing under another scope",
-                    )));
-                }
-                if flight.digest != admission.args_digest {
-                    return Err(unspent(Refusal::batch_id_reuse("arguments")));
-                }
-                Some(flight.result.clone())
-            } else {
-                None
-            }
-        };
+        let running = self
+            .flights
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&admission.batch_id)
+            .map(|flight| flight.join(&admission))
+            .transpose()?;
         if let Some(receiver) = running {
             return await_flight(receiver).await;
         }
+        let routed = if pinned_model.is_none() {
+            let route = match (recorded_route, &held) {
+                (_, Some(row)) => {
+                    let choice = serde_json::from_str(&row.frozen_row).map_err(|_| {
+                        unspent(crate::system_one::internal_refusal(
+                            "the held classifier route is unreadable",
+                        ))
+                    })?;
+                    // Execution compares the held decision with any recorded one before it
+                    // dispatches. The person approved the provider on the held decision.
+                    ToolRoute::Chosen(choice)
+                }
+                (Some(route), None) => route,
+                (None, None) => {
+                    let consumer = admission
+                        .routing_consumer
+                        .as_deref()
+                        .expect("stamped consumer");
+                    system
+                        .select_tool_route(&admission.params, consumer)
+                        .await
+                        .map_err(unspent)?
+                }
+            };
+            match &route {
+                ToolRoute::Chosen(choice) if choice.refusal.is_none() => Some(route),
+                _ => {
+                    return system
+                        .execute_routed_tool(
+                            &admission.params,
+                            &admission.scope,
+                            &admission.args_digest,
+                            route,
+                            None,
+                            &PreparedImages::default(),
+                        )
+                        .await
+                        .and_then(|reply| convert(&reply));
+                }
+            }
+        } else {
+            None
+        };
         let kept = match held.as_ref() {
             Some(row) => self
                 .held
@@ -882,6 +979,10 @@ impl LlmTools {
                 extractor
                     .prepare_tool_images(&admission.params, &image_scope)
                     .await
+            } else if let Some(ToolRoute::Chosen(choice)) = &routed {
+                self.system
+                    .prepare_routed_tool_images(&admission.params, &image_scope, choice)
+                    .await
             } else {
                 self.system
                     .prepare_images(&admission.params, &image_scope, stored.as_ref())
@@ -902,42 +1003,63 @@ impl LlmTools {
                 }
             },
         };
-        let pricing = if let Some(row) = &held {
-            serde_json::from_value(json!({"frozen_row":row.frozen_row})).map_err(|_| {
-                unspent(crate::system_one::internal_refusal(
-                    "held pricing snapshot is unreadable",
-                ))
-            })?
+        let pricing = if let Some(route) = routed {
+            Pricing::Routed(route)
+        } else if let Some(row) = &held {
+            Pricing::Pinned(
+                serde_json::from_value(json!({"frozen_row":row.frozen_row})).map_err(|_| {
+                    unspent(crate::system_one::internal_refusal(
+                        "held pricing snapshot is unreadable",
+                    ))
+                })?,
+            )
         } else if let Some(extractor) = extractor {
-            extractor
-                .admit_tool(&admission.params, stored.as_ref())
-                .map_err(|refusal| {
-                    crate::system_one::extraction_refusal_body(&Spend::Nothing.mark(refusal))
-                })?
+            Pricing::Pinned(
+                extractor
+                    .admit_tool(&admission.params, stored.as_ref())
+                    .map_err(|refusal| {
+                        crate::system_one::extraction_refusal_body(&Spend::Nothing.mark(refusal))
+                    })?,
+            )
         } else {
-            self.system
-                .admit_tool(&admission.params, stored.as_ref())
-                .map_err(unspent)?
+            Pricing::Pinned(
+                self.system
+                    .admit_tool(&admission.params, stored.as_ref())
+                    .map_err(unspent)?,
+            )
         };
         // Private-content admission runs on every call that may reach a provider. A recorded
         // outcome already returned above, so a stored batch here has none and this call would
         // dispatch its item again: it needs consent exactly as a fresh call would. A held call
         // was admitted by the person's decision instead.
         if held.is_none() {
-            if let Err(refusal) = self.private_content.admit(scope, &admission.provider).await {
-                let model = serde_json::from_str::<Value>(&admission.params)
-                    .ok()
-                    .and_then(|params| params["model"].as_str().map(str::to_owned))
-                    .unwrap_or_default();
-                let frozen_row = serde_json::to_value(&pricing)
-                    .ok()
-                    .and_then(|frozen| frozen["frozen_row"].as_str().map(str::to_owned))
-                    .unwrap_or_default();
+            let (model, provider) = match &pricing {
+                Pricing::Pinned(_) => {
+                    let model = pinned_model.as_deref().expect("pinned tool model");
+                    (model, model.split('/').next().unwrap_or_default())
+                }
+                Pricing::Routed(ToolRoute::Chosen(choice)) => {
+                    (choice.model.as_str(), choice.provider())
+                }
+                Pricing::Routed(ToolRoute::Refused(_)) => {
+                    unreachable!("a routing refusal already answered")
+                }
+            };
+            if let Err(refusal) = self.private_content.admit(scope, provider).await {
+                let frozen_row = match &pricing {
+                    Pricing::Pinned(pricing) => pricing.frozen_row.clone(),
+                    Pricing::Routed(ToolRoute::Chosen(choice)) => {
+                        serde_json::to_string(choice).expect("a frozen classifier route encodes")
+                    }
+                    Pricing::Routed(ToolRoute::Refused(_)) => {
+                        unreachable!("a routing refusal already answered")
+                    }
+                };
                 let call = HoldCall {
                     batch_id: admission.batch_id.clone(),
                     batch_scope: admission.scope.clone(),
-                    provider: &admission.provider,
-                    model: &model,
+                    provider,
+                    model,
                     request: admission.params.clone(),
                     args_digest: admission.args_digest.clone(),
                     frozen_row,
@@ -970,20 +1092,12 @@ impl LlmTools {
         let receiver = {
             let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(flight) = flights.get(&admission.batch_id) {
-                if flight.scope != admission.scope {
-                    return Err(unspent(refusal(
-                        "batch_scope_mismatch",
-                        "batch_id is executing under another scope",
-                    )));
-                }
-                if flight.digest != admission.args_digest {
-                    return Err(unspent(Refusal::batch_id_reuse("arguments")));
-                }
-                flight.result.clone()
+                flight.join(&admission)?
             } else {
                 let (sender, receiver) = watch::channel(None);
+                let batch_id = admission.batch_id.clone();
                 flights.insert(
-                    admission.batch_id.clone(),
+                    batch_id.clone(),
                     Flight {
                         scope: admission.scope.clone(),
                         digest: admission.args_digest.clone(),
@@ -991,61 +1105,20 @@ impl LlmTools {
                     },
                 );
                 let service = self.clone();
-                let is_extract = extractor.is_some();
                 tokio::spawn(async move {
-                    let batch_id = admission.batch_id.clone();
-                    let system = service.system.clone();
-                    let admitted_at = held.as_ref().map(|row| row.admitted_at_ms);
-                    let execution = tokio::spawn(async move {
-                        if is_extract {
-                            let extractor = system
-                                .tool_extractor()
-                                .expect("extractor checked before dispatch");
-                            extractor
-                                .execute_tool(
-                                    &admission.params,
-                                    &admission.scope,
-                                    &admission.args_digest,
-                                    &pricing,
-                                    admitted_at,
-                                    &images,
-                                )
-                                .await
-                        } else {
-                            system
-                                .execute_tool(
-                                    admission.params,
-                                    admission.scope,
-                                    admission.args_digest,
-                                    pricing,
-                                    admitted_at,
-                                    images,
-                                )
-                                .await
-                        }
+                    let worker = service.clone();
+                    let answer = tokio::spawn(async move {
+                        worker.dispatch(admission, pricing, held, images).await
                     })
-                    .await;
-                    let answer = match execution {
-                        Ok(Ok(reply)) if is_extract => Ok(reply),
-                        Ok(Ok(reply)) => convert(&reply),
-                        // `execute_tool` marks every refusal it returns with its spend.
-                        Ok(Err(refusal)) => Err(error(refusal, None)),
-                        // The task may have ended after its provider request was sent.
-                        Err(_) => Err(error(
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(error(
                             crate::system_one::internal_refusal(
                                 "model tool execution failed; retry the call",
                             ),
                             Some(Spend::Unknown),
-                        )),
-                    };
-                    let answer = if held.is_some() {
-                        let recorded = answer.is_err() && service.recorded(&batch_id).await;
-                        service
-                            .persist_held_answer(&batch_id, &answer, Spend::Unknown, recorded)
-                            .and(answer)
-                    } else {
-                        answer
-                    };
+                        ))
+                    });
                     sender.send_replace(Some(answer));
                     service
                         .flights
@@ -1057,6 +1130,76 @@ impl LlmTools {
             }
         };
         await_flight(receiver).await
+    }
+
+    async fn dispatch(
+        self: &Arc<Self>,
+        admission: Admission,
+        pricing: Pricing,
+        held: Option<HeldCall>,
+        images: Arc<PreparedImages>,
+    ) -> Answer {
+        let admitted_at = held.as_ref().map(|row| row.admitted_at_ms);
+        let batch_id = admission.batch_id;
+        let routed = matches!(pricing, Pricing::Routed(_));
+        let answer = match pricing {
+            Pricing::Routed(route) => self
+                .system
+                .execute_routed_tool(
+                    &admission.params,
+                    &admission.scope,
+                    &admission.args_digest,
+                    route,
+                    admitted_at,
+                    &images,
+                )
+                .await
+                .and_then(|reply| convert(&reply)),
+            Pricing::Pinned(pricing) => {
+                if extract::is_key(&batch_id) {
+                    let extractor = self
+                        .system
+                        .tool_extractor()
+                        .expect("extractor checked before dispatch");
+                    extractor
+                        .execute_tool(
+                            &admission.params,
+                            &admission.scope,
+                            &admission.args_digest,
+                            &pricing,
+                            admitted_at,
+                            &images,
+                        )
+                        .await
+                        .map_err(|refusal| error(refusal, None))
+                } else {
+                    self.system
+                        .clone()
+                        .execute_tool(
+                            admission.params,
+                            admission.scope,
+                            admission.args_digest,
+                            pricing,
+                            admitted_at,
+                            images,
+                        )
+                        .await
+                        .map_err(|refusal| error(refusal, None))
+                        .and_then(|reply| convert(&reply))
+                }
+            }
+        };
+        if held.is_some() {
+            let recorded = answer.is_err()
+                && (self.recorded(&batch_id).await
+                    || (routed
+                        && matches!(
+                            self.system.stored_tool_route(&batch_id).await,
+                            Ok(Some(ToolRoute::Refused(_)))
+                        )));
+            self.persist_held_answer(&batch_id, &answer, Spend::Unknown, recorded)?;
+        }
+        answer
     }
 
     /// Whether the batch has a recorded outcome, which is final for its call key.

@@ -11,7 +11,19 @@ pub(super) struct Admission {
     pub batch_id: String,
     pub args_digest: String,
     pub params: String,
-    pub provider: String,
+    pub routing_consumer: Option<String>,
+}
+
+impl Admission {
+    pub fn model(&self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Model {
+            model: Option<String>,
+        }
+        serde_json::from_str::<Model>(&self.params)
+            .expect("admitted model-tool parameters decode")
+            .model
+    }
 }
 
 #[derive(Deserialize)]
@@ -56,6 +68,12 @@ pub(super) fn admit(
             ));
         }
     }
+    if object.get("model").is_some_and(|model| !model.is_string()) {
+        return Err(Refusal::invalid_params(
+            "model",
+            "model must be a string when supplied",
+        ));
+    }
     if !object.get("max_cost_usd").is_some_and(Value::is_number) {
         return Err(Refusal::invalid_params(
             "max_cost_usd",
@@ -64,10 +82,6 @@ pub(super) fn admit(
     }
     let request: classify::Request = serde_json::from_str(arguments.get())
         .map_err(|e| Refusal::invalid_params("arguments", e.to_string()))?;
-    let model = request
-        .model
-        .as_deref()
-        .ok_or_else(|| Refusal::invalid_params("model", "model is required for llm.classify"))?;
     (if image_references {
         classify::validate_request_with_image_references(&request)
     } else {
@@ -94,13 +108,34 @@ pub(super) fn admit(
         raw.item.get(),
         raw.max_cost_usd.get(),
     );
+    let routing_consumer = request
+        .model
+        .is_none()
+        .then(|| scoped_consumer(crate::system_one::ROUTING_CONSUMER_ROOT, principal, &scope));
     Ok(Admission {
         scope,
         batch_id,
         args_digest,
         params,
-        provider: model.split('/').next().unwrap_or_default().into(),
+        routing_consumer,
     })
+}
+
+/// Routing policy follows the caller and kind of the daemon-stamped scope, not the arguments.
+pub(super) fn scoped_consumer(
+    root: &str,
+    principal: Option<&BindPrincipal>,
+    scope: &BatchScope,
+) -> String {
+    let caller = match principal {
+        Some(BindPrincipal::Reserved { module_id }) => module_id.as_str(),
+        _ => "direct",
+    };
+    let kind = match scope {
+        BatchScope::Flow { .. } => "flow",
+        BatchScope::Run { .. } => "run",
+    };
+    format!("{root}.{caller}.{kind}")
 }
 
 /// The scope a model tool call is attributed to, from the daemon's stamp on its route, and the
@@ -219,7 +254,7 @@ mod contract03_tests {
     use super::*;
 
     #[test]
-    fn llm_classify_missing_pin_is_refused_at_admission() {
+    fn llm_classify_admits_an_unpinned_request_for_routing() {
         let principal = broca_protocol::BindPrincipal::Reserved {
             module_id: "owner".into(),
         };
@@ -240,17 +275,18 @@ mod contract03_tests {
             parent_state: None,
         });
         let arguments = serde_json::value::to_raw_value(&serde_json::json!({"item":{"state":"invented"},"questions":{"q":{"type":"noul","instructions":"true?"}},"max_cost_usd":1.0})).unwrap();
-        let error = admit(
+        let admitted = admit(
             Some(&principal),
             &scope,
             &arguments,
             Some("missing-model"),
             false,
         )
-        .err()
-        .expect("unpinned tool call must not be admitted");
-        assert_eq!(error.code, "invalid_params");
-        assert_eq!(error.detail.field.as_deref(), Some("model"));
-        assert_eq!(error.message, "model is required for llm.classify");
+        .expect("unpinned tool call is admitted for routing");
+        assert!(admitted.model().is_none());
+        assert_eq!(
+            admitted.routing_consumer.as_deref(),
+            Some("broca.classifier.owner.run")
+        );
     }
 }

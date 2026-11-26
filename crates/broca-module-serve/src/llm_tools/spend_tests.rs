@@ -244,7 +244,6 @@ const SITES: &[(&str, &str, usize, &str)] = &[
         "no spend: extraction admission refused before dispatch",
     ),
     ("route.rs", "to_value(composition)", 1, "not a refusal"),
-    ("route.rs", "to_value(&pricing)", 1, "not a refusal"),
     (
         "held.rs",
         "result.body.as_bytes().to_vec()",

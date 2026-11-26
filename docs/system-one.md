@@ -148,9 +148,16 @@ The daemon refuses roots marked `broca-state/2`; the removed staging format has 
 System One service. Live snapshots and claims on supported roots refuse expired
 routed rows, so cleanup timing never exposes content past retention.
 
-`llm.classify/v1` results include the model used, as required by llm-tools.
-Unlike `classify.run`, `llm_classify` requires a model pin: the tool must know
-the provider before checking consent to send content or spend money.
+`llm_classify` (`llm.classify/v1`) uses a supplied model as a pin, without
+substitution. Without a pin, it asks routing under
+`broca.classifier.<caller>.<run|flow>`, using the caller module and scope kind
+the daemon stamped on the route. It asks for `iq: 1`, the lowest positive
+quality bar on routing's 0-100 scale, so routing picks the cheapest model with
+a decision grade rather than an ungraded one. It serves only per-token priced decision models. The tool checks consent for
+the selected provider before anything is sent to it. An approved hold runs on
+the selection it was held with, without selecting again. The result names the
+model actually used; repeating a recorded `call_key` returns that outcome
+without calling routing or the provider again.
 
 ## `extractor/v1`
 
