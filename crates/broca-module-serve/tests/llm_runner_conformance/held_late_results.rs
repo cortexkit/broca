@@ -17,6 +17,10 @@ use broca_session_store::record::Record;
 use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
 use cortexkit_role_tool_provider::late_results::{kinds, LateEntry};
 
+#[path = "held_daemon_upgrade.rs"]
+mod daemon_upgrade;
+pub(super) use daemon_upgrade::DaemonUpgradeRig;
+
 /// The scripted provider's one incarnation: it lives in the test process, so a broca restart
 /// does not restart it.
 const INCARNATION: &str = "conformance-provider-1";
@@ -47,6 +51,8 @@ pub(super) struct FeedState {
     enabled: bool,
     /// Arguments (as JSON text) of the calls the provider holds.
     hold: BTreeSet<String>,
+    /// Hold the wire reply itself open, so a daemon cut can strand a still-dispatched call.
+    cut_replies: BTreeSet<String>,
     /// Sessions whose sends need a plan to record the provider's late-results declarations
     /// in their session manifest.
     sessions: BTreeSet<String>,
@@ -390,6 +396,15 @@ pub(super) fn answer_held(
         }))
         .unwrap(),
     ))
+}
+
+pub(super) fn cut_wire_reply(shared: &Shared, arguments: &str) -> bool {
+    shared
+        .held_feed
+        .lock()
+        .unwrap()
+        .cut_replies
+        .contains(arguments)
 }
 
 /// Serve `late_results` and `late_results.ack`; `None` for any other request.

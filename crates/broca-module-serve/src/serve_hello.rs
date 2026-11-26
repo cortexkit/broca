@@ -46,20 +46,7 @@ where
 {
     let mut manifest = hello_manifest(module_id, consumer_routes, false);
     manifest.ready = Some(false);
-    let body = serde_json::to_vec(&ModuleHelloBody {
-        module_capabilities: None,
-        resume_token: None,
-        manifest,
-        protocol_ver: PROTOCOL_VERSION,
-        control_ops: Some(vec![
-            MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
-            subc_protocol::config::CONFIG_REVIEW_OP.to_string(),
-        ]),
-        launch_nonce: hello_launch_nonce()?,
-    })
-    .map_err(|e| ServeIoError(e.to_string()))?;
-    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
-        .map_err(|e| ServeIoError(e.to_string()))?;
+    let frame = gated_hello(manifest, hello_launch_nonce()?, None)?;
     write_frame(writer, &frame)
         .await
         .map_err(|e| ServeIoError(e.to_string()))?;
@@ -68,6 +55,29 @@ where
         .await
         .map_err(|e| ServeIoError(e.to_string()))?;
     expect_hello_ack(reader).await
+}
+
+pub(super) fn gated_hello(
+    manifest: subc_protocol::manifest::ModuleManifest,
+    launch_nonce: Option<String>,
+    resume_token: Option<String>,
+) -> Result<Frame, ServeIoError> {
+    let module_capabilities = cfg!(any(target_os = "linux", target_os = "macos"))
+        .then(|| vec![subc_protocol::session::LIVE_UPGRADE_CAPABILITY.to_owned()]);
+    let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities,
+        resume_token,
+        manifest,
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: Some(vec![
+            MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
+            subc_protocol::config::CONFIG_REVIEW_OP.to_string(),
+        ]),
+        launch_nonce,
+    })
+    .map_err(|_| ServeIoError("could not encode module HELLO".into()))?;
+    Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
+        .map_err(|_| ServeIoError("could not build module HELLO frame".into()))
 }
 
 /// A module connection that already registered unready through the settings gate: its HELLO
@@ -140,5 +150,31 @@ where
         ty => Err(ServeIoError(format!(
             "unexpected frame {ty:?} awaiting HELLO_ACK"
         ))),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) enum HelloError {
+    Wire(FrameIoError),
+    Closed,
+    Refused(ErrorBody),
+    Invalid,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) async fn read_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, HelloError>
+where
+    R: AsyncRead + Unpin,
+{
+    let frame = read_frame(reader)
+        .await
+        .map_err(HelloError::Wire)?
+        .ok_or(HelloError::Closed)?;
+    match frame.header.ty {
+        FrameType::HelloAck => serde_json::from_slice(&frame.body).map_err(|_| HelloError::Invalid),
+        FrameType::Error => Err(HelloError::Refused(
+            serde_json::from_slice(&frame.body).map_err(|_| HelloError::Invalid)?,
+        )),
+        _ => Err(HelloError::Invalid),
     }
 }

@@ -359,6 +359,81 @@ impl Served {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn resume_acknowledges_an_applied_pending_view_after_the_old_ack_was_cut() {
+    let effective = json!({"chatgpt_force_https":true});
+    let old = std::sync::Arc::new(super::Gate {
+        calls: super::Calls::new(subc_protocol::PROTOCOL_VERSION),
+        schema: crate::settings::schema(),
+        user_file: Some("/config/broca.jsonc".into()),
+        applied: std::sync::Mutex::new(Some(super::Applied {
+            effective: json!({"chatgpt_force_https":false}),
+            generation: 6,
+            attempt: None,
+            started: json!({"chatgpt_force_https":false}),
+            waiting_restart: vec![],
+            refused_at: None,
+        })),
+    });
+    let (tx, sent) = tokio::sync::mpsc::channel(8);
+    old.attach(tx.into());
+    let mut daemon = Served {
+        gate: old.clone(),
+        sent,
+    };
+    let applied = old.apply_view(view(7, 8, effective.clone(), ConfigStatus::Pending));
+    tokio::pin!(applied);
+    let (_, ack) = tokio::select! {
+        sent = daemon.request("config.applied") => sent,
+        result = &mut applied => panic!("old view did not wait for its acknowledgement: {result:?}"),
+    };
+    assert_eq!(ack["attempt"], 8);
+    old.detach_for_upgrade();
+
+    let replacement = old.resumed(subc_protocol::PROTOCOL_VERSION);
+    let (tx, sent) = tokio::sync::mpsc::channel(8);
+    let mut daemon = Served {
+        gate: replacement.clone(),
+        sent,
+    };
+    let started = replacement.finish_resume(tx.into(), Vec::new(), true);
+    let check = async {
+        let (corr, _) = daemon.request("catalog.update").await;
+        daemon.answer(corr, json!({}));
+        let (corr, _) = daemon.request("config.declare").await;
+        daemon.answer(corr, json!({}));
+        let (corr, _) = daemon.request("config.get").await;
+        daemon.answer(
+            corr,
+            get_reply(None, Some(view(7, 9, effective, ConfigStatus::Pending))),
+        );
+        let (corr, ack) = daemon.request("config.applied").await;
+        assert_eq!(
+            (ack["generation"].as_u64(), ack["attempt"].as_u64()),
+            (Some(7), Some(9))
+        );
+        daemon.answer(corr, json!({}));
+    };
+    let (started, ()) = tokio::join!(started, check);
+    started.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn resume_restarts_if_settings_became_daemon_managed() {
+    let gate = super::Gate::ungated(subc_protocol::PROTOCOL_VERSION);
+    let (tx, sent) = tokio::sync::mpsc::channel(8);
+    let mut daemon = Served {
+        gate: gate.clone(),
+        sent,
+    };
+    let resume = gate.finish_resume(tx.into(), Vec::new(), true);
+    tokio::pin!(resume);
+    tokio::select! {
+        result = &mut resume => assert!(matches!(result, Err(error) if error.0.contains("settings management changed"))),
+        sent = daemon.next() => panic!("an ungated module published readiness under a managed gate: {:?}", sent.header),
+    }
+}
+
 /// Once broca is built, the gate marks it ready with its real roles in one `catalog.update`,
 /// then acknowledges the view it started from. A later view that changes only a field applied
 /// in place is applied and acknowledged; one that changes a field read at start is left for the
@@ -752,6 +827,7 @@ fn an_older_view_never_overwrites_a_newer_one_taken_after_its_freshness_check() 
     let gate = std::sync::Arc::new(super::Gate {
         calls: super::Calls::new(subc_protocol::PROTOCOL_VERSION),
         schema: crate::settings::schema(),
+        user_file: None,
         applied: std::sync::Mutex::new(Some(super::Applied {
             effective: started.clone(),
             generation: 2,

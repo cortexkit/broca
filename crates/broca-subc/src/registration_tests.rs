@@ -78,6 +78,43 @@ async fn a_refused_mint_is_final() {
     assert_eq!(minter.requests.lock().unwrap().len(), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn mint_waits_for_the_resumed_minter() {
+    use std::task::Poll;
+
+    let slot = MinterSlot::new();
+    let minter = Arc::new(Scripted::default());
+    minter
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(minted("CLAIMCLAIMCLAIMCLAIM02"));
+    slot.0
+        .send_replace(Minter::Upgrading(Instant::now() + Duration::from_secs(2)));
+    let mut mint = std::pin::pin!(slot.mint());
+    assert!(matches!(futures::poll!(&mut mint), Poll::Pending));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    slot.0.send_replace(Minter::Ready(minter.clone()));
+    assert_eq!(
+        mint.await.unwrap().expose_secret(),
+        "CLAIMCLAIMCLAIMCLAIM02"
+    );
+    assert_eq!(minter.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mint_stops_at_the_upgrade_deadline() {
+    let slot = MinterSlot::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    slot.0.send_replace(Minter::Upgrading(deadline));
+    let error = slot.mint().await.unwrap_err();
+    assert_eq!(Instant::now(), deadline);
+    assert!(
+        error.contains("upgrade reconnect deadline passed"),
+        "{error}"
+    );
+}
+
 /// The daemon's side of a fresh connection: reads the first frame and answers it with `reply`.
 async fn daemon_answers(
     mut daemon: tokio::io::DuplexStream,

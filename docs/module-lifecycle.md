@@ -4,6 +4,45 @@ Broca's run lifetime is separate from the `session.send` RPC: the reply acknowle
 durable admission, while the lineage actor owns execution and queued submissions.
 Shutdown must therefore count actors' work, not just the daemon's forwarded RPCs.
 
+## In-place daemon upgrades
+
+On macOS and Linux, broca opts in to `live-upgrade/v1`. A `module.upgrading`
+notice sets a monotonic reconnect deadline without draining broca. When the
+old module connection closes, broca reconnects on the daemon's local socket
+using the newest resume token from HELLO_ACK. The token stays in memory.
+The new connection republishes broca's catalog and reviews the daemon's
+settings through the usual settings gate. If the daemon changes whether it
+manages settings, broca restarts so its normal startup can choose the source.
+Consumer connections bind again using claims from the new registration.
+
+Session actors, providers' model streams and stores stay up. Routes and
+subscriptions on the old connection end. A subscriber can attach again at its
+last durable cursor; a sender can repeat the same `send_id` to retrieve the
+original admission. Consumer tools reopen routes on use, catalog watches
+resubscribe, broca resumes pulling late results from providers, and bus credential
+requests open new routes as needed.
+
+The daemon's `module_reloading` refusal with `detail.reason: "daemon_upgrade"`
+proves that a request did not reach its provider, so broca can reopen its route
+and retry within the reconnect deadline and the request's own budget. In
+particular, a pre-tool hook whose declared budget expires during the switch
+still fails closed. A tool call already dispatched when its connection was cut
+is not sent again. The run continues with `outcome_unknown` (the tool may have
+run); a late result cannot replace the terminal already recorded for the call.
+A closure during the switch is not evidence that the run's scope has ended.
+
+A local stop or terminal resume refusal stops new work and seals any remaining
+runs before exit. If the reconnect deadline passes instead, the daemon kills
+broca. Broca stops starting work and attempts to seal, but the kill can arrive
+before the seal finishes or is logged. The replacement recovers the durable
+session records as it would after any crash, without repeating a dispatched
+call whose outcome is unknown.
+
+Losing the connection without a preceding notice still stops broca. Broca
+advertises the capability in its first HELLO; if the upgrade interrupts cold
+start before broca is ready, broca logs the interruption and lets the supervisor
+start it again. There are no live runs to preserve yet. Windows does not opt in.
+
 ## Accepting restart drains
 
 Broca declares `accepting-drain/v1`. A daemon that also advertises it in

@@ -187,6 +187,34 @@ impl SubcPlanFetcher {
     }
 
     async fn call(&self, provider: &str, op: &str, arguments: Value) -> Result<Value, FetchError> {
+        let mut upgrade = crate::daemon_upgrade::Retry::default();
+        loop {
+            let call = self.call_once(provider, op, arguments.clone());
+            let result = match upgrade.deadline() {
+                Some(deadline) => tokio::time::timeout_at(deadline, call)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(FetchError::Lost(
+                            "plan fetch did not finish by the daemon upgrade deadline".into(),
+                        ))
+                    }),
+                None => call.await,
+            };
+            if let Err(error) = &result {
+                if upgrade.after_fetch(error, &self.conn).await {
+                    continue;
+                }
+            }
+            return result;
+        }
+    }
+
+    async fn call_once(
+        &self,
+        provider: &str,
+        op: &str,
+        arguments: Value,
+    ) -> Result<Value, FetchError> {
         let selector = self.selector().await?;
         let catalog = self.catalog_snapshot().await?;
         let policy = crate::connection::ToolProviderRoutePolicy::for_provider(

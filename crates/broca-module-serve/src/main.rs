@@ -1111,11 +1111,10 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     };
-    let (read_half, write_half) = gated.connection.hand_over().await;
-    let registered = Some(gated.registration);
-    let serving = broca_module_serve::serve::serve_connection_with_llm_tools(
-        read_half,
-        write_half,
+    let serving = broca_module_serve::serve::serve_supervised(
+        &conn_path,
+        gated.connection,
+        gated.registration,
         &module_id,
         registry.clone(),
         registry.clone(),
@@ -1129,7 +1128,6 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(system_one),
         Some(llm_tools),
         gateway_listing,
-        registered,
     );
     tokio::pin!(serving);
     tokio::select! {

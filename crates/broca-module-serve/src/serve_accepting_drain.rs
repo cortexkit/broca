@@ -2,7 +2,7 @@
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -21,14 +21,14 @@ const READY_CORR: u64 = 2;
 const CHECK_INTERVAL: Duration = Duration::from_millis(10);
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Drain {
     supported: bool,
-    phase: Phase,
+    phase: Arc<Mutex<Phase>>,
     sessionless: Arc<AtomicUsize>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 enum Phase {
     #[default]
     Serving,
@@ -63,14 +63,22 @@ impl Drop for InFlight {
 }
 
 impl Drain {
-    pub(super) fn negotiated(ack: &ModuleHelloAckBody) -> Self {
+    pub(super) fn negotiated(&self, ack: &ModuleHelloAckBody) -> Self {
         Self {
             supported: ack
                 .subc_capabilities
                 .iter()
                 .any(|cap| cap == ACCEPTING_DRAIN_CAPABILITY),
-            ..Default::default()
+            ..self.clone()
         }
+    }
+
+    fn phase(&self) -> Phase {
+        *self.phase.lock().unwrap()
+    }
+
+    fn set_phase(&self, phase: Phase) {
+        *self.phase.lock().unwrap() = phase;
     }
 
     pub(super) fn sessionless_call(&self) -> InFlight {
@@ -89,7 +97,7 @@ impl Drain {
             accepting: true,
         }) = accepting
         {
-            if matches!(self.phase, Phase::Serving) {
+            if matches!(self.phase(), Phase::Serving) {
                 let started = Instant::now();
                 let remaining = deadline_ms.saturating_sub(now_epoch_ms().max(0) as u64);
                 let deadline = started
@@ -99,12 +107,12 @@ impl Drain {
                 let runs_in_flight = registry.slot_counts().runs_in_flight;
                 tracing::info!(target: "lifecycle", ?reason, deadline_ms, runs_in_flight,
                         "accepting drain started; deferring new runs until restart");
-                self.phase = Phase::Accepting {
+                self.set_phase(Phase::Accepting {
                     started,
                     deadline,
                     check_at: started,
                     ver: frame.header.ver,
-                };
+                });
             }
             return;
         }
@@ -135,7 +143,7 @@ impl Drain {
     }
 
     fn wake_at(&self) -> Option<Instant> {
-        match self.phase {
+        match self.phase() {
             Phase::Accepting { check_at, .. } => Some(check_at),
             Phase::AwaitingAck { until, .. } => Some(until),
             _ => None,
@@ -148,7 +156,7 @@ impl Drain {
         writer: &EgressSender<Frame>,
         llm_tools: Option<&crate::llm_tools::LlmTools>,
     ) {
-        match self.phase {
+        match self.phase() {
             Phase::Accepting {
                 started,
                 deadline,
@@ -170,16 +178,16 @@ impl Drain {
                     || sessionless != 0
                     || completions_in_flight != 0
                 {
-                    self.phase = Phase::Accepting {
+                    self.set_phase(Phase::Accepting {
                         started,
                         deadline,
                         check_at: (now + CHECK_INTERVAL).min(deadline),
                         ver,
-                    };
+                    });
                     return;
                 }
                 let until = (now + ACK_TIMEOUT).min(deadline);
-                self.phase = Phase::AwaitingAck { until, deadline };
+                self.set_phase(Phase::AwaitingAck { until, deadline });
                 let body = serde_json::to_vec(&ModuleDrainReady::Ready {})
                     .expect("drain readiness encodes");
                 let frame = Frame::build_with_version(
@@ -211,7 +219,7 @@ impl Drain {
     }
 
     pub(super) fn on_reply(&mut self, frame: &Frame, registry: &LineageRegistry) -> bool {
-        let Phase::AwaitingAck { deadline, .. } = self.phase else {
+        let Phase::AwaitingAck { deadline, .. } = self.phase() else {
             return false;
         };
         if frame.header.channel != 0
@@ -255,7 +263,7 @@ impl Drain {
     }
 
     fn stop(&mut self, registry: &LineageRegistry) {
-        self.phase = Phase::Stopping;
+        self.set_phase(Phase::Stopping);
         registry.begin_stop();
     }
 }

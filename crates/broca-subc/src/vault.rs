@@ -694,6 +694,9 @@ fn decode_list_scoped_reply(body: &serde_json::Value) -> Result<ScopedList, Vaul
 /// tool plane uses.)
 #[async_trait]
 trait VaultConnection: Send + Sync {
+    fn upgrade_connection(&self) -> Option<&SubcConnection> {
+        None
+    }
     async fn catalog_contains(&self, module_id: &str) -> Result<bool, ConnError>;
 
     /// Open the vault's management route, retrying a temporary refusal until `retry` runs out.
@@ -719,6 +722,9 @@ trait VaultConnection: Send + Sync {
 
 #[async_trait]
 impl VaultConnection for SubcConnection {
+    fn upgrade_connection(&self) -> Option<&SubcConnection> {
+        Some(self)
+    }
     fn consumer_module_id(&self) -> Option<String> {
         SubcConnection::consumer_module_id(self).map(str::to_string)
     }
@@ -1035,29 +1041,45 @@ impl VaultClient {
                 || (effect == VaultRequestEffect::ReadOnly
                     && matches!(error, ConnError::Transport(_)))
         };
-        let route = self.route().await?;
-        match self.conn.route_request(&route, body.clone()).await {
-            Ok(reply) => Ok(reply),
-            Err(first) if can_retry(&first) => {
-                self.invalidate_failed_route(route, &first);
-                let retry_route = self.route().await?;
-                match self.conn.route_request(&retry_route, body).await {
-                    Ok(reply) => Ok(reply),
-                    Err(second) => {
-                        if conn_error_is_retryable(&second)
-                            || matches!(second, ConnError::Transport(_))
-                        {
-                            self.invalidate_failed_route(retry_route, &second);
-                        }
-                        Err(map_exhausted_conn_err(second))
+        let mut upgrade = crate::daemon_upgrade::Retry::default();
+        let mut retried = false;
+        loop {
+            let route = match upgrade.deadline() {
+                Some(deadline) => tokio::time::timeout_at(deadline, self.route())
+                    .await
+                    .map_err(|_| {
+                        map_conn_err(ConnError::Transport(
+                            "daemon upgrade reconnect deadline passed".into(),
+                        ))
+                    })??,
+                None => self.route().await?,
+            };
+            match self.conn.route_request(&route, body.clone()).await {
+                Ok(reply) => return Ok(reply),
+                Err(error) => {
+                    if upgrade
+                        .after_connection_error(&error, self.conn.upgrade_connection())
+                        .await
+                    {
+                        self.invalidate_failed_route(route, &error);
+                        continue;
                     }
+                    if !retried && can_retry(&error) {
+                        self.invalidate_failed_route(route, &error);
+                        retried = true;
+                        continue;
+                    }
+                    if matches!(error, ConnError::Transport(_))
+                        || (retried && conn_error_is_retryable(&error))
+                    {
+                        self.invalidate_failed_route(route, &error);
+                    }
+                    return Err(if retried {
+                        map_exhausted_conn_err(error)
+                    } else {
+                        map_conn_err(error)
+                    });
                 }
-            }
-            Err(error) => {
-                if matches!(error, ConnError::Transport(_)) {
-                    self.invalidate_failed_route(route, &error);
-                }
-                Err(map_conn_err(error))
             }
         }
     }

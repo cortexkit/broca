@@ -102,7 +102,7 @@ impl RoleRoute {
         let body =
             serde_json::to_vec(request).map_err(|error| FetchError::Lost(error.to_string()))?;
         timeout_at(deadline, async {
-            let selector = self.selector(scope).await?;
+            let selector = self.selector(scope, deadline).await?;
             let slot = self
                 .routes
                 .lock()
@@ -112,7 +112,11 @@ impl RoleRoute {
                 .clone();
             let mut guard = slot.lock().await;
             let mut retried = false;
+            let mut upgrade = crate::daemon_upgrade::Retry::default();
             loop {
+                let deadline = upgrade
+                    .deadline()
+                    .map_or(deadline, |ceiling| ceiling.min(deadline));
                 if Instant::now() >= deadline {
                     return Err(expired());
                 }
@@ -126,6 +130,11 @@ impl RoleRoute {
                         &mut guard,
                     )
                     .await;
+                if let Err(error) = &result {
+                    if upgrade.after_fetch(error, &self.conn).await {
+                        continue;
+                    }
+                }
                 if retry_transient
                     && !retried
                     && matches!(
@@ -203,14 +212,31 @@ impl RoleRoute {
         deadline: Instant,
     ) -> Result<Result<Value, subc_protocol::ErrorBody>, FetchError> {
         timeout_at(deadline, async {
-            let selector = self.selector(scope).await?;
-            let (mut lease, describe) = self
-                .open_and_describe(provider, bind, selector, deadline)
-                .await?;
-            if let Some(route) = lease.route.take() {
-                let _ = self.conn.route_close(&route).await;
+            let selector = self.selector(scope, deadline).await?;
+            let mut upgrade = crate::daemon_upgrade::Retry::default();
+            loop {
+                let deadline = upgrade
+                    .deadline()
+                    .map_or(deadline, |ceiling| ceiling.min(deadline));
+                if Instant::now() >= deadline {
+                    return Err(expired());
+                }
+                let (mut lease, describe) = self
+                    .open_and_describe(provider, bind, selector.clone(), deadline)
+                    .await?;
+                if let Err(refusal) = &describe {
+                    if upgrade
+                        .after_refusal(&refusal.code, refusal.detail.as_ref(), &self.conn)
+                        .await
+                    {
+                        continue;
+                    }
+                }
+                if let Some(route) = lease.route.take() {
+                    let _ = self.conn.route_close(&route).await;
+                }
+                return Ok(describe);
             }
-            Ok(describe)
         })
         .await
         .unwrap_or_else(|_| Err(expired()))
@@ -279,13 +305,14 @@ impl RoleRoute {
     async fn selector(
         &self,
         scope: Option<&SessionScope>,
+        deadline: Instant,
     ) -> Result<Option<ScopeSelector>, FetchError> {
         let Some(scope) = scope else {
             return Ok(None);
         };
         let capabilities = self
             .conn
-            .server_capabilities()
+            .scoped_server_capabilities(deadline)
             .await
             .map_err(|error| FetchError::Lost(error.to_string()))?;
         if !capabilities

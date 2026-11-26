@@ -1364,6 +1364,9 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
             &arguments,
             &request,
         ) {
+            if held_late_results::cut_wire_reply(&self.shared, &arguments) {
+                std::future::pending::<()>().await;
+            }
             return outcome;
         }
         let session = self
@@ -1858,6 +1861,16 @@ impl BrocaSubject {
         root: &Path,
         routed_session: Option<&str>,
     ) -> Result<Live, HarnessError> {
+        self.start_configured_inner(root, routed_session, None)
+            .await
+    }
+
+    async fn start_configured_inner(
+        &self,
+        root: &Path,
+        routed_session: Option<&str>,
+        upgrade: Option<&held_late_results::DaemonUpgradeRig>,
+    ) -> Result<Live, HarnessError> {
         let routed = routed_session.is_some();
         let fail = |what: String| HarnessError::new(what);
         let config_home = root.join("config");
@@ -1977,33 +1990,45 @@ impl BrocaSubject {
         }
         std::fs::write(&broca_config, serde_json::to_vec(&settings).unwrap())
             .map_err(|error| fail(error.to_string()))?;
-        config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
+        if let Some(upgrade) = upgrade {
+            config["privileged_operator_prompt"] = json!("log");
+            config["modules"]["broca"]["reserved"] = json!(true);
+            config["modules"]["broca"]["registration_channel"] = json!(true);
+            upgrade.configure_broca(&mut config["modules"]["broca"]["env"]);
+        } else {
+            config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
+        }
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
         }
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .map_err(|e| fail(e.to_string()))?;
         let daemon = broca_test_support::retry_executable_file_busy(|| {
-            broca_test_support::tokio_rig_command(
-                broca_test_support::ckdev_binary(
-                    sibling_bin("ck-subc", "SUBC_CORE_BIN"),
-                    broca_test_support::scratch_root(),
-                ),
-                root,
-                "daemon",
-            )?
-            .env("XDG_CONFIG_HOME", &config_home)
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("XDG_DATA_HOME", &data_home)
-            .env("HOME", &home)
-            .env_remove("BROCA_STATE_ROOT")
-            .env_remove("BROCA_PROVIDER_BASE_URL")
-            .env("SUBC_PORT", "0")
-            .env_remove("SUBC_LAUNCH_NONCE")
-            .env_remove("SUBC_LAUNCH_NONCE_FD")
-            .env_remove("SUBC_MODULE_ID")
-            .kill_on_drop(true)
-            .spawn()
+            let binary = upgrade
+                .map(|rig| rig.executable.clone())
+                .unwrap_or_else(|| {
+                    broca_test_support::ckdev_binary(
+                        sibling_bin("ck-subc", "SUBC_CORE_BIN"),
+                        broca_test_support::scratch_root(),
+                    )
+                });
+            let mut command = broca_test_support::tokio_rig_command(binary, root, "daemon")?;
+            command
+                .env("XDG_CONFIG_HOME", &config_home)
+                .env("XDG_RUNTIME_DIR", &runtime_dir)
+                .env("XDG_DATA_HOME", &data_home)
+                .env("HOME", &home)
+                .env_remove("BROCA_STATE_ROOT")
+                .env_remove("BROCA_PROVIDER_BASE_URL")
+                .env("SUBC_PORT", "0")
+                .env_remove("SUBC_LAUNCH_NONCE")
+                .env_remove("SUBC_LAUNCH_NONCE_FD")
+                .env_remove("SUBC_MODULE_ID")
+                .kill_on_drop(true);
+            if let Some(upgrade) = upgrade {
+                upgrade.configure(&mut command, &connection_file);
+            }
+            command.spawn()
         })
         .map_err(|e| fail(format!("spawning ck-subc: {e}")))?;
         let daemon = broca_test_support::RigChild::new(daemon, root, "daemon");
@@ -2016,24 +2041,7 @@ impl BrocaSubject {
             }
             sleep(Duration::from_millis(25)).await;
         }
-        let stop = subc_client_rs::ModuleStopHandle::new();
-        let (_, serve) = subc_client_rs::ServeOptions::default()
-            .with_stop_handle(stop.clone())
-            .serve_with_handle(
-                &connection_file,
-                tool_manifest(),
-                ToolProvider {
-                    shared: self.shared.clone(),
-                    routes: Mutex::new(HashMap::new()),
-                    stop,
-                },
-            )
-            .await
-            .map_err(|e| fail(format!("registering the scripted tool provider: {e}")))?
-            .ok_or_else(|| fail("the scripted tool provider stopped before registering".into()))?;
-        let tools = tokio::spawn(async move {
-            let _ = serve.await;
-        });
+        let tools = self.start_tool_provider(&connection_file).await?;
         let routed_services = match routed_session {
             Some(session) => Some(
                 routed_accounts::register(
@@ -2074,6 +2082,31 @@ impl BrocaSubject {
             _routed_services: routed_services,
             _fixture: fixture,
         })
+    }
+
+    async fn start_tool_provider(
+        &self,
+        connection_file: &Path,
+    ) -> Result<tokio::task::JoinHandle<()>, HarnessError> {
+        let fail = HarnessError::new;
+        let stop = subc_client_rs::ModuleStopHandle::new();
+        let (_, serve) = subc_client_rs::ServeOptions::default()
+            .with_stop_handle(stop.clone())
+            .serve_with_handle(
+                connection_file,
+                tool_manifest(),
+                ToolProvider {
+                    shared: self.shared.clone(),
+                    routes: Mutex::new(HashMap::new()),
+                    stop,
+                },
+            )
+            .await
+            .map_err(|e| fail(format!("registering the scripted tool provider: {e}")))?
+            .ok_or_else(|| fail("the scripted tool provider stopped before registering".into()))?;
+        Ok(tokio::spawn(async move {
+            let _ = serve.await;
+        }))
     }
 
     /// The caller connection for `stamp`, opened once per rig.

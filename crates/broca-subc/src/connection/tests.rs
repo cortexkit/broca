@@ -510,7 +510,7 @@ async fn pinned_guarded_dispatch_preserves_pin_and_exact_argument_bytes() {
 async fn capabilities_are_single_flight_and_reset_on_reconnect() {
     let (conn, _, mut module) = SubcConnection::in_process_for_test(1, 1);
     read_capabilities_concurrently(&conn, &mut module, &["scopes/v1"]).await;
-    let (replacement, write_rx) = new_runtime();
+    let (replacement, write_rx) = new_runtime(crate::registration::SocketBinding::Unclaimed);
     let mut new_module = InProcessModuleEnd {
         write_rx,
         pending: replacement.pending.clone(),
@@ -1284,6 +1284,7 @@ fn test_connection(
     corr: u64,
 ) -> SubcConnection {
     let runtime = Arc::new(ConnectionRuntime {
+        binding: crate::registration::SocketBinding::Unclaimed,
         close_observer: Mutex::new(Weak::new()),
         closing_routes: Mutex::new(HashMap::new()),
         #[cfg(feature = "test-route-close")]
@@ -1985,6 +1986,7 @@ async fn superseded_reader_cannot_stamp_replacement_inbound_watermark() {
 
     let (replacement_write_tx, _replacement_write_rx) = mpsc::channel(4);
     let replacement = Arc::new(ConnectionRuntime {
+        binding: crate::registration::SocketBinding::Unclaimed,
         close_observer: Mutex::new(Weak::new()),
         closing_routes: Mutex::new(HashMap::new()),
         #[cfg(feature = "test-route-close")]
@@ -2879,7 +2881,7 @@ async fn retained_route_open_tombstone_stops_suppressing_after_grace() {
     assert_eq!(stub.accept_count(), 1, "the test must begin on one socket");
 
     let _error = conn
-        .route_open_rpc_deadline(Vec::new(), Duration::from_millis(40))
+        .route_open_rpc_deadline(|_| Ok(Vec::new()), Duration::from_millis(40))
         .await
         .expect_err("the dead daemon leaves a retained route.open tombstone");
     wait_for_accept_count(&stub, 2).await;
@@ -2910,7 +2912,7 @@ async fn slow_live_route_open_is_not_convicted_during_bind_relay_grace() {
     assert_eq!(stub.accept_count(), 1, "the test must begin on one socket");
 
     let _error = conn
-        .route_open_rpc_deadline(Vec::new(), Duration::from_millis(80))
+        .route_open_rpc_deadline(|_| Ok(Vec::new()), Duration::from_millis(80))
         .await
         .expect_err("the bind relay deliberately outlives the caller deadline");
     time::sleep(Duration::from_millis(250)).await;
@@ -3181,6 +3183,7 @@ async fn stale_probe_cannot_convict_replacement_generation() {
 
     let (new_write_tx, mut new_write_rx) = mpsc::channel(4);
     let replacement = Arc::new(ConnectionRuntime {
+        binding: crate::registration::SocketBinding::Unclaimed,
         close_observer: Mutex::new(Weak::new()),
         closing_routes: Mutex::new(HashMap::new()),
         #[cfg(feature = "test-route-close")]
@@ -3238,6 +3241,7 @@ async fn in_flight_tool_call_is_not_resent_across_generation_swap() {
 
     let (new_write_tx, mut new_write_rx) = mpsc::channel(4);
     let replacement = Arc::new(ConnectionRuntime {
+        binding: crate::registration::SocketBinding::Unclaimed,
         close_observer: Mutex::new(Weak::new()),
         closing_routes: Mutex::new(HashMap::new()),
         #[cfg(feature = "test-route-close")]
@@ -3293,6 +3297,7 @@ async fn in_flight_tool_call_is_not_resent_across_generation_swap() {
 async fn unreachable_reconnect_attempts_back_off_instead_of_spinning() {
     let (write_tx, _write_rx) = mpsc::channel(1);
     let runtime = Arc::new(ConnectionRuntime {
+        binding: crate::registration::SocketBinding::Unclaimed,
         close_observer: Mutex::new(Weak::new()),
         closing_routes: Mutex::new(HashMap::new()),
         #[cfg(feature = "test-route-close")]

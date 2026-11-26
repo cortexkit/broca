@@ -9,11 +9,14 @@
 //! hand-over on, mints go out through the serve loop, which hands their answers back.
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use broca_subc::registration::{ClaimMinter, DaemonStream, MintAnswer};
 use subc_protocol::claim::ClaimMintRequest;
+use subc_protocol::session::ModuleControlCommand;
+use subc_protocol::{Frame, FrameType};
 use subc_transport::{read_frame, write_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Chain, ReadHalf, WriteHalf};
 
@@ -26,6 +29,25 @@ pub type ServeReader = Chain<Cursor<Vec<u8>>, ReadHalf<Box<dyn DaemonStream>>>;
 pub struct ModuleConnection {
     gate: Arc<Gate>,
     state: tokio::sync::Mutex<State>,
+    startup_upgrade: AtomicBool,
+}
+
+// The serving generation can keep session state alive. Cold start does not own a serving
+// generation yet; closing its startup wire lets the supervisor start it against the new daemon.
+pub(crate) fn cold_start_upgrade(frame: &Frame) -> Option<&'static str> {
+    if cfg!(any(target_os = "linux", target_os = "macos"))
+        && frame.header.channel == 0
+        && frame.header.ty == FrameType::Push
+        && matches!(
+            serde_json::from_slice::<ModuleControlCommand>(&frame.body),
+            Ok(ModuleControlCommand::Upgrading { .. })
+        )
+    {
+        tracing::warn!(target: "lifecycle", "daemon upgrade arrived during broca startup; the supervisor will restart broca");
+        Some("daemon upgrade interrupted module startup")
+    } else {
+        None
+    }
 }
 
 enum State {
@@ -45,12 +67,17 @@ impl ModuleConnection {
         let (reader, writer) = tokio::io::split(stream);
         Self {
             gate,
+            startup_upgrade: AtomicBool::new(false),
             state: tokio::sync::Mutex::new(State::Startup {
                 reader,
                 writer,
                 kept: Vec::new(),
             }),
         }
+    }
+
+    pub(crate) fn startup_interrupted(&self) -> bool {
+        self.startup_upgrade.load(Ordering::Acquire)
     }
 
     /// Gives the connection to the serve loop: a reader that yields the frames start-up mints
@@ -96,6 +123,10 @@ impl ModuleConnection {
                 .await
                 .map_err(|error| format!("claim.mint: {error}"))?
                 .ok_or_else(|| "claim.mint: the daemon closed broca's connection".to_string())?;
+            if let Some(error) = cold_start_upgrade(&frame) {
+                self.startup_upgrade.store(true, Ordering::Release);
+                return Err(error.into());
+            }
             if !self.gate.on_frame(&frame) {
                 write_frame(kept, &frame)
                     .await
@@ -108,6 +139,9 @@ impl ModuleConnection {
 #[async_trait]
 impl ClaimMinter for ModuleConnection {
     async fn call(&self, request: &ClaimMintRequest) -> Result<MintAnswer, String> {
+        if self.startup_interrupted() {
+            return Err("daemon upgrade interrupted module startup".into());
+        }
         let reply = {
             let mut state = self.state.lock().await;
             match &mut *state {

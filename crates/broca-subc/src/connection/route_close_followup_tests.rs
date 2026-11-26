@@ -208,7 +208,7 @@ async fn review_reader_full_handoff_cannot_reenter_retired_generation() {
     })
     .await
     .unwrap();
-    let (replacement, _replacement_writer) = new_runtime();
+    let (replacement, _replacement_writer) = new_runtime(crate::registration::SocketBinding::Unclaimed);
     {
         let mut state = shared.current.lock().unwrap();
         *state = GenerationState::new(Arc::clone(&replacement));

@@ -4826,6 +4826,100 @@ mod scope_carrier {
         assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn an_upgrade_cut_does_not_drain_an_unsent_scoped_call() {
+        let (conn, plane, describer) = rig(vec![successful_tool_reply("must not be sent")]);
+        describer.script(
+            "head",
+            vec![
+                live("head", 1, "agent-a"),
+                live("head", 1, "agent-a"),
+                Err("scope.describe was refused while the daemon was switching".into()),
+            ],
+        );
+        let (scoped, read) = started(&plane).await;
+        let ceiling = tokio::time::Instant::now() + Duration::from_secs(2);
+        crate::daemon_upgrade::announce(ceiling);
+        conn.close(route_of(&plane, &scoped));
+        let mut dispatch = std::pin::pin!(plane.dispatch(&scoped, &read));
+        assert!(
+            futures::poll!(&mut dispatch).is_pending(),
+            "the switch is not evidence the scope ended"
+        );
+        crate::daemon_upgrade::resumed(ceiling);
+        assert!(matches!(dispatch.await, DispatchResult::NotSent { .. }));
+        assert_eq!(
+            conn.tool_calls.load(Ordering::SeqCst),
+            0,
+            "scope compatibility is still required"
+        );
+        crate::daemon_upgrade::abandon();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scope_describe_loss_can_race_the_upgrade_notice() {
+        let (conn, plane, describer) = rig(vec![successful_tool_reply("after resume")]);
+        describer.script(
+            "head",
+            vec![
+                live("head", 1, "agent-a"),
+                live("head", 1, "agent-a"),
+                Err("module connection closed".into()),
+            ],
+        );
+        let (scoped, read) = started(&plane).await;
+        crate::daemon_upgrade::expect_upgrade_notices(true);
+        conn.close(route_of(&plane, &scoped));
+        let mut dispatch = std::pin::pin!(plane.dispatch(&scoped, &read));
+        assert!(
+            futures::poll!(&mut dispatch).is_pending(),
+            "unanswered describe must wait for the racing notice"
+        );
+        let ceiling = tokio::time::Instant::now() + Duration::from_secs(2);
+        crate::daemon_upgrade::announce(ceiling);
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        describer.script("head", vec![live("head", 1, "agent-a")]);
+        crate::daemon_upgrade::resumed(ceiling);
+        assert_completed_success(dispatch.await);
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 1);
+        crate::daemon_upgrade::abandon();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upgrade_missing_sibling_stamp_is_not_scope_drained() {
+        let (conn, plane, describer) = rig(vec![]);
+        describer.script("head", vec![live("head", 1, "agent-a")]);
+        let (scoped, read) = started(&plane).await;
+        let route = route_of(&plane, &scoped);
+        plane.forget_route(&scoped, "aft", route);
+        let ceiling = tokio::time::Instant::now() + Duration::from_secs(2);
+        crate::daemon_upgrade::announce(ceiling);
+        crate::daemon_upgrade::resumed(ceiling);
+        let result = plane
+            .resend_or_drain(
+                &scoped,
+                &read,
+                "aft",
+                route,
+                None,
+                TOOL_DISPATCH_PATIENCE,
+                &ToolOpenGuard::default(),
+                (
+                    SubcToolPlane::session_key(&scoped.bind),
+                    read.tool_call_id.clone(),
+                ),
+                None,
+                &[],
+            )
+            .await;
+        assert!(
+            matches!(result, DispatchResult::NotSent { .. }),
+            "a sibling's missing stamp after resume is not a scope drain: {result:?}"
+        );
+        assert_eq!(conn.tool_calls.load(Ordering::SeqCst), 0);
+        crate::daemon_upgrade::abandon();
+    }
+
     /// A call already sent when its route closed: the outcome is unknown whatever the
     /// scope's state. Describe names why when the scope or parent is gone or the agent
     /// changed; a live, unchanged scope leaves the ordinary unknown outcome.

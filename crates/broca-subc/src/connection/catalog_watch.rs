@@ -105,6 +105,16 @@ impl SubcConnection {
     /// catalog, the last reply while its generation is still current, shared rather than
     /// copied; otherwise read now.
     pub async fn catalog_list(&self) -> ConnResult<Arc<Vec<CatalogEntry>>> {
+        // A model can finish its step while the tool consumer is still authenticating its
+        // replacement socket.
+        // Batch setup reads the catalog before opening a tool route, so that read also needs
+        // to outwait the switch. Never substitute an empty catalog for the lost socket.
+        let deadline = tokio::time::Instant::now() + super::RESPONSE_TIMEOUT;
+        self.read_during_upgrade(deadline, "catalog.list", || self.catalog_list_once())
+            .await
+    }
+
+    async fn catalog_list_once(&self) -> ConnResult<Arc<Vec<CatalogEntry>>> {
         let memo = &self.shared.catalog;
         if !memo.following.load(Ordering::Acquire) {
             return self

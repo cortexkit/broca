@@ -771,6 +771,7 @@ type WriteConfirmations = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Instant,
 type ClosingRoutes = Mutex<HashMap<(u16, u32), Arc<tokio::sync::Mutex<()>>>>;
 
 struct ConnectionRuntime {
+    binding: crate::registration::SocketBinding,
     close_observer: Mutex<Weak<crate::route_close::RouteCloser>>,
     capabilities: tokio::sync::OnceCell<Vec<String>>,
     write_tx: mpsc::Sender<Frame>,
@@ -1353,8 +1354,9 @@ impl SubcConnection {
         route_open_bind_relay_grace: Duration,
         consumer_identity: Option<subc_control::ConsumerIdentity>,
     ) -> ConnResult<Self> {
-        let (read_half, write_half) = open_authenticated_socket(connection_file_path).await?;
-        let (runtime, write_rx) = new_runtime();
+        let (read_half, write_half, binding) =
+            open_authenticated_socket(connection_file_path).await?;
+        let (runtime, write_rx) = new_runtime(binding);
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(ConnectionShared {
             aft_harness_answer: Mutex::new(None),
@@ -1567,14 +1569,9 @@ impl SubcConnection {
         request_liveness_probe(&self.shared, runtime);
     }
 
-    async fn route_open_rpc(&self, body: Vec<u8>) -> ConnResult<(Frame, ConnToken)> {
-        self.route_open_rpc_deadline(body, ROUTE_OPEN_ATTEMPT_TIMEOUT)
-            .await
-    }
-
     async fn route_open_rpc_deadline(
         &self,
-        body: Vec<u8>,
+        body: impl FnOnce(&ConnectionRuntime) -> ConnResult<Vec<u8>>,
         deadline: Duration,
     ) -> ConnResult<(Frame, ConnToken)> {
         // One deadline covers the whole attempt, queueing the request for the writer as well as
@@ -1585,6 +1582,7 @@ impl SubcConnection {
         let attempt_deadline = time::Instant::now() + deadline;
         let corr = self.next_corr();
         let (runtime, mut registration, rx) = self.register_control((0, 0, corr), true)?;
+        let body = body(&runtime)?;
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body)
             .map_err(|e| ConnError::Transport(e.to_string()))?;
         match time::timeout_at(attempt_deadline, self.send(&runtime, frame)).await {
@@ -2123,7 +2121,7 @@ impl SubcConnection {
         consumer_capabilities: Option<Vec<String>>,
     ) -> ConnResult<RouteHandle> {
         let first = self
-            .route_open_wire_target_once(
+            .route_open_during_upgrade(
                 target.clone(),
                 identity.clone(),
                 scope.clone(),
@@ -2153,7 +2151,7 @@ impl SubcConnection {
                 _ => return first,
             }
             match self
-                .route_open_wire_target_once(
+                .route_open_during_upgrade(
                     target.clone(),
                     identity.clone(),
                     scope.clone(),
@@ -2176,85 +2174,6 @@ impl SubcConnection {
                 Err(ConnError::Rejected(again)) => code = again.code().to_owned(),
                 Err(_) => return first,
             }
-        }
-    }
-
-    async fn route_open_wire_target_once(
-        &self,
-        target: RouteTarget,
-        identity: subc_protocol::BindIdentity,
-        scope: Option<subc_protocol::scope::ScopeSelector>,
-        role_versions: Option<std::collections::BTreeMap<String, String>>,
-        consumer_capabilities: Option<Vec<String>>,
-    ) -> ConnResult<RouteHandle> {
-        #[cfg(feature = "test-clock")]
-        if let Some(starts) = &self.route_open_attempts {
-            starts.lock().unwrap().push(time::Instant::now());
-        }
-        let reads_held_reply = cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
-            consumer_capabilities.as_deref(),
-        );
-        let reads_tool_result = cortexkit_role_tool_provider::consumer_reads_tool_result_v1(
-            consumer_capabilities.as_deref(),
-        );
-        let call_keepalive = consumer_capabilities.as_ref().is_some_and(|caps| {
-            caps.iter()
-                .any(|cap| cap == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY)
-        });
-        let declares_call_yield = cortexkit_role_tool_provider::consumer_reads_call_yield_v1(
-            consumer_capabilities.as_deref(),
-        );
-        let tool_provider_v1 = role_versions
-            .as_ref()
-            .is_some_and(|roles| roles.contains_key("tool-provider"));
-        let req = ClientControlRequest::RouteOpen {
-            identity,
-            target,
-            consumer_identity: self.shared.consumer_identity.clone(),
-            // Only dispatch routes negotiate result bodies. Role discovery and management
-            // routes keep their previous undeclared format; held replies are a separate opt-in.
-            consumer_capabilities,
-            // Admission facts come from a configured carrier module; the runner's
-            // consumer legs carry none.
-            admission_facts: None,
-            // Scoped tool and management clients first check the daemon advertises `scopes/v1`:
-            // an older daemon drops the field and would open an unscoped route instead.
-            scope,
-            // Tool routes declare the role only when the daemon manifest lists it.
-            role_versions,
-            // The daemon admits only so many requests in flight on one route. Leaving this unset
-            // keeps the old behaviour: a request past that limit waits for a slot instead of
-            // being refused at once with `route_busy`.
-            busy_refusals: None,
-        };
-        let body = serde_json::to_vec(&req).map_err(|e| ConnError::Transport(e.to_string()))?;
-        let (frame, conn) = self.route_open_rpc(body).await?;
-        match frame.header.ty {
-            FrameType::Response => {
-                match serde_json::from_slice::<ClientControlResponse>(&frame.body) {
-                    Ok(ClientControlResponse::RouteOpen {
-                        route_channel,
-                        route_epoch,
-                        ..
-                    }) => {
-                        let mut handle = RouteHandle::new(route_channel, route_epoch, conn);
-                        handle.reads_tool_result = reads_tool_result;
-                        handle.reads_held_reply = reads_held_reply;
-                        handle.declares_call_yield = declares_call_yield;
-                        handle.call_keepalive = call_keepalive;
-                        handle.tool_provider_v1 = tool_provider_v1;
-                        Ok(handle)
-                    }
-                    Ok(other) => Err(ConnError::Protocol(format!(
-                        "unexpected route.open reply: {other:?}"
-                    ))),
-                    Err(e) => Err(ConnError::Protocol(format!("decode route.open: {e}"))),
-                }
-            }
-            FrameType::Error => Err(ConnError::Rejected(decode_error_body(&frame.body))),
-            ty => Err(ConnError::Protocol(format!(
-                "unexpected route.open frame {ty:?}"
-            ))),
         }
     }
 
@@ -3095,7 +3014,11 @@ impl Drop for CancelOnAbandon {
 
 async fn open_authenticated_socket(
     connection_file_path: &Path,
-) -> ConnResult<(OwnedReadHalf, OwnedWriteHalf)> {
+) -> ConnResult<(
+    OwnedReadHalf,
+    OwnedWriteHalf,
+    crate::registration::SocketBinding,
+)> {
     let conn = connection_file::read(connection_file_path)
         .map_err(|e| ConnError::Transport(format!("read connection file: {e}")))?;
     let mut stream = crate::tcp_connect::connect_endpoints(
@@ -3112,16 +3035,20 @@ async fn open_authenticated_socket(
         .await
         .map_err(|e| ConnError::Transport(format!("authenticate: {e}")))?;
     // A broca registered over its registration channel binds each connection with a claim.
-    crate::registration::bind(&mut stream).await?;
-    Ok(stream.into_split())
+    let binding = crate::registration::bind(&mut stream).await?;
+    let (reader, writer) = stream.into_split();
+    Ok((reader, writer, binding))
 }
 
-fn new_runtime() -> (Arc<ConnectionRuntime>, mpsc::Receiver<Frame>) {
+fn new_runtime(
+    binding: crate::registration::SocketBinding,
+) -> (Arc<ConnectionRuntime>, mpsc::Receiver<Frame>) {
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
     let route_epochs: RouteEpochs = Arc::new(Mutex::new(HashMap::new()));
     let (write_tx, write_rx) = mpsc::channel(256);
     (
         Arc::new(ConnectionRuntime {
+            binding,
             close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
@@ -3267,8 +3194,8 @@ async fn reconnect_supervisor(
             #[cfg(test)]
             owner.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
             match open_authenticated_socket(&owner.connection_file_path).await {
-                Ok((read_half, write_half)) => {
-                    let (runtime, write_rx) = new_runtime();
+                Ok((read_half, write_half, binding)) => {
+                    let (runtime, write_rx) = new_runtime(binding);
                     let installed = {
                         let mut state = owner.current.lock().unwrap();
                         if state.runtime.conn == failed_conn && !state.active {
@@ -4207,7 +4134,10 @@ where
         }
         match outcome {
             Ok(handle) => return Ok(handle),
-            Err(ConnError::Rejected(message)) if route_open_is_retryable(message.code()) => {
+            Err(ConnError::Rejected(message))
+                if route_open_is_retryable(message.code())
+                    && !crate::daemon_upgrade::is_switch_refusal(&message) =>
+            {
                 let code = message.code();
                 let held = scope_hold.filter(|_| matches!(code, SCOPE_NOT_SYNCED | SCOPE_CHANGED));
                 if held.is_none() && !patience_started {
@@ -4811,7 +4741,7 @@ pub(crate) fn route_failure_is_known_dead(error: &ConnError) -> bool {
 /// and the registration contract forbids an identity on a connection bound that way.
 pub fn supervised_consumer_identity() -> Option<subc_control::ConsumerIdentity> {
     // A connection bound by a claim must present no identity: the claim already names broca.
-    if crate::registration::adopted() {
+    if crate::registration::claim_bound() {
         return None;
     }
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
@@ -4959,6 +4889,7 @@ fn to_subc_bind(
 }
 
 mod catalog_watch;
+mod daemon_upgrade;
 mod late_open;
 mod probe;
 mod renamed;

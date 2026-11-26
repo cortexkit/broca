@@ -96,13 +96,19 @@ lease.
 credential, usage and charge basis. Provider measurements that were not reported
 stay absent, rather than becoming zero.
 
-**Shutdown**. On an accepting restart drain, broca keeps serving requests and
+**Daemon upgrades and shutdown**. On macOS and Linux, an announced in-place daemon
+upgrade replaces the module connection without stopping broca's session actors,
+runs or stores. A call cut after dispatch is never repeated. If the daemon
+allows requests during a restart drain, broca keeps serving them and
 durably queues new sends without starting their runs. It finishes in-flight model
 steps, tool batches and sessionless calls before signaling readiness, up to the
-daemon's deadline. Ordinary drains, daemon connection closure and SIGTERM stop
-admission; work still in flight after the post-GOODBYE grace is sealed
-`Interrupted`, not `Cancelled`. After SIGTERM, broca re-raises the signal so the
-supervisor can respawn it. See [module lifecycle](module-lifecycle.md).
+daemon's deadline. Drains that close admission immediately, an unannounced
+daemon disconnect, a terminal refusal to resume and SIGTERM stop admission. broca
+then gives in-flight work a short grace and seals what is still running `Interrupted`,
+not `Cancelled`. After SIGTERM, broca re-raises the signal so the supervisor can
+respawn it. If broca misses the upgrade's reconnect deadline, the daemon kills
+it and the replacement recovers from its records as after any crash. See
+[module lifecycle](module-lifecycle.md).
 
 ## Crate map
 

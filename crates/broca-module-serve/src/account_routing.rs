@@ -553,29 +553,44 @@ impl SubcRoutingTransport {
         body: Vec<u8>,
         request_error: impl Fn(broca_subc::ConnError) -> String,
     ) -> Result<(broca_subc::RouteHandle, Result<Vec<u8>, Vec<u8>>), String> {
-        let route = self.route().await?;
-        match self.conn.route_request_terminal(&route, body.clone()).await {
-            Ok(reply) => return Ok((route, reply)),
-            Err(error) => {
-                self.forget(route);
-                if !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
-                    return Err(request_error(error));
+        let mut upgrade = broca_subc::daemon_upgrade::Retry::default();
+        let mut reopened = false;
+        loop {
+            let route = self.route_before(upgrade.deadline()).await?;
+            match self.conn.route_request_terminal(&route, body.clone()).await {
+                Ok(reply) => {
+                    if let Err(refusal) = &reply {
+                        if upgrade.after_frame(refusal, &self.conn).await {
+                            self.forget(route);
+                            continue;
+                        }
+                    }
+                    return Ok((route, reply));
+                }
+                Err(error) => {
+                    self.forget(route);
+                    // A stale handle fails before the request frame reaches the writer.
+                    if reopened || !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
+                        return Err(request_error(error));
+                    }
+                    reopened = true;
                 }
             }
         }
+    }
 
-        // A stale handle fails before the request frame is built or queued to subc's writer.
-        // Reopen only for that proof of non-delivery, never for a failed or missing reply.
-        let route = self.route().await?;
-        let reply = self
-            .conn
-            .route_request_terminal(&route, body)
-            .await
-            .map_err(|error| {
-                self.forget(route);
-                request_error(error)
-            })?;
-        Ok((route, reply))
+    async fn route_before(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<broca_subc::RouteHandle, String> {
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.route())
+                .await
+                .map_err(|_| {
+                    "routing route did not reopen before the daemon upgrade deadline".to_string()
+                })?,
+            None => self.route().await,
+        }
     }
 }
 
@@ -641,40 +656,48 @@ impl RoutingTransport for SubcRoutingTransport {
                 .await
                 .expect("close test route");
         }
-        match self
-            .conn
-            .route_request_terminal_observed(&route, body.clone(), || {
-                started.store(true, Ordering::Release)
-            })
-            .await
-        {
-            Ok(reply) => return Some(Ok(reply)),
-            Err(error) => {
-                self.forget(route);
-                if !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
-                    return Some(Err(self.request_error(error)));
-                }
-            }
-        }
-        // A stale handle fails before the request frame is built, so nothing was delivered.
-        if !declared().await {
-            return None;
-        }
-        let route = match self.route().await {
-            Ok(route) => route,
-            Err(error) => return Some(Err(error)),
-        };
-        Some(
-            self.conn
-                .route_request_terminal_observed(&route, body, || {
+        let mut route = route;
+        let mut reopened = false;
+        let mut upgrade = broca_subc::daemon_upgrade::Retry::default();
+        loop {
+            match self
+                .conn
+                .route_request_terminal_observed(&route, body.clone(), || {
                     started.store(true, Ordering::Release)
                 })
                 .await
-                .map_err(|error| {
+            {
+                Ok(Ok(reply)) => return Some(Ok(Ok(reply))),
+                Ok(Err(refusal)) => {
+                    if !upgrade.after_frame(&refusal, &self.conn).await {
+                        return Some(Ok(Err(refusal)));
+                    }
+                    started.store(false, Ordering::Release);
                     self.forget(route);
-                    self.request_error(error)
-                }),
-        )
+                }
+                Err(error) => {
+                    self.forget(route);
+                    if reopened || !matches!(error, broca_subc::ConnError::StaleRouteHandle(_)) {
+                        return Some(Err(self.request_error(error)));
+                    }
+                    reopened = true;
+                }
+            }
+            // The replacement provider may declare different capabilities.
+            let still_declared = match upgrade.deadline() {
+                Some(deadline) => tokio::time::timeout_at(deadline, declared())
+                    .await
+                    .unwrap_or(false),
+                None => declared().await,
+            };
+            if !still_declared {
+                return None;
+            }
+            route = match self.route_before(upgrade.deadline()).await {
+                Ok(route) => route,
+                Err(error) => return Some(Err(error)),
+            };
+        }
     }
 }
 

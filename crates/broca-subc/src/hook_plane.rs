@@ -115,3 +115,147 @@ impl HookPlane for SubcHookPlane {
         .await
     }
 }
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn pre_tool_hook_reopens_after_a_daemon_upgrade_refusal() {
+    use crate::daemon_upgrade;
+    use serde_json::json;
+
+    let (conn, _, mut daemon) = SubcConnection::in_process_for_test(7, 1);
+    let conn = Arc::new(conn);
+    let hook = SubcHookPlane {
+        route: RoleRoute::without_discovery(conn.clone(), "step-transform-provider", "2"),
+    };
+    let bind = BindIdentity::new("/project", "broca", "pre-tool");
+    let call = serde_json::from_value(
+        json!({"hook":"pre_tool", "step_id":"step-1", "phase":"mutate",
+        "tool":"read", "tool_call_id":"call-1", "input":{}, "params":{}}),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let run = hook.hook_with_deadline("transform", &bind, None, call, deadline);
+    tokio::pin!(run);
+    let open = tokio::select! {
+        request = daemon.next_request() => request,
+        result = &mut run => panic!("hook ended before opening: {result:?}"),
+    };
+    assert_eq!(open.header.channel, 0);
+    assert!(daemon.reply(
+        &open,
+        br#"{"op":"route.open","route_channel":7,"route_epoch":1}"#.to_vec()
+    ));
+    let first = tokio::select! {
+        request = daemon.next_request() => request,
+        result = &mut run => panic!("hook did not send its request: {result:?}"),
+    };
+    assert_eq!(first.header.channel, 7);
+    let ceiling = Instant::now() + Duration::from_secs(1);
+    daemon_upgrade::announce(ceiling);
+    assert!(daemon.refuse_for_daemon_upgrade(&first));
+    assert!(
+        futures::poll!(&mut run).is_pending(),
+        "a refused pre-tool hook must wait for resume"
+    );
+    assert!(
+        daemon.try_frame().is_none(),
+        "no reopen before the module is resumed"
+    );
+    daemon_upgrade::resumed(ceiling);
+    let reopen = tokio::select! {
+        request = daemon.next_request() => request,
+        result = &mut run => panic!("hook reported an upgrade refusal as failure: {result:?}"),
+    };
+    assert_eq!(reopen.header.channel, 0);
+    assert_eq!(
+        reopen.body, open.body,
+        "the replacement keeps the route declarations"
+    );
+    conn.allow_test_route(8, 2);
+    assert!(daemon.reply(
+        &reopen,
+        br#"{"op":"route.open","route_channel":8,"route_epoch":2}"#.to_vec()
+    ));
+    let retry = tokio::select! {
+        request = daemon.next_request() => request,
+        result = &mut run => panic!("hook did not retry on the new route: {result:?}"),
+    };
+    assert_eq!(retry.header.channel, 8);
+    assert_eq!(retry.body, first.body);
+    assert!(daemon.reply(&retry, br#"{"answer":"pass"}"#.to_vec()));
+    assert!(run.await.is_ok());
+    daemon_upgrade::abandon();
+}
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn a_scoped_pre_tool_hook_waits_to_discover_scopes_on_the_replacement() {
+    use crate::daemon_upgrade;
+    use serde_json::json;
+
+    let (conn, _, _) = SubcConnection::in_process_for_test(7, 1);
+    let (replacement, _, mut daemon) = SubcConnection::in_process_for_test(8, 2);
+    conn.deactivate_for_test();
+    let conn = Arc::new(conn);
+    let hook = SubcHookPlane {
+        route: RoleRoute::without_discovery(conn.clone(), "step-transform-provider", "2"),
+    };
+    let bind = BindIdentity::new("/project", "broca", "scoped-hook");
+    let scope = SessionScope {
+        owner: broca_protocol::BindPrincipal::Reserved {
+            module_id: "owner".into(),
+        },
+        agent_id_frozen: false,
+        scope_ref: "scope".into(),
+        scope_epoch: 7,
+        flow_id: None,
+        sender: None,
+        agent_id: None,
+        run_id: None,
+    };
+    let call = serde_json::from_value(
+        json!({"hook":"pre_tool", "step_id":"step-1", "phase":"mutate",
+        "tool":"read", "tool_call_id":"call-1", "input":{}, "params":{}}),
+    )
+    .unwrap();
+    let ceiling = Instant::now() + Duration::from_secs(1);
+    daemon_upgrade::announce(ceiling);
+    let run = hook.hook_with_deadline(
+        "transform",
+        &bind,
+        Some(&scope),
+        call,
+        Instant::now() + Duration::from_millis(500),
+    );
+    tokio::pin!(run);
+    assert!(
+        futures::poll!(&mut run).is_pending(),
+        "inactivity must not fail a scoped hook before its budget expires"
+    );
+    daemon_upgrade::resumed(ceiling);
+    conn.replace_generation_for_test(&replacement);
+    for (op, response) in [
+        (
+            "server.describe",
+            json!({"op":"server.describe", "protocol_ver":1,"subc_ops":[],"capabilities":["scopes/v1"],"connected_clients":1}),
+        ),
+        (
+            "route.open",
+            json!({"op":"route.open","route_channel":8,"route_epoch":2}),
+        ),
+        ("transform.hook", json!({"answer":"pass"})),
+    ] {
+        let next = tokio::select! {
+            request = daemon.next_request() => request,
+            result = &mut run => panic!("hook failed before {op}: {result:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_slice(&next.body).unwrap();
+        assert_eq!(body.get("op").unwrap_or(&body["method"]), op);
+        if op == "route.open" {
+            assert_eq!(body["scope"]["ref"], "scope");
+        }
+        assert!(daemon.reply(&next, serde_json::to_vec(&response).unwrap()));
+    }
+    assert!(run.await.is_ok());
+    daemon_upgrade::abandon();
+}

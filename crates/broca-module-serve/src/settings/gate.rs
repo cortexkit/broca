@@ -24,7 +24,7 @@
 //! place, keeps the others until its next start, and names those in its health.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,7 +72,11 @@ pub enum Reply {
 /// once the loop runs, it hands each frame here first ([`Gate::on_frame`]).
 struct Calls {
     next_corr: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
+    pending: Mutex<HashMap<u64, Pending>>,
+    ready: AtomicBool,
+    /// The daemon confirmed this delivery attempt on this wire. Taking settings locally does
+    /// not imply the acknowledgement made it through, and a resumed wire starts fresh.
+    acknowledged: Mutex<Option<(u64, u64)>>,
     /// The serve loop's outgoing queue, once it runs.
     writer: Mutex<Option<broca_diagnostics::Sender<Frame>>>,
     /// Woken when `writer` is set, for a request made before the serve loop runs.
@@ -80,11 +84,18 @@ struct Calls {
     ver: u8,
 }
 
+struct Pending {
+    reply: oneshot::Sender<Reply>,
+    publishes_readiness: bool,
+}
+
 impl Calls {
     fn new(ver: u8) -> Self {
         Self {
             next_corr: AtomicU64::new(FIRST_GATE_CORR),
             pending: Mutex::new(HashMap::new()),
+            ready: AtomicBool::new(false),
+            acknowledged: Mutex::new(None),
             writer: Mutex::new(None),
             writer_set: tokio::sync::Notify::new(),
             ver,
@@ -95,6 +106,14 @@ impl Calls {
     fn begin(
         &self,
         body: &impl Serialize,
+    ) -> Result<(Frame, oneshot::Receiver<Reply>), ServeIoError> {
+        self.begin_tracked(body, false)
+    }
+
+    fn begin_tracked(
+        &self,
+        body: &impl Serialize,
+        publishes_readiness: bool,
     ) -> Result<(Frame, oneshot::Receiver<Reply>), ServeIoError> {
         let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
         let body = serde_json::to_vec(body).map_err(|error| ServeIoError(error.to_string()))?;
@@ -109,7 +128,13 @@ impl Calls {
         )
         .map_err(|error| ServeIoError(error.to_string()))?;
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(corr, tx);
+        self.pending.lock().unwrap().insert(
+            corr,
+            Pending {
+                reply: tx,
+                publishes_readiness,
+            },
+        );
         Ok((frame, rx))
     }
 
@@ -124,6 +149,11 @@ impl Calls {
             return false;
         };
         let reply = if frame.header.ty == FrameType::Response {
+            // Record the catalog ACK in wire order. An upgrade announcement can be read
+            // before the startup task is scheduled to receive this reply.
+            if waiter.publishes_readiness {
+                self.ready.store(true, Ordering::Release);
+            }
             Reply::Done(frame.body.clone())
         } else {
             Reply::Refused(
@@ -134,7 +164,7 @@ impl Calls {
                 }),
             )
         };
-        let _ = waiter.send(reply);
+        let _ = waiter.reply.send(reply);
         true
     }
 
@@ -142,6 +172,14 @@ impl Calls {
     /// the serve loop took the connection but before it set its queue here (a claim for a
     /// connection opened just then) waits for the queue.
     async fn call(&self, body: &impl Serialize) -> Result<Reply, ServeIoError> {
+        self.call_tracked(body, false).await
+    }
+
+    async fn call_tracked(
+        &self,
+        body: &impl Serialize,
+        publishes_readiness: bool,
+    ) -> Result<Reply, ServeIoError> {
         let writer = loop {
             // Created before the check, so a queue set between the two still wakes it.
             let set = self.writer_set.notified();
@@ -154,7 +192,7 @@ impl Calls {
                 ));
             }
         };
-        let (frame, rx) = self.begin(body)?;
+        let (frame, rx) = self.begin_tracked(body, publishes_readiness)?;
         let corr = frame.header.corr;
         if writer.send(frame).await.is_err() {
             self.pending.lock().unwrap().remove(&corr);
@@ -178,6 +216,7 @@ fn control_flags() -> Flags {
 }
 
 /// The settings view broca runs on.
+#[derive(Clone)]
 struct Applied {
     /// The settings of the newest view broca took: in-place fields come from it.
     effective: Value,
@@ -197,6 +236,7 @@ struct Applied {
 pub struct Gate {
     calls: Calls,
     schema: &'static Schema,
+    user_file: Option<String>,
     /// The view broca runs on; `None` when the daemon has no gate and broca read its file.
     applied: Mutex<Option<Applied>>,
 }
@@ -304,6 +344,7 @@ where
                         let gate = Gate {
                             calls,
                             schema,
+                            user_file: Some(user_file.to_owned()),
                             applied: Mutex::new(Some(Applied {
                                 effective: view.effective.clone(),
                                 generation: view.generation,
@@ -351,6 +392,9 @@ where
             }
             (FrameType::Goodbye, 0) => return Ok(GateStart::Stopped(crate::ServeEnd::Goodbye)),
             (FrameType::Push, 0) => {
+                if let Some(error) = crate::module_connection::cold_start_upgrade(&frame) {
+                    return Err(ServeIoError(error.into()));
+                }
                 if op(&frame.body).as_deref() == Some(CONFIG_CHANGED_OP) {
                     if asked.is_none() && waiting != Waiting::Asking {
                         let (frame, rx) = calls.begin(&ConfigGetRequest::new())?;
@@ -437,6 +481,7 @@ impl Gate {
         Arc::new(Self {
             calls: Calls::new(negotiated_ver),
             schema: super::schema(),
+            user_file: None,
             applied: Mutex::new(None),
         })
     }
@@ -450,6 +495,11 @@ impl Gate {
     /// its writer finish. A request made after this waits for a queue that never comes and fails.
     pub fn detach(&self) {
         *self.calls.writer.lock().unwrap() = None;
+    }
+
+    pub(crate) fn detach_for_upgrade(&self) {
+        self.detach();
+        self.calls.pending.lock().unwrap().clear();
     }
 
     /// Takes `frame` when it answers one of the gate's own requests.
@@ -485,19 +535,8 @@ impl Gate {
         writer: broca_diagnostics::Sender<Frame>,
         provides: Vec<subc_protocol::manifest::ProviderRole>,
     ) -> Result<(), ServeIoError> {
-        *self.calls.writer.lock().unwrap() = Some(writer);
-        self.calls.writer_set.notify_waiters();
-        let update = ModuleControlRequestFromModule::CatalogUpdate {
-            provides,
-            capabilities: None,
-            ready: Some(true),
-        };
-        if let Reply::Refused(error) = self.calls.call(&update).await? {
-            return Err(ServeIoError(format!(
-                "the daemon refused broca's readiness: {} — {}",
-                error.code, error.message
-            )));
-        }
+        self.attach(writer);
+        self.publish_ready(provides).await?;
         let applied = self
             .applied
             .lock()
@@ -512,6 +551,107 @@ impl Gate {
                 tracing::info!(target: "config", generation, "ready on the daemon's settings");
             }
             None => tracing::info!(target: "config", "ready on broca.jsonc"),
+        }
+        Ok(())
+    }
+
+    fn attach(&self, writer: broca_diagnostics::Sender<Frame>) {
+        *self.calls.writer.lock().unwrap() = Some(writer);
+        self.calls.writer_set.notify_waiters();
+    }
+
+    async fn publish_ready(
+        &self,
+        provides: Vec<subc_protocol::manifest::ProviderRole>,
+    ) -> Result<(), ServeIoError> {
+        let update = ModuleControlRequestFromModule::CatalogUpdate {
+            provides,
+            capabilities: None,
+            ready: Some(true),
+        };
+        if let Reply::Refused(error) = self.calls.call_tracked(&update, true).await? {
+            return Err(ServeIoError(format!(
+                "the daemon refused broca's readiness: {} — {}",
+                error.code, error.message
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        self.calls.ready.load(Ordering::Acquire)
+    }
+
+    /// Keep what the process is running with, but never carry old wire calls into the new socket.
+    pub(crate) fn resumed(&self, negotiated_ver: u8) -> Arc<Self> {
+        let calls = Calls::new(negotiated_ver);
+        calls.ready.store(self.ready(), Ordering::Release);
+        Arc::new(Self {
+            calls,
+            schema: self.schema,
+            user_file: self.user_file.clone(),
+            applied: Mutex::new(self.applied.lock().unwrap().clone()),
+        })
+    }
+
+    pub(crate) fn check_resume_mode(&self, config_gate: bool) -> Result<(), ServeIoError> {
+        let was_managed = self.user_file.is_some();
+        if config_gate != was_managed {
+            let mode = |managed| {
+                if managed {
+                    "daemon managed"
+                } else {
+                    "local file"
+                }
+            };
+            tracing::warn!(target: "lifecycle", from = mode(was_managed), to = mode(config_gate),
+                "settings management changed across daemon upgrade; broca must restart");
+            return Err(ServeIoError(
+                "settings management changed across daemon upgrade".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish_resume(
+        &self,
+        writer: broca_diagnostics::Sender<Frame>,
+        provides: Vec<subc_protocol::manifest::ProviderRole>,
+        config_gate: bool,
+    ) -> Result<(), ServeIoError> {
+        self.check_resume_mode(config_gate)?;
+        self.attach(writer);
+        self.publish_ready(provides).await?;
+        if let Some(user_file) = &self.user_file {
+            let declare =
+                ConfigDeclareRequest::new(super::schema_document().clone(), user_file, Vec::new());
+            if let Reply::Refused(_) = self.calls.call(&declare).await? {
+                return Err(ServeIoError(
+                    "settings declaration refused after daemon upgrade".into(),
+                ));
+            }
+            let view =
+                view_from(self.calls.call(&ConfigGetRequest::new()).await?).map_err(|_| {
+                    ServeIoError("settings view unavailable after daemon upgrade".into())
+                })?;
+            let already_applied = view.status == ConfigStatus::Pending
+                && self
+                    .applied
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|applied| {
+                        view.generation == applied.generation && view.effective == applied.effective
+                    });
+            if already_applied && view.generation != 0 {
+                // The replacement can re-offer the same generation under a new attempt. Send
+                // the outcome without applying the settings a second time.
+                if let Some(attempt) = view.attempt {
+                    self.acknowledge(view.generation, attempt).await?;
+                }
+            } else {
+                self.apply_view(view).await?;
+            }
         }
         Ok(())
     }
@@ -551,6 +691,10 @@ impl Gate {
                 return Ok(());
             }
         };
+        self.apply_view(view).await
+    }
+
+    async fn apply_view(&self, view: ConfigView) -> Result<(), ServeIoError> {
         if view.generation == 0 {
             self.apply_unstamped(view);
             return Ok(());
@@ -646,10 +790,18 @@ impl Gate {
     }
 
     async fn acknowledge(&self, generation: u64, attempt: u64) -> Result<(), ServeIoError> {
+        let delivery = (generation, attempt);
+        if *self.calls.acknowledged.lock().unwrap() == Some(delivery) {
+            return Ok(());
+        }
         let ack =
             ConfigAppliedRequest::new(generation, attempt, ConfigApplyResult::Ack, Vec::new());
         match self.calls.call(&ack).await? {
-            Reply::Done(_) => Ok(()),
+            Reply::Done(_) => {
+                let mut acknowledged = self.calls.acknowledged.lock().unwrap();
+                *acknowledged = Some(acknowledged.map_or(delivery, |last| last.max(delivery)));
+                Ok(())
+            }
             Reply::Refused(error) => {
                 // A stale or duplicate outcome is refused and changes nothing on either side.
                 tracing::warn!(target: "config", generation, code = %error.code,

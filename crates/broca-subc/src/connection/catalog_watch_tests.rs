@@ -8,6 +8,40 @@ use tokio::sync::mpsc;
 use super::super::tests::route_open_test_connection;
 use super::super::{control_flags, PendingEntry, PendingMap, SubcConnection};
 
+#[tokio::test(start_paused = true)]
+async fn catalog_list_waits_for_the_replacement_during_daemon_upgrade() {
+    let (conn, _, _) = SubcConnection::in_process_for_test(7, 1);
+    let (replacement, _, mut daemon) = SubcConnection::in_process_for_test(8, 2);
+    conn.deactivate_for_test();
+    let ceiling = tokio::time::Instant::now() + Duration::from_secs(5);
+    crate::daemon_upgrade::announce(ceiling);
+    let read = conn.catalog_list();
+    tokio::pin!(read);
+    assert!(
+        futures::poll!(&mut read).is_pending(),
+        "catalog.list must wait for the replacement consumer before batch setup can fail"
+    );
+    crate::daemon_upgrade::resumed(ceiling);
+    conn.replace_generation_for_test(&replacement);
+    let request = tokio::select! {
+        sent = daemon.next_request() => sent,
+        done = &mut read => panic!("catalog read ended before sending on the replacement: {done:?}"),
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["op"],
+        "catalog.list"
+    );
+    let catalog = ClientControlResponse::CatalogList {
+        generation: 1,
+        modules: vec![CatalogEntry::new("replacement-tools", vec![], vec![])],
+        subc_ops: vec![],
+    };
+    assert!(daemon.reply(&request, serde_json::to_vec(&catalog).unwrap()));
+    let catalog = read.await.unwrap();
+    assert_eq!(catalog[0].module_id, "replacement-tools");
+    crate::daemon_upgrade::abandon();
+}
+
 /// The next frame the connection wrote, with its op.
 async fn next_request(write_rx: &mut mpsc::Receiver<Frame>) -> (Frame, String) {
     let frame = tokio::time::timeout(Duration::from_secs(5), write_rx.recv())

@@ -172,42 +172,53 @@ impl CredentialRoute for Credentials {
         method: &'static str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, CkbusError> {
-        let route = self
-            .conn
-            .route_open_management_within(
+        let request = serde_json::to_vec(&serde_json::json!({"method":method,"params":params}))
+            .map_err(|_| CkbusError::Malformed {
+                method,
+                what: "request could not be encoded",
+            })?;
+        let mut upgrade = broca_subc::daemon_upgrade::Retry::default();
+        let body = loop {
+            let opening = self.conn.route_open_management_within(
                 "ckbus",
                 &self.bind,
                 RouteOpenRetry {
                     budget: Duration::from_secs(5),
                     max_interval: Duration::from_millis(250),
                 },
-            )
-            .await
+            );
+            let route = match upgrade.deadline() {
+                Some(deadline) => tokio::time::timeout_at(deadline, opening)
+                    .await
+                    .map_err(|_| CkbusError::TimedOut { method })?,
+                None => opening.await,
+            }
             .map_err(|error| CkbusError::RouteUnavailable {
                 method,
                 detail: error.to_string(),
             })?;
-        let request = serde_json::to_vec(&serde_json::json!({"method":method,"params":params}))
-            .map_err(|_| CkbusError::Malformed {
-                method,
-                what: "request could not be encoded",
-            })?;
-        let answer = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.conn.route_request_terminal(&route, request),
-        )
-        .await;
-        let _ = self.conn.route_close(&route).await;
-        let body = match answer {
-            Err(_) => return Err(CkbusError::TimedOut { method }),
-            Ok(Err(error)) => {
-                return Err(CkbusError::RouteUnavailable {
-                    method,
-                    detail: error.to_string(),
-                })
+            let answer = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.conn.route_request_terminal(&route, request.clone()),
+            )
+            .await;
+            let _ = self.conn.route_close(&route).await;
+            match answer {
+                Err(_) => return Err(CkbusError::TimedOut { method }),
+                Ok(Err(error)) => {
+                    return Err(CkbusError::RouteUnavailable {
+                        method,
+                        detail: error.to_string(),
+                    })
+                }
+                Ok(Ok(Err(refusal))) => {
+                    if upgrade.after_frame(&refusal, &self.conn).await {
+                        continue;
+                    }
+                    return Err(refusal_of(method, &refusal));
+                }
+                Ok(Ok(Ok(body))) => break body,
             }
-            Ok(Ok(Err(refusal))) => return Err(refusal_of(method, &refusal)),
-            Ok(Ok(Ok(body))) => body,
         };
         let value: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| CkbusError::Malformed {

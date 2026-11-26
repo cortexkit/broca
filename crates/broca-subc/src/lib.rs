@@ -25,6 +25,7 @@ pub mod connection;
 pub mod consent;
 pub mod consent_card;
 pub mod content_v1;
+pub mod daemon_upgrade;
 pub mod flow_providers;
 pub mod hook_plane;
 pub mod late_results;

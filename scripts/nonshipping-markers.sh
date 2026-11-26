@@ -33,5 +33,6 @@ test-harness BROCA_TEST_HARNESS_VIRTUAL_RETRY_WAITS_V1
 test-attachments broca-nonshipping-attachments-v1
 fs-override BROCA_TEST_FS_OVERRIDE_V1
 test-loopback-credentials BROCA_TEST_LOOPBACK_CREDENTIALS_V1
+test-hooks BROCA_TEST_HOOKS_RESUME_HELLO_DELAY_V1
 MARKERS
 }

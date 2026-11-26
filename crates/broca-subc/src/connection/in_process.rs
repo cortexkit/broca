@@ -11,6 +11,22 @@ pub(crate) struct InProcessModuleEnd {
 }
 
 impl SubcConnection {
+    pub(crate) fn replace_generation_for_test(&self, replacement: &Self) {
+        let runtime = replacement.shared.current.lock().unwrap().runtime.clone();
+        *self.shared.current.lock().unwrap() = GenerationState::new(runtime);
+    }
+
+    pub(crate) fn allow_test_route(&self, channel: u16, epoch: u32) {
+        self.shared
+            .current
+            .lock()
+            .unwrap()
+            .runtime
+            .route_epochs
+            .lock()
+            .unwrap()
+            .insert(channel, epoch);
+    }
     /// A connection whose only live route is `(channel, epoch)`, plus the module end of it.
     pub(crate) fn in_process_for_test(
         channel: u16,
@@ -43,6 +59,7 @@ impl SubcConnection {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let conn_token = ConnToken(NEXT_CONNECTION_TOKEN.fetch_add(1, Ordering::Relaxed));
         let runtime = Arc::new(ConnectionRuntime {
+            binding: crate::registration::SocketBinding::Unclaimed,
             close_observer: Mutex::new(Weak::new()),
             closing_routes: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-route-close")]
@@ -87,6 +104,16 @@ impl SubcConnection {
 }
 
 impl InProcessModuleEnd {
+    pub(crate) fn refuse_for_daemon_upgrade(&self, request: &Frame) -> bool {
+        self.terminal(
+            request,
+            FrameType::Error,
+            serde_json::to_vec(
+                &subc_protocol::ErrorBody::module_reloading_for_daemon_upgrade("switching daemon"),
+            )
+            .unwrap(),
+        )
+    }
     pub(crate) fn try_frame(&mut self) -> Option<Frame> {
         self.write_rx.try_recv().ok()
     }

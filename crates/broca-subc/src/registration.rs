@@ -17,7 +17,7 @@
 //! consumer identity on route opens. Nothing here applies to it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,6 +28,8 @@ use subc_protocol::claim::{
 use subc_protocol::{error_codes, ErrorBody, Flags, Frame, FrameType, Priority};
 use subc_transport::{read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::connection::{ConnError, ConnResult};
 
@@ -37,13 +39,64 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> DaemonStream for T {}
 
 /// Set once broca has taken its registration channel; never cleared.
 static ADOPTED: AtomicBool = AtomicBool::new(false);
+static RESUMED: AtomicBool = AtomicBool::new(false);
 
 /// The module the daemon launched this process as, when it took its channel.
 static MODULE_ID: OnceLock<String> = OnceLock::new();
 
-/// Who sends `claim.mint` on the module connection. Replaced once, when the serve loop takes the
-/// module connection over from start-up.
-static MINTER: RwLock<Option<Arc<dyn ClaimMinter>>> = RwLock::new(None);
+static MINTER: LazyLock<MinterSlot> = LazyLock::new(MinterSlot::new);
+
+#[derive(Clone)]
+enum Minter {
+    Unregistered,
+    Ready(Arc<dyn ClaimMinter>),
+    Upgrading(Instant),
+}
+
+struct MinterSlot(watch::Sender<Minter>);
+
+impl MinterSlot {
+    fn new() -> Self {
+        Self(watch::Sender::new(Minter::Unregistered))
+    }
+
+    async fn mint(&self) -> Result<Claim, String> {
+        let mut updates = self.0.subscribe();
+        let mut ceiling = None;
+        loop {
+            let state = updates.borrow_and_update().clone();
+            match state {
+                Minter::Unregistered => {
+                    return Err("no claim minter: broca has not registered yet".into());
+                }
+                Minter::Upgrading(deadline) => {
+                    let until = *ceiling.get_or_insert(deadline);
+                    if Instant::now() >= until {
+                        return Err("claim.mint: daemon upgrade reconnect deadline passed".into());
+                    }
+                    if tokio::time::timeout_at(until, updates.changed())
+                        .await
+                        .is_err()
+                    {
+                        return Err("claim.mint: daemon upgrade reconnect deadline passed".into());
+                    }
+                }
+                Minter::Ready(minter) => {
+                    if ceiling.is_some_and(|until| Instant::now() >= until) {
+                        return Err("claim.mint: daemon upgrade reconnect deadline passed".into());
+                    }
+                    // A mint started just before the old connection closed must not keep
+                    // waiting on that connection's reply while its replacement is ready.
+                    tokio::select! {
+                        biased;
+                        _ = updates.changed() => {},
+                        answer = mint_with(minter.as_ref()) => return answer,
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// How long one claim may take to mint, rate-limit waits included.
 const MINT_BUDGET: Duration = Duration::from_secs(30);
@@ -100,7 +153,7 @@ pub fn refusal() -> Option<String> {
 /// launched (`SUBC_MODULE_ID`), once broca took its registration channel. `None` before that, or
 /// when broca registers with its launch nonce.
 pub fn bound_module_id() -> Option<&'static str> {
-    if !adopted() {
+    if !claim_bound() {
         return None;
     }
     MODULE_ID.get().map(String::as_str)
@@ -110,6 +163,11 @@ pub fn bound_module_id() -> Option<&'static str> {
 /// presents a claim and no consumer identity.
 pub fn adopted() -> bool {
     ADOPTED.load(Ordering::Acquire)
+}
+
+/// A resumed process binds with claims, even when it registered initially with a launch nonce.
+pub fn claim_bound() -> bool {
+    adopted() || RESUMED.load(Ordering::Acquire)
 }
 
 /// The daemon's answer to one `claim.mint` request.
@@ -130,18 +188,31 @@ pub trait ClaimMinter: Send + Sync {
 
 /// Makes `minter` the one that mints claims from now on.
 pub fn install_minter(minter: Arc<dyn ClaimMinter>) {
-    *MINTER.write().unwrap_or_else(|e| e.into_inner()) = Some(minter);
+    MINTER.0.send_replace(Minter::Ready(minter));
+}
+
+/// Use the resumed registration to mint claims even for a process started without an inherited
+/// registration channel.
+pub fn install_resumed_minter(module_id: &str, minter: Arc<dyn ClaimMinter>) {
+    let _ = MODULE_ID.set(module_id.to_owned());
+    install_minter(minter);
+    RESUMED.store(true, Ordering::Release);
+}
+
+/// Retires the old registration connection; consumer binds wait for its replacement.
+pub fn wait_for_resumed_minter(deadline: Instant) {
+    MINTER.0.send_replace(Minter::Upgrading(deadline));
+}
+
+/// Ends the gap if the module cannot resume, releasing any waiting consumer binds.
+pub fn abandon_resumed_minter() {
+    MINTER.0.send_replace(Minter::Unregistered);
 }
 
 /// Mints one claim for another connection of this spawn. The daemon's `claim_rate_limited`
 /// delay is waited out within [`MINT_BUDGET`]; any other refusal is final for this connection.
 pub async fn mint() -> Result<Claim, String> {
-    let minter = MINTER
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .ok_or_else(|| "no claim minter: broca has not registered yet".to_string())?;
-    mint_with(minter.as_ref()).await
+    MINTER.mint().await
 }
 
 async fn mint_with(minter: &dyn ClaimMinter) -> Result<Claim, String> {
@@ -181,18 +252,28 @@ async fn mint_with(minter: &dyn ClaimMinter) -> Result<Claim, String> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SocketBinding {
+    /// The socket did not present a registration claim.
+    Unclaimed,
+    /// The daemon accepted a claim on this socket.
+    Claim,
+}
+
 /// Binds a connection broca just dialled and authenticated to its registration: mints a claim
-/// and presents it as the connection's first frame. Does nothing when broca has no registration
-/// channel. A refused claim fails the connection, retryable refusals included; it never goes on
-/// unbound.
-pub async fn bind<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> ConnResult<()> {
-    if !adopted() {
-        return Ok(());
+/// and presents it as the connection's first frame. A process without a minter or an inherited
+/// channel leaves the socket unclaimed. A later resume cannot change the authentication the
+/// daemon received on this socket.
+pub async fn bind<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> ConnResult<SocketBinding> {
+    let use_claim = adopted() || !matches!(*MINTER.0.borrow(), Minter::Unregistered);
+    if !use_claim {
+        return Ok(SocketBinding::Unclaimed);
     }
     let claim = mint()
         .await
         .map_err(|error| ConnError::Transport(error.to_string()))?;
-    present(stream, claim).await
+    present(stream, claim).await?;
+    Ok(SocketBinding::Claim)
 }
 
 /// Presents `claim` on a fresh connection and reads the daemon's acceptance.

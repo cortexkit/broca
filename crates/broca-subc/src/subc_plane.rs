@@ -58,6 +58,7 @@ use crate::tool_deadline::tool_reply_deadline;
 
 use crate::route_close::{CloseTarget, RouteCloser};
 
+mod daemon_upgrade;
 mod run_transport;
 
 #[cfg(all(feature = "test-route-close", not(debug_assertions)))]
@@ -464,6 +465,9 @@ impl Fence {
 
 #[async_trait]
 trait ToolPlaneConnection: Send + Sync {
+    fn upgrade_connection(&self) -> Option<&SubcConnection> {
+        None
+    }
     fn shared_route_closer(&self) -> Option<Arc<RouteCloser>> {
         None
     }
@@ -581,6 +585,9 @@ trait ToolPlaneConnection: Send + Sync {
 
 #[async_trait]
 impl ToolPlaneConnection for SubcConnection {
+    fn upgrade_connection(&self) -> Option<&SubcConnection> {
+        Some(self)
+    }
     fn shared_route_closer(&self) -> Option<Arc<RouteCloser>> {
         Some(self.route_closer())
     }
@@ -1360,7 +1367,12 @@ impl SubcToolPlane {
                 reason: "late_results_registration_missing".into(),
             };
         }
-        if let Some(args) = args {
+        if let Some(mut args) = args {
+            let original = ToolOpenGuard::from(&args.signals);
+            if let Some(ceiling) = ToolOpenGuard::from(signals).deadline {
+                let deadline = original.deadline.map_or(ceiling, |end| end.min(ceiling));
+                args.signals = original.with_deadline(Some(deadline)).signals();
+            }
             // This is after every route, permit and stale-route recovery wait. An approved
             // call stopped here keeps the existing `approved_dispatch_stopped_before_send`
             // reason.
@@ -1879,11 +1891,41 @@ impl SubcToolPlane {
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
         // The call is not sent yet: run cancel and stop end the hold too, not only the session
         // close, and a run they stopped reports the call as stopped before send.
-        let reading = {
-            let wait = WaitCancel::link(&lifecycle, guard);
-            self.read_scope(scope, wait.token(), guard.deadline, true)
-                .await
-        };
+        let wait = WaitCancel::link(&lifecycle, guard);
+        let mut upgrade = crate::daemon_upgrade::recent_deadline();
+        if let Some(deadline) = upgrade {
+            if !daemon_upgrade::wait_for_resumed_scope(deadline, guard, wait.token()).await {
+                return if guard.interrupted() {
+                    self.stopped_before_send(ctx, call)
+                } else {
+                    daemon_upgrade::unverified_scope()
+                };
+            }
+        }
+        let mut reading = self
+            .read_scope_after_cut(scope, wait.token(), guard, upgrade)
+            .await;
+        let unknown = matches!(
+            reading,
+            ScopeReading::Unverifiable(_) | ScopeReading::NotSynced
+        );
+        if upgrade.is_none() && (unknown || composed_under.is_none()) && !guard.interrupted() {
+            upgrade = daemon_upgrade::possible_scope_upgrade(guard, wait.token()).await;
+            if let Some(deadline) = upgrade {
+                if !daemon_upgrade::wait_for_resumed_scope(deadline, guard, wait.token()).await {
+                    return if guard.interrupted() {
+                        self.stopped_before_send(ctx, call)
+                    } else {
+                        daemon_upgrade::unverified_scope()
+                    };
+                }
+                if unknown {
+                    reading = self
+                        .read_scope_after_cut(scope, wait.token(), guard, upgrade)
+                        .await;
+                }
+            }
+        }
         match reading {
             ScopeReading::Gone(reason) => {
                 self.latch_gone(ctx, reason);
@@ -1893,11 +1935,17 @@ impl SubcToolPlane {
                 return self.stopped_before_send(ctx, call);
             }
             ScopeReading::Unverifiable(_) | ScopeReading::NotSynced => {
-                return drained(SCOPE_UNVERIFIABLE)
+                if upgrade.is_some() {
+                    return daemon_upgrade::unverified_scope();
+                }
+                return drained(SCOPE_UNVERIFIABLE);
             }
             ScopeReading::Live(_) => {}
         }
         let Some(composed_under) = composed_under else {
+            if upgrade.is_some() {
+                return daemon_upgrade::unverified_scope();
+            }
             return drained(SCOPE_UNVERIFIABLE);
         };
         let (fresh, sem) = match self
@@ -1922,6 +1970,9 @@ impl SubcToolPlane {
                 let ToolPlaneError::ScopeRefused { code, .. } = error else {
                     unreachable!()
                 };
+                if code == SCOPE_UNVERIFIABLE && upgrade.is_some() {
+                    return daemon_upgrade::unverified_scope();
+                }
                 self.latch_gone(ctx, &code);
                 return drained(&code);
             }
@@ -1996,7 +2047,7 @@ impl SubcToolPlane {
             SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
             SendAttempt::Reply(reply) => reply,
         };
-        self.finish_dispatch(
+        self.finish_or_retry_upgrade(
             ctx,
             call,
             module_id,
@@ -2006,6 +2057,7 @@ impl SubcToolPlane {
             outcome,
             key,
             _permit,
+            guard,
         )
         .await
     }
@@ -2398,6 +2450,11 @@ impl SubcToolPlane {
     ) -> Option<DispatchResult> {
         let scope = ctx.scope.as_ref()?;
         if self.conn.route_is_open(&sent_on) {
+            return None;
+        }
+        if crate::daemon_upgrade::active_deadline().is_some() {
+            // This socket is going away independently of the session's scope. A describe
+            // racing that switch can't establish that the scope ended.
             return None;
         }
         let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
@@ -3562,6 +3619,33 @@ impl SubcToolPlane {
                 .zip(current.as_ref())
                 .is_some_and(|(original, actual)| may_resend_under(original, actual));
             if !compatible {
+                if composed_under.is_none() || current.is_none() {
+                    let lifecycle = self.capture_session_lifecycle_token(&ctx.bind);
+                    let wait = WaitCancel::link(&lifecycle, guard);
+                    if daemon_upgrade::possible_scope_upgrade(guard, wait.token())
+                        .await
+                        .is_some()
+                    {
+                        drop(first_permit);
+                        return self
+                            .resend_or_drain(
+                                ctx,
+                                call,
+                                &module_id,
+                                route_handle,
+                                composed_under,
+                                TOOL_DISPATCH_PATIENCE,
+                                guard,
+                                fence_key,
+                                key,
+                                &[],
+                            )
+                            .await;
+                    }
+                    if guard.interrupted() {
+                        return self.stopped_before_send(ctx, call);
+                    }
+                }
                 self.forget_route(ctx, &module_id, route_handle);
                 return DispatchResult::ScopeDrained {
                     reason: if composed_under.is_some() && current.is_some() {
@@ -3619,9 +3703,9 @@ impl SubcToolPlane {
             || matches!(&first, Err(ConnError::Rejected(msg)) if crate::connection::classify_tool_route_refusal(msg) == crate::connection::ToolRouteRefusal::Reopen);
         let endpoint_is_reloading = first.as_ref().err().and_then(ConnError::code)
             == Some(subc_protocol::error_codes::MODULE_RELOADING);
-        if !(route_is_known_stale || endpoint_is_reloading) {
+        if !(route_is_known_stale || endpoint_is_reloading) || daemon_upgrade::refused(&first) {
             return self
-                .finish_dispatch(
+                .finish_or_retry_upgrade(
                     ctx,
                     call,
                     &module_id,
@@ -3631,6 +3715,7 @@ impl SubcToolPlane {
                     first,
                     key,
                     first_permit,
+                    guard,
                 )
                 .await;
         }
@@ -3744,7 +3829,7 @@ impl SubcToolPlane {
             SendAttempt::Reply(reply) => reply,
         };
         // The re-sent request holds the fresh route's credit until its terminal.
-        self.finish_dispatch(
+        self.finish_or_retry_upgrade(
             ctx,
             call,
             &module_id,
@@ -3754,6 +3839,7 @@ impl SubcToolPlane {
             outcome,
             key,
             fresh_permit,
+            guard,
         )
         .await
     }
@@ -3836,7 +3922,7 @@ impl SubcToolPlane {
             SendAttempt::NotSent { reason } => return DispatchResult::NotSent { reason },
             SendAttempt::Reply(reply) => reply,
         };
-        self.finish_dispatch(
+        self.finish_or_retry_upgrade(
             ctx,
             call,
             module_id,
@@ -3846,6 +3932,7 @@ impl SubcToolPlane {
             outcome,
             key,
             fresh_permit,
+            guard,
         )
         .await
     }

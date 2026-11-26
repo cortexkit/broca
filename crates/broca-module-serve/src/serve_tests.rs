@@ -2600,28 +2600,10 @@ async fn reader_answers_health_ping_during_authorization_and_permit_waits() {
         release: tokio::sync::Notify::new(),
     });
     let loop_handler = handler.clone();
-    let serve = tokio::spawn(async move {
-        let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
-        run_frame_loop(
-            &mut module_read,
-            writer,
-            "broca",
-            loop_handler,
-            &registry,
-            &VaultGauge::not_in_use(),
-            Default::default(),
-            CancellationToken::new(),
-            &crate::consumer_routes::ConsumerRoutes::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    });
+    let serve =
+        tokio::spawn(
+            async move { test_frame_loop(&mut module_read, writer, loop_handler, None).await },
+        );
     let hello = next_written(&mut written).await;
     write_frame(
         &mut daemon,
@@ -2953,6 +2935,40 @@ async fn retract_own_send_uses_only_the_bound_daemon_principal_and_never_extends
 
 /// Start a frame loop serving `handler`, complete its handshake, and bind route channel 7
 /// to `session`. Returns the daemon end of the socket, the loop's egress, and the loop.
+async fn test_frame_loop<H: ServeHandler + 'static>(
+    reader: &mut tokio::io::DuplexStream,
+    writer: EgressSender<Frame>,
+    handler: Arc<H>,
+    scope_describer: Option<Arc<broca_subc::ModuleScopeDescriber>>,
+) -> Result<ServeEnd, ServeIoError> {
+    let services = connection::Services {
+        module_id: "broca".into(),
+        handler,
+        health_registry: Arc::new(test_registry(LineageRegistry::new(Arc::new(
+            RefusingOpener,
+        )))),
+        vault_gauge: VaultGauge::not_in_use(),
+        serves: Default::default(),
+        consumer_routes: Default::default(),
+        vault_auditor: None,
+        scope_describer,
+        agent_data: None,
+        system_one: None,
+        llm_tools: None,
+    };
+    connection::run_frame_loop(
+        reader,
+        writer,
+        &services,
+        CancellationToken::new(),
+        None,
+        None,
+        &accepting_drain::Drain::default(),
+        None,
+    )
+    .await
+}
+
 async fn bound_frame_loop<H: ServeHandler + 'static>(
     handler: Arc<H>,
     session: &str,
@@ -2963,28 +2979,8 @@ async fn bound_frame_loop<H: ServeHandler + 'static>(
 ) {
     let (mut daemon, mut module_read) = tokio::io::duplex(64 * 1024);
     let (writer, mut written) = broca_diagnostics::channel::<Frame>(EGRESS_BUFFER, Arc::default());
-    let serve = tokio::spawn(async move {
-        let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
-        run_frame_loop(
-            &mut module_read,
-            writer,
-            "broca",
-            handler,
-            &registry,
-            &VaultGauge::not_in_use(),
-            Default::default(),
-            CancellationToken::new(),
-            &crate::consumer_routes::ConsumerRoutes::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    });
+    let serve =
+        tokio::spawn(async move { test_frame_loop(&mut module_read, writer, handler, None).await });
     let hello = next_written(&mut written).await;
     write_frame(
         &mut daemon,
@@ -3135,28 +3131,8 @@ async fn a_panicking_request_does_not_end_the_connection() {
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
-    let serve = tokio::spawn(async move {
-        let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
-        run_frame_loop(
-            &mut module_read,
-            writer,
-            "broca",
-            handler,
-            &registry,
-            &VaultGauge::not_in_use(),
-            Default::default(),
-            CancellationToken::new(),
-            &crate::consumer_routes::ConsumerRoutes::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    });
+    let serve =
+        tokio::spawn(async move { test_frame_loop(&mut module_read, writer, handler, None).await });
     let hello = next_written(&mut written).await;
     write_frame(
         &mut daemon,
@@ -3292,27 +3268,7 @@ async fn a_scope_describe_rides_the_registered_module_connection() {
         release: tokio::sync::Notify::new(),
     });
     let serve = tokio::spawn(async move {
-        let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
-        let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
-        run_frame_loop(
-            &mut module_read,
-            writer_tx,
-            "broca",
-            handler,
-            &registry,
-            &VaultGauge::not_in_use(),
-            Default::default(),
-            CancellationToken::new(),
-            &consumer_routes,
-            None,
-            None,
-            Some(loop_describer.as_ref()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
+        test_frame_loop(&mut module_read, writer_tx, handler, Some(loop_describer)).await
     });
 
     let hello = next_written(&mut written).await;
@@ -3401,27 +3357,7 @@ async fn a_request_task_finishing_mid_frame_does_not_desync_the_reader() {
     });
     let loop_handler = handler.clone();
     let serve = tokio::spawn(async move {
-        let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
-        let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
-        run_frame_loop(
-            &mut module_read,
-            writer_tx,
-            "broca",
-            loop_handler,
-            &registry,
-            &VaultGauge::not_in_use(),
-            Default::default(),
-            CancellationToken::new(),
-            &consumer_routes,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
+        test_frame_loop(&mut module_read, writer_tx, loop_handler, None).await
     });
 
     let hello = next_written(&mut written).await;
@@ -3548,27 +3484,7 @@ async fn unbound_and_stale_module_frames_are_counted_without_replies() {
     });
     let loop_handler = handler.clone();
     let serve = tokio::spawn(async move {
-        let registry = test_registry(LineageRegistry::new(Arc::new(RefusingOpener)));
-        let consumer_routes = crate::consumer_routes::ConsumerRoutes::default();
-        run_frame_loop(
-            &mut module_read,
-            writer_tx,
-            "broca",
-            loop_handler,
-            &registry,
-            &VaultGauge::not_in_use(),
-            Default::default(),
-            CancellationToken::new(),
-            &consumer_routes,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
+        test_frame_loop(&mut module_read, writer_tx, loop_handler, None).await
     });
 
     let hello = next_written(&mut written).await;
