@@ -42,7 +42,8 @@ struct Cached {
     /// When a run last looked this request up; the least recent is forgotten first.
     used: Instant,
 }
-static CACHE: LazyLock<Mutex<HashMap<Key, Cached>>> = LazyLock::new(Mutex::default);
+type Cache = Mutex<HashMap<Key, Cached>>;
+static CACHE: LazyLock<Cache> = LazyLock::new(Cache::default);
 static WARNINGS: LazyLock<Mutex<HashSet<(String, &'static str)>>> = LazyLock::new(Mutex::default);
 
 struct Snapshot {
@@ -61,8 +62,8 @@ pub(super) fn invalidate(provider: &str) {
 }
 
 /// The cached slot for `key`, if any, marked as just used.
-fn cached(key: &Key) -> Option<Slot> {
-    let mut cache = CACHE.lock().unwrap();
+fn cached(key: &Key, cache: &Cache) -> Option<Slot> {
+    let mut cache = cache.lock().unwrap();
     let cached = cache.get_mut(key)?;
     cached.used = Instant::now();
     Some(Arc::clone(&cached.slot))
@@ -72,8 +73,8 @@ fn cached(key: &Key) -> Option<Slot> {
 /// [`TRANSPORT_CACHE_CAPACITY`] forgets the least recently used slots first. A slot some run
 /// still holds (it is reading or refreshing it) is never forgotten, so a lookup in progress
 /// keeps seeing the slot it found.
-fn slot(key: Key) -> Slot {
-    let mut cache = CACHE.lock().unwrap();
+fn slot(key: Key, cache: &Cache) -> Slot {
+    let mut cache = cache.lock().unwrap();
     let now = Instant::now();
     if let Some(cached) = cache.get_mut(&key) {
         cached.used = now;
@@ -225,7 +226,7 @@ pub(super) fn compatible_tools(
                 .get(&tool.name)?;
             let major = frozen.major?;
             let request = catalog_request(&plan, &dispatch, provider);
-            let slot = cached(&cache_key(provider, &request, bind, scope)?)?;
+            let slot = cached(&cache_key(provider, &request, bind, scope)?, &CACHE)?;
             let current = slot.state.lock().unwrap().latest.clone()?;
             let pin = current.catalog.schema_pins.get(&tool.name)?;
             if pin.major != Some(major) {
@@ -277,7 +278,7 @@ impl SubcToolPlane {
             let Some(key) = cache_key(provider, &request, bind, scope) else {
                 continue;
             };
-            let slot = slot(key);
+            let slot = slot(key, &CACHE);
             // Serialize refreshes for the same key, including across concurrent session starts.
             let refresh = tokio::time::timeout_at(deadline, slot.refresh.lock()).await;
             if let Ok(_guard) = refresh {
@@ -428,16 +429,18 @@ mod cache_tests {
     /// not every request ever made; one looked up again, or held by a run, stays.
     #[tokio::test(start_paused = true)]
     async fn the_transport_cache_forgets_its_least_recently_used_request_past_its_capacity() {
-        let held = slot(key(0));
+        // Other tests can fill the shared cache and evict entries before these checks.
+        let cache = Cache::default();
+        let held = slot(key(0), &cache);
         for n in 1..TRANSPORT_CACHE_CAPACITY {
             tokio::time::advance(Duration::from_millis(1)).await;
-            drop(slot(key(n)));
+            drop(slot(key(n), &cache));
         }
         tokio::time::advance(Duration::from_millis(1)).await;
-        assert!(cached(&key(1)).is_some());
+        assert!(cached(&key(1), &cache).is_some());
         tokio::time::advance(Duration::from_millis(1)).await;
-        drop(slot(key(TRANSPORT_CACHE_CAPACITY)));
-        let cache = CACHE.lock().unwrap();
+        drop(slot(key(TRANSPORT_CACHE_CAPACITY), &cache));
+        let cache = cache.lock().unwrap();
         assert!(cache.len() <= TRANSPORT_CACHE_CAPACITY, "{}", cache.len());
         assert!(
             Arc::ptr_eq(&cache[&key(0)].slot, &held),
