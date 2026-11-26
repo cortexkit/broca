@@ -51,6 +51,7 @@ use std::time::Duration;
 
 use broca_core::{AccountDecision, AccountSelectionRefusal, RoutingUnavailable};
 use broca_protocol::{AttemptOutcome, BindIdentity, ErrorClass, ModelAttempt, RunFinishReason};
+use broca_provider::transport::OAUTH_NOT_ALLOWED_FOR_ORGANIZATION;
 use broca_subc::vault::{ScopedCredential, ScopedList};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -2869,7 +2870,8 @@ impl RunReporter {
     }
 
     /// Report an unrecovered refusal of the admitted credential, not a resettable limit.
-    /// Subscription auth failures need sign-in instead; only API-key auth failures block a key.
+    /// An organization policy denial makes an OAuth credential unusable; an expired subscription
+    /// login needs sign-in instead. Only API-key authentication failures block a credential.
     /// The executor calls this only for a routed admission's error terminal or API-key auth pause.
     pub fn terminal_credential_refused(
         &self,
@@ -2885,6 +2887,7 @@ impl RunReporter {
                     | "credit_insufficient"
                     | "account_not_entitled"
                     | "usage_not_included"
+                    | OAUTH_NOT_ALLOWED_FOR_ORGANIZATION
             )
         ) || (auth_method == Some("apikey")
             && error.class == ErrorClass::Auth

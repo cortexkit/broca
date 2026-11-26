@@ -133,6 +133,9 @@ use completion::{
 use content_deadline::content_timeout_error;
 pub(crate) use content_deadline::STREAM_CONTENT_TIMEOUT;
 use content_gaps::{ContentGaps, SseObservationGuard};
+mod http_error_body;
+pub use http_error_body::OAUTH_NOT_ALLOWED_FOR_ORGANIZATION;
+use http_error_body::{extract_provider_code, normalize_oauth_policy_code, parse_http_error_body};
 
 pub use responses_websocket::Connections as ChatgptConnections;
 
@@ -5349,30 +5352,6 @@ fn parse_retry_after_value(value: &str, now: SystemTime) -> Option<f64> {
     )
 }
 
-fn extract_provider_code(text: &str) -> Option<String> {
-    let body = parse_http_error_body(text)?;
-    let error = body.get("error").filter(|v| v.is_object()).unwrap_or(&body);
-    error
-        .get("code")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("type").and_then(Value::as_str))
-        .or_else(|| error.get("status").and_then(Value::as_str))
-        .or_else(|| body.get("__type").and_then(Value::as_str))
-        .map(|code| code.rsplit('#').next().unwrap_or(code))
-        .map(str::to_owned)
-}
-
-fn parse_http_error_body(text: &str) -> Option<Value> {
-    let mut body: Value = serde_json::from_str(text).ok()?;
-    // Google's streaming endpoint can answer with a one-element array of RPC errors.
-    if let Value::Array(errors) = &mut body {
-        if errors.len() == 1 {
-            return errors.pop();
-        }
-    }
-    Some(body)
-}
-
 fn http_error_message(code: u16, text: &str, class: ErrorClass) -> String {
     if class == ErrorClass::Auth {
         format!("{code}: auth rejected — re-authenticate to get a fresh token. body: {text}")
@@ -5587,6 +5566,7 @@ fn classify_account_limit_exhausted_with_auth(
         }
     }
     if status == 403
+        && error.provider_code.as_deref() != Some(OAUTH_NOT_ALLOWED_FOR_ORGANIZATION)
         && matches!(
             family,
             crate::spec::WireFamilyId::OpenAiChat | crate::spec::WireFamilyId::AnthropicMessages
@@ -6519,6 +6499,7 @@ fn http_error_in_family(
         Some("personal-team-blocked:spending-limit") => Some(WireFamilyId::OpenAiChat),
         _ => None,
     });
+    let provider_code = normalize_oauth_policy_code(code, family, body.as_ref(), provider_code);
     let provider_code = match provider_code.as_deref() {
         Some("insufficient_quota") => Some(BILLING_EXHAUSTED.to_string()),
         Some("personal-team-blocked:spending-limit")

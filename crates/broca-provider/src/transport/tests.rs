@@ -43,15 +43,15 @@ include!("../transport_quota_tests.rs");
 
 use super::{
     build_provider_http_client, classify_account_limit_exhausted, classify_http_error,
-    collect_error_body, drive_attempt, drive_body_stream, drive_body_stream_with_limit,
-    drive_stream, drive_stream_with_header_timeout, dump_files_to_delete, extract_provider_code,
-    http_error, parse_retry_after_header, parse_retry_after_value, publish_completion,
-    request_dump_filename, retry_delay, send_attempt, transport_error, write_dump_file,
-    AttemptTrace, DumpFileMeta, DumpRetentionCaps, LiveProvider, PreparedHttpRequest,
-    ProviderHttpClient, RequestDigest, GOOGLE_RPC_DIMENSIONS_MAX_KEYS, GOOGLE_RPC_ERROR_INFO_TYPE,
-    GOOGLE_RPC_METADATA_MAX_KEYS, GOOGLE_RPC_QUOTA_FAILURE_TYPE, GOOGLE_RPC_RETRY_INFO_TYPE,
-    GOOGLE_RPC_VIOLATIONS_MAX, MAX_ERROR_BODY_BYTES, MAX_HTTP_ERROR_BODY_READ_BYTES,
-    STREAM_CONTENT_TIMEOUT, STREAM_IDLE_TIMEOUT,
+    classify_http_error_in_family, collect_error_body, drive_attempt, drive_body_stream,
+    drive_body_stream_with_limit, drive_stream, drive_stream_with_header_timeout,
+    dump_files_to_delete, extract_provider_code, http_error, parse_retry_after_header,
+    parse_retry_after_value, publish_completion, request_dump_filename, retry_delay, send_attempt,
+    transport_error, write_dump_file, AttemptTrace, DumpFileMeta, DumpRetentionCaps, LiveProvider,
+    PreparedHttpRequest, ProviderHttpClient, RequestDigest, GOOGLE_RPC_DIMENSIONS_MAX_KEYS,
+    GOOGLE_RPC_ERROR_INFO_TYPE, GOOGLE_RPC_METADATA_MAX_KEYS, GOOGLE_RPC_QUOTA_FAILURE_TYPE,
+    GOOGLE_RPC_RETRY_INFO_TYPE, GOOGLE_RPC_VIOLATIONS_MAX, MAX_ERROR_BODY_BYTES,
+    MAX_HTTP_ERROR_BODY_READ_BYTES, STREAM_CONTENT_TIMEOUT, STREAM_IDLE_TIMEOUT,
 };
 use broca_core::Clock;
 // Directory mode is only asserted on Unix, so keep that helper import under the same cfg.
@@ -6570,6 +6570,60 @@ fn error_classification_distinguishes_authentication_from_forbidden() {
         assert_eq!(
             actual, expected,
             "revert-check: {label} must classify as {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+const ANTHROPIC_OAUTH_POLICY_BODY: &str = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_code":"oauth_not_allowed_for_organization"}},"request_id":"req_x"}"#;
+
+#[test]
+fn anthropic_oauth_policy_refusal_is_a_permanent_entitlement_denial() {
+    let reworded = ANTHROPIC_OAUTH_POLICY_BODY.replace(
+        "OAuth authentication is currently not allowed for this organization.",
+        "OAuth is disabled",
+    );
+    for body in [ANTHROPIC_OAUTH_POLICY_BODY, &reworded] {
+        let error = classify_http_error_in_family(
+            403,
+            body,
+            None,
+            None,
+            Some(WireFamilyId::AnthropicMessages),
+            None,
+        );
+        assert_eq!(error.class, ErrorClass::Permanent, "{body}");
+        assert_eq!(error.status, Some(403));
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("oauth_not_allowed_for_organization"),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn anthropic_oauth_policy_refusal_requires_its_family_status_type_and_exact_signal() {
+    let other_code = ANTHROPIC_OAUTH_POLICY_BODY
+        .replace("oauth_not_allowed_for_organization", "model_not_allowed");
+    let message_only = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."},"request_id":"req_x"}"#;
+    let misplaced_code = r#"{"type":"error","error":{"type":"permission_error","code":"oauth_not_allowed_for_organization"}}"#;
+    let wrong_type =
+        ANTHROPIC_OAUTH_POLICY_BODY.replace("permission_error", "authentication_error");
+    let anthropic = WireFamilyId::AnthropicMessages;
+
+    for (family, status, body) in [
+        (anthropic, 403, other_code.as_str()),
+        (anthropic, 403, message_only),
+        (anthropic, 403, misplaced_code),
+        (anthropic, 403, wrong_type.as_str()),
+        (anthropic, 429, ANTHROPIC_OAUTH_POLICY_BODY),
+        (WireFamilyId::OpenAiChat, 403, ANTHROPIC_OAUTH_POLICY_BODY),
+    ] {
+        let error = classify_http_error_in_family(status, body, None, None, Some(family), None);
+        assert_ne!(
+            error.provider_code.as_deref(),
+            Some("oauth_not_allowed_for_organization"),
+            "{family:?} {status}: {body}"
         );
     }
 }

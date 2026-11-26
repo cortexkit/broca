@@ -840,10 +840,13 @@ capability cache, also used for `service_tier`, and refreshes when that route is
 Renewal (`mode: "renew"` with `expected_pin`) is not currently implemented for any routed method.
 
 For a routed admission ending in `billing_exhausted`, `credit_insufficient`,
-`account_not_entitled` or `usage_not_included`, broca sends `credential_refused` before
-`run_finished`, blocking that credential for every runner. API keys also report an unrecovered
-`auth_required` HTTP 401/403, including an `AuthRequired` pause: the pause is preserved and sends
-no `run_finished`. OAuth and ChatGPT auth pauses send no credential refusal. The report
+`account_not_entitled`, `usage_not_included` or `oauth_not_allowed_for_organization`, broca
+sends `credential_refused` before `run_finished`, blocking that credential for every runner. The
+last is Anthropic's HTTP 403 `permission_error` whose `error.details.error_code` says the
+login's organization no longer allows OAuth; it ends the run without a sign-in pause, since a
+sign-in can't change that policy. API keys also report an unrecovered `auth_required` HTTP
+401/403, including an `AuthRequired` pause: the pause is preserved and sends no `run_finished`.
+Other OAuth and ChatGPT auth pauses send no credential refusal. The report
 names `admission_id`, includes `credential_id` when known and `provider_code` verbatim when present,
 and never includes `retry_at_ms`. It is sent only when the router declares
 `observe_credential_refused` and its prerequisite `observe_backoff`; resettable account limits

@@ -1307,11 +1307,12 @@ async fn terminal_backoff_reports(
     } else {
         error.status
     };
-    terminal_backoff_reports_with_attempt_status(method, path, outcome, error, attempt_status).await
+    terminal_reports(method, "vault-key", path, outcome, error, attempt_status).await
 }
 
-async fn terminal_backoff_reports_with_attempt_status(
+async fn terminal_reports(
     method: &str,
+    credential_id: &str,
     path: &str,
     outcome: Result<RunSummary, RunError>,
     error: ProviderError,
@@ -1357,7 +1358,7 @@ async fn terminal_backoff_reports_with_attempt_status(
         broca_core::AccountReporter::attempt_recorded(reporter.as_ref(), seq, &attempt);
     }
     let selection: broca_core::AuthSelection = serde_json::from_value(serde_json::json!({
-        "auth_method":method,"credential_id":"vault-key",
+        "auth_method":method,"credential_id":credential_id,
         "account_decision":{"path":path,"admission_id":"adm-transient"}
     }))
     .unwrap();
@@ -1375,7 +1376,7 @@ async fn terminal_backoff_reports_with_attempt_status(
         }
     }
     drop(reporter);
-    broca_test_support::wait_until("terminal backoff reports drained", || async {
+    broca_test_support::wait_until("terminal routing reports drained", || async {
         if Arc::strong_count(&routing) == 1 {
             Ok(())
         } else {
@@ -1418,8 +1419,9 @@ async fn routed_chatgpt_terminal_overload_reports_default_backoff() {
 async fn routed_internal_transient_after_successful_attempt_does_not_queue_backoff() {
     let mut error = err_with_status(None);
     error.class = ErrorClass::Transient;
-    let reports = terminal_backoff_reports_with_attempt_status(
+    let reports = terminal_reports(
         "chatgpt",
+        "vault-key",
         "routed",
         run_outcome(RunFinishReason::Error, None),
         error,
@@ -1429,6 +1431,52 @@ async fn routed_internal_transient_after_successful_attempt_does_not_queue_backo
     assert!(reports
         .iter()
         .all(|body| body["kind"] != "transient_backoff"));
+}
+
+#[tokio::test]
+async fn routed_anthropic_oauth_policy_refusal_reports_the_login_before_finishing() {
+    const CREDENTIAL_ID: &str = "oauth:anthropic:acct1";
+    const CODE: &str = "oauth_not_allowed_for_organization";
+    let mut refusal = err_with_status(Some(403));
+    refusal.class = ErrorClass::Permanent;
+    refusal.provider_code = Some(CODE.into());
+    let other_forbidden = [
+        r#"{"type":"error","error":{"type":"permission_error","message":"This credential does not have access to the requested model."},"request_id":"req_x"}"#,
+        r#"{"type":"error","error":{"type":"permission_error","message":"This credential does not have access to the requested model.","details":{"error_code":"model_not_allowed"}},"request_id":"req_x"}"#,
+    ]
+    .map(|body| broca_provider::transport::classify_http_error(403, body, None, None));
+
+    for (error, expected) in std::iter::once((refusal, true))
+        .chain(other_forbidden.into_iter().map(|error| (error, false)))
+    {
+        assert_eq!(error.class, ErrorClass::Permanent);
+        let reports = terminal_reports(
+            "oauth",
+            CREDENTIAL_ID,
+            "routed",
+            run_outcome(RunFinishReason::Error, None),
+            error,
+            Some(403),
+        )
+        .await;
+        let mut kinds = vec!["attempt", "attempt"];
+        if expected {
+            kinds.push("credential_refused");
+        }
+        kinds.push("run_finished");
+        assert_eq!(
+            reports
+                .iter()
+                .map(|body| body["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            kinds
+        );
+        if expected {
+            assert_eq!(reports[2]["credential_id"], CREDENTIAL_ID);
+            assert_eq!(reports[2]["provider_code"], CODE);
+            assert!(reports[2].get("retry_at_ms").is_none());
+        }
+    }
 }
 
 #[tokio::test]
