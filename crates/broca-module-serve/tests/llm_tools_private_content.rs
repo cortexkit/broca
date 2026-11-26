@@ -395,8 +395,7 @@ impl Drop for Rig {
     fn drop(&mut self) {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let cleanup = cleanup_recorded_processes(&self.root);
-            broca_test_support::kill_and_reap(&mut self._daemon);
+            let cleanup = cleanup_recorded_processes(&self.root, || reap_daemon(&mut self._daemon));
             if let Err(error) = cleanup {
                 let message = format!(
                     "private-content rig cleanup {}: {error}",
@@ -414,17 +413,36 @@ impl Drop for Rig {
     }
 }
 
+fn reap_daemon(child: &mut tokio::process::Child) -> std::io::Result<()> {
+    use std::time::Instant;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon child did not exit after the recorded kill",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn cleanup_recorded_processes(root: &Path) -> std::io::Result<()> {
+fn cleanup_recorded_processes(
+    root: &Path,
+    reap_daemon: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use broca_test_support::RecordedProcess;
     use std::time::Instant;
     const LOCK_GRACE: Duration = Duration::from_secs(5);
 
     // Helpers check this marker under the same lock used for spawning and
     // recording. Once locked, no stand-in can slip between spawn and publication.
-    std::fs::write(root.join("stopping"), b"")?;
-    let lock = spawn_lock(root)?;
+    let stopping = std::fs::write(root.join("stopping"), b"");
+    let lock = spawn_lock(root);
     let deadline = Instant::now() + LOCK_GRACE;
-    let locked = loop {
+    let locked = lock.as_ref().is_ok_and(|lock| loop {
         if lock.try_lock().is_ok() {
             break true;
         }
@@ -432,7 +450,7 @@ fn cleanup_recorded_processes(root: &Path) -> std::io::Result<()> {
             break false;
         }
         std::thread::sleep(Duration::from_millis(10));
-    };
+    });
 
     let mut processes = recorded_processes(root);
     for (role, process) in &processes {
@@ -457,33 +475,21 @@ fn cleanup_recorded_processes(root: &Path) -> std::io::Result<()> {
         "daemon" => 2,
         _ => 1,
     });
-    for (_, process) in &processes {
-        // Every signal rechecks the kernel start time, never a command name or
-        // process group. A stale ledger entry is not authority to kill a reused PID.
-        if let Err(error) = process.kill() {
-            eprintln!("private-content rig: could not kill {process:?}: {error}");
+    let mut identities: Vec<_> = processes.into_iter().map(|(_, process)| process).collect();
+    let first_pass = RecordedProcess::kill_and_await_exit(&identities);
+    let daemon_exit = reap_daemon();
+
+    // The daemon can finish publishing a module after the first scans. Read its ledger
+    // after the owned child confirms exit, not merely after a kernel identity lookup.
+    // Even if an earlier wait failed, sweep both ledgers and retain every earlier identity.
+    for (_, process) in recorded_processes(root) {
+        if !identities.contains(&process) {
+            identities.push(process);
         }
     }
-    let identities: Vec<_> = processes.into_iter().map(|(_, process)| process).collect();
-    broca_test_support::RecordedProcess::await_exit(&identities)?;
-    // The reads above can miss a module the daemon spawned just before it stopped: a stopped
-    // process still finishes the system call it was in, so a ledger rename in flight when the
-    // daemon stopped can land after the second read. Every ledger writer is dead now, so this
-    // read is final, and anything it names that still runs is killed too.
-    let late: Vec<_> = recorded_processes(root)
-        .into_iter()
-        .filter(|(_, process)| process.is_running())
-        .map(|(role, process)| {
-            eprintln!(
-                "private-content rig: killing {role} {process:?}, recorded after the first pass"
-            );
-            if let Err(error) = process.kill() {
-                eprintln!("private-content rig: could not kill {process:?}: {error}");
-            }
-            process
-        })
-        .collect();
-    broca_test_support::RecordedProcess::await_exit(&late)?;
+    let final_pass = RecordedProcess::kill_and_await_exit(&identities);
+    final_pass.and(daemon_exit).and(first_pass).and(stopping)?;
+    let _lock = lock?;
     if !locked {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -491,6 +497,40 @@ fn cleanup_recorded_processes(root: &Path) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn private_content_rig_cleans_up_a_module_published_before_daemon_reap() {
+    use broca_test_support::RecordedProcess;
+
+    let root = broca_test_support::scratch_root().join("private-content-late-ledger");
+    let run_dir = root.join("data/cortexkit/run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let roster = run_dir.join("live-children.json");
+    let module = tokio::process::Command::new("/bin/sh")
+        .args(["-c", "read ignored"])
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let identity = RecordedProcess::capture(module.id().unwrap()).unwrap();
+    cleanup_recorded_processes(&root, || {
+        // Model the daemon's last publication becoming visible before its child handle
+        // confirms exit, without depending on scheduler or filesystem timing.
+        std::fs::write(
+            &roster,
+            json!({"children":[{"pid":identity.pid,"start_time":identity.start_time}]}).to_string(),
+        )
+    })
+    .unwrap();
+    let survived = identity.is_running().unwrap();
+    if survived {
+        identity.kill().unwrap();
+    }
+    assert!(
+        !survived,
+        "late ledger module survived cleanup: {identity:?}"
+    );
 }
 
 async fn consumer_nonce(path: &Path) -> String {
@@ -1542,7 +1582,9 @@ async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
     broca_test_support::wait_until("recorded stand-ins", || async {
         let count = recorded_processes(&root)
             .iter()
-            .filter(|(role, process)| role == "stand-in" && process.is_running())
+            .filter(|(role, process)| {
+                role == "stand-in" && matches!(process.is_running(), Ok(true))
+            })
             .count();
         if count >= 2 {
             Ok(())
@@ -1561,7 +1603,10 @@ async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
             helper.kill().unwrap();
         }
         broca_test_support::wait_until("helpers killed before rig drop", || async {
-            if helpers.iter().all(|process| !process.is_running()) {
+            if helpers
+                .iter()
+                .all(|process| matches!(process.is_running(), Ok(false)))
+            {
                 Ok(())
             } else {
                 Err("helper still running".to_owned())
@@ -1611,10 +1656,10 @@ async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
     assert!(failure.is_panic());
     let survivors: Vec<_> = recorded_processes(&root)
         .into_iter()
-        .filter(|(_, process)| process.is_running())
+        .filter(|(_, process)| !matches!(process.is_running(), Ok(false)))
         .collect();
     let unrelated_survived =
-        lookalike.is_running() && probe.lookalike.try_wait().unwrap().is_none();
+        lookalike.is_running().unwrap() && probe.lookalike.try_wait().unwrap().is_none();
     drop(probe);
     assert!(
         unrelated_survived,

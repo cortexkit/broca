@@ -2,6 +2,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 const CLEANUP_GRACE: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A rig-owned process identity, recorded immediately after spawn rather than rediscovered
 /// by command name at teardown. Start times prevent stale records from targeting reused PIDs.
@@ -13,70 +14,103 @@ pub struct RecordedProcess {
 
 impl RecordedProcess {
     pub fn capture(pid: u32) -> io::Result<Self> {
-        positive_pid(pid)?;
-        process_info(pid).map(|(start_time, _, _)| Self { pid, start_time })
+        process_info(positive_pid(pid)?).map(|(start_time, _, _)| Self { pid, start_time })
     }
 
     pub fn parent_pid(self) -> io::Result<u32> {
-        let (start_time, parent, _) = process_info(self.pid)?;
-        if start_time != self.start_time {
-            return Err(io::ErrorKind::NotFound.into());
-        }
-        Ok(parent)
+        self.matching_process_info()?
+            .map(|(parent, _)| parent)
+            .ok_or_else(|| io::ErrorKind::NotFound.into())
     }
 
-    pub fn is_running(self) -> bool {
-        Self::capture(self.pid).is_ok_and(|current| current == self)
+    fn matching_process_info(self) -> io::Result<Option<(u32, bool)>> {
+        match process_info(positive_pid(self.pid)?) {
+            Ok((start_time, parent, stopped)) => {
+                Ok((start_time == self.start_time).then_some((parent, stopped)))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn is_running(self) -> io::Result<bool> {
+        Ok(self.matching_process_info()?.is_some())
     }
 
     /// Signal only the recorded incarnation of the process. Missing or unverifiable
     /// identities are never signalled; cleanup must not adopt a new owner of the PID.
-    fn signal(self, signal: nix::sys::signal::Signal) -> io::Result<()> {
+    fn signal(self, signal: nix::sys::signal::Signal) -> io::Result<bool> {
         let pid = positive_pid(self.pid)?;
-        if self.is_running() {
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal)
-                .map_err(io::Error::from)?;
+        if !self.is_running()? {
+            return Ok(false);
         }
-        Ok(())
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal) {
+            Ok(()) => Ok(true),
+            Err(nix::errno::Errno::ESRCH) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn stop(self) -> io::Result<()> {
-        self.signal(nix::sys::signal::Signal::SIGSTOP)?;
+        if !self.signal(nix::sys::signal::Signal::SIGSTOP)? {
+            return Ok(());
+        }
         let deadline = Instant::now() + CLEANUP_GRACE;
-        while self.is_running() {
-            if process_info(self.pid).is_ok_and(|(_, _, stopped)| stopped) {
-                return Ok(());
-            }
+        while let Some((_, false)) = self.matching_process_info()? {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("process did not stop: {self:?}"),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(POLL_INTERVAL);
         }
         Ok(())
     }
 
     pub fn kill(self) -> io::Result<()> {
-        self.signal(nix::sys::signal::Signal::SIGKILL)
+        self.signal(nix::sys::signal::Signal::SIGKILL).map(|_| ())
     }
 
     /// Drop cannot await Tokio children on a current-thread runtime. Use one
     /// shared synchronous grace for recorded descendants, including orphans.
-    pub fn await_exit(processes: &[Self]) -> io::Result<()> {
+    pub fn kill_and_await_exit(processes: &[Self]) -> io::Result<()> {
         let deadline = Instant::now() + CLEANUP_GRACE;
-        while processes.iter().any(|process| process.is_running()) {
+        let mut remaining: Vec<_> = processes.iter().map(|&process| (process, false)).collect();
+        loop {
+            let mut errors = Vec::new();
+            remaining.retain_mut(|(process, signalled)| {
+                let running = if *signalled {
+                    process.is_running()
+                } else {
+                    // If the identity was unreadable, keep it pending instead of declaring
+                    // it dead or signalling a PID whose start time we could not verify.
+                    process
+                        .signal(nix::sys::signal::Signal::SIGKILL)
+                        .inspect(|sent| *signalled = *sent)
+                };
+                match running {
+                    Ok(running) => running,
+                    Err(error) => {
+                        errors.push(format!("{process:?}: {error}"));
+                        true
+                    }
+                }
+            });
+            if remaining.is_empty() {
+                return Ok(());
+            }
             if Instant::now() >= deadline {
-                let survivors: Vec<_> = processes.iter().filter(|p| p.is_running()).collect();
+                let pending: Vec<_> = remaining.iter().map(|(process, _)| process).collect();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("recorded processes survived cleanup: {survivors:?}"),
+                    format!(
+                        "recorded processes not confirmed exited: {pending:?}; errors: {errors:?}"
+                    ),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(POLL_INTERVAL);
         }
-        Ok(())
     }
 }
 
@@ -92,11 +126,26 @@ fn positive_pid(pid: u32) -> io::Result<i32> {
         })
 }
 
+fn lookup_failed(pid: i32, error: io::Error) -> io::Error {
+    // An identity lookup can fail while the PID still exists. Signal 0 only probes
+    // existence; it cannot authorize any later signal without the recorded start time.
+    if matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    ) {
+        io::ErrorKind::NotFound.into()
+    } else {
+        io::Error::other(error)
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn process_info(pid: u32) -> io::Result<(u64, u32, bool)> {
+fn process_info(pid: i32) -> io::Result<(u64, u32, bool)> {
     use libproc::libproc::bsd_info::BSDInfo;
     use libproc::libproc::proc_pid::pidinfo;
-    let info = pidinfo::<BSDInfo>(pid as i32, 0).map_err(io::Error::other)?;
+    // PROC_PIDTBSDINFO needs a nonzero argument to include zombies.
+    let info =
+        pidinfo::<BSDInfo>(pid, 1).map_err(|error| lookup_failed(pid, io::Error::other(error)))?;
     // Zombies cannot execute or write into the rig, even before init reaps them.
     if info.pbi_status == 5 {
         return Err(io::ErrorKind::NotFound.into());
@@ -109,8 +158,9 @@ fn process_info(pid: u32) -> io::Result<(u64, u32, bool)> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_info(pid: u32) -> io::Result<(u64, u32, bool)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+fn process_info(pid: i32) -> io::Result<(u64, u32, bool)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| lookup_failed(pid, error))?;
     // The process command-name field may contain spaces and ')'; the last ')'
     // ends it. Field 22 is kernel start time in ticks, not rounded wall-clock time.
     let fields: Vec<_> = stat
@@ -144,10 +194,19 @@ mod tests {
             start_time: current.start_time + 1,
             ..current
         };
-        assert!(current.is_running());
-        assert!(!stale.is_running());
+        assert!(current.is_running().unwrap());
+        assert!(!stale.is_running().unwrap());
         stale.signal(nix::sys::signal::Signal::SIGKILL).unwrap();
-        assert!(current.is_running());
+        assert!(current.is_running().unwrap());
+    }
+
+    #[test]
+    fn a_failed_identity_lookup_does_not_confirm_a_live_pid_exited() {
+        let pid = positive_pid(std::process::id()).unwrap();
+        let lookup = io::Error::new(io::ErrorKind::NotFound, "injected identity lookup failure");
+        let error = lookup_failed(pid, lookup);
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "injected identity lookup failure");
     }
 
     #[test]
