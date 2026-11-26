@@ -1330,7 +1330,12 @@ async fn drive_socket(
     trace.content_gaps.start();
     let _activity = AttemptActivity::begin(&socket);
     let (result, receive) = oneshot::channel();
-    let sent = tokio::time::timeout(STREAM_IDLE_TIMEOUT, async {
+    let mut deadlines = StepDeadlines::start(
+        trace.live_progress.clone(),
+        STREAM_IDLE_TIMEOUT,
+        normalizer.content_deadline(),
+    );
+    let sent = before_expiry!(deadlines, async {
         socket
             .send
             .send(SendCommand {
@@ -1345,9 +1350,8 @@ async fn drive_socket(
             observation.lock().unwrap().response_create_enqueued += 1;
         }
         receive.await.map_err(|_| ())?.map_err(|_| ())
-    })
-    .await;
-    if !matches!(sent, Ok(Ok(()))) {
+    });
+    if !matches!(sent, Some(Ok(()))) {
         return Err(AttemptFailure::transport(
             transport_error("Responses socket send failed"),
             AttemptOutcome::ChunkError,
@@ -1390,7 +1394,7 @@ async fn drive_socket(
     normalizer.private_error_diagnostics();
     // The existing body driver supplies all semantic idle, size, completion and rate bounds.
     // Reframing is confined to its input adapter; the response digest counts raw socket text.
-    let result = drive_body_stream_traced(stream, normalizer, tx, MAX_STREAM_BYTES, trace).await;
+    let result = drive_live_body(stream, normalizer, tx, MAX_STREAM_BYTES, trace, deadlines).await;
     if result
         .as_ref()
         .is_ok_and(|completion| tool_args_cut(completion))

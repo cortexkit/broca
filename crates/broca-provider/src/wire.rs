@@ -874,7 +874,8 @@ pub trait StreamNormalizer: Send {
     /// Socket ping/pong records have no exposed payload lengths; synthetic SSE framing is not
     /// measured data. Wrappers forward this setting without changing liveness counters.
     fn websocket_telemetry(&mut self) {}
-    /// Real-content telemetry is observational; it never resets the legacy deadline markers.
+    /// Telemetry on real-content records. An increase in content bytes resets the transport's
+    /// content deadline independently of the count of complete records.
     fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
         Default::default()
     }
@@ -886,32 +887,24 @@ pub trait StreamNormalizer: Send {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError>;
 
     /// Monotonic count of complete data-bearing wire records decoded so far. For SSE,
-    /// comment-only, blank, and empty-data records are not progress. The transport uses
-    /// changes in this marker to reset its idle deadline; raw HTTP chunks alone are not
-    /// progress because a peer may drip an incomplete record.
+    /// comment-only, blank, and empty-data records are not progress. This is a diagnostic
+    /// counter, not the measure of real model content.
     fn progress_marker(&self) -> u64 {
         0
     }
 
     /// Monotonic count of complete wire records that prove the peer is ALIVE, including
-    /// records that carry no content, such as SSE `: keepalive` comments. `None` (the
-    /// default) means the grammar has no such records.
-    ///
-    /// When this returns `Some`, the transport runs two deadlines: a short liveness
-    /// deadline reset by this marker (a dead or dripping connection trips it), and a long
-    /// content deadline reset only by [`Self::progress_marker`] (a peer that sends
-    /// keepalives forever and never any content trips it). When it returns `None`, the
-    /// transport keeps its single idle deadline reset by `progress_marker`, exactly as
-    /// before liveness existed. It must count complete records only, never raw bytes, for
-    /// the same reason `progress_marker` does.
+    /// records that carry no content, such as SSE `: keepalive` comments. The idle deadline
+    /// resets on complete records only, never on raw bytes, because bytes may make up only
+    /// part of a record. If unavailable, normalized events and `progress_marker` changes
+    /// still prove that a complete record arrived.
     fn liveness_marker(&self) -> Option<u64> {
         None
     }
 
     /// How long this grammar's stream may carry only liveness records before the transport
     /// abandons it, when the family has measured its own bound. `None` (the default) keeps the
-    /// transport's shared limit. Read only for grammars whose [`Self::liveness_marker`] is
-    /// `Some`, since only those run a content deadline apart from the idle one.
+    /// transport's shared limit.
     fn content_deadline(&self) -> Option<std::time::Duration> {
         None
     }

@@ -4,6 +4,7 @@ Object {
     "step": Object {
         "attempt": Number(0),
         "attempt_started_at_ms": Bool(true),
+        "phase": String("preparing"),
         "started_at_ms": Bool(true),
         "step_id": Number(1),
     },
@@ -19,6 +20,7 @@ Object {
     "step": Object {
         "attempt": Number(0),
         "attempt_started_at_ms": Bool(true),
+        "phase": String("preparing"),
         "started_at_ms": Bool(true),
         "step_id": Number(2),
     },

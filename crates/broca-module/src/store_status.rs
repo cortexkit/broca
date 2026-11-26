@@ -115,6 +115,8 @@ fn decode<T: serde::de::DeserializeOwned>(value: &Value, what: &str) -> Result<T
 pub struct RunFacts {
     pub wait: crate::store_awaits::RunWait,
     pub state: ReconciledRunState,
+    model_started: bool,
+    open_tools: bool,
     /// The routing detail retained in the error JSON of a refused queued send.
     admission_error_detail: Option<Box<Value>>,
     /// Why an interrupted run was interrupted, as its end recorded it.
@@ -1112,6 +1114,12 @@ pub async fn run_facts<B: SessionBackend>(
     let facts = RunFacts {
         wait,
         state,
+        model_started: records.iter().any(|(_, record)| {
+            matches!(record,
+                Record::StepStart(start) if start.run_id == run_id
+            )
+        }),
+        open_tools: latest.is_some_and(|run| run.open_batch.is_some()),
         admission_error_detail: rest.admission_error_detail,
         interrupt_reason: rest.interrupt_reason,
         wake_directive: rest.wake_directive,
@@ -1733,10 +1741,40 @@ pub(crate) fn status_response(
     let mut response =
         crate::serve::run_status_response_with_reader_policy(Some(facts.state), false);
     match &mut response {
-        RunStatusResponse::Active { awaits, reason, .. } => {
+        RunStatusResponse::Active {
+            awaits,
+            reason,
+            step,
+            deadline_ms,
+            held_calls,
+            ..
+        } => {
             *awaits = wait.awaits;
             if wait.reason.is_some() {
                 *reason = wait.reason;
+            }
+            use broca_wire::ReportedStep;
+            use cortexkit_role_llm_runner::run::{RunStatusStep, RunStatusStepPhase as Phase};
+            let preparing = || Phase::Unknown("preparing".into());
+            if !facts.model_started && step.is_none() {
+                return crate::serve::checked_run_status(response, run_id);
+            }
+            if deadline_ms.is_some()
+                && matches!(
+                    reason.as_deref(),
+                    Some("context_ceiling_wait" | "compaction_wait")
+                )
+            {
+                *step = Some(ReportedStep::Phase(RunStatusStep::new(Phase::Waiting)));
+            } else if let Some(ReportedStep::Live(live)) = step {
+                live.liveness.phase.get_or_insert_with(preparing);
+            } else {
+                let phase = if facts.open_tools || !held_calls.is_empty() {
+                    Phase::RunningTools
+                } else {
+                    preparing()
+                };
+                *step = Some(ReportedStep::Phase(RunStatusStep::new(phase)));
             }
         }
         RunStatusResponse::Paused { awaits, .. } => *awaits = wait.awaits,
@@ -2479,3 +2517,5 @@ mod held;
 
 #[cfg(test)]
 mod cap_tests;
+#[cfg(test)]
+mod liveness_tests;

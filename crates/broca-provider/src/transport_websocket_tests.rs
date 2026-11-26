@@ -2128,7 +2128,7 @@ async fn websocket_idle_and_keepalive_only_bounds() {
         if keepalive {
             assert_eq!(
                 failure.error.message,
-                "provider stream idle: waiting for content: only keepalive comments for 1800s"
+                "provider stream idle: no model content for 1800s"
             );
         }
     }
@@ -2787,7 +2787,6 @@ async fn logged_step(
         None,
         None,
         || ToolNameRestoringNormalizer {
-            live_progress: None,
             inner: provider.family.normalizer(&provider.frozen, StepId(1)),
             names: Arc::new(crate::tool_name_alias::ToolNameMap::build(&[], &[])),
         },
@@ -3597,7 +3596,6 @@ async fn codex_upgrade_retry_after_past_the_step_deadline_ends_the_step() {
             None,
             None,
             || ToolNameRestoringNormalizer {
-                live_progress: None,
                 inner: provider.family.normalizer(&provider.frozen, StepId(1)),
                 names: Arc::new(crate::tool_name_alias::ToolNameMap::build(&[], &[])),
             },

@@ -1,7 +1,7 @@
 //! Ephemeral status while the attempt driver owns a retry delay.
 
 use super::*;
-use broca_protocol::provider::{AwaitParty, RunAwaits};
+use broca_protocol::provider::{AwaitParty, RunAwaits, RunStatusStepPhase};
 
 pub(super) struct Wait {
     progress: broca_core::provider::LiveStepProgress,
@@ -19,9 +19,14 @@ impl Wait {
         attempt: u32,
     ) -> Option<Self> {
         let progress = seal.progress.as_ref()?;
-        if !progress.lock().unwrap().as_ref()?.report_awaits {
+        let run_id = broca_protocol::RunId(run_id?.to_owned());
+        let mut live = progress.lock().unwrap();
+        let step = live.as_mut()?;
+        if !step.report_awaits {
             return None;
         }
+        step.liveness.phase = Some(RunStatusStepPhase::Unknown("retrying".into()));
+        drop(live);
         let since = now_millis();
         let mut wait = RunAwaits::new(AwaitParty::Runner, since);
         wait.message = broca_protocol::provider::await_message(error);
@@ -38,7 +43,7 @@ impl Wait {
         );
         Some(Self {
             progress: Arc::clone(progress),
-            run_id: broca_protocol::RunId(run_id?.to_owned()),
+            run_id,
             wait,
             published: false,
         })
@@ -65,6 +70,14 @@ impl Wait {
     fn clear(&self) {
         if let Some(step) = self.progress.lock().unwrap().as_mut() {
             step.retry_awaits = None;
+            if step
+                .liveness
+                .phase
+                .as_ref()
+                .is_some_and(|phase| phase.as_str() == "retrying")
+            {
+                step.liveness.phase = None;
+            }
         }
     }
 
@@ -96,6 +109,7 @@ mod tests {
                 started_at_ms: 1,
                 attempt: 0,
                 attempt_started_at_ms: 1,
+                liveness: Default::default(),
                 last_content_at_ms: None,
                 max_content_gap_ms: None,
                 max_content_gap_ended_at_ms: None,

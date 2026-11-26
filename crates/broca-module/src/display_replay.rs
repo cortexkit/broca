@@ -230,6 +230,7 @@ mod tests {
             started_at_ms: 1,
             attempt: 1,
             attempt_started_at_ms: 1,
+            liveness: Default::default(),
             last_content_at_ms: None,
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,

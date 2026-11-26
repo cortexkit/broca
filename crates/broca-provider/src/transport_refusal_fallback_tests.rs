@@ -269,6 +269,7 @@ async fn a_fallback_step_sends_the_fallback_request_and_continues_the_attempt_or
             started_at_ms: 0,
             attempt: 0,
             attempt_started_at_ms: 0,
+            liveness: Default::default(),
             last_content_at_ms: None,
             max_content_gap_ms: None,
             max_content_gap_ended_at_ms: None,

@@ -290,6 +290,8 @@ pub struct InFlightStep {
     pub started_at_ms: u64,
     pub attempt: u32,
     pub attempt_started_at_ms: u64,
+    #[serde(flatten)]
+    pub liveness: StepLiveness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_content_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,6 +303,21 @@ pub struct InFlightStep {
     #[serde(skip)]
     pub request: InFlightRequest,
 }
+
+/// What the live runner knows about this step. No model deadlines apply once its response ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepLiveness {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<RunStatusStepPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_deadline_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_deadline_ms: Option<u64>,
+}
+
+pub use cortexkit_role_llm_runner::run::RunStatusStepPhase;
 
 /// The retry wait all live readers expose. Once a known long wait is visible it stays visible
 /// until its owner clears it, even when less than a second remains before the next attempt.

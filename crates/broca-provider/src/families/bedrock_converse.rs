@@ -1245,6 +1245,7 @@ pub struct BedrockStreamNormalizer {
     step_id: StepId,
     message_id: MessageId,
     decoder: BedrockEventStreamDecoder,
+    records: u64,
     content_observer: crate::content_progress::ContentObserver,
     blocks: BTreeMap<usize, BlockBuf>,
     usage: Usage,
@@ -1273,6 +1274,7 @@ impl BedrockStreamNormalizer {
             step_id,
             message_id: MessageId(format!("bedrock-step-{}", step_id.0)),
             decoder: BedrockEventStreamDecoder::new(),
+            records: 0,
             content_observer: crate::content_progress::ContentObserver::new(
                 crate::content_progress::ContentFamily::Bedrock,
             ),
@@ -1721,8 +1723,12 @@ impl StreamNormalizer for BedrockStreamNormalizer {
     fn content_progress(&self) -> broca_protocol::provider::ContentProgress {
         self.content_observer.snapshot()
     }
+    fn liveness_marker(&self) -> Option<u64> {
+        Some(self.records)
+    }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
         let frames = self.decoder.push(chunk)?;
+        self.records += frames.len() as u64;
         let mut out = Vec::new();
         for frame in frames {
             self.handle_frame(frame, &mut out)?;

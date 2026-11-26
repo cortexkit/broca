@@ -2182,9 +2182,9 @@ pub enum RunStatusResponse {
             skip_serializing_if = "Option::is_none"
         )]
         usage: Option<broca_protocol::usage::RunUsage>,
-        /// Snapshot of the live actor's in-flight model step; never read from the session's log.
+        /// The active phase, with model deadline and progress observations only from the live actor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        step: Option<broca_protocol::provider::InFlightStep>,
+        step: Option<ReportedStep>,
         /// The title the run's send carried, as its log record holds it. Absent (never empty)
         /// when the send carried none or the run predates titles.
         #[serde(default, skip_serializing_if = "Option::is_none")]

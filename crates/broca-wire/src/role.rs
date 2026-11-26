@@ -414,6 +414,7 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::capabilities::OUTPUT_REFS,
         "run_ops",
         cortexkit_role_llm_runner::capabilities::RUN_STATUS,
+        cortexkit_role_llm_runner::capabilities::STEP_LIVENESS,
         cortexkit_role_llm_runner::capabilities::FINISH_REASON,
         cortexkit_role_llm_runner::capabilities::HELD_CALLS,
         cortexkit_role_llm_runner::capabilities::RUN_USAGE,
@@ -664,6 +665,14 @@ pub fn broca_role_describe_with_writers(
         cortexkit_role_llm_runner::ops::SESSION_MEDIA_READ.into(),
     ]);
     response
+}
+
+/// Step liveness always has a phase; live progress also carries Broca's diagnostic counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReportedStep {
+    Live(broca_protocol::provider::InFlightStep),
+    Phase(cortexkit_role_llm_runner::run::RunStatusStep),
 }
 
 /// Family support is an upper bound; admission also requires that model's priced mode.
@@ -1571,7 +1580,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "0ed12a9d04922952f23c7d18008698de2453e2e4b5b55fde01fd2a2395b44758",
+            "b8837faa9cec14be5c7450384199b2c98a67f4b8d789674646a3e0a0b7c6feab",
         );
     }
 
@@ -1771,7 +1780,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "39fbc7fe630d8c3e5d5aed7e477ce1d1f6361d4329077f9a8ae75dc3b705e4e4";
+        "8116756bce0255c2cd8bc8f73af3c0d578fe22ef531bd71efbcba81c4ace11b8";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

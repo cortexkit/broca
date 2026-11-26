@@ -817,10 +817,11 @@ async fn connect_failure_has_no_sent_at() {
         &request,
         false,
         None,
-        Duration::from_secs(5),
+        (Duration::from_secs(5), None),
         &mut trace,
     )
     .await
+    .map(|(response, _)| response)
     .unwrap_err();
     assert_eq!(failure.outcome, AttemptOutcome::ConnectFailed);
     assert_eq!(trace.sent_at_ms, None);
@@ -879,10 +880,11 @@ async fn redirects_stop_before_second_post() {
                 &request,
                 false,
                 None,
-                Duration::from_secs(5),
+                (Duration::from_secs(5), None),
                 &mut trace,
             )
             .await
+            .map(|(response, _)| response)
             .unwrap();
             assert_eq!(response.status().as_u16(), status, "journaled {journaled}");
             assert_eq!(source.await.unwrap(), b"model request");
@@ -921,10 +923,11 @@ async fn journaled_redirect_to_refused_connection_keeps_sent_evidence() {
             &request,
             false,
             None,
-            Duration::from_secs(5),
+            (Duration::from_secs(5), None),
             &mut trace,
         )
-        .await;
+        .await
+        .map(|(response, _)| response);
         assert!(
             response.is_ok(),
             "original POST received a redirect, not a connect refusal: {response:?}"
@@ -6277,7 +6280,7 @@ async fn keepalive_only_stream_fails_at_the_content_deadline() {
     assert_eq!(error.outcome, AttemptOutcome::ContentTimeout);
     assert_eq!(
         error.error.message,
-        "provider stream idle: waiting for content: only keepalive comments for 1800s"
+        "provider stream idle: no model content for 1800s"
     );
     assert_eq!(started.elapsed(), STREAM_CONTENT_TIMEOUT);
 }
@@ -6304,16 +6307,14 @@ async fn sse_bytes_that_never_complete_a_record_trip_the_liveness_deadline() {
     assert_eq!(error.outcome, AttemptOutcome::IdleTimeout);
     assert_eq!(
         error.error.message,
-        "provider stream idle: waiting for any complete SSE record for 300s"
+        "provider stream idle: waiting for a complete event for 300s"
     );
     assert_eq!(started.elapsed(), STREAM_IDLE_TIMEOUT);
 }
 
-/// Which families report liveness: every SSE family does; Bedrock's binary event stream
-/// has no comment records and keeps the single idle deadline. An Anthropic `event: ping`
-/// arrives as a data record, so it stays content progress as it always was.
+/// Every SSE family counts comments, and Bedrock counts complete binary frames.
 #[test]
-fn sse_families_report_liveness_and_bedrock_keeps_the_single_deadline() {
+fn all_families_report_record_liveness() {
     let step = StepId(1);
     let sse_families: Vec<(&str, Box<dyn StreamNormalizer>)> = vec![
         (
@@ -6362,11 +6363,16 @@ fn sse_families_report_liveness_and_bedrock_keeps_the_single_deadline() {
         );
     }
 
-    let bedrock = BedrockConverse.normalizer(
+    let mut bedrock = BedrockConverse.normalizer(
         &frozen_config_for_family(WireFamilyId::BedrockConverse, "m"),
         step,
     );
-    assert_eq!(bedrock.liveness_marker(), None);
+    use crate::families::bedrock_converse::test_event_stream_message;
+    let frame = test_event_stream_message("contentBlockStop", br#"{"contentBlockIndex":0}"#);
+    bedrock.push(&frame[..frame.len() - 1]).unwrap();
+    assert_eq!(bedrock.liveness_marker(), Some(0));
+    bedrock.push(&frame[frame.len() - 1..]).unwrap();
+    assert_eq!(bedrock.liveness_marker(), Some(1));
 
     let mut anthropic = AnthropicMessages.normalizer(
         &frozen_config_for_family(WireFamilyId::AnthropicMessages, "m"),
@@ -6378,9 +6384,10 @@ fn sse_families_report_liveness_and_bedrock_keeps_the_single_deadline() {
     assert_eq!(
         anthropic.progress_marker(),
         1,
-        "an Anthropic ping is content progress"
+        "an Anthropic ping is a complete data record"
     );
     assert_eq!(anthropic.liveness_marker(), Some(1));
+    assert!(anthropic.content_progress().content_bytes.is_none());
 }
 
 #[tokio::test]

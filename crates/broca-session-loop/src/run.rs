@@ -78,6 +78,7 @@ use close_out::{
 mod call_plan;
 use call_plan::{hook_plan, plan_calls, CallPlan};
 mod dispatch;
+mod live_step;
 use dispatch::{dispatch_all, tool_open_guard, DispatchPlan, Dispatched};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused, take_deposited};
@@ -4214,17 +4215,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     live_display: &mut bool,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
-    // The step is in flight from here until the call's stream ends: published for the session's
-    // owner, and cleared however the call ends.
-    struct InFlight<'a>(Option<&'a broca_core::provider::LiveStepProgress>);
-    impl Drop for InFlight<'_> {
-        fn drop(&mut self) {
-            if let Some(progress) = self.0 {
-                *progress.lock().unwrap() = None;
-            }
-        }
-    }
-    let _in_flight = InFlight(seams.step_progress.as_ref());
+    let mut in_flight = live_step::Model::new(seams.step_progress.as_ref());
     let floor = crate::compaction::floor_through(writer, &[], opts.render_episodes.signed_floor);
     let request = RequestFacts::of(&opts, floor.await?);
     let context = AttemptContext {
@@ -4240,21 +4231,7 @@ async fn model_step<W: Writer, P: Provider, T>(
         .and_then(|driver| driver.step_seal());
     // The call's options are shared with the provider. The published progress names them
     // weakly, so the session's owner can size the request in flight without keeping it.
-    if let Some(progress) = &seams.step_progress {
-        let now = (seams.now_ms)();
-        *progress.lock().unwrap() = Some(broca_protocol::provider::InFlightStep {
-            retry_awaits: None,
-            report_awaits: true,
-            step_id: StepId(step_id),
-            started_at_ms: now,
-            attempt: 0,
-            attempt_started_at_ms: now,
-            last_content_at_ms: None,
-            max_content_gap_ms: None,
-            max_content_gap_ended_at_ms: None,
-            request: broca_protocol::provider::InFlightRequest::of(&opts),
-        });
-    }
+    in_flight.start(StepId(step_id), (seams.now_ms)(), &opts);
     if let Some(ready) = &seams.model_call_ready {
         tokio::select! {
             ready = ready.ready() => {
@@ -4422,6 +4399,12 @@ async fn model_step<W: Writer, P: Provider, T>(
             result?;
         }
     }
+    if outcome
+        .as_ref()
+        .is_ok_and(|step| step.message.tool_calls().next().is_some())
+    {
+        in_flight.keep_for_tools();
+    }
     Ok(outcome)
 }
 
@@ -4539,6 +4522,7 @@ where
     P: Provider,
     T: ToolPlane,
 {
+    let _progress = live_step::Tools::start(seams.step_progress.as_ref());
     let run_id = admission.run_id.as_str();
     let batch_id = format!("{run_id}-b{step_id}");
     let ctx = BatchCtx {

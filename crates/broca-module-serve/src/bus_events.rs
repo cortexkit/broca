@@ -645,13 +645,19 @@ impl Service {
                             registry.status(&session).await
                         {
                             if let Ok(broca_wire::RunStatusResponse::Active {
-                                step: Some(step),
+                                step: Some(broca_wire::ReportedStep::Live(step)),
                                 ..
                             }) = registry
                                 .run_status(&session, broca_protocol::RunId(run_id.clone()))
                                 .await
                             {
-                                if !progress.due(&run_id, tokio::time::Instant::now()) {
+                                if step
+                                    .liveness
+                                    .phase
+                                    .as_ref()
+                                    .is_some_and(|phase| phase.as_str() == "running_tools")
+                                    || !progress.due(&run_id, tokio::time::Instant::now())
+                                {
                                     continue;
                                 }
                                 // A session beats at its last durable record.

@@ -176,6 +176,8 @@ impl Step {
 /// What the provider and tool plane of the rig do, shared with the test.
 #[derive(Default)]
 pub struct Script {
+    /// Run the real OpenAI Chat transport against this fixture instead of scripted events.
+    pub model_url: Mutex<Option<String>>,
     /// Optional real tool transport for serve-path tests; ordinary scripts keep their fake plane.
     pub tool_plane: Mutex<Option<Arc<dyn broca_core::ToolPlane>>>,
     /// A synthetic tool's catalog schema and semantics pin; absent for legacy direct tools.
@@ -271,9 +273,21 @@ struct ScriptedProvider(
     Arc<Script>,
     Option<broca_protocol::structured_output::FrozenStructuredOutput>,
     std::sync::RwLock<Option<Arc<broca_core::provider::MediaRequestRenderer>>>,
+    Option<broca_provider::transport::LiveProvider<broca_provider::families::OpenAiChat>>,
 );
 
 impl ScriptedProvider {
+    async fn hold_before_response(&self) {
+        loop {
+            let gate = self.0.model_gate.notified();
+            if !*self.0.hold_model.lock().unwrap() {
+                break;
+            }
+            self.0.entered.notify_one();
+            gate.await;
+        }
+    }
+
     /// The OpenAI Chat render config this provider's requests are rendered with.
     fn frozen(&self) -> broca_provider::wire::FrozenRenderConfig {
         let mut frozen = broca_provider::families::openai_chat_frozen_config("fake");
@@ -284,6 +298,24 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    async fn step_with_runtime(
+        &self,
+        step_id: StepId,
+        opts: Arc<CallOptions>,
+        runtime: broca_core::provider::StepRuntime,
+    ) -> mpsc::Receiver<NormalizedEvent> {
+        if let Some(live) = &self.3 {
+            self.hold_before_response().await;
+            live.step_with_runtime(step_id, opts, runtime).await
+        } else {
+            self.step(step_id, &opts).await
+        }
+    }
+
+    fn reports_attempt_evidence(&self) -> bool {
+        self.3.is_some()
+    }
+
     fn supports_media_renderer(&self) -> bool {
         self.0.media_frozen.lock().unwrap().is_some()
     }
@@ -324,6 +356,9 @@ impl Provider for ScriptedProvider {
     }
 
     fn render_config_blob(&self) -> serde_json::Value {
+        if let Some(live) = &self.3 {
+            return live.render_config_blob();
+        }
         if let Some(frozen) = self.0.media_frozen.lock().unwrap().as_ref() {
             let mut frozen = frozen.clone();
             if *self.0.omit_media_profile.lock().unwrap() {
@@ -363,14 +398,7 @@ impl Provider for ScriptedProvider {
             .lock()
             .unwrap()
             .push(opts.tools.iter().map(|tool| tool.name.clone()).collect());
-        loop {
-            let gate = self.0.model_gate.notified();
-            if !*self.0.hold_model.lock().unwrap() {
-                break;
-            }
-            self.0.entered.notify_one();
-            gate.await;
-        }
+        self.hold_before_response().await;
         let (tx, rx) = mpsc::channel(8);
         let script = self.0.clone();
         let events = self
@@ -655,6 +683,12 @@ impl RunExecutor for CoreExec {
             self.script.clone(),
             structured_output,
             std::sync::RwLock::new(None),
+            self.script.model_url.lock().unwrap().as_ref().map(|url| {
+                use broca_provider::{families, transport::LiveProvider, wire::AuthHandle};
+                let mut frozen = families::openai_chat_frozen_config("fake");
+                frozen.base_url = Some(url.clone());
+                LiveProvider::new(families::OpenAiChat, frozen, AuthHandle::None)
+            }),
         );
         let tools = ScriptedTools(self.script.clone());
         let approval = ScriptedApproval(self.script.clone());

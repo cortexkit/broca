@@ -74,6 +74,8 @@ caused by the `StepStart` that places the steer, never by steer admission or by 
 merely places undelivered steers in the transcript. Progress is an in-flight observation, not
 a record: its `seq` is the session's last durable record, and its observation time
 distinguishes samples.
+`run.status` is the authoritative read for a step's phase and transport deadlines. Those fields
+are not added to the progress event.
 
 `terminal` uses the `run.status` vocabulary (`completed`, `cancelled`,
 `interrupted`, `error`, `max_steps`, `budget_exhausted`, `transform_unavailable`).

@@ -4,11 +4,9 @@ use std::time::Duration;
 
 use broca_protocol::error::{ErrorClass, ProviderError};
 
-/// How long a stream may carry ONLY keepalive records (SSE `: keepalive` comments, socket
-/// pings) before it is abandoned, unless the wire family sets its own limit through
-/// `StreamNormalizer::content_deadline`. Applies only to grammars that report a liveness
-/// marker; for them the 300-second idle deadline is reset by any complete record, keepalives
-/// included, and this one is reset only by content.
+/// How long an attempt may go without real content, unless the wire family sets its own
+/// limit through `StreamNormalizer::content_deadline`. Unlike the idle deadline, comments,
+/// socket pings, and protocol bookkeeping do not reset this timer.
 ///
 /// MEASURED, NOT GUESSED. xai/grok-4.7, replaying a failing request byte for byte, reasons
 /// without streaming its reasoning and sends nothing but `: keepalive` comments every 15 s
@@ -62,7 +60,7 @@ pub(super) fn content_timeout_error(limit: Duration) -> ProviderError {
         refusal: None,
         class: ErrorClass::Transient,
         message: format!(
-            "provider stream idle: waiting for content: only keepalive comments for {}s",
+            "provider stream idle: no model content for {}s",
             limit.as_secs()
         ),
         status: None,
@@ -110,7 +108,6 @@ mod tests {
         let wrapped = super::super::ToolNameRestoringNormalizer {
             inner: Box::new(OwnLimit),
             names: Arc::default(),
-            live_progress: None,
         };
         assert_eq!(wrapped.content_deadline(), Some(Duration::from_secs(600)));
     }

@@ -102,7 +102,6 @@ data: {"type":"response.incomplete","delta":"cut"#
         )
         .into();
     let normalizer = Box::new(ToolNameRestoringNormalizer {
-        live_progress: None,
         inner: family.normalizer(&frozen, StepId(1)),
         names: Arc::new(crate::tool_name_alias::ToolNameMap::build(&[], &[])),
     });

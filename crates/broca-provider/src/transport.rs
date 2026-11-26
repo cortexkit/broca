@@ -133,6 +133,12 @@ use completion::{
 use content_deadline::content_timeout_error;
 pub(crate) use content_deadline::STREAM_CONTENT_TIMEOUT;
 use content_gaps::{ContentGaps, SseObservationGuard};
+mod step_deadlines;
+mod step_stream;
+use step_deadlines::{before_expiry, StepDeadlines};
+#[cfg(test)]
+use step_stream::drive_body_stream_traced;
+use step_stream::drive_live_body;
 mod http_error_body;
 pub use http_error_body::OAUTH_NOT_ALLOWED_FOR_ORGANIZATION;
 use http_error_body::{extract_provider_code, normalize_oauth_policy_code, parse_http_error_body};
@@ -540,6 +546,7 @@ struct ChunkWarning {
 /// SSE adaptation, not compressed frames or control-frame payloads.
 #[derive(Clone, Default)]
 struct AttemptTrace {
+    live_progress: Option<broca_core::provider::LiveStepProgress>,
     quota_observer: Option<Arc<dyn crate::quota::QuotaObserver>>,
     cache_work: cache_runtime::Pending,
     cache_evidence: Option<Box<Value>>,
@@ -867,7 +874,6 @@ fn build_retry_normalizer<F: WireFamily>(
     ToolNameRestoringNormalizer {
         inner: family.normalizer(frozen, step_id),
         names: Arc::clone(names),
-        live_progress: None,
     }
 }
 
@@ -3057,20 +3063,19 @@ fn spawn_transport_task<F: WireFamily + 'static>(
                 if let Some(step) = progress.lock().unwrap().as_mut() {
                     step.attempt = attempt;
                     step.attempt_started_at_ms = now_millis();
+                    step.liveness = Default::default();
                     step.last_content_at_ms = None;
                     step.max_content_gap_ms = None;
                     step.max_content_gap_ended_at_ms = None;
                 }
             }
             attempt += 1;
-            let mut normalizer = build_retry_normalizer(
+            build_retry_normalizer(
                 family.as_ref(),
                 frozen.as_ref(),
                 step_id,
                 &rendered.name_map,
-            );
-            normalizer.live_progress = progress.clone();
-            normalizer
+            )
         };
         // Rebuilds only the HTTP shape (url and headers) for a refreshed credential. The body is
         // reused as-is: auth attaches after render, so the bytes sent do not change.
@@ -3321,6 +3326,7 @@ where
         }
         number_attempt(&mut request.headers, attempt_index);
         let mut trace = AttemptTrace {
+            live_progress: step_seal.progress.cloned(),
             sent_note: step_seal.sent_note(&request.body, request_digest),
             cache_work: cache_runtime::Pending::for_step(&step_fingerprint),
             attempt_hook: request.attempt_hook.clone(),
@@ -4272,15 +4278,9 @@ async fn drive_http_attempt(
     // Legacy telemetry treats the uncompressed retry as the attempt. The billing hook instead
     // settles each physical send, preserving the compressed refusal before resetting the trace.
     let unsent_trace = gzip.is_some().then(|| trace.clone());
-    let mut resp = send_attempt(
-        client,
-        request,
-        anthropic_api_host,
-        gzip,
-        header_timeout,
-        trace,
-    )
-    .await?;
+    let limits = (header_timeout, normalizer.content_deadline());
+    let (mut resp, mut deadlines) =
+        send_attempt(client, request, anthropic_api_host, gzip, limits, trace).await?;
     // A 400 from Anthropic to a compressed request has its body read to tell a JSON parse
     // failure from an ordinary invalid request. When it is ordinary, that text is the error.
     let mut error_text = None;
@@ -4290,7 +4290,7 @@ async fn drive_http_attempt(
             request_gzip::HeaderVerdict::Pass => None,
             request_gzip::HeaderVerdict::Rejected(rejection) => Some(rejection),
             request_gzip::HeaderVerdict::NeedsBody => {
-                let text = read_error_text(&mut resp, trace).await;
+                let text = read_error_text(&mut resp, trace, &mut deadlines).await;
                 let rejection = request_gzip::body_shows_invalid_json(&text)
                     .then_some(request_gzip::Rejection::InvalidJsonAtOrigin);
                 if rejection.is_none() {
@@ -4307,6 +4307,7 @@ async fn drive_http_attempt(
             // network error on the compressed send never gets here: it fails the attempt.
             client.request_gzip.latch(status, rejection);
             drop(resp);
+            drop(deadlines);
             content_gaps::log_sse_attempt(trace, true);
             if trace.attempt_hook.is_some() {
                 trace.http_status = Some(status);
@@ -4331,15 +4332,8 @@ async fn drive_http_attempt(
             *trace = unsent_trace;
             trace.cache_work.prepare(request);
             trace.send_index = 2;
-            resp = send_attempt(
-                client,
-                request,
-                anthropic_api_host,
-                None,
-                header_timeout,
-                trace,
-            )
-            .await?;
+            (resp, deadlines) =
+                send_attempt(client, request, anthropic_api_host, None, limits, trace).await?;
         }
     }
 
@@ -4367,7 +4361,7 @@ async fn drive_http_attempt(
             .is_some_and(|value| value.eq_ignore_ascii_case("false"));
         let text = match error_text {
             Some(text) => text,
-            None => read_error_text(&mut resp, trace).await,
+            None => read_error_text(&mut resp, trace, &mut deadlines).await,
         };
         if trace.attempt_hook.is_some() {
             if let Ok(response) = serde_json::from_str::<Value>(&text) {
@@ -4447,9 +4441,15 @@ async fn drive_http_attempt(
 
     let mut normalizer = normalizer;
     normalizer.observe_response_headers(&response_headers(resp.headers()));
-    let result =
-        drive_body_stream_traced(resp.bytes_stream(), normalizer, tx, MAX_STREAM_BYTES, trace)
-            .await;
+    let result = drive_live_body(
+        resp.bytes_stream(),
+        normalizer,
+        tx,
+        MAX_STREAM_BYTES,
+        trace,
+        deadlines,
+    )
+    .await;
     apply_chatgpt_response_deadline(result, request, trace)
 }
 
@@ -4460,9 +4460,9 @@ async fn send_attempt(
     request: &PreparedHttpRequest,
     anthropic_api_host: bool,
     gzip: Option<Bytes>,
-    header_timeout: Duration,
+    (header_timeout, content_limit): (Duration, Option<Duration>),
     trace: &mut AttemptTrace,
-) -> Result<reqwest::Response, AttemptFailure> {
+) -> Result<(reqwest::Response, StepDeadlines), AttemptFailure> {
     let builder = attempt_request_builder(
         client,
         &request.url,
@@ -4507,18 +4507,27 @@ async fn send_attempt(
     trace.sent_at = Some(std::time::Instant::now());
     trace.content_gaps.start();
     let header_timeout = content_deadline::first_response_timeout(&request.url, header_timeout);
-    let response = tokio::time::timeout(header_timeout, builder.body(body).send()).await;
+    let mut deadlines =
+        StepDeadlines::start(trace.live_progress.clone(), header_timeout, content_limit);
+    let response = before_expiry!(deadlines, builder.body(body).send());
     // A connect error put no bytes on any server; anything else may have reached one.
-    if !matches!(&response, Ok(Err(error)) if error.is_connect()) {
+    if !matches!(&response, Some(Err(error)) if error.is_connect()) {
         trace.note_reached_server();
     }
     trace.cache_work.start(request);
     let response = response
-        .map_err(|_| {
-            AttemptFailure::transport(
-                content_deadline::header_timeout_error(header_timeout),
-                AttemptOutcome::HeaderTimeout,
-            )
+        .ok_or_else(|| {
+            if deadlines.content() < deadlines.idle() {
+                AttemptFailure::transport(
+                    content_timeout_error(deadlines.content_limit()),
+                    AttemptOutcome::ContentTimeout,
+                )
+            } else {
+                AttemptFailure::transport(
+                    content_deadline::header_timeout_error(header_timeout),
+                    AttemptOutcome::HeaderTimeout,
+                )
+            }
         })?
         .map_err(|e| {
             // A connect error means no request bytes reached a server. Anything else before a
@@ -4535,24 +4544,33 @@ async fn send_attempt(
             };
             AttemptFailure::transport(transport_error(&e.to_string()), outcome)
         })?;
+    deadlines.headers();
     if trace.attempt_hook.is_some() {
         trace.vendor_request_id = vendor_request_id(response.headers());
     }
     if let Some(observer) = &trace.quota_observer {
         observer.headers(response.headers(), now_millis());
     }
-    Ok(response)
+    Ok((response, deadlines))
 }
 
 /// Read a non-2xx body for its diagnostic text into `trace`, leaving the response's headers
 /// readable.
-async fn read_error_text(resp: &mut reqwest::Response, trace: &mut AttemptTrace) -> String {
+async fn read_error_text(
+    resp: &mut reqwest::Response,
+    trace: &mut AttemptTrace,
+    deadlines: &mut StepDeadlines,
+) -> String {
     let chunks = futures::stream::unfold(resp, |resp| async move {
         resp.chunk().await.transpose().map(|chunk| (chunk, resp))
     });
-    match collect_error_body_traced(chunks, MAX_HTTP_ERROR_BODY_READ_BYTES, trace).await {
-        Ok(text) => text,
-        Err(failure) => {
+    match before_expiry!(
+        deadlines,
+        collect_error_body_traced(chunks, MAX_HTTP_ERROR_BODY_READ_BYTES, trace)
+    ) {
+        Some(Ok(text)) => text,
+        None => "<error body unreadable: provider stream idle: reading error body>".into(),
+        Some(Err(failure)) => {
             // HTTP headers remain authoritative when the diagnostic body is broken.
             // Preserve their classification and retry metadata instead of treating the
             // body-read problem as a network failure.
@@ -4901,232 +4919,6 @@ where
 {
     let mut trace = AttemptTrace::default();
     drive_body_stream_traced(stream, normalizer, tx, max_stream_bytes, &mut trace).await
-}
-
-async fn drive_body_stream_traced<S, B, E>(
-    stream: S,
-    mut normalizer: Box<dyn StreamNormalizer>,
-    tx: &mpsc::Sender<NormalizedEvent>,
-    max_stream_bytes: usize,
-    trace: &mut AttemptTrace,
-) -> Result<Vec<NormalizedEvent>, AttemptFailure>
-where
-    S: futures::Stream<Item = Result<B, E>>,
-    B: AsRef<[u8]>,
-    E: std::error::Error,
-{
-    futures::pin_mut!(stream);
-    if trace.attempt_hook.is_some() {
-        let evidence = trace.response_evidence.get_or_insert_with(Default::default);
-        normalizer.set_response_evidence(evidence.clone());
-    }
-    let mut stream_bytes = 0usize;
-    if trace.transport.as_deref() == Some("websocket") {
-        normalizer.websocket_telemetry();
-    }
-    let mut progress_marker = normalizer.progress_marker();
-    // A grammar with a liveness marker gets two deadlines: `idle` resets on any complete
-    // record including keepalive comments, `content` only on content. Without one, `idle` is
-    // the single deadline reset by content, and `content` is never armed, which is the rule
-    // those grammars have always had.
-    let mut liveness_marker = normalizer.liveness_marker();
-    let split_deadlines = liveness_marker.is_some();
-    let idle = tokio::time::sleep(STREAM_IDLE_TIMEOUT);
-    tokio::pin!(idle);
-    let content_limit = normalizer
-        .content_deadline()
-        .unwrap_or(STREAM_CONTENT_TIMEOUT);
-    let content = tokio::time::sleep(content_limit);
-    tokio::pin!(content);
-    let mut completion = Vec::new();
-    let mut rate_window = stream_floor_from_env().map(StreamRateWindow::new);
-    // Socket frames are tapped by the receive pump. SSE borrows the normalizer's decoded
-    // payloads so ordinary deltas incur no second decoder or per-record allocation.
-    if let Some(observer) = trace.quota_observer.as_ref().filter(|observer| {
-        observer.wants_frames() && trace.transport.as_deref() != Some("websocket")
-    }) {
-        let observer = observer.clone();
-        normalizer.set_raw_sse_observer(Arc::new(move |frame| {
-            crate::quota::observe_frame(observer.as_ref(), frame);
-        }));
-    }
-
-    loop {
-        let next = tokio::select! {
-            biased;
-            _ = &mut idle => {
-                // A body left open after the step's last record has nothing more to give.
-                if step_closed(normalizer.as_ref(), &completion) {
-                    break;
-                }
-                return Err(AttemptFailure::transport(
-                    stream_timeout_error(if split_deadlines {
-                        "waiting for any complete SSE record"
-                    } else {
-                        "waiting for a complete event"
-                    }),
-                    AttemptOutcome::IdleTimeout,
-                ));
-            }
-            _ = &mut content, if split_deadlines => return Err(AttemptFailure::transport(
-                content_timeout_error(content_limit),
-                AttemptOutcome::ContentTimeout,
-            )),
-            next = stream.next() => next,
-        };
-        let Some(chunk) = next else { break };
-        // The step's last record already arrived (a proxy reset the body before its clean end,
-        // say): nothing was lost, and asking the model again would bill a second answer.
-        if chunk.is_err() && step_closed(normalizer.as_ref(), &completion) {
-            break;
-        }
-        let bytes = chunk.map_err(|e| {
-            let failure = AttemptFailure::transport(
-                transport_error(&format!("stream chunk: {e}")),
-                AttemptOutcome::ChunkError,
-            );
-            trace.chunk_warning = Some(ChunkWarning {
-                last_event_type: crate::sse::safe_event_type_name(
-                    normalizer.last_event_type().unwrap_or("unknown"),
-                )
-                .into(),
-                event_type_counts: format_event_type_counts(normalizer.event_type_counts()),
-                error_chain: if trace.ephemeral_session {
-                    String::new()
-                } else {
-                    transport_error_chain(&e)
-                },
-            });
-            if !trace.defer_failure_warning {
-                warn_attempt_retry(&failure, trace, "not_retryable", "standalone_attempt");
-            }
-            trace.chunk_error_warned = true;
-            failure
-        })?;
-        let chunk = bytes.as_ref();
-        // Digest the raw chunk as received, before any limit or parse decision, so the record
-        // covers every byte that arrived even when this chunk ends the attempt.
-        trace.observe(chunk);
-        if let Some(observation) = trace
-            .websocket_observation
-            .upgrade()
-            .filter(|_| trace.transport.as_deref() == Some("websocket"))
-        {
-            observation.lock().unwrap().observe_text(chunk);
-        }
-        if chunk.len() > max_stream_bytes.saturating_sub(stream_bytes) {
-            return Err(AttemptFailure::decode(
-                stream_limit_error(&format!(
-                    "provider stream exceeds the {max_stream_bytes}-byte per-attempt limit"
-                )),
-                AttemptOutcome::ByteLimit,
-            ));
-        }
-        stream_bytes += chunk.len();
-        let websocket = trace.transport.as_deref() == Some("websocket");
-        if websocket {
-            if let Some(error) = responses_websocket::wrapped_error(chunk, trace) {
-                trace.content_gaps.observe(Some("error"));
-                return Err(error);
-            }
-        }
-        let framed;
-        let normalized = if websocket {
-            framed = responses_websocket::frame_record(chunk);
-            framed.as_slice()
-        } else {
-            chunk
-        };
-        let result = normalizer.push(normalized);
-        if normalizer.progress_marker() != progress_marker {
-            trace.content_gaps.observe(normalizer.last_event_type());
-        }
-        let progress = normalizer.content_progress();
-        if progress.content_bytes != trace.content_progress.content_bytes {
-            trace.last_content_elapsed = trace.elapsed_since_send();
-        }
-        *trace.content_progress = progress;
-        let events = result
-            .map_err(|error| AttemptFailure::normalize(error, AttemptOutcome::DecodeError))?;
-        observe_response_finish(&trace.response_evidence, &events);
-        trace.output_seen |= events.iter().any(|event| {
-            matches!(event,
-            NormalizedEvent::Display(DisplayEvent::TextDelta { delta, .. }
-                | DisplayEvent::ReasoningDelta { delta, .. }
-                | DisplayEvent::ToolInputDelta { delta, .. }) if !delta.is_empty())
-        });
-        if trace.input_transformations.is_none() {
-            trace.input_transformations = normalizer.input_transformations();
-        }
-        trace.input_transformations_unmeasured = normalizer.input_transformations_unmeasured();
-        let next_marker = normalizer.progress_marker();
-        let made_progress = next_marker != progress_marker || !events.is_empty();
-        if next_marker != progress_marker {
-            trace.content_event_count = next_marker;
-        }
-        trace.keepalives_after_content = normalizer.keepalives_after_content().unwrap_or_default();
-        progress_marker = next_marker;
-        // Raw bytes are never liveness: only a marker that counts complete records moves.
-        let next_liveness = normalizer.liveness_marker();
-        let alive = made_progress || next_liveness != liveness_marker;
-        liveness_marker = next_liveness;
-        let now = tokio::time::Instant::now();
-        if alive {
-            idle.as_mut().reset(now + STREAM_IDLE_TIMEOUT);
-        }
-        if made_progress && split_deadlines {
-            content.as_mut().reset(now + content_limit);
-        }
-        if let Some(window) = rate_window.as_mut() {
-            window.observe(&events);
-            if let Some(rate) = window.breach() {
-                // Transient (so the router sees provider health) and non-reissuable (so this loop
-                // does not burn the attempt budget on the same degraded endpoint first). The
-                // measured rate rides in the message because a router deciding between providers
-                // needs the magnitude, not just the verdict.
-                return Err(AttemptFailure::transport_without_reissue(
-                    stream_too_slow_error(rate, window.floor),
-                    AttemptOutcome::RateFloor,
-                ));
-            }
-        }
-        let cut = tool_args_cut(&events);
-        if !record_attempt_events(events, &mut completion, tx, trace).await? {
-            return Ok(Vec::new());
-        }
-        if cut {
-            return validate_attempt_completion(completion);
-        }
-        if websocket
-            && matches!(
-                normalizer.last_event_type(),
-                Some("response.completed" | "response.incomplete")
-            )
-        {
-            break;
-        }
-    }
-
-    // `finish` runs only at a clean end of body. A grammar that cannot close the step from
-    // what arrived emits nothing here, and the completion check below reports the cut as a
-    // transport fault, the same `eof_before_completion` for every wire family; `finish`
-    // fails only for what was received but does not decode.
-    let result = normalizer.finish();
-    if normalizer.progress_marker() != progress_marker {
-        trace.content_gaps.observe(normalizer.last_event_type());
-    }
-    let progress = normalizer.content_progress();
-    if progress.content_bytes != trace.content_progress.content_bytes {
-        trace.last_content_elapsed = trace.elapsed_since_send();
-    }
-    *trace.content_progress = progress;
-    let final_events = result
-        .map_err(|error| AttemptFailure::normalize(error, AttemptOutcome::EofBeforeCompletion))?;
-    observe_response_finish(&trace.response_evidence, &final_events);
-    if !record_attempt_events(final_events, &mut completion, tx, trace).await? {
-        return Ok(Vec::new());
-    }
-    validate_attempt_completion(completion)
 }
 
 async fn record_attempt_events(

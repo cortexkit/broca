@@ -1357,7 +1357,7 @@ pub(crate) fn run_status_response_with_reader_policy(
             },
             deadline_ms: state.ceiling_deadline_ms.or(state.ride_wait_deadline_ms),
             usage,
-            step: state.live_step,
+            step: state.live_step.map(broca_wire::ReportedStep::Live),
             title,
             awaiting_approval: None,
             held_calls: state.held_calls,

@@ -2275,6 +2275,13 @@ async fn active_status_reports_held_model_step_and_content() {
     golden["step"]["started_at_ms"] = 1790000000000u64.into();
     golden["step"]["attempt_started_at_ms"] = 1790000000001u64.into();
     golden["step"]["last_content_at_ms"] = 1790000000002u64.into();
+    assert_eq!(step["phase"], "streaming");
+    let last_event_at = step["last_event_at_ms"].as_u64().unwrap();
+    assert_eq!(step["idle_deadline_ms"], last_event_at + 300_000);
+    assert_eq!(step["content_deadline_ms"], last_event_at + 1_800_000);
+    golden["step"]["last_event_at_ms"] = 1790000000002u64.into();
+    golden["step"]["idle_deadline_ms"] = 1790000300002u64.into();
+    golden["step"]["content_deadline_ms"] = 1790001800002u64.into();
     golden["step"]["max_content_gap_ms"] = 1u64.into();
     golden["step"]["max_content_gap_ended_at_ms"] = 1790000000002u64.into();
     let bytes = serde_json::to_vec(&golden).unwrap();

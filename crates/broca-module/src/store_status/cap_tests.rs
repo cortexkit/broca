@@ -11,6 +11,8 @@ fn completed(n: u64, text: String) -> RunFacts {
         admission_error_detail: None,
         wait: Default::default(),
         state: fresh_state(RunIndexState::Completed),
+        model_started: true,
+        open_tools: false,
         interrupt_reason: None,
         wake_directive: false,
         final_message: Some(Ok(broca_wire::FinalMessage {
@@ -78,6 +80,8 @@ fn errored(text: String) -> RunFacts {
         admission_error_detail: None,
         wait: Default::default(),
         state,
+        model_started: false,
+        open_tools: false,
         interrupt_reason: None,
         wake_directive: false,
         final_message: None,

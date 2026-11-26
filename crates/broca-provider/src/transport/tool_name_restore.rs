@@ -8,20 +8,6 @@ use super::*;
 pub(super) struct ToolNameRestoringNormalizer {
     pub(super) inner: Box<dyn StreamNormalizer>,
     pub(super) names: Arc<crate::tool_name_alias::ToolNameMap>,
-    pub(super) live_progress: Option<broca_core::provider::LiveStepProgress>,
-}
-
-impl ToolNameRestoringNormalizer {
-    fn report_content(&self) {
-        if let Some(progress) = &self.live_progress {
-            if let Some(step) = progress.lock().unwrap().as_mut() {
-                let content = self.inner.content_progress();
-                step.last_content_at_ms = content.last_content_at_ms;
-                step.max_content_gap_ms = content.max_content_gap_ms;
-                step.max_content_gap_ended_at_ms = content.max_content_gap_ended_at_ms;
-            }
-        }
-    }
 }
 
 impl StreamNormalizer for ToolNameRestoringNormalizer {
@@ -44,9 +30,7 @@ impl StreamNormalizer for ToolNameRestoringNormalizer {
         self.inner.private_error_diagnostics();
     }
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<NormalizedEvent>, NormalizeError> {
-        let result = self.inner.push(chunk);
-        self.report_content();
-        result.map(|events| {
+        self.inner.push(chunk).map(|events| {
             events
                 .into_iter()
                 .map(|event| self.names.restore_event(event))
@@ -95,9 +79,7 @@ impl StreamNormalizer for ToolNameRestoringNormalizer {
     }
 
     fn finish(&mut self) -> Result<Vec<NormalizedEvent>, NormalizeError> {
-        let result = self.inner.finish();
-        self.report_content();
-        result.map(|events| {
+        self.inner.finish().map(|events| {
             events
                 .into_iter()
                 .map(|event| self.names.restore_event(event))

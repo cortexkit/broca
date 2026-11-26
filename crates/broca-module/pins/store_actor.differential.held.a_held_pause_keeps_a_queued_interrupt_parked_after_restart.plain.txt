@@ -10,6 +10,9 @@ Object {
         },
     ],
     "state": String("active"),
+    "step": Object {
+        "phase": String("running_tools"),
+    },
     "usage": Object {
         "by_model": Array [
             Object {

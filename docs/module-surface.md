@@ -1793,15 +1793,26 @@ keep their existing behavior and omit this diagnostic.
 - **`TransformUnavailable` is read, never written:** older records carry it, and readers report
   it (`run.status`, `session.read`), but this build never ends a run with it. It is terminal, not a pause: a pause preserves a resolvable nonterminal
   cause and the same run rather than sealing the episode.
-- **Active model-step progress:** run-keyed `run.status` can include an optional `step` object
-  `{step_id, started_at_ms, attempt, attempt_started_at_ms, last_content_at_ms?,
-  max_content_gap_ms?, max_content_gap_ended_at_ms?}`. It is a cheap snapshot of the live actor's
-  in-memory model call, never inferred from records. Timestamps are
-  Unix milliseconds; `attempt` is zero-based and its content progress resets on reissue. The
-  longest gap is measured only between consecutive real-content events, and its end time is the
-  later event's timestamp. With fewer than two content events both gap fields are absent.
-  No in-flight model step means no object, and no real content yet means no content timestamp.
-  The real-serve fixture is `crates/broca-wire/tests/golden/run_status.active_with_step.json`.
+- **Active step liveness (`step_liveness`):** run-keyed `run.status` includes `step` once an
+  active run has started its first model step. `phase` is an open string: `awaiting_response`
+  before a model response record; `streaming` once records arrive; `running_tools` while tools
+  execute or are held; `waiting` when the run's `reason` and `deadline_ms` describe a bounded
+  context or compaction wait. Broca also uses `preparing` for setup and handoffs with no request
+  in flight, and `retrying` during retry backoff. No model deadlines apply in these four
+  non-model phases.
+  `last_event_at_ms` is the latest complete model response record on this attempt, including
+  keepalives, and is absent until the first record. `idle_deadline_ms` and `content_deadline_ms`
+  are the transport's live deadlines in `awaiting_response` and `streaming`. The idle limit is
+  300 seconds from the last record (or HTTP response headers), with a 30-minute first-header
+  allowance for loopback and private HTTP routes. The content limit is 30 minutes from the send
+  or most recent text, reasoning or tool-argument record, including ChatGPT. When either limit
+  expires, the transport stops the attempt; the retry policy may start a fresh attempt with new
+  deadlines. A caller can read again at the earlier deadline, rather than managing its own timer.
+  Live diagnostics still include `step_id`, `started_at_ms`, `attempt`, `attempt_started_at_ms`,
+  `last_content_at_ms`, `max_content_gap_ms` and `max_content_gap_ended_at_ms` when known. Times
+  are Unix milliseconds. Attempts are zero-based, content diagnostics reset on reissue, and gap
+  fields are absent until two content records arrive. See the real-serve fixture at
+  `crates/broca-wire/tests/golden/run_status.active_with_step.json`.
 - **A queued send's run id (broca extension).** A queued send's reply names only its
   `submission_id`, `sub-<run_id>`; the run it would start takes that `run_id`. Core derives the
   run id from the submission id and polls `run.status` and `session.read` on it, so broca answers

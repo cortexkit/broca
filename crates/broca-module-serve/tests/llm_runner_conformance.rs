@@ -3408,6 +3408,7 @@ impl LlmRunnerSubject for BrocaSubject {
             Capability::Temperature,
             Capability::NoTools,
             Capability::RunStatus,
+            Capability::StepLiveness,
             Capability::FinishReason,
             Capability::RunUsage,
             Capability::SessionUsage,
