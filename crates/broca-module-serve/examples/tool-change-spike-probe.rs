@@ -2,14 +2,19 @@
 //!
 //! Usage: tool-change-spike-probe [--dry-run] --provider openai|chatgpt|kimi|deepseek|xai|gemini|anthropic
 //! [--credential <id>] --model <model> --out <file.jsonl> [--case 1|2|3|4|all]
-//! [--form a|b] [--place before-user|after-user] [--steps 3|4] [--max-requests N]. T4 is the
-//! request after the tools or instructions change. On OpenAI and Kimi, `--form` runs one of
-//! case 1's two forms (`a` the added-tools declaration, `b` the allowed-tools list).
+//! [--form a|b] [--place before-user|after-user|after-tool-result] [--steps 3|4]
+//! [--max-requests N]. T4 is the request after the tools or instructions change. On OpenAI and
+//! Kimi, `--form` runs one of case 1's two forms (`a` the added-tools declaration, `b` the
+//! allowed-tools list).
 //! ChatGPT requires `--case 1 --form a` and the `chatgpt:openai` credential for live runs.
 //! The ChatGPT lane uses HTTPS to measure the request form, not the WebSocket transport.
-//! Anthropic requires `--case 1 --form a --place after-user` and stops at T4's first response.
-//! `--grouped` (Anthropic only) puts a text plan note before the `tool_addition` block in the
-//! same system message, the shape broca sends when a note and an added tool share one turn.
+//! Anthropic requires `--case 1 --form a` with `--place after-user` or `after-tool-result`.
+//! The former stops at T4's first response. The latter sends exactly two requests: a thinking
+//! tool call, then its signed assistant reply and tool result followed by a plan-note system
+//! message. Its request limit defaults to two and `--steps` does not apply.
+//! `--grouped` (Anthropic only, with `after-user`) puts a text plan note before the
+//! `tool_addition` block in the same system message, the shape broca sends when a note and an
+//! added tool share one turn.
 //! Use `apikey:anthropic` or `oauth:anthropic` for live runs, or one account's credential id
 //! such as `oauth:anthropic:<account label>`.
 //! Its dry-run needs no credential and prints the API-key shape, with only header names and
@@ -51,6 +56,8 @@ const NEW_TOOL: &str = "lookup_orbit_code";
 const CHANGED_TOOL: &str = "lookup_station";
 const INSTRUCTION: &str = "From now on, end every plain-text reply with the word KITE.";
 const CHATGPT_CACHE_KEY: &str = "tool-change-spike-probe";
+const AFTER_TOOL_RESULT_QUESTION: &str = "Think briefly, then call lookup_station exactly once for station VEGA with name VEGA. Do not guess its status.";
+const PLAN_NOTE: &str = "The plan changed: answer in one sentence.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
@@ -155,6 +162,7 @@ impl Provider {
 enum Placement {
     BeforeUser,
     AfterUser,
+    AfterToolResult,
 }
 
 impl Placement {
@@ -162,7 +170,8 @@ impl Placement {
         match value {
             "before-user" => Ok(Self::BeforeUser),
             "after-user" => Ok(Self::AfterUser),
-            _ => Err("--place must be before-user|after-user".into()),
+            "after-tool-result" => Ok(Self::AfterToolResult),
+            _ => Err("--place must be before-user|after-user|after-tool-result".into()),
         }
     }
 
@@ -170,6 +179,7 @@ impl Placement {
         match self {
             Self::BeforeUser => "before-user",
             Self::AfterUser => "after-user",
+            Self::AfterToolResult => "after-tool-result",
         }
     }
 }
@@ -203,6 +213,7 @@ impl Args {
         let mut out = None;
         let mut case = None;
         let mut max_requests = REQUEST_CAP;
+        let mut max_requests_explicit = false;
         let mut alternate = None;
         let mut placement = Placement::BeforeUser;
         let mut steps = 4;
@@ -251,6 +262,7 @@ impl Args {
                     };
                 }
                 "--max-requests" => {
+                    max_requests_explicit = true;
                     max_requests = value
                         .parse()
                         .map_err(|_| "--max-requests requires an integer".to_string())?;
@@ -283,7 +295,7 @@ impl Args {
             None if dry_run && provider == Some(Provider::Anthropic) => String::new(),
             None => return Err("--credential is required".into()),
         };
-        let result = Self {
+        let mut result = Self {
             dry_run,
             provider: provider.ok_or("--provider is required")?,
             credential,
@@ -301,15 +313,26 @@ impl Args {
         if result.grouped && result.provider != Provider::Anthropic {
             return Err("--grouped applies only to --provider anthropic".into());
         }
+        if result.grouped && result.placement != Placement::AfterUser {
+            return Err("--grouped requires --place after-user".into());
+        }
+        if result.placement == Placement::AfterToolResult && result.provider != Provider::Anthropic
+        {
+            return Err("--place after-tool-result applies only to --provider anthropic".into());
+        }
         let only_form_a = result.case == Some(1) && result.alternate == Some(false);
         if result.provider == Provider::Chatgpt && !only_form_a {
             return Err("--provider chatgpt supports only --case 1 --form a".into());
         }
         if result.provider == Provider::Anthropic
-            && !(only_form_a && placement == Placement::AfterUser)
+            && !(only_form_a
+                && matches!(
+                    result.placement,
+                    Placement::AfterUser | Placement::AfterToolResult
+                ))
         {
             return Err(
-                "--provider anthropic supports only --case 1 --form a --place after-user".into(),
+                "--provider anthropic supports only --case 1 --form a --place after-user|after-tool-result".into(),
             );
         }
         if placement == Placement::AfterUser
@@ -320,7 +343,14 @@ impl Args {
                     .into(),
             );
         }
-        let minimum = result.variants().len() * usize::from(result.steps);
+        if result.placement == Placement::AfterToolResult && !max_requests_explicit {
+            result.max_requests = 2;
+        }
+        let minimum = if result.placement == Placement::AfterToolResult {
+            2
+        } else {
+            result.variants().len() * usize::from(result.steps)
+        };
         if minimum > result.max_requests {
             return Err(format!("selected cases need at least {minimum} requests; narrow --case or raise --max-requests"));
         }
@@ -458,6 +488,31 @@ fn options(
     }
     opts.tools = tools.into();
     opts
+}
+
+/// Build the two requests of the after-tool-result measurement. `assistant` is absent for the
+/// seed and is the first response, unmodified, for the continuation. Adding a canonical
+/// `turn_system` message lets the production Anthropic renderer emit the terminal system role and
+/// move the conversation cache marker from the seed's user text to the continuation's tool result.
+/// That marks the extended conversation for caching without hand-patching the existing prefix.
+fn after_tool_result_options(assistant: Option<Message>) -> CallOptions {
+    let variant = Variant {
+        case: 1,
+        alternate: false,
+    };
+    let mut prompt = vec![
+        message(Role::System, &fixed_prefix()),
+        message(Role::User, AFTER_TOOL_RESULT_QUESTION),
+    ];
+    if let Some(assistant) = assistant {
+        let results = tool_results(&assistant.content).expect("seed response has a tool call");
+        prompt.push(assistant);
+        prompt.push(results);
+        let mut note = message(Role::System, PLAN_NOTE);
+        note.turn_system = true;
+        prompt.push(note);
+    }
+    options(Provider::Anthropic, variant, false, prompt)
 }
 
 /// The encoder, endpoint, authentication, transport, and decoder remain production.
@@ -605,6 +660,25 @@ struct Answer {
     status: Option<u16>,
     stop_reason: Option<String>,
     error: Option<&'static str>,
+    error_body: Option<String>,
+}
+
+fn sanitize_error_body(message: &str, secrets: &[String]) -> String {
+    let mut sanitized = message.to_owned();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        sanitized = sanitized.replace(secret, "[redacted]");
+    }
+    sanitized
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(400)
+        .collect()
 }
 
 async fn send(
@@ -619,6 +693,13 @@ async fn send(
     use broca_core::Provider as _;
     use broca_protocol::{NormalizedEvent, ProviderControl, StepId};
     let provider = family.provider;
+    let placement = family.placement;
+    let secrets = match &auth {
+        AuthHandle::Bearer(token) => vec![token.clone()],
+        AuthHandle::ApiKeyHeader { value, .. } => vec![value.clone()],
+        AuthHandle::Headers(headers) => headers.iter().map(|(_, value)| value.clone()).collect(),
+        AuthHandle::None => Vec::new(),
+    };
     let live = broca_provider::LiveProvider::new(family, frozen, auth).with_credential_hosts(hosts);
     if provider == Provider::Chatgpt {
         live.set_chatgpt_https_policy(Arc::new(|| true));
@@ -652,9 +733,15 @@ async fn send(
                         // A WebSocket request records its 101 upgrade status, not a 2xx.
                         .is_some_and(|status| status != 101 && !(200..300).contains(&status))
                     {
-                        answer.error = Some("non-2xx response; response body withheld");
-                        cancel.cancel();
-                        return;
+                        answer.error = Some(if placement == Placement::AfterToolResult {
+                            "non-2xx response"
+                        } else {
+                            "non-2xx response; response body withheld"
+                        });
+                        if placement != Placement::AfterToolResult {
+                            cancel.cancel();
+                            return;
+                        }
                     }
                 }
                 NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
@@ -672,8 +759,8 @@ async fn send(
                     if answer.status.is_none() {
                         answer.status = error.status;
                     }
-                    // The class, status and codes name the failure without the provider's
-                    // text, which can echo the request.
+                    // Keep provider text out of logs. The after-tool-result output row separately
+                    // carries a bounded diagnostic with every credential value redacted.
                     if provider == Provider::Anthropic {
                         eprintln!(
                             "provider failure: class={:?} status={:?}",
@@ -685,7 +772,14 @@ async fn send(
                             error.class, error.status, error.provider_code, error.cause
                         );
                     }
-                    answer.error = Some("provider failure; error text withheld");
+                    answer.error = Some(if placement == Placement::AfterToolResult {
+                        "provider failure"
+                    } else {
+                        "provider failure; error text withheld"
+                    });
+                    if placement == Placement::AfterToolResult {
+                        answer.error_body = Some(sanitize_error_body(&error.message, &secrets));
+                    }
                 }
                 _ => {}
             }
@@ -785,7 +879,7 @@ fn write_row(
         row["instruction_form"] =
             json!("request-level systemInstruction; Gemini has no mid-conversation system role");
     }
-    if step == 4 {
+    if step == 4 || args.placement == Placement::AfterToolResult {
         let mut request_body = serde_json::from_slice(body)?;
         if args.provider == Provider::Anthropic && !args.dry_run {
             // The subscription body also carries IDs used in its request headers.
@@ -799,9 +893,18 @@ fn write_row(
                 row["stop_reason"] = json!(reason);
             }
             if answer.error.is_none() {
-                row["called_lookup_orbit_code"] = json!(answer.content.iter().any(|block| {
-                    matches!(block, ContentBlock::ToolCall(call) if call.tool_name == NEW_TOOL)
-                }));
+                if args.placement == Placement::AfterToolResult {
+                    if step == 1 {
+                        row["called_lookup_station"] = json!(answer.content.iter().any(|block| {
+                            matches!(block, ContentBlock::ToolCall(call) if call.tool_name == CHANGED_TOOL)
+                        }));
+                        row["signed_thinking"] = json!(has_signed_thinking(&answer.content));
+                    }
+                } else {
+                    row["called_lookup_orbit_code"] = json!(answer.content.iter().any(|block| {
+                        matches!(block, ContentBlock::ToolCall(call) if call.tool_name == NEW_TOOL)
+                    }));
+                }
             }
             ("cache_read_input_tokens", "cache_creation_input_tokens")
         } else {
@@ -821,11 +924,26 @@ fn write_row(
         if let Some(error) = answer.error {
             row["error"] = json!(error);
         }
+        if let Some(error_body) = &answer.error_body {
+            row["error_body"] = json!(error_body);
+        }
     }
     serde_json::to_writer(&mut *out, &row)?;
     writeln!(out)?;
     out.flush()?;
     Ok(())
+}
+
+fn has_signed_thinking(content: &[ContentBlock]) -> bool {
+    content.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::Reasoning {
+                signature: Some(signature),
+                ..
+            } if !signature.is_empty()
+        )
+    })
 }
 
 fn tool_results(content: &[ContentBlock]) -> Option<Message> {
@@ -925,7 +1043,11 @@ async fn credentials(
     if anthropic_method == Some(AuthMethod::Oauth) {
         let bind = probe_persona_bind()?;
         let persona = anthropic::persona(&id, secret.account_id.as_deref(), &bind)?;
-        *frozen = anthropic::frozen(&args.model, Some(persona));
+        *frozen = if args.placement == Placement::AfterToolResult {
+            anthropic::after_tool_result_frozen(&args.model, Some(persona))
+        } else {
+            anthropic::frozen(&args.model, Some(persona))
+        };
     }
     let hosts = secret.hosts.unwrap_or_else(|| {
         // A dev-tools reply may omit the record's host list. Allow only the host of the probe's
@@ -966,10 +1088,137 @@ fn fake_reply(step: u8) -> Message {
     )
 }
 
+/// A credential-free response fixture for rendering the continuation in a dry run. Its signature
+/// is deliberately synthetic; only a live provider response is ever used for a live continuation.
+fn dry_run_tool_reply() -> Message {
+    Message::new(
+        Role::Assistant,
+        vec![
+            ContentBlock::Reasoning {
+                text: "The archive cannot supply VEGA's status, so I should use the station tool."
+                    .into(),
+                signature: Some("dry-run-signature".into()),
+            },
+            ContentBlock::ToolCall(broca_protocol::ToolCall {
+                tool_call_id: broca_protocol::ToolCallId("toolu_dry_run_0001".into()),
+                tool_name: CHANGED_TOOL.into(),
+                input: json!({"name":"VEGA"}).into(),
+                thought_signature: None,
+                provider_state: None,
+            }),
+        ],
+    )
+}
+
+async fn run_after_tool_result(
+    args: &Args,
+    frozen: &FrozenRenderConfig,
+    auth: Option<&(
+        AuthHandle,
+        broca_provider::credential_hosts::CredentialHosts,
+    )>,
+    preview_auth: Option<&AuthHandle>,
+    out: &mut std::fs::File,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let variant = Variant {
+        case: 1,
+        alternate: false,
+    };
+    let mut assistant = None;
+    let mut before = Value::Null;
+    for (requests, step) in (1..=2).enumerate() {
+        if requests == args.max_requests {
+            return Err("request cap reached before conversation completed".into());
+        }
+        let opts = after_tool_result_options(assistant.clone());
+        let body = Arc::new(Mutex::new(Vec::new()));
+        let family = ProbeFamily {
+            provider: Provider::Anthropic,
+            variant,
+            changed: false,
+            placement: args.placement,
+            grouped: false,
+            body: body.clone(),
+        };
+        let patches = family.patches();
+        let answer = if let Some(auth) = auth {
+            Some(send(family, frozen.clone(), auth.clone(), &opts).await)
+        } else {
+            let rendered = family.render(frozen, &opts);
+            if let Some(preview_auth) = preview_auth {
+                let request = family.endpoint(frozen, preview_auth, rendered);
+                let names: Vec<_> = request.headers.iter().map(|(name, _)| name).collect();
+                println!("T{step} header names: {}", serde_json::to_string(&names)?);
+                println!(
+                    "T{step} request body: {}",
+                    std::str::from_utf8(&request.body)?
+                );
+            }
+            None
+        };
+        let bytes = body.lock().unwrap().clone();
+        write_row(
+            out,
+            args,
+            variant,
+            (step, step == 2),
+            &bytes,
+            &patches,
+            answer.as_ref(),
+        )?;
+
+        if args.dry_run {
+            let rendered: Value = serde_json::from_slice(&bytes)?;
+            println!(
+                "anthropic 1a T{step} (after-tool-result): {} body bytes; patched paths={patches:?}",
+                bytes.len()
+            );
+            if step == 1 {
+                before = rendered;
+                assistant = Some(dry_run_tool_reply());
+            } else {
+                let mut changes = Vec::new();
+                diff(&before, &rendered, "", &mut changes);
+                println!(
+                    "T2 against T1 (after-tool-result): {}",
+                    serde_json::to_string(&changes)?
+                );
+            }
+            continue;
+        }
+
+        let answer = answer.expect("live requests have answers");
+        if answer.error.is_some() {
+            return Err(format!("anthropic 1a T{step} failed; measured row flushed").into());
+        }
+        if step == 1 {
+            let expected_shape = matches!(
+                answer.content.as_slice(),
+                [
+                    ContentBlock::Reasoning {
+                        signature: Some(signature),
+                        ..
+                    },
+                    ContentBlock::ToolCall(call)
+                ] if !signature.is_empty() && call.tool_name == CHANGED_TOOL
+            );
+            if answer.stop_reason.as_deref() != Some("tool_use") || !expected_shape {
+                return Err("after-tool-result seed must stop with exactly signed thinking then one lookup_station call; measured row flushed".into());
+            }
+            assistant = Some(Message::new(Role::Assistant, answer.content));
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(std::env::args().skip(1))?;
-    let mut frozen = args.provider.frozen(&args.model);
+    let mut frozen = if args.placement == Placement::AfterToolResult {
+        anthropic::after_tool_result_frozen(&args.model, None)
+    } else {
+        args.provider.frozen(&args.model)
+    };
     let auth = if args.dry_run {
         None
     } else {
@@ -982,6 +1231,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .create_new(true)
         .write(true)
         .open(&args.out)?;
+    if args.placement == Placement::AfterToolResult {
+        return run_after_tool_result(
+            &args,
+            &frozen,
+            auth.as_ref(),
+            preview_auth.as_ref(),
+            &mut out,
+        )
+        .await;
+    }
     let mut requests = 0;
     for variant in args.variants() {
         let mut prompt = vec![message(Role::System, &fixed_prefix())];
@@ -1261,6 +1520,26 @@ mod tests {
         serde_json::from_slice(&first).unwrap()
     }
 
+    fn render_after_tool_result(assistant: Option<Message>) -> Value {
+        let variant = Variant {
+            case: 1,
+            alternate: false,
+        };
+        let family = ProbeFamily {
+            provider: Provider::Anthropic,
+            variant,
+            changed: false,
+            placement: Placement::AfterToolResult,
+            grouped: false,
+            body: Arc::new(Mutex::new(Vec::new())),
+        };
+        let frozen = anthropic::after_tool_result_frozen("test-model", None);
+        let opts = after_tool_result_options(assistant);
+        let first = family.render(&frozen, &opts);
+        assert_eq!(first, family.render(&frozen, &opts));
+        serde_json::from_slice(&first).unwrap()
+    }
+
     fn conversation_key(provider: Provider) -> &'static str {
         match provider {
             Provider::Openai | Provider::Chatgpt => "input",
@@ -1482,6 +1761,100 @@ mod tests {
                 "--provider anthropic supports only --case 1 --form a --place after-user"
             )));
         }
+    }
+
+    #[test]
+    fn after_tool_result_defaults_to_two_requests_and_is_anthropic_only() {
+        let flags = ["--case", "1", "--form", "a", "--place", "after-tool-result"];
+        let parsed = parse_args(Provider::Anthropic, &flags).unwrap();
+        assert_eq!(parsed.max_requests, 2);
+        assert_eq!(parsed.variants().len(), 1);
+        assert!(parse_args(
+            Provider::Anthropic,
+            &[flags.as_slice(), &["--max-requests", "1"]].concat()
+        )
+        .is_err());
+        assert_eq!(
+            parse_args(
+                Provider::Anthropic,
+                &[flags.as_slice(), &["--max-requests", "3"]].concat()
+            )
+            .unwrap()
+            .max_requests,
+            3
+        );
+        assert!(
+            matches!(parse_args(Provider::Openai, &flags), Err(error) if error.contains("after-tool-result applies only"))
+        );
+        assert!(
+            matches!(parse_args(Provider::Anthropic, &[flags.as_slice(), &["--grouped"]].concat()), Err(error) if error.contains("--grouped requires --place after-user"))
+        );
+    }
+
+    #[test]
+    fn after_tool_result_error_body_redacts_credentials_and_control_characters() {
+        let sanitized = sanitize_error_body(
+            "400: secret-token\ninvalid system message",
+            &["secret-token".into()],
+        );
+        assert_eq!(sanitized, "400: [redacted] invalid system message");
+        assert_eq!(sanitize_error_body(&"x".repeat(401), &[]).len(), 400);
+    }
+
+    #[test]
+    fn after_tool_result_echoes_signed_tool_call_and_moves_the_cache_breakpoint() {
+        let mut seed = render_after_tool_result(None);
+        let mut continuation = render_after_tool_result(Some(dry_run_tool_reply()));
+        assert_eq!(
+            seed["thinking"],
+            json!({"type":"enabled","budget_tokens":1024})
+        );
+        assert_eq!(continuation["thinking"], seed["thinking"]);
+        assert_eq!(seed["messages"].as_array().unwrap().len(), 1);
+        let messages = continuation["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(
+            messages[1]["content"],
+            json!([
+                {"type":"thinking","thinking":"The archive cannot supply VEGA's status, so I should use the station tool.","signature":"dry-run-signature"},
+                {"type":"tool_use","id":"toolu_dry_run_0001","name":"lookup_station","input":{"name":"VEGA"}}
+            ])
+        );
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            messages[2]["content"][0]["tool_use_id"],
+            "toolu_dry_run_0001"
+        );
+        assert_eq!(messages[3], json!({"role":"system","content":PLAN_NOTE}));
+
+        assert_eq!(
+            seed["messages"][0]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert!(continuation["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(
+            continuation["messages"][2]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert!(continuation["messages"][3].get("cache_control").is_none());
+
+        let mut seed_user = seed["messages"][0].clone();
+        let continued_user = continuation["messages"][0].clone();
+        seed_user["content"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        assert_eq!(continued_user, seed_user);
+        seed.as_object_mut().unwrap().remove("messages");
+        continuation.as_object_mut().unwrap().remove("messages");
+        assert_eq!(
+            continuation, seed,
+            "request 2 must preserve request 1's non-message fields"
+        );
     }
 
     #[test]

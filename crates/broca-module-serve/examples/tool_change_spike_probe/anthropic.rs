@@ -22,6 +22,21 @@ pub(super) fn frozen(model: &str, persona: Option<ClaudeCodePersona>) -> FrozenR
     frozen
 }
 
+/// Opt this measurement into the two capabilities under test. The standalone helpers normally
+/// disable thinking for API-key authentication; they also leave mid-conversation system messages
+/// off until broca's model catalog explicitly marks that capability supported. This probe
+/// deliberately exercises thinking and a mid-conversation system message with either auth method.
+pub(super) fn after_tool_result_frozen(
+    model: &str,
+    persona: Option<ClaudeCodePersona>,
+) -> FrozenRenderConfig {
+    let thinking = anthropic_frozen_config(model).reasoning;
+    let mut frozen = frozen(model, persona);
+    frozen.reasoning = thinking;
+    frozen.anthropic_turn_system = true;
+    frozen
+}
+
 pub(super) fn method(id: &CredentialId) -> Result<AuthMethod, &'static str> {
     if id.provider == "anthropic" && matches!(id.method, AuthMethod::ApiKey | AuthMethod::Oauth) {
         Ok(id.method)
