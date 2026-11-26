@@ -1094,8 +1094,9 @@ pub(crate) fn decode_terminal_tool_arguments(
 const TOOL_ARGS_WHITESPACE_LIMIT: usize = 4096;
 const TOOL_ARGS_BYTE_LIMIT: usize = 256_000;
 
-/// Shared streaming detector and terminal backstop. Partial arguments are never returned as
-/// canonical input: an empty object pairs the refused result with its call on the next request.
+/// Detects runaway arguments during streaming and checks for trailing whitespace at completion.
+/// For a cut call, replay uses empty arguments so the model can receive the error under the
+/// original call ID without seeing a broken JSON fragment.
 #[derive(Default)]
 pub(crate) struct ToolArgsGuard {
     trailing: std::collections::HashMap<u64, usize>,
@@ -1115,7 +1116,7 @@ impl ToolArgsGuard {
                 added
             };
             let whitespace = *trailing;
-            self.check(id, name, arguments, whitespace);
+            self.check(id, name, arguments, whitespace, true);
         }
     }
 
@@ -1125,7 +1126,7 @@ impl ToolArgsGuard {
             .rev()
             .take_while(|c| c.is_whitespace())
             .count();
-        self.check(id, name, arguments, whitespace);
+        self.check(id, name, arguments, whitespace, false);
     }
 
     pub(crate) fn replace(&mut self, key: u64, id: &str, name: &str, arguments: &str) {
@@ -1135,12 +1136,19 @@ impl ToolArgsGuard {
             .take_while(|c| c.is_whitespace())
             .count();
         self.trailing.insert(key, whitespace);
-        self.check(id, name, arguments, whitespace);
+        self.check(id, name, arguments, whitespace, true);
     }
 
-    fn check(&mut self, id: &str, name: &str, arguments: &str, whitespace: usize) {
-        if self.fired()
-            || (arguments.len() <= TOOL_ARGS_BYTE_LIMIT && whitespace < TOOL_ARGS_WHITESPACE_LIMIT)
+    fn check(&mut self, id: &str, name: &str, arguments: &str, whitespace: usize, streaming: bool) {
+        if self.fired() {
+            return;
+        }
+        // A streaming record can deliver the entire JSON argument before a separate done
+        // event. Cut only an over-limit buffer that has not yet formed a complete value.
+        if whitespace < TOOL_ARGS_WHITESPACE_LIMIT
+            && !(streaming
+                && arguments.len() > TOOL_ARGS_BYTE_LIMIT
+                && serde_json::from_str::<&serde_json::value::RawValue>(arguments).is_err())
         {
             return;
         }

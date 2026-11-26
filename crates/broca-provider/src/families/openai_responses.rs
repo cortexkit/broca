@@ -1572,7 +1572,7 @@ impl OpenAiResponsesNormalizer {
                     let buf = self.tool_calls.entry(idx).or_default();
                     buf.arguments = args.to_owned();
                     self.arguments_guard
-                        .replace(idx, &buf.call_id, &buf.name, &buf.arguments);
+                        .terminal(&buf.call_id, &buf.name, &buf.arguments);
                 }
             }
             // The completed item also carries the full final state; treat it as one more
@@ -1691,7 +1691,7 @@ impl OpenAiResponsesNormalizer {
                 if let Some(args) = item.get("arguments").and_then(Value::as_str) {
                     buf.arguments = args.to_owned();
                     self.arguments_guard
-                        .replace(idx, &buf.call_id, &buf.name, &buf.arguments);
+                        .terminal(&buf.call_id, &buf.name, &buf.arguments);
                 }
                 if self.provider_text_state {
                     buf.state = item.as_object().map(|fields| {

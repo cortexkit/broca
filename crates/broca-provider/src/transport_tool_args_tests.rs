@@ -248,7 +248,7 @@ fn runaway_argument_past_256000_bytes_is_cut() {
 }
 
 #[test]
-fn structured_google_arguments_are_size_checked_before_the_stream_ends() {
+fn complete_oversize_structured_google_arguments_are_kept() {
     let step = StepId(1);
     for (mut normalizer, envelope) in [
         (Gemini.normalizer(&gemini_frozen_config("m"), step), false),
@@ -258,23 +258,46 @@ fn structured_google_arguments_are_size_checked_before_the_stream_ends() {
         ),
     ] {
         let arguments = json!({"query":"x".repeat(256_000)});
-        let body = json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":arguments}}]}}]});
+        let body = json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"functionCall":{"name":"lookup","args":arguments}}]}}]});
         let body = if envelope {
             json!({"response":body})
         } else {
             body
         };
-        let events = normalizer
+        let mut events = normalizer
             .push(format!("data: {body}\n\n").as_bytes())
             .unwrap();
-        assert_eq!(cut(&events).tool_name, "lookup");
-        assert!(events.iter().any(|event| matches!(
-            event,
-            NormalizedEvent::Control(ProviderControl::Finished {
-                finish_reason: broca_protocol::FinishReason::Length,
-                ..
-            })
-        )));
+        events.extend(normalizer.finish().unwrap());
+        assert_tool_arguments(&events, &arguments);
+    }
+}
+
+fn assert_tool_arguments(events: &[NormalizedEvent], expected: &Value) {
+    assert!(!tool_args_cut(events));
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(message.tool_calls().next().unwrap().input.parse() == *expected);
+}
+
+#[test]
+fn complete_oversize_responses_arguments_from_a_done_event_are_kept() {
+    for family in [Family::Responses, Family::Chatgpt] {
+        let mut normalizer = family.normalizer();
+        for chunk in family.start(false) {
+            normalizer.push(&chunk).unwrap();
+        }
+        let arguments = json!({"query":"x".repeat(262_145)});
+        let mut events = normalizer.push(&family.record("", json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":arguments.to_string()}), false)).unwrap();
+        events.extend(normalizer.push(&family.record("", json!({"type":"response.completed","response":{"id":"m","status":"completed","output":[]}}), false)).unwrap());
+        events.extend(normalizer.finish().unwrap());
+        assert_tool_arguments(&events, &arguments);
     }
 }
 

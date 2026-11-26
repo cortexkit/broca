@@ -116,3 +116,56 @@ fn the_messages_stand_in_reports_a_turns_scripted_usage() {
     );
     assert_eq!(usage_of(&text()), (Some(1), Some(0), Some(0), Some(1)));
 }
+
+#[test]
+fn the_media_stand_in_preserves_complete_oversize_tool_arguments() {
+    use broca_protocol::{FinishReason, NormalizedEvent, ProviderControl, StepId};
+    use broca_provider::families::{anthropic_frozen_config, AnthropicMessages};
+    use broca_provider::wire::WireFamily;
+
+    // The media suite uses both a payload just over the inline threshold and two much larger
+    // siblings in one step. The normalizer must keep all the arguments for transcript reads.
+    for sizes in [&[262_145][..], &[2_200_000, 2_200_000][..]] {
+        let calls: Vec<_> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &size)| ScriptedToolCall {
+                tool_call_id: format!("call-{index}"),
+                tool: SCRIPTED_TOOL.into(),
+                arguments: json!({"marker": index, "payload": "a".repeat(size)}),
+                result: json!("unused"),
+                hold: false,
+            })
+            .collect();
+        let turn = ScriptedTurn::new(calls.iter().cloned().map(ScriptedPart::ToolCall).collect());
+        let raw = stream_for_model("msg", MEDIA_FIXTURE_MODEL, &turn);
+        let mut normalizer =
+            AnthropicMessages.normalizer(&anthropic_frozen_config(MEDIA_FIXTURE_MODEL), StepId(1));
+        let events = normalizer.push(raw.as_bytes()).unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { .. })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Control(ProviderControl::Finished {
+                finish_reason: FinishReason::ToolCalls,
+                ..
+            })
+        )));
+        let message = events
+            .iter()
+            .find_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::AssistantMessage { message }) => {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(message.tool_calls().count(), calls.len());
+        for (actual, expected) in message.tool_calls().zip(calls) {
+            assert_eq!(actual.tool_call_id.0, expected.tool_call_id);
+            assert!(actual.input.parse() == expected.arguments);
+        }
+    }
+}

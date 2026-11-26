@@ -1025,7 +1025,6 @@ pub(crate) struct GeminiNormalizer {
     tool_id_policy: ToolIdPolicy,
     text_state_format: Option<broca_protocol::content::TextProviderFormat>,
     sse: SseDecoder,
-    arguments_guard: crate::wire::ToolArgsGuard,
     parts: Vec<GeminiPartBuf>,
     next_call_index: u32,
     usage: Usage,
@@ -1058,7 +1057,6 @@ impl GeminiNormalizer {
             tool_id_policy,
             text_state_format: None,
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Gemini),
-            arguments_guard: Default::default(),
             parts: Vec::new(),
             next_call_index: 0,
             usage: Usage::default(),
@@ -1133,9 +1131,6 @@ impl GeminiNormalizer {
         v: &Value,
         out: &mut Vec<NormalizedEvent>,
     ) -> Result<(), NormalizeError> {
-        if self.arguments_guard.fired() {
-            return Ok(());
-        }
         if let Some(evidence) = &self.response_evidence {
             evidence.lock().unwrap().observe_response(v);
         }
@@ -1284,14 +1279,9 @@ impl GeminiNormalizer {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
-                let mut args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                 let display_delta = args.to_string();
                 let tcid = synthetic_inbound_id(index, self.tool_id_policy);
-                self.arguments_guard.terminal(&tcid, &name, &display_delta);
-                let cut = self.arguments_guard.fired();
-                if cut {
-                    args = self.arguments_guard.refuse(&tcid, &name);
-                }
                 let tool_name = crate::normalize::known_name(&name);
                 let part_index = self.push_part(GeminiPartBuf::FunctionCall(FunctionCallBuf {
                     index,
@@ -1299,12 +1289,6 @@ impl GeminiNormalizer {
                     args,
                     thought_signature,
                 }));
-                if cut {
-                    self.finish_reason = FinishReason::Length;
-                    self.terminal_observed = true;
-                    out.extend(self.final_events());
-                    break;
-                }
                 out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
                     mid: None,
                     part: Some(part_index),
@@ -1459,7 +1443,7 @@ impl GeminiNormalizer {
         }
         self.emitted_final = true;
         let message = self.assemble_message();
-        let mut out: Vec<_> = self.arguments_guard.events().collect();
+        let mut out = Vec::new();
         out.extend([
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
             NormalizedEvent::Control(ProviderControl::StepFinished {
