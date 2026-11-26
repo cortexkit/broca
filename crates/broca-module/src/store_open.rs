@@ -576,7 +576,7 @@ impl StoreRuntime {
     }
 
     /// [`current_view`](Self::current_view) of the session `key`, kept in the root of `class`.
-    async fn current_view_in(
+    pub(crate) async fn current_view_in(
         &self,
         key: &BindIdentity,
         class: StorageClass,
@@ -602,9 +602,9 @@ impl StoreRuntime {
         match Session::view(backend, addr, &triple(key), self.deployment()).await {
             Ok(view) => {
                 let position = view.position();
-                Ok(Some(Arc::new(
-                    crate::store_read::StoredView::new(Box::new(view), position).await,
-                )))
+                let view = crate::store_read::StoredView::new(Box::new(view), position).await;
+                self.views.count_unkept(&view.address().0, reason, &view);
+                Ok(Some(Arc::new(view)))
             }
             Err(SessionError::Missing) => Ok(None),
             Err(error) => Err(error),
@@ -1562,7 +1562,7 @@ fn recovery_changes_reads(view: &Session<LocalBackend>) -> bool {
 }
 
 /// A view that couldn't be loaded, as the opener reports it.
-fn view_error(error: SessionError) -> OpenError {
+pub(crate) fn view_error(error: SessionError) -> OpenError {
     match error {
         SessionError::SessionMoving { cut_id } => OpenError::SessionMoving { cut_id },
         SessionError::SessionMoved { holder } => OpenError::SessionMoved { holder },

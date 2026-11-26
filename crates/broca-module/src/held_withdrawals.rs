@@ -51,6 +51,7 @@ pub struct HeldWithdrawals {
     stopping: std::sync::OnceLock<tokio_util::sync::CancellationToken>,
     sweep: Mutex<SweepProgress>,
     store_runtime: std::sync::OnceLock<std::sync::Weak<crate::store_open::StoreRuntime>>,
+    cancellation_memo: store::CancellationMemo,
 }
 
 /// What one recovery sweep did, for its closing log line, and the last failure it met.
@@ -80,6 +81,7 @@ impl HeldWithdrawals {
             stopping: std::sync::OnceLock::new(),
             sweep: Mutex::default(),
             store_runtime: std::sync::OnceLock::new(),
+            cancellation_memo: store::CancellationMemo::default(),
         })
     }
 
@@ -250,13 +252,16 @@ impl HeldWithdrawals {
             // Whether each call was cancelled while held, from one read of the session's ledger
             // back to the oldest of their intents, rather than one read per call.
             let calls: Vec<_> = rows.iter().map(|(call, _, _)| call.clone()).collect();
-            let mut identities = match store::cancellation_identities(&runtime, &calls).await {
-                Ok(identities) => Some(identities),
-                Err(error) => {
-                    tally.failure = Some(error);
-                    None
-                }
-            };
+            let mut identities =
+                match store::cancellation_identities(&self.cancellation_memo, &runtime, &calls)
+                    .await
+                {
+                    Ok(identities) => Some(identities),
+                    Err(error) => {
+                        tally.failure = Some(error);
+                        None
+                    }
+                };
             for (call, state, attempts) in &rows {
                 let attempts = if state == "failed" {
                     None
@@ -306,7 +311,13 @@ impl HeldWithdrawals {
                     .remove_spent_calls(&inline)
                     .and_then(|inline| Ok(inline + self.store.retire_watches(&held)?))
                 {
-                    Ok(removed) => tally.rows_settled += removed,
+                    Ok(removed) => {
+                        tally.rows_settled += removed;
+                        self.cancellation_memo.forget_calls(
+                            &bind,
+                            inline.iter().chain(&held).map(|(_, key)| key.as_str()),
+                        );
+                    }
                     Err(error) => tally.failure = Some(error),
                 }
             }
@@ -337,6 +348,8 @@ impl HeldWithdrawals {
         rows: &[(LateResultRegistration, String, u32)],
         tally: &mut SweepTally,
     ) {
+        self.cancellation_memo
+            .forget_calls(bind, rows.iter().map(|(call, _, _)| call.call_key.as_str()));
         let calls: Vec<_> = rows
             .iter()
             .map(|(call, _, _)| (call.module.clone(), call.call_key.clone()))
@@ -424,10 +437,12 @@ impl HeldWithdrawals {
         let Some((state, durable_attempts)) =
             self.store.withdrawal_state(&call.module, &call.call_key)?
         else {
+            self.cancellation_memo.forget(&call);
             return Ok(0);
         };
         let retry_failed = attempts.is_none() && state == "failed";
         if state == "done" || (state == "failed" && !retry_failed) {
+            self.cancellation_memo.forget(&call);
             return Ok(0);
         }
         let attempts = match attempts {
@@ -507,6 +522,7 @@ impl HeldWithdrawals {
         ) || raw.get("answer").and_then(Value::as_str) == Some("refused");
         let state = if failed { "failed" } else { "done" };
         self.store.record_withdrawal(&call, state, attempts, &raw)?;
+        self.cancellation_memo.forget(&call);
         self.refresh_health();
         Ok(1)
     }
@@ -544,6 +560,8 @@ impl HeldWithdrawals {
                 if let Err(error) = this.drive_with(call, Some(attempts), known).await {
                     this.health.lock().expect("withdrawal health")["error"] = json!(error);
                 }
+            } else {
+                this.cancellation_memo.forget(&call);
             }
         });
     }
@@ -568,9 +586,10 @@ impl HeldWithdrawals {
             .holds(&call.bind)
             .map_err(|error| error.to_string())?
         {
+            self.cancellation_memo.forget(call);
             return Ok(None);
         }
-        store::cancellation_identity(&runtime, call).await
+        store::cancellation_identity(&self.cancellation_memo, &runtime, call).await
     }
 }
 

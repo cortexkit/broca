@@ -1442,6 +1442,166 @@ fn held_reply(call_key: &str) -> broca_core::tool_plane::ProviderHeldReply {
     }
 }
 
+#[cfg(feature = "test-clock")]
+#[tokio::test(start_paused = true)]
+async fn a_closed_sessions_withdrawal_retries_do_not_reload_its_view() {
+    use crate::held_slots::HeldWithdrawal;
+    use std::sync::atomic::Ordering;
+
+    let bind = session("closed-withdrawal");
+    let call_key = "lineage:4";
+    let mut records = held_records(call_key, "tools");
+    cancelled_held(&mut records, &["a"]);
+    let (root, runtime) = withdrawal_root("bounded-withdrawal", &bind, &records).await;
+    // No view fits, so retries cannot reuse the view from their first attempt.
+    let runtime = Arc::new(
+        Arc::into_inner(runtime)
+            .unwrap()
+            .with_view_bytes_for_test(1),
+    );
+    let store = Arc::new(review_store(&root));
+    store
+        .register_calls(&[registration(call_key, "tools", &bind)])
+        .unwrap();
+    let route = Arc::new(PendingWithdrawalRoute {
+        hint_ms: None,
+        pending: 2,
+        seen: Mutex::default(),
+    });
+    let service = withdrawals(store.clone(), &runtime, route.clone(), Default::default());
+    let counts = || {
+        let views = runtime.views().memory(|_| 0);
+        let loads = views
+            .loads_by_reason
+            .unwrap_or_default()
+            .get("held_withdrawals")
+            .map_or(0, |load| load.loads);
+        (loads, runtime.log_reads.load(Ordering::Relaxed))
+    };
+
+    assert_eq!(counts(), (0, 0));
+    service.withdraw(&held_reply(call_key)).await.unwrap();
+    assert_eq!(counts(), (1, 1));
+    assert_eq!(runtime.views().usage().0, 0);
+    withdrawals_settled(&service).await;
+
+    assert_eq!(route.seen.lock().unwrap().len(), 3);
+    assert_eq!(
+        store.withdrawal_state("tools", call_key).unwrap(),
+        Some(("done".into(), 3))
+    );
+    assert_eq!(counts(), (1, 1));
+}
+
+#[tokio::test]
+async fn withdrawal_checks_read_a_sealed_run_start_and_do_not_memoize_plan_errors() {
+    use crate::held_slots::HeldWithdrawal;
+    use broca_records::session_storage::StorageClass;
+    use broca_session_loop::parts::{MemoryParts, Parts};
+    use broca_session_store::{backend::SessionAddr, record::PartKind};
+
+    let bind = session("sealed-withdrawal");
+    let call_key = "lineage:4";
+    let mut records = held_records(call_key, "tools");
+    cancelled_held(&mut records, &["a"]);
+    let tools = json!([]);
+    let part = MemoryParts::default().put(PartKind::Tools, &tools).unwrap();
+    let Record::RunStart(start) = &mut records[0] else {
+        panic!("expected a run start");
+    };
+    start.setup.push(part.clone());
+    let (root, runtime) = withdrawal_root("sealed-withdrawal", &bind, &records[..1]).await;
+    let class = StorageClass::Ordinary;
+    let backend = runtime.class_backend(class);
+    let mut session = Session::load(
+        &backend,
+        SessionAddr(broca_core::session_addr(&bind)),
+        &crate::store_open::triple(&bind),
+        runtime.deployment(),
+    )
+    .await
+    .unwrap();
+    session.seal(None, 0).await.unwrap();
+    session.append(&records[1..], true).await.unwrap();
+    assert!(session.head().id_index.is_some());
+    assert!(session
+        .open_log_records()
+        .await
+        .unwrap()
+        .iter()
+        .all(|(_, record)| !matches!(record, Record::RunStart(_))));
+    let cipher = session.head().cipher();
+    session.close().await.unwrap();
+
+    let store = Arc::new(review_store(&root));
+    store
+        .register_calls(&[registration(call_key, "tools", &bind)])
+        .unwrap();
+    let route = Arc::new(WithdrawalRoute {
+        seen: Mutex::default(),
+        mode: "ok",
+    });
+    let service = withdrawals(store, &runtime, route.clone(), Default::default());
+    let reply = held_reply(call_key);
+    let error = service.withdraw(&reply).await.unwrap_err();
+    assert!(
+        error.starts_with("withdrawal plan is unreadable:"),
+        "{error}"
+    );
+    assert!(route.seen.lock().unwrap().is_empty());
+
+    // Make the part readable without changing the ledger position that produced the error.
+    assert_eq!(
+        runtime
+            .parts_for(class, cipher)
+            .clone()
+            .put(PartKind::Tools, &tools)
+            .unwrap(),
+        part
+    );
+    service.withdraw(&reply).await.unwrap();
+    assert_eq!(*route.seen.lock().unwrap(), [call_key]);
+}
+
+#[tokio::test]
+async fn withdrawal_checks_reconsider_a_hold_after_a_cancel_is_written() {
+    use crate::held_slots::HeldWithdrawal;
+
+    let bind = session("held-before-cancel");
+    let call_key = "lineage:4";
+    let (root, runtime) = withdrawal_root(
+        "held-before-cancel",
+        &bind,
+        &held_records(call_key, "tools"),
+    )
+    .await;
+    let store = Arc::new(review_store(&root));
+    store
+        .register_calls(&[
+            registration(call_key, "tools", &bind),
+            registration("lineage:8", "tools", &bind),
+        ])
+        .unwrap();
+    let route = Arc::new(WithdrawalRoute {
+        seen: Mutex::default(),
+        mode: "ok",
+    });
+    let service = withdrawals(store, &runtime, route.clone(), Default::default());
+    let error = service
+        .withdraw(&held_reply("lineage:8"))
+        .await
+        .unwrap_err();
+    assert_eq!(error, "withdrawal dispatch intent is missing");
+    service.withdraw(&held_reply(call_key)).await.unwrap();
+    assert!(route.seen.lock().unwrap().is_empty());
+
+    let mut cancel = Vec::new();
+    cancelled_held(&mut cancel, &["a"]);
+    seed_root(&root, &bind, &cancel).await;
+    service.withdraw(&held_reply(call_key)).await.unwrap();
+    assert_eq!(*route.seen.lock().unwrap(), [call_key]);
+}
+
 #[tokio::test]
 async fn review_regression_completed_sibling_is_not_withdrawn_on_recovery() {
     let bind = session("siblings");
