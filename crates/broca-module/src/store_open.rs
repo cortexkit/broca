@@ -653,10 +653,10 @@ impl StoreRuntime {
         Some((class, position))
     }
 
-    /// Whether the head kept for the session `key` admits `access`, when the session is closed
-    /// where that head was built: `None` when no head is kept there or its read policy can't
-    /// decide alone, and the read is admitted from the session as stored. Authorizing a polled
-    /// closed session's head this way spares the load of its view the head itself spares.
+    /// Whether the read policy kept for the session `key` admits `access`, when the session is
+    /// closed at that position. Returns `None` when no policy is kept there or it can't decide
+    /// without the session's records. The policy can spare a view load even when the head reply
+    /// depends on the clock and isn't kept.
     pub(crate) async fn admit_by_kept_head(
         &self,
         registry: &crate::LineageRegistry,

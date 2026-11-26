@@ -143,9 +143,9 @@ impl StoreReadRequest {
             Self::Head => "session.head",
             Self::Page(_) => "session.read",
             Self::Entries { .. } => "session.entries",
-            Self::AuthorizationOwnership
-            | Self::AuthorizationRead(_)
-            | Self::AuthorizationSubmissionSender(_) => "authorization",
+            Self::AuthorizationOwnership => "authorization.ownership",
+            Self::AuthorizationRead(_) => "authorization.read",
+            Self::AuthorizationSubmissionSender(_) => "authorization.sender",
             Self::Compaction { .. } => "compaction",
             Self::HistoryHead { .. } => "session.history",
             Self::Media { .. } => "session.media_read",

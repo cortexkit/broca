@@ -715,6 +715,170 @@ async fn authorizing_a_read_of_a_kept_head_reads_no_log() {
 }
 
 #[cfg(feature = "test-clock")]
+const PAUSED_RESUME_MS: u64 = 4_000_000_000_000;
+
+#[cfg(feature = "test-clock")]
+async fn paused_closed_read_fixture(
+    name: &str,
+) -> (PathBuf, Arc<StoreRuntime>, LineageRegistry, BindIdentity) {
+    use broca_records::record::AccountLimitPause;
+    use broca_session_store::record::{Pause, Record};
+
+    // A view is too large to retain, so any read that needs it must load the log again.
+    let (root, runtime, registry, key) = closed_read_fixture(name, 1).await;
+    let mut session = Session::load(
+        LocalBackend::new(StorageClass::Ordinary.store_root(&root)),
+        SessionAddr(broca_core::session_addr(&key)),
+        &triple(&key),
+        &deployment(),
+    )
+    .await
+    .unwrap();
+    let mut start = session
+        .operations
+        .run
+        .as_ref()
+        .unwrap()
+        .start
+        .clone()
+        .unwrap();
+    start.run_id = "paused".into();
+    start.submission_id = None;
+    start.send_id = None;
+    let limit = AccountLimitPause {
+        failed_step: broca_protocol::StepId(1),
+        failed_attempt_seq: 1,
+        attempt_id: None,
+        attempt: 1,
+        paused_at_ms: FIXTURE_NOW_MS,
+        observed_at_ms: FIXTURE_NOW_MS,
+        auth_method: "oauth".into(),
+        credential_id: "oauth:openai:fixture".into(),
+        credential_ref: None,
+        account_ref: None,
+        disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
+        resets_at_ms: Some(PAUSED_RESUME_MS),
+        retry_after_secs: None,
+        resume_not_before_ms: PAUSED_RESUME_MS,
+        request_body_len: 0,
+        request_body_sha256: String::new(),
+        selection_round: 0,
+        next_routing_check_ms: None,
+    };
+    session
+        .append(
+            &[
+                Record::RunStart(Box::new(start)),
+                Record::Pause(Pause {
+                    run_id: "paused".into(),
+                    reason: broca_protocol::PauseReason::AccountLimit,
+                    ts_ms: Some(FIXTURE_NOW_MS),
+                    error: None,
+                    account_limit: Some(serde_json::to_value(limit).unwrap().into()),
+                }),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+    (root, runtime, registry, key)
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn authorizing_a_read_of_a_closed_paused_session_reads_no_log() {
+    use crate::serve::ServeHandler;
+    use std::sync::atomic::Ordering;
+
+    let (root, runtime, registry, key) = paused_closed_read_fixture("paused-head-auth").await;
+    let accesses = [
+        crate::reader_admission::ReadAccess {
+            principal: Some(broca_protocol::BindPrincipal::Direct),
+            op: "session.head".into(),
+            send: None,
+        },
+        crate::reader_admission::ReadAccess {
+            principal: Some(broca_protocol::BindPrincipal::Reserved {
+                module_id: "another".into(),
+            }),
+            op: "session.read".into(),
+            send: None,
+        },
+    ];
+    let mut from_log = Vec::new();
+    for access in &accesses {
+        from_log.push(format!(
+            "{:?}",
+            registry.authorize_session_read(&key, access).await
+        ));
+    }
+    let head = registry
+        .head_for(&key, None, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(head.last_run_state.unwrap().state, "paused");
+    assert!(registry.open_handle(&key).is_none());
+
+    let loads = || runtime.views().memory(|_| 0).loads.unwrap();
+    let before = loads();
+    assert!(runtime.log_reads.swap(0, Ordering::Relaxed) > 0);
+    for (access, from_log) in accesses.iter().zip(from_log) {
+        assert_eq!(
+            format!("{:?}", registry.authorize_session_read(&key, access).await),
+            from_log,
+            "{access:?}"
+        );
+    }
+    assert_eq!(runtime.log_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(loads(), before, "read authorization must not load a view");
+    let views = runtime.views().memory(|_| 0);
+    assert_eq!(
+        views.loads_by_reason.unwrap()["authorization.read"].loads,
+        accesses.len() as u64,
+        "only the cold authorization reads load views"
+    );
+    let kept = runtime.heads().counts();
+    assert_eq!(kept.kept.get("read_policy.read"), Some(&1));
+    assert!(kept.not_kept.is_empty());
+    assert_eq!(kept.held.entries, 1);
+    let parts = kept.held.estimated_by_part.unwrap();
+    assert!(parts["read_policy_only"] > 0);
+    assert!(!parts.contains_key("reply"));
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn a_closed_paused_sessions_head_still_rebuilds_the_reply() {
+    use crate::serve::ServeHandler;
+    use std::sync::atomic::Ordering;
+
+    let (root, runtime, registry, key) = paused_closed_read_fixture("paused-head-reply").await;
+    let scope = broca_protocol::SendScope::default();
+    let first = registry.head_for(&key, None, &scope).await.unwrap();
+    let last = first.last_run_state.as_ref().unwrap();
+    assert_eq!(last.state, "paused");
+    assert_eq!(last.reason.as_deref(), Some("account_limit"));
+    assert_eq!(last.resume_not_before_ms, Some(PAUSED_RESUME_MS));
+    assert_eq!(
+        last.awaits.as_ref().unwrap().next_ms,
+        Some(PAUSED_RESUME_MS)
+    );
+
+    // Rebuild at the same position: the reply's wait may change even without a log append.
+    runtime.log_reads.store(0, Ordering::Relaxed);
+    assert_eq!(registry.head_for(&key, None, &scope).await.unwrap(), first);
+    assert!(runtime.log_reads.load(Ordering::Relaxed) > 0);
+    assert!(registry.open_handle(&key).is_none());
+    drop(registry);
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "test-clock")]
 #[tokio::test]
 async fn stored_read_future_stays_small() {
     fn future_bytes<F: std::future::Future>(_: impl FnOnce() -> F) -> usize {

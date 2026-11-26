@@ -1834,7 +1834,7 @@ async fn a_running_sessions_stored_read_keeps_no_view_and_projects_no_stream_hea
         .await
         .unwrap();
     }
-    assert_eq!((loads("send_status"), loads("authorization")), (0, 0));
+    assert_eq!((loads("send_status"), loads("authorization.read")), (0, 0));
     let request = StoreReadRequest::RunToolCalls(
         cortexkit_role_llm_runner::tool_calls::ToolCallsRequest::new("r1"),
     );
