@@ -163,6 +163,7 @@ impl RunExecutor for ScriptedExecutor {
                 provider:&provider, tools:&tools, bind:req.session.clone(), out:Some(&out), cancel:control.cancel.clone().unwrap_or_default(), stop:Default::default(),
                 held:None, approval:&broca_core::AllowAll, hook_plane:None, now_ms:&now, session_address:None, compaction_plane:None,
                 compaction_session:None, compaction_changes:false, keep_warm:None, account_reports:None, max_same_account_wait:Default::default(),
+                accepting_drain: None,
                 auth_selection:None, step_progress:None, model_call_ready:None,
                 pause_for_auth_at_start:first_run.then(sign_in_error), account_continue:first_run.then_some(&continuation),
             };

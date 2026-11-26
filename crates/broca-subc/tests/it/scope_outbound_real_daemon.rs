@@ -296,6 +296,8 @@ impl Rig {
             .expect("authenticate the describer module");
         let (mut reader, mut writer) = stream.into_split();
         let hello = subc_protocol::ModuleHelloBody {
+            module_capabilities: None,
+            resume_token: None,
             manifest: subc_protocol::manifest::ModuleManifest::builder(DESCRIBER, "0.0.0").build(),
             protocol_ver: subc_protocol::PROTOCOL_VERSION,
             control_ops: None,

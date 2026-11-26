@@ -4,6 +4,74 @@
 use super::*;
 
 impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
+    /// An otherwise immediate send can be awaiting its input transforms when the drain starts.
+    /// Keep the original request and the prepared input separate so it can still queue without
+    /// repeating the transforms or losing its media.
+    pub(super) async fn start_or_defer_send(
+        &mut self,
+        mut start: Start,
+        delivery: broca_protocol::Delivery,
+        mut reply: oneshot::Sender<SendOutcome>,
+    ) {
+        let outcome = async {
+            self.freeze_plan(&mut start)?;
+            let staged = self.stage_media(&mut start.request, None).await?;
+            for item in &staged {
+                self.held.hold(&item.reference, Arc::clone(&item.bytes));
+            }
+            let at_ms = start
+                .prepared
+                .retention
+                .map(|_| (self.now_ms)())
+                .or_else(broca_core::clock::epoch_millis);
+            let prepared = self
+                .transform_input(
+                    start.request.input.clone(),
+                    delivery,
+                    start.manifest.as_deref(),
+                    start.scope.as_ref(),
+                    at_ms,
+                    &mut reply,
+                )
+                .await
+                .map_err(|outcome| {
+                    SendOutcome::Error(format!("input preparation failed: {outcome:?}"))
+                })?;
+            Ok((staged, at_ms, prepared))
+        }
+        .await;
+        let (staged, at_ms, prepared) = match outcome {
+            Ok(value) => value,
+            Err(outcome) => {
+                self.held.clear();
+                let _ = reply.send(outcome);
+                return;
+            }
+        };
+        if self.is_accepting_drain() {
+            self.held.clear();
+            let outcome = if let Some(provider) = prepared.refused.clone() {
+                SendOutcome::PreUserUnavailable { provider }
+            } else {
+                self.queue_transformed(start, delivery, prepared, &staged)
+                    .await
+            };
+            let _ = reply.send(outcome);
+            return;
+        }
+        // A fresh run still starts if a transform refused its input, then ends with that
+        // refusal before any model call.
+        start.prepared.at_ms = at_ms;
+        start.prepared.pre_model_error = prepared
+            .refused
+            .as_ref()
+            .map(|provider| crate::actor::pre_user::refusal_error(provider));
+        start.request.input = prepared.input;
+        start.prepared.hooks = prepared.hooks;
+        self.start_run(start, None, Some(reply), StoreRunMode::Fresh)
+            .await;
+    }
+
     /// The submission id of the first queued send that starts a run on an idle session: a plain
     /// send, or an ordered one whose list names `idle_start`. An ordered send whose order can't
     /// be read back is returned as the error, with why.
@@ -77,12 +145,22 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             Ok(manifest) => manifest,
             Err(error) => return SendOutcome::Error(error),
         };
+        let first_deferred =
+            self.is_accepting_drain() && self.session.operations().owner.needs_admission();
         let prepared = match self
             .transform_input(
                 start.request.input.clone(),
                 delivery,
-                manifest.as_deref(),
-                None,
+                if first_deferred {
+                    start.manifest.as_deref()
+                } else {
+                    manifest.as_deref()
+                },
+                if first_deferred {
+                    start.scope.as_ref()
+                } else {
+                    None
+                },
                 self.retention_timestamp()
                     .or_else(broca_core::clock::epoch_millis),
                 reply,
@@ -151,16 +229,37 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             identity,
             conversation_key,
             sent_by,
-            scope: _,
-            // A queued send keeps its request as sent; the plan is frozen into it when it
-            // drains, at the episode's start.
-            manifest: _,
+            scope,
+            manifest,
             session_class,
             prepared: start_prepared,
             message_marks,
         } = start;
         let submission_id = broca_protocol::SubmissionId(format!("sub-{}", run_id.0));
         request.staged_uploads = None;
+        // Unlike a send queued behind a run, a send accepted during the drain can be the
+        // session's first. Keep its admission inputs and register it for boot recovery before
+        // acknowledging the queue write, even if no run has ever registered this session.
+        let first_deferred =
+            self.is_accepting_drain() && self.session.operations().owner.needs_admission();
+        let (scope, manifest) = if first_deferred {
+            let manifest = match manifest
+                .as_deref()
+                .map(|manifest| queue::receipt_manifest(manifest, &mut self.parts))
+                .transpose()
+            {
+                Ok(manifest) => manifest,
+                Err(error) => return SendOutcome::Error(error),
+            };
+            (scope, manifest)
+        } else {
+            (None, None)
+        };
+        if self.is_accepting_drain() {
+            if let Err(error) = self.track_recovery() {
+                return SendOutcome::Transient(error);
+            }
+        }
         let receipt = queue::Receipt {
             session_class: session_class.filter(|_| self.frozen_session_class().is_none()),
             conversation_key,
@@ -170,6 +269,8 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             title,
             hooks: prepared.queued_hooks(),
             retention: start_prepared.retention,
+            scope,
+            manifest,
             ..queue::Receipt::default()
         };
         let at = queue::Queued {

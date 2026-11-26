@@ -824,6 +824,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         }
         // The queued record keeps the send's media, stored as the session's own objects before
         // the batch, as a queued send's are.
+        if self.is_accepting_drain() && !expired && order.starts_runs() {
+            self.track_recovery().map_err(SendOutcome::Transient)?;
+        }
         self.append_own_batch_with_media(&records, &staged)
             .await
             .map_err(|error| SendOutcome::Error(format!("{error:?}")))?;

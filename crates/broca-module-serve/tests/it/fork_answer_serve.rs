@@ -307,6 +307,7 @@ impl RunExecutor for StoreLoop {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
+                accepting_drain: None,
                 model_call_ready: None,
                 pause_for_auth_at_start: None,
                 account_continue: None,
@@ -593,6 +594,7 @@ impl Rig {
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
                 subc_capabilities: vec![],

@@ -59,6 +59,7 @@ where
             max_same_account_wait: Default::default(),
             auth_selection: None,
             step_progress: control.step_progress.clone(),
+            accepting_drain: None,
             model_call_ready: None,
             pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
             account_continue: None,

@@ -575,6 +575,7 @@ impl RunExecutor for LoopExecutor {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
+                accepting_drain: control.accepting_drain.clone(),
                 model_call_ready: media_wait,
                 pause_for_auth_at_start: None,
                 account_continue: None,

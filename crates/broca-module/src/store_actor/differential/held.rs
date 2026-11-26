@@ -288,6 +288,7 @@ impl RunExecutor for HeldExecutor {
                 max_same_account_wait: Default::default(),
                 auth_selection: control.auth_selection,
                 step_progress: control.step_progress,
+                accepting_drain: control.accepting_drain.clone(),
                 model_call_ready: None,
                 pause_for_auth_at_start: control.pause_for_auth_at_start,
                 account_continue: None,

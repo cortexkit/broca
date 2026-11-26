@@ -245,6 +245,7 @@ async fn health_check_stream_chunks_session_reads_and_actor_opens_start_at_zero_
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],

@@ -85,7 +85,10 @@ use plan_notes::{removed_tools, with_plan_notes, with_plan_system};
 mod resolved;
 use resolved::{resolve, Resolved};
 mod stops;
-use stops::{hard_stop, stop_before_batch, stopped_batch, stopped_batch_in};
+use stops::{
+    accepting_before_batch, append_end, finish, finish_idle, hard_stop, stop_before_batch,
+    stopped_batch, stopped_batch_in,
+};
 mod send_facts;
 pub use send_facts::SendFacts;
 mod setup;
@@ -234,6 +237,8 @@ pub struct Seams<'a, P, T> {
     /// `cancel`, it cuts nothing in flight: the run stops at its next step boundary, where it
     /// pauses or ends interrupted as its restart policy says.
     pub stop: CancellationToken,
+    /// Like `stop` at work boundaries, but does not ask dispatched tools to yield.
+    pub accepting_drain: Option<CancellationToken>,
     /// The late-result runtime's waiting slots for calls a provider holds. Without it a held
     /// call is never answered, and its run pauses.
     pub held: Option<&'a dyn ProviderHeldLifecycle>,
@@ -291,6 +296,12 @@ pub struct Seams<'a, P, T> {
 }
 
 impl<'a, P, T> Seams<'a, P, T> {
+    fn is_accepting_drain(&self) -> bool {
+        self.accepting_drain
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }
+
     /// These seams, with the run moved to another account: `provider` sends on it and
     /// `auth_selection` names it.
     fn moved_to<'b>(
@@ -306,6 +317,7 @@ impl<'a, P, T> Seams<'a, P, T> {
             out: self.out,
             cancel: self.cancel.clone(),
             stop: self.stop.clone(),
+            accepting_drain: self.accepting_drain.clone(),
             held: self.held,
             approval: self.approval,
             hook_plane: self.hook_plane.clone(),
@@ -2305,11 +2317,14 @@ where
             )
             .await;
         }
+        if seams.is_accepting_drain() && known.is_empty() {
+            let calls = if started { &unsent } else { &planned };
+            return accepting_before_batch(writer, seams, admission, step_id, calls, started).await;
+        }
         match batch(
             writer,
             seams,
-            &admission.run_id,
-            admission.send.scope.as_ref(),
+            admission,
             step_id,
             // The step's request isn't rendered again, so its calls cite no number.
             &[],
@@ -2391,6 +2406,7 @@ where
         // boundary that ends the run applies none.
         let ending = cancelled_now
             || stopping
+            || seams.is_accepting_drain()
             || writer
                 .operations()
                 .run
@@ -2419,13 +2435,14 @@ where
         // A step entered again after a move writes no boundary, unless the run must end or
         // pause here: a cancel or a stop that came while routing was asked or the move was
         // written is acted on before anything is sent on the new account.
-        let boundary = if entering.is_some() && !ending {
+        let boundary = if entering.is_some() && !ending && !seams.is_accepting_drain() {
             Vec::new()
         } else {
             writer
                 .append_with(
                     &mut |conversation, operations, first_seq| {
                         let run = operations.run.as_ref().expect("a run is active");
+                        let stopping = stopping || seams.is_accepting_drain();
                         if !(cancelled_now || run.cancel.is_some()) && stopping && resumes {
                             return restart_pause.take().into_iter().collect();
                         }
@@ -3461,11 +3478,14 @@ where
             )
             .await;
         }
+        if seams.is_accepting_drain() {
+            return accepting_before_batch(writer, seams, admission, step_id, &uncut, started)
+                .await;
+        }
         match batch(
             writer,
             seams,
-            &admission.run_id,
-            admission.send.scope.as_ref(),
+            admission,
             step_id,
             &shown_tags,
             &calls,
@@ -4508,9 +4528,7 @@ enum BatchOutcome {
 async fn batch<W, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
-    run_id: &str,
-    // The scope the run is frozen to: its tool calls are routed under it.
-    scope: Option<&broca_protocol::SessionScope>,
+    admission: &Admission,
     step_id: u64,
     // The part numbers the step's request showed, which the batch's start records.
     shown_tags: &[broca_session_store::record::TagRange],
@@ -4532,12 +4550,13 @@ where
     P: Provider,
     T: ToolPlane,
 {
+    let run_id = admission.run_id.as_str();
     let batch_id = format!("{run_id}-b{step_id}");
     let ctx = BatchCtx {
         batch_id: BatchId(batch_id.clone()),
         bind: seams.bind.clone(),
         run_id: RunId(run_id.into()),
-        scope: scope.cloned(),
+        scope: admission.send.scope.clone(),
         // A result keeps only media captured here for that exact call (`checked`).
         media_capture: writer.media(),
     };
@@ -4669,9 +4688,16 @@ where
         Box::pin(ordered_sends(writer, sends_read)).await?
     };
     let system_after = system_after_results(seams.provider);
+    let mut deferred = false;
     let written = writer
         .append_with(
             &mut |conversation, operations, first_seq| {
+                // Routing and hooks can await. Check again at the barrier that commits
+                // this batch to dispatch, before writing any new call intent.
+                if known.is_empty() && seams.is_accepting_drain() {
+                    deferred = true;
+                    return Vec::new();
+                }
                 let mut records = Vec::with_capacity(calls.len() + 1);
                 if !started {
                     records.push(Record::BatchStart(BatchStart {
@@ -4793,6 +4819,12 @@ where
             true,
         )
         .await?;
+    if deferred {
+        let _ = seams.tools.batch_finished(&ctx).await;
+        return accepting_before_batch(writer, seams, admission, step_id, calls, started)
+            .await
+            .map(BatchOutcome::Stopped);
+    }
     if !dispatching {
         let _ = seams.tools.batch_finished(&ctx).await;
         if let Some(changes) = changes {
@@ -5721,78 +5753,6 @@ fn finished<W: Writer>(writer: &W, reason: RunFinishReason) -> Finished {
         paused: None,
         sign_in: None,
     }
-}
-
-/// Appends the run's end, durable before the run reports it.
-async fn finish<W: Writer, P, T>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    run_id: &str,
-    reason: RunFinishReason,
-) -> Result<Finished, LoopError> {
-    let record = run_end(writer, run_id, reason, (seams.now_ms)());
-    append_end(writer, run_id, vec![record]).await?;
-    Ok(finished(writer, reason))
-}
-
-/// Ends a run a crash left idle: its last step answered without calls, and the run's end was
-/// never written. A completed run admitted with structured output records what it produced with
-/// that end, as the step would have: the step writes both in one barrier, so neither is durable.
-async fn finish_idle<W: Writer, P, T>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    admission: &Admission,
-    reason: RunFinishReason,
-) -> Result<Finished, LoopError> {
-    let mut records = Vec::new();
-    if reason == RunFinishReason::Completed {
-        if let Some(frozen) = structured_of(admission) {
-            let text = (frozen.mode == broca_protocol::structured_output::Mode::FinalText)
-                .then(|| writer.conversation().newest().cloned())
-                .flatten()
-                .filter(|message| message.role == Role::Assistant)
-                .map(|message| broca_core::structured_output::joined_text_of(&message.content));
-            records.push(structured_result(
-                &admission.run_id,
-                broca_protocol::structured_output::result(
-                    &frozen,
-                    true,
-                    None,
-                    text.as_deref(),
-                    Vec::new(),
-                ),
-            ));
-        }
-    }
-    records.push(run_end(writer, &admission.run_id, reason, (seams.now_ms)()));
-    append_end(writer, &admission.run_id, records).await?;
-    Ok(finished(writer, reason))
-}
-
-/// Appends `records`, which end with the run's end, as one durable batch. Messages steered or
-/// delivered since the last boundary enter the conversation just before the end: the run ends
-/// with them in its conversation.
-async fn append_end<W: Writer>(
-    writer: &mut W,
-    run_id: &str,
-    records: Vec<Record>,
-) -> Result<(), LoopError> {
-    let run_id = run_id.to_string();
-    let mut records = Some(records);
-    writer
-        .append_with(
-            &mut |_, operations, first_seq| {
-                let mut batch = records.take().expect("one batch");
-                let end = batch.pop().expect("the batch ends with the run's end");
-                batch.extend(placed_copies(operations, &run_id));
-                batch.push(end);
-                name_resumed_from(&mut batch, first_seq);
-                batch
-            },
-            true,
-        )
-        .await?;
-    Ok(())
 }
 
 /// Names, in each `Resumed` record of a batch, the record just before the batch: the seq before

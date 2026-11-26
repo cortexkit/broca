@@ -94,10 +94,13 @@ lease.
 credential, usage and charge basis. Provider measurements that were not reported
 stay absent, rather than becoming zero.
 
-**Shutdown**. Daemon connection closure or SIGTERM stops admission. In-flight
-runs have a short grace period to finish; remaining runs are sealed
+**Shutdown**. On an accepting restart drain, broca keeps serving requests and
+durably queues new sends without starting their runs. It finishes in-flight model
+steps, tool batches and sessionless calls before signaling readiness, up to the
+daemon's deadline. Ordinary drains, daemon connection closure and SIGTERM stop
+admission; work still in flight after the post-GOODBYE grace is sealed
 `Interrupted`, not `Cancelled`. After SIGTERM, broca re-raises the signal so the
-supervisor can respawn it.
+supervisor can respawn it. See [module lifecycle](module-lifecycle.md).
 
 ## Crate map
 

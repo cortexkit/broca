@@ -2371,6 +2371,7 @@ async fn bind_test_route(daemon: &mut tokio::io::DuplexStream, session: &str) {
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
                 subc_capabilities: vec![],
@@ -2630,6 +2631,7 @@ async fn reader_answers_health_ping_during_authorization_and_permit_waits() {
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
                 subc_capabilities: vec![],
@@ -2992,6 +2994,7 @@ async fn bound_frame_loop<H: ServeHandler + 'static>(
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
                 subc_capabilities: vec![],
@@ -3163,6 +3166,7 @@ async fn a_panicking_request_does_not_end_the_connection() {
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
                 subc_capabilities: vec![],
@@ -3318,6 +3322,7 @@ async fn a_scope_describe_rides_the_registered_module_connection() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3426,6 +3431,7 @@ async fn a_request_task_finishing_mid_frame_does_not_desync_the_reader() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3572,6 +3578,7 @@ async fn unbound_and_stale_module_frames_are_counted_without_replies() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],

@@ -292,6 +292,7 @@ async fn run_episode(
         max_same_account_wait: Default::default(),
         auth_selection: None,
         step_progress: None,
+        accepting_drain: None,
         model_call_ready: None,
         pause_for_auth_at_start: None,
         account_continue: None,

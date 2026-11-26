@@ -883,6 +883,7 @@ fn seams<'a>(
         max_same_account_wait: wait,
         auth_selection: Some(selection),
         step_progress: None,
+        accepting_drain: None,
         model_call_ready: None,
         pause_for_auth_at_start: None,
         account_continue: routing.map(|routing| routing as &dyn AccountContinue<Box<dyn Provider>>),

@@ -741,6 +741,7 @@ pub fn manifest_configured(module_id: &str, consumer_routes: &ConsumerRoutes) ->
         // addresses. Project id never keys a session.
         // `bind-no-project/v1` promises that only scope supplies project attribution.
         provides: vec![
+            subc_protocol::session::ACCEPTING_DRAIN_CAPABILITY.to_string(),
             broca_wire::LLM_RUNNER_V1.to_string(),
             "compaction-runner/v1".to_string(),
             broca_wire::agent_data::PROVIDES.to_string(),
@@ -1146,11 +1147,11 @@ mod provenance_tests {
         assert_eq!(
             obj["capabilities"],
             serde_json::json!({
-                "provides": ["llm-runner/v1", "compaction-runner/v1", "agent-data/v1", "classifier/v1", "extractor/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1", "bind-no-project/v1"],
+                "provides": ["accepting-drain/v1", "llm-runner/v1", "compaction-runner/v1", "agent-data/v1", "classifier/v1", "extractor/v1", "tool-provider/v1", "permissions/v1", "flow-scopes/v1", "agent-run-scopes/v1", "scope-workdir/v1", "bind-no-project/v1"],
                 "requires": [],
                 "must_never_reach": [],
             }),
-            "broca declares runner, agent-data, classifier, model-tool and permissions roles, flow and agent-run scope handling, scope workdir stamps, and requires or denies nothing"
+            "broca declares accepting drain, runner, agent-data, classifier, model-tool and permissions roles, flow and agent-run scope handling, scope workdir stamps, and requires or denies nothing"
         );
         //
         // `consumes` has skip_serializing_if = "Vec::is_empty" since subc-protocol 0.19.0, so

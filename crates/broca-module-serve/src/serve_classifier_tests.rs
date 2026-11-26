@@ -252,9 +252,10 @@ async fn start_with_basis(table: crate::billing_routing::ChargeBasisTable) -> Ri
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
-                subc_capabilities: vec![],
+                subc_capabilities: vec![subc_protocol::session::ACCEPTING_DRAIN_CAPABILITY.into()],
                 storage: None,
                 machine_id: None,
             })
@@ -406,6 +407,77 @@ fn run_stamp(run: &str) -> subc_protocol::scope::ScopeStamp {
         "attributes": {"agent_id": "agent", "run_id": run}
     }))
     .unwrap()
+}
+
+#[tokio::test]
+async fn accepting_drain_waits_for_in_flight_sessionless_call() {
+    let mut rig = start().await;
+    rig.bind(9, &[broca_subc::CLASSIFIER_ROLE_VERSIONS]).await;
+    rig.request(9, 1, "classify.run", classify_params("draining-batch"))
+        .await;
+    let provider = rig.provider.clone();
+    broca_test_support::wait_for(
+        "classifier provider in flight",
+        async {
+            loop {
+                let entered = provider.entered.notified();
+                if provider.waiting.load(Ordering::SeqCst) != 0 {
+                    break;
+                }
+                entered.await;
+            }
+        },
+        || "waiting for the classifier provider".into(),
+    )
+    .await;
+    let deadline_ms = now_epoch_ms() + 60_000;
+    let body = serde_json::to_vec(&json!({"op": "module.draining", "reason": "restart", "deadline_ms": deadline_ms, "accepting": true})).unwrap();
+    write_frame(
+        &mut rig.daemon,
+        &Frame::build(FrameType::Push, control_flags(), 0, 0, 0, body).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let answer = {
+        // Give the readiness check time to run while the provider is still held. Keep the
+        // same read future alive in case any bytes arrive as the observation window ends.
+        let first = rig.reply();
+        tokio::pin!(first);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut first)
+                .await
+                .is_err(),
+            "ready must not overtake the held classifier reply"
+        );
+        provider.gate.add_permits(1);
+        first.await
+    };
+    assert_eq!(
+        (answer.header.ty, answer.header.channel, answer.header.corr),
+        (FrameType::Response, 9, 1)
+    );
+    let ready = rig.reply().await;
+    assert_eq!(
+        (ready.header.ty, ready.header.channel),
+        (FrameType::Request, 0)
+    );
+    assert_eq!(ready.body, br#"{"op":"module.drain_ready"}"#);
+    write_frame(
+        &mut rig.daemon,
+        &Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0,
+            0,
+            ready.header.corr,
+            ready.body,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    rig.finish().await;
 }
 
 #[tokio::test]

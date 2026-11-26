@@ -47,6 +47,8 @@ where
     let mut manifest = hello_manifest(module_id, consumer_routes, false);
     manifest.ready = Some(false);
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![
@@ -83,6 +85,8 @@ pub(super) async fn send_hello(
 ) -> Result<(), ServeIoError> {
     let manifest = hello_manifest(module_id, consumer_routes, image_references);
     let body = serde_json::to_vec(&ModuleHelloBody {
+        module_capabilities: None,
+        resume_token: None,
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),

@@ -196,6 +196,7 @@ impl RunExecutor for MovingExecutor {
                 max_same_account_wait: Default::default(),
                 auth_selection: Some(routed("A")),
                 step_progress: control.step_progress.clone(),
+                accepting_drain: None,
                 model_call_ready: None,
                 pause_for_auth_at_start: None,
                 account_continue: Some(&routing),

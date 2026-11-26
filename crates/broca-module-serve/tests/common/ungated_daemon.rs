@@ -54,6 +54,7 @@ async fn serve(mut stream: tokio::net::TcpStream, key: Vec<u8>, daemon_id: [u8; 
             FrameType::Hello => (
                 FrameType::HelloAck,
                 serde_json::to_vec(&ModuleHelloAckBody {
+                    resume_token: None,
                     negotiated_ver: PROTOCOL_VERSION,
                     subc_ops: vec![],
                     subc_capabilities: vec![],

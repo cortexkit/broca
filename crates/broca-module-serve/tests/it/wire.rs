@@ -497,6 +497,7 @@ async fn vault_audit_is_answered_by_the_daemon_auditor_without_opening_a_session
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -597,6 +598,7 @@ async fn memory_report_answers_only_the_operator_and_opens_no_session() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -702,6 +704,7 @@ async fn retired_usage_export_is_unknown_and_terminal_facts_remain() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -861,6 +864,7 @@ async fn removed_spend_cap_operations_are_unknown_methods_that_write_nothing() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -998,6 +1002,7 @@ async fn bind_ack_precedes_route_egress_and_stale_epoch_is_silent() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -1094,6 +1099,7 @@ async fn separator_collision_bind_is_rejected_before_any_durable_state() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -1279,6 +1285,7 @@ async fn hello_bind_send_with_system_writes_leading_system_message() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -1392,6 +1399,7 @@ async fn session_send_rejects_reserved_seed_from_before_starting_a_run() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -1484,6 +1492,7 @@ async fn session_send_refuses_an_unknown_context_management_value_before_startin
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -1589,6 +1598,7 @@ async fn session_send_refuses_an_unknown_service_tier_before_starting_a_run() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -1745,6 +1755,7 @@ async fn health_check_reports_slot_counts_and_stale_lkg_without_degrading() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -2304,6 +2315,7 @@ async fn a_vanished_project_root_refuses_execute_ops_but_still_admits_run_ops() 
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -2453,6 +2465,7 @@ async fn health_check_vault_gauge_flips_on_stamped_outcomes() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -2624,6 +2637,7 @@ async fn hello_bind_send_status_roundtrip() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -2728,6 +2742,7 @@ async fn slow_request_on_one_session_does_not_block_another_session() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -2862,6 +2877,7 @@ async fn pipelined_requests_for_one_session_reach_the_handler_in_wire_order() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -2999,6 +3015,7 @@ async fn read_route_manifest_and_page_roundtrip() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3147,6 +3164,7 @@ async fn same_send_id_same_prompt_reuses_one_episode() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3291,6 +3309,7 @@ async fn subscribe_streams_then_egress_close_tears_down_cleanly() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3437,6 +3456,7 @@ async fn serve_returns_on_daemon_eof_so_the_seal_can_run() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3503,6 +3523,7 @@ async fn serve_returns_on_channel0_goodbye_with_cause_goodbye() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3581,6 +3602,7 @@ async fn serve_ends_ok_when_the_daemon_resets_the_socket() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3688,6 +3710,7 @@ async fn project_observation_wire(import: bool) {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -3942,6 +3965,7 @@ impl PrincipalRig {
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
                 subc_capabilities: vec![],
@@ -4422,6 +4446,7 @@ async fn undecodable_control_request_errors_and_keeps_connection_alive() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -4518,6 +4543,7 @@ async fn session_send_invalid_on_restart_matches_golden_and_writes_nothing() {
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],
@@ -4637,6 +4663,7 @@ async fn send_declared_tool_reply_is_validated_frozen_and_inherited_over_the_ser
         0,
         hello.header.corr,
         serde_json::to_vec(&ModuleHelloAckBody {
+            resume_token: None,
             negotiated_ver: PROTOCOL_VERSION,
             subc_ops: vec![],
             subc_capabilities: vec![],

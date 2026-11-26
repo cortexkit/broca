@@ -328,6 +328,10 @@ impl Complete {
         self
     }
 
+    pub(super) fn in_flight(&self) -> usize {
+        self.flights.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
     pub fn with_poll(mut self, poll: Duration) -> Self {
         self.poll = poll;
         self

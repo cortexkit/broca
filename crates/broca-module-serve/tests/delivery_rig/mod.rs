@@ -714,6 +714,7 @@ impl RunExecutor for CoreExec {
                 max_same_account_wait: Default::default(),
                 auth_selection: control.auth_selection.clone(),
                 step_progress: control.step_progress.clone(),
+                accepting_drain: control.accepting_drain.clone(),
                 model_call_ready,
                 pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
                 account_continue: None,
@@ -961,13 +962,15 @@ impl Rig {
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
-                subc_capabilities: if daemon_scopes {
-                    vec![subc_protocol::scope::CAP_SCOPES_V1.into()]
-                } else {
-                    vec![]
-                },
+                subc_capabilities: std::iter::once(
+                    subc_protocol::session::ACCEPTING_DRAIN_CAPABILITY,
+                )
+                .chain(daemon_scopes.then_some(subc_protocol::scope::CAP_SCOPES_V1))
+                .map(str::to_owned)
+                .collect(),
                 storage: None,
                 machine_id: None,
             })
@@ -1027,6 +1030,50 @@ impl Rig {
             }
             self.skipped.push(reply);
         }
+    }
+
+    pub async fn drain_push(&mut self, accepting: bool, deadline_ms: u64) {
+        let mut body = serde_json::json!({"op":"module.draining", "reason":"restart", "deadline_ms": deadline_ms});
+        if accepting {
+            body["accepting"] = true.into();
+        }
+        self.drain_frame(FrameType::Push, 0, serde_json::to_vec(&body).unwrap())
+            .await;
+    }
+
+    pub async fn drain_ready(&mut self) -> Frame {
+        let frame = broca_test_support::wait_for(
+            "module.drain_ready",
+            read_frame(&mut self.reader),
+            || {
+                format!(
+                    "in-flight runs: {}",
+                    self.registry.slot_counts().runs_in_flight
+                )
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (frame.header.ty, frame.header.channel, frame.header.epoch),
+            (FrameType::Request, 0, 0)
+        );
+        assert_eq!(frame.body, br#"{"op":"module.drain_ready"}"#);
+        frame
+    }
+
+    pub async fn drain_frame(&mut self, kind: FrameType, corr: u64, body: Vec<u8>) {
+        let frame = Frame::build(
+            kind,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .unwrap();
+        write_frame(&mut self.writer, &frame).await.unwrap();
     }
 
     /// Opens `session.subscribe` with `params` on `channel` and returns its correlation id
@@ -1536,11 +1583,15 @@ impl Rig {
     }
 
     pub async fn records(&self) -> Vec<Record> {
+        self.records_for(&self.session).await
+    }
+
+    pub async fn records_for(&self, session: &BindIdentity) -> Vec<Record> {
         let runtime = self
             .registry
             .store_runtime()
             .expect("the rig keeps its sessions in the new storage");
-        match runtime.current_view(&self.session).await {
+        match runtime.current_view(session).await {
             Ok(Some(view)) => view
                 .open_log_records()
                 .await

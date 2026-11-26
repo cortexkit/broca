@@ -42,6 +42,7 @@ mod stored_log;
 #[path = "../common/ungated_daemon.rs"]
 mod ungated_daemon;
 
+mod accepting_drain;
 mod account_selection_real_daemon;
 mod anthropic_default_cache_render;
 mod anthropic_model_switch_live;

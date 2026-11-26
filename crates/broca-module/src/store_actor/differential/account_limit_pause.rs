@@ -331,6 +331,7 @@ impl RunExecutor for Executor {
                 max_same_account_wait: Default::default(),
                 auth_selection: Some(selection),
                 step_progress: control.step_progress,
+                accepting_drain: control.accepting_drain.clone(),
                 model_call_ready: None,
                 pause_for_auth_at_start: self.sign_in_error(),
                 account_continue: routing_enabled.then_some(self as &dyn AccountContinue<Limited>),

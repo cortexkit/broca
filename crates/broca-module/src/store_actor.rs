@@ -932,7 +932,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 });
             let timed_pause = self.account_limit_timer.clone().filter(|_| {
                 self.registry.as_ref().is_none_or(|registry| {
-                    registry.restart_resume_ready() && !registry.is_stopping()
+                    registry.restart_resume_ready()
+                        && !registry.is_stopping()
+                        && !registry.is_accepting_drain()
                 })
             });
             let account_deadline = timed_pause.as_ref().map(|pause| pause.resume_not_before_ms);
@@ -1636,7 +1638,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                                 message_marks: None,
                             };
                             let mode = self.sign_in_recheck_mode().await;
-                            self.start_run(start, None, Some(reply), mode).await;
+                            if self.is_accepting_drain() {
+                                let _ = reply.send(SendOutcome::Paused {
+                                    run_id,
+                                    reason: broca_protocol::PauseReason::AuthRequired,
+                                    delivered: None,
+                                });
+                            } else {
+                                self.start_run(start, None, Some(reply), mode).await;
+                            }
                             return false;
                         }
                         Err(error) => {
@@ -1908,7 +1918,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         self.steer_restart_paused(start, paused, &mut reply).await
                     };
                     let _ = reply.send(outcome);
-                } else if self.run.is_some() || self.running().is_some() {
+                } else if self.run.is_some()
+                    || self.running().is_some()
+                    || self.is_accepting_drain()
+                {
                     // A run whose end is written still owns the session until its task returns
                     // and `finish_run` takes it: a run started now would replace it, and the
                     // finished run's remaining work (its warm records, the queue drain, the
@@ -1927,33 +1940,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                         self.drain().await;
                     }
                 } else {
-                    let mut start = start;
-                    let admitted = match self.freeze_plan(&mut start) {
-                        // A run starts with the send's attachments staged into its input before
-                        // its transforms; they are held until the run's start, which stores them,
-                        // is appended.
-                        Ok(()) => match self.stage_media(&mut start.request, None).await {
-                            Ok(staged) => {
-                                for item in &staged {
-                                    self.held.hold(&item.reference, Arc::clone(&item.bytes));
-                                }
-                                self.transform_fresh_input(&mut start, delivery, &mut reply)
-                                    .await
-                            }
-                            Err(outcome) => Err(outcome),
-                        },
-                        Err(outcome) => Err(outcome),
-                    };
-                    match admitted {
-                        Ok(()) => {
-                            self.start_run(start, None, Some(reply), StoreRunMode::Fresh)
-                                .await
-                        }
-                        Err(outcome) => {
-                            self.held.clear();
-                            let _ = reply.send(outcome);
-                        }
-                    }
+                    self.start_or_defer_send(start, delivery, reply).await;
                 }
                 false
             }
@@ -2252,6 +2239,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 .registry
                 .as_ref()
                 .map(|registry| registry.stopping_signal()),
+            accepting_drain: self
+                .registry
+                .as_ref()
+                .map(|registry| registry.accepting_drain_signal()),
             step_progress: Some(Arc::clone(&step)),
             hook_plane: self.executor.hook_plane(),
             provider_held_lifecycle: self.executor.provider_held_lifecycle(),
@@ -3019,44 +3010,6 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         })
     }
 
-    /// Runs a fresh run's own input through the session's `pre_user` transforms before starting
-    /// a run that consumes no queued send: the run sends what the transforms leave, and its
-    /// start records what they did. If a transform refuses the input, the run still starts and
-    /// ends with that refusal before any model call. A failure to run the transforms refuses
-    /// the send.
-    async fn transform_fresh_input(
-        &mut self,
-        start: &mut Start,
-        delivery: broca_protocol::Delivery,
-        reply: &mut oneshot::Sender<SendOutcome>,
-    ) -> Result<(), SendOutcome> {
-        let at_ms = start
-            .prepared
-            .retention
-            .map(|_| (self.now_ms)())
-            .or_else(broca_core::clock::epoch_millis);
-        let prepared = self
-            .transform_input(
-                start.request.input.clone(),
-                delivery,
-                start.manifest.as_deref(),
-                start.scope.as_ref(),
-                at_ms,
-                reply,
-            )
-            .await
-            .map_err(|outcome| {
-                SendOutcome::Error(format!("input preparation failed: {outcome:?}"))
-            })?;
-        start.prepared.at_ms = at_ms;
-        if let Some(provider) = &prepared.refused {
-            start.prepared.pre_model_error = Some(crate::actor::pre_user::refusal_error(provider));
-        }
-        start.request.input = prepared.input;
-        start.prepared.hooks = prepared.hooks;
-        Ok(())
-    }
-
     /// `input`, a send delivered as `delivery` and accepted at `at_ms`, through the `pre_user`
     /// transforms `manifest`'s plan declares (`crate::actor::pre_user`). They run under `scope`,
     /// the scope a session's first send freezes, else under the one the session froze. They give
@@ -3706,6 +3659,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         waiting: &mut Option<(broca_protocol::SubmissionId, oneshot::Sender<SendOutcome>)>,
     ) {
         if self.stopping
+            || self.is_accepting_drain()
             || self.run.is_some()
             || self
                 .session
@@ -3742,6 +3696,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     self.freeze_plan(&mut start)
                 }) {
                 Ok(()) => {
+                    if self.is_accepting_drain() {
+                        return;
+                    }
                     start.prepared.hooks = crate::actor::pre_user::drained_hooks(
                         drained.hooks.take(),
                         &start.request.input,

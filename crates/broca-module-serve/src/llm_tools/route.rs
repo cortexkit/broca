@@ -154,6 +154,12 @@ pub struct LlmTools {
 }
 
 impl LlmTools {
+    pub(crate) fn completions_in_flight(&self) -> usize {
+        self.complete
+            .as_ref()
+            .map_or(0, |complete| complete.in_flight())
+    }
+
     pub fn new(
         system: Arc<crate::system_one::SystemOne>,
         config: crate::config::LlmToolsConfig,

@@ -1312,6 +1312,7 @@ impl LineageRegistry {
                 opener,
                 run_index,
                 stopping: tokio_util::sync::CancellationToken::new(),
+                accepting_drain: tokio_util::sync::CancellationToken::new(),
                 seal: tokio_util::sync::CancellationToken::new(),
                 seal_state: Mutex::new(SealState::default()),
                 shutdown_report: Mutex::new(None),
@@ -2580,6 +2581,12 @@ impl LineageRegistry {
         }
     }
 
+    /// Stop starting work without closing admission or interrupting a dispatched tool batch.
+    /// Only the replacement process starts work again.
+    pub fn begin_accepting_drain(&self) {
+        self.inner.accepting_drain.cancel();
+    }
+
     /// Stop admission and queued dispatch, asking active runs to stop at their next step boundary.
     /// This does not seal actors or start a deadline: the daemon's drain window belongs to
     /// in-flight work. Its channel-0 GOODBYE (or connection loss) starts the final seal budget.
@@ -3002,6 +3009,14 @@ impl RegistryHandle {
         self.inner.stopping.is_cancelled()
     }
 
+    pub(crate) fn is_accepting_drain(&self) -> bool {
+        self.inner.accepting_drain.is_cancelled()
+    }
+
+    pub(crate) fn accepting_drain_signal(&self) -> tokio_util::sync::CancellationToken {
+        self.inner.accepting_drain.child_token()
+    }
+
     pub(crate) fn seal_signal(&self) -> tokio_util::sync::CancellationToken {
         self.inner.seal.clone()
     }
@@ -3371,6 +3386,7 @@ struct Inner {
     opener: Arc<dyn LineageOpener>,
     run_index: Option<Arc<dyn broca_core::RunEventBodies>>,
     stopping: tokio_util::sync::CancellationToken,
+    accepting_drain: tokio_util::sync::CancellationToken,
     seal: tokio_util::sync::CancellationToken,
     seal_state: Mutex<SealState>,
     shutdown_report: Mutex<Option<ShutdownReport>>,

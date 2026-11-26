@@ -3,6 +3,41 @@
 
 use super::*;
 
+/// Keep the unanswered tool turn intact for a restart resume. A non-resumable run still
+/// closes its unsent calls as interrupted, just as it would on an ordinary stop.
+pub(super) async fn accepting_before_batch<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    step_id: u64,
+    calls: &[ToolCall],
+    started: bool,
+) -> Result<Finished, LoopError> {
+    if admission.on_restart == Some(OnRestart::Resume) && !seams.stop.is_cancelled() {
+        pause(
+            writer,
+            seams,
+            &admission.run_id,
+            PauseReason::Restart,
+            None,
+            None,
+            None,
+        )
+        .await
+    } else {
+        stopped_batch_in(
+            writer,
+            seams,
+            &admission.run_id,
+            step_id,
+            calls,
+            seams.cancel.is_cancelled(),
+            !started,
+        )
+        .await
+    }
+}
+
 /// Every call the open tool turn's assistant message asked for.
 /// The stop condition the step that asked for the open tool turn's calls met, while that step's
 /// batch hasn't started. The live loop closes such calls as not run right after the answer
@@ -189,4 +224,76 @@ pub(super) async fn stopped_batch_in<W: Writer, P, T>(
     records.push(end);
     append_end(writer, run_id, records).await?;
     Ok(finished(writer, reason))
+}
+
+/// Appends the run's end, durable before the run reports it.
+pub(super) async fn finish<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    reason: RunFinishReason,
+) -> Result<Finished, LoopError> {
+    let record = run_end(writer, run_id, reason, (seams.now_ms)());
+    append_end(writer, run_id, vec![record]).await?;
+    Ok(finished(writer, reason))
+}
+
+/// Ends a run a crash left idle: its last step answered without calls, and the run's end was
+/// never written. A completed run admitted with structured output records what it produced with
+/// that end, as the step would have: the step writes both in one barrier, so neither is durable.
+pub(super) async fn finish_idle<W: Writer, P, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    admission: &Admission,
+    reason: RunFinishReason,
+) -> Result<Finished, LoopError> {
+    let mut records = Vec::new();
+    if reason == RunFinishReason::Completed {
+        if let Some(frozen) = structured_of(admission) {
+            let text = (frozen.mode == broca_protocol::structured_output::Mode::FinalText)
+                .then(|| writer.conversation().newest().cloned())
+                .flatten()
+                .filter(|message| message.role == Role::Assistant)
+                .map(|message| broca_core::structured_output::joined_text_of(&message.content));
+            records.push(structured_result(
+                &admission.run_id,
+                broca_protocol::structured_output::result(
+                    &frozen,
+                    true,
+                    None,
+                    text.as_deref(),
+                    Vec::new(),
+                ),
+            ));
+        }
+    }
+    records.push(run_end(writer, &admission.run_id, reason, (seams.now_ms)()));
+    append_end(writer, &admission.run_id, records).await?;
+    Ok(finished(writer, reason))
+}
+
+/// Appends `records`, which end with the run's end, as one durable batch. Messages steered or
+/// delivered since the previous step boundary enter the conversation just before the end, so
+/// the run ends with them in its conversation.
+pub(super) async fn append_end<W: Writer>(
+    writer: &mut W,
+    run_id: &str,
+    records: Vec<Record>,
+) -> Result<(), LoopError> {
+    let run_id = run_id.to_string();
+    let mut records = Some(records);
+    writer
+        .append_with(
+            &mut |_, operations, first_seq| {
+                let mut batch = records.take().expect("one batch");
+                let end = batch.pop().expect("the batch ends with the run's end");
+                batch.extend(placed_copies(operations, &run_id));
+                batch.push(end);
+                name_resumed_from(&mut batch, first_seq);
+                batch
+            },
+            true,
+        )
+        .await?;
+    Ok(())
 }

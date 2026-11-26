@@ -442,6 +442,8 @@ fn to_broca_identity(id: &SubcBindIdentity) -> BrocaBindIdentity {
     }
 }
 
+#[path = "serve_accepting_drain.rs"]
+mod accepting_drain;
 #[path = "serve_hello.rs"]
 mod hello;
 #[path = "serve_run_ids.rs"]
@@ -578,6 +580,7 @@ fn to_bind_principal(principal: &subc_protocol::Principal) -> broca_protocol::Bi
 /// cancel for a live subscribe stream on that channel (cancelled on the route's GOODBYE so
 /// an explicit unsubscribe tears the forward task down promptly).
 struct Routes {
+    drain: accepting_drain::Drain,
     /// The settings gate, when broca registered through it (`settings::gate`).
     gate: Option<Arc<crate::settings::gate::Gate>>,
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
@@ -603,6 +606,7 @@ struct Routes {
 impl Routes {
     fn new(daemon_scopes: bool) -> Self {
         Self {
+            drain: accepting_drain::Drain::default(),
             gate: None,
             agent_data: None,
             system_one: None,
@@ -1152,6 +1156,7 @@ where
         .any(|capability| capability == subc_protocol::scope::CAP_SCOPES_V1);
 
     let mut routes = Routes::new(daemon_scopes);
+    routes.drain = accepting_drain::Drain::negotiated(&ack);
     routes.gate = gate;
     routes.agent_data = agent_data;
     routes.system_one = system_one;
@@ -1179,6 +1184,9 @@ where
 
     let loop_result = loop {
         tokio::select! {
+            _ = routes.drain.next_check() => {
+                routes.drain.check(health_registry, &writer, routes.llm_tools.as_deref()).await;
+            }
             joined = routes.bind_tasks.join_next(), if !routes.bind_tasks.is_empty() => {
                 match joined.expect("guarded by !routes.bind_tasks.is_empty()") {
                     Ok(completed) => finish_bind(completed, &writer, &mut routes).await?,
@@ -1239,7 +1247,8 @@ where
                 // A reply to the describer's own request is its alone; every other frame is
                 // handled as before.
                 let describe_reply = scope_describer.is_some_and(|describer| describer.on_frame(&frame))
-                    || routes.gate.as_ref().is_some_and(|gate| gate.on_frame(&frame));
+                    || routes.gate.as_ref().is_some_and(|gate| gate.on_frame(&frame))
+                    || routes.drain.on_reply(&frame, health_registry);
                 if !describe_reply && !handle_frame(
                     frame,
                     &writer,
@@ -1363,22 +1372,7 @@ where
                 request_tasks.spawn(async move { gate.on_changed(&frame.body).await });
                 return Ok(true);
             }
-            match serde_json::from_slice::<ModuleControlCommand>(&frame.body) {
-                Ok(ModuleControlCommand::Draining {
-                    reason,
-                    deadline_ms,
-                }) => {
-                    // Keep serving health probes and current tool replies. Starting the seal
-                    // timer here would spend the post-GOODBYE grace inside the drain window.
-                    health_registry.begin_stop();
-                    tracing::info!(target: "lifecycle", ?reason, deadline_ms,
-                        "module draining; admission stopped, waiting for step boundaries");
-                }
-                Err(error) => {
-                    tracing::warn!(target: "wire", %error,
-                        "ignored unknown or malformed channel-0 control push");
-                }
-            }
+            routes.drain.on_push(&frame, health_registry);
             Ok(true)
         }
         FrameType::Goodbye => {
@@ -1551,7 +1545,7 @@ where
                     routes.system_one.clone(),
                     writer,
                     request_tasks,
-                    (ver, channel, epoch, corr),
+                    ((ver, channel, epoch, corr), routes.drain.sessionless_call()),
                 );
                 return Ok(true);
             }
@@ -1617,11 +1611,14 @@ where
             }
             if matches!(bind.role, RouteRole::ToolProvider | RouteRole::Permissions) {
                 let service = routes.llm_tools.clone();
+                let in_flight =
+                    (bind.role == RouteRole::ToolProvider).then(|| routes.drain.sessionless_call());
                 let writer = writer.clone();
                 request_tasks.spawn(reply_on_panic(
                     writer.clone(),
                     (ver, channel, epoch, corr),
                     async move {
+                        let _in_flight = in_flight;
                         let operation = request_operation(&frame.body);
                         let caller = caller_module(&bind).map(str::to_owned);
                         log_served_request(

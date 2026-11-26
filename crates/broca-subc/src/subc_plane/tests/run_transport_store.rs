@@ -100,6 +100,7 @@ impl RunExecutor for Executor {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
+                accepting_drain: control.accepting_drain.clone(),
                 model_call_ready: None,
                 pause_for_auth_at_start: self.pause_once.swap(false, Ordering::SeqCst).then(|| {
                     serde_json::from_value(json!({"class":"auth_required","message":"sign in"}))

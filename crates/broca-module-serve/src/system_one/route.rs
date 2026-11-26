@@ -13,10 +13,14 @@ pub(super) fn spawn_request(
     service: Option<Arc<SystemOne>>,
     writer: &EgressSender<Frame>,
     request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
-    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    ((ver, channel, epoch, corr), in_flight): (
+        (u8, u16, u32, u64),
+        super::accepting_drain::InFlight,
+    ),
 ) {
     let writer = writer.clone();
     request_tasks.spawn(async move {
+        let _in_flight = in_flight;
         let operation = request_operation(&body);
         let caller = caller_module(&bind).map(str::to_owned);
         log_served_request(&operation, &session, caller.as_deref(), "reply", async move {

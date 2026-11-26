@@ -29,6 +29,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     pub(super) async fn resume_held(&mut self) -> Result<(), String> {
+        if self.is_accepting_drain() && self.run.is_none() {
+            return Ok(());
+        }
         if self.run.is_some() {
             // The live batch usually takes the deposited result directly. If it has already
             // decided to park, its terminal handler owes the continuation instead.

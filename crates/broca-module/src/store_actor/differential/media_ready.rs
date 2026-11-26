@@ -255,6 +255,7 @@ impl RunExecutor for ReadyExecutor {
                 max_same_account_wait: Default::default(),
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
+                accepting_drain: None,
                 model_call_ready: Some(ready),
                 pause_for_auth_at_start: None,
                 account_continue: None,

@@ -298,6 +298,7 @@ impl Rig {
             0,
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
+                resume_token: None,
                 negotiated_ver: PROTOCOL_VERSION,
                 subc_ops: vec![],
                 subc_capabilities: if scopes {

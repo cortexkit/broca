@@ -1079,6 +1079,7 @@ fn store_seams<'a, P: broca_core::provider::Provider>(
         auth_selection,
         // The actor's in-flight step, which `run.status` serves for its active run.
         step_progress: control.step_progress.clone(),
+        accepting_drain: control.accepting_drain.clone(),
         model_call_ready: None,
         pause_for_auth_at_start: control.pause_for_auth_at_start.clone(),
         account_continue: None,

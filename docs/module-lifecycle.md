@@ -4,7 +4,36 @@ Broca's run lifetime is separate from the `session.send` RPC: the reply acknowle
 durable admission, while the lineage actor owns execution and queued submissions.
 Shutdown must therefore count actors' work, not just the daemon's forwarded RPCs.
 
-## Drain first, final seal second
+## Accepting restart drains
+
+Broca declares `accepting-drain/v1`. A daemon that also advertises it in
+`HELLO_ACK.subc_capabilities` can restart or reload broca in two phases. It first
+sends `module.draining` with `accepting: true` and an absolute Unix-millisecond
+`deadline_ms`. It keeps admitting requests and does not consult the busy gauges.
+
+During this phase, reads, subscriptions and steers are served normally. A send
+that would start a run is durably queued before its `pending` reply, even on an
+idle session, and runs in the replacement process. A streaming model step or a
+dispatched tool batch finishes and records its result. Broca starts no new model
+step or tool batch. At the next boundary, an unfinished `on_restart: "resume"`
+run records `Pause{reason: restart}`; other unfinished runs end `interrupted`.
+A natural ending or a caller's cancellation still wins. An unanswered tool turn
+in a restart pause dispatches after restart, not during the drain. A run parked
+on a provider-held call stays parked. Sessionless model calls continue to be
+served and broca waits for those in flight.
+
+When the work has finished, broca sends one channel-0 `module.drain_ready`
+request and waits for its echo. After the echo, refusal or timeout, or if the
+drain deadline arrives first, broca stops admission. The daemon closes admission
+on readiness or expiry, allows up to 5 s for already-forwarded requests, then
+sends GOODBYEs. There is no second drain push. Broca then uses the same final
+seal budget as for an ordinary drain. The daemon controls the accepting window;
+setting a 600 s drain budget gives a restart up to ten minutes before teardown.
+
+## Ordinary drains and final seal
+
+Older daemons, module stop, daemon shutdown and `restart --now` use the ordinary
+path. A daemon shutdown can also take over an accepting drain this way.
 
 1. The daemon closes route admission and sends a channel-0 `PUSH` with
    `{"op":"module.draining","reason":"restart","deadline_ms":...}` over the
@@ -44,7 +73,7 @@ Shutdown must therefore count actors' work, not just the daemon's forwarded RPCs
    work is recovered after the unfinished episode. See
    [graceful restart policy](module-surface.md#graceful-restart-policy).
 
-The default module restart offers up to **30 s drain + 10 s grace** to reach a
+The default drain offers up to **30 s drain + 10 s grace** to reach a
 boundary. The drain can end early when idle; `--drain-ms` and `--now` can shorten
 it. SIGTERM or connection loss without a drain notice offers only the 10 s grace.
 The 20 s final budget includes grace and teardown, not 20 s in addition to grace.
@@ -54,15 +83,14 @@ Repeated drain notices are idempotent and do not escalate to a seal.
 
 The current daemon has no module drain-abort command or admission-resume notice.
 Once it sends `module.draining`, it proceeds to teardown, not back to serving.
-Broca intentionally leaves admission stopped even if GOODBYE is delayed or never
-arrives: reopening on a local deadline would admit work onto routes the daemon
-still marks draining. A transport failure runs the same final seal path; an
+Broca does not reopen admission once it stops, even if GOODBYE is delayed or
+never arrives. A transport failure runs the same final seal path; an
 operator must replace a module whose daemon cannot complete its drain.
 
 Daemon source references (paths relative to the subconscious checkout):
 
-- `crates/subc-protocol/src/session.rs:115-139`: the one-way command enum contains
-  only `module.draining { reason, deadline_ms }`, no abort/resume command.
+- `crates/subc-protocol/src/session.rs`: defines the ordinary and accepting
+  `module.draining` pushes and `module.drain_ready`, but no abort/resume command.
 - `crates/subc-daemon/src/supervise.rs:8235-8281`: serializes that command as
   `FrameType::Push`, channel/epoch/corr 0, and sends through `target.sink` (the
   registered module connection).

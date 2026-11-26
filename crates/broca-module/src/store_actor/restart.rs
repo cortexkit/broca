@@ -26,6 +26,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             .is_some_and(|registry| registry.restart_resume_ready())
     }
 
+    pub(super) fn is_accepting_drain(&self) -> bool {
+        self.registry
+            .as_ref()
+            .is_some_and(|registry| registry.is_accepting_drain())
+    }
+
     pub(super) fn finish_restart_waiters(&mut self, result: Result<(), String>) {
         self.restart_admitting = false;
         for reply in std::mem::take(&mut self.restart_waiters) {
@@ -43,7 +49,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     }
 
     pub(super) async fn resume_restart_pause(&mut self) -> Result<(), String> {
-        if self.run.is_some() {
+        if self.run.is_some() || self.is_accepting_drain() {
             return Ok(());
         }
         let Some(run) = self.session.operations().run.as_ref().filter(|run| {
