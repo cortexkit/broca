@@ -1,10 +1,15 @@
 # broca
 
+> [!WARNING]
+> **Alpha.** broca is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 broca is a durable LLM agent-loop runner that runs as a module of the
 subconscious daemon. It calls a model, dispatches requested tools and feeds their
-results back until the run stops. A write-ahead log records the run so it can
-resume after a restart without repeating a tool call that may have had a side
-effect.
+results back until the run stops. Its session store records each step before
+broca acts on it, so a run resumes after a restart without repeating a tool call
+that may have had a side effect.
 
 ## Repository map
 
