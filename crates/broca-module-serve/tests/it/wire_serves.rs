@@ -255,6 +255,7 @@ async fn role_describe_serves_tracks_complete_catalog_and_gateway_snapshots() {
             "google",
             "meta",
             "mixed",
+            "opencode-go",
             "openai-platform",
         ]
     );
@@ -272,6 +273,7 @@ async fn role_describe_serves_tracks_complete_catalog_and_gateway_snapshots() {
         &std::collections::BTreeSet::from(["gpt-fixture".into()])
     ));
     assert!(!capped.iter().any(|entry| entry.provider == "openai"));
+    assert!(!capped.iter().any(|entry| entry.provider == "opencode"));
     assert_eq!(capped[1].models, ServesModels::All);
     assert_eq!(capped[3].except.as_deref().unwrap(), ["no-endpoint"]);
     assert_eq!(capped[5].except.as_deref().unwrap(), ["unsupported"]);

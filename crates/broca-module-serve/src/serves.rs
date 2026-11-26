@@ -200,7 +200,9 @@ fn add_entry<'a>(
     provider: &'a str,
     models: &Models<'_>,
 ) -> Result<(), String> {
-    if matches!(provider, "openai" | "opencode" | "opencode-go") || models.admitted.is_empty() {
+    // ChatGPT logins are served only on the uncapped harness, and OpenCode's free models run
+    // through Thalamus (Third-Party Harnesses), not broca. OpenCode Go's paid plan is served.
+    if matches!(provider, "openai" | "opencode") || models.admitted.is_empty() {
         return Ok(());
     }
     // The contract only carries provider ids that start with a lowercase letter, and the
