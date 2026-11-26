@@ -79,6 +79,13 @@ impl<L: LeaseStore> DefaultOpener<L> {
 
 #[async_trait]
 impl<L: LeaseStore + 'static> LineageOpener for DefaultOpener<L> {
+    async fn check_creating_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> crate::executor::CreatingPlanSelection {
+        self.executor.check_creating_plan_selection(plan).await
+    }
+
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,

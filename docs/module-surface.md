@@ -443,10 +443,11 @@ Broca has no separate host model picker or host-switch path. Joining sends retai
 run's model and fixed tier. Sessions with no plan selection keep the legacy joining-only
 model omission rule. Unsupported plan models (including unavailable provider sign-in)
 refuse `invalid_params` with `{field:"plan.model", reason:"unsupported_model"}`; unsupported
-plan tiers name `plan.model.service_tier` with reason `unsupported_tier`. These checks are
-read-only and precede acceptance and writes. The selection is recovered from the creating
-`RunStart`'s manifest and later accepted refreshes, not from a run's applied tier or a refetch of
-the original plan.
+plan tiers name `plan.model.service_tier` with reason `unsupported_tier`. A creating send that
+needs a vault credential listing the vault hasn't answered yet is refused with retryable
+`transient` instead. These checks are read-only and precede acceptance and writes. The selection
+is recovered from the creating `RunStart`'s manifest and later accepted refreshes, not from a
+run's applied tier or a refetch of the original plan.
 
 `usage`, behind the `session_usage` group, is incremental durable session spend with
 `since` naming the first counted run. Its selection keys, first-use ordering and lower-bound

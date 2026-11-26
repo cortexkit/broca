@@ -268,6 +268,7 @@ const REFRESHED_TTL_MS: i64 = 60 * 60 * 1000;
 /// The one credential record the stand-in serves, shared across its connections.
 #[derive(Default)]
 struct StandInRecord {
+    listing: Option<ListingReply>,
     /// Per-credential read scripts; the final reply remains until the test changes it.
     credential_replies: std::collections::HashMap<String, std::collections::VecDeque<serde_json::Value>>,
     /// Bumped by each refresh; 0 means "not read yet" and is shown as version 1.
@@ -281,6 +282,15 @@ struct StandInRecord {
     /// The deployment-key records (`opaque:broca-deployment:<id>`) and their values. A
     /// deployment-key id not listed is answered `not_found`.
     deployment_keys: std::collections::HashMap<String, Vec<u8>>,
+}
+
+#[derive(Clone)]
+enum ListingReply {
+    Silent,
+    Listed {
+        listing: Arc<broca_subc::vault::ScopedList>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    },
 }
 
 /// The token the stand-in serves at `version`: version 1 is the admission token.
@@ -447,6 +457,24 @@ async fn serve_capturing_vault(
                 let request: serde_json::Value = serde_json::from_slice(&frame.body)
                     .map_err(|error| format!("decode route request: {error}"))?;
                 let method = request["method"].as_str().unwrap_or_default().to_string();
+                if method == "credential.list_scoped" {
+                    let script = record.lock().unwrap().listing.clone();
+                    if let Some(script) = script {
+                        requests.lock().unwrap().push((method, request["params"].clone()));
+                        match script {
+                            ListingReply::Silent => {}
+                            ListingReply::Listed { listing, release } => {
+                                if let Some(release) = release {
+                                    release.notified().await;
+                                }
+                                let body = serde_json::to_vec(&serde_json::json!({"result": listing.as_ref()}))
+                                    .map_err(|error| error.to_string())?;
+                                respond(&mut stream, &frame, Priority::Interactive, body).await?;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 let token = |version: u64, expires_at_ms: Option<i64>| {
                     let secret = if expiry.chatgpt_jwt {
                         chatgpt_test_token(version, expiry.refreshed_jwt_other_account)

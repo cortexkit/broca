@@ -1,7 +1,30 @@
 //! Validate and fetch a send's plan before opening the session actor.
 
-use broca_module::serve::ServeHandler;
+use broca_module::executor::CreatingPlanSelection;
+use broca_module::serve::{PlanState, ServeHandler};
+use cortexkit_role_llm_runner::head_selection::PlanModelProblem;
 use subc_protocol::ErrorBody;
+
+pub(super) async fn creating_plan_selection<H: ServeHandler + ?Sized>(
+    handler: &H,
+    session: &broca_module::LineageKey,
+    params: &serde_json::Value,
+) -> CreatingPlanSelection {
+    if let Some(plan) = params.get("plan").filter(|plan| !plan.is_null()) {
+        if matches!(handler.plan_state(session).await, PlanState::NotAdmitted) {
+            return handler.check_creating_plan_selection(plan).await;
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn invalid_plan_selection(problem: PlanModelProblem) -> ErrorBody {
+    ErrorBody::new(
+        "invalid_params",
+        "plan.model is not a supported model and tier selection",
+    )
+    .with_detail(problem.detail())
+}
 
 pub(super) enum SendPlanRefusal {
     Plan(broca_fetch_plan::Refusal),

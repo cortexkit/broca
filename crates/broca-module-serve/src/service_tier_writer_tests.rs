@@ -595,6 +595,107 @@ async fn head_selection_creating_refusals_do_not_create_a_session() {
     }
 }
 
+async fn cold_plan_send_rig(
+    root: &std::path::Path,
+    reply: ListingReply,
+    provider_url: &str,
+) -> (TierServeRig, CapturingVaultDaemon, Arc<broca_module_serve::account_routing::ListingCache>) {
+    let daemon = CapturingVaultDaemon::start(root).await;
+    daemon.record.lock().unwrap().listing = Some(reply);
+    let listing = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+    let live = executor_with_vault_addressing(
+        root, &daemon, crate::VAULT_READY_TIMEOUT, listing.clone(), supervised_broca_identity(),
+    ).await.with_provider_overrides(runtime_overrides(provider_url));
+    let rig = TierServeRig::start_with_executor(root, live).await;
+    rig.registry.set_plan_admitter(Arc::new(HeadSelectionAdmitter));
+    assert!(listing.get().is_none());
+    (rig, daemon, listing)
+}
+
+async fn cold_plan_send(rig: &mut TierServeRig) -> subc_protocol::Frame {
+    let plan = selection_plan(Some(serde_json::json!({"provider":"deepseek","model":"deepseek-v4-flash"})));
+    rig.call("session.send", serde_json::json!({"send_id":"first","prompt":"hello","plan":plan})).await
+}
+
+#[tokio::test]
+async fn creating_plan_send_waits_for_cold_vault_listing() {
+    if !run_catalog_drift_child("creating_plan_send_waits_for_cold_vault_listing") {
+        return;
+    }
+    let _catalog = install_test_catalog();
+    let root = fresh_vault_root("cold-plan-send");
+    let http = resume_http_fixture().await;
+    let reply = ListingReply::Listed { listing: listed_credentials([]).get().unwrap().0, release: None };
+    let (mut rig, daemon, _) = cold_plan_send_rig(&root, reply, &http.url).await;
+    let sent = tokio::time::timeout(2 * crate::VAULT_READY_TIMEOUT, cold_plan_send(&mut rig)).await.unwrap();
+    let run = tier_run(&sent);
+    selection_completed(&mut rig, &run).await;
+    let requests = daemon.requests();
+    assert_eq!(methods(&requests), ["credential.list_scoped", "credential.get_scoped"]);
+    assert_eq!(requests[1].1["credential_id"], "apikey:deepseek");
+    daemon.assert_healthy();
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn creating_plan_send_refuses_transiently_when_vault_is_silent() {
+    if !run_catalog_drift_child("creating_plan_send_refuses_transiently_when_vault_is_silent") {
+        return;
+    }
+    let _catalog = install_test_catalog();
+    let root = fresh_vault_root("cold-plan-silent");
+    let http = resume_http_fixture().await;
+    let (mut rig, daemon, listing) = cold_plan_send_rig(&root, ListingReply::Silent, &http.url).await;
+    let reply = tokio::time::timeout(2 * crate::VAULT_READY_TIMEOUT, cold_plan_send(&mut rig)).await.unwrap();
+    assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
+    assert_eq!(tier_reply(&reply), serde_json::json!({
+        "code": "transient", "message": "the vault credential listing has not loaded yet",
+        "detail": {"class": "transient", "cause": "credentials_unavailable"},
+    }));
+    assert_eq!(methods(&daemon.requests()), ["credential.list_scoped"]);
+    assert!(listing.get().is_none());
+    assert!(rig.runtime.current_view(&rig.session).await.unwrap().is_none());
+    daemon.assert_healthy();
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn creating_plan_send_refuses_unsupported_model_after_empty_vault_listing() {
+    if !run_catalog_drift_child("creating_plan_send_refuses_unsupported_model_after_empty_vault_listing") {
+        return;
+    }
+    let _catalog = install_test_catalog();
+    let root = fresh_vault_root("cold-plan-no-credential");
+    let http = resume_http_fixture().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reply = ListingReply::Listed {
+        listing: Arc::new(broca_subc::vault::ScopedList {
+            credentials: vec![], grants: 1, grant_tuples: vec![], view: "fixture".into(),
+        }),
+        release: Some(release.clone()),
+    };
+    let (mut rig, daemon, listing) = cold_plan_send_rig(&root, reply, &http.url).await;
+    let reply = {
+        let send = cold_plan_send(&mut rig);
+        tokio::pin!(send);
+        // Hold the vault reply briefly: an unsupported-model refusal may only follow the listing.
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut send).await.is_err(),
+            "the send answered before the vault released its listing");
+        release.notify_one();
+        tokio::time::timeout(2 * crate::VAULT_READY_TIMEOUT, send).await.unwrap()
+    };
+    assert_eq!(reply.header.ty, subc_protocol::FrameType::Error);
+    assert_eq!(reply.body, br#"{"code":"invalid_params","message":"plan.model is not a supported model and tier selection","detail":{"field":"plan.model","reason":"unsupported_model"}}"#);
+    assert!(listing.get().unwrap().0.credentials.is_empty());
+    assert_eq!(methods(&daemon.requests()), ["credential.list_scoped"]);
+    assert!(rig.runtime.current_view(&rig.session).await.unwrap().is_none());
+    daemon.assert_healthy();
+    rig.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 async fn tier_http_fixture(reports: Vec<Option<&'static str>>,
     two_steps: bool,
     hold: Option<Arc<tokio::sync::Notify>>,

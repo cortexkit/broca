@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use broca_catalog::live::{AuthMode, CachePolicy};
 use broca_core::{AllowAll, OutputEvent, RunError, RunSummary};
-use broca_module::executor::{RunExecutor, RunKind};
+use broca_module::executor::{CreatingPlanSelection, RunExecutor, RunKind};
 use broca_protocol::caller::{PauseReason, RunFinishReason};
 use broca_protocol::error::{ErrorClass, ProviderError};
 use broca_protocol::{AuthRequest, BindIdentity};
@@ -21,6 +21,8 @@ use tokio::sync::mpsc;
 use broca_catalog::live::WireFamilyId;
 use broca_module_serve::account_routing::{AccountChoice, RoutingClient};
 use broca_module_serve::{AuthMethod, CacheTtlTable};
+
+mod plan_selection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EpisodeAuthContext {
@@ -4214,6 +4216,13 @@ impl RunExecutor for LiveLoopExecutor {
         .map_err(|error| error.to_string())
     }
 
+    async fn check_creating_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> CreatingPlanSelection {
+        self.creating_plan_selection(plan).await
+    }
+
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,
@@ -4221,94 +4230,11 @@ impl RunExecutor for LiveLoopExecutor {
         Option<cortexkit_role_llm_runner::head_selection::PlanModel>,
         cortexkit_role_llm_runner::head_selection::PlanModelProblem,
     > {
-        use cortexkit_role_llm_runner::head_selection::{self, PlanModelProblem};
-        let listing = if plan.get("model").is_some() && self.provider_base_url.is_none() {
-            match &self.vault {
-                Some(vault) => latest_listing(Arc::clone(vault)).await,
-                None => None,
-            }
-        } else {
-            None
+        let listing = match self.plan_selection_vault(plan) {
+            Some(vault) => latest_listing(Arc::clone(vault)).await,
+            None => None,
         };
-        // A provider the catalog doesn't carry is checked against the rows of the catalog
-        // provider its vault credentials serve, as admission resolves it.
-        let catalog_model =
-            |model: &head_selection::PlanModel| -> Option<head_selection::PlanModel> {
-                use broca_module_serve::auth_routing::{catalog_provider, CatalogProvider};
-                if self.provider_base_url.is_some() {
-                    return Some(model.clone());
-                }
-                let catalog = broca_catalog::catalog().ok()?;
-                match catalog_provider(listing.as_ref()?, &model.provider, |id| {
-                    catalog.serves_provider(id)
-                }) {
-                    CatalogProvider::Own => Some(model.clone()),
-                    CatalogProvider::Borrowed(served) => {
-                        let mut served_model = model.clone();
-                        served_model.provider = served;
-                        Some(served_model)
-                    }
-                    CatalogProvider::Unresolved(_) => None,
-                }
-            };
-        let selection = head_selection::check_plan(
-            plan,
-            &broca_wire::broca_role_describe(env!("CARGO_PKG_VERSION")).role,
-            |model| {
-                if self.provider_base_url.is_none() {
-                    let vault = self.vault.as_ref()?;
-                    let key = broca_module_serve::auth_routing::resolve_credential_id(
-                        &model.provider,
-                        Some(vault.methods.method_for(&model.provider)?),
-                        None,
-                        &vault.methods,
-                        FALLBACK_METHOD,
-                    );
-                    let resolved = vault.addressing.vault_id_for(&key);
-                    let listing = listing.as_ref()?;
-                    // Every run asks routing for its account, so any active row routing could
-                    // pick serves the plan. A subscription row needs its account id; an API
-                    // key is offered by its credential id when it has none.
-                    let routed = self.routing.is_some()
-                        && listing.credentials.iter().any(|row| {
-                            row.state == "active"
-                                && row.operations.iter().any(|op| op == "read")
-                                && (matches!(key.method, AuthMethod::ApiKey | AuthMethod::Gateway)
-                                    || row.account_id.is_some())
-                                && row.provider_ids.contains(&model.provider)
-                                && row.auth_method.as_deref() == Some(key.method.as_token())
-                        });
-                    let available = routed
-                        || resolved.ok().flatten().is_some_and(|id| {
-                            listing.credentials.iter().any(|row| {
-                                row.id == id && row.operations.iter().any(|op| op == "read")
-                            })
-                        });
-                    if !available {
-                        return None;
-                    }
-                }
-                self.head_selection_wire(&catalog_model(model)?)
-            },
-        )?;
-        if let Some(model) = &selection {
-            if let Some(tier) = model.service_tier.filter(|tier| !tier.is_standard()) {
-                let catalog =
-                    broca_catalog::catalog().map_err(|_| PlanModelProblem::UnsupportedModel)?;
-                let model = catalog_model(model).ok_or(PlanModelProblem::UnsupportedModel)?;
-                broca_catalog::live::check_service_tier_level(
-                    self.selection_family(&model)
-                        .ok_or(PlanModelProblem::UnsupportedModel)?,
-                    tier.as_str(),
-                    &model.provider,
-                    &format!("{}/{}", model.provider, model.model),
-                    &catalog.priced_modes(&model.provider, &model.model),
-                    &catalog.mode_wire_ids(&model.provider, &model.model),
-                )
-                .map_err(|_| PlanModelProblem::UnsupportedTier)?;
-            }
-        }
-        Ok(selection)
+        self.validate_plan_selection(plan, listing.as_deref())
     }
 
     fn check_service_tier(

@@ -3376,35 +3376,18 @@ where
                     return send_serve_error(writer, ver, channel, epoch, corr, &error).await;
                 }
             }
+            use broca_module::executor::CreatingPlanSelectionError;
             let plan_selection =
-                if let Some(plan) = req.params.get("plan").filter(|plan| !plan.is_null()) {
-                    if matches!(
-                        handler.plan_state(session).await,
-                        broca_module::serve::PlanState::NotAdmitted
-                    ) {
-                        match handler.check_plan_selection(plan).await {
-                            Ok(selection) => selection,
-                            Err(problem) => {
-                                return send_error_body(
-                                    writer,
-                                    ver,
-                                    channel,
-                                    epoch,
-                                    corr,
-                                    ErrorBody::new(
-                                        "invalid_params",
-                                        "plan.model is not a supported model and tier selection",
-                                    )
-                                    .with_detail(problem.detail()),
-                                )
-                                .await
-                            }
-                        }
-                    } else {
-                        None
+                match send_plan::creating_plan_selection(&**handler, session, &req.params).await {
+                    Ok(selection) => selection,
+                    Err(CreatingPlanSelectionError::Invalid(problem)) => {
+                        let body = send_plan::invalid_plan_selection(problem);
+                        return send_error_body(writer, ver, channel, epoch, corr, body).await;
                     }
-                } else {
-                    None
+                    Err(CreatingPlanSelectionError::CredentialsUnavailable) => {
+                        let error = ServeError::CredentialsUnavailable;
+                        return send_serve_error(writer, ver, channel, epoch, corr, &error).await;
+                    }
                 };
             if params.model.is_none() {
                 if let Some(selection) = &plan_selection {

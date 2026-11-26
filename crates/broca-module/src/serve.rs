@@ -1794,6 +1794,15 @@ impl std::error::Error for ServeError {}
 /// real outcome or a typed `ServeError`.
 #[async_trait]
 pub trait ServeHandler: Send + Sync {
+    async fn check_creating_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> crate::executor::CreatingPlanSelection {
+        self.check_plan_selection(plan)
+            .await
+            .map_err(crate::executor::CreatingPlanSelectionError::Invalid)
+    }
+
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,
@@ -2681,6 +2690,13 @@ impl ServeHandler for crate::LineageRegistry {
     ) -> Result<cortexkit_role_llm_runner::fork_answer::ForkEndReply, crate::fork_answer::ForkError>
     {
         self.fork_manager()?.end(session, principal, request).await
+    }
+
+    async fn check_creating_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> crate::executor::CreatingPlanSelection {
+        crate::LineageRegistry::check_creating_plan_selection(self, plan).await
     }
 
     async fn check_plan_selection(

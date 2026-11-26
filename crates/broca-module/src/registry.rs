@@ -264,6 +264,15 @@ enum Entry {
 /// executor) so the admission concurrency is deterministically testable.
 #[async_trait]
 pub trait LineageOpener: Send + Sync {
+    async fn check_creating_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> crate::executor::CreatingPlanSelection {
+        self.check_plan_selection(plan)
+            .await
+            .map_err(crate::executor::CreatingPlanSelectionError::Invalid)
+    }
+
     async fn check_plan_selection(
         &self,
         plan: &serde_json::Value,
@@ -941,6 +950,13 @@ impl LineageRegistry {
     ) -> Result<Option<Box<broca_provider::media_profile::MediaProfile>>, broca_core::RunError>
     {
         self.inner.opener.media_profile(request).await
+    }
+
+    pub(crate) async fn check_creating_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> crate::executor::CreatingPlanSelection {
+        self.inner.opener.check_creating_plan_selection(plan).await
     }
 
     pub(crate) async fn check_plan_selection(

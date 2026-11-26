@@ -13,6 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use broca_core::{OutputEvent, RunControl, RunError, RunRequest};
 use broca_protocol::BindIdentity;
+use cortexkit_role_llm_runner::head_selection::{PlanModel, PlanModelProblem};
 use tokio::sync::mpsc;
 
 #[path = "executor_fork.rs"]
@@ -20,6 +21,14 @@ mod fork;
 pub use fork::fork_admission_id;
 pub(crate) use fork::fork_conversation_key;
 pub use fork::{ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, ForkStepSpend};
+
+#[derive(Debug)]
+pub enum CreatingPlanSelectionError {
+    Invalid(PlanModelProblem),
+    CredentialsUnavailable,
+}
+
+pub type CreatingPlanSelection = Result<Option<PlanModel>, CreatingPlanSelectionError>;
 
 /// Which start mode a run uses (the coordinator decides; the executor obeys).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +67,16 @@ pub trait RunExecutor: Send + Sync + 'static {
         _model: &cortexkit_role_llm_runner::head_selection::PlanModel,
     ) -> Option<String> {
         None
+    }
+
+    /// Check a creating send's selection, distinguishing unavailable credentials from invalid input.
+    async fn check_creating_plan_selection(
+        &self,
+        plan: &serde_json::Value,
+    ) -> CreatingPlanSelection {
+        self.check_plan_selection(plan)
+            .await
+            .map_err(CreatingPlanSelectionError::Invalid)
     }
 
     async fn check_plan_selection(
