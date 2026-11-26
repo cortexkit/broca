@@ -741,6 +741,18 @@ The `llm-runner/v1` role ops (`role.describe`, `session.head`, `run.result`, `ru
   tool_call_id, call_key?}`. The answer includes only `result_bytes`, the byte length of the
   stored tool-result encoding; result content is never returned. Calls with a durable intent but
   no result read as `indeterminate`, not as a failed zero-byte result.
+  If a step ends `length` inside a tool call, that call is refused with reason
+  `arguments_incomplete`. The model receives: "Tool call `<name>` was not run: the reply hit
+  the output limit before its arguments were complete. Re-issue it with complete arguments,
+  and split large payloads into smaller calls." Complete calls in the same step run as usual.
+  On the third consecutive `length` step with calls, none of that step's calls run and the run
+  ends in a permanent `output_limit` error. A non-`length` finish resets the count; a `length`
+  finish without calls is a truncated final reply.
+  The model gets one note when it repeats the same tool and canonical arguments three times
+  in a row. Broca stops with a permanent `tool_loop` error instead of dispatching the 20th such
+  call if the previous 19 settled results were identical. A different result resets the stop
+  count. Parallel sibling calls don't wait for one another; if the streak crosses 20 inside
+  a parallel batch, broca checks it at the next batch boundary.
 - `session.baseline` and the admitting send's `baseline`: sessions are admitted without a fetch
   plan, so `items` is empty and `composition_digest` absent; `tool_names` are the first
   episode's tools; both generations are 0. The send reply carries it only when the session's
@@ -1040,10 +1052,11 @@ absence is recorded; resume never re-applies current catalog facts. A joining se
 temperature is normalized using the run's frozen model and current catalog facts only to check
 compatibility with that recorded setting; no rendered setting changes. If the model row is
 unavailable, the join compares temperatures literally. An omitted temperature still inherits
-the run's setting without re-normalizing it. Explicit output caps on supporting routes are bounded by
-the catalog's model maximum. Broca does **not** declare `max_output_tokens`: ChatGPT routes
-cannot enforce an output cap because their backend rejects the field, so they continue to
-accept explicit caps without rendering them. `tools: []` offers no tools; on a plan session
+the run's setting without re-normalizing it. Explicit output caps on ordinary catalog routes
+are bounded by the catalog's model maximum. Newly admitted ChatGPT runs send the caller's
+`generation.max_output_tokens`, or 32,000 when omitted; this includes reasoning tokens.
+Older ChatGPT runs that froze a renderer without this field still omit it on resume.
+`tools: []` offers no tools; on a plan session
 any non-null `tools` on a later send is refused `invalid_params {field: "tools"}` before
 queueing, steering or interrupting, even if it repeats the frozen surface.
 

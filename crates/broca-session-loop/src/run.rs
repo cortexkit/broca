@@ -68,6 +68,7 @@ mod warming;
 pub(crate) use warming::Warming;
 pub use warming::{warm_count, warm_spend};
 mod close_out;
+mod limits;
 pub use close_out::{
     end_restart_resume_refused, end_run_with_error, end_run_with_error_and_interrupt_reason,
 };
@@ -980,9 +981,15 @@ where
         (Resolution::Resume, Some(frozen)) => pending_submit(writer, &frozen).map(|s| (frozen, s)),
         _ => None,
     };
+    let output_limit = limits::resumed_output_limit(writer).await?;
+    let tool_loop = resolution == Resolution::Resume
+        && run_state(writer).open_batch.is_none()
+        && limits::tool_loop(writer, planned_calls(writer).first()).await?;
     let mut resumed = resumed_record(writer, &resolution);
     // A resume that ends the run instead of redoing anything records nothing to redo.
-    if submit.is_some()
+    if output_limit
+        || tool_loop
+        || submit.is_some()
         || drift.is_some()
         || cancelling_held
         || stop_before_batch(writer, &admission.stop_when).is_some()
@@ -1045,6 +1052,9 @@ where
     };
     if cancelling_held {
         return close_held_cancelled(writer, seams, &admission).await;
+    }
+    if output_limit || tool_loop {
+        return limits::stop(writer, seams, &admission.run_id, output_limit).await;
     }
     if let Some((frozen, pending)) = submit {
         return submitted(writer, seams, &admission.run_id, &frozen, &pending).await;
@@ -3292,42 +3302,21 @@ where
         // The step's whole usage, over every model that ran when the provider handed the
         // request on itself.
         let whole = step.served.total(step.usage);
-        // A call whose arguments the provider cut is answered with an error in the step's
-        // own batch, before anything is sent; the batch then runs the other calls, or a stop
-        // condition, a stop or a cancel closes them as never run.
-        let batch_id = format!("{}-b{step_id}", admission.run_id);
-        let mut cut = Vec::new();
-        if !step.cuts.is_empty() {
-            cut.push(Record::BatchStart(BatchStart {
-                run_id: admission.run_id.clone(),
-                batch_id: batch_id.clone(),
-                step_id,
-                planned: calls.iter().map(|call| call.tool_call_id.clone()).collect(),
-                mid: None,
-                shown_tags: shown_tags.clone(),
-            }));
-            for garbage in &step.cuts {
-                terminal_with_reason(
-                    &mut cut,
-                    &admission.run_id,
-                    &batch_id,
-                    error_result(&garbage.tool_call_id, &garbage.error_text()),
-                    CallOutcome::Completed,
-                    Some("tool_args_trailing_garbage".into()),
-                    Some(now),
-                );
-            }
-        }
-        let uncut: Vec<ToolCall> = calls
-            .iter()
-            .filter(|call| {
-                !step
-                    .cuts
-                    .iter()
-                    .any(|garbage| garbage.tool_call_id == call.tool_call_id)
-            })
-            .cloned()
-            .collect();
+        let limits::CutCalls {
+            records: cut,
+            uncut,
+            stop: output_limit,
+        } = limits::CutCalls::prepare(
+            writer,
+            &admission.run_id,
+            step_id,
+            &step,
+            &calls,
+            &shown_tags,
+            now,
+        )
+        .await?;
+        let started = !cut.is_empty();
         writer
             .append(
                 &[
@@ -3369,6 +3358,9 @@ where
             )
             .await?;
         *live_display = false;
+        if output_limit || (!started && limits::tool_loop(writer, uncut.first()).await?) {
+            return limits::stop(writer, seams, &admission.run_id, output_limit).await;
+        }
         if let Some(ctx) = compaction {
             crate::compaction::notice(writer, admission, seams, ctx, episodes.signed_floor).await?;
         }
@@ -3427,7 +3419,6 @@ where
         // A `submit_tool` run ends at the step that calls `submit_result`, before anything is
         // dispatched or a stop condition is weighed. A `submit_result` call the provider cut
         // isn't counted: it keeps its error, and the model can call it again.
-        let started = !step.cuts.is_empty();
         if let Some(frozen) = structured.as_ref() {
             let rejected: Vec<ToolResult> = step
                 .cuts

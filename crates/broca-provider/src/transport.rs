@@ -2307,9 +2307,8 @@ const MAX_ERROR_BODY_BYTES: usize = 512;
 const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
 /// Deadline for establishing a provider connection; streaming requests have no total deadline.
 const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Matches the external codex-rs client's 300-second semantic-progress limit. The same deadline covers response
-/// headers and gaps between complete decoded records; raw bytes from an incomplete record do not
-/// reset it. This is not a total stream deadline, so a long stream making real progress stays live.
+/// Bounds public response headers and gaps between complete decoded records. A partial record
+/// does not reset it, and a long stream making progress stays live.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Optional floor on how slowly a provider may stream while still counting as healthy, read from
 /// `BROCA_MIN_STREAM_BYTES_PER_SEC` and `BROCA_MIN_STREAM_WINDOW_SECS`.
@@ -4504,6 +4503,7 @@ async fn send_attempt(
     trace.sent_at_ms = Some(now_millis());
     trace.sent_at = Some(std::time::Instant::now());
     trace.content_gaps.start();
+    let header_timeout = content_deadline::first_response_timeout(&request.url, header_timeout);
     let response = tokio::time::timeout(header_timeout, builder.body(body).send()).await;
     // A connect error put no bytes on any server; anything else may have reached one.
     if !matches!(&response, Ok(Err(error)) if error.is_connect()) {
@@ -4513,7 +4513,7 @@ async fn send_attempt(
     let response = response
         .map_err(|_| {
             AttemptFailure::transport(
-                stream_timeout_error("waiting for response headers"),
+                content_deadline::header_timeout_error(header_timeout),
                 AttemptOutcome::HeaderTimeout,
             )
         })?

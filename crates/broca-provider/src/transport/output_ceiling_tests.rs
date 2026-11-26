@@ -21,7 +21,7 @@ use crate::{
     wire::{AuthHandle, FrozenRenderConfig, WireFamily},
 };
 
-/// The cap the requests are rendered with, which the ceiling error must name.
+/// The cap the requests are rendered with.
 const CAP: u32 = 4096;
 /// A tool-argument buffer cut mid-object, as a ceiling leaves it.
 const CUT_ARGS: &str = r#"{"path":"a.txt","content":"hel"#;
@@ -137,35 +137,25 @@ async fn read_request(socket: &mut tokio::net::TcpStream) {
     }
 }
 
-/// The ceiling case: one attempt, a permanent class, and a message that names the
-/// ceiling, the cap, the tool, and how much of its arguments arrived.
-fn assert_ceiling_cut(outcome: &Outcome, cap: &str, decode_outcome: AttemptOutcome) {
-    let error = outcome.error();
+/// A reported ceiling returns a length step with a named refusal, not a decode retry.
+fn assert_ceiling_cut(outcome: &Outcome, raw_reason: &str) {
+    assert_eq!(outcome.requests, 1);
     assert_eq!(
-        error.class,
-        ErrorClass::Permanent,
-        "a proven ceiling cut must not be retried: {}",
-        error.message
+        outcome.attempt_outcomes(),
+        [AttemptOutcome::ToolArgsTrailingGarbage]
     );
-    let expected_lead = format!(
-        "output ceiling reached mid tool call: finish=length, max_output_tokens={cap} (tool {TOOL}, {} argument bytes received",
-        CUT_ARGS.len()
-    );
-    assert!(
-        error.message.starts_with(&expected_lead),
-        "the error must name the ceiling, got: {}",
-        error.message
-    );
-    assert!(
-        !error.message.contains("EOF while parsing"),
-        "the ceiling error must not read as a parse failure: {}",
-        error.message
-    );
-    assert_eq!(
-        outcome.requests, 1,
-        "exactly one attempt reaches the provider"
-    );
-    assert_eq!(outcome.attempt_outcomes(), vec![decode_outcome]);
+    assert!(outcome.events.iter().any(|event| matches!(event,
+        NormalizedEvent::Control(ProviderControl::StepFinished {
+            finish_reason: broca_protocol::FinishReason::Length, raw_finish_reason: Some(reason), usage, ..
+        }) if reason == raw_reason && usage.output_tokens == Some(4096)
+    )));
+    assert!(outcome.events.iter().any(|event| matches!(event,
+        NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { cut }) if cut.tool_name == TOOL
+    )));
+    assert!(!outcome.events.iter().any(|event| matches!(
+        event,
+        NormalizedEvent::Control(ProviderControl::Error { .. })
+    )));
 }
 
 /// The control case: a parse failure classified as transient, with one decode retry.
@@ -214,7 +204,7 @@ fn anthropic_body(message_delta: Option<&str>) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn anthropic_ceiling_cut_is_permanent_and_named() {
+async fn anthropic_ceiling_cut_finishes_length_without_retry() {
     let outcome = run_step(
         AnthropicMessages,
         anthropic_frozen_config("claude-test"),
@@ -222,12 +212,7 @@ async fn anthropic_ceiling_cut_is_permanent_and_named() {
         anthropic_body(Some("max_tokens")),
     )
     .await;
-    assert_ceiling_cut(&outcome, "4096", AttemptOutcome::DecodeError);
-    assert!(outcome
-        .error()
-        .message
-        .contains("provider stop reason max_tokens"));
-    assert!(outcome.error().message.contains("output_tokens=4096"));
+    assert_ceiling_cut(&outcome, "max_tokens");
 }
 
 #[tokio::test]
@@ -261,14 +246,15 @@ fn openai_chat_body(finish_reason: Option<&str>) -> Vec<u8> {
             r#"{{"id":"c1","choices":[{{"index":0,"delta":{{}},"finish_reason":"{finish_reason}"}}]}}"#
         ));
     }
+    record(
+        r#"{"id":"c1","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4096}}"#.into(),
+    );
     record("[DONE]".into());
     body.into_bytes()
 }
 
-// OpenAI Chat assembles at EOF in `finish()`, so its decode failures record as
-// `eof_before_completion` today; the ceiling cut keeps that attempt outcome.
 #[tokio::test]
-async fn openai_chat_ceiling_cut_is_permanent_and_named() {
+async fn openai_chat_ceiling_cut_finishes_length_without_retry() {
     let outcome = run_step(
         OpenAiChat,
         openai_chat_frozen_config("gpt-test"),
@@ -276,11 +262,7 @@ async fn openai_chat_ceiling_cut_is_permanent_and_named() {
         openai_chat_body(Some("length")),
     )
     .await;
-    assert_ceiling_cut(&outcome, "4096", AttemptOutcome::EofBeforeCompletion);
-    assert!(outcome
-        .error()
-        .message
-        .contains("provider stop reason length"));
+    assert_ceiling_cut(&outcome, "length");
 }
 
 #[tokio::test]
@@ -333,7 +315,7 @@ const RESPONSES_CONTROLS: [&str; 3] = [
 ];
 
 #[tokio::test]
-async fn openai_responses_ceiling_cut_is_permanent_and_named() {
+async fn openai_responses_ceiling_cut_finishes_length_without_retry() {
     let outcome = run_step(
         OpenAiResponses,
         openai_responses_frozen_config("gpt-test"),
@@ -341,11 +323,7 @@ async fn openai_responses_ceiling_cut_is_permanent_and_named() {
         responses_body(RESPONSES_CEILING),
     )
     .await;
-    assert_ceiling_cut(&outcome, "4096", AttemptOutcome::DecodeError);
-    assert!(outcome
-        .error()
-        .message
-        .contains("provider stop reason max_output_tokens"));
+    assert_ceiling_cut(&outcome, "incomplete:max_output_tokens");
 }
 
 #[tokio::test]
@@ -362,10 +340,8 @@ async fn openai_responses_cut_without_ceiling_stop_keeps_the_parse_failure() {
     }
 }
 
-// The codex backend rejects `max_output_tokens` in the body, so no cap is sent and the
-// error says the cap is unknown rather than naming one the provider never saw.
 #[tokio::test]
-async fn openai_responses_chatgpt_ceiling_cut_is_permanent_and_named() {
+async fn openai_responses_chatgpt_ceiling_cut_finishes_length_without_retry() {
     let outcome = run_step(
         OpenAiResponsesChatgpt,
         openai_responses_chatgpt_frozen_config("gpt-test"),
@@ -373,8 +349,7 @@ async fn openai_responses_chatgpt_ceiling_cut_is_permanent_and_named() {
         responses_body(RESPONSES_CEILING),
     )
     .await;
-    assert_ceiling_cut(&outcome, "unknown", AttemptOutcome::DecodeError);
-    assert!(outcome.error().message.contains("output_tokens=4096"));
+    assert_ceiling_cut(&outcome, "incomplete:max_output_tokens");
 }
 
 #[tokio::test]
@@ -429,10 +404,8 @@ fn bedrock_body(message_stop: &str) -> Vec<u8> {
     body
 }
 
-// The Bedrock normalizer does not see the per-step generation cap the body may render,
-// so it names the cap as unknown; the stop reason and reported output count prove the cut.
 #[tokio::test]
-async fn bedrock_ceiling_cut_is_permanent_and_named() {
+async fn bedrock_ceiling_cut_finishes_length_without_retry() {
     let outcome = run_step(
         BedrockConverse,
         bedrock_frozen_config("anthropic.claude-test"),
@@ -440,12 +413,7 @@ async fn bedrock_ceiling_cut_is_permanent_and_named() {
         bedrock_body(r#"{"stopReason":"max_tokens"}"#),
     )
     .await;
-    assert_ceiling_cut(&outcome, "unknown", AttemptOutcome::DecodeError);
-    assert!(outcome
-        .error()
-        .message
-        .contains("provider stop reason max_tokens"));
-    assert!(outcome.error().message.contains("output_tokens=4096"));
+    assert_ceiling_cut(&outcome, "max_tokens");
 }
 
 #[tokio::test]

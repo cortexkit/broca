@@ -468,7 +468,7 @@ impl FrozenRenderConfig {
     /// or `None` when the rendered body does not carry `max_output_tokens` as its cap, so lowering
     /// it would change nothing:
     ///
-    /// - the ChatGPT codex backend omits the field (the backend rejects it);
+    /// - ChatGPT configs frozen before renderer version 9 omit the cap;
     /// - an Antigravity tier model renders its tier ceiling unless the caller set a cap and the
     ///   renderer is version 7 or later;
     /// - Bedrock before renderer version 3 renders the caller's cap without bounding it.
@@ -481,7 +481,7 @@ impl FrozenRenderConfig {
     #[cfg(any(feature = "live", test))]
     pub fn output_limits(&self) -> Option<broca_core::output_reservation::OutputLimits> {
         let renders_cap = match self.family_id {
-            WireFamilyId::OpenAiResponsesChatgpt => false,
+            WireFamilyId::OpenAiResponsesChatgpt => self.renderer_version >= 9,
             WireFamilyId::GoogleCodeAssist => {
                 crate::families::google_codeassist::renders_frozen_output_cap(self)
             }
@@ -1092,124 +1092,118 @@ pub(crate) fn decode_terminal_tool_arguments(
 }
 
 const TOOL_ARGS_WHITESPACE_LIMIT: usize = 4096;
+const TOOL_ARGS_BYTE_LIMIT: usize = 256_000;
 
-/// Counts only the new delta's JSON whitespace suffix, never rescanning the accumulated
-/// buffer. A run is parsed once, when it first exceeds 4096 bytes. Whitespace inside an
-/// unterminated string cannot fire: the prefix before that run is not a complete JSON value.
-#[derive(Default)]
-pub(crate) struct TrailingWhitespaceDetector {
-    trailing: usize,
-}
-
-impl TrailingWhitespaceDetector {
-    fn observe(&mut self, arguments: &str, delta: &str) -> Option<(usize, usize)> {
-        let suffix = json_whitespace_suffix(delta);
-        let previous = self.trailing;
-        self.trailing = if suffix == delta.len() {
-            previous.saturating_add(suffix)
-        } else {
-            suffix
-        };
-        if self.trailing > TOOL_ARGS_WHITESPACE_LIMIT
-            && (previous <= TOOL_ARGS_WHITESPACE_LIMIT || suffix != delta.len())
-        {
-            return complete_prefix(arguments, self.trailing);
-        }
-        None
-    }
-}
-
-fn json_whitespace_suffix(arguments: &str) -> usize {
-    arguments
-        .bytes()
-        .rev()
-        .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-        .count()
-}
-
-fn complete_prefix(arguments: &str, whitespace: usize) -> Option<(usize, usize)> {
-    let json_bytes = arguments.len().checked_sub(whitespace)?;
-    serde_json::from_str::<Value>(&arguments[..json_bytes]).ok()?;
-    Some((json_bytes, whitespace))
-}
-
-/// Shared streaming detector and terminal backstop. The cut is a completed step with a
-/// rejected call, not a provider failure; only byte counts, never arguments, leave this guard.
+/// Shared streaming detector and terminal backstop. Partial arguments are never returned as
+/// canonical input: an empty object pairs the refused result with its call on the next request.
 #[derive(Default)]
 pub(crate) struct ToolArgsGuard {
-    detectors: std::collections::HashMap<u64, TrailingWhitespaceDetector>,
-    cut: Option<broca_protocol::provider::ToolArgsTrailingGarbage>,
+    trailing: std::collections::HashMap<u64, usize>,
+    guarded: Option<broca_protocol::ToolCallId>,
+    cuts: Vec<broca_protocol::provider::ToolArgsTrailingGarbage>,
 }
 
 impl ToolArgsGuard {
     pub(crate) fn stream(&mut self, key: u64, id: &str, name: &str, arguments: &str, delta: &str) {
-        if self.cut.is_none() {
-            let counts = self
-                .detectors
-                .entry(key)
-                .or_default()
-                .observe(arguments, delta);
-            self.mark(id, name, counts);
+        if !self.fired() {
+            let tail = delta.trim_end_matches(char::is_whitespace);
+            let added = delta[tail.len()..].chars().count();
+            let trailing = self.trailing.entry(key).or_default();
+            *trailing = if tail.is_empty() {
+                *trailing + added
+            } else {
+                added
+            };
+            let whitespace = *trailing;
+            self.check(id, name, arguments, whitespace);
         }
     }
 
     pub(crate) fn terminal(&mut self, id: &str, name: &str, arguments: &str) {
-        let whitespace = json_whitespace_suffix(arguments);
-        if self.cut.is_none() && whitespace > TOOL_ARGS_WHITESPACE_LIMIT {
-            self.mark(id, name, complete_prefix(arguments, whitespace));
-        }
+        let whitespace = arguments
+            .chars()
+            .rev()
+            .take_while(|c| c.is_whitespace())
+            .count();
+        self.check(id, name, arguments, whitespace);
     }
 
     pub(crate) fn replace(&mut self, key: u64, id: &str, name: &str, arguments: &str) {
-        self.detectors.entry(key).or_default().trailing = json_whitespace_suffix(arguments);
-        self.terminal(id, name, arguments);
+        let whitespace = arguments
+            .chars()
+            .rev()
+            .take_while(|c| c.is_whitespace())
+            .count();
+        self.trailing.insert(key, whitespace);
+        self.check(id, name, arguments, whitespace);
     }
 
-    fn mark(&mut self, id: &str, name: &str, counts: Option<(usize, usize)>) {
-        if let Some((json_bytes, whitespace_bytes)) = counts {
-            self.cut = Some(broca_protocol::provider::ToolArgsTrailingGarbage {
-                tool_call_id: broca_protocol::ToolCallId(id.to_owned()),
-                tool_name: name.to_owned(),
-                json_bytes,
-                whitespace_bytes,
-                omitted_tool_calls: 0,
-            });
+    fn check(&mut self, id: &str, name: &str, arguments: &str, whitespace: usize) {
+        if self.fired()
+            || (arguments.len() <= TOOL_ARGS_BYTE_LIMIT && whitespace < TOOL_ARGS_WHITESPACE_LIMIT)
+        {
+            return;
         }
+        let head = arguments
+            .char_indices()
+            .nth(200)
+            .map_or(arguments, |(end, _)| &arguments[..end]);
+        let tail = arguments
+            .char_indices()
+            .rev()
+            .nth(199)
+            .map_or(arguments, |(start, _)| &arguments[start..]);
+        tracing::warn!(tool_name = name, argument_bytes = arguments.len(),
+            trailing_whitespace = whitespace, argument_head = ?head, argument_tail = ?tail,
+            "ended provider step at the tool argument limit");
+        self.guarded = Some(broca_protocol::ToolCallId(id.to_owned()));
     }
 
     pub(crate) fn fired(&self) -> bool {
-        self.cut.is_some()
+        self.guarded.is_some()
     }
 
-    pub(crate) fn omit_tool(&mut self) {
-        if let Some(cut) = &mut self.cut {
-            cut.omitted_tool_calls += 1;
-        }
+    pub(crate) fn guarded_call(&self, id: &str) -> bool {
+        self.guarded.as_ref().is_some_and(|call| call.0 == id)
+    }
+
+    pub(crate) fn refused_call(&self, id: &str) -> bool {
+        self.cuts.iter().any(|cut| cut.tool_call_id.0 == id)
+    }
+
+    pub(crate) fn refuse(&mut self, id: &str, name: &str) -> Value {
+        self.cuts
+            .push(broca_protocol::provider::ToolArgsTrailingGarbage {
+                tool_call_id: broca_protocol::ToolCallId(id.to_owned()),
+                tool_name: name.to_owned(),
+                json_bytes: 0,
+                whitespace_bytes: 0,
+                omitted_tool_calls: 0,
+            });
+        Value::Object(Default::default())
     }
 
     pub(crate) fn decode(
         &mut self,
+        id: &str,
         arguments: &str,
         name: &str,
         ceiling: Option<CeilingStop<'_>>,
         completed: bool,
-    ) -> Result<Option<Value>, NormalizeError> {
-        if self.fired() {
-            // Empty buffers on a cut are still in progress, not zero-argument calls.
-            if arguments.is_empty() && completed {
-                return Ok(Some(Value::Object(Default::default())));
-            }
-            if let Ok(input) = serde_json::from_str(arguments) {
-                return Ok(Some(input));
-            }
-            self.omit_tool();
-            return Ok(None);
+    ) -> Result<Value, NormalizeError> {
+        if self.guarded_call(id)
+            || (self.fired() || ceiling.is_some()) && !completed && arguments.is_empty()
+        {
+            return Ok(self.refuse(id, name));
         }
-        decode_terminal_tool_arguments(arguments, name, ceiling).map(Some)
+        match decode_terminal_tool_arguments(arguments, name, ceiling) {
+            Err(_) if self.fired() || ceiling.is_some() => Ok(self.refuse(id, name)),
+            result => result,
+        }
     }
 
-    pub(crate) fn event(&self) -> Option<NormalizedEvent> {
-        self.cut.clone().map(|cut| {
+    pub(crate) fn events(&mut self) -> impl Iterator<Item = NormalizedEvent> {
+        std::mem::take(&mut self.cuts).into_iter().map(|cut| {
             NormalizedEvent::Control(broca_protocol::ProviderControl::ToolArgsTrailingGarbage {
                 cut,
             })
@@ -1480,11 +1474,13 @@ mod output_cap_tests {
 
     #[test]
     fn output_limits_follow_what_each_family_renders() {
-        // The ChatGPT codex backend omits the field, so there is nothing to lower.
+        let mut chatgpt = frozen_config_for_family(WireFamilyId::OpenAiResponsesChatgpt, "m");
         assert_eq!(
-            frozen_config_for_family(WireFamilyId::OpenAiResponsesChatgpt, "m").output_limits(),
-            None
+            chatgpt.output_limits().unwrap().max,
+            chatgpt.max_output_tokens
         );
+        chatgpt.renderer_version = 8;
+        assert_eq!(chatgpt.output_limits(), None);
         // An Antigravity tier model without a caller cap renders its tier ceiling.
         let tier = frozen_config_for_family(WireFamilyId::GoogleCodeAssist, "gemini-3-flash-agent");
         assert_eq!(tier.output_limits(), None);

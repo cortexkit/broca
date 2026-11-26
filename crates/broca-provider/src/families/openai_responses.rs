@@ -1641,7 +1641,7 @@ impl OpenAiResponsesNormalizer {
             _ => {}
         }
         if self.arguments_guard.fired() && !self.completed {
-            self.finish_reason = FinishReason::ToolCalls;
+            self.finish_reason = FinishReason::Length;
             self.finish_terminal(out)?;
         }
         Ok(())
@@ -1896,7 +1896,7 @@ impl OpenAiResponsesNormalizer {
         if !self.completed {
             self.completed = true;
             let message = self.assemble_message(out)?;
-            out.extend(self.arguments_guard.event());
+            out.extend(self.arguments_guard.events());
             out.push(NormalizedEvent::Control(
                 ProviderControl::AssistantMessage { message },
             ));
@@ -1962,7 +1962,7 @@ impl OpenAiResponsesNormalizer {
                 .terminal(&buf.call_id, &buf.name, &buf.arguments);
         }
         if self.arguments_guard.fired() {
-            self.finish_reason = FinishReason::ToolCalls;
+            self.finish_reason = FinishReason::Length;
         }
         // One assistant message can represent several Responses output items. Sort canonical
         // blocks by output_index so reasoning remains immediately before the function/message
@@ -2037,30 +2037,28 @@ impl OpenAiResponsesNormalizer {
                 output_tokens: self.usage.output_tokens,
             });
         for (index, buf) in std::mem::take(&mut self.tool_calls) {
-            // A call the provider itself marked incomplete never becomes a call, whatever its
-            // arguments hold. Cut at the output ceiling, it fails the attempt as the same
-            // permanent ceiling cut a call with unparseable arguments is; cut for any other
-            // reason, it is left out of the answer.
-            if buf.incomplete {
-                if let Some(stop) = ceiling {
-                    return Err(NormalizeError::OutputCeiling(
-                        stop.cut(&buf.name, &buf.arguments),
-                    ));
-                }
-                self.arguments_guard.omit_tool();
+            // Only a length cut gives a provider-incomplete call a not-run result. Other
+            // provider-incomplete items stay out of the answer as before.
+            if buf.incomplete && ceiling.is_none() && !self.arguments_guard.fired() {
                 continue;
             }
-            let Some(input) = self.arguments_guard.decode(
-                &buf.arguments,
-                &buf.name,
-                ceiling,
-                self.completed_items.contains(&index),
-            )?
-            else {
-                continue;
+            let input = if buf.incomplete {
+                self.arguments_guard.refuse(&buf.call_id, &buf.name)
+            } else {
+                self.arguments_guard.decode(
+                    &buf.call_id,
+                    &buf.arguments,
+                    &buf.name,
+                    ceiling,
+                    self.completed_items.contains(&index),
+                )?
             };
             let input: broca_protocol::json::Json = input.into();
-            let provider_state = self.call_state(buf.state, &buf.arguments, &input);
+            let provider_state = if self.arguments_guard.refused_call(&buf.call_id) {
+                None
+            } else {
+                self.call_state(buf.state, &buf.arguments, &input)
+            };
             ordered.push((
                 index,
                 3,
@@ -2721,13 +2719,17 @@ mod tests {
     }
 
     #[test]
-    fn a_call_marked_incomplete_at_the_output_ceiling_is_a_ceiling_cut() {
+    fn a_call_marked_incomplete_at_the_output_ceiling_is_refused() {
         for format in FORMATS {
             for in_terminal_output in [false, true] {
-                let result = incomplete_call(format, in_terminal_output, "max_output_tokens");
+                let events =
+                    incomplete_call(format, in_terminal_output, "max_output_tokens").unwrap();
                 assert!(
-                    matches!(&result, Err(NormalizeError::OutputCeiling(_))),
-                    "{format:?} in_terminal_output={in_terminal_output}: {result:?}"
+                    events.iter().any(|event| matches!(
+                        event,
+                        NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { .. })
+                    )),
+                    "{format:?} in_terminal_output={in_terminal_output}: {events:?}"
                 );
             }
         }

@@ -29,6 +29,10 @@ pub(crate) fn error_result(call: &ToolCall, message: &str) -> ToolResult {
 /// result bytes, so the two paths can't drift).
 pub fn no_dispatch_result(tool_call_id: &ToolCallId, reason: &NoDispatchReason) -> ToolResult {
     let output = match reason {
+        NoDispatchReason::ArgumentsIncomplete { tool_name } => ToolOutput::error(format!(
+            "Tool call `{tool_name}` was not run: the reply hit the output limit before its arguments were complete. \
+             Re-issue it with complete arguments, and split large payloads into smaller calls."
+        )),
         NoDispatchReason::Denied { reason } => ToolOutput::Denied {
             reason: reason.clone(),
         },

@@ -1,9 +1,9 @@
 use super::*;
 use crate::families::{
     anthropic_frozen_config, bedrock_converse::test_event_stream_message, bedrock_frozen_config,
-    openai_chat_frozen_config, openai_responses_chatgpt_frozen_config,
-    openai_responses_frozen_config, AnthropicMessages, BedrockConverse, OpenAiChat,
-    OpenAiResponses, OpenAiResponsesChatgpt,
+    gemini_frozen_config, google_codeassist_frozen_config, openai_chat_frozen_config,
+    openai_responses_chatgpt_frozen_config, openai_responses_frozen_config, AnthropicMessages,
+    BedrockConverse, Gemini, GoogleCodeAssist, OpenAiChat, OpenAiResponses, OpenAiResponsesChatgpt,
 };
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -155,9 +155,9 @@ async fn stream_detector_cuts_each_family_before_terminal_and_further_reads() {
                 continue;
             }
             let mut chunks = family.start(websocket);
-            chunks.push(family.delta(r#"{"key":"alpha"}"#, websocket));
-            chunks.push(family.delta(&" ".repeat(4096), websocket));
-            chunks.push(family.delta(" ", websocket));
+            chunks.push(family.delta(r#"{"key":"unfinished"#, websocket));
+            chunks.push(family.delta(&" ".repeat(4095), websocket));
+            chunks.push(family.delta("\t", websocket));
             let expected_reads = chunks.len();
             // A poison record proves the body driver stops polling, not just suppressing output.
             chunks.push(b"unread poison: must not read after the whitespace cut".to_vec());
@@ -183,12 +183,13 @@ async fn stream_detector_cuts_each_family_before_terminal_and_further_reads() {
             .unwrap_or_else(|error| panic!("{family:?} websocket={websocket}: {error:?}"));
             assert_eq!(reads.load(Ordering::SeqCst), expected_reads, "{family:?}");
             let rejection = cut(&events);
-            assert_eq!(rejection.json_bytes, 15);
-            assert_eq!(rejection.whitespace_bytes, 4097);
             assert_eq!(rejection.tool_call_id.0, "bad");
             assert!(events.iter().any(|event| matches!(
                 event,
-                NormalizedEvent::Control(ProviderControl::Finished { .. })
+                NormalizedEvent::Control(ProviderControl::Finished {
+                    finish_reason: broca_protocol::FinishReason::Length,
+                    ..
+                })
             )));
             let message = events
                 .iter()
@@ -199,16 +200,13 @@ async fn stream_detector_cuts_each_family_before_terminal_and_further_reads() {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(
-                message.tool_calls().next().unwrap().input,
-                json!({"key":"alpha"})
-            );
+            assert_eq!(message.tool_calls().next().unwrap().input, json!({}));
         }
     }
 }
 
 #[test]
-fn long_string_whitespace_and_small_trailing_runs_do_not_cut_any_family() {
+fn a_short_whitespace_run_does_not_cut_any_family() {
     for family in FAMILIES {
         for prefix in [r#"{"key":"alpha"}"#, r#"{"key":"unterminated"#] {
             let mut normalizer = family.normalizer();
@@ -216,12 +214,67 @@ fn long_string_whitespace_and_small_trailing_runs_do_not_cut_any_family() {
                 normalizer.push(&chunk).unwrap();
             }
             normalizer.push(&family.delta(prefix, false)).unwrap();
-            let size = if prefix.ends_with('}') { 4096 } else { 9000 };
             let events = normalizer
-                .push(&family.delta(&" ".repeat(size), false))
+                .push(&family.delta(&" ".repeat(4095), false))
                 .unwrap();
             assert!(!tool_args_cut(&events), "{family:?} {prefix}");
         }
+    }
+}
+
+#[test]
+fn runaway_argument_past_256000_bytes_is_cut() {
+    for family in FAMILIES {
+        let mut normalizer = family.normalizer();
+        for chunk in family.start(false) {
+            normalizer.push(&chunk).unwrap();
+        }
+        let prefix = r#"{"key":"x"#;
+        normalizer.push(&family.delta(prefix, false)).unwrap();
+        let to_limit = "x".repeat(256_000 - prefix.len());
+        assert!(!tool_args_cut(
+            &normalizer.push(&family.delta(&to_limit, false)).unwrap()
+        ));
+        let events = normalizer.push(&family.delta("ñ", false)).unwrap();
+        assert_eq!(cut(&events).tool_call_id.0, "bad", "{family:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Control(ProviderControl::Finished {
+                finish_reason: broca_protocol::FinishReason::Length,
+                ..
+            })
+        )));
+    }
+}
+
+#[test]
+fn structured_google_arguments_are_size_checked_before_the_stream_ends() {
+    let step = StepId(1);
+    for (mut normalizer, envelope) in [
+        (Gemini.normalizer(&gemini_frozen_config("m"), step), false),
+        (
+            GoogleCodeAssist.normalizer(&google_codeassist_frozen_config("m"), step),
+            true,
+        ),
+    ] {
+        let arguments = json!({"query":"x".repeat(256_000)});
+        let body = json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","args":arguments}}]}}]});
+        let body = if envelope {
+            json!({"response":body})
+        } else {
+            body
+        };
+        let events = normalizer
+            .push(format!("data: {body}\n\n").as_bytes())
+            .unwrap();
+        assert_eq!(cut(&events).tool_name, "lookup");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NormalizedEvent::Control(ProviderControl::Finished {
+                finish_reason: broca_protocol::FinishReason::Length,
+                ..
+            })
+        )));
     }
 }
 
@@ -234,8 +287,7 @@ fn terminal_backstop_rejects_done_only_responses_arguments() {
         }
         let args = format!("{{\"key\":\"alpha\"}}{}", " ".repeat(4097));
         let events = normalizer.push(&family.record("", json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":args}), false)).unwrap();
-        assert_eq!(cut(&events).whitespace_bytes, 4097);
-        assert_eq!(cut(&events).json_bytes, 15);
+        assert_eq!(cut(&events).tool_call_id.0, "bad");
     }
 }
 
@@ -255,7 +307,7 @@ fn other_call(family: Family, index: u64, id: &str, args: &str) -> Vec<Vec<u8>> 
 }
 
 #[test]
-fn cut_omits_incomplete_calls_and_preserves_completed_text_and_calls() {
+fn cut_refuses_incomplete_calls_and_preserves_completed_text_and_calls() {
     for family in FAMILIES {
         let mut normalizer = family.normalizer();
         for chunk in family.start(false) {
@@ -293,7 +345,16 @@ fn cut_omits_incomplete_calls_and_preserves_completed_text_and_calls() {
         let events = normalizer
             .push(&family.delta(&" ".repeat(4097), false))
             .unwrap();
-        assert_eq!(cut(&events).omitted_tool_calls, 1, "{family:?}");
+        let refused: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { cut }) => {
+                    Some(cut.tool_call_id.0.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, ["bad", "unfinished"], "{family:?}");
         let message = events
             .iter()
             .find_map(|event| match event {
@@ -307,7 +368,7 @@ fn cut_omits_incomplete_calls_and_preserves_completed_text_and_calls() {
             .tool_calls()
             .map(|call| call.tool_call_id.0.as_str())
             .collect();
-        assert_eq!(calls, ["bad", "good"], "{family:?}");
+        assert_eq!(calls, ["bad", "unfinished", "good"], "{family:?}");
         assert!(message.content.iter().any(|block| matches!(block, broca_protocol::ContentBlock::Text { text } if text == "completed text")));
         assert!(!message.content.iter().any(|block| matches!(block, broca_protocol::ContentBlock::Text { text } if text == "unfinished text")));
     }

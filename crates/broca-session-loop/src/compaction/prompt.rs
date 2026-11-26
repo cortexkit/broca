@@ -85,7 +85,7 @@ struct Kept {
 enum RunGuidance {
     /// Counting starts at the run's first assistant message.
     Waiting,
-    Counting(RepetitionGuidance),
+    Counting(Box<RepetitionGuidance>),
 }
 
 /// The numbering a request on the current compaction contract gives its prompt: the window's
@@ -484,18 +484,19 @@ impl Kept {
                     let seed = serde_json::from_value(seed.clone()).map_err(|error| {
                         LoopError::Parts(format!("stored repetition counters: {error}"))
                     })?;
-                    RunGuidance::Counting(RepetitionGuidance::seeded(&seed).ok_or_else(|| {
+                    let guidance = RepetitionGuidance::seeded(&seed).ok_or_else(|| {
                         LoopError::Parts(
                             "stored repetition counters were taken under other warning rules"
                                 .into(),
                         )
-                    })?)
+                    })?;
+                    RunGuidance::Counting(Box::new(guidance))
                 }
                 None => RunGuidance::Waiting,
             };
         }
         if matches!(self.guidance, RunGuidance::Waiting) && message.role == Role::Assistant {
-            self.guidance = RunGuidance::Counting(RepetitionGuidance::new());
+            self.guidance = RunGuidance::Counting(Box::default());
         }
         if let RunGuidance::Counting(guidance) = &mut self.guidance {
             guidance.guide(message);

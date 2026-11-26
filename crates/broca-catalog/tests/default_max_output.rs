@@ -232,7 +232,7 @@ mod gated {
     }
 
     #[test]
-    fn the_family_override_path_reads_the_catalog_where_it_lists_the_model() {
+    fn chatgpt_defaults_to_32000_without_changing_other_catalog_defaults() {
         install();
         let try_resolve = |model: &str, caller| {
             resolve_chatgpt_pause_provider_with_client(
@@ -254,7 +254,8 @@ mod gated {
                 .render_config_blob()["max_output_tokens"]
                 .clone()
         };
-        assert_eq!(resolve("openai/chatgpt-listed", None), CHATGPT_OUTPUT);
+        assert_eq!(resolve("openai/chatgpt-listed", None), 32_000);
+        assert_eq!(frozen_cap("anthropic/known-output", None), KNOWN_OUTPUT);
         // A ChatGPT id the catalog does not list is no longer sent with a fallback cap: it is
         // refused as unknown, like an unlisted id on every other catalog path.
         let error = try_resolve("openai/not-in-catalog", None)

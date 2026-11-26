@@ -850,6 +850,15 @@ impl ToolPlane for Spy {
                 is_error: false,
             });
         }
+        if call.tool_name == "loop_test_poll" {
+            return DispatchResult::Completed(ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Text {
+                    text: call.tool_call_id.0.clone().into(),
+                },
+                is_error: false,
+            });
+        }
         // An error result, which a ride may ride on.
         if call.tool_name == "broken" {
             return DispatchResult::Completed(ToolResult {
@@ -12185,6 +12194,8 @@ mod ride_placement;
 
 #[path = "differential/plan_notes.rs"]
 mod plan_notes;
+#[path = "differential/run_limits.rs"]
+mod run_limits;
 
 /// A call handed back for the person's steer is closed by the interim content its provider
 /// answered with, and its outcome names that provider. That result is written as soon as the

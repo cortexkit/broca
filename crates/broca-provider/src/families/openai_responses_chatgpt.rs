@@ -243,12 +243,13 @@ fn with_request_body<R>(
             // set to false"). The platform Responses API defaults store on the server side;
             // codex enforces it in the body.
             body["store"] = serde_json::Value::Bool(false);
-            // The codex backend rejects platform-only output and sampling controls as
-            // unsupported. They must be absent rather than defaulted, even when the caller
-            // supplied them. Because ChatGPT cannot enforce that cap, broca does not declare
-            // max_output_tokens.
+            // The ChatGPT backend honors max_output_tokens, including reasoning (measured
+            // 26 Nov 2026). Older runs still omit it to reproduce their recorded request.
             if let Some(obj) = body.as_object_mut() {
-                for field in ["max_output_tokens", "temperature", "top_p"] {
+                if frozen.renderer_version < 9 {
+                    obj.remove("max_output_tokens");
+                }
+                for field in ["temperature", "top_p"] {
                     obj.remove(field);
                 }
             }
@@ -441,17 +442,6 @@ impl WireFamily for OpenAiResponsesChatgpt {
     }
 }
 
-/// How long a ChatGPT backend stream may answer only keepalives (socket pings) before it is
-/// abandoned and the step's attempt sent again.
-///
-/// MEASURED. Across 3,051 completed WebSocket attempts logged 10-17 Nov 2026, the longest gap
-/// between content records was 363 s; 99% stayed under 191 s. Over the same days 8 attempts
-/// went silent for 914 s to 1,800 s while the backend kept answering pings, 7 of them right
-/// after `response.output_item.done`, and none sent content again before it was cut. Under the
-/// shared 1,800 s limit a worker waited up to half an hour on such a stream. 600 s keeps 1.65x
-/// headroom over the longest healthy gap.
-const CHATGPT_CONTENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
-
 /// Delegates to the OpenAI-Responses normalizer unchanged (the codex backend streams the
 /// same Responses SSE events). A thin wrapper so the family owns its own normalizer type.
 struct ChatgptNormalizer {
@@ -501,10 +491,6 @@ impl StreamNormalizer for ChatgptNormalizer {
         self.inner.liveness_marker()
     }
 
-    fn content_deadline(&self) -> Option<std::time::Duration> {
-        Some(CHATGPT_CONTENT_DEADLINE)
-    }
-
     fn input_transformations(&self) -> Option<Vec<broca_protocol::InputTransformation>> {
         self.inner.input_transformations()
     }
@@ -542,8 +528,7 @@ mod tests {
 
     #[test]
     fn codex_body_is_responses_plus_the_codex_delta() {
-        // With default generation controls, the codex body is the platform OpenAI-Responses
-        // body with exactly its required store/token-limit deltas applied.
+        // With default generation controls, the codex body differs only in store.
         let frozen_chatgpt = openai_responses_chatgpt_frozen_config("gpt-5"); // no cache key
         let chatgpt_body = OpenAiResponsesChatgpt.render(&frozen_chatgpt, &opts());
         let mut frozen_as_responses = frozen_chatgpt.clone();
@@ -559,24 +544,12 @@ mod tests {
             responses.get("store").is_none(),
             "platform body has no store field"
         );
-        // − max_output_tokens (codex rejects its presence; platform body always emits it).
-        assert!(
-            codex.get("max_output_tokens").is_none(),
-            "codex body must OMIT max_output_tokens (the backend rejects it)"
-        );
-        assert!(
-            responses.get("max_output_tokens").is_some(),
-            "the platform Responses body carries max_output_tokens (the stripped field)"
-        );
-
-        // Apply the inverse delta to the platform body (drop max_output_tokens, add
-        // store:false) → it must then equal the default codex body exactly.
+        assert_eq!(codex["max_output_tokens"], 32_000);
         let r = responses.as_object_mut().unwrap();
-        r.remove("max_output_tokens");
         r.insert("store".to_string(), serde_json::json!(false));
         assert_eq!(
             responses, codex,
-            "codex body == platform Responses body − max_output_tokens + store:false"
+            "codex body == platform Responses body + store:false"
         );
     }
 
@@ -678,7 +651,6 @@ mod tests {
         assert_eq!(expected["temperature"], serde_json::json!(0.2));
         assert_eq!(expected["top_p"], serde_json::json!(0.8));
         let expected = expected.as_object_mut().unwrap();
-        expected.remove("max_output_tokens");
         expected.remove("temperature");
         expected.remove("top_p");
         expected.insert("store".into(), serde_json::json!(false));

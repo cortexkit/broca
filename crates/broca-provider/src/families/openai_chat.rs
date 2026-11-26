@@ -1262,12 +1262,9 @@ impl OpenAiChatNormalizer {
                 output_tokens: self.usage.output_tokens,
             });
         for (slot, buf) in std::mem::take(&mut self.tool_calls).into_iter().enumerate() {
-            let Some(input) =
+            let input =
                 self.arguments_guard
-                    .decode(&buf.arguments, &buf.name, ceiling, false)?
-            else {
-                continue;
-            };
+                    .decode(&buf.id, &buf.arguments, &buf.name, ceiling, false)?;
             content.push(ContentBlock::ToolCall(ToolCall {
                 tool_call_id: ToolCallId(buf.id),
                 tool_name: buf.name,
@@ -1319,7 +1316,7 @@ impl StreamNormalizer for OpenAiChatNormalizer {
             self.handle_chunk(payload.value()?, &mut out)?;
             if self.arguments_guard.fired() {
                 self.terminal_observed = true;
-                self.finish_reason = Some(FinishReason::ToolCalls);
+                self.finish_reason = Some(FinishReason::Length);
                 out.extend(self.finish()?);
                 break;
             }
@@ -1381,11 +1378,11 @@ impl StreamNormalizer for OpenAiChatNormalizer {
         };
         let message = self.assemble_message(&mut out)?;
         let finish_reason = if self.arguments_guard.fired() {
-            FinishReason::ToolCalls
+            FinishReason::Length
         } else {
             finish_reason
         };
-        out.extend(self.arguments_guard.event());
+        out.extend(self.arguments_guard.events());
         out.extend([
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
             NormalizedEvent::Control(ProviderControl::StepFinished {

@@ -974,7 +974,7 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
                 }
                 let body = if upstream
                     .output_ceiling
-                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
                 {
                     output_ceiling_sse()
                 } else if upstream
@@ -3973,13 +3973,12 @@ async fn paused_auth_routed_status_matches_golden_through_real_serve() {
     assert_eq!(value["auth"]["path"], "routed");
 }
 
-/// Regenerate the fixture only from the daemon's real run.status reply:
-/// BROCA_UPDATE_GOLDEN=1 cargo test -p broca-module-serve --test it output_ceiling_status_matches_golden_through_real_serve
+/// A provider ceiling cuts one call, not the run. The second provider response is a normal answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn output_ceiling_status_matches_golden_through_real_serve() {
+async fn output_ceiling_refuses_the_incomplete_call_and_continues_through_real_serve() {
     let rig = Rig::start()
         .await
-        .expect("the output-ceiling golden requires the real daemon");
+        .expect("the output-ceiling test requires the real daemon");
     rig.upstream
         .output_ceiling
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3991,45 +3990,28 @@ async fn output_ceiling_status_matches_golden_through_real_serve() {
             .iter()
             .filter(|frame| matches!(frame.record, Record::Attempt(_)))
             .count(),
-        1
+        2
     );
-    assert_eq!(rig.upstream.authorized_as.lock().unwrap().len(), 1);
-    let status = broca_test_support::wait_until(
-        "output_ceiling_status_matches_golden_through_real_serve: run status",
-        || async {
+    assert_eq!(rig.upstream.authorized_as.lock().unwrap().len(), 2);
+    assert!(!frames
+        .iter()
+        .any(|frame| matches!(frame.record, Record::ToolIntent(_))));
+    assert!(frames.iter().any(|frame| matches!(&frame.record, Record::ToolOutcome(outcome)
+        if outcome.tool_call_id.0 == "tool_1" && outcome.reason.as_deref() == Some("arguments_incomplete")
+    )));
+    let status =
+        broca_test_support::wait_until("the run continues after refusing the cut call", || async {
             let status = client.run_status(&run_id).await.unwrap();
-            if matches!(status, broca_wire::RunStatusResponse::Error { .. }) {
-                Ok(status)
-            } else {
+            if matches!(status, broca_wire::RunStatusResponse::Active { .. }) {
                 Err(format!("{status:?}"))
+            } else {
+                Ok(status)
             }
-        },
-    )
-    .await;
-    let value = serde_json::to_value(&status).unwrap();
-    assert_eq!(value["state"], "error");
-    assert_eq!(value["error"]["class"], "permanent");
-    assert_eq!(value["error"]["provider_code"], "output_ceiling");
-    assert!(value["error"]["message"].as_str().unwrap().starts_with(
-        "output ceiling reached mid tool call: finish=length, max_output_tokens=8192"
-    ));
-    assert!(!value.to_string().contains("PRIVATE-"));
-    let bytes = serde_json::to_vec(&status).unwrap();
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../broca-wire/tests/golden/run_status.output_ceiling.json");
-    if std::env::var_os("BROCA_UPDATE_GOLDEN").is_some() {
-        std::fs::write(&path, &bytes).unwrap();
-    }
-    let golden = std::fs::read(&path)
-        .expect("generate the output-ceiling golden through the real serve path");
-    use sha2::{Digest, Sha256};
-    assert_eq!(
-        format!("{:x}", Sha256::digest(&golden)),
-        "59d6bb3c0b8046b1dc2858199fb14b352a5fedac243a4ccbba885726c36148f4"
-    );
-    assert_eq!(
-        usage_compat::legacy_bytes(&without_awaits(&bytes, &golden), &golden),
-        golden
+        })
+        .await;
+    assert!(
+        matches!(status, broca_wire::RunStatusResponse::Completed { .. }),
+        "{status:?}"
     );
 }
 

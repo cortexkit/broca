@@ -186,7 +186,7 @@ const RENDERED_SHA256: &[(&str, &str)] = &[
     ),
     (
         "openai_responses_chatgpt",
-        "f716d889f02d58f68d9c549178003eb1288874532cd0f5e63d8d639a5d1aa6a8",
+        "2d70a16461686fe3f8e75c8a1a51ec7f063c03c04e6f5bf731f8bf89ebc86ccf",
     ),
     (
         "gemini",

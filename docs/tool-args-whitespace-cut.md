@@ -1,23 +1,22 @@
-# Runaway tool-argument whitespace
+# Runaway tool arguments
 
-`tool_args_trailing_garbage` means broca stopped a provider attempt after a complete JSON
-argument value was followed by more than 4096 bytes of JSON whitespace. The step is complete
-and validated; this is not a provider failure or a transport retry. The malformed call keeps
-its parsed input, receives an existing `ToolResult` error, and is never dispatched. Other
-incomplete calls are omitted and their count is included in that error. The next model step
-can re-issue the call with properly escaped arguments.
+Broca ends a provider step with finish `length` if one tool call's arguments exceed 256,000
+bytes or end in a run of at least 4,096 whitespace characters. The guard checks each delta as
+it arrives and stops reading the attempt; it is not a transport failure or an attempt retry.
+The warning log includes the first and last 200 characters of the offending argument. Treat
+those excerpts as untrusted model output that may contain request text.
 
-The shared guard lives beside `decode_terminal_tool_arguments` in `broca-provider/src/wire.rs`.
-Each delta updates its buffer's suffix count using only the new bytes; it does not rescan or
-reparse the growing buffer. A strict prefix parse happens only at the first threshold crossing
-of a whitespace run. An unterminated string cannot pass that parse. Authoritative final
-buffers also pass the terminal backstop. Anthropic Messages, OpenAI Chat, OpenAI Responses
-(including ChatGPT on HTTPS and WebSocket), and Bedrock Converse use this guard. Gemini and
-Google Code Assist receive structured argument values, not JSON argument-string buffers.
+The shared guard lives in `broca-provider/src/wire.rs`. Suffix counting inspects only the new
+delta, not the growing argument buffer. Final argument strings also pass the guard. Gemini and
+Google Code Assist deliver structured arguments in a single part, so the size check uses the
+JSON encoding of that part's argument value.
 
-No record type or field was added. An attempt's outcome gained the open-string value
-`tool_args_trailing_garbage`. The existing step, batch and result records carry the
-transcript. Calls with an intent but no result keep the unknown-outcome/Interrupted rule and
-are never re-dispatched. A WARN contains session, step, tool name, code and byte counts only.
-Usage not yet reported by the provider remains unknown rather than being estimated.
+An unfinished call gets a normal not-run result with reason `arguments_incomplete`; its
+partial arguments aren't saved or sent to the model. Complete sibling calls can still run.
+The same rule applies to unfinished calls when the provider itself reports the output ceiling.
+The third consecutive length cut ends the run with a permanent `output_limit` error instead
+of dispatching any of that step's calls. See the [module surface](module-surface.md).
 
+The existing step, batch and result records carry these outcomes. Usage not yet reported by
+the provider remains unknown. Calls with an intent but no result keep the unknown-outcome
+rule and are never re-dispatched.

@@ -290,6 +290,7 @@ mod gated {
         let mut frozen = frozen_config_for_family(WireFamilyId::OpenAiResponsesChatgpt, "gpt-5");
         frozen.base_url = Some(server.url.clone());
         frozen.reasoning_effort = Some("high".into());
+        let cap = format!("\"max_output_tokens\":{}", frozen.max_output_tokens);
         let provider = LiveProvider::new(
             OpenAiResponsesChatgpt,
             frozen,
@@ -300,9 +301,9 @@ mod gated {
         let base_text = String::from_utf8(base.clone()).unwrap();
         assert!(base_text.contains(r#""effort":"high""#));
         assert!(base_text.contains(r#""stream":true"#));
-        assert!(!base_text.contains("max_output_tokens"));
+        assert_eq!(base_text.matches(&cap).count(), 1);
         let expected = base_text
-            .replacen(r#""model":"#, r#""max_output_tokens":16,"model":"#, 1)
+            .replacen(&cap, r#""max_output_tokens":16"#, 1)
             .into_bytes();
         let sent = logs.scope_future(provider.warm(&base)).await.unwrap();
         assert_eq!(server.bodies(), vec![expected]);

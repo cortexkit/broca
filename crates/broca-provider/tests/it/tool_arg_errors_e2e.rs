@@ -275,7 +275,5 @@ async fn runaway_tool_whitespace_returns_error_and_aimock_retries() {
     assert_eq!(outcome.final_text(), "Retried after the malformed call.");
     let results = outcome.tool_result_texts();
     assert_eq!(results.len(), 1);
-    assert!(results[0].starts_with("tool_args_trailing_garbage:"));
-    assert!(results[0].contains("whitespace_bytes=4097"));
-    assert!(!results[0].contains("MUST-NOT-EXECUTE"));
+    assert_eq!(results[0], "Tool call `lookup` was not run: the reply hit the output limit before its arguments were complete. Re-issue it with complete arguments, and split large payloads into smaller calls.");
 }

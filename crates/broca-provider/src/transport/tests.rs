@@ -6027,6 +6027,63 @@ async fn response_header_stall_uses_stream_timeout_classification() {
     server.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn local_first_byte_wait_uses_the_content_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (seen_tx, mut seen_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = [0; 128];
+        assert_ne!(socket.read(&mut bytes).await.unwrap(), 0);
+        seen_tx.send(()).unwrap();
+        futures::future::pending::<()>().await;
+    });
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let request = PreparedHttpRequest::from(HttpRequest {
+        method: HttpMethod::Post,
+        url: format!("http://{address}/stall"),
+        headers: Vec::new(),
+        body: Vec::new(),
+    });
+    let task = tokio::spawn(async move {
+        drive_stream(
+            &reqwest::Client::new().into(),
+            &request,
+            Box::new(CountingNormalizer(Arc::new(AtomicUsize::new(0)))),
+            &tx,
+        )
+        .await
+    });
+    // Keep this task runnable until the socket has the request, so Tokio cannot advance
+    // the paused clock past the header deadline while the OS is still establishing it.
+    loop {
+        match seen_rx.try_recv() {
+            Ok(()) => break,
+            Err(oneshot::error::TryRecvError::Empty) => {
+                assert!(
+                    !task.is_finished(),
+                    "client ended before sending its request"
+                );
+                tokio::task::yield_now().await;
+            }
+            Err(error) => panic!("server closed before receiving the request: {error}"),
+        }
+    }
+    let start = tokio::time::Instant::now();
+    tokio::time::advance(Duration::from_secs(301)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "a local attempt was cut at the public header deadline"
+    );
+    tokio::time::advance(Duration::from_secs(1499)).await;
+    let error = task.await.unwrap().unwrap_err();
+    assert_eq!(error.outcome, AttemptOutcome::HeaderTimeout);
+    assert_eq!(start.elapsed(), Duration::from_secs(1800));
+    server.abort();
+}
+
 #[tokio::test]
 async fn non_2xx_error_body_stall_times_out_and_classifies_by_status() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

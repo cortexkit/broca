@@ -19,6 +19,40 @@ use broca_protocol::error::{ErrorClass, ProviderError};
 /// 579 s while still bounding a peer that keeps the connection alive and never answers.
 pub(crate) const STREAM_CONTENT_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Local models can finish prompt evaluation before writing any response headers. This extra
+/// time applies only before the response, not to gaps once the stream starts.
+pub(super) fn first_response_timeout(url: &str, default: Duration) -> Duration {
+    if default != super::STREAM_IDLE_TIMEOUT {
+        return default;
+    }
+    use url::Host;
+    let local = url::Url::parse(url).is_ok_and(|url| match url.host() {
+        Some(Host::Domain(host)) => host.trim_end_matches('.') == "localhost",
+        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
+        Some(Host::Ipv6(ip)) => ip.to_ipv4_mapped().map_or_else(
+            || ip.is_loopback() || ip.is_unique_local(),
+            |ip| ip.is_loopback() || ip.is_private(),
+        ),
+        None => false,
+    });
+    if local {
+        STREAM_CONTENT_TIMEOUT
+    } else {
+        default
+    }
+}
+
+pub(super) fn header_timeout_error(limit: Duration) -> ProviderError {
+    let mut error = super::stream_timeout_error("waiting for response headers");
+    if limit == STREAM_CONTENT_TIMEOUT {
+        error.message = format!(
+            "provider stream idle: waiting for response headers for {}s",
+            limit.as_secs()
+        );
+    }
+    error
+}
+
 /// The error for a stream that carried only keepalives for `limit`.
 pub(super) fn content_timeout_error(limit: Duration) -> ProviderError {
     ProviderError {
@@ -70,7 +104,7 @@ mod tests {
     }
 
     /// Every live attempt reads its stream through the tool-name wrapper, so a family's own
-    /// content limit (ChatGPT's 600 s) only applies if the wrapper passes it on.
+    /// content limit only applies if the wrapper passes it on.
     #[test]
     fn the_live_wrapper_keeps_the_family_content_limit() {
         let wrapped = super::super::ToolNameRestoringNormalizer {
@@ -79,5 +113,25 @@ mod tests {
             live_progress: None,
         };
         assert_eq!(wrapped.content_deadline(), Some(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn first_byte_policy_classifies_private_and_loopback_hosts() {
+        for (url, secs) in [
+            ("http://localhost:8000", 1800),
+            ("http://127.0.0.2", 1800),
+            ("http://[::1]", 1800),
+            ("https://192.168.1.2", 1800),
+            ("https://[fd00::1]", 1800),
+            ("https://[::ffff:10.0.0.1]", 1800),
+            ("https://192.0.2.1", 300),
+            ("https://localhost.example", 300),
+        ] {
+            assert_eq!(
+                super::first_response_timeout(url, Duration::from_secs(300)),
+                Duration::from_secs(secs),
+                "{url}"
+            );
+        }
     }
 }

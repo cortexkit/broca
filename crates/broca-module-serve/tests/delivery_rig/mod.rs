@@ -49,6 +49,8 @@ pub enum Step {
     Text(&'static str),
     /// One call of the `work` tool.
     Call(&'static str),
+    /// A call whose arguments the provider cut at the output ceiling.
+    CutCall(&'static str),
     /// Sibling calls of the `work` tool in one step, in order.
     Calls(&'static [&'static str]),
     /// A final answer made of these blocks, in order.
@@ -74,7 +76,7 @@ impl Step {
             Step::Text(text) => vec![ContentBlock::Text {
                 text: (*text).into(),
             }],
-            Step::Call(id) => vec![call(id)],
+            Step::Call(id) | Step::CutCall(id) => vec![call(id)],
             Step::Calls(ids) => ids.iter().map(|id| call(id)).collect(),
             Step::Usage {
                 content: blocks, ..
@@ -96,8 +98,22 @@ impl Step {
                 }
             }
             Step::Call(_) | Step::Calls(_) => FinishReason::ToolCalls,
+            Step::CutCall(_) => FinishReason::Length,
         };
         let mut events = Vec::new();
+        if let Step::CutCall(id) = self {
+            events.push(NormalizedEvent::Control(
+                ProviderControl::ToolArgsTrailingGarbage {
+                    cut: broca_protocol::provider::ToolArgsTrailingGarbage {
+                        tool_call_id: ToolCallId((*id).into()),
+                        tool_name: "work".into(),
+                        json_bytes: 0,
+                        whitespace_bytes: 0,
+                        omitted_tool_calls: 0,
+                    },
+                },
+            ));
+        }
         let message_id = MessageId(
             if matches!(self, Step::StreamEmpty(_)) {
                 ""

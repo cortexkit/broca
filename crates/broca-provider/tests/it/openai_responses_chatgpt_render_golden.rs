@@ -94,6 +94,7 @@ pub(crate) const GOLDEN: &str =
     include_str!("../fixtures/openai_responses_chatgpt_render_golden.json");
 pub(crate) const GOLDEN_VERSION: &str =
     include_str!("../fixtures/openai_responses_chatgpt_render_golden.json.version");
+pub(crate) const V8_GOLDEN: &str = include_str!("../fixtures/openai_responses_chatgpt_v8.json");
 
 /// The frozen config the golden bytes are rendered with.
 pub(crate) fn golden_frozen() -> broca_provider::wire::FrozenRenderConfig {
@@ -160,7 +161,10 @@ fn frozen_profile_round_trips_without_legacy_defaults() {
     let restored: broca_provider::wire::FrozenRenderConfig =
         serde_json::from_value(serde_json::to_value(admitted).unwrap()).unwrap();
     assert_eq!(restored.chatgpt_wire, Some(wire));
-    assert_eq!(restored.renderer_version, 8);
+    assert_eq!(
+        restored.renderer_version,
+        OPENAI_RESPONSES_CHATGPT_RENDERER_VERSION
+    );
 }
 
 #[test]
@@ -178,8 +182,18 @@ fn codex_profile_plain_body_fixture() {
         {"role":"user","content":[{"type":"text","text":"Hello"}]}
     ]}))
     .unwrap();
-    let expected: serde_json::Value =
+    let mut expected: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/chatgpt_codex_0_163_plain.json")).unwrap();
+    // This fixture is from Codex, not broca. Compare against it before and after adding
+    // the cap, so unrelated Codex wire fields must still agree byte for byte.
+    frozen.renderer_version = 8;
+    assert_eq!(
+        OpenAiResponsesChatgpt.render(&frozen, &opts),
+        broca_protocol::canonical_json_bytes(&expected)
+    );
+    frozen.renderer_version = OPENAI_RESPONSES_CHATGPT_RENDERER_VERSION;
+    frozen.max_output_tokens = 12_345;
+    expected["max_output_tokens"] = json!(12_345);
     assert_eq!(
         OpenAiResponsesChatgpt.render(&frozen, &opts),
         broca_protocol::canonical_json_bytes(&expected)

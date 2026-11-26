@@ -474,6 +474,22 @@ impl AnthropicNormalizer {
                         }
                         _ => return Ok(out), // unknown block type: ignore
                     };
+                    if let BlockBuf::ToolUse {
+                        id,
+                        name,
+                        start_input,
+                        ..
+                    } = &buf
+                    {
+                        if !start_input.is_null()
+                            && !start_input
+                                .as_object()
+                                .is_some_and(|input| input.is_empty())
+                        {
+                            self.arguments_guard
+                                .terminal(id, name, &start_input.to_string());
+                        }
+                    }
                     self.blocks.insert(idx, buf);
                 }
             }
@@ -592,7 +608,7 @@ impl AnthropicNormalizer {
                 let served_model = self.served_model();
                 let message = self.assemble_message()?;
                 self.completed = true;
-                out.extend(self.arguments_guard.event());
+                out.extend(self.arguments_guard.events());
                 out.push(NormalizedEvent::Control(
                     ProviderControl::AssistantMessage { message },
                 ));
@@ -687,7 +703,7 @@ impl AnthropicNormalizer {
             _ => {} // ping, unknown: ignore
         }
         if self.arguments_guard.fired() && !self.completed {
-            self.finish_reason = FinishReason::ToolCalls;
+            self.finish_reason = FinishReason::Length;
             out.extend(self.push_json(r#"{"type":"message_stop"}"#)?);
         }
         Ok(out)
@@ -798,7 +814,7 @@ impl AnthropicNormalizer {
             }
         }
         if self.arguments_guard.fired() {
-            self.finish_reason = FinishReason::ToolCalls;
+            self.finish_reason = FinishReason::Length;
         }
         // Tool arguments are parsed here, at `message_stop`, which Anthropic sends after the
         // `message_delta` carrying `stop_reason`. So when a buffer does not parse, the stop
@@ -858,36 +874,28 @@ impl AnthropicNormalizer {
                     start_input,
                 } => {
                     let closed = self.completed_blocks.contains(&idx);
-                    // When the provider ended the message itself, a block it never closed was
-                    // cut off mid-call (a refusal that stops partway through a tool call, say):
-                    // its start event's placeholder input is not the call's arguments, so it
-                    // must not become a call. When the whitespace guard stopped the stream, the
-                    // provider never got to close anything, so a block whose arguments already
-                    // parse is kept.
-                    let omit = if self.arguments_guard.fired() {
-                        (input_json.is_empty() && !closed)
-                            || (!input_json.is_empty()
-                                && serde_json::from_str::<Value>(&input_json).is_err())
-                    } else {
-                        !closed
-                    };
-                    if omit {
-                        self.arguments_guard.omit_tool();
+                    if !closed && !self.arguments_guard.fired() && ceiling.is_none() {
                         continue;
                     }
-                    let input = if input_json.is_empty() {
+                    let input = if (!closed && ceiling.is_some() && !self.arguments_guard.fired())
+                        || self.arguments_guard.guarded_call(&id)
+                        || (!closed && input_json.is_empty())
+                    {
+                        self.arguments_guard.refuse(&id, &name)
+                    } else if input_json.is_empty() {
                         if start_input.is_null() {
                             Value::Object(Default::default())
                         } else {
                             start_input
                         }
                     } else {
-                        serde_json::from_str(&input_json).map_err(|error| match ceiling {
-                            Some(stop) => {
-                                NormalizeError::OutputCeiling(stop.cut(&name, &input_json))
+                        match serde_json::from_str(&input_json) {
+                            Ok(input) => input,
+                            Err(_) if ceiling.is_some() || self.arguments_guard.fired() => {
+                                self.arguments_guard.refuse(&id, &name)
                             }
-                            None => NormalizeError::ToolArguments(error),
-                        })?
+                            Err(error) => return Err(NormalizeError::ToolArguments(error)),
+                        }
                     };
                     content.push(ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId(id),

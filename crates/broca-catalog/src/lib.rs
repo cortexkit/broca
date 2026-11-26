@@ -2264,6 +2264,11 @@ mod tests {
 
             let renderer = wire_family(family).expect("family is implemented");
             let mut helper_frozen = helper(family, model_id);
+            if family == WireFamilyId::OpenAiResponsesChatgpt {
+                // Compare renderer shape at the fixture's explicit cap, not the helper's
+                // ChatGPT-specific default for fresh runs.
+                helper_frozen.max_output_tokens = 2048;
+            }
             assert!(catalog_frozen.repetition_after_input);
             assert!(!helper_frozen.repetition_after_input);
             // The raw family helper also rebuilds old admissions. Align only the newly frozen

@@ -1024,11 +1024,14 @@ fn resolve_provider_inner(
             context_limit: None,
         });
     }
-    // Compatibility callers can override the cap while constructing a config. Production
-    // resumes take the complete recorded-config branch above, never this partial override.
+    // Production resumes use the complete recorded config, not a partial compatibility override.
     let max_tokens_override = episode_render.max_output_tokens;
-    let max_tokens_for = |output_limit: Option<u64>, context_limit: Option<u64>| {
+    let max_tokens_for = |family, output_limit: Option<u64>, context_limit: Option<u64>| {
         max_tokens_override.unwrap_or_else(|| {
+            if family == WireFamilyId::OpenAiResponsesChatgpt {
+                return caller_max_tokens
+                    .unwrap_or(broca_provider::families::CHATGPT_DEFAULT_MAX_OUTPUT_TOKENS);
+            }
             caller_max_tokens.map_or_else(
                 || default_max_output_tokens(output_limit, context_limit),
                 |requested| {
@@ -1042,7 +1045,7 @@ fn resolve_provider_inner(
 
     if let Some(base_url) = base_url.filter(|s| !s.is_empty()) {
         // No catalog model on this path: the endpoint is opaque, so the default is the fallback.
-        let max_tokens = max_tokens_for(None, None);
+        let max_tokens = max_tokens_for(WireFamilyId::OpenAiChat, None, None);
         // Mode 1: explicit base_url override — OpenAI-Chat, model id verbatim.
         let mut frozen = openai_chat_frozen_config(model);
         frozen.repetition_after_input = true;
@@ -1233,10 +1236,10 @@ fn resolve_provider_inner(
         }
         let mut frozen = frozen_config_for_family(family, &wire_model_id);
         frozen.repetition_after_input = true;
-        // The override family owns the endpoint, but output capacity belongs to the model, so
-        // the catalog answers it where it lists this provider/model. A tier alias the catalog
-        // does not list gets the fallback rather than a guess about its base model's limit.
+        // Except on ChatGPT, use the catalog limit even with an endpoint override. An unlisted
+        // tier alias gets the fallback rather than a guess about its base model's capacity.
         frozen.max_output_tokens = max_tokens_for(
+            family,
             catalog.output_limit(provider_id, catalog_model_id),
             catalog.context_limit(provider_id, catalog_model_id),
         );
@@ -1438,7 +1441,11 @@ fn resolve_provider_inner(
     }
 
     let family = provider_spec.wire_family;
-    let max_tokens = max_tokens_for(model_spec.limits.max_output, model_spec.limits.context);
+    let max_tokens = max_tokens_for(
+        family,
+        model_spec.limits.max_output,
+        model_spec.limits.context,
+    );
     let mut frozen: FrozenRenderConfig = resolve_frozen(
         &provider_spec,
         &model_spec,
@@ -1582,7 +1589,7 @@ fn resolve_provider_inner(
             fallback_model,
             auth_method,
             opts,
-            &max_tokens_for,
+            &|output_limit, context_limit| max_tokens_for(family, output_limit, context_limit),
         ) {
             Ok(fallback) => frozen.refusal_fallback = Some(Box::new(fallback)),
             Err(reason) => tracing::info!(
@@ -4863,8 +4870,9 @@ mod tests {
             );
             // The output cap is the warm's sole body edit, independently derived from the base.
             let base_text = std::str::from_utf8(&base).unwrap();
-            let expected_warm =
-                base_text.replacen("\"model\":", "\"max_output_tokens\":16,\"model\":", 1);
+            let step_cap = format!("\"max_output_tokens\":{},", frozen.max_output_tokens);
+            assert!(base_text.contains(&step_cap));
+            let expected_warm = base_text.replacen(&step_cap, "\"max_output_tokens\":16,", 1);
             assert!(
                 warm_body == expected_warm.as_bytes(),
                 "warm body must retain the prefix byte-identically"

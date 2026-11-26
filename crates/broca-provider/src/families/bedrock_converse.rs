@@ -1368,7 +1368,7 @@ impl BedrockStreamNormalizer {
             _ => {}
         }
         if self.arguments_guard.fired() && !self.emitted_final {
-            self.finish_reason = FinishReason::ToolCalls;
+            self.finish_reason = FinishReason::Length;
             out.extend(self.final_events()?);
         }
         Ok(())
@@ -1610,7 +1610,7 @@ impl BedrockStreamNormalizer {
         }
         self.emitted_final = true;
         let message = self.assemble_message()?;
-        let mut events: Vec<_> = self.arguments_guard.event().into_iter().collect();
+        let mut events: Vec<_> = self.arguments_guard.events().collect();
         events.extend([
             NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
             NormalizedEvent::Control(ProviderControl::StepFinished {
@@ -1645,7 +1645,7 @@ impl BedrockStreamNormalizer {
             }
         }
         if self.arguments_guard.fired() {
-            self.finish_reason = FinishReason::ToolCalls;
+            self.finish_reason = FinishReason::Length;
         }
         // Tool arguments are parsed here, once both `messageStop` (which carries `stopReason`)
         // and the metadata trailer have arrived. So a `max_tokens` stop is already known when a
@@ -1685,14 +1685,12 @@ impl BedrockStreamNormalizer {
                     name,
                     input_json,
                 } => {
-                    let Some(input) = self.arguments_guard.decode(
-                        &input_json,
-                        &name,
-                        ceiling,
-                        self.completed_blocks.contains(&idx),
-                    )?
-                    else {
-                        continue;
+                    let closed = self.completed_blocks.contains(&idx);
+                    let input = if ceiling.is_some() && !self.arguments_guard.fired() && !closed {
+                        self.arguments_guard.refuse(&id, &name)
+                    } else {
+                        self.arguments_guard
+                            .decode(&id, &input_json, &name, ceiling, closed)?
                     };
                     content.push(ContentBlock::ToolCall(ToolCall {
                         tool_call_id: ToolCallId(id),

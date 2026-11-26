@@ -142,7 +142,7 @@ fn legacy_chatgpt_audio_flags_cannot_bypass_the_live_refusal() {
         assert!(content[1]["text"].as_str().unwrap().contains("reason=mime"));
         assert!(!body.to_string().contains("YWJj"));
         assert_eq!(body["store"], false);
-        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["max_output_tokens"], frozen.max_output_tokens);
         frozen
             .media
             .as_mut()

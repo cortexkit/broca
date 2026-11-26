@@ -9,9 +9,10 @@
 //! signal usable: a repeated call is not evidence of a stuck model, but a repeated call that keeps
 //! failing, or that keeps returning bytes the model has already seen, is.
 //!
-//! Nothing here terminates a run. The step cap remains the only terminator.
+//! The loop checks settled results before deciding whether another batch may run.
 
 use broca_protocol::{canonical_json_bytes, ContentBlock, Message, Role, ToolCall, ToolOutput};
+use sha2::{Digest, Sha256};
 use std::{borrow::Cow, collections::HashMap};
 
 /// The bytes of a tool result as the repetition check sees them.
@@ -95,11 +96,23 @@ pub enum RepetitionVerdict {
     /// Nothing worth saying.
     Quiet,
     /// The same call, with the same arguments, has now failed this many times.
-    RepeatedFailure { tool_name: String, count: u32 },
+    RepeatedFailure {
+        tool_name: String,
+        count: u32,
+    },
     /// This tool has failed this many times in a row, with any arguments.
-    RepeatedToolFailure { tool_name: String, count: u32 },
+    RepeatedToolFailure {
+        tool_name: String,
+        count: u32,
+    },
     /// A read-only tool returned a byte-identical result this many times running.
-    NoProgress { tool_name: String, count: u32 },
+    NoProgress {
+        tool_name: String,
+        count: u32,
+    },
+    IdenticalCalls {
+        tool_name: String,
+    },
 }
 
 impl RepetitionVerdict {
@@ -121,6 +134,11 @@ impl RepetitionVerdict {
             Self::NoProgress { tool_name, count } => Some(format!(
                 "{tool_name} returned exactly the same result {count} times. The information is \
                  already available above; use it or change the query rather than asking again."
+            )),
+            Self::IdenticalCalls { tool_name } => Some(format!(
+                "You called `{tool_name}` with the same arguments 3 times in a row. Repeating it is \
+                 unlikely to help. Change your approach: use different arguments or another tool, \
+                 or answer with what you have."
             )),
         }
     }
@@ -159,6 +177,84 @@ pub struct RepetitionObserver {
     tool_failures: HashMap<String, u32>,
     /// Signature -> (digest of the last result, how many times that digest has repeated).
     no_progress: HashMap<CallSignature, (u64, u32)>,
+    consecutive: ConsecutiveCalls,
+}
+
+/// Content-free identity of the last settled call and its result. The call ID is a transport
+/// correlation key and not part of the comparison. A strong digest keeps the checkpoint small
+/// without letting short, deliberately colliding arguments make an unrelated call look identical.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SettledCall {
+    name: String,
+    input: [u8; 32],
+    result: [u8; 32],
+    identical_calls: u32,
+    identical_results: u32,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConsecutiveCalls(Option<SettledCall>);
+
+impl ConsecutiveCalls {
+    pub const STOP_AT: u32 = 20;
+
+    pub fn seeded(checkpoint: &RepetitionCheckpoint) -> Self {
+        Self(checkpoint.consecutive.clone())
+    }
+
+    pub fn stops(&self, call: &ToolCall) -> bool {
+        self.0.as_ref().is_some_and(|last| {
+            last.identical_results >= Self::STOP_AT - 1
+                && last.name == call.tool_name
+                && last.input == <[u8; 32]>::from(Sha256::digest(call.input.text().as_bytes()))
+        })
+    }
+
+    fn observe(&mut self, call: &ToolCall, result: [u8; 32]) -> u32 {
+        let input = Sha256::digest(call.input.text().as_bytes()).into();
+        if let Some(last) = self
+            .0
+            .as_mut()
+            .filter(|last| last.name == call.tool_name && last.input == input)
+        {
+            last.identical_calls = last.identical_calls.saturating_add(1);
+            last.identical_results = if last.result == result {
+                last.identical_results.saturating_add(1)
+            } else {
+                1
+            };
+            last.result = result;
+            last.identical_calls
+        } else {
+            self.0 = Some(SettledCall {
+                name: call.tool_name.clone(),
+                input,
+                result,
+                identical_calls: 1,
+                identical_results: 1,
+            });
+            1
+        }
+    }
+
+    pub fn observe_result(&mut self, call: &ToolCall, result: &broca_protocol::ToolResult) -> u32 {
+        struct DigestWriter(Sha256);
+        impl std::io::Write for DigestWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut digest = DigestWriter(Sha256::new());
+        digest.0.update([u8::from(result.is_error)]);
+        // Include the output kind and structured data, not only the text shown to the model,
+        // so a changed result never counts as byte-identical.
+        serde_json::to_writer(&mut digest, &result.output).expect("tool output serializes");
+        self.observe(call, digest.0.finalize().into())
+    }
 }
 
 impl RepetitionObserver {
@@ -169,6 +265,50 @@ impl RepetitionObserver {
     /// to the layer that made the call, and sniffing an error out of result bytes would misread any
     /// tool that legitimately returns the word "error".
     pub fn observe(
+        &mut self,
+        call: &ToolCall,
+        result_bytes: &[u8],
+        failed: bool,
+    ) -> RepetitionVerdict {
+        let mut digest = Sha256::new();
+        digest.update([u8::from(failed)]);
+        digest.update(result_bytes);
+        let count = self.consecutive.observe(call, digest.finalize().into());
+        self.with_consecutive_warning(call, result_bytes, failed, count)
+    }
+
+    fn observe_result(
+        &mut self,
+        call: &ToolCall,
+        result: &broca_protocol::ToolResult,
+    ) -> RepetitionVerdict {
+        let count = self.consecutive.observe_result(call, result);
+        self.with_consecutive_warning(
+            call,
+            result_bytes(&result.output).as_ref(),
+            result.is_error,
+            count,
+        )
+    }
+
+    fn with_consecutive_warning(
+        &mut self,
+        call: &ToolCall,
+        result_bytes: &[u8],
+        failed: bool,
+        count: u32,
+    ) -> RepetitionVerdict {
+        let previous_rules = self.observe_outcome(call, result_bytes, failed);
+        if count >= 3 {
+            RepetitionVerdict::IdenticalCalls {
+                tool_name: call.tool_name.clone(),
+            }
+        } else {
+            previous_rules
+        }
+    }
+
+    fn observe_outcome(
         &mut self,
         call: &ToolCall,
         result_bytes: &[u8],
@@ -254,13 +394,15 @@ pub struct RepetitionFold {
 }
 
 /// Content-free continuation of the repetition rules: call identities, result digests and
-/// counters, never argument or output text. Bump the version when warning rules change.
+/// counters, never argument or output text. Older readers ignore optional counters they don't use.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepetitionCheckpoint {
     pub rules_version: u32,
     exact_failures: Vec<(CallSignature, u32)>,
     tool_failures: Vec<(String, u32)>,
     no_progress: Vec<(CallSignature, (u64, u32))>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consecutive: Option<SettledCall>,
 }
 
 pub const REPETITION_RULES_VERSION: u32 = 1;
@@ -288,6 +430,7 @@ impl RepetitionFold {
                 exact_failures: checkpoint.exact_failures.iter().cloned().collect(),
                 tool_failures: checkpoint.tool_failures.iter().cloned().collect(),
                 no_progress: checkpoint.no_progress.iter().cloned().collect(),
+                consecutive: ConsecutiveCalls::seeded(checkpoint),
             },
             pending_calls: None,
         })
@@ -329,6 +472,14 @@ impl RepetitionFold {
             exact_failures,
             tool_failures,
             no_progress,
+            // Omit a one-call streak, so runs that never repeat a call keep the old checkpoint
+            // bytes. Resuming from that checkpoint starts the streak at zero.
+            consecutive: self
+                .observer
+                .consecutive
+                .0
+                .clone()
+                .filter(|last| last.identical_calls >= 2),
         })
     }
 
@@ -343,11 +494,7 @@ impl RepetitionFold {
                 for (index, block) in message.content.iter().enumerate() {
                     if let ContentBlock::ToolResult(result) = block {
                         if let Some(call) = calls.next() {
-                            let bytes = result_bytes(&result.output);
-                            verdicts.push((
-                                index,
-                                self.observer.observe(call, bytes.as_ref(), result.is_error),
-                            ));
+                            verdicts.push((index, self.observer.observe_result(call, result)));
                         }
                     }
                 }
@@ -568,6 +715,8 @@ mod tests {
         let c = call("read", json!({"filePath": "a.rs"}));
         observer.observe(&c, b"boom", true);
         observer.observe(&c, b"fine", false);
+        // Break the consecutive-call streak so it doesn't mask the failure-specific rule.
+        observer.observe(&call("search", json!({})), b"fine", false);
         assert_eq!(
             observer.observe(&c, b"boom", true),
             RepetitionVerdict::Quiet,
@@ -583,9 +732,9 @@ mod tests {
         let c = call("read", json!({"filePath": "growing.log"}));
         for i in 0..6 {
             let body = format!("line {i}");
-            assert_eq!(
-                observer.observe(&c, body.as_bytes(), false),
-                RepetitionVerdict::Quiet,
+            let verdict = observer.observe(&c, body.as_bytes(), false);
+            assert!(
+                !matches!(verdict, RepetitionVerdict::NoProgress { .. }),
                 "a read whose contents keep changing is making progress"
             );
         }
@@ -605,17 +754,66 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_sealed_repetition_checkpoint_keeps_both_streaks_and_legacy_starts_clean() {
+        let call = call("work", json!({"key":"private argument"}));
+        let assistant = Message::new(Role::Assistant, vec![ContentBlock::ToolCall(call.clone())]);
+        let tool = Message::new(
+            Role::Tool,
+            vec![ContentBlock::ToolResult(broca_protocol::ToolResult {
+                tool_call_id: call.tool_call_id.clone(),
+                output: ToolOutput::Text {
+                    text: "private output".into(),
+                },
+                is_error: false,
+            })],
+        );
+        let mut fold = RepetitionFold::default();
+        fold.push(&assistant);
+        fold.push(&tool);
+        assert!(serde_json::to_value(fold.checkpoint().unwrap())
+            .unwrap()
+            .get("consecutive")
+            .is_none());
+        for _ in 1..18 {
+            fold.push(&assistant);
+            fold.push(&tool);
+        }
+        let mut checkpoint = serde_json::to_value(fold.checkpoint().unwrap()).unwrap();
+        assert_eq!(checkpoint["consecutive"]["identical_calls"], 18);
+        let encoded = checkpoint.to_string();
+        assert!(!encoded.contains("private argument") && !encoded.contains("private output"));
+        let new = serde_json::from_value(checkpoint.clone()).unwrap();
+        checkpoint.as_object_mut().unwrap().remove("consecutive");
+        let legacy = serde_json::from_value(checkpoint).unwrap();
+        for (checkpoint, expected) in [(new, true), (legacy, false)] {
+            let mut restored = RepetitionFold::seeded(&checkpoint).unwrap();
+            restored.push(&assistant);
+            let verdicts = restored.push(&tool);
+            assert_eq!(
+                matches!(
+                    verdicts.as_slice(),
+                    [(_, RepetitionVerdict::IdenticalCalls { .. })]
+                ),
+                expected
+            );
+            assert_eq!(restored.into_observer().consecutive.stops(&call), expected);
+        }
+    }
+
     /// Writing the same file twice is repetition and not a loop, so a mutating tool must never
     /// produce a no-progress verdict however identical its results.
     #[test]
     fn a_mutating_tool_never_reports_no_progress() {
         let mut observer = RepetitionObserver::default();
         let c = call("write", json!({"filePath": "out.rs", "content": "x"}));
-        for _ in 0..5 {
-            assert_eq!(
-                observer.observe(&c, b"written", false),
-                RepetitionVerdict::Quiet
-            );
+        for i in 0..5 {
+            let verdict = observer.observe(&c, b"written", false);
+            if i < 2 {
+                assert_eq!(verdict, RepetitionVerdict::Quiet);
+            } else {
+                assert!(matches!(verdict, RepetitionVerdict::IdenticalCalls { .. }));
+            }
         }
     }
 

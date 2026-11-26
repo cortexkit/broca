@@ -1025,6 +1025,7 @@ pub(crate) struct GeminiNormalizer {
     tool_id_policy: ToolIdPolicy,
     text_state_format: Option<broca_protocol::content::TextProviderFormat>,
     sse: SseDecoder,
+    arguments_guard: crate::wire::ToolArgsGuard,
     parts: Vec<GeminiPartBuf>,
     next_call_index: u32,
     usage: Usage,
@@ -1057,6 +1058,7 @@ impl GeminiNormalizer {
             tool_id_policy,
             text_state_format: None,
             sse: SseDecoder::for_content_family(crate::content_progress::ContentFamily::Gemini),
+            arguments_guard: Default::default(),
             parts: Vec::new(),
             next_call_index: 0,
             usage: Usage::default(),
@@ -1131,6 +1133,9 @@ impl GeminiNormalizer {
         v: &Value,
         out: &mut Vec<NormalizedEvent>,
     ) -> Result<(), NormalizeError> {
+        if self.arguments_guard.fired() {
+            return Ok(());
+        }
         if let Some(evidence) = &self.response_evidence {
             evidence.lock().unwrap().observe_response(v);
         }
@@ -1279,8 +1284,14 @@ impl GeminiNormalizer {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
-                let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                let mut args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                 let display_delta = args.to_string();
+                let tcid = synthetic_inbound_id(index, self.tool_id_policy);
+                self.arguments_guard.terminal(&tcid, &name, &display_delta);
+                let cut = self.arguments_guard.fired();
+                if cut {
+                    args = self.arguments_guard.refuse(&tcid, &name);
+                }
                 let tool_name = crate::normalize::known_name(&name);
                 let part_index = self.push_part(GeminiPartBuf::FunctionCall(FunctionCallBuf {
                     index,
@@ -1288,7 +1299,12 @@ impl GeminiNormalizer {
                     args,
                     thought_signature,
                 }));
-                let tcid = synthetic_inbound_id(index, self.tool_id_policy);
+                if cut {
+                    self.finish_reason = FinishReason::Length;
+                    self.terminal_observed = true;
+                    out.extend(self.final_events());
+                    break;
+                }
                 out.push(NormalizedEvent::Display(DisplayEvent::ToolInputDelta {
                     mid: None,
                     part: Some(part_index),
@@ -1436,6 +1452,37 @@ impl GeminiNormalizer {
             content,
         }
     }
+
+    fn final_events(&mut self) -> Vec<NormalizedEvent> {
+        if self.emitted_final || !self.started || !self.terminal_observed {
+            return Vec::new();
+        }
+        self.emitted_final = true;
+        let message = self.assemble_message();
+        let mut out: Vec<_> = self.arguments_guard.events().collect();
+        out.extend([
+            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
+            NormalizedEvent::Control(ProviderControl::StepFinished {
+                raw_finish_reason: self.raw_finish_reason.take(),
+                step_id: self.step_id,
+                usage: self.usage,
+                finish_reason: self.finish_reason,
+                service_tier_used: self
+                    .header_service_tier
+                    .clone()
+                    .or_else(|| self.body_service_tier.clone()),
+                speed_used: None,
+                served_model: None,
+                usage_iterations: None,
+            }),
+            NormalizedEvent::Control(ProviderControl::Finished {
+                usage: self.usage,
+                finish_reason: self.finish_reason,
+                retries_used: 0,
+            }),
+        ]);
+        out
+    }
 }
 
 fn synthetic_inbound_id(index: u32, policy: ToolIdPolicy) -> String {
@@ -1505,39 +1552,7 @@ impl StreamNormalizer for GeminiNormalizer {
             }
             self.handle_chunk(payload.value()?, &mut out)?;
         }
-        if self.emitted_final || !self.started {
-            return Ok(out);
-        }
-        if !self.terminal_observed {
-            // A body that ended before the stream's terminal chunk was cut in transit, not
-            // decoded wrongly: assemble nothing, and the transport's completion check reports
-            // the missing step as a transport fault, as it does for every other family.
-            return Ok(out);
-        }
-        self.emitted_final = true;
-        let message = self.assemble_message();
-        out.extend([
-            NormalizedEvent::Control(ProviderControl::AssistantMessage { message }),
-            NormalizedEvent::Control(ProviderControl::StepFinished {
-                raw_finish_reason: self.raw_finish_reason.take(),
-                step_id: self.step_id,
-                usage: self.usage,
-                finish_reason: self.finish_reason,
-                service_tier_used: self
-                    .header_service_tier
-                    .clone()
-                    .or_else(|| self.body_service_tier.clone()),
-                speed_used: None,
-                // No non-Anthropic family reports a server-side fallback or per-model usage.
-                served_model: None,
-                usage_iterations: None,
-            }),
-            NormalizedEvent::Control(ProviderControl::Finished {
-                usage: self.usage,
-                finish_reason: self.finish_reason,
-                retries_used: 0,
-            }),
-        ]);
+        out.extend(self.final_events());
         Ok(out)
     }
 

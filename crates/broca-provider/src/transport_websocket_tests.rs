@@ -426,7 +426,7 @@ async fn codex_profile_https_orders_wire_without_changing_canonical_digest() {
 
 /// A warm must resend the cache prefix of the step it warms byte for byte. Over HTTPS a Codex
 /// step goes out with its routing fields first, so the warm must too: it is the step's own wire
-/// bytes with only the output cap added, never the sorted canonical form.
+/// bytes with only the output cap changed, never the sorted canonical form.
 #[tokio::test]
 async fn codex_https_warm_resends_the_step_wire_bytes_with_only_the_output_cap() {
     let mock = Mock::start(vec![text_events(), text_events()], false, true).await;
@@ -442,12 +442,15 @@ async fn codex_https_warm_resends_the_step_wire_bytes_with_only_the_output_cap()
     let step_body = String::from_utf8(observed.http_bodies[0].clone()).unwrap();
     let warm_body = String::from_utf8(observed.http_bodies[1].clone()).unwrap();
     assert!(step_body.starts_with("{\"model\":\"m\",\"stream\":true,\"input\":"));
-    let cap = "\"max_output_tokens\":16";
-    assert_eq!(warm_body.matches(cap).count(), 1, "{warm_body}");
-    let uncapped = warm_body
-        .replacen(&format!("{cap},"), "", 1)
-        .replacen(&format!(",{cap}"), "", 1);
-    assert_eq!(uncapped, step_body);
+    let cap = format!(
+        "\"max_output_tokens\":{}",
+        provider.frozen.max_output_tokens
+    );
+    assert_eq!(step_body.matches(&cap).count(), 1, "{step_body}");
+    assert_eq!(
+        warm_body,
+        step_body.replacen(&cap, "\"max_output_tokens\":16", 1)
+    );
     assert_eq!(
         sent.warm_body_sha256,
         RequestDigest::of(warm_body.as_bytes()).sha256,
@@ -1246,7 +1249,11 @@ async fn codex_previous_response_miss(status: Option<u16>) {
         .iter()
         .filter_map(|record| match record {
             Record::Attempt(attempt) if attempt.step_id == 2 => {
-                let telemetry = attempt.telemetry.as_ref().expect("websocket telemetry").parse();
+                let telemetry = attempt
+                    .telemetry
+                    .as_ref()
+                    .expect("websocket telemetry")
+                    .parse();
                 let websocket: broca_protocol::provider::WebSocketRequestDigest =
                     serde_json::from_value(telemetry["websocket_request"].clone()).unwrap();
                 let outcome: AttemptOutcome =
@@ -1646,8 +1653,14 @@ async fn retention_websocket_diagnostics_omit_backend_content() {
         assert!(
             failure.keys().all(|key| matches!(
                 key.as_str(),
-                "class" | "status" | "provider_code" | "message"
-                    | "max_content_gap_ms" | "first_content_ms" | "tail_gap_ms" | "max_gap_after_event"
+                "class"
+                    | "status"
+                    | "provider_code"
+                    | "message"
+                    | "max_content_gap_ms"
+                    | "first_content_ms"
+                    | "tail_gap_ms"
+                    | "max_gap_after_event"
             )),
             "{failure:?}"
         );
@@ -1660,30 +1673,33 @@ async fn retention_websocket_diagnostics_omit_backend_content() {
 
 #[tokio::test]
 async fn websocket_output_ceiling_matches_https_without_retry() {
-    let expected = format!(
-        "output ceiling reached mid tool call: finish=length, max_output_tokens=unknown (tool write_file, {} argument bytes received; provider stop reason max_output_tokens, output_tokens=4096)",
-        CUT_ARGS.len()
-    );
-    let mut errors = Vec::new();
+    let mut cuts = Vec::new();
     for https in [false, true] {
         let mock = Mock::start(vec![cut_tool_events(true)], false, false).await;
         let provider = provider(&mock);
         provider.set_chatgpt_https_policy(Arc::new(move || https));
         let events = step(&provider, 1, &opts()).await;
-        let error = terminal_error(&events);
-        assert_eq!(error.class, ErrorClass::Permanent);
-        assert_eq!(error.provider_code.as_deref(), Some("output_ceiling"));
-        assert_eq!(error.message, expected);
+        let cut = events
+            .iter()
+            .find_map(|event| match event {
+                NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage { cut }) => {
+                    Some(cut)
+                }
+                _ => None,
+            })
+            .expect("the incomplete call was refused");
+        assert_eq!(cut.tool_name, "write_file");
         assert!(events.iter().any(|event| matches!(
             event,
-            NormalizedEvent::Control(ProviderControl::Error {
+            NormalizedEvent::Control(ProviderControl::Finished {
+                finish_reason: broca_protocol::FinishReason::Length,
                 retries_used: 0,
                 ..
             })
         )));
         let attempts = attempts(&events);
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].outcome, AttemptOutcome::DecodeError);
+        assert_eq!(attempts[0].outcome, AttemptOutcome::ToolArgsTrailingGarbage);
         assert_eq!(
             attempts[0].transport.as_deref(),
             Some(if https { "https" } else { "websocket" })
@@ -1691,9 +1707,9 @@ async fn websocket_output_ceiling_matches_https_without_retry() {
         let seen = mock.observed.lock().unwrap();
         assert_eq!(seen.http_bodies.len(), usize::from(https));
         assert_eq!(seen.requests.len(), usize::from(!https));
-        errors.push(error.clone());
+        cuts.push(cut.clone());
     }
-    assert_eq!(errors[0], errors[1]);
+    assert_eq!(cuts[0], cuts[1]);
 }
 
 #[tokio::test]
@@ -2076,15 +2092,16 @@ async fn close_failure(elapsed: Option<Duration>) {
     assert_eq!(attempt.websocket_close_code, Some(1012));
 }
 
-/// A silent socket ends at the shared idle limit, and one answering only pings ends at the
-/// ChatGPT family's own content limit, which is shorter than the shared one.
+/// Pings keep the socket alive, but do not reset the deadline for model content.
 #[tokio::test(start_paused = true)]
 async fn websocket_idle_and_keepalive_only_bounds() {
-    let chatgpt_content = Duration::from_secs(600);
-    assert!(chatgpt_content < STREAM_CONTENT_TIMEOUT);
     for (keepalive, outcome, duration) in [
         (false, AttemptOutcome::IdleTimeout, STREAM_IDLE_TIMEOUT),
-        (true, AttemptOutcome::ContentTimeout, chatgpt_content),
+        (
+            true,
+            AttemptOutcome::ContentTimeout,
+            Duration::from_secs(1800),
+        ),
     ] {
         let stream = futures::stream::unfold((), move |_| async move {
             if keepalive {
@@ -2111,7 +2128,7 @@ async fn websocket_idle_and_keepalive_only_bounds() {
         if keepalive {
             assert_eq!(
                 failure.error.message,
-                "provider stream idle: waiting for content: only keepalive comments for 600s"
+                "provider stream idle: waiting for content: only keepalive comments for 1800s"
             );
         }
     }
@@ -2138,7 +2155,6 @@ async fn websocket_failure_after_send_retries_on_a_new_socket_not_https() {
         "a sent request cannot fall back outside the retry loop"
     );
 }
-
 
 #[tokio::test]
 async fn websocket_turn_state_is_sticky_metadata_without_changing_canonical_body() {
@@ -2220,70 +2236,58 @@ async fn websocket_errors_and_warnings_never_echo_headers_or_payloads() {
 #[tokio::test]
 async fn websocket_decode_failure_warns_once_without_response_or_tool_content() {
     use tracing::instrument::WithSubscriber;
-    for ceiling in [false, true] {
-        let mut replies = cut_tool_events(ceiling);
-        replies.insert(0, serde_json::json!({"type":"response.output_text.delta","delta":"PRIVATE-RESPONSE-CONTENT"}));
-        let response_bytes: usize = replies.iter().map(|event| event.to_string().len()).sum();
-        let mock = Mock::start(vec![replies], false, false).await;
-        let provider = provider(&mock);
-        let request: PreparedHttpRequest = provider
-            .family
-            .endpoint(
-                &provider.frozen,
-                &provider.current_auth().auth,
-                provider.render_request(&opts()),
-            )
-            .into();
-        let (tx, _rx) = mpsc::channel(256);
-        let mut trace = AttemptTrace::default();
-        let logs = super::chunk_error_tests::ProviderWarnings::default();
-        let failure = responses_websocket::drive(
-            &provider.websocket,
-            &provider.client,
-            &request,
-            &provider.clock,
-            provider.family.normalizer(&provider.frozen, StepId(1)),
-            &tx,
-            &mut trace,
+    let mut replies = cut_tool_events(false);
+    replies.insert(
+        0,
+        serde_json::json!({"type":"response.output_text.delta","delta":"PRIVATE-RESPONSE-CONTENT"}),
+    );
+    let response_bytes: usize = replies.iter().map(|event| event.to_string().len()).sum();
+    let mock = Mock::start(vec![replies], false, false).await;
+    let provider = provider(&mock);
+    let request: PreparedHttpRequest = provider
+        .family
+        .endpoint(
+            &provider.frozen,
+            &provider.current_auth().auth,
+            provider.render_request(&opts()),
         )
-        .with_subscriber(logs.clone())
-        .await
-        .unwrap_err();
-        assert_eq!(failure.outcome, AttemptOutcome::DecodeError);
-        let warnings = logs.0.lock().unwrap();
-        assert_eq!(warnings.len(), 1, "one WARN for each failed socket attempt");
-        let log = &warnings[0];
-        assert_eq!(log["message"], "model websocket attempt failed");
-        assert_eq!(log["outcome"], "DecodeError");
-        assert_eq!(
-            log["class"],
-            if ceiling { "Permanent" } else { "Transient" }
+        .into();
+    let (tx, _rx) = mpsc::channel(256);
+    let mut trace = AttemptTrace::default();
+    let logs = super::chunk_error_tests::ProviderWarnings::default();
+    let failure = responses_websocket::drive(
+        &provider.websocket,
+        &provider.client,
+        &request,
+        &provider.clock,
+        provider.family.normalizer(&provider.frozen, StepId(1)),
+        &tx,
+        &mut trace,
+    )
+    .with_subscriber(logs.clone())
+    .await
+    .unwrap_err();
+    assert_eq!(failure.outcome, AttemptOutcome::DecodeError);
+    let warnings = logs.0.lock().unwrap();
+    assert_eq!(warnings.len(), 1, "one WARN for each failed socket attempt");
+    let log = &warnings[0];
+    assert_eq!(log["message"], "model websocket attempt failed");
+    assert_eq!(log["outcome"], "DecodeError");
+    assert_eq!(log["class"], "Transient");
+    assert_eq!(log["provider_code"], "none");
+    assert_eq!(log["transport"], "websocket");
+    assert_eq!(
+        log["response_bytes"].parse::<usize>().unwrap(),
+        response_bytes
+    );
+    assert!(log["elapsed_ms"].parse::<u64>().is_ok());
+    assert!(log.contains_key("close_code"));
+    let diagnostics = format!("{warnings:?} {:?}", failure.error);
+    for private in ["PRIVATE-", "mock-token", "Bearer"] {
+        assert!(
+            !diagnostics.contains(private),
+            "socket WARN must omit content and credentials"
         );
-        assert_eq!(
-            log["provider_code"],
-            if ceiling { "output_ceiling" } else { "none" }
-        );
-        assert_eq!(log["transport"], "websocket");
-        assert_eq!(
-            log["response_bytes"].parse::<usize>().unwrap(),
-            response_bytes
-        );
-        assert!(log["elapsed_ms"].parse::<u64>().is_ok());
-        assert!(log.contains_key("close_code"));
-        if ceiling {
-            assert_eq!(log["provider_stop_reason"], "max_output_tokens");
-            assert_eq!(log["tool_name"], "write_file");
-            assert_eq!(log["argument_bytes"], CUT_ARGS.len().to_string());
-            assert_eq!(log["output_tokens"], "4096");
-            assert_eq!(log["max_output_tokens"], "unknown");
-        }
-        let diagnostics = format!("{warnings:?} {:?}", failure.error);
-        for private in ["PRIVATE-", "mock-token", "Bearer"] {
-            assert!(
-                !diagnostics.contains(private),
-                "socket WARN must omit content and credentials"
-            );
-        }
     }
 }
 
@@ -2296,9 +2300,16 @@ struct RefreshScript {
 impl crate::credential_refresh::CredentialRefresher for RefreshScript {
     fn refresh_expiring(
         &self,
-    ) -> crate::credential_refresh::ExpiringRefreshFuture<'_, crate::credential_refresh::RefreshedCredential>
-    {
-        Box::pin(async { self.expiring.lock().unwrap().pop_front().flatten().map_or(crate::credential_refresh::ExpiringRefresh::Unavailable, crate::credential_refresh::ExpiringRefresh::Token) })
+    ) -> crate::credential_refresh::ExpiringRefreshFuture<
+        '_,
+        crate::credential_refresh::RefreshedCredential,
+    > {
+        Box::pin(async {
+            self.expiring.lock().unwrap().pop_front().flatten().map_or(
+                crate::credential_refresh::ExpiringRefresh::Unavailable,
+                crate::credential_refresh::ExpiringRefresh::Token,
+            )
+        })
     }
     fn refresh_rejected(
         &self,
@@ -2307,7 +2318,10 @@ impl crate::credential_refresh::CredentialRefresher for RefreshScript {
     {
         Box::pin(async {
             self.rereads.fetch_add(1, Ordering::SeqCst);
-            self.rejected.lock().unwrap().take().map_or(crate::credential_refresh::RejectedRefresh::Unavailable, crate::credential_refresh::RejectedRefresh::Token)
+            self.rejected.lock().unwrap().take().map_or(
+                crate::credential_refresh::RejectedRefresh::Unavailable,
+                crate::credential_refresh::RejectedRefresh::Token,
+            )
         })
     }
 }
@@ -2423,46 +2437,51 @@ async fn websocket_upgrade_auth_refusal_rereads_and_recovers_without_https() {
 async fn paused_run(provider: &impl Provider, label: &str) -> Vec<Record> {
     let dir = broca_test_support::scratch_root().join(label);
     let bind = BindIdentity::new(dir.join("project"), "websocket-auth", label);
-    let request = RunRequest { account_route: None,
-    route_decision_id: None,
-    input_written_at_ms: None,
-    directives: None,
-    session_class: None, retention: None, retention_policy: None, on_restart: None,
-    keep_warm: None,
-    send_id: None,
-    request_identity_digest: None,
-    title: None,
-    project_id: None,
-    principal: None,
-    scope: None,
-    run_id: RunId(label.into()),
-    session: bind.clone(),
-    model: ModelHandle::new("openai", "m"),
-    input: vec![Message {
-        turn_system: false,
-        role: Role::User,
-        content: vec![ContentBlock::Text { text: "hi".into() }],
-        cache_prefix_blocks: None,
-        origin: None,
-        ordinal: None,
-        tags: Default::default(),
-    }],
-    tools: vec![],
-    policy_allowed: Default::default(),
-    tool_choice: ToolChoice::Auto,
-    generation: GenerationConfig::default(),
-    cache: None,
-    stop_when: vec![StopCondition::StepCount { n: 2 }],
-    submission_id: None,
-    budget: None,
-    context_limit: None,
-    work_class: None,
-    context_management: None,
-    variant: None,
-    service_tier: None,
-    inherit_frozen_cache: false,
-    structured_output: None,
-        head_turn: false, };
+    let request = RunRequest {
+        account_route: None,
+        route_decision_id: None,
+        input_written_at_ms: None,
+        directives: None,
+        session_class: None,
+        retention: None,
+        retention_policy: None,
+        on_restart: None,
+        keep_warm: None,
+        send_id: None,
+        request_identity_digest: None,
+        title: None,
+        project_id: None,
+        principal: None,
+        scope: None,
+        run_id: RunId(label.into()),
+        session: bind.clone(),
+        model: ModelHandle::new("openai", "m"),
+        input: vec![Message {
+            turn_system: false,
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: "hi".into() }],
+            cache_prefix_blocks: None,
+            origin: None,
+            ordinal: None,
+            tags: Default::default(),
+        }],
+        tools: vec![],
+        policy_allowed: Default::default(),
+        tool_choice: ToolChoice::Auto,
+        generation: GenerationConfig::default(),
+        cache: None,
+        stop_when: vec![StopCondition::StepCount { n: 2 }],
+        submission_id: None,
+        budget: None,
+        context_limit: None,
+        work_class: None,
+        context_management: None,
+        variant: None,
+        service_tier: None,
+        inherit_frozen_cache: false,
+        structured_output: None,
+        head_turn: false,
+    };
     let run = tokio::time::timeout(
         Duration::from_secs(10),
         crate::session_loop_rig::run_once(request, provider, &StubToolPlane::new()),
@@ -3023,7 +3042,6 @@ fn tool_run_request(bind: &BindIdentity) -> RunRequest {
     head_turn: false, }
 }
 
-
 #[tokio::test]
 async fn websocket_reused_failure_reports_age_and_time_since_completion() {
     let mock = Mock::start(
@@ -3211,8 +3229,10 @@ fn a_wrapped_chatgpt_usage_limit_takes_its_window_from_the_responses_rate_limits
     let window_after = |frames: &[Value]| {
         let mut trace = AttemptTrace::default();
         for frame in frames {
-            assert!(responses_websocket::wrapped_error(frame.to_string().as_bytes(), &mut trace)
-                .is_none());
+            assert!(
+                responses_websocket::wrapped_error(frame.to_string().as_bytes(), &mut trace)
+                    .is_none()
+            );
         }
         let failure = responses_websocket::wrapped_error(usage.to_string().as_bytes(), &mut trace)
             .expect("a wrapped 429 is a refusal");
@@ -3225,7 +3245,10 @@ fn a_wrapped_chatgpt_usage_limit_takes_its_window_from_the_responses_rate_limits
         assert_eq!(failure.error.limit_window.as_deref(), observed.as_deref());
         observed
     };
-    assert_eq!(window_after(std::slice::from_ref(&recorded)).as_deref(), Some("seven_day"));
+    assert_eq!(
+        window_after(std::slice::from_ref(&recorded)).as_deref(),
+        Some("seven_day")
+    );
     // The recorded frame with its window five hours long.
     let mut five_hour = recorded.clone();
     five_hour["rate_limits"]["primary"]["window_minutes"] = serde_json::json!(300);

@@ -338,8 +338,8 @@ pub fn renderer_version_for(family: WireFamilyId) -> u32 {
 pub enum EarlierRendererVersion {
     /// The current renderer sends byte-identical requests for every config frozen at this
     /// version, so a resume of such a run is accepted. True only when the bump that left this
-    /// version changed behaviour gated on a frozen config field that configs from this version
-    /// do not carry. Every such entry is proven by a byte-equality test that renders a pinned
+    /// version changed behaviour gated on the recorded version or a frozen config field that
+    /// older configs do not carry. Every such entry is proven by a byte-equality test that renders a pinned
     /// config and prompt from this version under the current code
     /// (`tests/it/renderer_version_reproduction.rs` in this crate).
     Reproducible,
@@ -500,6 +500,8 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
             ),
             // v8 preserves message phases only under `provider_text_state`, which v7 configs lack.
             (7, Reproducible),
+            // v9 sends an output cap only when the recorded config is v9 or later.
+            (8, Reproducible),
         ],
     }
 }
@@ -1065,14 +1067,19 @@ pub fn google_codeassist_frozen_config(wire_model_id: impl Into<String>) -> Froz
 /// v6: normalize model-visible tool names at the render edge.
 /// v7: omit sampling controls that the ChatGPT codex backend rejects as unsupported.
 /// v8: preserve Responses message phase in newly frozen runs.
-pub const OPENAI_RESPONSES_CHATGPT_RENDERER_VERSION: u32 = 8;
+/// v9: send the frozen output-token cap.
+pub const OPENAI_RESPONSES_CHATGPT_RENDERER_VERSION: u32 = 9;
+pub const CHATGPT_DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
 /// Build the frozen render config for the OpenAI ChatGPT codex backend. The body starts from the
 /// OpenAI-Responses shape and applies the codex backend's stricter field set.
 pub fn openai_responses_chatgpt_frozen_config(
     wire_model_id: impl Into<String>,
 ) -> FrozenRenderConfig {
-    frozen_from_family_defaults(WireFamilyId::OpenAiResponsesChatgpt, wire_model_id, None)
+    let mut frozen =
+        frozen_from_family_defaults(WireFamilyId::OpenAiResponsesChatgpt, wire_model_id, None);
+    frozen.max_output_tokens = CHATGPT_DEFAULT_MAX_OUTPUT_TOKENS;
+    frozen
 }
 
 #[cfg(test)]

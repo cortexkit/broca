@@ -95,8 +95,8 @@ fn golden(family: WireFamilyId) -> Option<Golden> {
         WireFamilyId::OpenAiResponsesChatgpt => Golden {
             request: chatgpt::fixed_request(),
             frozen: chatgpt::golden_frozen(),
-            bytes: chatgpt::GOLDEN,
-            version: chatgpt::GOLDEN_VERSION,
+            bytes: chatgpt::V8_GOLDEN,
+            version: "8",
         },
         WireFamilyId::Gemini => Golden {
             request: gemini::fixed_request(),
@@ -260,8 +260,15 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
                         && case["frozen"]["renderer_version"] == version
                 })
                 .collect();
+            let archived_golden = golden(family);
             assert!(
-                !cases.is_empty(),
+                !cases.is_empty()
+                    || archived_golden.as_ref().is_some_and(|golden| golden
+                        .version
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                        == Some(version)),
                 "{family:?} declares renderer version {version} reproducible, but no pinned \
                  config and bytes from that version prove it"
             );
@@ -295,7 +302,7 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
             // golden test has held them unchanged since, so they are what the declared version
             // sent for the golden request. The declared version's config is the golden's config
             // as it was frozen then: without provider text state.
-            if let Some(golden) = golden(family) {
+            if let Some(golden) = archived_golden {
                 let pinned_at: u32 = golden.version.trim().parse().unwrap();
                 if pinned_at <= version {
                     let mut frozen = golden.frozen;
@@ -416,7 +423,7 @@ fn openai_without_media_keep_their_pinned_old_version_bytes() {
             WireFamilyId::OpenAiResponsesChatgpt,
             chatgpt::golden_frozen(),
             chatgpt::fixed_request(),
-            chatgpt::GOLDEN,
+            chatgpt::V8_GOLDEN,
             8,
         ),
     ] {
@@ -512,6 +519,7 @@ mod live {
             other => panic!("no legacy pin for {other:?}"),
         };
         frozen.project_id = pin.project_id.clone();
+        frozen.max_output_tokens = pin.max_output_tokens;
         frozen.provider_text_state = provider_text_state;
         frozen
     }
@@ -569,6 +577,24 @@ mod live {
                 pin.family_id
             );
         }
+    }
+
+    #[test]
+    fn chatgpt_v8_replays_the_archived_request_without_the_output_cap() {
+        use crate::openai_responses_chatgpt_render_golden as chatgpt;
+        let mut frozen = chatgpt::golden_frozen();
+        frozen.renderer_version = 8;
+        frozen.max_output_tokens = 2048;
+        let recorded = serde_json::to_value(frozen).unwrap();
+        let resumed = provider(serde_json::from_value(recorded.clone()).unwrap());
+        assert!(resumed.reproduces_renderer_version(8));
+        assert_eq!(resumed.render_config_blob_for_version(8), recorded);
+        assert_eq!(
+            resumed
+                .try_render_request(&chatgpt::fixed_request())
+                .unwrap(),
+            chatgpt::V8_GOLDEN.trim_end_matches('\n').as_bytes()
+        );
     }
 
     /// Rebuilding state with an old label does not load an old renderer implementation.

@@ -171,6 +171,8 @@ capped at 120 s, 240 s waiting budget).
   holds no lock or attempt slot. A restart during a wait resumes the step the same way a restart between attempts does, with a fresh count.
 
 A close/error before completion is `chunk_error`. Code 1012 means server restart.
+The socket's idle deadline is 300 seconds without an event; only model content resets the
+30-minute content deadline, so keepalives alone cannot keep a stalled step alive forever.
 At 895 seconds or later that cut follows the existing non-reissuable `response_deadline`
 rule. Responses error-event wrappers with HTTP statuses use the existing HTTP classifier;
 ordinary Responses events, including tool calls, use the existing Responses normalizer.

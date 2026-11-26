@@ -1284,6 +1284,9 @@ impl<'de> Deserialize<'de> for VaultReadOp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NoDispatchReason {
+    ArgumentsIncomplete {
+        tool_name: String,
+    },
     Denied {
         reason: String,
     },
