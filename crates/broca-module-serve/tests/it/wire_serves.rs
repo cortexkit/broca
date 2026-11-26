@@ -255,8 +255,8 @@ async fn role_describe_serves_tracks_complete_catalog_and_gateway_snapshots() {
             "google",
             "meta",
             "mixed",
-            "opencode-go",
             "openai-platform",
+            "opencode-go",
         ]
     );
     let uncapped = first.list_for(Some("broca-uncapped")).unwrap();
