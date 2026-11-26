@@ -155,8 +155,8 @@ step reported a tier; buckets need not sum to `usage`), `retries_used`, `pricing
 `pricing_at_precision`, `occurred_at_ms`, `occurred_at_precision`, `terminal_reason` (final
 slice only), optional `agent_id` and `agent_run_id` for a daemon-stamped agent run, optional
 `flow_id` for a daemon-stamped flow, optional `warm_outcome` on a keep-warm fact, and
-`usage_in_attempts` (below). `fact_id` is SHA-256 (hex)
-over the length-prefixed source instance id, triple, run id and segment ordinal.
+`usage_in_attempts` (below). `fact_id` is SHA-256 (hex) over the length-prefixed source instance
+id, session triple (project root, harness, session name), run id and segment ordinal.
 
 A slice ends where the run's frozen config or credential is frozen again, and where a model
 call is answered by another model than the slice's: a step routed to the refusal-fallback
