@@ -980,6 +980,7 @@ impl<V: CachedBytes> ViewCache<V> {
             ),
             top_sessions: Some(inner.top_sessions()),
             stored_reads: stored_reads(),
+            estimated_by_part: None,
         }
     }
 

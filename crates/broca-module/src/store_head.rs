@@ -580,27 +580,34 @@ impl KeptHeads {
     pub(crate) fn memory(&self) -> broca_wire::MemoryCache {
         use broca_session_store::held::{serde_heap_bytes, HeldBytes};
         let kept = self.lock();
-        let estimated = kept
-            .heads
-            .iter()
-            .map(|(addr, entry)| {
-                let head = &entry.head;
+        let mut parts = std::collections::BTreeMap::<String, u64>::new();
+        let mut add = |part: &str, bytes: usize| {
+            *parts.entry(part.to_owned()).or_default() += bytes as u64;
+        };
+        for (addr, entry) in &kept.heads {
+            let head = &entry.head;
+            add(
+                "keys",
                 std::mem::size_of::<(String, KeptHead)>()
                     + std::mem::size_of::<(u64, String)>()
-                    + 2 * addr.heap_bytes()
-                    + serde_heap_bytes(&head.reply)
-                    + serde_heap_bytes(&head.ownership)
-                    + serde_heap_bytes(&head.senders)
-                    + head
-                        .read_policy
-                        .as_ref()
-                        .map_or(0, |policy| policy.heap_bytes())
-            })
-            .sum::<usize>();
+                    + 2 * addr.heap_bytes(),
+            );
+            add("reply", serde_heap_bytes(&head.reply));
+            add("ownership", serde_heap_bytes(&head.ownership));
+            add("senders", serde_heap_bytes(&head.senders));
+            add(
+                "read_policy",
+                head.read_policy
+                    .as_ref()
+                    .map_or(0, |policy| policy.heap_bytes()),
+            );
+        }
+        let estimated: u64 = parts.values().sum();
         broca_wire::MemoryCache {
             entries: kept.heads.len() as u64,
             max_entries: HEADS_KEPT as u64,
-            estimated_bytes: estimated as u64,
+            estimated_bytes: estimated,
+            estimated_by_part: Some(parts),
             ..Default::default()
         }
     }

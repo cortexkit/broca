@@ -265,6 +265,12 @@ pub struct MemoryCache {
     /// session as stored, which loads a view. Absent when there were none, and for other caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stored_reads: Option<std::collections::BTreeMap<String, u64>>,
+    /// For the kept-heads cache (the `session.head` answers broca keeps for closed sessions, so
+    /// a poll needn't load the session): `estimated_bytes` split by what each kept answer holds
+    /// (`reply`, `senders`, `read_policy`, `ownership`, `keys`), so a large estimate names its
+    /// holder. Absent for other caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_by_part: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// One closed session's view loads since broca started.
