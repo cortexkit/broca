@@ -40,8 +40,8 @@ use cortexkit_role_harness::{
 use cortexkit_role_llm_runner::points;
 use cortexkit_role_llm_runner_conformance::{
     run_suite_with, Capability, CaseOutcome, LlmRunnerSubject, Reply, RouteFailure, RunnerRoute,
-    Script, ScriptedLateEntry, ScriptedPart, ScriptedToolOutcome, ScriptedUsage, SubscribeOutcome,
-    SuiteOptions, SCRIPTED_TOOL,
+    Script, ScriptedLateEntry, ScriptedPart, ScriptedToolCall, ScriptedToolOutcome, ScriptedTurn,
+    ScriptedUsage, SubscribeOutcome, SuiteOptions, SCRIPTED_TOOL,
 };
 use serde_json::{json, Map, Value};
 use subc_control::ConsumerIdentity;
@@ -1218,7 +1218,7 @@ async fn serve_model_request(
                 chunk(
                     json!({"tool_calls": [{"index": calls - 1, "id": call.tool_call_id,
                         "type": "function", "function": {"name": call.tool,
-                        "arguments": call.arguments.to_string()}}]}),
+                        "arguments": scripted_tool_arguments(&turn, call)}}]}),
                     None,
                 )
             }
@@ -1263,6 +1263,33 @@ async fn serve_model_request(
         stream.write_all(body.as_bytes()).await?;
     }
     stream.shutdown().await
+}
+
+/// Encode exactly the argument bytes the script asks the provider to stream. In particular, a
+/// length-cut turn can withhold the rest of a call's JSON instead of sending a repaired object.
+fn scripted_tool_arguments(turn: &ScriptedTurn, call: &ScriptedToolCall) -> String {
+    turn.tool_argument_prefix(&call.tool_call_id)
+        .map_or_else(|| call.arguments.to_string(), str::to_owned)
+}
+
+#[test]
+fn scripted_tool_argument_prefixes_remain_incomplete_on_the_wire() {
+    let call = ScriptedToolCall {
+        tool_call_id: "cut-call".into(),
+        tool: SCRIPTED_TOOL.into(),
+        arguments: json!({"payload": "complete"}),
+        result: json!("unused"),
+        hold: false,
+    };
+    let cut = ScriptedTurn::new(vec![ScriptedPart::ToolCall(call.clone())])
+        .with_finish_reason("length")
+        .with_tool_argument_prefix("cut-call", "{\"payload\":\"cut");
+    assert_eq!(scripted_tool_arguments(&cut, &call), "{\"payload\":\"cut");
+    let complete = ScriptedTurn::new(vec![ScriptedPart::ToolCall(call.clone())]);
+    assert_eq!(
+        scripted_tool_arguments(&complete, &call),
+        call.arguments.to_string()
+    );
 }
 
 // ---- the scripted tool provider -----------------------------------------------------------------
@@ -4250,6 +4277,18 @@ impl LlmRunnerSubject for BrocaSubject {
         Ok(())
     }
 
+    fn supports_tool_argument_prefixes(&self) -> bool {
+        true
+    }
+
+    async fn configure_runner_enforced_cap(&self, _session: &str) -> Result<bool, HarnessError> {
+        // This fixture's ordinary provider is OpenAI Chat, which accepts the request's output
+        // cap. It has no capless scripted route to select; dropping that cap would fake the
+        // runner-enforced path instead of exercising it. Broca also leaves max_output_tokens
+        // undeclared, so the kit marks this case inapplicable before asking for the fixture.
+        Ok(false)
+    }
+
     fn oversized_tool_result(
         &self,
         message: &Value,
@@ -5113,12 +5152,15 @@ fn check_0814_undeclared_cases(
     Ok(())
 }
 
-fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
-    // The Passed send-id pin depends on the product fix that omits internal submission IDs
-    // from unkeyed direct starts, rather than exposing them as caller send IDs.
+/// Exact native verdicts for the adapter's explicitly reviewed cases, in pin-file order.
+fn expected_native_case_pins() -> Vec<(&'static str, CaseOutcome)> {
+    // Later contract versions append their own pin file. The Passed send-id pin depends on the
+    // product fix that omits internal submission IDs from unkeyed direct starts, rather than
+    // exposing them as caller send IDs.
     include_str!("golden/llm_runner_0821.applicability.txt")
         .lines()
         .chain(include_str!("golden/llm_runner_0828.applicability.txt").lines())
+        .chain(include_str!("golden/llm_runner_0101.applicability.txt").lines())
         .map(|line| {
             let (status, row) = line.split_once(' ').unwrap();
             let (name, reason) = row.split_once(": ").unwrap_or((row, ""));
@@ -5150,11 +5192,11 @@ fn expected_0821_cases() -> Vec<(&'static str, CaseOutcome)> {
         .collect()
 }
 
-fn check_0821_cases(
+fn check_native_case_pins(
     cases: &[cortexkit_role_llm_runner_conformance::CaseReport],
 ) -> Result<(), String> {
     let mut mismatches = Vec::new();
-    for (name, expected) in expected_0821_cases() {
+    for (name, expected) in expected_native_case_pins() {
         match cases.iter().find(|case| case.case == name) {
             None => mismatches.push(format!("the suite has no case {name}")),
             Some(case) if case.outcome != expected => {
@@ -5183,7 +5225,7 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
     const UNKEYED: &str =
         "read_display_facts_send_id_unkeyed: runner returned no submission_id; verified absence instead";
     assert_eq!(
-        expected_0821_cases()
+        expected_native_case_pins()
             .into_iter()
             .find(|(name, _)| *name == SEND_ID)
             .unwrap()
@@ -5192,7 +5234,7 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
             reason: UNKEYED.into()
         }
     );
-    let mut cases: Vec<_> = expected_0821_cases()
+    let mut cases: Vec<_> = expected_native_case_pins()
         .into_iter()
         .map(|(name, outcome)| {
             let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
@@ -5207,7 +5249,7 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
     cases[index].outcome = CaseOutcome::Inapplicable {
         reason: REASON.into(),
     };
-    check_0821_cases(&cases).unwrap();
+    check_native_case_pins(&cases).unwrap();
     for reason in [
         "",
         "runner returned no submission_id",
@@ -5217,7 +5259,7 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
         changed[index].outcome = CaseOutcome::Inapplicable {
             reason: reason.into(),
         };
-        assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
+        assert!(check_native_case_pins(&changed).unwrap_err().contains(CASE));
     }
     for outcome in [
         CaseOutcome::Passed,
@@ -5227,7 +5269,7 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
     ] {
         let mut changed = cases.clone();
         changed[index].outcome = outcome;
-        assert!(check_0821_cases(&changed).unwrap_err().contains(CASE));
+        assert!(check_native_case_pins(&changed).unwrap_err().contains(CASE));
     }
     // The send-id case itself: any other outcome, or the same outcome for another reason,
     // is a drift.
@@ -5245,19 +5287,21 @@ fn runner_0821_send_identity_pins_the_exact_replacement_rule() {
     ] {
         let mut changed = cases.clone();
         changed[send_id].outcome = outcome;
-        assert!(check_0821_cases(&changed).unwrap_err().contains(SEND_ID));
+        assert!(check_native_case_pins(&changed)
+            .unwrap_err()
+            .contains(SEND_ID));
     }
     cases.remove(index);
     assert_eq!(
-        check_0821_cases(&cases).unwrap_err(),
+        check_native_case_pins(&cases).unwrap_err(),
         format!("the suite has no case {CASE}")
     );
 }
 
 #[test]
-fn runner_0821_cases_pin_exact_native_outcomes() {
+fn runner_contract_cases_pin_exact_native_outcomes() {
     use cortexkit_role_llm_runner_conformance::{CaseReport, CASES};
-    let cases: Vec<_> = expected_0821_cases()
+    let cases: Vec<_> = expected_native_case_pins()
         .into_iter()
         .map(|(name, outcome)| {
             let spec = CASES.iter().find(|spec| spec.name == name).unwrap();
@@ -5268,8 +5312,8 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 115);
-    check_0821_cases(&cases).unwrap();
+    assert_eq!(cases.len(), 119);
+    check_native_case_pins(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [
             CaseOutcome::Passed,
@@ -5296,21 +5340,21 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
             let mut changed = cases.clone();
             changed[index].outcome = outcome;
             assert!(
-                check_0821_cases(&changed).is_err(),
+                check_native_case_pins(&changed).is_err(),
                 "{}",
                 changed[index].case
             );
         }
         let mut missing = cases.clone();
         missing.remove(index);
-        assert!(check_0821_cases(&missing).is_err());
+        assert!(check_native_case_pins(&missing).is_err());
     }
 }
 
 #[test]
-fn runner_0821_pin_check_reports_every_mismatch_and_missing_case() {
+fn native_pin_check_reports_every_mismatch_and_missing_case() {
     use cortexkit_role_llm_runner_conformance::CaseReport;
-    let mut cases: Vec<_> = expected_0821_cases()
+    let mut cases: Vec<_> = expected_native_case_pins()
         .into_iter()
         .map(|(case, outcome)| CaseReport {
             case,
@@ -5326,7 +5370,7 @@ fn runner_0821_pin_check_reports_every_mismatch_and_missing_case() {
             reason: "pin regression fixture".into(),
         };
     }
-    let mismatches = check_0821_cases(&cases).unwrap_err();
+    let mismatches = check_native_case_pins(&cases).unwrap_err();
     let lines: Vec<_> = mismatches.lines().collect();
     assert_eq!(lines.len(), 3, "{mismatches}");
     assert_eq!(lines[0], format!("the suite has no case {missing}"));
@@ -5822,7 +5866,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         eprintln!("{}", subject.failure_evidence().await);
     }
     // Report every pin drift even when a failed case would stop the later contract checks.
-    let pinned = check_0821_cases(&report.cases);
+    let pinned = check_native_case_pins(&report.cases);
     if let Err(mismatches) = &pinned {
         eprintln!("Conformance pin mismatches:\n{mismatches}");
     }

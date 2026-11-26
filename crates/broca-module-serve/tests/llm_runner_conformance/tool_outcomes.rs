@@ -89,6 +89,23 @@ fn chat_error(text: &str) -> (bool, Option<String>) {
         let code = lines.find_map(|line| line.strip_prefix("code: "));
         return (true, code.map(str::to_owned));
     }
+    if let Some((tool, message)) = text
+        .strip_prefix("Tool call `")
+        .and_then(|rest| rest.split_once("` was not run: "))
+    {
+        if !tool.is_empty()
+            && message
+                == "the reply hit the output limit before its arguments were complete. Re-issue it with complete arguments, and split large payloads into smaller calls."
+        {
+            return (
+                true,
+                Some(
+                    cortexkit_role_llm_runner::errors::tool_result_reasons::ARGUMENTS_INCOMPLETE
+                        .into(),
+                ),
+            );
+        }
+    }
     (false, None)
 }
 
@@ -109,12 +126,15 @@ fn only_the_cut_off_reply_session_needs_a_private_tool_provider() {
 fn observes_native_chat_tool_results_in_request_order() {
     let refused = "tool/route rejected: conformance_tool_error — provider refused this call";
     let unknown = "outcome_unknown: the call may have run\ncode: outcome_unknown";
+    let cut = "Tool call `lookup` was not run: the reply hit the output limit before its arguments were complete. Re-issue it with complete arguments, and split large payloads into smaller calls.";
     let request = serde_json::json!({"messages": [
         {"role": "assistant", "content": unknown},
         {"role": "tool", "tool_call_id": "ok", "content": "success"},
         {"role": "tool", "tool_call_id": "refused", "content": refused},
         {"role": "tool", "tool_call_id": "lost", "content": unknown},
-        {"role": "tool", "tool_call_id": "uncoded", "content": "outcome_unknown: no reply"}
+        {"role": "tool", "tool_call_id": "uncoded", "content": "outcome_unknown: no reply"},
+        {"role": "tool", "tool_call_id": "cut", "content": cut},
+        {"role": "tool", "tool_call_id": "other", "content": "Tool call `lookup` was not run: another reason"}
     ]});
     let observed = super::observe_model_request(&request).tool_results;
     assert_eq!(
@@ -129,6 +149,13 @@ fn observes_native_chat_tool_results_in_request_order() {
             ),
             ModelToolResultObservation::new("lost", true, Some("outcome_unknown".into()), unknown),
             ModelToolResultObservation::new("uncoded", true, None, "outcome_unknown: no reply"),
+            ModelToolResultObservation::new("cut", true, Some("arguments_incomplete".into()), cut,),
+            ModelToolResultObservation::new(
+                "other",
+                false,
+                None,
+                "Tool call `lookup` was not run: another reason",
+            ),
         ]
     );
 }
