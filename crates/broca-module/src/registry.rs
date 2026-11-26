@@ -2581,8 +2581,8 @@ impl LineageRegistry {
         }
     }
 
-    /// Stop starting work without closing admission or interrupting a dispatched tool batch.
-    /// Only the replacement process starts work again.
+    /// Stop starting work without closing admission. A dispatched call may finish normally
+    /// or hand back as held. Only the replacement process starts work again.
     pub fn begin_accepting_drain(&self) {
         self.inner.accepting_drain.cancel();
     }

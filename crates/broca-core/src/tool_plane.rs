@@ -322,6 +322,7 @@ pub fn refusal_detail(provider: &str, detail: Option<&serde_json::Value>) -> ser
 pub struct DispatchSignals {
     cancel: Option<tokio_util::sync::CancellationToken>,
     stop: Option<tokio_util::sync::CancellationToken>,
+    accepting_drain: Option<tokio_util::sync::CancellationToken>,
     /// The run's absolute step deadline, carried so the route-open wait in front of the send
     /// ends with it (see [`ToolOpenGuard`]). It never makes an enqueued call count as unsent.
     deadline: Option<tokio::time::Instant>,
@@ -335,6 +336,7 @@ impl DispatchSignals {
         Self {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
+            accepting_drain: None,
             deadline: None,
             steer_yields: None,
         }
@@ -399,6 +401,18 @@ impl DispatchSignals {
             None => std::future::pending().await,
         }
     }
+
+    /// Either drain can ask a yield-capable provider to hand back its call. The accepting
+    /// signal is separate from `stop` so it never cuts a route open or a send short.
+    pub async fn restart_yield_requested(&self) {
+        let Some(drain) = &self.accepting_drain else {
+            return self.stopping().await;
+        };
+        tokio::select! {
+            _ = self.stopping() => {}
+            _ = drain.cancelled() => {}
+        }
+    }
 }
 
 impl From<&DispatchSignals> for ToolOpenGuard {
@@ -408,6 +422,7 @@ impl From<&DispatchSignals> for ToolOpenGuard {
         Self {
             cancel: signals.cancel.clone(),
             stop: signals.stop.clone(),
+            accepting_drain: signals.accepting_drain.clone(),
             steer_yields: signals.steer_yields.clone(),
             deadline: signals.deadline,
         }
@@ -455,6 +470,7 @@ pub struct SteerYields(pub tokio::sync::watch::Receiver<SteerYieldState>);
 pub struct ToolOpenGuard {
     cancel: Option<tokio_util::sync::CancellationToken>,
     stop: Option<tokio_util::sync::CancellationToken>,
+    accepting_drain: Option<tokio_util::sync::CancellationToken>,
     steer_yields: Option<SteerYields>,
     /// The run's step deadline, as an absolute instant: no route-open wait of the batch, and
     /// no open attempt in flight, outlasts it. `None` when the run has none, which leaves the
@@ -475,6 +491,7 @@ impl ToolOpenGuard {
         Self {
             cancel: cancel.cloned(),
             stop: stop.cloned(),
+            accepting_drain: None,
             steer_yields: None,
             deadline: None,
         }
@@ -484,12 +501,23 @@ impl ToolOpenGuard {
         self.steer_yields = steer_yields;
         self
     }
+
+    /// Carry the accepting drain only to the reply watcher of a dispatched call.
+    pub fn with_accepting_drain(
+        mut self,
+        drain: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        self.accepting_drain = drain.cloned();
+        self
+    }
+
     /// The send-boundary signals matching this guard: the same tokens and deadline, for
     /// the physical enqueue that follows the open.
     pub fn signals(&self) -> DispatchSignals {
         DispatchSignals {
             cancel: self.cancel.clone(),
             stop: self.stop.clone(),
+            accepting_drain: self.accepting_drain.clone(),
             deadline: self.deadline,
             steer_yields: self.steer_yields.clone(),
         }

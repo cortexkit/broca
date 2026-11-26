@@ -2737,12 +2737,12 @@ impl SubcConnection {
             } => terminal,
             _ = async {
                 if let (Some(signals), Some(yielding)) = (signals, yielding.as_mut()) {
-                    // A call is asked once, for whichever comes first: the runner stopping, or
-                    // a steer requesting hand-back after the call was sent. Either way its answer
-                    // is still the call's own terminal frame, awaited above.
+                    // Ask once, on either drain or a steer. Ask while the routes are still open:
+                    // even a short call may hand back and finish by late result after restart,
+                    // just as in an ordinary drain. A normal result still settles the call.
                     let reason = match yielding.steers_seen {
                         Some(seen) => tokio::select! {
-                            _ = signals.stopping() => "runner_restart",
+                            _ = signals.restart_yield_requested() => "runner_restart",
                              cause = signals.steer_yield_after(seen) => match cause {
                                  broca_core::tool_plane::SteerYield::PersonMessage =>
                                      cortexkit_role_tool_provider::call_yield::PERSON_MESSAGE,
@@ -2750,7 +2750,7 @@ impl SubcConnection {
                              },
                         },
                         None => {
-                            signals.stopping().await;
+                            signals.restart_yield_requested().await;
                             "runner_restart"
                         }
                     };

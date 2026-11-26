@@ -21,7 +21,7 @@ use broca_core::provider::{Provider, StepRuntime};
 use broca_core::stop_conditions::{limiting_stop_satisfied, stop_satisfied};
 use broca_core::tool_plane::{
     BatchCtx, DispatchKey, DispatchRegistration, DispatchResult, ProviderHeldLifecycle,
-    ProviderHeldRecorder, ProviderHeldReply, ToolOpenGuard, ToolPlane,
+    ProviderHeldRecorder, ProviderHeldReply, ToolPlane,
 };
 use broca_protocol::approval::ApprovalResponse;
 use broca_protocol::caller::{PauseReason, RunFinishReason};
@@ -77,7 +77,7 @@ use close_out::{
 mod call_plan;
 use call_plan::{hook_plan, plan_calls, CallPlan};
 mod dispatch;
-use dispatch::{dispatch_all, DispatchPlan, Dispatched};
+use dispatch::{dispatch_all, tool_open_guard, DispatchPlan, Dispatched};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused, take_deposited};
 mod plan_notes;
@@ -237,7 +237,7 @@ pub struct Seams<'a, P, T> {
     /// `cancel`, it cuts nothing in flight: the run stops at its next step boundary, where it
     /// pauses or ends interrupted as its restart policy says.
     pub stop: CancellationToken,
-    /// Like `stop` at work boundaries, but does not ask dispatched tools to yield.
+    /// Stops new steps and batches and asks dispatched yield-capable calls to hand back.
     pub accepting_drain: Option<CancellationToken>,
     /// The late-result runtime's waiting slots for calls a provider holds. Without it a held
     /// call is never answered, and its run pauses.
@@ -4563,8 +4563,7 @@ where
     // The plane learns of the batch first, so it can say where each call goes; the intents then
     // record that, with each call's key, before anything is sent. A plane that refuses the batch
     // leaves every call unsent, with a terminal saying why.
-    let guard = ToolOpenGuard::new(Some(&seams.cancel), Some(&seams.stop))
-        .with_steer_yields(seams.steer_yields.clone());
+    let guard = tool_open_guard(seams);
     let refusal = seams
         .tools
         .batch_started_guarded(&ctx, planned, manifest, &guard)

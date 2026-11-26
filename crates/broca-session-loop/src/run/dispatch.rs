@@ -3,7 +3,14 @@
 //! calls a provider holds are still waiting.
 
 use super::*;
+use broca_core::tool_plane::ToolOpenGuard;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+pub(super) fn tool_open_guard<P, T>(seams: &Seams<'_, P, T>) -> ToolOpenGuard {
+    ToolOpenGuard::new(Some(&seams.cancel), Some(&seams.stop))
+        .with_accepting_drain(seams.accepting_drain.as_ref())
+        .with_steer_yields(seams.steer_yields.clone())
+}
 
 /// A held reply on its way to the batch's writer, with where to say it's durable.
 type HeldRequest = (ProviderHeldReply, oneshot::Sender<Result<(), String>>);

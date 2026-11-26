@@ -111,6 +111,12 @@ impl InProcessModuleEnd {
         self.write_rx.close();
     }
 
+    /// Drop the original reply waiters as the connection reader does on teardown.
+    pub(crate) fn disconnect(&mut self) {
+        self.write_rx.close();
+        self.pending.lock().unwrap().clear();
+    }
+
     pub(crate) fn pending_count_for_test(&self) -> usize {
         self.pending.lock().unwrap().len()
     }

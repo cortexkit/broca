@@ -112,7 +112,8 @@ pub struct RunControl {
     /// work in flight, this only refuses to start more. `None` means nothing asks this run to
     /// stop.
     pub stop_requested: Option<CancellationToken>,
-    /// Stops starting model steps and tool batches without asking already dispatched tools to yield.
+    /// Stops starting model steps and tool batches and asks dispatched yield-capable tools
+    /// to hand back without stopping admission or cutting short other calls.
     pub accepting_drain: Option<CancellationToken>,
     /// The frozen plan manifest of a session admitted with a fetch plan. A fresh episode
     /// records it on its `RunStarted`: the first episode freezes it there, and every later one

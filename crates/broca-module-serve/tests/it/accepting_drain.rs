@@ -1,7 +1,7 @@
 //! Drive both drain modes over the real module connection against a scripted model and tools.
 
 use broca_protocol::PauseReason;
-use broca_session_store::record::Record;
+use broca_session_store::record::{CallOutcome, Record};
 use serde_json::{json, Value};
 use subc_protocol::{Frame, FrameType};
 
@@ -98,6 +98,7 @@ async fn accepting_drain_finishes_step_and_recovers_queued_send_and_unsent_tools
 
     rig.script.hold_model(false);
     let ready = rig.drain_ready().await;
+    assert!(!rig.registry().stopping_signal().is_cancelled());
     // Receipt of readiness proves the end and pause were already durable, not just scheduled.
     let records = rig.records().await;
     assert!(records
@@ -198,6 +199,10 @@ async fn accepting_drain_finishes_dispatched_tool_batch_before_ready() {
     rig.script.hold_tool(false);
     let ready = rig.drain_ready().await;
     let records = rig.records().await;
+    assert!(records.iter().any(|record| matches!(record,
+        Record::ToolOutcome(outcome) if outcome.tool_call_id.0 == "in-flight-tool"
+            && outcome.outcome == CallOutcome::Completed
+    )));
     let closed = records
         .iter()
         .position(|record| matches!(record, Record::BatchEnd(_)))

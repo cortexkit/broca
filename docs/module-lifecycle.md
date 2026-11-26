@@ -13,9 +13,13 @@ sends `module.draining` with `accepting: true` and an absolute Unix-millisecond
 
 During this phase, reads, subscriptions and steers are served normally. A send
 that would start a run is durably queued before its `pending` reply, even on an
-idle session, and runs in the replacement process. A streaming model step or a
-dispatched tool batch finishes and records its result. Broca starts no new model
-step or tool batch. At the next boundary, an unfinished `on_restart: "resume"`
+idle session, and runs in the replacement process. At the start of the drain,
+broca asks already-dispatched yield-capable calls to hand back on their own routes
+(`tool.yield`, reason `runner_restart`). Broca records held replies and pauses those
+runs `tool_held`; the replacement resumes the same runs when the providers' late
+results arrive. Streaming model steps and other dispatched tool calls still finish
+and record their results within the drain budget. Broca starts no new model step
+or tool batch. At the next boundary, an unfinished `on_restart: "resume"`
 run records `Pause{reason: restart}`; other unfinished runs end `interrupted`.
 A natural ending or a caller's cancellation still wins. An unanswered tool turn
 in a restart pause dispatches after restart, not during the drain. A run parked

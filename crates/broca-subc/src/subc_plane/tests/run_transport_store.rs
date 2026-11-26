@@ -422,6 +422,127 @@ async fn fresh_store_run_learns_aft_yield_tags_and_restart_holds_without_cancel(
     );
 }
 
+#[tokio::test]
+async fn accepting_drain_records_held_before_the_daemon_closes_the_connection() {
+    use broca_session_store::{
+        backend::{LocalBackend, SessionAddr},
+        head::SessionTriple,
+        record::Record,
+        session::Session,
+    };
+
+    let _serial = AFT_SESSION_TESTS.lock().await;
+    let self::Session {
+        registry,
+        bind,
+        mut provider,
+        ..
+    } = session("accepting-drain", vec![step(true)], true).await;
+    send(
+        &registry,
+        &bind,
+        "held-run",
+        Some(crate::subc_plane::tests::run_transport_tests::plan(
+            "aft", true,
+        )),
+    )
+    .await;
+    let original =
+        broca_test_support::wait_for("running tool request", provider.next_request(), || {
+            "the original tool call has not reached the provider".into()
+        })
+        .await;
+    let body: serde_json::Value = serde_json::from_slice(&original.body).unwrap();
+    assert_eq!(body["name"], "bash");
+    let call_key = body["call_key"].as_str().unwrap();
+    assert_eq!(registry.slot_counts().runs_in_flight, 1);
+
+    // The provider answers only if asked to yield while the daemon still admits requests.
+    // With the clock paused, expiry wins only after the runner has no runnable work left.
+    tokio::time::pause();
+    registry.begin_accepting_drain();
+    let yield_request = tokio::time::timeout(Duration::from_secs(1), provider.next_request()).await;
+    tokio::time::resume();
+    if let Ok(yielding) = yield_request {
+        let body: serde_json::Value = serde_json::from_slice(&yielding.body).unwrap();
+        assert_eq!(body["name"], "tool.yield");
+        assert_eq!(
+            body["arguments"],
+            json!({"call_key":call_key,"reason":"runner_restart"})
+        );
+        assert_eq!(
+            (yielding.header.channel, yielding.header.epoch),
+            (original.header.channel, original.header.epoch)
+        );
+        assert!(provider.reply(&yielding, br#"{"answer":"accepted"}"#.to_vec()));
+        assert_eq!(
+            registry.slot_counts().runs_in_flight,
+            1,
+            "a yield ACK is not a tool result"
+        );
+        assert!(provider.reply(
+            &original,
+            serde_json::to_vec(&json!({
+                "content":[{"type":"text","text":"running"}],
+                "held":{"reason":"running","yielded":true}
+            }))
+            .unwrap()
+        ));
+        broca_test_support::wait_until("held run becomes drain-ready", || {
+            std::future::ready(match registry.slot_counts().runs_in_flight {
+                0 => Ok(()),
+                active => Err(format!("{active} run(s) still in flight")),
+            })
+        })
+        .await;
+        assert!(!registry.stopping_signal().is_cancelled());
+        assert!(
+            provider.try_frame().is_none(),
+            "no second yield or CANCEL before teardown"
+        );
+    }
+    // The daemon tears down the route at readiness or expiry. On expiry, close the
+    // tool transport before the late stop signal has a chance to send a yield.
+    provider.disconnect();
+    assert!(registry.stop_and_seal().await);
+
+    let runtime = registry.store_runtime().unwrap();
+    let address = broca_core::session_addr(&bind);
+    let root = runtime.state_root();
+    let class = broca_records::session_storage::session_storage_class(root, &address)
+        .unwrap()
+        .unwrap();
+    let records = Session::view(
+        LocalBackend::new(class.store_root(root)),
+        SessionAddr(address),
+        &SessionTriple {
+            project_root: bind.project_root.display().to_string(),
+            harness: bind.harness,
+            session: bind.session,
+        },
+        runtime.deployment(),
+    )
+    .await
+    .unwrap()
+    .open_log_records()
+    .await
+    .unwrap();
+    let outcomes: Vec<_> = records
+        .iter()
+        .filter_map(|(_, record)| match record {
+            Record::ToolReply(_) | Record::ToolHeld(_) | Record::Pause(_) | Record::RunEnd(_) => {
+                Some(record)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(outcomes.as_slice(), [Record::ToolHeld(held), Record::Pause(pause)]
+            if held.call_key == call_key && pause.run_id == "held-run" && pause.reason == broca_protocol::PauseReason::ToolHeld),
+        "expected the original run to park with a held call before shutdown: {outcomes:?}"
+    );
+}
+
 async fn paused_transport_resume(assert_recorded: bool) {
     let _serial = AFT_SESSION_TESTS.lock().await;
     tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, async {
