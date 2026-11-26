@@ -40,8 +40,8 @@ use cortexkit_role_harness::{
 use cortexkit_role_llm_runner::points;
 use cortexkit_role_llm_runner_conformance::{
     run_suite_with, Capability, CaseOutcome, LlmRunnerSubject, Reply, RouteFailure, RunnerRoute,
-    Script, ScriptedLateEntry, ScriptedPart, ScriptedUsage, SubscribeOutcome, SuiteOptions,
-    SCRIPTED_TOOL,
+    Script, ScriptedLateEntry, ScriptedPart, ScriptedToolOutcome, ScriptedUsage, SubscribeOutcome,
+    SuiteOptions, SCRIPTED_TOOL,
 };
 use serde_json::{json, Map, Value};
 use subc_control::ConsumerIdentity;
@@ -362,6 +362,8 @@ mod session_class;
 mod signed_floor;
 #[path = "llm_runner_conformance/step_events.rs"]
 mod step_events;
+#[path = "llm_runner_conformance/tool_outcomes.rs"]
+mod tool_outcomes;
 #[path = "llm_runner_conformance/voice_handoff.rs"]
 mod voice_handoff;
 
@@ -479,6 +481,7 @@ struct Shared {
     scripts: Mutex<HashMap<String, Script>>,
     /// Each scripted call's result, by its arguments' JSON text.
     results: Mutex<HashMap<String, Value>>,
+    tool_outcomes: Mutex<tool_outcomes::ScriptedOutcomes>,
     /// How often the tool provider was called with each arguments' JSON text, across every kill.
     invocations: Mutex<HashMap<String, usize>>,
     armed: Mutex<Option<Armed>>,
@@ -833,6 +836,7 @@ fn observe_model_request(
         .collect();
     let mut observation =
         cortexkit_role_llm_runner_conformance::ModelRequestObservation::new(names);
+    observation.tool_results = tool_outcomes::observe_chat_results(request);
     if let Some(temperature) = request.get("temperature").and_then(Value::as_f64) {
         observation = observation.with_temperature(temperature);
     }
@@ -1267,6 +1271,7 @@ struct ToolProvider {
     shared: Arc<Shared>,
     /// The session each bound route channel serves, from its bind.
     routes: Mutex<HashMap<(u16, u32), String>>,
+    stop: subc_client_rs::ModuleStopHandle,
 }
 
 impl ToolProvider {
@@ -1352,6 +1357,16 @@ impl subc_client_rs::ModuleHandler for ToolProvider {
             arguments.clone(),
             request["schema_pin"].as_str().map(str::to_owned),
         );
+        let scripted = self
+            .shared
+            .tool_outcomes
+            .lock()
+            .unwrap()
+            .get(&(session.clone(), arguments.clone()))
+            .cloned();
+        if let Some(outcome) = scripted {
+            return tool_outcomes::answer(outcome, &self.stop).await;
+        }
         // The call is sent only once its dispatch intent is durable.
         if self.shared.reach(points::DISPATCH_INTENT, &session) {
             self.shared.until_killed(&session).await;
@@ -1974,16 +1989,21 @@ impl BrocaSubject {
             }
             sleep(Duration::from_millis(25)).await;
         }
-        let (_, serve) = subc_client_rs::serve_with_handle(
-            &connection_file,
-            tool_manifest(),
-            ToolProvider {
-                shared: self.shared.clone(),
-                routes: Mutex::new(HashMap::new()),
-            },
-        )
-        .await
-        .map_err(|e| fail(format!("registering the scripted tool provider: {e}")))?;
+        let stop = subc_client_rs::ModuleStopHandle::new();
+        let (_, serve) = subc_client_rs::ServeOptions::default()
+            .with_stop_handle(stop.clone())
+            .serve_with_handle(
+                &connection_file,
+                tool_manifest(),
+                ToolProvider {
+                    shared: self.shared.clone(),
+                    routes: Mutex::new(HashMap::new()),
+                    stop,
+                },
+            )
+            .await
+            .map_err(|e| fail(format!("registering the scripted tool provider: {e}")))?
+            .ok_or_else(|| fail("the scripted tool provider stopped before registering".into()))?;
         let tools = tokio::spawn(async move {
             let _ = serve.await;
         });
@@ -2387,7 +2407,7 @@ struct BrocaRoute {
     session: broca_protocol::BindIdentity,
     describe_calls: std::sync::atomic::AtomicUsize,
     logs_dir: PathBuf,
-    _routed_live: Option<Arc<Live>>,
+    _private_live: Option<Arc<Live>>,
 }
 
 fn scripted_usage_chunk(id: &str, usage: &ScriptedUsage, output_cap: u64) -> Value {
@@ -3503,8 +3523,12 @@ impl LlmRunnerSubject for BrocaSubject {
         stamp: &RouteStamp,
     ) -> Result<BrocaRoute, HarnessError> {
         let stamp = message_marks_route_stamp(session, stamp);
-        let routed_live = routed_accounts::session_live(self, handle, session).await?;
-        let handle = routed_live.as_deref().unwrap_or(handle);
+        let private_live = if tool_outcomes::needs_private_runner(session) {
+            Some(tool_outcomes::start_private_runner(self, handle, session).await?)
+        } else {
+            routed_accounts::session_live(self, handle, session).await?
+        };
+        let handle = private_live.as_deref().unwrap_or(handle);
         let connection = self.connection(handle, &stamp).await?;
         self.shared
             .session_roots
@@ -3552,7 +3576,7 @@ impl LlmRunnerSubject for BrocaSubject {
             session: identity,
             describe_calls: std::sync::atomic::AtomicUsize::new(0),
             logs_dir: handle.logs_dir.clone(),
-            _routed_live: routed_live,
+            _private_live: private_live,
         })
     }
 
@@ -4278,6 +4302,27 @@ impl LlmRunnerSubject for BrocaSubject {
             .get(&arguments.to_string())
             .copied()
             .unwrap_or(0)
+    }
+
+    async fn set_scripted_tool_outcome(
+        &self,
+        session: &str,
+        arguments: &Value,
+        outcome: ScriptedToolOutcome,
+    ) -> Result<(), HarnessError> {
+        if matches!(outcome, ScriptedToolOutcome::CutOff)
+            && !tool_outcomes::needs_private_runner(session)
+        {
+            return Err(HarnessError::new(
+                "cutting off a tool reply requires a private conformance runner",
+            ));
+        }
+        self.shared
+            .tool_outcomes
+            .lock()
+            .unwrap()
+            .insert((session.to_owned(), arguments.to_string()), outcome);
+        Ok(())
     }
 
     async fn dispatched_schema_pin(
@@ -5214,7 +5259,7 @@ fn runner_0821_cases_pin_exact_native_outcomes() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 114);
+    assert_eq!(cases.len(), 115);
     check_0821_cases(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [
@@ -7028,6 +7073,7 @@ mod held_call_tests {
         let shared = Arc::new(Shared::default());
         let provider = ToolProvider {
             shared: shared.clone(),
+            stop: subc_client_rs::ModuleStopHandle::new(),
             routes: Mutex::new(HashMap::from([
                 ((11, 1), "held-catalog".into()),
                 ((12, 1), "structured-catalog".into()),

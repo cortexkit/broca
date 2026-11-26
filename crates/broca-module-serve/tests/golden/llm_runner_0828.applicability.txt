@@ -39,3 +39,4 @@ PASS signed_tool_reorder_keeps
 N/A signed_tool_deferred_addition_strips: adapter supplies no prefix-bound signed-tool-change fixture
 N/A signed_tool_note_keeps: adapter supplies no prefix-bound signed-tool-change fixture
 N/A signed_tool_resume_identical: adapter supplies no prefix-bound signed-tool-change fixture
+PASS tool_outcome_continues_turn

@@ -442,6 +442,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn step_hint_round_trips_refusal_fallback_with_or_without_category() {
+        use cortexkit_role_llm_runner::step_events::{decode_step_finished, Fallback};
+
+        let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel();
+        let events = StepEvents::start(
+            "account_a",
+            "broca",
+            Arc::new(Publisher { calls, fail: false }),
+        )
+        .unwrap();
+        for (category, expected) in [
+            (
+                "test_category",
+                r#""fallback":{"by":"client","requested_model":"requested","category":"test_category","cause":"round"}"#,
+            ),
+            (
+                "",
+                r#""fallback":{"by":"client","requested_model":"requested","cause":"round"}"#,
+            ),
+        ] {
+            let event =
+                hint().with_fallback(Fallback::new("client", "requested", category, "round"));
+            events.tx.try_send(event.clone()).unwrap();
+            let (subject, body) = inbox.recv().await.unwrap();
+            assert!(std::str::from_utf8(&body).unwrap().contains(expected));
+            assert_eq!(decode_step_finished(&subject, &body).unwrap(), event);
+        }
+    }
+
+    #[tokio::test]
     async fn unavailable_bus_drops_hints_without_publishing() {
         let (calls, mut inbox) = tokio::sync::mpsc::unbounded_channel();
         let events = StepEvents::start_on_bus(Arc::new(Publisher { calls, fail: false }));

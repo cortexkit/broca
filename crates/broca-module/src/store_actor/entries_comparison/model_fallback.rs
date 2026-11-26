@@ -161,6 +161,36 @@ async fn refused_reply_exposes_recorded_model_fallback_on_read_and_history() {
             serde_json::from_value(facts.clone()).unwrap();
         checked.check_model_fallback("assistant").unwrap();
     }
+
+    // Readers can also receive refusal reasons from a runner that supplies them.
+    for category in [None, Some("test_category")] {
+        let mut reason = expected.clone();
+        reason["by"] = json!("client");
+        reason["cause"] = json!("refused_here");
+        if let Some(category) = category {
+            reason["category"] = json!(category);
+        }
+        let mut entry = facts[1].clone();
+        entry["model_fallback"] = reason.clone();
+        let read: broca_wire::SessionReadMessage = serde_json::from_value(entry.clone()).unwrap();
+        let checked: cortexkit_role_llm_runner::read::ReadMessage =
+            serde_json::from_value(entry).unwrap();
+        checked.check_model_fallback("assistant").unwrap();
+        assert_eq!(
+            serde_json::to_value(read).unwrap()["model_fallback"],
+            reason
+        );
+
+        let mut row = rows[1]["row"].clone();
+        row["model_fallback"] = reason;
+        let display: cortexkit_role_llm_runner::display::DisplayRow =
+            serde_json::from_value(row.clone()).unwrap();
+        display.check_model_fallback().unwrap();
+        assert_eq!(
+            serde_json::to_value(display).unwrap()["model_fallback"],
+            row["model_fallback"]
+        );
+    }
 }
 
 #[tokio::test]
