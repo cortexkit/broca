@@ -39,6 +39,9 @@ pub struct ForkCallJob {
     /// provider from this config alone, renders `base.opts` and sends nothing when the bytes'
     /// digest differs from `base.request_body_sha256` ([`ForkCallRefusal::BaseUnavailable`]).
     pub base: Box<broca_core::RecordedRequest>,
+    /// The head's read-only media renderer as of the base attempt, shared by the base check and
+    /// the fork request. No renderer is needed when the base has no media.
+    pub media: Option<ForkMedia>,
     /// The request to send: `base.opts` with the fork's earlier questions and answers and the new
     /// question appended as messages, and nothing else changed. The tools stay in it byte for
     /// byte; the executor sends it on the base's route (`base.route`) and never runs a tool.
@@ -61,6 +64,34 @@ pub struct ForkCallJob {
     /// durably and writes it to the usage export under [`ForkCallJob::run_id`]. An attempt that
     /// never reports one made no model call the manager can bill.
     pub on_step: Option<Arc<dyn Fn(ForkStepSpend) + Send + Sync>>,
+}
+
+/// Media delivery pinned to the head's base attempt instead of the head's current index.
+pub struct ForkMedia {
+    pub(crate) delivery: crate::store_media::RunMedia,
+    pub(crate) render_tags: bool,
+}
+
+impl ForkMedia {
+    pub fn install(&self, provider: &dyn broca_core::Provider) {
+        provider.set_media_request_renderer(self.delivery.renderer());
+        provider.defer_media_tags(self.render_tags);
+    }
+
+    pub(crate) fn render(
+        &self,
+        frozen: &broca_provider::wire::FrozenRenderConfig,
+        opts: &broca_protocol::CallOptions,
+    ) -> Result<Vec<u8>, String> {
+        let config = serde_json::to_value(&*frozen.for_step(opts))
+            .map_err(|error| format!("encode the head's media render config: {error}"))?;
+        self.delivery
+            .render(&config, opts, self.render_tags, None)
+            .map_err(|error| match &error.provider_code {
+                Some(code) => format!("{code}: {}", error.message),
+                None => error.message.clone(),
+            })
+    }
 }
 
 /// What a fork attempt's model call spent, as the provider reported it: what a run's step records

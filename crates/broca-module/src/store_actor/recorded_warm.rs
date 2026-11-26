@@ -33,6 +33,7 @@ pub(crate) async fn request<W: Writer>(
         Through::Request,
     )
     .await
+    .map(|replay| replay.request)
 }
 
 /// Where a rebuilt request's conversation ends.
@@ -45,6 +46,17 @@ pub(crate) enum Through {
     /// placed in the conversation, which a reply that asked for no tool call is when its step
     /// ends. The rebuilt request keeps the step's settings; its digest is not the recorded one.
     Answer,
+}
+
+pub(crate) struct RequestReplay {
+    pub request: RecordedRequest,
+    pub media: Option<MediaReplay>,
+}
+
+pub(crate) struct MediaReplay {
+    /// The media renderer sees the index before the transport's attempt is recorded.
+    pub before_attempt: u64,
+    pub render_tags: bool,
 }
 
 /// Build the request step `step` of run `run_id` sent, as the session stood when it sent it, for
@@ -72,6 +84,7 @@ pub(crate) async fn request_as_of<W: Writer>(
         Through::Request,
     )
     .await
+    .map(|replay| replay.request)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -84,7 +97,7 @@ async fn rebuild<W: Writer>(
     step: Option<u64>,
     as_of: bool,
     through: Through,
-) -> Result<RecordedRequest, String> {
+) -> Result<RequestReplay, String> {
     let (attempt_at, attempt) = records
         .iter()
         .enumerate()
@@ -285,7 +298,24 @@ async fn rebuild<W: Writer>(
     if let Some(route) = &route {
         opts.target_model = Some(route.model.clone());
     }
-    Ok(RecordedRequest {
+    let media = if opts
+        .prompt
+        .iter()
+        .any(|message| !broca_session_store::session::message_media(message).is_empty())
+    {
+        let render_tags = config.render_tags
+            || broca_session_loop::run::frozen_manifest(start, parts)
+                .map_err(|error| format!("the recorded run's plan: {error:?}"))?
+                .as_deref()
+                .is_some_and(broca_core::tags::plan_renders_tags);
+        Some(MediaReplay {
+            before_attempt: records[attempt_at].0 - 1,
+            render_tags,
+        })
+    } else {
+        None
+    };
+    let request = RecordedRequest {
         run_id: RunId(run.run_id.clone()),
         step_id: StepId(step),
         config,
@@ -297,7 +327,8 @@ async fn rebuild<W: Writer>(
             .map(|byte| format!("{byte:02x}"))
             .collect(),
         route,
-    })
+    };
+    Ok(RequestReplay { request, media })
 }
 
 /// The request `session` last sent for run `run_id` (for its step `step`, when one is named),
@@ -312,7 +343,7 @@ pub(crate) async fn recorded_request<B, R>(
     run_id: &str,
     step: Option<u64>,
     through: Through,
-) -> Result<RecordedRequest, String>
+) -> Result<RequestReplay, String>
 where
     B: broca_session_store::backend::SessionBackend,
     R: broca_session_store::backend::SessionBackend,
@@ -382,6 +413,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
             Through::Request,
         )
         .await
+        .map(|replay| replay.request)
     }
 }
 

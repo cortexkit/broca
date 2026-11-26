@@ -128,6 +128,7 @@ fn fork_job(root: &std::path::Path, url: &str) -> ForkCallJob {
             route: None,
         }),
         request,
+        media: None,
         on_usage: None,
         on_step: None,
     }

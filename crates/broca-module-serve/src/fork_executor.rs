@@ -220,6 +220,9 @@ impl LiveLoopExecutor {
         } else {
             broca_core::refusal_fallback::StepRoute::Source
         });
+        if let Some(media) = &job.media {
+            media.install(provider.as_ref());
+        }
         let rendered = match provider.try_render_request(&job.base.opts) {
             Ok(bytes) => bytes,
             Err(error) => {

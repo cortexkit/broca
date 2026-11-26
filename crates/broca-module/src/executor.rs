@@ -20,7 +20,9 @@ use tokio::sync::mpsc;
 mod fork;
 pub use fork::fork_admission_id;
 pub(crate) use fork::fork_conversation_key;
-pub use fork::{ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkReleaseJob, ForkStepSpend};
+pub use fork::{
+    ForkCallJob, ForkCallOutcome, ForkCallRefusal, ForkMedia, ForkReleaseJob, ForkStepSpend,
+};
 
 #[derive(Debug)]
 pub enum CreatingPlanSelectionError {

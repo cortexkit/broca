@@ -27,6 +27,8 @@ use crate::executor::{RunExecutor, RunKind, StoreRunEnd, StoreRunError, StoreRun
 use crate::registry::LineageRegistry;
 use broca_session_store::keys::Cipher;
 
+mod fork_media;
+
 cipher_tests!(
     a_photo_in_the_input_renders_alike,
     a_photo_in_a_tool_result_renders_alike,
@@ -55,6 +57,7 @@ struct Rendering {
     renderer: RwLock<Option<Arc<MediaRequestRenderer>>>,
     render_tags: AtomicBool,
     sent: Sent,
+    record_attempts: bool,
 }
 
 impl Rendering {
@@ -64,6 +67,7 @@ impl Rendering {
             renderer: RwLock::new(None),
             render_tags: AtomicBool::new(false),
             sent: Arc::clone(sent),
+            record_attempts: false,
         }
     }
 }
@@ -92,11 +96,11 @@ fn refusal(code: String) -> broca_protocol::ProviderError {
 #[async_trait]
 impl Provider for Rendering {
     fn render_config_blob(&self) -> Value {
-        image_render_config()
+        self.script.render_config.clone().unwrap()
     }
 
     fn render_config_blob_for_version(&self, _renderer_version: u32) -> Value {
-        image_render_config()
+        self.render_config_blob()
     }
 
     fn supports_media_renderer(&self) -> bool {
@@ -117,7 +121,7 @@ impl Provider for Rendering {
         step_id: broca_protocol::StepId,
         opts: &broca_protocol::request::CallOptions,
     ) -> mpsc::Receiver<NormalizedEvent> {
-        let config = image_render_config();
+        let config = self.render_config_blob();
         let renderer = self.renderer.read().unwrap().clone();
         let rendered = match renderer {
             Some(renderer) => renderer(
@@ -136,6 +140,24 @@ impl Provider for Rendering {
                     .render(&frozen, opts))
             }
         };
+        let attempt = rendered
+            .as_ref()
+            .ok()
+            .filter(|_| self.record_attempts)
+            .map(|body| {
+                serde_json::from_value(json!({
+                    "attempt": 0,
+                    "request_body_len": body.len(),
+                    "request_body_sha256": broca_core::render::request_digest_hex(body),
+                    "http_status": 200,
+                    "response_body_len": 0,
+                    "response_body_sha256": "0".repeat(64),
+                    "outcome": "complete",
+                    "ts_ms": 1,
+                    "sent_at_ms": 1,
+                }))
+                .unwrap()
+            });
         let refused = rendered.as_ref().err().cloned();
         self.sent.lock().unwrap().push(rendered);
         if let Some(code) = refused {
@@ -148,7 +170,28 @@ impl Provider for Rendering {
                 .await;
             return receiver;
         }
-        self.script.step(step_id, opts).await
+        let mut events = self.script.step(step_id, opts).await;
+        let Some(attempt) = attempt else {
+            return events;
+        };
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            if tx
+                .send(NormalizedEvent::Control(ProviderControl::AttemptFinished {
+                    attempt,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            while let Some(event) = events.recv().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
     }
 }
 
@@ -249,6 +292,7 @@ struct RenderExecutor {
     sent: Sent,
     /// The compaction provider the side's runs are offered, when its sessions are planned.
     compactor: Option<Arc<super::controls::Compactor>>,
+    fork_sent: Option<Sent>,
 }
 
 /// The session store's renderer, installed as the module's executor installs it for a store run
@@ -299,7 +343,8 @@ impl RunExecutor for RenderExecutor {
             ..
         } = job;
         control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
-        let provider = Rendering::new(&self.script, &self.sent);
+        let mut provider = Rendering::new(&self.script, &self.sent);
+        provider.record_attempts = self.fork_sent.is_some();
         let result = async {
             let holds_media = req
                 .input
@@ -374,32 +419,61 @@ impl RunExecutor for RenderExecutor {
         .await;
         StoreRunEnd { parts, result }
     }
+
+    async fn fork_call(
+        &self,
+        job: crate::executor::ForkCallJob,
+    ) -> crate::executor::ForkCallOutcome {
+        let sent = self
+            .fork_sent
+            .as_ref()
+            .expect("the test captures fork requests");
+        let media = job
+            .media
+            .as_ref()
+            .expect("the fork keeps the head's media renderer");
+        let frozen = serde_json::from_value(job.base.config.frozen_render_config.clone()).unwrap();
+        sent.lock().unwrap().extend([
+            media.render(&frozen, &job.base.opts),
+            media.render(&frozen, &job.request),
+        ]);
+        crate::executor::ForkCallOutcome::Answered {
+            answer: "fork reply".into(),
+            finish: "end_turn".into(),
+            usage: Default::default(),
+        }
+    }
 }
 
-/// A module over the state root `dir` whose runs render their requests into `sent`. Sessions
-/// start in the session store; `store` must say so.
+/// A module over the state root `dir` whose runs render their requests into `sent`.
 async fn registry(
     dir: &std::path::Path,
-    store: bool,
+    fork: Option<fork_media::Capture>,
     steps: Vec<Vec<NormalizedEvent>>,
     gate: Option<Arc<tokio::sync::Notify>>,
     sent: &Sent,
     compactor: Option<Arc<super::controls::Compactor>>,
     cipher: Cipher,
 ) -> LineageRegistry {
-    assert!(store, "sessions start in the new storage");
     broca_core::media_uploads::create_upload_directories(dir).unwrap();
+    let mut render_config = image_render_config();
+    if fork.as_ref().is_some_and(|fork| fork.age_early) {
+        // Age the first unprotected image without needing a large attachment.
+        render_config["media"]["aging"]["byte_trigger"] = json!(32);
+        render_config["media"]["aging"]["byte_target"] = json!(16);
+    }
     let executor: Arc<dyn RunExecutor> = Arc::new(RenderExecutor {
         script: Arc::new(super::super::tests::Gated {
             inner: broca_core::provider::StubProvider::new(steps),
             gate,
-            render_config: Some(image_render_config()),
+            render_config: Some(render_config),
             notes_sends: false,
             hold: None,
             attempt_digest: None,
         }),
         sent: Arc::clone(sent),
         compactor: compactor.clone(),
+        fork_sent: fork.map(|fork| fork.sent),
     });
     let runtime = crate::store_open::StoreRuntime::open(
         dir,
@@ -469,7 +543,8 @@ impl Rendered {
         std::fs::create_dir_all(&dir).unwrap();
         let gate = gated.then(|| Arc::new(tokio::sync::Notify::new()));
         let sent = Sent::default();
-        let registry = registry(&dir, store, steps, gate.clone(), &sent, compactor, cipher).await;
+        assert!(store, "sessions start in the new storage");
+        let registry = registry(&dir, None, steps, gate.clone(), &sent, compactor, cipher).await;
         let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
         Self {
             side: Side {
@@ -488,9 +563,10 @@ impl Rendered {
     /// `steps`.
     async fn restarted(mut self, store: bool, steps: Vec<Vec<NormalizedEvent>>) -> Self {
         assert!(self.side.registry.stop_and_seal().await);
+        assert!(store, "sessions start in the new storage");
         let cipher = self.side.cipher;
         self.side.registry =
-            registry(&self.side.dir, store, steps, None, &self.sent, None, cipher).await;
+            registry(&self.side.dir, None, steps, None, &self.sent, None, cipher).await;
         self
     }
 

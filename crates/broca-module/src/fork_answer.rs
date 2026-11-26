@@ -48,7 +48,7 @@ use serde_json::{json, Value};
 
 use crate::executor::{
     fork_admission_id, fork_conversation_key, ForkCallJob, ForkCallOutcome, ForkCallRefusal,
-    ForkReleaseJob,
+    ForkMedia, ForkReleaseJob,
 };
 use crate::fork_state::{ForkState, FINISH_MODEL_ERROR};
 use crate::store_open::StoreRuntime;
@@ -336,6 +336,39 @@ struct Head {
     view: crate::store_read::StoredLocalView,
 }
 
+struct Rebuilt {
+    request: broca_core::RecordedRequest,
+    media: Option<ForkMedia>,
+}
+
+impl Rebuilt {
+    fn digest(&self) -> Result<String, ForkError> {
+        Ok(broca_core::render::request_digest_hex(
+            &self.render().map_err(ForkError::BaseUnavailable)?,
+        ))
+    }
+
+    fn render(&self) -> Result<Vec<u8>, String> {
+        let request = &self.request;
+        let Some(media) = &self.media else {
+            return render(&request.config, &request.opts);
+        };
+        let source: broca_provider::wire::FrozenRenderConfig =
+            serde_json::from_value(request.config.frozen_render_config.clone())
+                .map_err(|error| format!("the head's media render config: {error}"))?;
+        let frozen = if request.route.is_some() {
+            &source
+                .refusal_fallback
+                .as_ref()
+                .ok_or("the head's recorded fallback has no frozen render config")?
+                .frozen
+        } else {
+            &source
+        };
+        media.render(frozen, &request.opts)
+    }
+}
+
 /// Serves the fork operations of every head kept in the session store.
 pub struct ForkManager {
     runtime: Arc<StoreRuntime>,
@@ -424,37 +457,28 @@ impl ForkManager {
     /// The head request `run_id` sent at step `step`, rebuilt from the head's records, with the
     /// digest its bytes render to under the head's frozen render config. Refuses a request it
     /// can't rebuild or whose bytes differ from what the head's attempt recorded.
-    async fn rebuild(
-        &self,
-        head: &Head,
-        run_id: &str,
-        step: u64,
-    ) -> Result<broca_core::RecordedRequest, ForkError> {
-        let request = self
-            .rebuild_through(head, run_id, step, Through::Request)
+    async fn rebuild(&self, head: &Head, run_id: &str, step: u64) -> Result<Rebuilt, ForkError> {
+        let rebuilt = self
+            .rebuild_through(head, run_id, step, Through::Request, None)
             .await?;
-        let digest =
-            render_digest(&request.config, &request.opts).map_err(ForkError::BaseUnavailable)?;
+        let digest = rebuilt.digest()?;
+        let request = &rebuilt.request;
         if digest != request.request_body_sha256 {
             return Err(ForkError::BaseUnavailable(format!(
                 "the head's request rebuilds to {digest}, not the {} it sent",
                 request.request_body_sha256
             )));
         }
-        Ok(request)
+        Ok(rebuilt)
     }
 
     /// The fork's base as `base` fixed it: the head's request, checked against the digest it
     /// was sent with, and then, when prepare appended the head's answer, the request with that
     /// answer, checked against the digest prepare fixed for it. The returned request carries
     /// the digest of the bytes it renders to, so the executor's own check holds for either.
-    async fn rebuild_base(
-        &self,
-        head: &Head,
-        base: &Base,
-    ) -> Result<broca_core::RecordedRequest, ForkError> {
+    async fn rebuild_base(&self, head: &Head, base: &Base) -> Result<Rebuilt, ForkError> {
         let request = self.rebuild(head, &base.run_id, base.step_id).await?;
-        if request.request_body_sha256 != base.request_body_sha256 {
+        if request.request.request_body_sha256 != base.request_body_sha256 {
             return Err(ForkError::BaseUnavailable(
                 "the head's recorded request is not the fork's base".into(),
             ));
@@ -462,11 +486,13 @@ impl ForkManager {
         let Some(prepared) = &base.prepared_sha256 else {
             return Ok(request);
         };
-        let answered = self.answered(head, &base.run_id, base.step_id).await?;
-        if &answered.request_body_sha256 != prepared {
+        let answered = self
+            .answered(head, &base.run_id, base.step_id, request.media)
+            .await?;
+        if &answered.request.request_body_sha256 != prepared {
             return Err(ForkError::BaseUnavailable(format!(
                 "the head's request and answer rebuild to {}, not the fork's base {prepared}",
-                answered.request_body_sha256
+                answered.request.request_body_sha256
             )));
         }
         Ok(answered)
@@ -479,12 +505,12 @@ impl ForkManager {
         head: &Head,
         run_id: &str,
         step: u64,
-    ) -> Result<broca_core::RecordedRequest, ForkError> {
+        media: Option<ForkMedia>,
+    ) -> Result<Rebuilt, ForkError> {
         let mut answered = self
-            .rebuild_through(head, run_id, step, Through::Answer)
+            .rebuild_through(head, run_id, step, Through::Answer, media)
             .await?;
-        answered.request_body_sha256 =
-            render_digest(&answered.config, &answered.opts).map_err(ForkError::BaseUnavailable)?;
+        answered.request.request_body_sha256 = answered.digest()?;
         Ok(answered)
     }
 
@@ -494,11 +520,14 @@ impl ForkManager {
         run_id: &str,
         step: u64,
         through: Through,
-    ) -> Result<broca_core::RecordedRequest, ForkError> {
-        let request = crate::store_actor::recorded_warm::recorded_request(
+        media: Option<ForkMedia>,
+    ) -> Result<Rebuilt, ForkError> {
+        let reader = || self.runtime.class_backend(head.class);
+        let parts = self.parts(head);
+        let replay = crate::store_actor::recorded_warm::recorded_request(
             &**head.view,
-            Some(self.runtime.class_backend(head.class)),
-            self.parts(head),
+            Some(reader()),
+            parts,
             &head.key,
             run_id,
             Some(step),
@@ -506,18 +535,37 @@ impl ForkManager {
         )
         .await
         .map_err(ForkError::BaseUnavailable)?;
-        // Rendering media needs the head's media delivery, which only its actor holds.
-        if request
-            .opts
-            .prompt
-            .iter()
-            .any(|message| !broca_session_store::session::message_media(message).is_empty())
-        {
-            return Err(ForkError::Unsupported(
-                "the head's last request holds media".into(),
-            ));
-        }
-        Ok(request)
+        let media = if let Some(media) = media {
+            Some(media)
+        } else if let Some(media) = replay.media {
+            // An ask can follow more head steps. Fold only to the base's attempt so newer
+            // steps cannot age its images or change the media limits it rendered with.
+            let history = head
+                .view
+                .stored_records(reader())
+                .media_history(media.before_attempt)
+                .await
+                .map_err(|error| {
+                    ForkError::BaseUnavailable(format!("read the head's media history: {error:?}"))
+                })?;
+            let index = crate::store_media::SessionIndex::from_history(
+                &**head.view,
+                reader(),
+                history,
+                media.before_attempt,
+                parts,
+            );
+            Some(ForkMedia {
+                delivery: index.for_run(),
+                render_tags: media.render_tags,
+            })
+        } else {
+            None
+        };
+        Ok(Rebuilt {
+            request: replay.request,
+            media,
+        })
     }
 
     /// The fork `fork_id` of `head`, open under its lease; `None` when there is none. A fork
@@ -677,17 +725,6 @@ fn head_of(key: &BindIdentity, fork_id: &str) -> BindIdentity {
     )
 }
 
-/// The digest of `opts` rendered by the wire family `config` froze, as the store actor learns a
-/// warm's digest before the executor sends it.
-fn render_digest(
-    config: &broca_records::record::RunConfig,
-    opts: &broca_protocol::request::CallOptions,
-) -> Result<String, String> {
-    Ok(broca_core::render::request_digest_hex(&render(
-        config, opts,
-    )?))
-}
-
 /// `opts` rendered by the wire family `config` froze.
 pub(crate) fn render(
     config: &broca_records::record::RunConfig,
@@ -790,7 +827,7 @@ impl ForkManager {
                 "the head has no served model request".into(),
             ));
         };
-        let request = self.rebuild(&read, &run_id, step_id).await?;
+        let Rebuilt { request, media } = self.rebuild(&read, &run_id, step_id).await?;
         // The answer to that request follows it when it finished asking for no tool call:
         // providers refuse a tool call without its result, and an answer cut off, failed or
         // still streaming isn't one the head's next request carries as it is.
@@ -803,8 +840,9 @@ impl ForkManager {
         });
         let prepared_sha256 = if answer_finished {
             Some(
-                self.answered(&read, &run_id, step_id)
+                self.answered(&read, &run_id, step_id, media)
                     .await?
+                    .request
                     .request_body_sha256,
             )
         } else {
@@ -930,7 +968,10 @@ impl ForkManager {
             .head(head)
             .await?
             .ok_or_else(|| ForkError::BaseUnavailable("the head is gone".into()))?;
-        let rebuilt = self.rebuild_base(&read, &base).await?;
+        let Rebuilt {
+            request: rebuilt,
+            media,
+        } = self.rebuild_base(&read, &base).await?;
         drop(read);
         let applied = hint
             .as_deref()
@@ -1009,6 +1050,7 @@ impl ForkManager {
             attempt,
             run_id: admission_id.clone(),
             base: Box::new(rebuilt),
+            media,
             request: call,
             admission_id: admission_id.clone(),
             conversation_key,

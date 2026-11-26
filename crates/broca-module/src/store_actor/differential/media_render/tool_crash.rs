@@ -128,7 +128,7 @@ async fn a_crash_while_a_planned_tool_call_runs_is_recovered_alike(cipher: Ciphe
         side.sent = Sent::default();
         side.side.registry = registry(
             &side.side.dir,
-            store,
+            None,
             vec![text_step("b1", "after")],
             None,
             &side.sent,
