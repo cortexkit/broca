@@ -295,6 +295,57 @@ fn outcomes(page: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+#[tokio::test]
+async fn length_cut_calls_list_as_not_executed_with_results_and_no_dispatch() {
+    for cut_count in [1, 3] {
+        let mut steps = Vec::new();
+        for index in 0..cut_count {
+            let id = format!("cut-{index}");
+            let mut calls = vec![(id.as_str(), json!({}))];
+            if cut_count == 1 {
+                calls.push(("complete-sibling", json!({"n": 1})));
+            }
+            let mut step = reads_with(&format!("a{index}"), &calls);
+            let Some(NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. })) =
+                step.last_mut()
+            else {
+                panic!("the scripted step has no finish");
+            };
+            *finish_reason = FinishReason::Length;
+            step.insert(
+                0,
+                NormalizedEvent::Control(ProviderControl::ToolArgsTrailingGarbage {
+                    cut: broca_protocol::provider::ToolArgsTrailingGarbage {
+                        tool_call_id: ToolCallId(id),
+                        tool_name: "read".into(),
+                        json_bytes: 0,
+                        whitespace_bytes: 0,
+                        omitted_tool_calls: 0,
+                    },
+                }),
+            );
+            steps.push(step);
+        }
+        steps.push(text_step("last", "done"));
+        let store = side(steps, None, Cipher::None).await;
+        store.send("r1", "first").await;
+        store.idle().await;
+
+        let page = store.calls("r1", None, None).await.unwrap();
+        assert_eq!(page.calls.len(), if cut_count == 1 { 2 } else { 3 });
+        for (index, call) in page.calls.iter().take(cut_count).enumerate() {
+            assert_eq!(call.tool_call_id, format!("cut-{index}"));
+            assert_eq!(call.outcome, "not_executed");
+            assert!(call.dispatched_to.is_none());
+            assert!(call.result_bytes.is_some_and(|bytes| bytes > 0));
+        }
+        if cut_count == 1 {
+            assert_eq!(page.calls[1].tool_call_id, "complete-sibling");
+            assert_eq!(page.calls[1].outcome, "succeeded");
+        }
+    }
+}
+
 /// Two finished runs: the first made three calls over two batches, the second none. Each run's
 /// calls, a page at a time and whole, read alike; so does a run id no run carries. A cursor one
 /// storage returned is refused by the other, naming `after`.

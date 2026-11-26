@@ -9,8 +9,9 @@
 //! - **A dispatch intent:** the first copy of the call's id with no intent and no outcome takes
 //!   the intent's arguments (the call's own input when the intent stored none), its module and
 //!   its key.
-//! - **An outcome:** a call never dispatched (`NotDispatched`) is refused, and carries no result
-//!   size. Any other outcome is read with its reply, and carries the size of the stored result.
+//! - **An outcome:** a call whose arguments were cut at the output limit is not executed, and
+//!   carries the size of its synthetic result. Other `NotDispatched` calls are refused and carry
+//!   no result size. Any other outcome carries the size of the stored result.
 //!   A call with no key yet takes the key the outcome recorded.
 //! - **The batch's end:** every call of the batch is listed, its results at the next ordinal. A
 //!   call with an intent and no outcome is indeterminate; one with neither isn't listed.
@@ -28,6 +29,7 @@ use broca_session_store::backend::SessionBackend;
 use broca_session_store::idindex::IdKind;
 use broca_session_store::record::{CallOutcome, Record, ToolReply};
 use broca_session_store::session::{Session, SessionError};
+use cortexkit_role_llm_runner::errors::tool_result_reasons::ARGUMENTS_INCOMPLETE;
 use cortexkit_role_llm_runner::tool_calls::{
     outcomes, RunToolCall, ToolCallsPage, ToolCallsRequest,
 };
@@ -162,6 +164,17 @@ struct Builder {
     call: RunToolCall,
     has_intent: bool,
     terminal: bool,
+}
+
+fn result_bytes(reply: &ToolReply) -> Result<u64, ServeError> {
+    serde_json::to_vec(&reply.result)
+        .map(|bytes| bytes.len() as u64)
+        .map_err(|error| {
+            ServeError::Open(
+                format!("could not encode stored tool result size: {error}"),
+                None,
+            )
+        })
 }
 
 /// The run's listed calls, from `records`: the run's records from its start, or, `seeded`, the
@@ -307,7 +320,12 @@ fn walk(
                         if call.call.call_key.is_none() {
                             call.call.call_key = outcome.call_key.clone();
                         }
-                        call.call.outcome = outcomes::REFUSED.into();
+                        if outcome.reason.as_deref() == Some(ARGUMENTS_INCOMPLETE) {
+                            call.call.result_bytes = Some(result_bytes(replied)?);
+                            call.call.outcome = outcomes::NOT_EXECUTED.into();
+                        } else {
+                            call.call.outcome = outcomes::REFUSED.into();
+                        }
                         // The results' ordinal follows the message's, set when it is listed.
                         call.call.result_ordinal = Some(0);
                         call.terminal = true;
@@ -334,16 +352,7 @@ fn walk(
                         replied.result.is_error,
                     )
                     .into();
-                    call.call.result_bytes = Some(
-                        serde_json::to_vec(&replied.result)
-                            .map_err(|error| {
-                                ServeError::Open(
-                                    format!("could not encode stored tool result size: {error}"),
-                                    None,
-                                )
-                            })?
-                            .len() as u64,
-                    );
+                    call.call.result_bytes = Some(result_bytes(replied)?);
                     call.call.result_ordinal = Some(0);
                     call.terminal = true;
                 }
