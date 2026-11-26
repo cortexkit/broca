@@ -206,6 +206,8 @@ async fn serve() -> Result<(), String> {
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
         launch_nonce: Some(nonce.clone()),
+        module_capabilities: None,
+        resume_token: None,
     };
     let body = serde_json::to_vec(&hello).map_err(|error| error.to_string())?;
     write(&mut stream, control(FrameType::Hello, 1, body)).await?;
