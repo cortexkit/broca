@@ -875,13 +875,14 @@ where
     // A resume that will call the provider again first confirms the provider still renders the
     // run's requests byte for byte. A changed renderer or render config would bust the prompt
     // cache or make the conversation invalid for the provider.
+    let provider_config = crate::repetition::provider_config(&admission.render_config);
     let drift = match resolution {
         _ if cancelling_held || seams.pause_for_auth_at_start.is_some() => None,
         Resolution::Resume | Resolution::ProviderHeld(_) | Resolution::Paused(_) => {
             broca_core::provider_errors::render_identity_error(
                 seams.provider,
                 admission.renderer_version,
-                &admission.render_config,
+                &provider_config,
             )
         }
         Resolution::Idle(_) | Resolution::Interrupted(_) => None,
@@ -907,10 +908,7 @@ where
                         != Some(account)
             })
             && seams.provider.renderer_version() == admission.renderer_version
-            && differs_only_in_persona(
-                &seams.provider.render_config_blob(),
-                &admission.render_config,
-            );
+            && differs_only_in_persona(&seams.provider.render_config_blob(), &provider_config);
         if let Some(error) = &drift {
             // Before any provider call no request depends on the old config, so the run takes
             // the provider's current one; after a call, or when either config can't be read, the

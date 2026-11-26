@@ -274,13 +274,14 @@ impl RepetitionObserver {
         digest.update([u8::from(failed)]);
         digest.update(result_bytes);
         let count = self.consecutive.observe(call, digest.finalize().into());
-        self.with_consecutive_warning(call, result_bytes, failed, count)
+        self.with_consecutive_warning(call, result_bytes, failed, count, WarningRules::Consecutive)
     }
 
     fn observe_result(
         &mut self,
         call: &ToolCall,
         result: &broca_protocol::ToolResult,
+        rules: WarningRules,
     ) -> RepetitionVerdict {
         let count = self.consecutive.observe_result(call, result);
         self.with_consecutive_warning(
@@ -288,6 +289,7 @@ impl RepetitionObserver {
             result_bytes(&result.output).as_ref(),
             result.is_error,
             count,
+            rules,
         )
     }
 
@@ -297,9 +299,10 @@ impl RepetitionObserver {
         result_bytes: &[u8],
         failed: bool,
         count: u32,
+        rules: WarningRules,
     ) -> RepetitionVerdict {
         let previous_rules = self.observe_outcome(call, result_bytes, failed);
-        if count >= 3 {
+        if rules == WarningRules::Consecutive && count >= 3 {
             RepetitionVerdict::IdenticalCalls {
                 tool_name: call.tool_name.clone(),
             }
@@ -385,12 +388,22 @@ impl RepetitionObserver {
     }
 }
 
+/// Which model-facing warnings an episode renders. The counters, including those used to stop
+/// a run, are the same under either choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WarningRules {
+    Legacy,
+    #[default]
+    Consecutive,
+}
+
 /// The episode fold shared by whole-prompt restoration and streamed store reads.
 /// Only the immediately preceding assistant's calls survive a page boundary; no message rows do.
 #[derive(Default)]
 pub struct RepetitionFold {
     observer: RepetitionObserver,
     pending_calls: Option<Vec<ToolCall>>,
+    rules: WarningRules,
 }
 
 /// Content-free continuation of the repetition rules: call identities, result digests and
@@ -408,6 +421,11 @@ pub struct RepetitionCheckpoint {
 pub const REPETITION_RULES_VERSION: u32 = 1;
 
 impl RepetitionFold {
+    pub(crate) fn with_rules(mut self, rules: WarningRules) -> Self {
+        self.rules = rules;
+        self
+    }
+
     pub(crate) fn seeded(checkpoint: &RepetitionCheckpoint) -> Option<Self> {
         if checkpoint.rules_version != REPETITION_RULES_VERSION
             || !checkpoint
@@ -433,6 +451,7 @@ impl RepetitionFold {
                 consecutive: ConsecutiveCalls::seeded(checkpoint),
             },
             pending_calls: None,
+            rules: WarningRules::default(),
         })
     }
 
@@ -494,7 +513,10 @@ impl RepetitionFold {
                 for (index, block) in message.content.iter().enumerate() {
                     if let ContentBlock::ToolResult(result) = block {
                         if let Some(call) = calls.next() {
-                            verdicts.push((index, self.observer.observe_result(call, result)));
+                            verdicts.push((
+                                index,
+                                self.observer.observe_result(call, result, self.rules),
+                            ));
                         }
                     }
                 }

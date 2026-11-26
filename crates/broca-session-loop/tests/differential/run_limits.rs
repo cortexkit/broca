@@ -1,5 +1,9 @@
 use super::*;
 
+tokio::task_local! {
+    pub(super) static CURRENT_REPETITION_RULES: ();
+}
+
 fn tool_step(n: usize, name: &str, reason: FinishReason) -> Vec<NormalizedEvent> {
     // The property is canonical input, not correlation ID or incoming object key order.
     let args = if n.is_multiple_of(2) {
@@ -122,7 +126,9 @@ async fn a_length_cut_settles_only_the_incomplete_call_and_then_continues() {
 
 #[tokio::test]
 async fn the_third_identical_call_adds_one_model_facing_note() {
-    let outcome = new_loop(&repeat("json", 3)).await;
+    let outcome = CURRENT_REPETITION_RULES
+        .scope((), new_loop(&repeat("json", 3)))
+        .await;
     let note = "You called `json` with the same arguments 3 times in a row. Repeating it is unlikely to help. Change your approach: use different arguments or another tool, or answer with what you have.";
     assert!(!serde_json::to_string(&outcome.requests[2])
         .unwrap()
@@ -137,6 +143,58 @@ async fn the_third_identical_call_adds_one_model_facing_note() {
     assert!(!serde_json::to_string(&outcome.records)
         .unwrap()
         .contains(note));
+    assert_eq!(
+        outcome.requests[3].render_episodes[0].frozen_config["repetition_rules"],
+        json!(2)
+    );
+}
+
+#[tokio::test]
+async fn a_new_run_keeps_old_repetition_guidance_in_its_prefix() {
+    let mut scenario = repeat("read", 3);
+    scenario.steps.extend(repeat("read", 3).steps);
+    for layout in LAYOUTS {
+        let outcome = LAYOUT
+            .scope(
+                layout,
+                CURRENT_REPETITION_RULES.scope(
+                    (),
+                    Box::pin(drive_runs(
+                        scenario.clone(),
+                        &[("old", vec![user("first")]), ("new", vec![user("second")])],
+                        |run_id, admission| {
+                            let config = Arc::make_mut(&mut admission.render_config)
+                                .as_object_mut()
+                                .unwrap();
+                            config.insert("repetition_after_input".into(), json!(true));
+                            if run_id == "old" {
+                                config.remove("repetition_rules");
+                            }
+                        },
+                    )),
+                ),
+            )
+            .await;
+        assert_eq!(outcome.requests.len(), 8);
+
+        const OLD: &str = "read returned exactly the same result 3 times. The information is already available above; use it or change the query rather than asking again.";
+        const NEW: &str = "You called `read` with the same arguments 3 times in a row.";
+        let old_request = &outcome.requests[3];
+        let first_new_request = &outcome.requests[4];
+        let last_new_request = &outcome.requests[7];
+        for request in [old_request, first_new_request, last_new_request] {
+            let prefix = &request.prompt[..old_request.prompt.len()];
+            assert_eq!(prefix, old_request.prompt.as_slice());
+            let text = serde_json::to_string(prefix).unwrap();
+            assert!(text.contains(OLD), "legacy guidance missing: {text}");
+            assert!(!text.contains(NEW));
+        }
+        assert!(
+            serde_json::to_string(&last_new_request.prompt[old_request.prompt.len()..])
+                .unwrap()
+                .contains(NEW)
+        );
+    }
 }
 
 #[tokio::test]
@@ -150,7 +208,9 @@ async fn the_twentieth_identical_call_and_result_is_not_dispatched() {
 
 #[tokio::test]
 async fn a_poll_with_changing_results_can_pass_twenty_identical_calls() {
-    let outcome = new_loop(&repeat("loop_test_poll", 22)).await;
+    let outcome = CURRENT_REPETITION_RULES
+        .scope((), new_loop(&repeat("loop_test_poll", 22)))
+        .await;
     assert_eq!(run_end_reason(&outcome), "completed");
     assert_eq!(named(&outcome, "ToolIntent").len(), 22);
     assert_eq!(outcome.requests.len(), 23);
@@ -162,7 +222,9 @@ async fn a_poll_with_changing_results_can_pass_twenty_identical_calls() {
 #[tokio::test]
 async fn resume_mid_loop_preserves_requests_and_stops_at_the_same_call() {
     let scenario = repeat("json", 20);
-    let source = new_source(&scenario, None, scenario.steps.clone()).await;
+    let source = CURRENT_REPETITION_RULES
+        .scope((), new_source(&scenario, None, scenario.steps.clone()))
+        .await;
     let kept = source
         .records
         .iter()

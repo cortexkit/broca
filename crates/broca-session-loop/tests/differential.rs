@@ -2315,14 +2315,26 @@ impl Scenario {
         input: &[Message],
     ) -> Admission {
         let mut request = self.request_for(run_id, input);
-        broca_session_loop::admit::admission(
+        let mut admission = broca_session_loop::admit::admission(
             &mut request,
             &admission_control(self),
             provider,
             &Default::default(),
             Some(1),
         )
-        .expect("the shared rules admit the run")
+        .expect("the shared rules admit the run");
+        // Keep the recorded replay fixtures on their original warning rules. Tests of current
+        // admission opt in to its frozen marker.
+        if run_limits::CURRENT_REPETITION_RULES
+            .try_with(|()| ())
+            .is_err()
+        {
+            Arc::make_mut(&mut admission.render_config)
+                .as_object_mut()
+                .unwrap()
+                .remove("repetition_rules");
+        }
+        admission
     }
 }
 
@@ -4212,6 +4224,15 @@ async fn compare_runs_in(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
 }
 
 async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)]) {
+    let new = drive_runs(scenario, runs, |_, _| {}).await;
+    pin_outcome("", &new.requests, &new.records, &new.calls, as_rendered);
+}
+
+async fn drive_runs(
+    scenario: Scenario,
+    runs: &[(&str, Vec<Message>)],
+    amend: impl Fn(&str, &mut Admission),
+) -> Outcome {
     // The new loop.
     let backend = MemoryBackend::default();
     let triple = SessionTriple {
@@ -4276,14 +4297,10 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
         account_continue: None,
     };
     for (index, (run_id, input)) in runs.iter().enumerate() {
-        through!(writer, |w| run(
-            w,
-            &mut parts,
-            scenario.admission_for(&provider, run_id, input),
-            &seams,
-        )
-        .await)
-        .expect("the new loop runs");
+        let mut admission = scenario.admission_for(&provider, run_id, input);
+        amend(run_id, &mut admission);
+        through!(writer, |w| run(w, &mut parts, admission, &seams).await)
+            .expect("the new loop runs");
         // A scenario may seal the new loop's ledger between runs, which today's loop never
         // does; the next run must still send the same requests.
         if LEDGER_SEAL_BETWEEN_RUNS
@@ -4340,7 +4357,6 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
             eprintln!("new   {index}: {record}");
         }
     }
-    pin_outcome("", &new.requests, &new.records, &new.calls, as_rendered);
     let _ = NEW_REQUESTS.try_with(|seen| seen.lock().unwrap().extend(new.requests.clone()));
     // Every call as the new loop made it, `last_prompt_view` included.
     let _ = NEW_CALLS.try_with(|seen| {
@@ -4353,6 +4369,7 @@ async fn compare_runs_in_once(scenario: Scenario, runs: &[(&str, Vec<Message>)])
                 .collect(),
         )
     });
+    new
 }
 
 #[tokio::test]

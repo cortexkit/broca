@@ -37,11 +37,12 @@ pub enum SetupParts {
 /// ([`RunStart::render_config`](broca_session_store::record::RunStart::render_config)).
 /// `not_object` names a config member, or a render config half, that isn't a JSON object.
 ///
-/// The inverse conversion (`today.rs`) rebuilds the record from this, and the serve executor
-/// rebuilds the config a new run's admission reads (`run_config_of_start`), so both read a run's
-/// start the same way. The config's parts come first (its tools, then the response format every
-/// run config has, then its global system text and render config), then the manifest's. So a
-/// tools part before the response format is the config's, and one after it is the manifest's.
+/// The serve executor rebuilds the config a new run's admission reads (`run_config_of_start`)
+/// from this. The provider config excludes the loop's repetition rules, which are read separately
+/// from the episode's render-config part. The config's parts come first (its tools, then the
+/// response format every run config has, then its global system text and render config), then the
+/// manifest's. A tools part before the response format is the config's; one after it is the
+/// manifest's.
 pub fn run_config_members<E>(
     start: &broca_session_store::record::RunStart,
     wanted: SetupParts,
@@ -109,6 +110,7 @@ pub fn run_config_members<E>(
                 .render_config(std::sync::Arc::new(value))
                 .map(std::sync::Arc::unwrap_or_clone)
                 .map_err(|_| not_object())?;
+            crate::repetition::remove_warning_rules(&mut value);
         }
         match member {
             Some(member) => {

@@ -469,6 +469,7 @@ impl Kept {
         let Some(at) = run else {
             return Ok(());
         };
+        let rules = || crate::repetition::warning_rules(&episodes[at]);
         if let Some(starts) = corrected {
             let Some(first_answer) = starts[at] else {
                 return Ok(());
@@ -484,7 +485,7 @@ impl Kept {
                     let seed = serde_json::from_value(seed.clone()).map_err(|error| {
                         LoopError::Parts(format!("stored repetition counters: {error}"))
                     })?;
-                    let guidance = RepetitionGuidance::seeded(&seed).ok_or_else(|| {
+                    let guidance = RepetitionGuidance::seeded(&seed, rules()).ok_or_else(|| {
                         LoopError::Parts(
                             "stored repetition counters were taken under other warning rules"
                                 .into(),
@@ -496,7 +497,7 @@ impl Kept {
             };
         }
         if matches!(self.guidance, RunGuidance::Waiting) && message.role == Role::Assistant {
-            self.guidance = RunGuidance::Counting(Box::default());
+            self.guidance = RunGuidance::Counting(Box::new(RepetitionGuidance::new(rules())));
         }
         if let RunGuidance::Counting(guidance) = &mut self.guidance {
             guidance.guide(message);

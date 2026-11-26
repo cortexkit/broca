@@ -55,7 +55,9 @@ pub fn admission<P: Provider>(
         generation: request.generation,
         response_format: Arc::new(request.response_format),
         provider_options: request.provider_options,
-        render_config: Arc::new(provider.render_config_blob()),
+        render_config: Arc::new(crate::repetition::freeze_warning_rules(
+            provider.render_config_blob(),
+        )),
         renderer_version: provider.renderer_version(),
         stop_when: request.stop_when,
         on_restart: req.on_restart,

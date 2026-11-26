@@ -1,6 +1,6 @@
 //! Repetition guidance reconstructed from raw tool results without changing durable history.
 
-use crate::tool_repetition::{RepetitionFold, RepetitionObserver};
+use crate::tool_repetition::{RepetitionFold, RepetitionObserver, WarningRules};
 use broca_protocol::{ContentBlock, Message, ToolOutput, ToolResult};
 
 pub(crate) fn append_repetition_guidance(result: &mut ToolResult, guidance: &str) {
@@ -33,8 +33,8 @@ pub(crate) fn append_repetition_guidance(result: &mut ToolResult, guidance: &str
 /// contain raw, undecorated tool outputs: applying this fold twice would duplicate warnings.
 /// Offline renderers use this same fold so their reconstructed inputs receive exactly the
 /// decoration the run loop sends to the provider.
-pub fn restore_repetition_guidance(prompt: &mut [Message]) {
-    restore_guidance_with_originals(prompt, 0, None);
+pub fn restore_repetition_guidance(prompt: &mut [Message], rules: WarningRules) {
+    restore_guidance_with_originals(prompt, 0, None, rules);
 }
 
 /// [`restore_repetition_guidance`] for a run whose earlier steps aren't in `prompt`: counting
@@ -44,8 +44,9 @@ pub fn restore_repetition_guidance(prompt: &mut [Message]) {
 pub fn restore_repetition_guidance_seeded(
     prompt: &mut [Message],
     seed: &crate::tool_repetition::RepetitionCheckpoint,
+    rules: WarningRules,
 ) -> bool {
-    let Some(mut guidance) = RepetitionGuidance::seeded(seed) else {
+    let Some(mut guidance) = RepetitionGuidance::seeded(seed, rules) else {
         return false;
     };
     for message in prompt.iter_mut() {
@@ -59,22 +60,19 @@ pub fn restore_repetition_guidance_seeded(
 /// one by one, in order, gives each the warnings the whole-slice fold gives it.
 pub struct RepetitionGuidance(RepetitionFold);
 
-impl Default for RepetitionGuidance {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RepetitionGuidance {
     /// Fresh counters, for a run's first model-step message.
-    pub fn new() -> Self {
-        Self(RepetitionFold::default())
+    pub fn new(rules: WarningRules) -> Self {
+        Self(RepetitionFold::default().with_rules(rules))
     }
 
     /// Counters continuing from `seed`, as [`restore_repetition_guidance_seeded`] starts. `None`
     /// when the checkpoint was taken under other warning rules or doesn't read as one.
-    pub fn seeded(seed: &crate::tool_repetition::RepetitionCheckpoint) -> Option<Self> {
-        RepetitionFold::seeded(seed).map(Self)
+    pub fn seeded(
+        seed: &crate::tool_repetition::RepetitionCheckpoint,
+        rules: WarningRules,
+    ) -> Option<Self> {
+        RepetitionFold::seeded(seed).map(|fold| Self(fold.with_rules(rules)))
     }
 
     /// Counts `message`, raw, then adds to its tool results the warnings due.
@@ -127,8 +125,9 @@ pub(crate) fn restore_guidance_with_originals(
     prompt: &mut [Message],
     base: usize,
     mut originals: Option<&mut crate::compaction::OriginalMessages>,
+    rules: WarningRules,
 ) -> RepetitionObserver {
-    let mut fold = RepetitionFold::default();
+    let mut fold = RepetitionFold::default().with_rules(rules);
     for (index, message) in prompt.iter_mut().enumerate() {
         let verdicts = fold.push(message);
         let original = originals
