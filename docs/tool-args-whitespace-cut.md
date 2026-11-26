@@ -1,15 +1,18 @@
 # Runaway tool arguments
 
-Broca ends a provider step with finish `length` if one tool call's arguments exceed 256,000
-bytes or end in a run of at least 4,096 whitespace characters. The guard checks each delta as
-it arrives and stops reading the attempt; it is not a transport failure or an attempt retry.
+Broca ends a provider step with finish `length` if one tool call's arguments pass 256,000
+bytes while still streaming, before they form a complete JSON value, or end in a run of at
+least 4,096 whitespace characters. The guard checks each delta as it arrives and stops reading
+the attempt; it is not a transport failure or an attempt retry.
 The warning log includes the first and last 200 characters of the offending argument. Treat
 those excerpts as untrusted model output that may contain request text.
 
 The shared guard lives in `broca-provider/src/wire.rs`. Suffix counting inspects only the new
-delta, not the growing argument buffer. Final argument strings also pass the guard. Gemini and
-Google Code Assist deliver structured arguments in a single part, so the size check uses the
-JSON encoding of that part's argument value.
+delta, not the growing argument buffer. An argument that is already complete is never cut for
+size, whatever its length: one delivered whole in a single delta, a provider's final argument
+event, and the structured arguments Gemini and Google Code Assist send in a single part. The
+size cut exists to stop a model that keeps writing, and a complete value has stopped. Final
+argument strings still pass the whitespace check.
 
 An unfinished call gets a normal not-run result with reason `arguments_incomplete`; its
 partial arguments aren't saved or sent to the model. Complete sibling calls can still run.
