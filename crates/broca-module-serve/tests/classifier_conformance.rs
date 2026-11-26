@@ -1317,10 +1317,11 @@ async fn scoped_real_classifier_route_exports_paid_items_once_across_resends() {
     for (index, json) in facts.iter().enumerate() {
         let fact: Value = serde_json::from_str(json).unwrap();
         assert_eq!(fact["item_index"], index);
+        assert_eq!(fact["agent_id"], "classifier-agent");
         assert_eq!(fact["run_id"], "classifier-run");
+        assert!(fact.get("flow_id").is_none());
         assert_eq!(fact["usage"]["input_tokens"], 100);
         assert!(fact["usage"].get("output_tokens").is_none());
-        assert!(fact.get("agent_id").is_none() && fact.get("flow_id").is_none());
     }
     assert!(matches!(
         route.request("classify.run", &params).await.unwrap(),
