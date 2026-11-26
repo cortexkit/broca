@@ -1,0 +1,7 @@
+{
+  "requires_core": "SET_PUBLIC_CORE_VERSION_BEFORE_RELEASE",
+  "windows": {
+    "status": "release incomplete",
+    "native_suite_passed": false
+  }
+}

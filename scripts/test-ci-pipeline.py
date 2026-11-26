@@ -1156,13 +1156,13 @@ class WorkflowGraph(unittest.TestCase):
             self.assertEqual(env['FAKE_SURFACE_BIN'],
                              env['FAKE_AFT_STUB_BIN'].replace('fake-aft-stub', 'fake-surface'))
 
-    def test_release_requires_only_ci(self):
-        release = (ROOT / 'scripts/release.sh').read_text()
+    def test_public_release_gate_requires_only_push_ci(self):
+        release = (ROOT / 'scripts/release-ci-gate.sh').read_text()
         calls = [shlex.split(line) for line in release.splitlines()
-                 if line.startswith('bash scripts/ci-status.sh ')]
+                 if 'bash scripts/ci-status.sh ' in line]
         self.assertEqual(len(calls), 1)
-        required = calls[0][3:calls[0].index('||')]
-        self.assertEqual(required, ['--event', 'push', '--only', 'CI'])
+        self.assertEqual(calls[0], ['GH_REPO=cortexkit/broca', 'bash', 'scripts/ci-status.sh',
+                                    '$sha', '--event', 'push', '--only', 'CI'])
 
     def test_required_status_refuses_failed_skipped_cancelled_or_empty_lanes(self):
         job = self.workflow('ci.yml')['jobs']['test']
