@@ -404,6 +404,7 @@ pub fn broca_role_describe_with_writers(
     // max_output_tokens group across all of its model routes.
     let mut capabilities = [
         "transcript_reads",
+        cortexkit_role_llm_runner::capabilities::SERVES,
         cortexkit_role_llm_runner::capabilities::HOST_HISTORY,
         cortexkit_role_llm_runner::capabilities::HISTORY_DISPLAY,
         cortexkit_role_llm_runner::capabilities::RICH_UI_STAMP,
@@ -1570,7 +1571,7 @@ mod pinned_reply_bytes {
         assert_golden(
             broca_role_describe("0.0.0-reader-golden"),
             "role_describe_reader.json",
-            "338a911f4d92dd0ebe2131a7e4cbd03798131b71ff579daa3c0bc407c462d41b",
+            "0ed12a9d04922952f23c7d18008698de2453e2e4b5b55fde01fd2a2395b44758",
         );
     }
 
@@ -1770,7 +1771,7 @@ mod pinned_reply_bytes {
     const SEND_REPLY_PENDING_SHA256: &str =
         "64757351eb175035f70b80cb349f0ecc17f83549bd912d17a739a5351f628772";
     const ROLE_DESCRIBE_SHA256: &str =
-        "6adbe2f178d85bb257eccaba637bbd4eb20fc87fc5f233e6f7222a46947b7110";
+        "39fbc7fe630d8c3e5d5aed7e477ce1d1f6361d4329077f9a8ae75dc3b705e4e4";
     const RUN_TOOL_CALLS_PAGE_SHA256: &str =
         "6978763bd48c30edffbf61a4b4a0966d7efdfc146b94023f4a36cca4bda0881d";
     const DELIVERED_STEP_SHA256: &str =

@@ -2936,6 +2936,14 @@ fn place_cache_once(fields: &mut Map<String, Value>, first: bool, planned: bool)
 
 #[async_trait]
 impl LlmRunnerSubject for BrocaSubject {
+    fn serves_harnesses(&self) -> Option<Vec<String>> {
+        Some(
+            broca_module_serve::manifest::BROCA_HARNESSES
+                .map(String::from)
+                .to_vec(),
+        )
+    }
+
     async fn step_event_observation(
         &self,
         handle: &Live,
@@ -3329,6 +3337,7 @@ impl LlmRunnerSubject for BrocaSubject {
     fn capabilities(&self) -> BTreeSet<Capability> {
         let mut capabilities: BTreeSet<_> = [
             Capability::TranscriptReads,
+            Capability::Serves,
             Capability::HostHistory,
             Capability::HistoryDisplay,
             Capability::RunOps,
@@ -7476,6 +7485,17 @@ async fn conformance_subject_always_declares_attachments() {
     assert!(subject.image_tool_result("old-image-rule").is_some());
     assert!(subject.capabilities().contains(&Capability::MessageMarks));
     assert!(subject.capabilities().contains(&Capability::MediaRefs));
+}
+
+#[tokio::test]
+async fn conformance_subject_declares_serves_and_both_harnesses() {
+    let root = broca_test_support::scratch_root().join("subject-serves");
+    let subject = BrocaSubject::new(&root).await;
+    assert!(subject.capabilities().contains(&Capability::Serves));
+    assert_eq!(
+        subject.serves_harnesses().unwrap(),
+        ["broca", "broca-uncapped"]
+    );
 }
 
 #[test]

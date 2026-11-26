@@ -15,7 +15,7 @@ const CREDENTIAL_PERSONA_ROUTES: &[(&str, &str, WireFamilyId, &str)] = &[(
 
 /// Meta subscription credentials require the Meta Responses client. This endpoint is
 /// credential policy, including for curated rows that have no models.dev wire metadata.
-pub(crate) fn credential_persona_route(
+pub fn credential_persona_route(
     provider: &str,
     method: &str,
 ) -> Option<(WireFamilyId, &'static str)> {
@@ -25,16 +25,8 @@ pub(crate) fn credential_persona_route(
         .map(|(_, _, family, endpoint)| (*family, *endpoint))
 }
 
-/// Families with a credential-owned endpoint for this method, independent of catalog facts.
-pub fn credential_persona_families(method: &str) -> impl Iterator<Item = WireFamilyId> + '_ {
-    CREDENTIAL_PERSONA_ROUTES
-        .iter()
-        .filter(move |(_, m, _, _)| *m == method)
-        .map(|(_, _, family, _)| *family)
-}
-
-// Keep admission and capability discovery on the same npm/shape authority. Each entry is
-// an exact accepted tuple; an unknown shape must not fall back to another wire grammar.
+// Each entry is an exact accepted tuple; an unknown shape must not fall back to another
+// wire grammar.
 const WIRE_ROUTES: &[(&str, Option<&str>, WireFamilyId)] = &[
     ("@ai-sdk/openai", None, WireFamilyId::OpenAiResponses),
     (
@@ -83,11 +75,6 @@ const WIRE_ROUTES: &[(&str, Option<&str>, WireFamilyId)] = &[
     ),
     ("@ai-sdk/cerebras", None, WireFamilyId::OpenAiChat),
 ];
-
-/// Families reachable through catalog npm/shape facts. Several tuples can share a family.
-pub fn catalog_wire_families() -> impl Iterator<Item = WireFamilyId> {
-    WIRE_ROUTES.iter().map(|(_, _, family)| *family)
-}
 
 /// Translate an upstream SDK package and API shape into a renderer Broca implements.
 /// Package names describe the upstream protocol, not an endpoint or a model alias.

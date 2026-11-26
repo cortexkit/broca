@@ -46,6 +46,9 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::common;
 
+#[path = "wire_serves.rs"]
+mod wire_serves;
+
 // Serialize the only integration test that intentionally drops a stale-route frame with
 // health probes that compare process-wide drop counters.
 static SERVE_FRAME_DROP_COUNTER_TEST_LOCK: tokio::sync::Mutex<()> =
@@ -2611,20 +2614,12 @@ async fn hello_bind_send_status_roundtrip() {
         .runner
         .expect("HELLO declares broca as a runner");
     assert!(runner.follows_account_choice);
-    assert!(!runner.requires_wire_api());
-    assert_eq!(runner.pairs.len(), 13);
+    assert_eq!(runner.harnesses.unwrap(), ["broca", "broca-uncapped"]);
+    assert_eq!(declarations.consumers[0].name, "broca.complete");
     assert_eq!(
-        runner
-            .pairs
-            .iter()
-            .filter(|pair| runner.requires_wire_api_for_pair(pair))
-            .count(),
-        9
+        declarations.consumers[0].defaults.workload.as_deref(),
+        Some("quick")
     );
-    assert!(runner
-        .pairs
-        .iter()
-        .any(|pair| pair.wire_api == "google.code_assist" && pair.auth_method == "antigravity"));
     assert_eq!(
         body.control_ops,
         Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()])

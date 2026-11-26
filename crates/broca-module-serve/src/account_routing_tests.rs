@@ -1012,6 +1012,30 @@ fn a_key_belongs_to_providers_by_routing_rule() {
     assert!(!key_belongs_to(&key(&[], &[]), "anthropic", &catalog));
 }
 
+#[test]
+fn an_openai_platform_key_is_not_offered_for_the_chatgpt_pool() {
+    let mut key = row("apikey:openai:fixture", None, "openai-platform", "apikey");
+    key.serves = vec!["openai".into()];
+    let chatgpt = row(
+        "chatgpt:fixture",
+        Some("chatgpt-account"),
+        "openai",
+        "chatgpt",
+    );
+    let rows = listing(vec![key, chatgpt]);
+    let catalog = |provider: &str| provider == "openai";
+
+    let platform = Candidates::api_keys(&rows, "openai-platform", &catalog);
+    assert_eq!(platform.accounts.len(), 1);
+    assert!(platform.offers("apikey:openai:fixture", "apikey:openai:fixture"));
+    assert!(Candidates::api_keys(&rows, "openai", &catalog)
+        .accounts
+        .is_empty());
+    let subscription = Candidates::from_listing(&rows, AuthMethod::Chatgpt, "openai");
+    assert_eq!(subscription.accounts.len(), 1);
+    assert!(subscription.offers("chatgpt-account", "chatgpt:fixture"));
+}
+
 fn api_key_router(method: &str, credential_id: &str) -> Arc<FakeRouting> {
     FakeRouting::answering(Ok(Ok(serde_json::to_vec(&json!({"result":{
         "account":{"account_id":credential_id,"credential_id":credential_id,"method":method}

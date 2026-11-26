@@ -164,6 +164,105 @@ async fn a_pool_key_run_borrows_anthropic_rows_and_renders_the_same_request() {
     assert_eq!(config.billed_provider(), "anthropic", "its spend names the rows it borrowed");
 }
 
+#[derive(Default)]
+struct OpenAiPlatformRouting(Mutex<Vec<serde_json::Value>>);
+
+#[async_trait::async_trait]
+impl broca_module_serve::account_routing::RoutingTransport for OpenAiPlatformRouting {
+    async fn request(&self, body: Vec<u8>) -> broca_module_serve::account_routing::RoutingReply {
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if request["method"] != "route.account_for" {
+            return Ok(Ok(br#"{"result":{}}"#.to_vec()));
+        }
+        self.0.lock().unwrap().push(request);
+        Ok(Ok(br#"{"result":{"account":{"provider":"openai-platform","account_id":"apikey:openai:fixture-b","credential_id":"apikey:openai:fixture-b","method":"apikey"}}}"#.to_vec()))
+    }
+}
+
+/// The account route selects keys from `openai-platform`; both `openai` and `openai-platform`
+/// model handles render and bill against the `openai` catalog row.
+#[tokio::test]
+async fn openai_platform_account_route_uses_openai_wire_and_rates() {
+    use broca_module_serve::account_routing::{ListingCache, RoutingClient};
+    use serde_json::json;
+
+    if !run_catalog_drift_child("openai_platform_account_route_uses_openai_wire_and_rates") {
+        return;
+    }
+    let _catalog = install_queued_ultrafast_catalog();
+    let root = fresh_vault_root("openai-platform-account-route");
+    let http = resume_http_fixture().await;
+    let vault = CapturingVaultDaemon::start(&root).await;
+    let routing = Arc::new(OpenAiPlatformRouting::default());
+    let pool = Arc::new(ListingCache::default());
+    let keys = ["apikey:openai", "apikey:openai:fixture-b", "apikey:openai:fixture-c", "apikey:openai:fixture-d"];
+    pool.store(broca_subc::vault::ScopedList {
+        credentials: keys.iter().map(|id| serde_json::from_value(json!({
+            "id": id, "type": "apikey", "categories": ["llm-provider"], "state": "active",
+            "record_version": 1, "operations": ["read"], "auth_method": "apikey",
+            "provider_ids": ["openai-platform"], "serves": ["openai"],
+            "fusiform_provider_id": "openai",
+        })).unwrap()).collect(),
+        grants: 1, grant_tuples: vec![], view: "fixture".into(),
+    });
+    let executor = executor_with_vault_addressing(
+        &root, &vault, Duration::from_secs(2), pool, supervised_broca_identity(),
+    ).await.with_routing(Arc::new(RoutingClient::new(routing.clone(), Default::default())))
+      .with_provider_overrides(broca_module_serve::provider_overrides::ProviderOverrides::parse(
+          &json!({"providers":{"openai":{"base_url":http.url}}}).to_string(),
+      ).unwrap());
+
+    for provider in ["openai", "openai-platform"] {
+        let mut req = drift_request(&root);
+        let run_id = broca_protocol::RunId(format!("run-{provider}"));
+        req.run_id = run_id.clone();
+        req.model = broca_protocol::request::ModelHandle::new(provider, "test-standard-only");
+        req.account_route = Some(broca_protocol::request::AccountRoute::new("openai-platform", "test-standard-only"));
+        req.generation.max_output_tokens = Some(1024);
+        req.input = vec![broca_protocol::Message::new(broca_protocol::Role::User,
+            vec![broca_protocol::ContentBlock::Text { text: "hello".into() }])];
+        let bind = req.session.clone();
+        let mut session = store_session().await;
+        let parts = broca_session_loop::parts::SharedParts::new(Box::new(
+            broca_session_loop::parts::MemoryParts::default(),
+        ));
+        let end = serve_store_run_with_control(&executor, &mut session, &parts, req,
+            broca_module::executor::StoreRunMode::Fresh, Default::default(), Some(broca_protocol::AuthRequest {
+                method: "apikey".into(), account: None, pool: None, credential_id: None,
+            })).await;
+        assert_eq!(end.result.unwrap().reason, RunFinishReason::Completed, "{provider}");
+        let (records, _) = broca_session_loop::billing::run_billing_inputs(&session, &run_id.0, &bind, &parts).await.unwrap();
+        let segments = broca_core::billing::compute_segments_for_run(&records, &run_id, "instance",
+            &broca_module_serve::ChargeBasisTable::shipped_defaults());
+        let [spend] = segments.as_slice() else { panic!("expected one billed spend segment") };
+        assert_eq!(spend.resolved_credential_id.as_deref(), Some("apikey:openai:fixture-b"));
+        assert_eq!(spend.charge_basis, broca_core::ChargeBasis::MeteredApi);
+        assert_eq!((&*spend.provider, &*spend.model), ("openai", "test-standard-only"));
+        let prices = broca_catalog::catalog().unwrap()
+            .warm_cost_schedule(&spend.provider, &spend.model).unwrap();
+        assert_eq!((prices.input, prices.output), (Some(1.0), Some(2.0)));
+    }
+
+    let requests = routing.0.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        let params = &request["params"];
+        assert_eq!(params["provider"], "openai-platform");
+        let offered: Vec<_> = params["candidates"]["accounts"].as_array().unwrap().iter()
+            .map(|account| account["credential_id"].as_str().unwrap()).collect();
+        assert_eq!(offered, keys);
+    }
+    let requests = http.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(request.headers.lines().next().unwrap().contains("/v1/chat/completions "));
+        assert!(request.headers.to_lowercase().contains("authorization: bearer "));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "test-standard-only");
+    }
+    vault.assert_healthy();
+}
+
 /// A send on the paid-key pool route that names a reasoning variant sends it: the borrowed rows'
 /// reasoning options resolve it as they do for the same send on `anthropic`.
 #[tokio::test]

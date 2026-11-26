@@ -965,10 +965,7 @@ impl Candidates {
             .credentials
             .iter()
             .filter(|row| {
-                row.state == "active"
-                    && row.operations.iter().any(|op| op == "read")
-                    && row.auth_method.as_deref() == Some(AuthMethod::Gateway.as_token())
-                    && row.provider_ids.iter().any(|id| id == provider)
+                is_readable_gateway(row) && row.provider_ids.iter().any(|id| id == provider)
             })
             .map(|row| Candidate {
                 account_id: row.account_id.clone().unwrap_or_else(|| row.id.clone()),
@@ -1052,6 +1049,12 @@ impl Candidates {
             candidate.credential_id == credential_id && candidate.account_id == account_id
         })
     }
+}
+
+pub(crate) fn is_readable_gateway(row: &ScopedCredential) -> bool {
+    row.state == "active"
+        && row.operations.iter().any(|op| op == "read")
+        && row.auth_method.as_deref() == Some(AuthMethod::Gateway.as_token())
 }
 
 /// Which account-selection metadata a listed credential lacks, or `None` when it has both

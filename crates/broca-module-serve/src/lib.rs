@@ -46,6 +46,8 @@ pub mod routing_capabilities;
 mod scope_workdir;
 pub mod send_audit;
 pub mod serve;
+#[doc(hidden)]
+pub mod serves;
 mod session_address_health;
 pub mod session_class;
 mod session_inventory;

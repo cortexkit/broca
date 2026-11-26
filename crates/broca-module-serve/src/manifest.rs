@@ -7,10 +7,8 @@
 
 use crate::catalog_refresh::CATALOG_POLL_INTERVAL;
 use crate::consumer_routes::ConsumerRoutes;
-use broca_catalog::live::WireFamilyId;
 use cortexkit_role_routing::declarations::{
     ConsumerDeclaration, ConsumerDeclarations, DemandDefaults, HarnessLimits, RunnerDeclaration,
-    RunnerPair,
 };
 use cortexkit_role_routing::placement::HarnessCapability;
 use std::collections::BTreeMap;
@@ -476,108 +474,23 @@ pub(crate) fn observability_surfaces() -> Vec<ObservabilitySurface> {
     }]
 }
 
-struct RoutingRunnerPair {
-    pair: RunnerPair,
-    opens_through_catalog_endpoint: bool,
-}
-
-fn routing_wire_api(family: WireFamilyId) -> &'static str {
-    match family {
-        WireFamilyId::AnthropicMessages => "anthropic.messages",
-        WireFamilyId::OpenAiResponses => "openai.responses",
-        WireFamilyId::OpenAiChat => "openai.chat_completions",
-        WireFamilyId::OpenAiResponsesChatgpt => "openai.chatgpt_responses",
-        WireFamilyId::Gemini => "google.generate_content",
-        WireFamilyId::GoogleCodeAssist => "google.code_assist",
-        WireFamilyId::BedrockConverse => "aws.bedrock_converse",
-    }
-}
-
-fn routing_runner_pairs() -> Vec<RoutingRunnerPair> {
-    let mut pairs = BTreeMap::new();
-    for method in crate::auth_routing::DEFAULT_METHOD_ORDER {
-        // The vault's gateways serve Anthropic's Messages API only, at an address the
-        // credential holds, so the pair never needs the catalog's endpoint.
-        if method == crate::AuthMethod::Gateway {
-            pairs.insert(
-                (
-                    routing_wire_api(WireFamilyId::AnthropicMessages),
-                    method.as_token(),
-                ),
-                false,
-            );
-            continue;
-        }
-        let mut insert = |family, catalog_endpoint| {
-            pairs
-                .entry((routing_wire_api(family), method.as_token()))
-                .and_modify(|all_catalog: &mut bool| *all_catalog &= catalog_endpoint)
-                .or_insert(catalog_endpoint);
-        };
-        if let Some(family) = crate::auth_routing::family_for_method(method) {
-            insert(family, false);
-        } else {
-            for family in broca_catalog::family::catalog_wire_families() {
-                insert(family, true);
-            }
-        }
-        // A family shared with a credential persona cannot require a catalog endpoint:
-        // routing's pair union must admit every provider broca can open through that pair.
-        for family in broca_catalog::family::credential_persona_families(method.as_token()) {
-            insert(family, false);
-        }
-    }
-    pairs
-        .into_iter()
-        .map(
-            |((wire_api, auth_method), opens_through_catalog_endpoint)| RoutingRunnerPair {
-                pair: RunnerPair::new(wire_api, auth_method),
-                opens_through_catalog_endpoint,
-            },
-        )
-        .collect()
-}
-
 fn routing_declarations() -> ConsumerDeclarations {
-    let pairs: Vec<RunnerPair> = routing_runner_pairs()
-        .into_iter()
-        .map(|pair| {
-            pair.pair
-                .with_requires_wire_api(pair.opens_through_catalog_endpoint)
-        })
-        .collect();
-    // Routing places a task on a runner by the harness it names, and a harness may narrow the
-    // runner's pairs and carry its own capabilities. The ChatGPT backend refuses
-    // max_output_tokens, so its pairs sit under a second harness that doesn't promise
-    // output_cap: a task with an output cap then never lands there, and uncapped work still
-    // does. A pair names only its identity here; its endpoint requirement stays on the
-    // runner's pair. A worker's structured result is taken on every route in both modes,
-    // through a submit tool or as the final text: where a provider can't enforce the schema,
-    // broca still checks the result against it when the run ends.
-    let (uncapped, capped): (Vec<RunnerPair>, Vec<RunnerPair>) = pairs
-        .iter()
-        .map(|pair| RunnerPair::new(pair.wire_api.clone(), pair.auth_method.clone()))
-        .partition(|pair| pair.wire_api == routing_wire_api(WireFamilyId::OpenAiResponsesChatgpt));
+    // The ChatGPT backend refuses max_output_tokens, so its harness does not promise
+    // output_cap. Routing places it separately using the runner's current serves list.
     let mut capped_capabilities = BROCA_HARNESS_CAPABILITIES.to_vec();
     capped_capabilities.push(HarnessCapability::OutputCap);
-    let mut runner = RunnerDeclaration::new(pairs);
+    let mut runner = RunnerDeclaration::new();
     runner.follows_account_choice = true;
     runner = runner
-        .with_harnesses(vec![BROCA_HARNESS.into(), BROCA_UNCAPPED_HARNESS.into()])
+        .with_harnesses(BROCA_HARNESSES.map(String::from).to_vec())
         .with_harness_limits(BTreeMap::from([
             (
                 BROCA_HARNESS.into(),
-                HarnessLimits::new()
-                    .with_capabilities(capped_capabilities)
-                    .with_pairs(capped)
-                    .with_exclude(excluded_providers()),
+                HarnessLimits::new().with_capabilities(capped_capabilities),
             ),
             (
                 BROCA_UNCAPPED_HARNESS.into(),
-                HarnessLimits::new()
-                    .with_capabilities(BROCA_HARNESS_CAPABILITIES.to_vec())
-                    .with_pairs(uncapped)
-                    .with_exclude(excluded_providers()),
+                HarnessLimits::new().with_capabilities(BROCA_HARNESS_CAPABILITIES.to_vec()),
             ),
         ]));
     runner
@@ -596,24 +509,15 @@ fn routing_declarations() -> ConsumerDeclarations {
     declarations
 }
 
-/// Providers whose models broca never serves, so routing places none of their routes on
-/// [`BROCA_HARNESS`] or [`BROCA_UNCAPPED_HARNESS`]. OpenCode's models run in OpenCode itself,
-/// through Agent Runner: the model catalog carries no request address broca could send them
-/// to, so a pin on broca would only fail at admission.
-const EXCLUDED_PROVIDERS: [&str; 2] = ["opencode", "opencode-go"];
-
-fn excluded_providers() -> Vec<String> {
-    EXCLUDED_PROVIDERS
-        .iter()
-        .map(|&provider| provider.into())
-        .collect()
-}
-
 /// The harness for every route that honors an output cap, which is every route but ChatGPT's.
-const BROCA_HARNESS: &str = "broca";
+pub(crate) const BROCA_HARNESS: &str = "broca";
 
 /// The harness for ChatGPT routes, whose backend refuses an output cap.
-const BROCA_UNCAPPED_HARNESS: &str = "broca-uncapped";
+pub(crate) const BROCA_UNCAPPED_HARNESS: &str = "broca-uncapped";
+
+/// The same programs are named by the routing declaration and the serves conformance check.
+#[doc(hidden)]
+pub const BROCA_HARNESSES: [&str; 2] = [BROCA_HARNESS, BROCA_UNCAPPED_HARNESS];
 
 /// What both of broca's harnesses can do, as routing places tasks by them (routing contract
 /// §16.2). Only [`BROCA_HARNESS`] adds `output_cap`.
@@ -886,89 +790,12 @@ fn provider_declarations() -> subc_protocol::provider_declarations::ProviderDecl
 mod routing_tests {
     use super::*;
     use cortexkit_role_routing::declarations::parse_consumer_declarations_serving;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn runner_pairs_and_endpoint_sources_follow_admission_authorities() {
-        let pairs = routing_runner_pairs();
-        let actual: BTreeSet<_> = pairs
-            .iter()
-            .map(|pair| {
-                (
-                    pair.pair.wire_api.as_str(),
-                    pair.pair.auth_method.as_str(),
-                    pair.opens_through_catalog_endpoint,
-                )
-            })
-            .collect();
-        // auth_routing::family_for_method preserves catalog families for API key/OAuth;
-        // live.rs:1348-1406 opens those through catalog.resolve_route's wire.api, except
-        // credential_persona_route in family.rs, which gives OAuth/Responses its own base.
-        // live.rs:1167-1214 builds BOTH method overrides from family defaults instead:
-        // neither ChatGPT nor Code Assist requires a catalog endpoint.
-        let expected = BTreeSet::from([
-            ("anthropic.messages", "apikey", true),
-            ("anthropic.messages", "oauth", true),
-            ("anthropic.messages", "gateway", false),
-            ("aws.bedrock_converse", "apikey", true),
-            ("aws.bedrock_converse", "oauth", true),
-            ("google.code_assist", "antigravity", false),
-            ("google.generate_content", "apikey", true),
-            ("google.generate_content", "oauth", true),
-            ("openai.chat_completions", "apikey", true),
-            ("openai.chat_completions", "oauth", true),
-            ("openai.chatgpt_responses", "chatgpt", false),
-            ("openai.responses", "apikey", true),
-            ("openai.responses", "oauth", false),
-        ]);
-        assert_eq!(actual, expected);
-        assert_eq!(pairs.len(), expected.len(), "no duplicate pairs");
-        assert!(actual.contains(&("google.code_assist", "antigravity", false)));
-
-        // The contract vocabulary pins the external tokens; WireFamilyId's serde names
-        // are not routing's wire_api spellings.
-        assert_eq!(
-            actual
-                .iter()
-                .map(|(wire, _, _)| *wire)
-                .collect::<BTreeSet<_>>(),
-            cortexkit_role_routing::spellings::WIRE_APIS
-                .iter()
-                .copied()
-                .collect()
-        );
-        let methods: BTreeSet<_> = crate::auth_routing::DEFAULT_METHOD_ORDER
-            .iter()
-            .map(|method| method.as_token())
-            .collect();
-        assert_eq!(
-            methods,
-            BTreeSet::from(["apikey", "oauth", "chatgpt", "antigravity", "gateway"])
-        );
-        for method in methods {
-            assert!(cortexkit_role_routing::spellings::AUTH_METHODS.contains(&method));
-        }
-    }
 
     #[test]
     fn hello_routing_slot_passes_the_whole_slot_parser() {
         let manifest = serde_json::to_value(manifest("broca")).unwrap();
         let slot = &manifest["role_declarations"][cortexkit_role_routing::ROLE_DECLARATIONS_KEY];
         assert_eq!(*slot, serialized_routing_slot());
-        // Samples for routing to check its reader against, written only when asked.
-        if let Some(dir) = std::env::var_os("BROCA_ROUTING_SLOT_SAMPLE_DIR") {
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                std::path::Path::new(&dir).join("routing-runner-slot.json"),
-                serde_json::to_vec(&slot["runner"]).unwrap(),
-            )
-            .unwrap();
-            std::fs::write(
-                std::path::Path::new(&dir).join("routing-slot.json"),
-                serde_json::to_vec(slot).unwrap(),
-            )
-            .unwrap();
-        }
         let parsed = parse_consumer_declarations_serving(
             slot,
             &[cortexkit_role_routing::capabilities::SELECT_WORKLOAD],
@@ -982,38 +809,8 @@ mod routing_tests {
         );
         let runner = parsed.runner.as_ref().expect("broca declares its runner");
         assert!(runner.follows_account_choice);
-        assert!(!runner.requires_wire_api());
-        assert!(!slot["runner"]
-            .as_object()
-            .unwrap()
-            .contains_key("requires_wire_api"));
-        assert_eq!(runner.pairs.len(), 13);
-        let sources = routing_runner_pairs();
-        for (pair, source) in runner.pairs.iter().zip(&sources) {
-            assert_eq!(pair.wire_api, source.pair.wire_api);
-            assert_eq!(pair.auth_method, source.pair.auth_method);
-            assert_eq!(
-                pair.requires_wire_api,
-                Some(source.opens_through_catalog_endpoint)
-            );
-            assert_eq!(
-                runner.requires_wire_api_for_pair(pair),
-                source.opens_through_catalog_endpoint
-            );
-            assert_eq!(
-                runner.admits_pair_row(pair, false),
-                !source.opens_through_catalog_endpoint
-            );
-            assert!(runner.admits_pair_row(pair, true));
-        }
-        assert_eq!(
-            runner
-                .pairs
-                .iter()
-                .filter(|pair| runner.requires_wire_api_for_pair(pair))
-                .count(),
-            9
-        );
+        assert!(runner.starts_sessions);
+        assert_eq!(runner.harnesses.as_deref().unwrap(), BROCA_HARNESSES);
         assert_eq!(serde_json::to_value(parsed).unwrap(), *slot);
     }
 
@@ -1024,29 +821,14 @@ mod routing_tests {
             .clone()
     }
 
-    /// The slot's exact bytes: the runner pairs, plus broca's two harnesses. `broca` narrows to
-    /// every pair but ChatGPT's and adds `output_cap`; `broca-uncapped` holds ChatGPT's pair.
-    /// Explicit pair false values remain present, unlike the omitted runner-level false.
+    /// Placement comes from `role.describe`; the routing slot states only durable harness facts.
     #[test]
     fn routing_slot_declares_the_broca_harnesses_and_only_supported_capabilities() {
         let expected = concat!(
             r#"{"consumers":[{"name":"broca.complete","workload":"quick"}],"runner":{"follows_account_choice":true,"harness_limits":{"#,
-            r#""broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans","output_cap"],"exclude":["opencode","opencode-go"],"pairs":[{"auth_method":"apikey","wire_api":"anthropic.messages"},{"auth_method":"gateway","wire_api":"anthropic.messages"},{"auth_method":"oauth","wire_api":"anthropic.messages"},{"auth_method":"apikey","wire_api":"aws.bedrock_converse"},{"auth_method":"oauth","wire_api":"aws.bedrock_converse"},{"auth_method":"antigravity","wire_api":"google.code_assist"},{"auth_method":"apikey","wire_api":"google.generate_content"},{"auth_method":"oauth","wire_api":"google.generate_content"},{"auth_method":"apikey","wire_api":"openai.chat_completions"},{"auth_method":"oauth","wire_api":"openai.chat_completions"},{"auth_method":"apikey","wire_api":"openai.responses"},{"auth_method":"oauth","wire_api":"openai.responses"}]},"#,
-            r#""broca-uncapped":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"],"exclude":["opencode","opencode-go"],"pairs":[{"auth_method":"chatgpt","wire_api":"openai.chatgpt_responses"}]}},"#,
-            r#""harnesses":["broca","broca-uncapped"],"pairs":["#,
-            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
-            r#"{"auth_method":"gateway","requires_wire_api":false,"wire_api":"anthropic.messages"},"#,
-            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"anthropic.messages"},"#,
-            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,
-            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"aws.bedrock_converse"},"#,
-            r#"{"auth_method":"antigravity","requires_wire_api":false,"wire_api":"google.code_assist"},"#,
-            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"google.generate_content"},"#,
-            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"google.generate_content"},"#,
-            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"openai.chat_completions"},"#,
-            r#"{"auth_method":"oauth","requires_wire_api":true,"wire_api":"openai.chat_completions"},"#,
-            r#"{"auth_method":"chatgpt","requires_wire_api":false,"wire_api":"openai.chatgpt_responses"},"#,
-            r#"{"auth_method":"apikey","requires_wire_api":true,"wire_api":"openai.responses"},"#,
-            r#"{"auth_method":"oauth","requires_wire_api":false,"wire_api":"openai.responses"}]}}"#,
+            r#""broca":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans","output_cap"]},"#,
+            r#""broca-uncapped":{"capabilities":["one_off","fork_answer","submit_tool","final_text","plans"]}},"#,
+            r#""harnesses":["broca","broca-uncapped"]}}"#,
         );
         let slot = serialized_routing_slot();
         assert_eq!(
@@ -1068,34 +850,16 @@ mod routing_tests {
             .typed_harness_limits()
             .expect("broca declares harness limits")
             .expect("the ungated producer validator accepts the harness facts");
-        let narrowed = |harness: &str| {
-            limits[harness]
-                .pairs
-                .as_ref()
-                .expect("each harness narrows the runner's pairs")
-                .iter()
-                .map(|pair| pair.wire_api.as_str())
-                .collect::<Vec<_>>()
-        };
         assert!(limits["broca"]
             .capabilities
             .as_ref()
             .unwrap()
             .contains(&HarnessCapability::OutputCap));
-        assert!(!narrowed("broca").contains(&"openai.chatgpt_responses"));
         assert!(!limits["broca-uncapped"]
             .capabilities
             .as_ref()
             .unwrap()
             .contains(&HarnessCapability::OutputCap));
-        assert_eq!(narrowed("broca-uncapped"), ["openai.chatgpt_responses"]);
-        for harness in ["broca", "broca-uncapped"] {
-            assert_eq!(
-                limits[harness].exclude.as_deref(),
-                Some(&["opencode".to_owned(), "opencode-go".to_owned()][..]),
-                "{harness} excludes OpenCode's providers"
-            );
-        }
     }
 }
 

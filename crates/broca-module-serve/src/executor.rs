@@ -2027,6 +2027,31 @@ impl broca_module_serve::vault_audit::VaultAuditor for VaultAuth {
     }
 }
 
+#[async_trait::async_trait]
+impl broca_module_serve::serves::GatewayListing for VaultAuth {
+    async fn listing(self: Arc<Self>) -> Option<Arc<broca_subc::vault::ScopedList>> {
+        let previous = match self.listing.get() {
+            Some((listing, false)) => return Some(listing),
+            Some((listing, true)) => Some(listing),
+            None => None,
+        };
+        if !self.listing.begin_refresh() {
+            return previous;
+        }
+        // Wait for a fresh listing on the polling request itself, rather than waiting for
+        // routing's next poll to report a change. Dropping the request must not strand the lock.
+        tokio::spawn(async move {
+            let listing = refresh_listing(&self).await;
+            self.listing.end_refresh();
+            listing
+        })
+        .await
+        .ok()
+        .flatten()
+        .or(previous)
+    }
+}
+
 /// Report a provider's rejection of a served token to the vault, by the same credential id
 /// the read used, under the same grant. A selection whose vault id cannot be named was
 /// never read, so there is nothing to report.
@@ -3621,6 +3646,12 @@ impl LiveLoopExecutor {
         self.vault
             .clone()
             .map(|vault| vault as Arc<dyn broca_module_serve::vault_audit::VaultAuditor>)
+    }
+
+    pub fn gateway_listing(&self) -> Option<Arc<dyn broca_module_serve::serves::GatewayListing>> {
+        self.vault
+            .clone()
+            .map(|vault| vault as Arc<dyn broca_module_serve::serves::GatewayListing>)
     }
 
     pub fn with_provider_overrides(

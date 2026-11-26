@@ -534,6 +534,19 @@ impl RowExclusion {
 pub struct CatalogSnapshot(Arc<LoadedCatalog>);
 
 impl CatalogSnapshot {
+    /// Model ids from the published catalog, including present rows admission cannot serve.
+    /// Discovery needs those rows as well, since routing expands an `all` list independently.
+    pub fn published_models(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .catalog
+            .routing
+            .keys()
+            .filter_map(|id| id.split_once('/'))
+            .filter(|(provider, model)| {
+                !provider.is_empty() && !model.is_empty() && !self.is_withdrawn(provider, model)
+            })
+    }
+
     pub(crate) fn temperature_policy(
         &self,
         provider: &str,

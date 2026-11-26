@@ -254,6 +254,22 @@ No verified provider gives the existing transient `routing_unavailable` admissio
 Multiple verified providers also refuse without opening either, with the distinct logged
 diagnostic `routing_provider_ambiguous` and the same transient `routing_unavailable` refusal.
 
+#### What broca advertises to routing
+
+Broca's HELLO `routing/v1` slot lists its harnesses and their capabilities, not request formats
+or login kinds. `role.describe {"serves": true}` returns the current provider and model lists by
+harness. `broca` supports output caps; `broca-uncapped` serves the ChatGPT login (`openai`) because
+that backend refuses output caps. OpenAI and Anthropic API keys use the vault's `openai-platform`
+and `anthropic-platform` account provider ids. OpenCode routes are not placed on broca.
+
+Broca reads the loaded catalog and its own vault listing for this answer. If it cannot give a
+harness's complete list yet, it omits that harness rather than claiming it serves nothing.
+Routing uses the lists, usable vault logins and the catalog's model login facts to place routes.
+Other describe calls advertise the `serves` capability but do not return the lists.
+
+This is a clean cut: deploy this build with routing 0.8.0 and the corresponding Agent Runner
+in one restart window. An older routing reader requires the deleted runner `pairs` declaration.
+
 ## 2. Two consumer roles
 
 - **Drivers** start or steer work and inject prompts.
@@ -376,7 +392,7 @@ run.tool_calls { run_id, after?, limit? }
     → { run_id, calls: [{ tool_call_id, call_key?, name, args, outcome,
                           result_bytes?, dispatched_to?, ordinal }], next? }
 session.baseline {} → { state: "not_yet" | "ready", baseline? } (owner only)
-role.describe {} → the llm-runner/v1 major, its ops and capability groups (including `run_usage`), max_bytes
+role.describe { serves? } → the llm-runner/v1 major, ops, capabilities, max_bytes, and the live serves lists only on `serves: true`
 
 session.subscribe { from?: "start" | "live" | cursor } (dedicated route; §9)
     → stream of events (control reliable+replayable, display live+lossy); see §7,§8,§16

@@ -667,6 +667,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
 
     executor_impl = executor_impl.with_context_management(context_management);
     let vault_auditor = executor_impl.vault_auditor();
+    let gateway_listing = executor_impl.gateway_listing();
     let store_reader = run_index
         .clone()
         .map(|store| store as Arc<dyn broca_core::RunEventBodies>);
@@ -1123,6 +1124,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(agent_data),
         Some(system_one),
         Some(llm_tools),
+        gateway_listing,
         registered,
     );
     tokio::pin!(serving);

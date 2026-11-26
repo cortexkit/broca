@@ -34,6 +34,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::serves::trace_describe;
 use crate::stall::{self, Phase};
 use broca_diagnostics::{Receiver as EgressReceiver, Sender as EgressSender};
 use broca_module::serve::{
@@ -1007,6 +1008,7 @@ where
         system_one,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1028,6 +1030,7 @@ pub async fn serve_connection_with_llm_tools<R, W, H>(
     agent_data: Option<Arc<crate::agent_data::AgentDataService>>,
     system_one: Option<Arc<crate::system_one::SystemOne>>,
     llm_tools: Option<Arc<crate::llm_tools::LlmTools>>,
+    gateway_listing: Option<Arc<dyn crate::serves::GatewayListing>>,
     registered: Option<GatedRegistration>,
 ) -> Result<ServeEnd, ServeIoError>
 where
@@ -1059,7 +1062,10 @@ where
             handler,
             health_registry.as_ref(),
             vault_gauge.as_ref(),
-            catalog_cache.as_deref(),
+            Arc::new(crate::serves::Source {
+                catalog: catalog_cache,
+                vault: gateway_listing,
+            }),
             conn_cancel.clone(),
             &consumer_routes,
             vault_auditor,
@@ -1119,7 +1125,7 @@ async fn run_frame_loop<R, H>(
     handler: Arc<H>,
     health_registry: &LineageRegistry,
     vault_gauge: &VaultGauge,
-    catalog_cache: Option<&broca_catalog::CatalogCache>,
+    serves: Arc<crate::serves::Source>,
     conn_cancel: CancellationToken,
     consumer_routes: &crate::consumer_routes::ConsumerRoutes,
     vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
@@ -1256,7 +1262,7 @@ where
                     &handler,
                     health_registry,
                     vault_gauge,
-                                catalog_cache,
+                    &serves,
                     &conn_cancel,
                     &request_slots,
                     &mut request_tasks,
@@ -1299,7 +1305,7 @@ async fn handle_frame<H>(
     handler: &Arc<H>,
     health_registry: &LineageRegistry,
     vault_gauge: &VaultGauge,
-    catalog_cache: Option<&broca_catalog::CatalogCache>,
+    serves: &Arc<crate::serves::Source>,
     conn_cancel: &CancellationToken,
     request_slots: &Arc<Semaphore>,
     request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
@@ -1392,7 +1398,7 @@ where
                 routes,
                 health_registry,
                 vault_gauge,
-                catalog_cache,
+                serves.catalog.as_deref(),
             )
             .await?;
             Ok(true)
@@ -1441,7 +1447,7 @@ where
                     }
                 };
                 let now = now_epoch_ms();
-                let catalog_age = crate::diagnostics::catalog_age(catalog_cache, now);
+                let catalog_age = crate::diagnostics::catalog_age(serves.catalog.as_deref(), now);
                 let writer = writer.clone();
                 let slots = request_slots.clone();
                 request_tasks.spawn(reply_on_panic(
@@ -1798,6 +1804,7 @@ where
                     dispatch_ticket,
                     writer,
                     handler,
+                    serves,
                     conn_cancel,
                     request_slots,
                     request_tasks,
@@ -2798,6 +2805,7 @@ async fn spawn_route_request<H>(
     dispatch_ticket: DispatchTicket,
     writer: &EgressSender<Frame>,
     handler: &Arc<H>,
+    serves: &Arc<crate::serves::Source>,
     conn_cancel: &CancellationToken,
     request_slots: &Arc<Semaphore>,
     request_tasks: &mut JoinSet<Result<(), ServeIoError>>,
@@ -2817,6 +2825,9 @@ where
     let conn_cancel = conn_cancel.clone();
     let describe =
         matches!(&prepared, PreparedRouteRequest::Request(req) if req.method == OP_ROLE_DESCRIBE);
+    let serves = matches!(&prepared, PreparedRouteRequest::Request(req)
+        if describe && crate::serves::requested(&req.params))
+    .then(|| Arc::clone(serves));
     let fork_operation =
         matches!(&prepared, PreparedRouteRequest::Request(req) if is_fork_operation(&req.method));
 
@@ -2906,7 +2917,7 @@ where
                     }
                     tokio::select! {
                         _ = conn_cancel.cancelled() => Ok(()),
-                        result = execute_route_request(req, &writer, ver, channel, epoch, corr, &session, &bind, &handler) => result,
+                        result = execute_route_request(req, &writer, ver, channel, epoch, corr, &session, &bind, &handler, serves.as_deref()) => result,
                     }
                 }
                 PreparedRouteRequest::Subscribe { params, slot } => {
@@ -3022,12 +3033,13 @@ fn execute_route_request<'a, H>(
     session: &'a BrocaBindIdentity,
     bind: &'a BindObservation,
     handler: &'a Arc<H>,
+    serves: Option<&'a crate::serves::Source>,
 ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), ServeIoError>> + Send + 'a>>
 where
     H: ServeHandler + 'static,
 {
     Box::pin(execute_route_request_inner(
-        req, writer, ver, channel, epoch, corr, session, bind, handler,
+        req, writer, ver, channel, epoch, corr, session, bind, handler, serves,
     ))
 }
 
@@ -3042,6 +3054,7 @@ async fn execute_route_request_inner<H>(
     session: &BrocaBindIdentity,
     bind: &BindObservation,
     handler: &Arc<H>,
+    serves: Option<&crate::serves::Source>,
 ) -> Result<(), ServeIoError>
 where
     H: ServeHandler + 'static,
@@ -4460,17 +4473,7 @@ where
         }
         OP_ROLE_DESCRIBE => {
             trace_describe("authorized", channel, epoch, corr);
-            if let Err((field, message)) = decode_params::<RoleDescribeParams>(&req.params) {
-                return send_invalid_params(writer, ver, channel, epoch, corr, field, &message)
-                    .await;
-            }
-            let mut describe = broca_wire::broca_role_describe_with_writers(
-                env!("CARGO_PKG_VERSION"),
-                handler.compaction_supported(),
-                crate::RETENTION_WRITER_ENABLED,
-                handler.hook_plane_available(),
-            );
-            describe.session_class.backup_classes = handler.backup_classes();
+            let describe = crate::serves::describe(handler.as_ref(), serves).await;
             trace_describe("response_ready", channel, epoch, corr);
             let sent = send_json_response(writer, ver, channel, epoch, corr, &describe).await;
             if sent.is_ok() {
@@ -5969,11 +5972,6 @@ mod role_selection_tests;
 #[path = "system_one/route.rs"]
 mod system_one_route;
 
-/// `role.describe` params: none.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RoleDescribeParams {}
-
 /// Decode a strict request's `params`, a JSON `null` meaning the empty request. A refusal names
 /// the member at fault when it can be told.
 fn decode_params<T: serde::de::DeserializeOwned + Default>(
@@ -6538,12 +6536,6 @@ fn method_code(method: &str) -> u8 {
         OP_MEMORY_REPORT => 21,
         _ => 255,
     }
-}
-
-// Correlated milestones distinguish a request that never reached serve from one parked at
-// admission, dispatch, or egress. Debug-only, and no prompt or response bodies are recorded.
-fn trace_describe(stage: &str, channel: u16, epoch: u32, corr: u64) {
-    tracing::debug!(target: "wire.describe", stage, channel, epoch, corr, "role.describe progress");
 }
 
 fn trace_egress(stage: &str, header: &subc_protocol::EnvelopeHeader) {

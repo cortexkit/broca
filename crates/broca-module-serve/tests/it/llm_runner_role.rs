@@ -1153,6 +1153,7 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
     let describe = check_describe(&raw).unwrap_or_else(|p| panic!("{raw}: {p:?}"));
     for group in [
         "transcript_reads",
+        "serves",
         "run_ops",
         "run_status",
         "held_calls",
@@ -1191,11 +1192,18 @@ async fn role_describe_passes_the_roles_check_and_declares_what_broca_serves() {
         serde_json::json!({"default": 3145728, "maximum": 3145728})
     );
     assert_eq!(raw["majors"][0]["stability"], "alpha");
-    // It describes the build, never the session, so a second answer is the same.
-    let again = call(&mut rig, "role.describe", serde_json::Value::Null).await;
-    assert_eq!(result(&again), raw);
-    let body = refusal(&call(&mut rig, "role.describe", serde_json::json!({"x": 1})).await);
-    assert_eq!(body["detail"]["field"], "x");
+    // llm-runner 0.10.0 §2.1 requires the default answer unless `serves` is boolean true,
+    // even if a caller sends unknown properties or spells `true` as a string.
+    assert!(raw.get("serves").is_none());
+    for params in [
+        serde_json::Value::Null,
+        serde_json::json!({"x": 1}),
+        serde_json::json!({"serves": false}),
+        serde_json::json!({"serves": "true"}),
+    ] {
+        let again = call(&mut rig, "role.describe", params).await;
+        assert_eq!(again.body, reply.body);
+    }
     rig.finish().await;
 }
 
