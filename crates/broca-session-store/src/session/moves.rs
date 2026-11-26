@@ -32,6 +32,7 @@ pub enum Error {
     Backend(BackendError),
     Invalid(String),
     DeploymentKeyMissing(u16),
+    SetupKeyUnavailable,
 }
 
 impl From<BackendError> for Error {
@@ -46,6 +47,13 @@ impl From<std::io::Error> for Error {
 }
 fn invalid(reason: impl std::fmt::Debug) -> Error {
     Error::Invalid(format!("{reason:?}"))
+}
+
+fn restore_failure(error: super::restore::RestoreError) -> Error {
+    match error {
+        super::restore::RestoreError::KeyUnavailable => Error::SetupKeyUnavailable,
+        error => invalid(error),
+    }
 }
 
 /// A fully checked framing; the values are stored bytes, never decrypted payloads.
@@ -66,17 +74,50 @@ impl Export {
         class: &str,
         deployment: &DeploymentKey,
     ) -> Result<Self, Error> {
+        Self::pinned_using(store, addr, version, class, deployment, None).await
+    }
+
+    /// Compares a pinned version with this cut, even when a setup digest now has a second
+    /// encrypted copy. The cut's original file names and bytes must still match exactly.
+    pub async fn matches_pinned(
+        &self,
+        store: &LocalBackend,
+        addr: &SessionAddr,
+        version: Version,
+        deployment: &DeploymentKey,
+    ) -> Result<bool, Error> {
+        let actual = Self::pinned_using(
+            store,
+            addr,
+            version,
+            &self.header.class,
+            deployment,
+            Some(&self.files),
+        )
+        .await?;
+        Ok(actual.files == self.files)
+    }
+
+    async fn pinned_using(
+        store: &LocalBackend,
+        addr: &SessionAddr,
+        version: Version,
+        class: &str,
+        deployment: &DeploymentKey,
+        setup_from: Option<&BTreeMap<String, Vec<u8>>>,
+    ) -> Result<Self, Error> {
         let bytes = store
             .read_head_version(addr, version)?
             .ok_or_else(|| invalid("pinned head is missing"))?;
-        let (head, _) = head::open(&bytes, deployment).map_err(invalid)?;
+        let (head, _, deployment_key) =
+            head::open_with_deployment_id(&bytes, deployment).map_err(invalid)?;
         if !matches!(head.residence, Residence::Local(())) {
             return Err(invalid("export head is not local"));
         }
         let (mut files, finding) =
-            super::restore::reachable(store, addr, deployment, &bytes, version)
+            super::restore::reachable(store, addr, deployment, &bytes, version, setup_from)
                 .await
-                .map_err(invalid)?;
+                .map_err(restore_failure)?;
         if let Some(finding) = finding {
             return Err(invalid(finding));
         }
@@ -88,11 +129,7 @@ impl Export {
             triple: head.triple,
             class: class.into(),
             cipher: head.cipher.unwrap_or(Cipher::XChaCha20Poly1305),
-            deployment_key: head
-                .keys
-                .iter()
-                .find(|key| key.deployment == deployment.id())
-                .map(|key| key.deployment),
+            deployment_key,
         };
         let export = Self {
             header,
@@ -188,6 +225,10 @@ impl Export {
         if head.triple != self.header.triple
             || head.cipher() != self.header.cipher
             || !matches!(head.residence, Residence::Local(()))
+            || self
+                .header
+                .deployment_key
+                .is_some_and(|id| !head.keys.iter().any(|wrap| wrap.deployment == id))
         {
             return Err(invalid("export header differs from local head"));
         }
@@ -287,11 +328,7 @@ pub fn covered_stream(bytes: &[u8], covered: u64) -> Result<&[u8], Error> {
 fn preflight(header: &Header, deployment: &DeploymentKey) -> Result<(), Error> {
     match (header.cipher, header.deployment_key) {
         (Cipher::None, None) => Ok(()),
-        (Cipher::XChaCha20Poly1305, Some(id))
-            if deployment.is_loaded() && deployment.id() == id =>
-        {
-            Ok(())
-        }
+        (Cipher::XChaCha20Poly1305, Some(id)) if deployment.has_key(id) => Ok(()),
         (Cipher::XChaCha20Poly1305, Some(id)) => Err(Error::DeploymentKeyMissing(id)),
         _ => Err(invalid("cipher and deployment key disagree")),
     }

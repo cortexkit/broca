@@ -487,6 +487,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // when the module reads no vault, so sessions kept in the session store stay refused.
     let mut store_key_source: Option<Arc<dyn broca_module_serve::store_key::DeploymentKeySource>> =
         None;
+    let mut store_key_listing = None;
     // System One's provider credentials. Without a vault (the mock provider path) their
     // requests carry none, as every run's do there.
     let mut system_one_credential: Arc<
@@ -507,6 +508,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         // opens the capability-handle file: the vault revokes this module's handles once no
         // placed build reads them, so a handle read here would fail for every run.
         let listing_cache = Arc::new(broca_module_serve::account_routing::ListingCache::default());
+        store_key_listing = Some(Arc::clone(&listing_cache));
         let addressing = broca_module_serve::VaultAddressing::new(Arc::clone(&listing_cache));
         // A process-global identity for broca's vault calls, not a conversation identity.
         // Only harness/session travel in the wire bind; the local storage-root field is not sent.
@@ -1013,21 +1015,23 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             ready.wait_registered().await;
             registry.enable_restart_resumes();
-            broca_module_serve::store_key::KeyLoader {
+            let loader = broca_module_serve::store_key::KeyLoader {
                 source: store_key_source,
                 slot: Arc::clone(&store_slot),
                 setup: store_setup,
                 backoff: Default::default(),
-            }
-            .run(registry)
-            .await;
-            // A move into this computer that stopped mid-way recovers at boot, except for an
-            // encrypted session, which can't be read until the key has loaded.
-            if store_slot.key_loaded() {
-                if let Err(error) = agent_data.reconcile_pending_cuts().await {
-                    tracing::warn!(target: "lifecycle", error = %error.message,
-                        "agent-data move recovery after the storage key loaded failed; a retry of the move finishes it");
-                }
+            };
+            if let Some(listing) = store_key_listing {
+                // A pending cut can depend on any of the loaded keys, not just on the key
+                // configured for new sessions on this computer.
+                loader.run_following(registry, listing, || async {
+                    if let Err(error) = agent_data.reconcile_pending_cuts().await {
+                        tracing::warn!(target: "lifecycle", error = %error.message,
+                            "agent-data move recovery after a deployment key loaded failed; a retry of the move finishes it");
+                    }
+                }).await;
+            } else {
+                loader.run(registry).await;
             }
         })
     };

@@ -369,7 +369,7 @@ async fn store_missing_key_refusal_names_transfer_and_local_grant_before_staging
     let message = refusal.to_string();
     for word in [
         "deployment_key_missing",
-        "opaque:broca-deployment:1",
+        "opaque:broca-deployment:7",
         "reserved:broca",
         "exact read",
         "grants do not travel",

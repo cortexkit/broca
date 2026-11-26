@@ -15,10 +15,16 @@ impl Export {
         let (_, version) = self.head(addr, deployment)?;
         let head_path = format!("heads/{}/head", addr.0);
         let stored = &self.files[&head_path];
-        let (mut reached, finding) =
-            super::super::restore::reachable(&memory, addr, deployment, &stored[8..], version)
-                .await
-                .map_err(invalid)?;
+        let (mut reached, finding) = super::super::restore::reachable(
+            &memory,
+            addr,
+            deployment,
+            &stored[8..],
+            version,
+            None,
+        )
+        .await
+        .map_err(restore_failure)?;
         if let Some(finding) = finding {
             return Err(invalid(finding));
         }
@@ -71,7 +77,7 @@ impl Export {
         let staged = LocalBackend::new(root);
         if let Some(finding) = super::super::restore::check(&staged, addr, deployment)
             .await
-            .map_err(invalid)?
+            .map_err(restore_failure)?
         {
             return Err(invalid(finding));
         }

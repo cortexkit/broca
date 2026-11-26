@@ -53,14 +53,16 @@ use std::sync::Arc;
 
 use broca_core::{RunControl, RunRequest};
 use broca_protocol::{BindIdentity, RunId, SubmissionRequest};
+use broca_session_loop::durable::{PartStore, SetupParts};
 use broca_session_loop::parts::{Parts, SharedParts};
 use broca_session_loop::queue;
 use broca_session_loop::shared::{ActorWriter, RunLink};
 use broca_session_loop::writer::Writer;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::idindex::IdKind;
+use broca_session_store::keys::{Cipher, DeploymentKey};
 use broca_session_store::record::{
-    Billed, CancelPoint, CancelRequest, QueuedSend, Record, Retraction,
+    Billed, CancelPoint, CancelRequest, PartRef, QueuedSend, Record, Retraction,
 };
 use broca_session_store::session::{Session, SessionError};
 use tokio::sync::{mpsc, oneshot};
@@ -78,6 +80,46 @@ fn unserved(what: &str) -> String {
     format!("{what} is not served yet for a session kept in the new storage")
 }
 
+enum ActorSetupStore<B> {
+    Fixed(SetupParts<B>),
+    Configured {
+        backend: B,
+        deployment: Arc<DeploymentKey>,
+        cipher: Cipher,
+    },
+}
+
+impl<B: SessionBackend> PartStore for ActorSetupStore<B> {
+    async fn store(&self, part: &PartRef, bytes: &[u8]) -> Result<(), SessionError> {
+        match self {
+            Self::Fixed(store) => store.store(part, bytes).await,
+            Self::Configured {
+                backend,
+                deployment,
+                cipher,
+            } => {
+                // An old session may be opened before the configured key loads. Only its writes
+                // of new parts need that key, and they can use it as soon as it arrives.
+                let key = deployment.setup_key_for(*cipher).ok_or(SessionError::Head(
+                    broca_session_store::head::HeadError::NotLoaded,
+                ))?;
+                let (stored, _) = broca_session_store::setup::SetupStore::new(backend, &key)
+                    .put(part.kind, bytes)
+                    .await
+                    .map_err(broca_session_loop::durable::setup_error)?;
+                if stored.digest != part.digest {
+                    return Err(SessionError::Backend(
+                        broca_session_store::backend::BackendError::Corrupt(
+                            "a setup part's bytes don't match the digest it was put under",
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// A session actor over the session store.
 pub struct StoreActor<B: SessionBackend> {
     key: BindIdentity,
@@ -88,7 +130,7 @@ pub struct StoreActor<B: SessionBackend> {
     parts: SharedParts,
     /// Where setup parts are stored durably before any record names them: the deployment's
     /// setup store. `None` keeps them in memory only, as tests do.
-    storage: Option<broca_session_loop::durable::SetupParts<B>>,
+    storage: Option<ActorSetupStore<B>>,
     recovery_index: Option<std::path::PathBuf>,
     /// A successful file-and-directory barrier covers later runs until ownership is given up.
     recovery_registered: bool,
@@ -669,11 +711,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// The session's writer, storing setup parts not yet durable before each append.
     fn durable(
         &mut self,
-    ) -> broca_session_loop::durable::Durable<
-        '_,
-        Session<B>,
-        broca_session_loop::durable::SetupParts<B>,
-    > {
+    ) -> broca_session_loop::durable::Durable<'_, Session<B>, ActorSetupStore<B>> {
         broca_session_loop::durable::Durable {
             writer: &mut self.session,
             parts: &mut self.parts,

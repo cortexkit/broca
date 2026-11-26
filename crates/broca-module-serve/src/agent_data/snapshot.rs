@@ -15,7 +15,7 @@ use broca_session_store::keys::DeploymentKey;
 use broca_session_store::record::{Input, PartKind, Placement, Record, StepStart};
 use broca_session_store::session::moves::Export;
 use broca_session_store::session::Session;
-use broca_session_store::setup::SetupStore;
+use broca_session_store::setup::SetupReader;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -116,10 +116,7 @@ pub async fn store_snapshot(
         .await
         .map_err(|e| format!("{e:?}"))?;
     let records = view.records_from(0).await.map_err(|e| format!("{e:?}"))?;
-    let key = deployment
-        .setup_key_for(export.header.cipher)
-        .ok_or("deployment key missing")?;
-    let setup = SetupStore::new(&memory, &key);
+    let setup = SetupReader::new(&memory, deployment, export.header.cipher);
     let mut parts = MemoryParts {
         parts: BTreeMap::new(),
     };

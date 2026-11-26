@@ -122,10 +122,10 @@ pub fn read(
             1 => Cipher::XChaCha20Poly1305,
             _ => return Err(Error::Damaged("expiry cipher".into())),
         };
-        let key = deployment.expiry_key(cipher).ok_or(Error::KeyUnavailable)?;
-        if cipher != Cipher::None && prefix[1..] != deployment.id().to_le_bytes() {
-            return Err(Error::KeyUnavailable);
-        }
+        let id = u16::from_le_bytes([prefix[1], prefix[2]]);
+        let key = deployment
+            .expiry_key_for(cipher, id)
+            .ok_or(Error::KeyUnavailable)?;
         let body = key
             .open_unit(&aad(addr, name, prefix), &bytes[3..])
             .ok_or_else(|| Error::Damaged("expiry authentication".into()))?;

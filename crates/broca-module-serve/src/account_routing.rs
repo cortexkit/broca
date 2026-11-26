@@ -3016,6 +3016,7 @@ pub fn report_scoped_not_found<F>(
 #[derive(Default)]
 pub struct ListingCache {
     latest: Mutex<Option<(Arc<ScopedList>, std::time::Instant)>>,
+    changed: tokio::sync::watch::Sender<()>,
     /// Set while a background refresh is in flight, so a burst of admissions starts one.
     refreshing: std::sync::atomic::AtomicBool,
     /// The credentials of the latest listing that lack account-selection metadata.
@@ -3038,7 +3039,12 @@ impl ListingCache {
         self.unmapped.observe(&listing);
         let listing = Arc::new(listing);
         *self.latest.lock().unwrap() = Some((Arc::clone(&listing), std::time::Instant::now()));
+        self.changed.send_replace(());
         listing
+    }
+
+    pub(crate) fn watch(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changed.subscribe()
     }
 
     /// The unmapped credentials of the latest listing, for `health.check`.

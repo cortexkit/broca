@@ -312,13 +312,6 @@ impl crate::registry::LineageRegistry {
                         .ok_or_else(|| "head disappeared".to_owned())?;
                     let cipher = broca_session_store::head::stored_cipher(&head)
                         .map_err(|error| format!("decode head mode: {error:?}"))?;
-                    // An encrypted session's unfinished-run and queue state cannot be read
-                    // before the key arrives. Keep its durable candidate for the key-loaded pass.
-                    if cipher != Cipher::None && !runtime.key_loaded() {
-                        sweep.deferred += 1;
-                        sweep.unfinished.push((class, addr.clone()));
-                        return Ok(());
-                    }
                     sweep.inspected += 1;
                     let triple = broca_session_store::head::stored_triple(&head)
                         .map_err(|error| format!("decode head identity: {error:?}"))?;
@@ -345,6 +338,14 @@ impl crate::registry::LineageRegistry {
                     .await
                     {
                         Ok(view) => {
+                            if runtime
+                                .check_recovery_setup(class, cipher, &view.operations)
+                                .is_err()
+                            {
+                                sweep.deferred += 1;
+                                sweep.unfinished.push((class, addr.clone()));
+                                return Ok(());
+                            }
                             let parts = runtime.parts_for(class, cipher)
                                 as &dyn broca_session_loop::parts::Parts;
                             let owed = recovery_owed(
@@ -366,6 +367,12 @@ impl crate::registry::LineageRegistry {
                         // is owed; this machine can't open it.
                         Err(SessionError::SessionMoved { .. }) => None,
                         Err(SessionError::NeedsRecovery) => Some("needs_recovery"),
+                        Err(error) if super::needs_deployment_key(&error) => {
+                            sweep.inspected -= 1;
+                            sweep.deferred += 1;
+                            sweep.unfinished.push((class, addr.clone()));
+                            return Ok(());
+                        }
                         Err(error) => return Err(format!("read operational state: {error:?}")),
                     };
                     if let Some(due_ms) = warm_due {

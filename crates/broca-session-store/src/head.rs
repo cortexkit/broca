@@ -252,6 +252,13 @@ pub(crate) fn stored_residence(bytes: &[u8]) -> Result<Residence, HeadError> {
 /// key is unwrapped under `deployment` and checks its tag; a plain head checks its unkeyed check
 /// and needs no deployment key.
 pub fn open(bytes: &[u8], deployment: &DeploymentKey) -> Result<(Head, DataKey), HeadError> {
+    open_with_deployment_id(bytes, deployment).map(|(head, key, _)| (head, key))
+}
+
+pub(crate) fn open_with_deployment_id(
+    bytes: &[u8],
+    deployment: &DeploymentKey,
+) -> Result<(Head, DataKey, Option<u16>), HeadError> {
     if bytes.len() < TAG_LEN {
         return Err(HeadError::Malformed);
     }
@@ -269,27 +276,35 @@ pub fn open(bytes: &[u8], deployment: &DeploymentKey) -> Result<(Head, DataKey),
             if !checks || !head.keys.is_empty() {
                 return Err(HeadError::Authentication);
             }
-            Ok((head, DataKey::plain()))
+            Ok((head, DataKey::plain(), None))
         }
         Cipher::XChaCha20Poly1305 => {
             // Every encrypted head wraps its data key; one that wraps none was never written so.
             if head.keys.is_empty() {
                 return Err(HeadError::Authentication);
             }
-            if !deployment.is_loaded() {
+            if !deployment.has_loaded_keys() {
                 return Err(HeadError::NotLoaded);
             }
             let wrapped = head
                 .keys
                 .iter()
-                .find(|key| key.deployment == deployment.id())
+                .filter(|key| deployment.has_key(key.deployment))
+                .min_by_key(|key| key.deployment != deployment.id())
                 .ok_or(HeadError::NoKey)?;
-            let key = keys::unwrap(deployment, &head.session_id, wrapped.id, &wrapped.wrapped.0)
-                .map_err(HeadError::Unwrap)?;
+            let id = wrapped.deployment;
+            let key = keys::unwrap_with_id(
+                deployment,
+                id,
+                &head.session_id,
+                wrapped.id,
+                &wrapped.wrapped.0,
+            )
+            .map_err(HeadError::Unwrap)?;
             if !keys::verify(&key, HEAD_CONTEXT, body, tag) {
                 return Err(HeadError::Authentication);
             }
-            Ok((head, key))
+            Ok((head, key, Some(id)))
         }
     }
 }

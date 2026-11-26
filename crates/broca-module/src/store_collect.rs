@@ -320,7 +320,7 @@ impl StoreCollectSweep {
             // creation or recovery hasn't committed.
             Ok(0) => Outcome::NothingDue,
             Ok(changes) => Outcome::Collected(changes),
-            Err(SessionError::Head(HeadError::NotLoaded)) => Outcome::Skipped,
+            Err(SessionError::Head(HeadError::NotLoaded | HeadError::NoKey)) => Outcome::Skipped,
             Err(error) => Outcome::Failed(format!("{error:?}")),
         }
     }

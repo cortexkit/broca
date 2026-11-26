@@ -12,7 +12,7 @@ impl StoreRuntime {
             self.deployment(),
         )
         .map_err(|error| match error {
-            expired::Error::KeyUnavailable => key_unavailable(self.key_id),
+            expired::Error::KeyUnavailable => super::stored_key_unavailable(),
             other => OpenError::Open(format!(
                 "the session's expiry marker could not be read: {other:?}"
             )),

@@ -13,6 +13,7 @@
 //! logged or reported, and the vault's reply is never echoed, since a reply that fails to decode
 //! can carry its value.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -22,12 +23,27 @@ use broca_records::session_storage::StorageClass;
 use broca_session_store::backend::SessionAddr;
 use broca_session_store::keys::DeploymentKey;
 
+mod follow;
+
 /// The key id the module uses when `broca.jsonc` names none.
 pub const DEFAULT_KEY_ID: u16 = 1;
+const CREDENTIAL_PREFIX: &str = "opaque:broca-deployment:";
 
 /// The vault record that holds deployment key `key_id`.
 pub fn credential_id(key_id: u16) -> String {
-    format!("opaque:broca-deployment:{key_id}")
+    format!("{CREDENTIAL_PREFIX}{key_id}")
+}
+
+fn granted_keys(listing: &broca_subc::vault::ScopedList) -> BTreeSet<u16> {
+    listing
+        .credentials
+        .iter()
+        .filter_map(|row| {
+            let id = row.id.strip_prefix(CREDENTIAL_PREFIX)?.parse().ok()?;
+            (row.id == credential_id(id) && row.operations.iter().any(|op| op == "read"))
+                .then_some(id)
+        })
+        .collect()
 }
 
 /// Why the deployment key isn't loaded. Says nothing of the key's value, and carries no text the
@@ -94,6 +110,10 @@ pub fn decode_key(value: &str) -> Result<[u8; 32], KeyUnavailable> {
 #[async_trait]
 pub trait DeploymentKeySource: Send + Sync {
     async fn read(&self, credential_id: &str) -> broca_subc::VaultGet;
+
+    async fn list(&self) -> Result<broca_subc::vault::ScopedList, broca_subc::VaultError> {
+        Err(broca_subc::VaultError::NotFound)
+    }
 }
 
 #[async_trait]
@@ -101,6 +121,10 @@ impl DeploymentKeySource for broca_subc::VaultClient {
     async fn read(&self, credential_id: &str) -> broca_subc::VaultGet {
         // A static record: nothing is minted or refreshed, so no lifetime is asked for.
         self.get_scoped(credential_id, None).await
+    }
+
+    async fn list(&self) -> Result<broca_subc::vault::ScopedList, broca_subc::VaultError> {
+        self.list_scoped().await
     }
 }
 

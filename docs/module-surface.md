@@ -585,20 +585,20 @@ deliberate edit, and served without the deployment key. `"on"` (the default) cre
 sessions. A session keeps the mode it was created in, so changing the setting leaves existing
 sessions as they are, and a deployment can hold both kinds.
 
-Encrypted sessions are opened with a deployment key read from the vault
-when broca starts: the static record `opaque:broca-deployment:<key_id>`, read by grant
-(`credential.get_scoped`, an exact `read` grant to `reserved:broca`), whose value is 32 bytes
-written as 64 lowercase hex characters. The root `broca.jsonc` setting
-`"session_storage": {"deployment_key_id": 1}` names the key (1 when absent); a rotation adds a
-record under a new id and never rewrites one. Startup never waits for or fails on the key. Until
-it loads (the vault is unreachable, answers `not_found`, or holds a malformed value), today's
-sessions and plain sessions are served as before, and an encrypted session kept in the new
-storage is refused `open_failed`, class `transient`, its reason starting `key_unavailable:`;
-broca reads the record again with backoff and serves those sessions once it loads, without a
-restart. A deployment with encryption off and no encrypted sessions never needs the key. The
-key is kept in memory only; logs name only its id, with one WARN while it is missing and one
-INFO when it loads. `health.check.metrics.store` reports `{key_id, loaded, new_sessions, phases}`,
-`new_sessions` being `"encrypted"` or `"plain"`.
+broca loads every deployment key in its scoped vault listing that it can read. Each static
+record is `opaque:broca-deployment:<key_id>` and holds 32 bytes as 64 lowercase hex characters.
+Grant `reserved:broca` exact `read` on each record; the value is read with `credential.get_scoped`.
+The root `broca.jsonc` setting `"session_storage": {"deployment_key_id": 1}` names the key for
+new sessions and newly stored encrypted setup parts (1 when absent). A rotation adds a record
+under a new id and never rewrites one. Existing data stays locked with its original key.
+
+Startup never waits for or fails on a key. A session whose key hasn't loaded is refused
+`open_failed`, class `transient`, with a reason starting `key_unavailable:`. broca retries key
+reads with backoff and checks for new grants on listing refresh, so a grant can make existing
+sessions available without a restart. Plain sessions do not need a key. Key values stay in
+memory only and logs name only their ids. `health.check.metrics.store` reports
+`{key_id, loaded, new_sessions, phases}`. `key_id` and `loaded` refer to the configured key;
+`new_sessions` is `"encrypted"` or `"plain"`.
 
 `phases` reports process-lifetime monotonic timings for `open`, `append`, `sync`, `seal`,
 `media_wait`, `request_prepare`, `media_fold`, `read`, `entries_page`, `collection` and
@@ -2786,7 +2786,8 @@ broca-session --subc <connection file> --project-root <root> --harness <harness>
 ```
 
 With `--all`, the session named only attaches the command to the daemon. The restore runs
-inside the daemon, since checking an encrypted session needs the deployment key. For each
+inside the daemon, since checking an encrypted session needs the key that wrapped the head
+version being checked. For each
 session it:
 
 - keeps a session whose head and every file it names (open log and checkpoint, directory

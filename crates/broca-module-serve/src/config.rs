@@ -623,7 +623,7 @@ impl ImportConfig {
 
 /// How the session store is configured: `session_storage` in `broca.jsonc`.
 ///
-/// `deployment_key_id` names the deployment key encrypted sessions are opened with, 1 when
+/// `deployment_key_id` names the deployment key used for new encrypted data, 1 when
 /// absent. The key itself is the vault record `opaque:broca-deployment:<id>` (see `store_key`).
 /// Keys form a ring: a rotation adds a record under a new id and names it here, and never
 /// rewrites an existing record.

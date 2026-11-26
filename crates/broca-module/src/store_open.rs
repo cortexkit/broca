@@ -23,11 +23,13 @@ use std::time::Duration;
 
 use broca_protocol::BindIdentity;
 use broca_records::session_storage::StorageClass;
-use broca_session_loop::durable::SetupParts;
-use broca_session_loop::parts::{DeploymentParts, SetupSource, SharedParts};
+use broca_session_loop::parts::{
+    DecodedParts, DeploymentParts, Parts, PartsUsage, SetupSource, SharedParts, StoredParts,
+};
 use broca_session_store::backend::{LocalBackend, SessionAddr};
 use broca_session_store::head::SessionTriple;
 use broca_session_store::keys::{Cipher, DeploymentKey};
+use broca_session_store::record::{PartKind, PartRef};
 use broca_session_store::session::{Position, Session, SessionError};
 use tokio::sync::mpsc;
 
@@ -41,20 +43,15 @@ const COMMANDS: usize = 64;
 #[path = "store_expiry.rs"]
 mod expiry;
 
-/// What the module needs to serve sessions kept in the session store. Opened without the
-/// deployment key it serves plain sessions only; the key is installed into it once it loads
-/// (see [`StoreSlot::load`]), and from then on it serves every session.
+/// What the module needs to serve sessions kept in the session store. Keys are installed into
+/// the shared runtime as they arrive, so already-open sessions see new setup name spaces too.
 pub struct StoreRuntime {
     state_root: PathBuf,
-    /// The id of the deployment key encrypted sessions open with.
+    /// The id of the deployment key used to create encrypted data.
     key_id: u16,
     /// The mode of the sessions this runtime creates.
     new_sessions: Cipher,
-    /// The deployment key, once it has loaded.
-    deployment: OnceLock<Arc<DeploymentKey>>,
-    /// What sessions are opened with before the key has loaded: plain sessions open, encrypted
-    /// ones refuse.
-    unloaded: Arc<DeploymentKey>,
+    deployment: Arc<DeploymentKey>,
     /// Each class root's setup parts, by [`StorageClass::index`]. A root keeps its own, so a
     /// part stored in one root never counts as stored in another: a session's root holds every
     /// part its runs name.
@@ -108,6 +105,75 @@ struct RootParts {
     plain_parts: SharedParts,
 }
 
+struct EncryptedSetupSource {
+    backend: LocalBackend,
+    deployment: Arc<DeploymentKey>,
+}
+
+impl StoredParts for EncryptedSetupSource {
+    fn read(
+        &self,
+        digest: &broca_session_store::codec::Digest,
+    ) -> Result<Option<Arc<[u8]>>, String> {
+        use broca_session_store::setup::{LookupError, SetupReader};
+        use futures::FutureExt as _;
+        match SetupReader::new(&self.backend, &self.deployment, Cipher::XChaCha20Poly1305)
+            .read(digest)
+            .now_or_never()
+            .ok_or("the setup store's backend can't be read inline")?
+        {
+            Ok(bytes) => Ok(bytes),
+            // `DeploymentParts::put` also probes storage before staging new bytes. A key
+            // waiting to load must not block writing a known value with the configured key.
+            Err(LookupError::KeyUnavailable) => Ok(None),
+            Err(LookupError::Store(error)) => {
+                Err(format!("a stored setup part can't be read: {error:?}"))
+            }
+        }
+    }
+}
+
+pub(crate) const SETUP_KEY_UNAVAILABLE: &str =
+    "key_unavailable: a granted setup part deployment key has not loaded yet";
+
+struct EncryptedParts {
+    parts: DeploymentParts,
+    deployment: Arc<DeploymentKey>,
+}
+
+impl Parts for EncryptedParts {
+    fn put(&mut self, kind: PartKind, value: &serde_json::Value) -> Result<PartRef, String> {
+        self.parts.put(kind, value)
+    }
+
+    fn get(&self, part: &PartRef) -> Result<serde_json::Value, String> {
+        let pending = self.deployment.has_pending_keys();
+        self.parts.get(part).map_err(|error| {
+            if error == "setup part missing" && pending {
+                SETUP_KEY_UNAVAILABLE.into()
+            } else {
+                error
+            }
+        })
+    }
+
+    fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {
+        self.parts.unstored()
+    }
+
+    fn mark_stored(&mut self, parts: &[PartRef]) {
+        self.parts.mark_stored(parts);
+    }
+
+    fn decoded(&self) -> Option<DecodedParts> {
+        self.parts.decoded()
+    }
+
+    fn usage(&self) -> Option<PartsUsage> {
+        self.parts.usage()
+    }
+}
+
 impl StoreRuntime {
     /// The runtime for the session store under `state_root`, its three class roots (see
     /// [`StorageClass::store_dir`]), with its deployment key loaded. Loads every setup part each
@@ -127,8 +193,9 @@ impl StoreRuntime {
             idle_ttl,
         )
         .await?;
-        let parts = runtime.encrypted_parts(&deployment)?;
-        runtime.install_key(deployment, parts)?;
+        if !runtime.deployment.install(deployment) {
+            return Err("the deployment key offered has not loaded".into());
+        }
         Ok(runtime)
     }
 
@@ -146,13 +213,20 @@ impl StoreRuntime {
         crate::store_import_stage::clear_import_staging(state_root).map_err(|error| {
             format!("the new storage's import staging could not be cleared: {error}")
         })?;
+        let deployment = Arc::new(DeploymentKey::unloaded(key_id).creating(new_sessions));
         let mut roots = Vec::with_capacity(StorageClass::ALL.len());
         for class in StorageClass::ALL {
             let backend = LocalBackend::new(class.store_root(state_root));
             recovery_index::prepare(&class.store_root(state_root))
                 .map_err(|error| format!("prepare {class} recovery candidates: {error}"))?;
             roots.push(RootParts {
-                parts: SharedParts::new(Box::new(DeploymentParts::default())),
+                parts: SharedParts::new(Box::new(EncryptedParts {
+                    parts: DeploymentParts::stored(Arc::new(EncryptedSetupSource {
+                        backend: LocalBackend::new(class.store_root(state_root)),
+                        deployment: Arc::clone(&deployment),
+                    })),
+                    deployment: Arc::clone(&deployment),
+                })),
                 plain_parts: SharedParts::new(Box::new(DeploymentParts::stored(Arc::new(
                     SetupSource {
                         backend,
@@ -168,8 +242,7 @@ impl StoreRuntime {
             state_root: state_root.to_path_buf(),
             key_id,
             new_sessions,
-            deployment: OnceLock::new(),
-            unloaded: Arc::new(DeploymentKey::unloaded(key_id).creating(new_sessions)),
+            deployment,
             roots,
             executor,
             idle_ttl,
@@ -202,66 +275,17 @@ impl StoreRuntime {
         })
     }
 
-    /// The encrypted sessions' setup parts of each class root, by [`StorageClass::index`], read
-    /// from the root's setup store under `deployment`, which must have loaded. Nothing is read
-    /// until a session names a part.
-    fn encrypted_parts(&self, deployment: &DeploymentKey) -> Result<Vec<DeploymentParts>, String> {
-        StorageClass::ALL
-            .iter()
-            .map(|class| {
-                let key = deployment
-                    .setup_key_for(Cipher::XChaCha20Poly1305)
-                    .ok_or("the deployment key offered has not loaded")?;
-                Ok(DeploymentParts::stored(Arc::new(SetupSource {
-                    backend: self.backend(*class),
-                    key,
-                })))
-            })
-            .collect()
-    }
-
-    /// Installs the deployment key and the encrypted sessions' setup parts read under it, one
-    /// per class root, so encrypted sessions are served from now on. The parts go in first:
-    /// whoever sees the key installed finds them. A runtime keeps the first key installed.
-    fn install_key(
-        &self,
-        deployment: DeploymentKey,
-        parts: Vec<DeploymentParts>,
-    ) -> Result<(), String> {
-        if deployment.id() != self.key_id {
-            return Err(format!(
-                "deployment key {} was offered for the new storage, which is opened with key {}",
-                deployment.id(),
-                self.key_id
-            ));
-        }
-        if self.key_loaded() {
-            return Ok(());
-        }
-        for (root, parts) in self.roots.iter().zip(parts) {
-            *root
-                .parts
-                .0
-                .lock()
-                .map_err(|_| "a holder of the encrypted setup parts panicked")? = Box::new(parts);
-        }
-        let _ = self
-            .deployment
-            .set(Arc::new(deployment.creating(self.new_sessions)));
-        Ok(())
-    }
-
-    /// Whether the deployment key has loaded, so encrypted sessions are served.
+    /// Whether the configured deployment key has loaded, so new encrypted data can be written.
     pub fn key_loaded(&self) -> bool {
-        self.deployment.get().is_some()
+        self.deployment.is_loaded()
     }
 
     /// Installs `deployment` into a runtime opened without it, as the module's key loader does
     /// once the vault answers.
     #[cfg(test)]
     pub(crate) fn load_key_for_test(&self, deployment: DeploymentKey) -> Result<(), String> {
-        let parts = self.encrypted_parts(&deployment)?;
-        self.install_key(deployment, parts)
+        self.deployment.install(deployment);
+        Ok(())
     }
 
     /// The mode of the sessions this runtime creates.
@@ -275,21 +299,15 @@ impl StoreRuntime {
         self.new_sessions == Cipher::None || self.key_loaded()
     }
 
-    /// What sessions are opened and created with now: the deployment key once it has loaded,
-    /// and before that a stand-in that opens plain sessions only. Either creates sessions in
-    /// the mode `session_storage.encryption` chose ([`new_sessions`](Self::new_sessions)).
+    /// The live deployment keys for opening and creating sessions.
     pub fn deployment(&self) -> &DeploymentKey {
-        self.deployment_shared_ref()
+        &self.deployment
     }
 
     /// The deployment key as [`StoreRuntime::deployment`] gives it, shared, for what outlives a
     /// borrow of the runtime (an import's staging loads the session it publishes with it).
     pub fn deployment_shared(&self) -> Arc<DeploymentKey> {
-        Arc::clone(self.deployment_shared_ref())
-    }
-
-    fn deployment_shared_ref(&self) -> &Arc<DeploymentKey> {
-        self.deployment.get().unwrap_or(&self.unloaded)
+        Arc::clone(&self.deployment)
     }
 
     /// Reads file-source imports from `roots` (`import.roots` in `broca.jsonc`, loaded at
@@ -398,7 +416,7 @@ impl StoreRuntime {
         self
     }
 
-    /// The id of the deployment key this runtime opens encrypted sessions with.
+    /// The id of the deployment key configured for writes.
     pub fn key_id(&self) -> u16 {
         self.key_id
     }
@@ -1188,14 +1206,7 @@ impl StoreRuntime {
         drop(timing);
         // The session reads and stores its setup parts in its own root and mode.
         let cipher = session.head().cipher();
-        let setup_key = self
-            .deployment()
-            .setup_key_for(cipher)
-            .ok_or_else(|| key_unavailable(self.key_id))?;
-        let storage = SetupParts {
-            backend: self.backend(class),
-            key: setup_key,
-        };
+        self.check_recovery_setup(class, cipher, &session.operations)?;
         let mut actor = StoreActor::new(
             key.clone(),
             session,
@@ -1203,7 +1214,7 @@ impl StoreRuntime {
             Box::new(self.parts_for(class, cipher).clone()),
         )
         .with_recovery_index(class.store_root(&self.state_root))
-        .with_storage(storage)
+        .with_deployment_storage(self.backend(class), self.deployment_shared(), cipher)
         .with_class_placement(class, registry.backup_classes())
         .with_settled(Arc::clone(&self.settled))
         // A send's attachments are uploaded beside the session, under the state root, whichever
@@ -1265,6 +1276,35 @@ impl StoreRuntime {
             run_in_flight,
             first_episode,
         })
+    }
+
+    fn check_recovery_setup(
+        &self,
+        class: StorageClass,
+        cipher: Cipher,
+        operations: &broca_session_store::fold::operations::Operations,
+    ) -> Result<(), OpenError> {
+        if cipher == Cipher::XChaCha20Poly1305 && self.deployment.has_pending_keys() {
+            if let Some(start) = operations
+                .run
+                .as_ref()
+                .filter(|run| run.finished.is_none())
+                .and_then(|run| run.start.as_ref())
+            {
+                // Don't start recovery of an unfinished run if a granted key may still unlock
+                // the setup it froze. Once every key has loaded, the usual damage path applies.
+                for part in &start.setup {
+                    if self
+                        .parts_for(class, cipher)
+                        .get(part)
+                        .is_err_and(|error| error == SETUP_KEY_UNAVAILABLE)
+                    {
+                        return Err(stored_key_unavailable());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1424,9 +1464,7 @@ impl StoreSlot {
         Ok(())
     }
 
-    /// Installs `deployment` into the runtime, opening the runtime `setup` describes first when
-    /// none is open, so every session kept here is served from now on. `deployment` must be the
-    /// key this slot names. The first key installed stays: a second load changes nothing.
+    /// Installs the configured key, opening the runtime first when necessary.
     pub async fn load(
         &self,
         setup: &StoreRuntimeSetup,
@@ -1439,16 +1477,23 @@ impl StoreSlot {
                 self.key_id
             ));
         }
-        if self.key_loaded() {
-            return Ok(());
-        }
+        self.load_read_key(setup, deployment).await
+    }
+
+    /// Installs a readable deployment key. The first value for an id stays; loading another
+    /// id does not enable new encrypted sessions.
+    pub async fn load_read_key(
+        &self,
+        setup: &StoreRuntimeSetup,
+        deployment: DeploymentKey,
+    ) -> Result<(), String> {
         self.open_without_key(setup).await?;
         let runtime = self.runtime().expect("the runtime was just opened");
-        let parts = runtime.encrypted_parts(&deployment)?;
         // Installed under the lock `holding` records refusals under, so a session refused just
         // before the key arrived is in the set `take_refused` returns afterwards.
         let _refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
-        runtime.install_key(deployment, parts)
+        runtime.deployment.install(deployment);
+        Ok(())
     }
 
     /// The runtime when the session store keeps the session `key`; `None` for a session it
@@ -1463,14 +1508,19 @@ impl StoreSlot {
             return Ok(None);
         };
         if let Some(runtime) = self.runtime.get() {
-            if runtime.key_loaded() || stored_cipher(&self.state_root, class, key)? == Cipher::None
+            if runtime.deployment.has_loaded_keys()
+                || stored_cipher(&self.state_root, class, key)? == Cipher::None
             {
                 return Ok(Some(Arc::clone(runtime)));
             }
         }
         let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
         // The key may have loaded since the check above; `load` installs it under this lock.
-        if let Some(runtime) = self.runtime.get().filter(|runtime| runtime.key_loaded()) {
+        if let Some(runtime) = self
+            .runtime
+            .get()
+            .filter(|runtime| runtime.deployment.has_loaded_keys())
+        {
             return Ok(Some(Arc::clone(runtime)));
         }
         refused.insert(key.clone());
@@ -1481,6 +1531,13 @@ impl StoreSlot {
     pub fn take_refused(&self) -> Vec<BindIdentity> {
         let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
         refused.drain().collect()
+    }
+
+    pub fn remember_refused(&self, key: &BindIdentity) {
+        self.refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
     }
 }
 
@@ -1503,6 +1560,21 @@ pub fn key_unavailable(key_id: u16) -> OpenError {
         ),
         class: broca_protocol::ErrorClass::Transient,
     }
+}
+
+pub(crate) fn stored_key_unavailable() -> OpenError {
+    OpenError::Classified {
+        reason: "key_unavailable: the deployment key that locked the stored data has not loaded yet; retry once it has".into(),
+        class: broca_protocol::ErrorClass::Transient,
+    }
+}
+
+pub(crate) fn needs_deployment_key(error: &SessionError) -> bool {
+    use broca_session_store::head::HeadError;
+    matches!(
+        error,
+        SessionError::Head(HeadError::NotLoaded | HeadError::NoKey)
+    )
 }
 
 /// Whether `error` is the [`key_unavailable`] refusal. [`StoreSlot::holding`] records every
@@ -1563,6 +1635,9 @@ fn recovery_changes_reads(view: &Session<LocalBackend>) -> bool {
 
 /// A view that couldn't be loaded, as the opener reports it.
 pub(crate) fn view_error(error: SessionError) -> OpenError {
+    if needs_deployment_key(&error) {
+        return stored_key_unavailable();
+    }
     match error {
         SessionError::SessionMoving { cut_id } => OpenError::SessionMoving { cut_id },
         SessionError::SessionMoved { holder } => OpenError::SessionMoved { holder },
@@ -1611,6 +1686,9 @@ pub fn triple(key: &BindIdentity) -> SessionTriple {
 }
 
 fn open_error(error: SessionError, create: bool) -> OpenError {
+    if needs_deployment_key(&error) {
+        return stored_key_unavailable();
+    }
     match error {
         SessionError::SessionMoving { cut_id } => return OpenError::SessionMoving { cut_id },
         SessionError::SessionMoved { holder } => return OpenError::SessionMoved { holder },

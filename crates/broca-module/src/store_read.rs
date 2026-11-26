@@ -807,6 +807,9 @@ fn empty_page() -> SessionReadPage {
 /// A store read that failed. Only a backend failure is worth a retry: anything else is the
 /// session's stored bytes or state being wrong, which reading again won't change.
 pub(crate) fn read_failed(error: SessionError) -> crate::serve::ServeError {
+    if crate::store_open::needs_deployment_key(&error) {
+        return crate::store_open::stored_key_unavailable().into();
+    }
     let class = match error {
         SessionError::Backend(_) => broca_protocol::ErrorClass::Transient,
         _ => broca_protocol::ErrorClass::Permanent,
@@ -821,6 +824,9 @@ pub(crate) fn read_failed(error: SessionError) -> crate::serve::ServeError {
 fn refused(error: StoreReadError) -> crate::serve::ServeError {
     match error {
         StoreReadError::Session(error) => read_failed(error),
+        StoreReadError::Setup(error) if error == crate::store_open::SETUP_KEY_UNAVAILABLE => {
+            crate::store_open::stored_key_unavailable().into()
+        }
         other => crate::serve::ServeError::Open(
             format!("the session's stored facts can't be read: {other:?}"),
             Some(broca_protocol::ErrorClass::Permanent),

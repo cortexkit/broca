@@ -367,7 +367,15 @@ impl Driver {
         let divergence = if op == Op::Diverged {
             match self.incoming(reference, cut, op).await {
                 Ok(incoming) if streamless => Some(
-                    match same_files(&incoming.bytes, &export, &addr, runtime.deployment()) {
+                    match same_files(
+                        &incoming.bytes,
+                        &backend,
+                        &addr,
+                        (class.name(), version),
+                        runtime.deployment(),
+                    )
+                    .await
+                    {
                         Ok(true) => LocalDivergence::AtCut,
                         Ok(false) => LocalDivergence::Advanced,
                         Err(cause) => {
@@ -485,17 +493,24 @@ pub(super) fn unreadable_divergence(reference: &str, session: &BindIdentity) -> 
     }
 }
 
-/// Whether the cut in `stream` holds exactly the session files `local` pins, in the same
+/// Whether the cut in `stream` holds exactly the files the local version pins, in the same
 /// storage class: the comparison import makes before it refuses a local copy as advanced.
-fn same_files(
+async fn same_files(
     stream: &[u8],
-    local: &Export,
+    store: &LocalBackend,
     addr: &SessionAddr,
+    (class, version): (&str, broca_session_store::backend::Version),
     deployment: &broca_session_store::keys::DeploymentKey,
 ) -> Result<bool, String> {
     let frame = moves::last_export(stream).map_err(|error| format!("{error:?}"))?;
     let incoming = Export::decode(frame, addr, deployment).map_err(|error| format!("{error:?}"))?;
-    Ok(incoming.header.class == local.header.class && incoming.files == local.files)
+    if incoming.header.class != class {
+        return Ok(false);
+    }
+    incoming
+        .matches_pinned(store, addr, version, deployment)
+        .await
+        .map_err(|error| format!("{error:?}"))
 }
 
 async fn exported_next_seq(

@@ -456,3 +456,36 @@ fn stream_frames_skip_old_exports_and_preserve_partial_admission_tails() {
         assert!(last_export(&[second.as_slice(), b"trailing"].concat()).is_err());
     });
 }
+
+#[test]
+fn a_pinned_move_preserves_its_setup_names_after_another_key_loads() {
+    block_on(async {
+        let source = Root::new();
+        let store = LocalBackend::new(&source.0);
+        let old = DeploymentKey::new(7, &[4; 32]);
+        let session = history(&store, &old).await;
+        let version = session.position().version;
+        let cut = Export::pinned(&store, &addr(), version, "durable", &old)
+            .await
+            .unwrap();
+        let shared = DeploymentKey::new(9, &[8; 32]);
+        shared.install(old);
+        SetupStore::new(&store, &shared.setup_key())
+            .put(PartKind::SystemText, b"synthetic system")
+            .await
+            .unwrap();
+        let fresh = Export::pinned(&store, &addr(), version, "durable", &shared)
+            .await
+            .unwrap();
+        assert_ne!(
+            fresh.files.keys().collect::<Vec<_>>(),
+            cut.files.keys().collect::<Vec<_>>()
+        );
+        let decoded = Export::decode(&cut.encode(), &addr(), &shared).unwrap();
+        decoded.validate(&addr(), &shared).await.unwrap();
+        assert!(decoded
+            .matches_pinned(&store, &addr(), version, &shared)
+            .await
+            .unwrap());
+    });
+}

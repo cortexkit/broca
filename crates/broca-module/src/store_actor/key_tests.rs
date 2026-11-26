@@ -649,3 +649,243 @@ fn holds_cost_on_a_root_without_the_new_storage() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+const OTHER_ID: u16 = 9;
+
+fn other_deployment() -> DeploymentKey {
+    DeploymentKey::new(OTHER_ID, &[0x49; 32])
+}
+
+async fn held_by_other_key(module: &Module) -> BindIdentity {
+    let key = BindIdentity::new(module.dir.join("project"), "store-actor", "paired");
+    Session::create(
+        LocalBackend::new(module.dir.join(broca_records::SESSION_STORAGE_DIR)),
+        SessionAddr(broca_core::session_addr(&key)),
+        triple(&key),
+        &other_deployment(),
+        false,
+    )
+    .await
+    .unwrap();
+    key
+}
+
+#[tokio::test]
+async fn sessions_setup_parts_and_expiry_markers_open_under_both_deployment_keys() {
+    use broca_records::session_storage::StorageClass;
+    use broca_session_loop::parts::Parts as _;
+    use broca_session_store::{expired, keys::random_id, record::PartKind, setup::SetupStore};
+
+    let module = module("mixed-keys", None).await;
+    let paired = held_by_other_key(&module).await;
+    let root = StorageClass::Ordinary.store_root(&module.dir);
+    let backend = LocalBackend::new(&root);
+    let configured = DeploymentKey::new(1, &KEY);
+    let other = other_deployment();
+    let mut parts = Vec::new();
+    for (key, bytes) in [(&configured, b"[1]"), (&other, b"[9]")] {
+        let (part, _) = SetupStore::new(&backend, &key.setup_key())
+            .put(PartKind::Tools, bytes)
+            .await
+            .unwrap();
+        parts.push((
+            part,
+            serde_json::from_slice::<serde_json::Value>(bytes).unwrap(),
+        ));
+    }
+    let expiry_root = StorageClass::Ephemeral.store_root(&module.dir);
+    for (key, session) in [(&configured, &module.held), (&other, &paired)] {
+        expired::write(
+            &expiry_root,
+            &SessionAddr(broca_core::session_addr(session)),
+            &random_id(),
+            expired::Marker {
+                format: 1,
+                triple: triple(session),
+                expired_at_ms: 100,
+                seq: 0,
+                next_tag: 1,
+                next_notice_seq: 1,
+                runs: vec![],
+                history_version: None,
+                policy_deleted: None,
+            },
+            Cipher::XChaCha20Poly1305,
+            key,
+        )
+        .unwrap();
+    }
+    module.load_key().await;
+    load_discovered(&module).await;
+    let runtime = module.slot.runtime().unwrap();
+    for (part, value) in parts {
+        assert_eq!(
+            runtime
+                .parts_for(StorageClass::Ordinary, Cipher::XChaCha20Poly1305)
+                .get(&part)
+                .unwrap(),
+            value
+        );
+    }
+    for session in [&module.held, &paired] {
+        let marks = runtime
+            .expiry_markers(session)
+            .expect("both expiry markers open");
+        assert_eq!(marks[0].triple, triple(session));
+        // These fixtures use a different expiry root from the live head.
+        module
+            .registry
+            .actor_for(session)
+            .await
+            .expect("both sessions open");
+    }
+}
+
+#[tokio::test]
+async fn new_sessions_and_setup_parts_use_the_configured_deployment_key() {
+    use broca_records::session_storage::StorageClass;
+    use broca_session_store::{backend::SessionBackend as _, setup::SetupStore};
+
+    let module = module("configured-write-key", None).await;
+    let paired = held_by_other_key(&module).await;
+    module.slot.open_without_key(&module.setup).await.unwrap();
+    load_discovered(&module).await;
+    let runtime = module.slot.runtime().unwrap();
+    assert!(
+        module.registry.actor_for(&paired).await.is_ok(),
+        "loading an old key permits opening its sessions"
+    );
+    assert!(
+        !runtime.can_create(),
+        "an old key must not enable new encrypted sessions"
+    );
+    module.load_key().await;
+    let new = &module.absent;
+    let outcome = module
+        .registry
+        .route_submission_with_class(
+            new,
+            RunId("new".into()),
+            request("a new setup"),
+            RunKind::FreshOrResume,
+            SendKey::Minted,
+            false,
+            broca_protocol::Delivery::Queue,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::registry::HEAD_SESSION_CLASS.into()),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, SendOutcome::Active { .. }));
+    let backend = LocalBackend::new(StorageClass::Durable.store_root(&module.dir));
+    let addr = SessionAddr(broca_core::session_addr(new));
+    let configured = DeploymentKey::new(1, &KEY);
+    let configured_setup = configured.setup_key();
+    broca_test_support::wait_until("the new run to persist setup parts", || async {
+        match backend.list_setup().await {
+            Ok(parts) if !parts.is_empty() => Ok(()),
+            _ => Err("no durable setup parts yet".to_owned()),
+        }
+    })
+    .await;
+    let (head, _) = backend.read_stored_head(&addr).unwrap().unwrap();
+    broca_session_store::head::open(&head, &configured)
+        .expect("new sessions use the configured key");
+    assert!(
+        !SetupStore::new(&backend, &configured_setup)
+            .load_all()
+            .await
+            .unwrap()
+            .is_empty(),
+        "new parts are sealed and named with the configured key"
+    );
+}
+
+#[tokio::test]
+async fn restore_opens_a_retained_head_wrapped_by_the_other_deployment_key() {
+    use broca_records::session_storage::StorageClass;
+    use broca_session_store::{backend::SessionBackend as _, head, keys, session::restore::*};
+
+    let module = module("other-key-retained-head", None).await;
+    let paired = held_by_other_key(&module).await;
+    let backend = LocalBackend::new(StorageClass::Ordinary.store_root(&module.dir));
+    let addr = SessionAddr(broca_core::session_addr(&paired));
+    let configured = DeploymentKey::new(1, &KEY);
+    let (old, old_version) = backend.read_stored_head(&addr).unwrap().unwrap();
+    let (mut current, data) = head::open(&old, &other_deployment()).unwrap();
+    current.keys[0].deployment = 1;
+    current.keys[0].wrapped.0 = keys::wrap(&configured, &current.session_id, &data).unwrap();
+    // Synthesize an incomplete backup: the current head names a log that was not copied.
+    current.open_log.as_mut().unwrap().change = keys::random_id();
+    let current_version = old_version + 1;
+    backend
+        .write_head(
+            &addr,
+            &head::seal(&current, &data),
+            Some(old_version),
+            current_version,
+        )
+        .await
+        .unwrap();
+
+    module.load_key().await;
+    load_discovered(&module).await;
+    let runtime = module.slot.runtime().unwrap();
+    assert_eq!(
+        restore(&backend, &addr, runtime.deployment(), 42)
+            .await
+            .unwrap(),
+        Restored::Repaired {
+            from: current_version,
+            to: old_version,
+            written: Some(current_version + 1),
+            cut: None
+        },
+    );
+    let (restored, _) = backend.read_stored_head(&addr).unwrap().unwrap();
+    head::open(&restored, &other_deployment()).expect("restore must not rewrap the retained head");
+}
+
+async fn load_discovered(module: &Module) {
+    module
+        .slot
+        .load_read_key(&module.setup, other_deployment())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_encrypted_setup_miss_is_only_retryable_while_a_granted_key_is_pending() {
+    use broca_records::session_storage::StorageClass;
+    use broca_session_loop::parts::Parts as _;
+    use broca_session_store::{
+        record::{PartKind, PartRef},
+        setup::digest,
+    };
+
+    let module = module("pending-setup-key", None).await;
+    module.load_key().await;
+    let runtime = module.slot.runtime().unwrap();
+    let mut parts = runtime
+        .parts_for(StorageClass::Ordinary, Cipher::XChaCha20Poly1305)
+        .clone();
+    let missing = PartRef {
+        kind: PartKind::Tools,
+        digest: digest(b"missing"),
+    };
+    assert_eq!(parts.get(&missing).unwrap_err(), "setup part missing");
+    runtime.deployment().set_granted([1, OTHER_ID].into());
+    assert_eq!(
+        parts.get(&missing).unwrap_err(),
+        crate::store_open::SETUP_KEY_UNAVAILABLE
+    );
+    parts
+        .put(PartKind::Tools, &serde_json::json!(["new value"]))
+        .expect("a pending old key does not block new parts");
+    load_discovered(&module).await;
+    assert_eq!(parts.get(&missing).unwrap_err(), "setup part missing");
+}

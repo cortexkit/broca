@@ -56,6 +56,7 @@ pub const PLAIN_PREFIX: &str = "plain/";
 const CACHE_CAP: usize = 4096;
 
 /// The deployment's setup-store keys for one cipher mode: one to name parts, one to seal them.
+#[derive(Clone)]
 pub struct SetupKey {
     naming: [u8; 32],
     cipher: FrameKey,
@@ -125,6 +126,75 @@ impl From<BackendError> for SetupError {
     }
 }
 
+#[derive(Debug)]
+pub enum LookupError {
+    KeyUnavailable,
+    Store(SetupError),
+}
+
+/// A reader for setup references, which store the content digest but not the deployment id.
+/// Writers still use a single `SetupStore` with the configured key.
+pub struct SetupReader<'a, B: SessionBackend> {
+    backend: &'a B,
+    keys: Vec<Arc<SetupKey>>,
+    pending: bool,
+    cache: Mutex<HashMap<Digest, Arc<[u8]>>>,
+}
+
+impl<'a, B: SessionBackend> SetupReader<'a, B> {
+    pub fn new(
+        backend: &'a B,
+        deployment: &crate::keys::DeploymentKey,
+        cipher: crate::keys::Cipher,
+    ) -> Self {
+        let (keys, pending) = deployment.setup_keys(cipher);
+        Self {
+            backend,
+            keys,
+            pending,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn get(&self, part: &PartRef) -> Result<Arc<[u8]>, LookupError> {
+        match self.read(&part.digest).await? {
+            Some(bytes) => Ok(bytes),
+            None => Err(LookupError::Store(SetupError::Missing(part.clone()))),
+        }
+    }
+
+    pub async fn read(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, LookupError> {
+        if let Some(bytes) = self.cache.lock().unwrap().get(digest).cloned() {
+            return Ok(Some(bytes));
+        }
+        for key in &self.keys {
+            let name = key.name(digest);
+            let Some(sealed) = self
+                .backend
+                .get_setup(&name)
+                .await
+                .map_err(|e| LookupError::Store(e.into()))?
+            else {
+                continue;
+            };
+            let bytes: Arc<[u8]> = open_part(key, &name, &sealed, digest)
+                .ok_or(LookupError::Store(SetupError::CorruptStored(name)))?
+                .into();
+            let mut cache = self.cache.lock().unwrap();
+            if cache.len() >= CACHE_CAP {
+                cache.clear();
+            }
+            cache.insert(*digest, bytes.clone());
+            return Ok(Some(bytes));
+        }
+        if self.pending {
+            Err(LookupError::KeyUnavailable)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 /// The SHA-256 a part is named by in records.
 pub fn digest(bytes: &[u8]) -> Digest {
     Digest(Sha256::digest(bytes).into())
@@ -134,6 +204,12 @@ fn aad(name: &str) -> Vec<u8> {
     let mut aad = AAD_CONTEXT.to_vec();
     aad.extend_from_slice(name.as_bytes());
     aad
+}
+
+fn open_part(key: &SetupKey, name: &str, sealed: &[u8], expected: &Digest) -> Option<Vec<u8>> {
+    key.cipher
+        .open_unit(&aad(name), sealed)
+        .filter(|bytes| digest(bytes) == *expected)
 }
 
 /// Reads and writes the deployment's setup parts, caching them only for this instance.
@@ -207,11 +283,7 @@ impl<'a, B: SessionBackend> SetupStore<'a, B> {
             .get_setup(&name)
             .await?
             .ok_or_else(|| SetupError::Missing(part.clone()))?;
-        let bytes = self
-            .key
-            .cipher
-            .open_unit(&aad(&name), &sealed)
-            .filter(|bytes| digest(bytes) == part.digest)
+        let bytes = open_part(self.key, &name, &sealed, &part.digest)
             .ok_or_else(|| SetupError::Corrupt(part.clone()))?;
         let bytes: Arc<[u8]> = bytes.into();
         self.remember(part.digest, bytes.clone());

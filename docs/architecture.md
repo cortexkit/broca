@@ -32,7 +32,9 @@ afterward. Runs end with a durable `RunEnd`, or stop at a `Pause`.
 **Session store** (`broca-session-store`). Each session has a head (its current
 version), append-only logs and immutable parts, under a folder named by an address
 derived from the triple. An encrypted session has its own data key, protected by
-a deployment key broca reads from the vault. A random lineage id distinguishes a continued log from a recreated one. Only the
+the deployment key that created it. broca loads the deployment keys it has read grants for
+and uses its configured key for new sessions. A random lineage id distinguishes a continued
+log from a recreated one. Only the
 lease holder writes. History behind the compaction view is sealed into segments
 and read back on demand. See [the session store](session-store.md).
 

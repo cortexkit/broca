@@ -191,6 +191,29 @@ impl<L: LeaseStore + 'static> DefaultOpener<L> {
         session_class: Option<String>,
         status: bool,
     ) -> Result<ActorHandle, OpenError> {
+        self.open_mode_inner(key, gen, registry, retention, session_class, status)
+            .await
+            .inspect_err(|error| {
+                if crate::store_open::is_key_unavailable(error)
+                    && self
+                        .store
+                        .runtime()
+                        .is_some_and(|runtime| runtime.holds(key).unwrap_or(false))
+                {
+                    self.store.remember_refused(key);
+                }
+            })
+    }
+
+    async fn open_mode_inner(
+        &self,
+        key: &LineageKey,
+        gen: u64,
+        registry: RegistryHandle,
+        retention: Option<u64>,
+        session_class: Option<String>,
+        status: bool,
+    ) -> Result<ActorHandle, OpenError> {
         let slot = &self.store;
         debug_assert!(
             key.validate_keyable().is_ok(),

@@ -49,7 +49,7 @@ use crate::record::{
     EnrolledEntries, ImportReceipt, ImportedIdMap, ImportedIds, MediaObject, PartRef, Record,
 };
 use crate::segment::Segment;
-use crate::setup::{SetupError, SetupKey, SetupStore};
+use crate::setup::{LookupError, SetupError, SetupReader};
 
 /// What restore did for one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,13 +145,19 @@ struct Pinned<'a, B: SessionBackend> {
     store: &'a B,
     head: &'a [u8],
     version: Version,
-    capture: Option<&'a Mutex<BTreeMap<String, Vec<u8>>>>,
+    capture: Option<Capture<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct Capture<'a> {
+    files: &'a Mutex<BTreeMap<String, Vec<u8>>>,
+    setup_from: Option<&'a BTreeMap<String, Vec<u8>>>,
 }
 
 impl<B: SessionBackend> Pinned<'_, B> {
     fn capture(&self, name: String, bytes: &[u8]) {
         if let Some(files) = self.capture {
-            files.lock().unwrap().insert(name, bytes.to_vec());
+            files.files.lock().unwrap().insert(name, bytes.to_vec());
         }
     }
 }
@@ -280,12 +286,21 @@ impl<B: SessionBackend> SessionBackend for Pinned<'_, B> {
         Err(read_only())
     }
     async fn get_setup(&self, name: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        let path = match name.strip_prefix(crate::setup::PLAIN_PREFIX) {
+            Some(hex) => format!("setup-plain/{hex}"),
+            None => format!("setup/{name}"),
+        };
+        // When checking a durable move, use its original setup names. A second copy of a
+        // part may have become readable since the stream was built, without changing the cut.
+        if self
+            .capture
+            .and_then(|capture| capture.setup_from)
+            .is_some_and(|files| !files.contains_key(&path))
+        {
+            return Ok(None);
+        }
         let bytes = self.store.get_setup(name).await?;
         if let Some(bytes) = &bytes {
-            let path = match name.strip_prefix(crate::setup::PLAIN_PREFIX) {
-                Some(hex) => format!("setup-plain/{hex}"),
-                None => format!("setup/{name}"),
-            };
             self.capture(path, bytes);
         }
         Ok(bytes)
@@ -375,7 +390,7 @@ struct Objects<'a, B: SessionBackend> {
     store: &'a B,
     addr: &'a SessionAddr,
     key: &'a DataKey,
-    setup: SetupStore<'a, B>,
+    setup: SetupReader<'a, B>,
 }
 
 impl<B: SessionBackend> Objects<'_, B> {
@@ -408,11 +423,14 @@ impl<B: SessionBackend> Objects<'_, B> {
             }
             Named::Setup(part) => match self.setup.get(part).await {
                 Ok(_) => Ok(None),
-                Err(SetupError::Missing(_) | SetupError::Corrupt(_)) => {
+                Err(LookupError::Store(SetupError::Missing(_) | SetupError::Corrupt(_))) => {
                     Ok(Some(format!("setup part {}", hex(&part.digest.0))))
                 }
-                Err(SetupError::Backend(error)) => Err(error.into()),
-                Err(SetupError::CorruptStored(name)) => Ok(Some(format!("setup part {name}"))),
+                Err(LookupError::Store(SetupError::Backend(error))) => Err(error.into()),
+                Err(LookupError::Store(SetupError::CorruptStored(_))) => {
+                    Ok(Some(format!("setup part {}", hex(&part.digest.0))))
+                }
+                Err(LookupError::KeyUnavailable) => Err(Stop::Error(RestoreError::KeyUnavailable)),
             },
             Named::Import(ids) => {
                 let map = super::import::id_map_name(ids);
@@ -493,12 +511,14 @@ async fn check_version<B: SessionBackend>(
     deployment: &DeploymentKey,
     bytes: &[u8],
     position: (Version, bool),
-    capture: Option<&Mutex<BTreeMap<String, Vec<u8>>>>,
+    capture: Option<Capture<'_>>,
 ) -> Result<Complete, Stop> {
     let (version, current) = position;
     let (head, key) = match head::open(bytes, deployment) {
         Ok(opened) => opened,
-        Err(HeadError::NotLoaded) => return Err(Stop::Error(RestoreError::KeyUnavailable)),
+        Err(HeadError::NotLoaded | HeadError::NoKey) => {
+            return Err(Stop::Error(RestoreError::KeyUnavailable));
+        }
         Err(error) => return Err(refused(format!("its head doesn't open: {error:?}"))),
     };
     match head.residence {
@@ -554,14 +574,11 @@ async fn check_version<B: SessionBackend>(
     };
     let checkpoint = Checkpoint::decode(&read.checkpoint)
         .map_err(|error| refused(format!("its checkpoint doesn't decode: {error:?}")))?;
-    let setup_key: SetupKey = deployment
-        .setup_key_for(head.cipher())
-        .ok_or(Stop::Error(RestoreError::KeyUnavailable))?;
     let objects = Objects {
         store,
         addr,
         key: &key,
-        setup: SetupStore::new(store, &setup_key),
+        setup: SetupReader::new(store, deployment, head.cipher()),
     };
     // What the checkpoint's state names was written before the change that wrote the
     // checkpoint.
@@ -689,6 +706,7 @@ pub(super) async fn reachable<B: SessionBackend>(
     deployment: &DeploymentKey,
     bytes: &[u8],
     version: Version,
+    setup_from: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> Result<(BTreeMap<String, Vec<u8>>, Option<Finding>), RestoreError> {
     let files = Mutex::new(BTreeMap::new());
     let finding = match check_version(
@@ -697,7 +715,10 @@ pub(super) async fn reachable<B: SessionBackend>(
         deployment,
         bytes,
         (version, false),
-        Some(&files),
+        Some(Capture {
+            files: &files,
+            setup_from,
+        }),
     )
     .await
     {

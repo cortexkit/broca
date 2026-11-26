@@ -694,6 +694,12 @@ impl KeptHeads {
 /// session's stored bytes or state being wrong, which reading again won't change.
 pub(crate) fn head_failed(error: StoreHeadError) -> crate::serve::ServeError {
     use broca_protocol::ErrorClass;
+    if matches!(&error, StoreHeadError::Session(error) | StoreHeadError::Read(crate::store_read::StoreReadError::Session(error))
+        if crate::store_open::needs_deployment_key(error))
+        || matches!(&error, StoreHeadError::Setup(error) if error == crate::store_open::SETUP_KEY_UNAVAILABLE)
+    {
+        return crate::store_open::stored_key_unavailable().into();
+    }
     let class =
         match &error {
             StoreHeadError::Session(SessionError::Backend(_))
@@ -719,8 +725,14 @@ fn frozen_manifest(
     start: &RunStart,
     parts: &dyn Parts,
 ) -> Result<Option<std::sync::Arc<broca_records::record::PlanManifest>>, StoreHeadError> {
-    broca_session_loop::run::frozen_manifest(start, parts)
-        .map_err(|error| StoreHeadError::Setup(format!("run {}: {error:?}", start.run_id)))
+    broca_session_loop::run::frozen_manifest(start, parts).map_err(|error| match error {
+        broca_session_loop::LoopError::Parts(reason)
+            if reason == crate::store_open::SETUP_KEY_UNAVAILABLE =>
+        {
+            StoreHeadError::Setup(reason)
+        }
+        error => StoreHeadError::Setup(format!("run {}: {error:?}", start.run_id)),
+    })
 }
 
 /// The model a run start ran, with the variant its send named, read from the run's config: an
@@ -765,8 +777,15 @@ fn read_render_config<T>(
     else {
         return Ok(None);
     };
-    let config = broca_session_loop::parts::shared::<serde_json::Value, _>(parts, part)
-        .map_err(|error| StoreHeadError::Setup(format!("run {}: {error}", start.run_id)))?;
+    let config = broca_session_loop::parts::shared::<serde_json::Value, _>(parts, part).map_err(
+        |error| {
+            if error == crate::store_open::SETUP_KEY_UNAVAILABLE {
+                StoreHeadError::Setup(error)
+            } else {
+                StoreHeadError::Setup(format!("run {}: {error}", start.run_id))
+            }
+        },
+    )?;
     let config = start
         .render_config(config)
         .map_err(|error| StoreHeadError::Setup(error.to_string()))?;

@@ -542,3 +542,109 @@ async fn stopping_before_key_load_leaves_candidates_deferred_and_logs_once() {
     );
     assert!(rig.registry.stop_and_seal().await);
 }
+
+struct GrantedLater {
+    attempts: AtomicUsize,
+}
+
+fn scoped_rows(read: bool) -> broca_subc::vault::ScopedList {
+    serde_json::from_value(serde_json::json!({
+        "credentials": [{
+            "id": "opaque:broca-deployment:9", "categories": [], "type": "opaque",
+            "serves": [], "state": "active", "record_version": 1,
+            "operations": [if read { "read" } else { "status" }]
+        }],
+        "grants": 1, "grant_tuples": [], "view": if read { "new" } else { "old" }
+    }))
+    .unwrap()
+}
+
+#[async_trait]
+impl DeploymentKeySource for GrantedLater {
+    async fn read(&self, id: &str) -> broca_subc::VaultGet {
+        let byte = match id {
+            "opaque:broca-deployment:1" => "07",
+            "opaque:broca-deployment:9" if self.attempts.fetch_add(1, Ordering::SeqCst) != 0 => {
+                "09"
+            }
+            _ => return broca_subc::VaultGet::replied(Err(broca_subc::VaultError::NotFound)),
+        };
+        broca_subc::VaultGet::replied(Ok(broca_subc::VaultToken {
+            token: byte.repeat(32),
+            expires_at_ms: None,
+            record_version: 1,
+            project_id: None,
+            account_id: None,
+            resolved_credential_id: None,
+            hosts: None,
+            gateway: None,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_scoped_refresh_loads_a_newly_granted_session_key_without_restart() {
+    use crate::account_routing::ListingCache;
+    use broca_module::store_open::{is_key_unavailable, triple};
+    let rig = Rig::new("late-scoped-grant").await;
+    let key = BindIdentity::new(rig.root.join("project"), "runner", "from-other-computer");
+    let addr = SessionAddr(broca_core::session_addr(&key));
+    Session::create(
+        LocalBackend::new(StorageClass::Ordinary.store_root(&rig.root)),
+        addr,
+        triple(&key),
+        &DeploymentKey::new(9, &[9; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+    let listing = Arc::new(ListingCache::default());
+    listing.store(scoped_rows(false));
+    let source = Arc::new(GrantedLater {
+        attempts: AtomicUsize::new(0),
+    });
+    let mut loader = rig.loader(Some(source.clone()));
+    loader.backoff = Backoff {
+        first: Duration::from_millis(10),
+        max: Duration::from_millis(20),
+    };
+    let loading =
+        tokio::spawn(loader.run_following(rig.registry.clone(), listing.clone(), || async {}));
+    broca_test_support::wait_until("the configured key to load", || async {
+        rig.slot
+            .key_loaded()
+            .then_some(())
+            .ok_or_else(|| "configured key not loaded".into())
+    })
+    .await;
+    let error = rig
+        .registry
+        .actor_for(&key)
+        .await
+        .err()
+        .expect("an ungranted key cannot open its session");
+    assert!(is_key_unavailable(&error), "{error:?}");
+    assert_eq!(
+        source.attempts.load(Ordering::SeqCst),
+        0,
+        "a row without read is not fetched"
+    );
+    listing.store(scoped_rows(true));
+    broca_test_support::wait_until("the session to open after a listing refresh", || async {
+        rig.registry
+            .actor_for(&key)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    assert!(
+        source.attempts.load(Ordering::SeqCst) >= 2,
+        "the first scoped read is retried"
+    );
+    rig.registry.begin_stop();
+    tokio::time::timeout(broca_test_support::EVENT_HANG_GUARD, loading)
+        .await
+        .unwrap()
+        .unwrap();
+}

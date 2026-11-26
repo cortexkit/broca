@@ -12,8 +12,9 @@ use broca_session_store::{
 pub fn failure(error: moves::Error) -> ErrorBody {
     match error {
         moves::Error::DeploymentKeyMissing(id) => refusal("unavailable",
-            "The deployment key was not transferred, or broca's read grant was not added on this computer (grants do not travel). Transfer opaque:broca-deployment:1 from the source computer, then grant reserved:broca exact read on it on the receiver.",
+            format!("Deployment key {id} is not loaded on this computer. Transfer opaque:broca-deployment:{id} from the source computer if needed, then grant reserved:broca exact read on it on the receiver (grants do not travel)."),
             serde_json::json!({"reason":"deployment_key_missing", "key_id":id})),
+        moves::Error::SetupKeyUnavailable => unavailable(crate::store_open::SETUP_KEY_UNAVAILABLE),
         moves::Error::Invalid(reason) if reason.contains("format") => refusal("incompatible_version", "unsupported store export format", Value::Null),
         moves::Error::Invalid(reason) if reason.contains("SHA-256") => refusal("digest_mismatch", "store export file or frame digest differs", Value::Null),
         error => unavailable(format!("{error:?}")),
@@ -124,16 +125,11 @@ impl FileCutArtifacts {
                     ));
                 }
             }
-            let actual = Export::pinned(
-                &backend,
-                &addr,
-                version,
-                &export.header.class,
-                runtime.deployment(),
-            )
-            .await
-            .map_err(failure)?;
-            if actual.files != export.files {
+            if !export
+                .matches_pinned(&backend, &addr, version, runtime.deployment())
+                .await
+                .map_err(failure)?
+            {
                 return Err(unavailable("frozen source store bytes changed"));
             }
         } else if matches!(op, Op::Import | Op::Activate) {
@@ -170,16 +166,11 @@ impl FileCutArtifacts {
                             .is_none_or(|intent| intent.op != "activate") =>
                     {
                         let version = local.as_ref().unwrap().1;
-                        let actual = Export::pinned(
-                            &backend,
-                            &addr,
-                            version,
-                            &export.header.class,
-                            runtime.deployment(),
-                        )
-                        .await
-                        .map_err(failure)?;
-                        if actual.files != export.files {
+                        if !export
+                            .matches_pinned(&backend, &addr, version, runtime.deployment())
+                            .await
+                            .map_err(failure)?
+                        {
                             return Err(refusal(
                                 "local_advanced",
                                 "local store differs from incoming cut",
@@ -305,11 +296,11 @@ impl FileCutArtifacts {
                     .into_iter()
                     .find(|class| class.name() == export.header.class)
                     .unwrap();
-                let setup_key = runtime
-                    .deployment()
-                    .setup_key_for(export.header.cipher)
-                    .ok_or_else(|| unavailable("deployment key missing"))?;
-                let setup = broca_session_store::setup::SetupStore::new(&memory, &setup_key);
+                let setup = broca_session_store::setup::SetupReader::new(
+                    &memory,
+                    runtime.deployment(),
+                    export.header.cipher,
+                );
                 let mut parts = runtime.parts_for(class, export.header.cipher).clone();
                 for (_, record) in view
                     .records_from(0)

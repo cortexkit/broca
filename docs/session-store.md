@@ -66,11 +66,16 @@ A session's cipher mode is chosen when it is created and recorded in its head.
   stored only in the head, wrapped under the deployment key and bound to the session id and key
   id, so a wrapped key copied into another head fails to unwrap. The head itself is readable and
   authenticated with the data key.
-- The **deployment key** comes from the vault (`opaque:broca-deployment:<key-id>`, with the id
-  from `session_storage.deployment_key_id`) when broca starts, and is held only in memory. Without
-  it an encrypted session can't be opened, and there is no fallback to plaintext. broca starts
-  without waiting for it; until it loads, an encrypted session is refused `key_unavailable`,
-  which a caller may retry.
+- **Deployment keys** come from the vault (`opaque:broca-deployment:<key-id>`) and stay in
+  memory. `session_storage.deployment_key_id` chooses the key for new sessions and newly stored
+  encrypted setup parts. Existing session heads and expiry markers name the key that locked
+  them. Setup references name only a content digest, so broca tries the loaded keys' setup
+  names, configured first. A missing encrypted part is retryable while a granted key is still
+  loading; once all granted keys are loaded, a missing part is damage.
+- broca starts without waiting for keys and discovers new grants when its scoped listing
+  refreshes. An encrypted session whose key hasn't loaded is refused `key_unavailable`, which a
+  caller may retry. There is no fallback to plaintext. Pairing computers does not re-lock
+  existing data: keep the old key records and grant broca read access to each key it needs.
 - A **plain** session has no data key: each unit is its plaintext followed by an unkeyed check,
   which catches a torn or damaged unit but not a deliberate edit. New sessions are plain only when
   `session_storage.encryption` is `off` (the default is `on`), and a plain session opens without

@@ -142,7 +142,21 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
 
     /// The actor stores setup parts in `storage` before each append that could name them.
     pub fn with_storage(mut self, storage: broca_session_loop::durable::SetupParts<B>) -> Self {
-        self.storage = Some(storage);
+        self.storage = Some(super::ActorSetupStore::Fixed(storage));
+        self
+    }
+
+    pub(crate) fn with_deployment_storage(
+        mut self,
+        backend: B,
+        deployment: Arc<broca_session_store::keys::DeploymentKey>,
+        cipher: broca_session_store::keys::Cipher,
+    ) -> Self {
+        self.storage = Some(super::ActorSetupStore::Configured {
+            backend,
+            deployment,
+            cipher,
+        });
         self
     }
 
