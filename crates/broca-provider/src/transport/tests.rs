@@ -72,6 +72,10 @@ mod gemini_errors {
     include!("../transport_gemini_error_tests.rs");
 }
 
+mod anthropic_stream_errors {
+    include!("../transport_anthropic_stream_error_tests.rs");
+}
+
 mod request_invalid {
     include!("../transport_request_invalid_tests.rs");
 }

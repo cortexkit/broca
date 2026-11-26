@@ -17,13 +17,14 @@ use std::collections::BTreeMap;
 use broca_protocol::{
     content::{AssistantMessage, ContentBlock, FinishReason, ToolCall},
     display::DisplayEvent,
-    error::{ErrorClass, ProviderError},
+    error::{ErrorClass, ProviderError, BILLING_EXHAUSTED},
     ids::{MessageId, StepId, ToolCallId},
     provider::{NormalizedEvent, ProviderControl},
     usage::Usage,
 };
 
 use crate::wire::UsageIteration;
+use cortexkit_anthropic_policy::ANTHROPIC_CREDIT_BALANCE_MESSAGE;
 use serde_json::Value;
 
 /// Response-only billing evidence. Allocated and installed only for journaled attempts;
@@ -619,23 +620,28 @@ impl AnthropicNormalizer {
                     .and_then(Value::as_str)
                     .unwrap_or("anthropic stream error")
                     .to_owned();
-                let provider_code = err
-                    .and_then(|e| e.get("type"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                let provider_code = err.and_then(|e| e.get("type")).and_then(Value::as_str);
+                // An error inside an accepted stream has no HTTP refusal status. Require the
+                // exact type and message before telling routing to stop using the credential.
+                let provider_code = if provider_code == Some("invalid_request_error")
+                    && message == ANTHROPIC_CREDIT_BALANCE_MESSAGE
+                {
+                    Some(BILLING_EXHAUSTED)
+                } else {
+                    provider_code
+                };
                 let overflow_code = context_overflow_code(
                     crate::spec::WireFamilyId::AnthropicMessages,
-                    provider_code.as_deref(),
+                    provider_code,
                     &message,
                     None,
                 );
                 let class = overflow_code
                     .map(|_| ErrorClass::ContextOverflow)
                     .unwrap_or_else(|| {
-                        classify_error(provider_code.as_deref(), None)
-                            .unwrap_or(ErrorClass::Permanent)
+                        classify_error(provider_code, None).unwrap_or(ErrorClass::Permanent)
                     });
-                let provider_code = overflow_code.map(str::to_owned).or(provider_code);
+                let provider_code = overflow_code.or(provider_code).map(str::to_owned);
                 out.push(NormalizedEvent::Control(ProviderControl::Error {
                     error: ProviderError {
                         provider_details: None,
@@ -1031,7 +1037,7 @@ pub(crate) fn classify_error(code: Option<&str>, status: Option<u16>) -> Option<
         Some("context_length_exceeded") | Some("context_window_exceeded") => {
             Some(ErrorClass::ContextOverflow)
         }
-        Some("billing_exhausted") | Some("usage_not_included") => Some(ErrorClass::Permanent),
+        Some(BILLING_EXHAUSTED) | Some("usage_not_included") => Some(ErrorClass::Permanent),
         // A 429 is permanent only for the billing and entitlement codes above. Every other
         // provider code defaults to transient for this status, even if that code normally
         // maps differently on another status.
