@@ -82,6 +82,9 @@ pub struct AttemptFact {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_run_id: Option<String>,
+    /// The daemon-stamped flow that made the request; absent on agent-run and unscoped facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
     #[serde(with = "super::fact_session")]
     pub session: BindIdentity,
     pub step_id: u64,
@@ -393,6 +396,10 @@ fn attempt_fact<R: ChargeBasisResolver>(
             .scope
             .as_ref()
             .and_then(|scope| scope.run_id.clone()),
+        flow_id: context
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.flow_id.clone()),
         session: session.clone(),
         step_id: attempt.step_id,
         attempt: attempt.attempt,

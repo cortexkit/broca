@@ -51,6 +51,11 @@ together before any observation is flushed; routing delivery failure cannot lose
 an already-recorded answer. The immutable spend/export fact format does not
 acquire a decision id.
 
+A paid item's System One fact names the caller from the daemon scope stored at batch admission.
+An agent-run scope writes optional `agent_id` beside `run_id`; a flow scope writes `flow_id` and
+omits both `agent_id` and `run_id`, so a flow's spend never inherits its owner agent. The optional
+members stay absent when their scope has no value for them, and stored facts are not backfilled.
+
 Two unavoidable remote-answer/local-commit boundaries remain. If a provider
 answered but broca died before committing the answer, the adapters offer no
 idempotency key: a resend asks that unrecorded item again, matching the legacy

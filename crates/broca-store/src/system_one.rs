@@ -743,9 +743,9 @@ impl SystemOneStore {
                 identity.update((value.len() as u64).to_le_bytes());
                 identity.update(value.as_bytes());
             }
-            let (run_id, flow_id) = match scope {
-                BatchScope::Run { run_id, .. } => (Some(run_id), None),
-                BatchScope::Flow { flow_id } => (None, Some(flow_id)),
+            let (agent_id, run_id, flow_id) = match scope {
+                BatchScope::Run { agent_id, run_id } => (Some(agent_id), Some(run_id), None),
+                BatchScope::Flow { flow_id } => (None, None, Some(flow_id)),
             };
             let fact = SystemOneFact {
                 fact_id: format!("{:x}", identity.finalize()),
@@ -755,6 +755,7 @@ impl SystemOneStore {
                 model: context.model.clone(),
                 auth_selection: context.auth_selection.clone(),
                 account_ref: context.account_ref.clone(),
+                agent_id,
                 run_id,
                 flow_id,
                 charge_basis: context.charge_basis,

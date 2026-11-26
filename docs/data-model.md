@@ -154,7 +154,8 @@ separate-reasoning normalizer), `usage` (section 3.3), `usage_by_service_tier` (
 step reported a tier; buckets need not sum to `usage`), `retries_used`, `pricing_at_ms`,
 `pricing_at_precision`, `occurred_at_ms`, `occurred_at_precision`, `terminal_reason` (final
 slice only), optional `agent_id` and `agent_run_id` for a daemon-stamped agent run, optional
-`warm_outcome` on a keep-warm fact, and `usage_in_attempts` (below). `fact_id` is SHA-256 (hex)
+`flow_id` for a daemon-stamped flow, optional `warm_outcome` on a keep-warm fact, and
+`usage_in_attempts` (below). `fact_id` is SHA-256 (hex)
 over the length-prefixed source instance id, triple, run id and segment ordinal.
 
 A slice ends where the run's frozen config or credential is frozen again, and where a model
@@ -166,7 +167,8 @@ full storage triple.
 
 **Attempt facts** (`kind: "model_attempt"`): one per provider attempt of a run, failed and
 cut-off attempts included. Fields: `fact_id`, `run_id`, optional `agent_id` and `agent_run_id`,
-`session`, `step_id`, `attempt`, optional `attempt_id`, `outcome`, optional `http_status`,
+optional `flow_id` for a daemon-stamped flow, `session`, `step_id`, `attempt`, optional
+`attempt_id`, `outcome`, optional `http_status`,
 `provider`, `model`, optional `usage_by_model` (each entry: `provider`, `model`, `usage`,
 optional `served_service_tier`, and the `segment_fact_id` of the segment that also counts it),
 `reasoning_included_in_output`, optional `usage_policy_version`, `requested_service_tier`,
@@ -184,7 +186,8 @@ from finding attempts: a reader may meet them before or after their segment.
 
 **System One facts** (`kind: "system_one"`): one per decision item, with no session. Fields:
 `fact_id`, `batch_id`, `item_index`, `provider`, `model`, optional `auth_selection` and
-`account_ref`, exactly one of `run_id` or `flow_id`, `charge_basis`,
+`account_ref`, optional `agent_id` for a daemon-stamped agent run, exactly one of `run_id` or
+`flow_id`, `charge_basis`,
 `charge_basis_mapping_version`, `charge_basis_overrides`, `usage` (only reported `input_tokens`
 and `output_tokens`), and `occurred_at_ms`. Their ids use domain-separated, length-prefixed
 SHA-256 over `system_one/v1`, source instance id, role, batch id, first-admission time and item

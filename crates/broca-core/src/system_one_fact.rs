@@ -20,6 +20,9 @@ pub struct SystemOneFact {
     pub auth_selection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_ref: Option<String>,
+    /// The agent from the batch's daemon-stamped run scope; absent for flow-scoped batches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

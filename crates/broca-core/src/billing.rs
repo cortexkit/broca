@@ -134,6 +134,9 @@ pub struct SpendSegment {
     /// The scope's agent run, distinct from broca's episode `run_id` and not part of `fact_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_run_id: Option<String>,
+    /// The flow ID from the same daemon scope; absent keeps existing facts' bytes and ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
     /// The storage identity; its namespace root is omitted from exported project attribution.
     #[serde(with = "fact_session")]
     pub session: BindIdentity,
@@ -490,6 +493,7 @@ impl OpenRun {
             run_id: self.run_id.clone(),
             agent_id: self.scope.as_ref().and_then(|scope| scope.agent_id.clone()),
             agent_run_id: self.scope.as_ref().and_then(|scope| scope.run_id.clone()),
+            flow_id: self.scope.as_ref().and_then(|scope| scope.flow_id.clone()),
             session: self.session.clone(),
             segment_ordinal,
             fact_id,
@@ -813,6 +817,7 @@ fn compute_segments_matching<R: ChargeBasisResolver>(
                         segment.agent_id = scope.as_ref().and_then(|scope| scope.agent_id.clone());
                         segment.agent_run_id =
                             scope.as_ref().and_then(|scope| scope.run_id.clone());
+                        segment.flow_id = scope.as_ref().and_then(|scope| scope.flow_id.clone());
                         output.push(segment);
                     }
                 }
@@ -940,6 +945,7 @@ fn warm_segment<R: ChargeBasisResolver>(
     SpendSegment {
         agent_id: None,
         agent_run_id: None,
+        flow_id: None,
         run_id: run_id.clone(),
         session: session.clone(),
         segment_ordinal: wal_seq,

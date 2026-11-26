@@ -534,6 +534,7 @@ async fn scoped_classifier_exports_one_measurement_per_paid_item_and_none_on_res
                 panic!("not a System One fact")
             };
             assert_eq!(fact.item_index, index as u64);
+            assert_eq!(fact.agent_id.as_deref(), Some("agent"));
             assert_eq!(fact.run_id.as_deref(), Some("run"));
             assert_eq!(fact.flow_id, None);
             assert_eq!(
