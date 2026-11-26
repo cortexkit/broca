@@ -76,11 +76,29 @@ impl ReadPlan {
             Ok(full) => full,
             Err(error) => return Self::Invalid(error.to_string().into_boxed_str()),
         };
+        // Read admission reads only each sender's `module`. A sender's notice templates can run
+        // to tens of kilobytes, and a closed session's head kept for `session.head` (see
+        // `store_head::KeptHeads`) holds this policy with two plans, so keep the modules alone
+        // when the stored list parses. A list that doesn't parse stays as stored, so admission
+        // refuses it the same way the full plan does.
+        let sender_modules = cortexkit_role_llm_runner::delivery_order::plan_senders(&full)
+            .ok()
+            .map(|senders| {
+                senders
+                    .into_iter()
+                    .map(|sender| serde_json::json!({ "module": sender.module }))
+                    .collect::<Vec<_>>()
+            });
         let mut projection = Map::new();
         for member in READ_PLAN_MEMBERS {
             let Some(mut value) = full.remove(member) else {
                 continue;
             };
+            if member == "senders" {
+                if let Some(modules) = &sender_modules {
+                    value = Value::Array(modules.clone());
+                }
+            }
             if member == "compaction_item" {
                 let mut item = Map::new();
                 if let Some(provider) = value
@@ -329,7 +347,11 @@ mod tests {
     #[test]
     fn projected_plans_make_the_same_read_decisions_as_full_plans() {
         let effective = opaque(json!({
-            "readers": ["old-reader"], "senders": [{"module": "old-sender"}],
+            "readers": ["old-reader"],
+            "senders": [{
+                "module": "old-sender", "idle_start": true,
+                "templates": [{"id": "wake", "text": "A long notice template."}]
+            }],
             "compaction_item": {"provider": "active-compactor", "preset": "worker"},
             "composition": {"providers": []}
         }));
@@ -434,6 +456,33 @@ mod tests {
         assert!(matches!(
             decide(&policy, &access, None),
             Some(Err(ServeError::InvalidParams { field, .. })) if field == "plan.readers"
+        ));
+        // A sender list that doesn't parse (here a module named twice) keeps its stored form,
+        // so a send-status read is refused as with the full plan, not admitted by a projection.
+        let duplicate = opaque(json!({
+            "readers": ["reader"], "senders": [{"module": "twice"}, {"module": "twice"}]
+        }));
+        let status = ReadAccess {
+            principal: Some(BindPrincipal::Reserved {
+                module_id: "twice".into(),
+            }),
+            op: "send.status".into(),
+            send: Some((RunId("r1".into()), "s1".into())),
+        };
+        let full = ReadPolicy {
+            ownership: Default::default(),
+            effective: ReadPlan::Json(duplicate.as_json_text().into()),
+            accepted: ReadPlan::Json(duplicate.as_json_text().into()),
+        };
+        let projected =
+            ReadPolicy::from_plans(Default::default(), Some(&duplicate), Some(&duplicate));
+        assert_eq!(
+            format!("{:?}", decide(&projected, &status, Some(true))),
+            format!("{:?}", decide(&full, &status, Some(true)))
+        );
+        assert!(matches!(
+            decide(&projected, &status, Some(true)),
+            Some(Err(ServeError::InvalidParams { .. }))
         ));
         let non_object = opaque(json!(123));
         let policy = ReadPolicy::from_plans(Default::default(), Some(&non_object), None);
