@@ -3,16 +3,17 @@
 #
 # The fleet layout keeps internal material (design notes, investigations, tool state)
 # under .cortexkit/, ignored by git, and tracks only release-notes/, skills/, rules/ and
-# WORKER.md there. With the .gitignore block in place, the only way to track anything
-# else is to force-add an ignored path, so the check is that `git ls-files -ci` lists no
-# tracked file that the ignore rules would exclude.
+# WORKER.md there. The check lists every tracked path under .cortexkit/ and refuses any
+# outside that allowlist. It does not ask git which tracked files are also ignored:
+# a stray `!` line in any .gitignore can un-ignore a private file, and that file is then
+# tracked but not ignored, so a tracked-and-ignored listing would never show it.
 #
-# That check passes vacuously if the ignore block is missing, because then nothing is
-# ignored. So it first confirms the block works: an internal path must be ignored and
-# an allowed one must not be. If either control fails, the checker reports itself
-# BLIND and exits 2 rather than passing.
+# The ignore block is still checked first, so an internal file can't be added by
+# accident: an internal path must be ignored and an allowed one must not be. If either
+# control fails, or git can't list the tracked files, the checker reports itself BLIND
+# and exits 2 rather than passing.
 #
-# Exit 0 clean, 1 a disallowed file is tracked, 2 the ignore rules don't work.
+# Exit 0 clean, 1 a disallowed file is tracked, 2 the check can't see.
 
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
@@ -26,10 +27,14 @@ if git check-ignore -q --no-index .cortexkit/release-notes/control.md; then
   exit 2
 fi
 
-tracked="$(git ls-files -ci --exclude-standard -- .cortexkit)"
-if [ -n "$tracked" ]; then
-  echo "tracked files under .cortexkit/ that the layout keeps out of git:" >&2
-  printf '  %s\n' $tracked >&2
+if ! all="$(git ls-files -- .cortexkit)"; then
+  echo "BLIND: git ls-files failed" >&2
+  exit 2
+fi
+bad="$(printf '%s\n' "$all" | grep -vE '^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$)' | grep -v '^$')"
+if [ -n "$bad" ]; then
+  echo "tracked files under .cortexkit/ outside the allowlist (release-notes/, skills/, rules/, WORKER.md):" >&2
+  printf '  %s\n' $bad >&2
   echo "move them to .cortexkit/internal-docs/ (or remove them) and 'git rm --cached' them" >&2
   exit 1
 fi
