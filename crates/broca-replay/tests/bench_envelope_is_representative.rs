@@ -94,6 +94,9 @@ const ACCEPTED: &[[&str; 2]] = &[
     // diff is lib.rs, manifest.rs, peer.rs, scope.rs, session.rs and the new modules (route
     // busy credits, federated scopes, settings), none of them data-plane framing.
     ["0.34.3", "0.37.5"],
+    // 0.37.11 (accepting drains, 2026-11-26): lib.rs, peer.rs, reader_skew.rs, session.rs and a new
+    // policy_root.rs. frame.rs is byte-identical to 0.37.5, so the replay framing is unchanged.
+    ["0.34.3", "0.37.11"],
 ];
 
 // 0.19.0 admitted 2026-09-06. The ENTIRE crate diff over the bump is `src/manifest.rs`, 208
