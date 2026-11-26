@@ -93,9 +93,16 @@ fn chat_error(text: &str) -> (bool, Option<String>) {
         .strip_prefix("Tool call `")
         .and_then(|rest| rest.split_once("` was not run: "))
     {
+        // From the second identical cut on, broca appends its own repetition guidance after a
+        // blank line. The result is still the cut call's error; anything else after the fixed
+        // sentence is not.
+        let rest = message.strip_prefix(
+            "the reply hit the output limit before its arguments were complete. Re-issue it with complete arguments, and split large payloads into smaller calls.",
+        );
         if !tool.is_empty()
-            && message
-                == "the reply hit the output limit before its arguments were complete. Re-issue it with complete arguments, and split large payloads into smaller calls."
+            && rest.is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with("\n\nTool repetition guidance: ")
+            })
         {
             return (
                 true,
@@ -127,6 +134,8 @@ fn observes_native_chat_tool_results_in_request_order() {
     let refused = "tool/route rejected: conformance_tool_error — provider refused this call";
     let unknown = "outcome_unknown: the call may have run\ncode: outcome_unknown";
     let cut = "Tool call `lookup` was not run: the reply hit the output limit before its arguments were complete. Re-issue it with complete arguments, and split large payloads into smaller calls.";
+    let guided = format!("{cut}\n\nTool repetition guidance: lookup has now failed 2 times with identical arguments.");
+    let trailing = format!("{cut} And then something else.");
     let request = serde_json::json!({"messages": [
         {"role": "assistant", "content": unknown},
         {"role": "tool", "tool_call_id": "ok", "content": "success"},
@@ -134,6 +143,8 @@ fn observes_native_chat_tool_results_in_request_order() {
         {"role": "tool", "tool_call_id": "lost", "content": unknown},
         {"role": "tool", "tool_call_id": "uncoded", "content": "outcome_unknown: no reply"},
         {"role": "tool", "tool_call_id": "cut", "content": cut},
+        {"role": "tool", "tool_call_id": "guided", "content": guided},
+        {"role": "tool", "tool_call_id": "trailing", "content": trailing},
         {"role": "tool", "tool_call_id": "other", "content": "Tool call `lookup` was not run: another reason"}
     ]});
     let observed = super::observe_model_request(&request).tool_results;
@@ -150,6 +161,13 @@ fn observes_native_chat_tool_results_in_request_order() {
             ModelToolResultObservation::new("lost", true, Some("outcome_unknown".into()), unknown),
             ModelToolResultObservation::new("uncoded", true, None, "outcome_unknown: no reply"),
             ModelToolResultObservation::new("cut", true, Some("arguments_incomplete".into()), cut,),
+            ModelToolResultObservation::new(
+                "guided",
+                true,
+                Some("arguments_incomplete".into()),
+                guided.as_str(),
+            ),
+            ModelToolResultObservation::new("trailing", false, None, trailing.as_str()),
             ModelToolResultObservation::new(
                 "other",
                 false,
