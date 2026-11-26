@@ -2,9 +2,10 @@
 # Nothing under .cortexkit/ may be tracked except the allowed folders and files.
 #
 # The fleet layout keeps internal material (design notes, investigations, tool state)
-# under .cortexkit/, ignored by git, and tracks only release-notes/, skills/, rules/ and
-# WORKER.md there. The check lists every tracked path under .cortexkit/ and refuses any
-# outside that allowlist. It does not ask git which tracked files are also ignored:
+# under .cortexkit/, ignored by git, and tracks only release-notes/, skills/, rules/,
+# WORKER.md and top-level <module>.jsonc project settings files, which the daemon
+# reads. The check lists every tracked path under .cortexkit/ and refuses any outside
+# that allowlist. It does not ask git which tracked files are also ignored:
 # a stray `!` line in any .gitignore can un-ignore a private file, and that file is then
 # tracked but not ignored, so a tracked-and-ignored listing would never show it.
 #
@@ -31,9 +32,9 @@ if ! all="$(git ls-files -- .cortexkit)"; then
   echo "BLIND: git ls-files failed" >&2
   exit 2
 fi
-bad="$(printf '%s\n' "$all" | grep -vE '^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$)' | grep -v '^$')"
+bad="$(printf '%s\n' "$all" | grep -vE '^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$|[a-z0-9-]+\.jsonc$)' | grep -v '^$')"
 if [ -n "$bad" ]; then
-  echo "tracked files under .cortexkit/ outside the allowlist (release-notes/, skills/, rules/, WORKER.md):" >&2
+  echo "tracked files under .cortexkit/ outside the allowlist (release-notes/, skills/, rules/, WORKER.md, <module>.jsonc):" >&2
   printf '  %s\n' $bad >&2
   echo "move them to .cortexkit/internal-docs/ (or remove them) and 'git rm --cached' them" >&2
   exit 1
