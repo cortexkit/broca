@@ -359,7 +359,7 @@ pub async fn send_warm(
     base: WarmBase,
 ) -> Result<broca_core::WarmSent, WarmError> {
     let bytes = prepare_warm_base(provider, base).await?;
-    provider.warm(&bytes).await.map_err(warm_failure)
+    provider.warm(bytes.as_slice()).await.map_err(warm_failure)
 }
 
 /// Render and check the warm prefix before granting the transport a billing hook.
@@ -370,16 +370,30 @@ pub async fn send_warm_with_hook(
 ) -> Result<broca_core::WarmSent, WarmError> {
     let bytes = prepare_warm_base(provider, base).await?;
     let result = match hook {
-        Some(hook) => provider.warm_with_hook(&bytes, Some(hook)).await,
-        None => provider.warm(&bytes).await,
+        Some(hook) => provider.warm_with_hook(bytes.as_slice(), Some(hook)).await,
+        None => provider.warm(bytes.as_slice()).await,
     };
     result.map_err(warm_failure)
+}
+
+enum WarmBody {
+    InFlight(Arc<dyn AsRef<[u8]> + Send + Sync>),
+    Rebuilt(Vec<u8>),
+}
+
+impl WarmBody {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::InFlight(body) => body.as_ref().as_ref(),
+            Self::Rebuilt(body) => body,
+        }
+    }
 }
 
 async fn prepare_warm_base(
     provider: &dyn broca_core::Provider,
     base: WarmBase,
-) -> Result<Vec<u8>, WarmError> {
+) -> Result<WarmBody, WarmError> {
     let base = match base {
         WarmBase::RecordedMedia { request, renderer } => {
             use broca_session_loop::run::ModelCallReady as _;
@@ -400,7 +414,7 @@ async fn prepare_warm_base(
             // run on its refusal-fallback model would have its warm addressed as the episode's
             // own model.
             provider.set_step_route(sent.route);
-            sent.bytes().to_vec()
+            WarmBody::InFlight(sent.body)
         }
         WarmBase::Recorded(recorded) => {
             // A step the refusal-fallback model answered was rendered and sent for that model,
@@ -424,7 +438,7 @@ async fn prepare_warm_base(
                     recorded.request_body_sha256
                 )));
             }
-            rendered
+            WarmBody::Rebuilt(rendered)
         }
         WarmBase::RecordedMedia { .. } => unreachable!("media readiness was resolved above"),
     };
@@ -438,6 +452,56 @@ fn warm_failure(failure: broca_core::WarmFailure) -> WarmError {
             WarmError::AccountChanged { frozen, served }
         }
         broca_core::WarmFailure::Provider(error) => WarmError::Provider(error),
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    use broca_core::refusal_fallback::StepRoute;
+    use broca_core::{Provider, SentRequest, WarmFailure, WarmSent};
+    use broca_protocol::{request::CallOptions, NormalizedEvent, StepId};
+
+    struct WarmProbe(Arc<Vec<u8>>);
+
+    #[async_trait]
+    impl Provider for WarmProbe {
+        async fn step(&self, _: StepId, _: &CallOptions) -> mpsc::Receiver<NormalizedEvent> {
+            unreachable!("warming does not start a model step")
+        }
+
+        fn set_step_route(&self, route: StepRoute) {
+            assert_eq!(route, StepRoute::Fallback);
+        }
+
+        async fn warm(&self, body: &[u8]) -> Result<WarmSent, WarmFailure> {
+            assert_eq!(body, self.0.as_slice());
+            assert_eq!(body.as_ptr(), self.0.as_ptr());
+            Err(WarmFailure::Unsupported(
+                "probe stops before sending".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn warming_borrows_the_transport_body() {
+        let body = Arc::new(b"the exact body the transport sent".to_vec());
+        let base = SentRequest {
+            step_id: StepId(2),
+            sha256: broca_core::render::request_digest_hex(&body),
+            body: body.clone(),
+            sent_at_ms: 0,
+            route: StepRoute::Fallback,
+        };
+        let probe = WarmProbe(body);
+        assert!(matches!(
+            send_warm(&probe, WarmBase::InFlight(base.clone())).await,
+            Err(WarmError::Unsupported(reason)) if reason == "probe stops before sending"
+        ));
+        assert!(matches!(
+            send_warm_with_hook(&probe, WarmBase::InFlight(base), None).await,
+            Err(WarmError::Unsupported(reason)) if reason == "probe stops before sending"
+        ));
     }
 }
 
