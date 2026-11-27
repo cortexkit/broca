@@ -14,8 +14,6 @@
 //! The carrier's send over the same scope is refused `scope_owner_mismatch`. And a session an
 //! unscoped (direct) caller already drove cannot be adopted: the owner's scoped `route.open` is
 //! answered with broca's `scope_adoption_refused`, relayed by the daemon from the bind.
-#![cfg(unix)]
-
 #[path = "../../broca-wire/tests/support/run_usage.rs"]
 mod usage_compat;
 
@@ -345,6 +343,20 @@ fn sibling_bin(name: &str, env_key: &str) -> PathBuf {
     broca_test_support::subc_bin(name, env_key)
 }
 
+/// SUBC stamps its canonical project path, not the extended-length Windows spelling
+/// returned by the filesystem. Keep the exact path assertion in the daemon's spelling.
+fn stamped_workdir(path: &Path) -> PathBuf {
+    let path = path.canonicalize().unwrap();
+    #[cfg(windows)]
+    if let Some(disk_path) = path.to_str().unwrap().strip_prefix(r"\\?\") {
+        if let Some(unc) = disk_path.strip_prefix(r"UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        return PathBuf::from(disk_path);
+    }
+    path
+}
+
 /// `scripts/rust-test-gate.sh` exports `BROCA_REQUIRE_SUBC`, so in a gated run a missing
 /// daemon is a failure that names itself; a bare local run may still skip, out loud.
 fn require_subc() -> bool {
@@ -510,19 +522,34 @@ async fn project_identity_existing_unscoped_and_scoped_resume_on_legacy_addresse
             .unwrap(),
         )
         .unwrap();
-        let pid = roster["children"]
+        let child = roster["children"]
             .as_array()
             .unwrap()
             .iter()
             .find(|child| child["module_id"] == "broca")
-            .unwrap()["pid"]
+            .unwrap();
+        let pid = u32::try_from(child["pid"].as_u64().unwrap()).unwrap();
+        let birth = child["start_time"]
             .as_u64()
-            .unwrap();
-        subc_os::Process::open(u32::try_from(pid).unwrap())
-            .unwrap()
-            .unwrap()
-            .signal(subc_os::Signal::Kill)
-            .unwrap();
+            .expect("roster child start time");
+        let process = subc_os::Process::open(pid).unwrap().unwrap();
+        assert_eq!(
+            subc_os::parent_pid(pid),
+            Some(rig.child.id().expect("rig daemon is live")),
+            "only terminate a child of this rig's daemon"
+        );
+        assert_eq!(
+            process
+                .observe()
+                .expect("supervised broca is live")
+                .start_time,
+            birth,
+            "broca must be the process this daemon registered"
+        );
+        #[cfg(unix)]
+        assert!(process.signal(subc_os::Signal::Kill).unwrap());
+        #[cfg(windows)]
+        assert!(process.force_stop(birth, Duration::from_secs(5)).unwrap());
 
         let other_root = rig.dir.join("different-client-folder");
         std::fs::create_dir_all(&other_root).unwrap();
@@ -562,9 +589,30 @@ async fn project_identity_new_scoped_session_uses_stamped_workdir() {
     let route = project_identity_open(&owner, &route_identity, true).await;
     send(&owner, &route, "first").await.unwrap();
     let mut storage = route_identity.clone();
-    storage.project_root = checkout;
-    assert!(rig.exists(&storage));
+    storage.project_root = stamped_workdir(&checkout);
+    let inventory = broca_store::legacy_inventory::open_session_resolver(&rig.state_root).unwrap();
+    let recorded: Vec<_> = inventory
+        .named_refs(&storage.session, 2)
+        .unwrap()
+        .sessions
+        .into_values()
+        .collect();
+    let address = broca_core::session_addr(&storage);
+    assert_eq!(recorded, vec![(address.clone(), storage.clone())]);
+    assert!(
+        rig.exists(&storage),
+        "inventory points at {address}, but no session head exists under {}",
+        rig.state_root.display()
+    );
     assert!(!rig.exists(&route_identity));
+    #[cfg(windows)]
+    {
+        // The filesystem and daemon spellings hash differently; only the stamped one is stored.
+        assert_ne!(storage.project_root, checkout);
+        let mut alias = storage;
+        alias.project_root = checkout;
+        assert!(!rig.exists(&alias));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -607,8 +655,8 @@ struct Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        // Let the supervisor drain its modules before killing it. Otherwise the placed
-        // release processes can briefly outlive the rig and contaminate the pid snapshot.
+        // On Unix, let the supervisor drain its modules before falling back to tree cleanup.
+        #[cfg(unix)]
         if let Some(pid) = self.child.id() {
             if let Ok(Some(process)) = subc_os::Process::open(pid) {
                 let _ = process.signal(subc_os::Signal::Terminate);
@@ -827,7 +875,12 @@ impl Rig {
         // The daemon launches each module through a trampoline: it re-executes its own binary,
         // which then replaces itself with the module image. The roster names the pid before that
         // replacement, so for a moment the pid's image is the daemon's, not broca's.
+        #[cfg(unix)]
         let daemon_image = subc_os::file_identity(&subc_core);
+        #[cfg(windows)]
+        let expected_image =
+            subc_os::retained_file_identity(&std::fs::File::open(&module_bin).unwrap())
+                .expect("identify the requested module binary");
         let child = broca_test_support::retry_executable_file_busy(|| {
             broca_test_support::tokio_rig_command(&subc_core, &dir, "daemon")?
                 .env("HOME", &dir)
@@ -885,28 +938,49 @@ impl Rig {
                     .unwrap()
                     .expect("supervised broca is live");
                 let observed = process.observe().expect("observe supervised broca");
-                if observed.executable.is_some() && observed.executable == daemon_image {
-                    assert!(
-                        Instant::now() < deadline,
-                        "pid {pid} was still the daemon's launch trampoline after 30 s, so the \
-                         module image never replaced it"
+                #[cfg(unix)]
+                {
+                    if observed.executable.is_some() && observed.executable == daemon_image {
+                        assert!(
+                            Instant::now() < deadline,
+                            "pid {pid} was still the daemon's launch trampoline after 30 s, so the \
+                             module image never replaced it"
+                        );
+                        sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    assert_eq!(
+                        observed.executable,
+                        subc_os::file_identity(&module_bin),
+                        "the running broca image must be the requested binary"
                     );
-                    sleep(Duration::from_millis(25)).await;
-                    continue;
                 }
-                assert_eq!(
-                    observed.executable,
-                    subc_os::file_identity(&module_bin),
-                    "the running broca image must be the requested binary"
-                );
+                #[cfg(windows)]
+                {
+                    // Windows records the full file ID at suspended spawn, rather than an inode
+                    // in the process observation. Confirm that the roster names the live child.
+                    assert_eq!(child["start_time"].as_u64(), Some(observed.start_time));
+                    assert_eq!(subc_os::parent_pid(pid), rig.child.id());
+                    assert_eq!(
+                        child["executable"]["windows_file_identity"],
+                        serde_json::json!({
+                            "volume_serial_number": expected_image.volume_serial_number,
+                            "file_id": expected_image.file_id,
+                        }),
+                        "the running broca image must be the requested binary"
+                    );
+                }
                 assert_eq!(
                     std::fs::read(&module_bin).unwrap(),
                     module_bytes,
                     "the versioned and hashed file must not change during launch"
                 );
+                #[cfg(unix)]
+                let verified_image = observed.executable;
+                #[cfg(windows)]
+                let verified_image = expected_image;
                 println!(
-                    "MODULE running pid={pid} image={:?} verified requested binary",
-                    observed.executable
+                    "MODULE running pid={pid} image={verified_image:?} verified requested binary"
                 );
                 break;
             }
@@ -1032,16 +1106,6 @@ impl Rig {
         broca_protocol::BindIdentity::new("broca-unscoped-v1", "scope-e2e", name)
     }
 
-    /// `session` as the daemon keys it: a folder as it resolves it (on macOS /var is
-    /// /private/var); the unscoped namespace as it is.
-    fn keyed(&self, session: &broca_protocol::BindIdentity) -> broca_protocol::BindIdentity {
-        let mut keyed = session.clone();
-        if let Ok(resolved) = std::fs::canonicalize(&session.project_root) {
-            keyed.project_root = resolved;
-        }
-        keyed
-    }
-
     /// `session`'s records, each as its debug text, for comparing what a later step kept.
     async fn debug_records(&self, session: &broca_protocol::BindIdentity) -> Vec<String> {
         self.records(session)
@@ -1051,11 +1115,11 @@ impl Rig {
             .collect()
     }
 
-    /// Whether the session store holds `session`.
+    /// Whether the store has a head at the exact address asserted by the caller.
     fn exists(&self, session: &broca_protocol::BindIdentity) -> bool {
         broca_records::session_storage::session_storage_class(
             &self.state_root,
-            &broca_core::session_addr(&self.keyed(session)),
+            &broca_core::session_addr(session),
         )
         .unwrap()
         .is_some()
@@ -1063,7 +1127,7 @@ impl Rig {
 
     /// `session`'s records in the session store, in log order; empty while it doesn't exist.
     async fn records(&self, session: &broca_protocol::BindIdentity) -> Vec<Record> {
-        stored_log::stored_records(&self.state_root, &self.keyed(session)).await
+        stored_log::stored_records(&self.state_root, session).await
     }
 
     /// What each run `session` started was admitted with, in the order the runs started.
@@ -1071,7 +1135,7 @@ impl Rig {
         &self,
         session: &broca_protocol::BindIdentity,
     ) -> Vec<broca_session_loop::run::Admission> {
-        stored_log::stored_admissions(&self.state_root, &self.keyed(session)).await
+        stored_log::stored_admissions(&self.state_root, session).await
     }
 
     /// The runs `session` started and the sends it queued: what an admitted send writes. The
@@ -2054,18 +2118,41 @@ async fn a_new_head_runs_two_turns_across_a_restart_in_the_new_storage() {
     assert_eq!(kept(&first), in_the_new_storage, "after the first turn");
     drop(owner);
 
-    // The daemon stops, draining broca, and a new daemon starts broca over the same state.
-    if let Some(pid) = first.child.id() {
-        subc_os::Process::open(pid)
+    // Drain broca before a fresh daemon starts it over the same state.
+    #[cfg(unix)]
+    {
+        let pid = first.child.id().expect("first daemon is live");
+        assert!(subc_os::Process::open(pid)
             .unwrap()
-            .unwrap()
+            .expect("first daemon is live")
             .signal(subc_os::Signal::Terminate)
+            .unwrap());
+        tokio::time::timeout(Duration::from_secs(30), first.child.wait())
+            .await
+            .unwrap()
             .unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(30), first.child.wait())
+    #[cfg(windows)]
+    {
+        // Windows has no daemon SIGTERM handler. Ask this daemon to drain and stop broca,
+        // then end the test daemon once the CLI confirms the module has stopped.
+        let ck = sibling_bin("ck-subc", "SUBC_CORE_BIN").with_file_name("ck.exe");
+        let ck = broca_test_support::ckdev_binary(ck, broca_test_support::scratch_root());
+        let output = broca_test_support::wait_for(
+            "scope rig module stop",
+            Command::new(ck)
+                .arg("--subc")
+                .arg(&first.connection_file)
+                .args(["module", "stop", "broca", "--wait"])
+                .kill_on_drop(true)
+                .output(),
+            || first.connection_file.display().to_string(),
+        )
         .await
-        .unwrap()
-        .unwrap();
+        .expect("run ck module stop broca");
+        assert!(output.status.success(), "ck module stop failed: {output:?}");
+        broca_test_support::kill_and_reap_tree(&mut first.child);
+    }
     let second = Rig::start_with_broca_config(
         None,
         Some(&first.state_root),

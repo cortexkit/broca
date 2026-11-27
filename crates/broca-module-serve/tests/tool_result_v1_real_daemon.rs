@@ -1,7 +1,5 @@
 //! Negotiation over a real daemon, with replies shaped like the AFT tool provider's encoder
 //! stored by the real serve/core path.
-#![cfg(unix)]
-
 mod delivery_rig;
 
 use broca_session_store::record::Record;
@@ -41,7 +39,7 @@ fn binary(name: &str, variable: &str) -> PathBuf {
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../.test-rigs")
-                .join(name)
+                .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
         })
 }
 
@@ -205,8 +203,8 @@ async fn capture(
         .collect();
     assert_eq!(tool_calls.len(), 3, "each call dispatches once: {log}");
     assert!(tool_calls.iter().all(|call| call.get("call_key").is_none()));
+    broca_test_support::kill_and_reap_tree(&mut daemon);
     rig.finish().await;
-    daemon.kill().await.unwrap();
     (outputs, read.body)
 }
 

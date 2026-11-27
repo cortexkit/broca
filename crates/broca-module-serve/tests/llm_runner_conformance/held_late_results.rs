@@ -17,8 +17,11 @@ use broca_session_store::record::Record;
 use cortexkit_role_llm_runner_conformance::{ScriptedToolCall, ScriptedTurn};
 use cortexkit_role_tool_provider::late_results::{kinds, LateEntry};
 
+// SUBC only supports in-place daemon upgrade on Linux and macOS.
+#[cfg(unix)]
 #[path = "held_daemon_upgrade.rs"]
 mod daemon_upgrade;
+#[cfg(unix)]
 pub(super) use daemon_upgrade::DaemonUpgradeRig;
 
 /// The scripted provider's one incarnation: it lives in the test process, so a broca restart
@@ -1282,7 +1285,7 @@ async fn named_sender_cancel_survives_real_kill_and_withdraws_without_redispatch
         .any(|record| matches!(record, Record::CancelRequest(_))));
     assert!(
         live.kill_all(),
-        "the accepted stop is followed by a real SIGKILL"
+        "the accepted stop is followed by a real process kill"
     );
     drop(sender);
     drop(owner);
@@ -1432,6 +1435,8 @@ async fn graceful_restart_yields_running_tool_and_resumes_same_run_once() {
     );
     let cli = broca_test_support::ckdev_binary(&cli, broca_test_support::scratch_root());
     let mut command = tokio::process::Command::new(cli);
+    #[cfg(windows)]
+    command.arg("--subc").arg(&live.connection_file);
     command
         .env("XDG_CONFIG_HOME", case.root.join("config"))
         .env("XDG_RUNTIME_DIR", case.root.join("runtime"))

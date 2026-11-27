@@ -130,7 +130,13 @@ fn bind_identity(args: &Args) -> Result<broca_protocol::BindIdentity, String> {
         }
         if let Some(project) = &args.project_root {
             let project = local_storage_root(project);
-            if project != bind.project_root {
+            let matches_project = project == bind.project_root;
+            // The daemon stamps an ordinary Windows path; canonicalize both sides of this filter
+            // if their spellings differ. Keep the recorded bind unchanged for addressing.
+            #[cfg(windows)]
+            let matches_project =
+                matches_project || project == local_storage_root(&bind.project_root);
+            if !matches_project {
                 return Err(format!("session {id:?} does not match --project-root; pass both --project-root and --harness for literal addressing"));
             }
         }
@@ -2768,6 +2774,52 @@ mod tests {
         }
         let missing = std::path::Path::new("missing-directory");
         assert_eq!(super::local_storage_root(missing), missing);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_project_filter_matches_a_stamped_windows_path_without_rekeying() {
+        use broca_core::{SessionInventory, SessionRefIndex};
+        use clap::Parser;
+
+        let root = broca_test_support::scratch_root().join("stamped-windows-project-filter");
+        let state = root.join("state");
+        let project = root.join("project");
+        let other = root.join("other");
+        for dir in [&state, &project, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let extended = project.canonicalize().unwrap();
+        let ordinary = extended.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        let bind = broca_protocol::BindIdentity::new(ordinary, "runner", "stamped-session");
+        assert_ne!(bind.project_root, extended);
+        let db = broca_store::SqliteStore::open(state.join("run-index.db")).unwrap();
+        let address = broca_core::session_addr(&bind);
+        db.record_session(&address, &bind).unwrap();
+        db.rebuild_inventory(&state).unwrap();
+        drop(db);
+
+        let args = |project: &std::path::Path| {
+            Args::try_parse_from([
+                "broca-session",
+                "--state-root",
+                state.to_str().unwrap(),
+                "--project-root",
+                project.to_str().unwrap(),
+                "read",
+                "stamped-session",
+            ])
+            .unwrap()
+        };
+        for hint in [&project, &extended] {
+            let resolved = super::bind_identity(&args(hint)).unwrap();
+            assert_eq!(resolved, bind);
+            assert_eq!(broca_core::session_addr(&resolved), address);
+        }
+        assert!(super::bind_identity(&args(&other))
+            .unwrap_err()
+            .contains("does not match --project-root"));
+        broca_test_support::remove_rig_dir(root);
     }
 
     use std::sync::Arc;

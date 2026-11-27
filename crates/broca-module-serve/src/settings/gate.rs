@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -239,6 +239,7 @@ pub struct Gate {
     user_file: Option<String>,
     /// The view broca runs on; `None` when the daemon has no gate and broca read its file.
     applied: Mutex<Option<Applied>>,
+    startup_at: Mutex<Option<Instant>>,
 }
 
 /// How [`wait_for_settings`] ended.
@@ -345,6 +346,7 @@ where
                             calls,
                             schema,
                             user_file: Some(user_file.to_owned()),
+                            startup_at: Mutex::new(None),
                             applied: Mutex::new(Some(Applied {
                                 effective: view.effective.clone(),
                                 generation: view.generation,
@@ -483,7 +485,13 @@ impl Gate {
             schema: super::schema(),
             user_file: None,
             applied: Mutex::new(None),
+            startup_at: Mutex::new(None),
         })
+    }
+
+    /// Record when this process began, for the first successful READY acknowledgement.
+    pub fn record_startup(&self, started: Instant) {
+        *self.startup_at.lock().unwrap() = Some(started);
     }
 
     /// Whether `frame` is the daemon saying broca's settings changed.
@@ -535,8 +543,16 @@ impl Gate {
         writer: broca_diagnostics::Sender<Frame>,
         provides: Vec<subc_protocol::manifest::ProviderRole>,
     ) -> Result<(), ServeIoError> {
+        let ready_started = Instant::now();
         self.attach(writer);
         self.publish_ready(provides).await?;
+        let startup_at = self.startup_at.lock().unwrap().take();
+        if let Some(started) = startup_at {
+            tracing::debug!(target: "lifecycle", phase = "publish_ready",
+                elapsed_ms = ready_started.elapsed().as_millis() as u64, "startup phase complete");
+            tracing::info!(target: "lifecycle", startup_ms = started.elapsed().as_millis() as u64,
+                "startup ready");
+        }
         let applied = self
             .applied
             .lock()
@@ -591,6 +607,7 @@ impl Gate {
             schema: self.schema,
             user_file: self.user_file.clone(),
             applied: Mutex::new(self.applied.lock().unwrap().clone()),
+            startup_at: Mutex::new(*self.startup_at.lock().unwrap()),
         })
     }
 

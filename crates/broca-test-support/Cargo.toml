@@ -10,6 +10,7 @@ publish = false
 
 [target.'cfg(windows)'.dependencies]
 broca-owner-only = { workspace = true, features = ["test-support"] }
+subc-os.workspace = true
 
 [dependencies]
 broca-core = { path = "../broca-core", optional = true }

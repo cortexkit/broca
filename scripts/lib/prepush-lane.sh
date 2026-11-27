@@ -146,7 +146,7 @@ checkout_pin() {
 fixtures() {
   source scripts/ci-fixture-revisions.conf
   local subc_source vault_source vendor_source
-  local subc_config=() vault_config=()
+  local subc_config=() vault_config=() surface_config=()
   if [[ "$platform" == windows ]]; then
     subc_source="$scratch/subconscious-source"
     vault_source="$scratch/claustrum-source"
@@ -172,6 +172,7 @@ PY
       --subconscious-lock "$subc_source/Cargo.lock" --claustrum-lock "$vault_source/Cargo.lock"
     subc_config=(--offline --config "$vendor_source/.configs/subconscious.toml")
     vault_config=(--offline --config "$vendor_source/.configs/claustrum.toml")
+    surface_config=(--offline --config "$vendor_source/.configs/fake-surface.toml")
   else
     subc_source="$CARGO_TARGET_DIR/fixture-sources/subconscious-$SUBC_REV"
     vault_source="$CARGO_TARGET_DIR/fixture-sources/claustrum-$CLAUSTRUM_REV"
@@ -188,10 +189,8 @@ PY
     cp "$CARGO_TARGET_DIR/debug/$name$suffix" "$scratch/package/fixtures/bin/"
     test -s "$scratch/package/fixtures/bin/$name$suffix"
   done
-  if [[ "$platform" != windows ]]; then
-    cargo build --locked --manifest-path crates/broca-module-serve/tests/support/fake-surface/Cargo.toml --target-dir "$CARGO_TARGET_DIR/fake-surface-target"
-    cp "$CARGO_TARGET_DIR/fake-surface-target/debug/fake-surface" "$scratch/package/fixtures/bin/"
-  fi
+  cargo build --locked ${surface_config[@]+"${surface_config[@]}"} --manifest-path crates/broca-module-serve/tests/support/fake-surface/Cargo.toml --target-dir "$CARGO_TARGET_DIR/fake-surface-target"
+  cp "$CARGO_TARGET_DIR/fake-surface-target/debug/fake-surface$suffix" "$scratch/package/fixtures/bin/"
   cp "$vault_source/crates/credentials-module/tests/fixtures/enrollment_wire_contract.json" \
     "$scratch/package/fixtures/claustrum/crates/credentials-module/tests/fixtures/"
   archive="$scratch/fixtures.tar.gz"

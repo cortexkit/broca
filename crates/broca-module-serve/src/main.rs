@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use broca_module::LineageRegistry;
 use broca_module_serve::{
@@ -50,9 +50,10 @@ const LEASE_SWEEP_DELAY: Duration = Duration::from_secs(300);
 const OPENAI_DECISIONS_SERVED: bool = false;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let startup_at = Instant::now();
     broca_module::diagnostics::initialize();
     broca_module_serve::serve::initialize_session_readers();
-    run_runtime(serve_main())?
+    run_runtime(serve_main(startup_at))?
 }
 
 fn run_runtime<F: std::future::Future>(work: F) -> std::io::Result<F::Output> {
@@ -71,7 +72,25 @@ fn run_runtime<F: std::future::Future>(work: F) -> std::io::Result<F::Output> {
     Ok(result)
 }
 
-async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
+struct StartupPhases {
+    started: Instant,
+    phase_started: Instant,
+}
+
+impl StartupPhases {
+    fn finished(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        tracing::debug!(
+            target: "lifecycle",
+            phase,
+            elapsed_ms = now.duration_since(self.phase_started).as_millis() as u64,
+            "startup phase complete"
+        );
+        self.phase_started = now;
+    }
+}
+
+async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error>> {
     // READ THE LAUNCH NONCE BEFORE ANYTHING ELSE. The daemon hands it over as an inherited pipe
     // (named by SUBC_LAUNCH_NONCE_FD), and that descriptor stays inheritable until it is read:
     // a process spawned before this line would inherit the pipe and could read broca's secret.
@@ -138,6 +157,11 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // The guard is bound for the whole of `main`: dropping it stops logging, so this must not
     // become a `let _ =`.
     let _log = cortexkit_log::init(cortexkit_log::Config::for_module(&module_id))?;
+    let mut startup = StartupPhases {
+        started: startup_at,
+        phase_started: startup_at,
+    };
+    startup.finished("launch_handoff_and_logger");
     // A descriptor that was named but could not be read (empty, closed, not the named pipe) means
     // the handoff went wrong. Refuse to start, with the accessor's own message, and never fall
     // back to the environment copy: that would hide the broken handoff, and in a process that
@@ -179,6 +203,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // The start writes into the state root (the old settings file's saved copy) before the
     // settings arrive, so it takes the lock first.
     lock_state_root(&state_root)?;
+    startup.finished("state_root_lock");
     // A profiling build answers heap snapshot requests from a folder in its state root, so it
     // starts only once this process holds the root.
     #[cfg(feature = "heap-profile")]
@@ -188,6 +213,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         registration_channel,
         &module_id,
         mock_provider_path,
+        &mut startup,
     )
     .await?
     {
@@ -299,6 +325,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         )?)),
         Err(_) => None,
     };
+    startup.finished("validate_settings_and_state_format");
 
     // The module holds TWO subc roles in this one process: it serves session.* as a MODULE
     // (the inbound connection below), AND dispatches tools as a CONSUMER (this outbound
@@ -327,6 +354,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let plane = SubcToolPlane::new(tool_conn, consumer_routes.tool_module.clone());
+    startup.finished("tool_consumer_and_capabilities");
 
     // The coordinator: a registry over the session store, the file leases and the run index.
     // The module owns its state_root: the leases and the session store are its durability
@@ -352,6 +380,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     let lease_store = Arc::new(broca_core::session_leases(&state_root));
     // The session classes whose new sessions start in the backed-up root.
     let backup_class_names = backup_classes.0.clone();
+    startup.finished("state_directories_and_backup_catalog");
 
     // The provider-held runtime: the slots a held call waits in, and the intake that pulls each
     // provider's late results under broca's own principal and hands them to the run's batch.
@@ -388,11 +417,13 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     // serve loop below attaches the describer once that connection has registered.
     let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
     plane.set_scope_describer(scope_describer.clone());
+    startup.finished("late_results_consumer_and_store");
     let index = Arc::new(
         broca_store::SqliteStore::open(state_root.join("run-index.db"))
             .map_err(|error| ServeIoError(format!("open run index: {error}")))?,
     );
     let run_index = Some(index);
+    startup.finished("run_index");
     // Load the last-known-good before any admission is possible. The fetch leg gets its own
     // consumer connection, but construction performs no fusiform route.open; only the detached
     // poll below can dial that sibling module.
@@ -426,6 +457,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         |notice| tracing::warn!(target: "catalog", "{notice}"),
     );
     let _catalog_poll = spawn_catalog_poll(Arc::new(catalog_poller));
+    startup.finished("catalog_snapshot_and_consumer");
 
     // The retired method file is only checked for presence, never opened.
     let _obsolete_methods = method_config_for_launch(mock_provider_path, || {
@@ -479,6 +511,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(target: "billing", "{warning}");
     }
     charge_basis_table.publish_for_health();
+    startup.finished("plan_consumer_and_executor");
     let mut vault_gauge = broca_module_serve::serve::VaultGauge::not_in_use();
     let mut classifier_router = None;
     // The routing client `llm.complete/v1` asks for its model, when broca reaches routing.
@@ -666,6 +699,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         executor_impl = executor_impl.with_routing(routing);
         executor_impl.prime_account_listing();
     }
+    startup.finished("vault_and_account_clients");
 
     executor_impl = executor_impl.with_context_management(context_management);
     let vault_auditor = executor_impl.vault_auditor();
@@ -729,6 +763,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             "the new storage could not be opened without its deployment key: {error}"
         );
     }
+    startup.finished("open_session_store_without_key");
     let store_move_leases: Arc<dyn broca_core::LeaseStore> = lease_store.clone();
     // Both live hints and durable run events share this process's credential and broker link.
     let bus_connector = Arc::new(broca_module_serve::bus_events_nats::NatsConnector::new(
@@ -786,6 +821,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     retention.set_withdraw_before_delete(held_runtime.withdraw_before_delete());
     registry.set_retention_service(retention);
+    startup.finished("session_registry_and_event_routing");
     // System One: decision models served in this process with no session. Its batch record
     // is kept in `system-one.db`, separate from the session inventory and its reservations.
     let llm_tools_config = broca_module_serve::config::LlmToolsConfig::from_settings(&settings)
@@ -872,6 +908,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_export(run_index.as_ref().unwrap().clone(), charge_basis_table)
                 .with_clairic(clairic),
         );
+        startup.finished("classifier_store_and_providers");
         // The previous process may still be closing its files, so the release waits a little
         // for a batch owner that holds its lock (see `release_abandoned_within`).
         let (released, held) = {
@@ -891,6 +928,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!(target: "system_one", held,
                 "batches stay claimed by an owner that still holds its lock; a re-send of each is refused as in progress until that owner is gone");
         }
+        startup.finished("classifier_batch_recovery");
         service
     };
     let _routing_recovery = system_one.spawn_routing_recovery(registry.stopping_signal());
@@ -947,6 +985,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     llm_tools
         .recover_consent()
         .map_err(|error| ServeIoError(format!("recover consent cards: {error}")))?;
+    startup.finished("llm_tools_store_and_recovery");
     let door = Arc::new(broca_subc::session_door::SessionDoorClient::new(
         plan_conn.clone(),
         broca_protocol::BindIdentity::new(state_root.clone(), "broca", "agent-data"),
@@ -967,6 +1006,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| ServeIoError(format!("agent-data boot recovery: {}", error.message)))?;
     tracing::info!(target: "lifecycle", elapsed_ms = phase_started.elapsed().as_millis() as u64,
         "agent-data boot recovery complete");
+    startup.finished("agent_data_recovery");
     let retention_sweep = Some(spawn_retention_sweep(
         registry.clone(),
         scope_describer.clone(),
@@ -1111,6 +1151,7 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     };
+    startup.finished("start_background_services");
     let serving = broca_module_serve::serve::serve_supervised(
         &conn_path,
         gated.connection,
@@ -1429,6 +1470,7 @@ async fn start_gated(
     channel: Option<Box<dyn broca_subc::registration::DaemonStream>>,
     module_id: &str,
     mock_provider_path: bool,
+    startup: &mut StartupPhases,
 ) -> Result<Option<(broca_module_serve::settings::Settings, Gated)>, ServeIoError> {
     use broca_module_serve::settings::{gate, Settings};
     // The routes broca consumes are named before its settings are known; no setting changes them.
@@ -1454,6 +1496,7 @@ async fn start_gated(
         (Some(path), true) => path.clone(),
         _ => move_settings_file(old_file.as_deref())?,
     };
+    startup.finished("prepare_settings_path");
     let (mut read_half, mut write_half) =
         tokio::io::split(registered_stream(conn_path, channel).await?);
     let ack = broca_module_serve::serve::register_unready(
@@ -1463,6 +1506,7 @@ async fn start_gated(
         &consumer_routes,
     )
     .await?;
+    startup.finished("register_unready");
     let gated = ack
         .subc_capabilities
         .iter()
@@ -1499,6 +1543,7 @@ async fn start_gated(
         let settings = Settings::read(&user_file).map_err(ServeIoError)?;
         (settings, gate::Gate::ungated(ack.negotiated_ver))
     };
+    gate.record_startup(startup.started);
     let connection = Arc::new(
         broca_module_serve::module_connection::ModuleConnection::new(
             Box::new(read_half.unsplit(write_half)),
@@ -1509,6 +1554,7 @@ async fn start_gated(
         broca_subc::registration::install_minter(connection.clone());
         tracing::info!(target: "lifecycle", "registered over the daemon's registration channel");
     }
+    startup.finished("load_settings");
     let registration = broca_module_serve::serve::GatedRegistration { ack, gate };
     Ok(Some((
         settings,

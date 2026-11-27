@@ -233,32 +233,36 @@ impl Rig {
         self._child.id()
     }
 
-    /// Crash every module process the daemon supervises (the daemon's direct
-    /// children), simulating an unexpected module crash mid-session. subc-core's
-    /// supervisor then respawns them under its restart policy. Unix-only (uses
-    /// `pgrep`/`kill`); a no-op elsewhere. Returns the count killed.
-    pub async fn crash_supervised_modules(&self) -> usize {
-        let Some(pid) = self.daemon_pid() else {
-            return 0;
-        };
-        let out = tokio::process::Command::new("pgrep")
-            .arg("-P")
-            .arg(pid.to_string())
-            .output()
-            .await;
-        let Ok(out) = out else { return 0 };
-        let mut killed = 0;
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if let Ok(child_pid) = line.trim().parse::<u32>() {
-                let _ = tokio::process::Command::new("kill")
-                    .arg("-9")
-                    .arg(child_pid.to_string())
-                    .status()
-                    .await;
-                killed += 1;
-            }
-        }
-        killed
+    /// Crash the named module without draining its routes or disturbing the other modules.
+    pub fn crash_supervised_module(&self, module_id: &str) {
+        let path = self
+            .dir
+            .join("runtime/data-home/cortexkit/run/live-children.json");
+        let roster: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let child = roster["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["module_id"] == module_id)
+            .expect("the rig daemon supervises the target module");
+        let pid = u32::try_from(child["pid"].as_u64().unwrap()).unwrap();
+        let birth = child["start_time"]
+            .as_u64()
+            .expect("roster child start time");
+        let process = subc_os::Process::open(pid)
+            .unwrap()
+            .expect("module is live");
+        assert_eq!(
+            subc_os::parent_pid(pid),
+            Some(self.daemon_pid().expect("rig daemon is live")),
+            "only terminate children of this rig's daemon"
+        );
+        assert_eq!(process.observe().expect("module is live").start_time, birth);
+        #[cfg(unix)]
+        assert!(process.signal(subc_os::Signal::Kill).unwrap());
+        #[cfg(windows)]
+        assert!(process.force_stop(birth, Duration::from_secs(5)).unwrap());
     }
 
     /// Connect once the daemon publishes its connection file + accepts auth.

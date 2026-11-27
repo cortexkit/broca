@@ -265,8 +265,11 @@ def prepare(output, source_cache, cache, *, snapshot_visible=False):
                     str(history_bundle.resolve()), 'HEAD'], check=True)
     print(f'subconscious complete history bundle: {history_bundle.stat().st_size} bytes', flush=True)
     print(f'claustrum plain source archive: {vault_archive.stat().st_size} bytes sha256={vault_digest}', flush=True)
-    cargo_vendor = prepare_cargo_vendor(output, {name: source_cache / name for name in ('subconscious', 'claustrum')},
-                                        source_cache)
+    cargo_vendor = prepare_cargo_vendor(output, {
+        'subconscious': source_cache / 'subconscious',
+        'claustrum': source_cache / 'claustrum',
+        'fake-surface': ROOT / 'crates/broca-module-serve/tests/support/fake-surface',
+    }, source_cache)
     (output / 'manifest.json').write_text(json.dumps({
         'package_lock_sha256': hashlib.sha256(lock_bytes).hexdigest(),
         'npm_archives': packages,
@@ -335,8 +338,11 @@ if __name__ == '__main__':
     elif args.extract_cargo_vendor:
         if args.inputs is None or args.subconscious_lock is None or args.claustrum_lock is None:
             parser.error('--extract-cargo-vendor requires --inputs and both fixture lockfiles')
-        extract_cargo_vendor(args.inputs, args.output, {'subconscious': args.subconscious_lock,
-                                                      'claustrum': args.claustrum_lock})
+        extract_cargo_vendor(args.inputs, args.output, {
+            'subconscious': args.subconscious_lock,
+            'claustrum': args.claustrum_lock,
+            'fake-surface': ROOT / 'crates/broca-module-serve/tests/support/fake-surface/Cargo.lock',
+        })
     elif args.extract_source:
         if args.inputs is None or args.revision is None:
             parser.error('--extract-source requires --inputs and --revision')

@@ -91,6 +91,7 @@ dependencies = [
  "base64",
  "libc",
  "serde_json",
+ "subc-os",
  "subc-protocol",
  "subc-transport",
  "tokio",
@@ -312,12 +313,13 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.43"
+version = "0.1.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f4a3f50e80bddf23968b1c4683d842fe232da42cf4e0f491267135a50299a8"
+checksum = "256bf8fb8c9b14c2eba092a53cd8b6dc0ae7b771802113c2fd731590c6fc4f14"
 dependencies = [
  "libc",
  "rustix",
+ "socket2",
  "windows-sys",
  "zeroize",
 ]

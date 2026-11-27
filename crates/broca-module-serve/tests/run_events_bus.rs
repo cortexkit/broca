@@ -8,7 +8,6 @@
 //! own trust chain.
 #[path = "common/routing_fixture.rs"]
 mod routing_fixture;
-#[cfg(unix)]
 #[path = "common/stored_log.rs"]
 mod stored_log;
 
@@ -426,7 +425,6 @@ async fn real_bus_outage_queues_then_reconnect_resumes_identical_event() {
 /// answers `ckbus.credential`, `ckbus.credential_renew` and `ckbus.nonce_sign` with a
 /// `{"result": ...}` body. It holds one user key, whose JWT the private broker's trust chain signs
 /// for the provisioned account, and signs the broker's connect nonce with it.
-#[cfg(unix)]
 struct FakeCkBus {
     user: Arc<KeyPair>,
     jwt: String,
@@ -436,7 +434,6 @@ struct FakeCkBus {
     methods: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-#[cfg(unix)]
 #[async_trait::async_trait]
 impl subc_client_rs::ModuleHandler for FakeCkBus {
     async fn handle(
@@ -488,18 +485,15 @@ impl subc_client_rs::ModuleHandler for FakeCkBus {
     }
 }
 
-#[cfg(unix)]
 const GEMINI_MODEL: &str = "gemini-2.5-flash";
 
 /// One Gemini SSE chunk carrying a short answer and its usage, for every model request.
-#[cfg(unix)]
 const GEMINI_TEXT_SSE: &str = concat!(
     "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}],\"role\":\"model\"},",
     "\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":5,",
     "\"candidatesTokenCount\":1}}\n\n",
 );
 
-#[cfg(unix)]
 async fn serve_gemini() -> String {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -541,14 +535,12 @@ async fn serve_gemini() -> String {
     url
 }
 
-#[cfg(unix)]
 struct DaemonRig {
     daemon: tokio::process::Child,
     dir: std::path::PathBuf,
     ckbus: Option<tokio::task::JoinHandle<()>>,
 }
 
-#[cfg(unix)]
 impl Drop for DaemonRig {
     fn drop(&mut self) {
         if let Some(task) = self.ckbus.take() {
@@ -560,7 +552,6 @@ impl Drop for DaemonRig {
     }
 }
 
-#[cfg(unix)]
 fn outbox_rows(db: &std::path::Path, run_id: &str) -> Result<Vec<(String, Option<u64>)>, String> {
     let conn =
         rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -581,7 +572,6 @@ fn outbox_rows(db: &std::path::Path, run_id: &str) -> Result<Vec<(String, Option
 /// session store and the broker. The publisher's health block must also count the event batches
 /// the run recorded in the store's outbox, which is what tells an operator an armed publisher is
 /// actually working.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_daemon_turn_publishes_run_started_and_run_ended() {
     use std::time::Instant;
@@ -899,12 +889,10 @@ async fn real_daemon_turn_publishes_run_started_and_run_ended() {
 }
 
 /// Seconds from a turn's terminal to both of its lifecycle events on the stream.
-#[cfg(unix)]
 const STREAM_DEADLINE_S: u64 = 5;
 
 /// The module's own run event log lines, without the per-session notice that recovered history
 /// was too old to publish, which the seeded history repeats thousands of times.
-#[cfg(unix)]
 fn bus_log_lines(logs: &std::path::Path) -> String {
     let mut lines = Vec::new();
     for entry in std::fs::read_dir(logs).into_iter().flatten().flatten() {
@@ -918,7 +906,6 @@ fn bus_log_lines(logs: &std::path::Path) -> String {
     lines.join("\n")
 }
 
-#[cfg(unix)]
 async fn broca_metrics(connection_file: &std::path::Path) -> serde_json::Value {
     let conn = broca_subc::SubcConnection::connect(connection_file)
         .await

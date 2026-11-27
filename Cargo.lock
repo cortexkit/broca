@@ -729,6 +729,7 @@ dependencies = [
  "libproc",
  "nix",
  "sha2",
+ "subc-os",
  "tokio",
  "tracing",
  "tracing-subscriber",

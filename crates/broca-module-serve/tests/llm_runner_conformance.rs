@@ -10,7 +10,7 @@
 //! number of emitted answers to choose their scripted turn. Legacy requests identify
 //! their session by a system marker and count assistant messages already in the input.
 //!
-//! Before SIGKILL, the harness verifies the log records required by the named crash
+//! Before killing broca, the harness verifies the log records required by the named crash
 //! checkpoint. CompactionApplied and FoldRecorded pause inside the runner before HTTP
 //! can receive the corresponding model input. Older checkpoints hold the subsequent
 //! model or tool operation. StepRecorded additionally truncates away dispatch intents
@@ -18,8 +18,6 @@
 //!
 //! `SUBC_CORE_BIN` and `FAKE_AFT_STUB_BIN` name the staged daemon/stand-in fixtures.
 //! `BROCA_REQUIRE_SUBC=1` makes missing fixtures fail rather than silently pass a skip.
-#![cfg(unix)]
-
 mod delivery_rig;
 mod step_transform_rig;
 #[path = "common/stored_log.rs"]
@@ -1696,6 +1694,7 @@ struct Live {
     owner_nonce: PathBuf,
     state_root: PathBuf,
     logs_dir: PathBuf,
+    roster: PathBuf,
     tools: tokio::task::JoinHandle<()>,
     #[cfg(feature = "test-clock")]
     bus_credentials: Option<tokio::task::JoinHandle<()>>,
@@ -1705,66 +1704,69 @@ struct Live {
     _fixture: Option<FixtureRegistration>,
 }
 
+#[derive(serde::Deserialize)]
+struct RecordedChild {
+    module_id: String,
+    pid: u32,
+    start_time: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct RigRoster {
+    children: Vec<RecordedChild>,
+}
+
 impl Live {
-    /// Every process the daemon supervises, by pid and command name.
-    fn children(&self) -> Vec<(i32, String)> {
-        let Some(pid) = self
-            .daemon
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|child| child.id())
-        else {
-            return Vec::new();
-        };
-        let output = std::process::Command::new("pgrep")
-            .arg("-P")
-            .arg(pid.to_string())
-            .output();
-        let Ok(output) = output else {
-            return Vec::new();
-        };
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| line.trim().parse::<i32>().ok())
-            .map(|pid| {
-                let name = std::process::Command::new("ps")
-                    .args(["-o", "comm=", "-p", &pid.to_string()])
-                    .output()
-                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-                    .unwrap_or_default();
-                (pid, name)
-            })
-            .collect()
+    /// The rig must prove this is its own live broca before it can report a real process cut.
+    fn cut_broca(&self, daemon_pid: u32) -> Result<bool, HarnessError> {
+        let fail = |what| HarnessError::new(format!("conformance crash cut: {what}"));
+        let bytes = std::fs::read(&self.roster).map_err(|e| fail(e.to_string()))?;
+        let roster: RigRoster = serde_json::from_slice(&bytes).map_err(|e| fail(e.to_string()))?;
+        let child = roster
+            .children
+            .iter()
+            .find(|child| child.module_id == "broca")
+            .ok_or_else(|| fail("no broca in rig's child roster".into()))?;
+        let birth = child
+            .start_time
+            .ok_or_else(|| fail("no process start time for broca".into()))?;
+        let process = subc_os::Process::open(child.pid)
+            .map_err(|e| fail(e.to_string()))?
+            .ok_or_else(|| fail("recorded broca is no longer live".into()))?;
+        if subc_os::parent_pid(child.pid) != Some(daemon_pid)
+            || process
+                .observe()
+                .is_none_or(|current| current.start_time != birth)
+        {
+            return Err(fail(format!(
+                "pid {} is not the child recorded by this rig's daemon",
+                child.pid
+            )));
+        }
+        #[cfg(unix)]
+        let killed = process.signal(subc_os::Signal::Kill);
+        #[cfg(windows)]
+        let killed = process.force_stop(birth, Duration::from_secs(5));
+        killed.map_err(|e| fail(e.to_string()))
     }
 
-    /// `SIGKILL` every supervised process, broca first, then the daemon, so nothing respawns
-    /// broca and no module outlives its rig.
+    /// Force-kill broca before tearing down the daemon and anything it still supervises.
     fn kill_all(&mut self) -> bool {
-        self.kill_supervised()
+        self.stop(true)
     }
 
-    /// [`Self::kill_all`] through a shared reference, for a rig another owner still holds.
-    fn kill_supervised(&self) -> bool {
-        let children = self.children();
-        let mut killed_broca = false;
-        for (pid, _) in children
-            .iter()
-            .filter(|(_, name)| name.contains("ckdev-broca"))
-        {
-            killed_broca |= sigkill(*pid);
-        }
-        for (pid, _) in children
-            .iter()
-            .filter(|(_, name)| !name.contains("ckdev-broca"))
-        {
-            sigkill(*pid);
-        }
+    fn stop(&self, crash_cut: bool) -> bool {
         let daemon = self.daemon.lock().unwrap().take();
+        let mut killed_broca = false;
         if let Some(mut daemon) = daemon {
-            // The daemon may already have respawned a module killed above. The tree kill stops
-            // the daemon before listing and killing its remaining processes, so no module
-            // outlives the rig and writes into the scratch directory while it is removed.
+            if let (true, Some(pid)) = (crash_cut, daemon.id()) {
+                match self.cut_broca(pid) {
+                    Ok(killed) => killed_broca = killed,
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
+            // The daemon may already have respawned broca after the cut. Finish the whole rig
+            // before the caller can remove or reopen its scratch store.
             broca_test_support::kill_and_reap_tree(&mut daemon);
         }
         self.tools.abort();
@@ -1775,43 +1777,89 @@ impl Live {
         killed_broca
     }
 
-    /// Stops the rig as dropping it does: an orderly shutdown, then [`Self::kill_supervised`]
-    /// for anything left. Callable on a rig another owner still holds, such as a routed-account
-    /// runner a session route keeps alive; stopping it again does nothing.
+    /// Stop a rig even when a routed session still owns a handle to it.
     fn shut_down(&self) {
-        // Wait for the daemon's shutdown notification to let the coordinator record a planned
-        // stop before fallback cleanup can leave the run for crash recovery.
-        let mut daemon = self.daemon.lock().unwrap();
-        if let Some(daemon) = daemon.as_mut() {
-            if let Some(pid) = daemon.id() {
-                let sent = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status()
-                    .is_ok_and(|status| status.success());
-                if sent {
-                    let _ = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(
-                            broca_test_support::event_timeout(
-                                "orderly conformance daemon exit",
-                                daemon.wait(),
-                                || format!("daemon pid={pid}"),
-                            ),
-                        )
-                    });
+        // The daemon's planned-stop notification is triggered by SIGTERM on Unix only.
+        #[cfg(unix)]
+        {
+            let mut daemon = self.daemon.lock().unwrap();
+            if let Some(daemon) = daemon.as_mut() {
+                if let Some(pid) = daemon.id() {
+                    let sent = subc_os::Process::open(pid)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|process| {
+                            matches!(daemon.try_wait(), Ok(None))
+                                && matches!(process.signal(subc_os::Signal::Terminate), Ok(true))
+                        });
+                    if sent {
+                        let _ = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(
+                                broca_test_support::event_timeout(
+                                    "orderly conformance daemon exit",
+                                    daemon.wait(),
+                                    || format!("daemon pid={pid}"),
+                                ),
+                            )
+                        });
+                    }
                 }
             }
         }
-        drop(daemon);
-        self.kill_supervised();
+        #[cfg(windows)]
+        {
+            let live = self
+                .daemon
+                .lock()
+                .unwrap()
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+            if live {
+                let stopped = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(self.drain_broca())
+                });
+                if let Err(error) = stopped {
+                    eprintln!("orderly conformance shutdown failed: {error}");
+                }
+            }
+        }
+        self.stop(false);
     }
-}
 
-/// Send `SIGKILL` to `pid` with the `kill` utility. True when it was delivered.
-fn sigkill(pid: i32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
+    // The conformance suite drops its handle to request a planned stop. Windows has no SIGTERM, so
+    // use the rig daemon's module-stop request so broca can write the terminal run record.
+    #[cfg(windows)]
+    async fn drain_broca(&self) -> Result<(), HarnessError> {
+        let ack = broca_test_support::event_timeout(
+            "conformance rig module stop",
+            async {
+                // The daemon acknowledges disable after the drain finishes. Use the same local
+                // operator request as ck module stop without launching a CLI for every fixture.
+                let consumer = subc_client_rs::SubcConsumer::connect_local(
+                    &self.connection_file,
+                    subc_client_rs::ConsumerOptions {
+                        call_timeout: broca_test_support::EVENT_HANG_GUARD,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| HarnessError::new(error.to_string()))?;
+                consumer
+                    .supervisor_set_enabled("broca", false)
+                    .await
+                    .map_err(|error| HarnessError::new(error.to_string()))
+            },
+            || self.connection_file.display().to_string(),
+        )
+        .await
+        .map_err(|error| HarnessError::new(error.to_string()))??;
+        if ack.module_id != "broca" || !ack.applied {
+            return Err(HarnessError::new(format!(
+                "module stop not applied: {ack:?}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Live {
@@ -1894,15 +1942,20 @@ impl BrocaSubject {
         root: &Path,
         routed_session: Option<&str>,
     ) -> Result<Live, HarnessError> {
-        self.start_configured_inner(root, routed_session, None)
-            .await
+        self.start_configured_inner(
+            root,
+            routed_session,
+            #[cfg(unix)]
+            None,
+        )
+        .await
     }
 
     async fn start_configured_inner(
         &self,
         root: &Path,
         routed_session: Option<&str>,
-        upgrade: Option<&held_late_results::DaemonUpgradeRig>,
+        #[cfg(unix)] upgrade: Option<&held_late_results::DaemonUpgradeRig>,
     ) -> Result<Live, HarnessError> {
         let routed = routed_session.is_some();
         let fail = |what: String| HarnessError::new(what);
@@ -2023,13 +2076,15 @@ impl BrocaSubject {
         }
         std::fs::write(&broca_config, serde_json::to_vec(&settings).unwrap())
             .map_err(|error| fail(error.to_string()))?;
+        config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
+        #[cfg(unix)]
         if let Some(upgrade) = upgrade {
             config["privileged_operator_prompt"] = json!("log");
             config["modules"]["broca"]["reserved"] = json!(true);
             config["modules"]["broca"]["registration_channel"] = json!(true);
-            upgrade.configure_broca(&mut config["modules"]["broca"]["env"]);
-        } else {
-            config["modules"]["broca"]["env"]["BROCA_CONFIG_PATH"] = json!(broca_config);
+            let env = &mut config["modules"]["broca"]["env"];
+            env.as_object_mut().unwrap().remove("BROCA_CONFIG_PATH");
+            upgrade.configure_broca(env);
         }
         if let Some(dump_dir) = &self.dump_dir {
             config["modules"]["broca"]["env"]["BROCA_DUMP_REQUEST_DIR"] = json!(dump_dir);
@@ -2037,14 +2092,16 @@ impl BrocaSubject {
         std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap())
             .map_err(|e| fail(e.to_string()))?;
         let daemon = broca_test_support::retry_executable_file_busy(|| {
-            let binary = upgrade
-                .map(|rig| rig.executable.clone())
-                .unwrap_or_else(|| {
-                    broca_test_support::ckdev_binary(
-                        sibling_bin("ck-subc", "SUBC_CORE_BIN"),
-                        broca_test_support::scratch_root(),
-                    )
-                });
+            let default_daemon = || {
+                broca_test_support::ckdev_binary(
+                    sibling_bin("ck-subc", "SUBC_CORE_BIN"),
+                    broca_test_support::scratch_root(),
+                )
+            };
+            #[cfg(unix)]
+            let binary = upgrade.map_or_else(default_daemon, |rig| rig.executable.clone());
+            #[cfg(windows)]
+            let binary = default_daemon();
             let mut command = broca_test_support::tokio_rig_command(binary, root, "daemon")?;
             command
                 .env("XDG_CONFIG_HOME", &config_home)
@@ -2058,6 +2115,7 @@ impl BrocaSubject {
                 .env_remove("SUBC_LAUNCH_NONCE_FD")
                 .env_remove("SUBC_MODULE_ID")
                 .kill_on_drop(true);
+            #[cfg(unix)]
             if let Some(upgrade) = upgrade {
                 upgrade.configure(&mut command, &connection_file);
             }
@@ -2108,6 +2166,7 @@ impl BrocaSubject {
             owner_nonce,
             state_root,
             logs_dir: data_home.join("cortexkit/broca/logs"),
+            roster: data_home.join("cortexkit/run/live-children.json"),
             tools,
             #[cfg(feature = "test-clock")]
             bus_credentials,
@@ -2333,7 +2392,7 @@ impl Harness for BrocaSubject {
         .map(|point| PointDeclaration {
             point: KillPoint::new(point),
             mechanisms: vec![KillMechanism::ProcessSignal],
-            note: "SIGKILL of the ck-broca process while the rig holds the next thing it \
+            note: "Forced termination of ck-broca while the rig holds the next thing it \
                        waits on, after the session's log is checked to hold exactly the point's \
                        state. broca's run start holds the send with its send_id, so Admitted \
                        and SendRecorded cut at the same place."
@@ -2346,11 +2405,10 @@ impl Harness for BrocaSubject {
             points.push(PointDeclaration {
                 point: KillPoint::new(points::RETENTION_TOMBSTONED),
                 mechanisms: vec![KillMechanism::ProcessSignal],
-                note: "A session head folder the daemon can't write stops a retention deletion \
-                       after its expiry marker is durable and before the session is removed. \
-                       SIGKILL follows observation of that marker with the session whole; the \
-                       folder is made writable again only after the process dies, before \
-                       restart."
+                note: "Blocking the session head's rename stops retention deletion after its \
+                       expiry marker is durable and before the session is removed. The rig kills \
+                       broca with the session still whole, then lets the head be renamed again \
+                       before restart."
                     .into(),
             });
             points
@@ -2778,7 +2836,13 @@ impl RunnerRoute for BrocaRoute {
                 }
                 Ok(Reply::Response(value["result"].clone()))
             }
-            Err(error) => Ok(Reply::Error(error_body(&error))),
+            Err(error) => {
+                let error: subc_protocol::ErrorBody = error_body(&error);
+                if method == "session.head" && error.code == "open_failed" {
+                    eprintln!("conformance session.head open_failed: {}", error.message);
+                }
+                Ok(Reply::Error(error))
+            }
         }
     }
 
@@ -6195,6 +6259,7 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
     if skip_crash_kills() {
         assert!(report.kills.is_empty());
         println!("Crash kills disabled: the kit's overall verdict remains non-conforming without a real kill; run natively without BROCA_CONFORMANCE_SKIP_CRASH_KILLS to verify durability.");
+        drop(subject);
         broca_test_support::remove_rig_dir(&scratch);
         return;
     }
@@ -6206,6 +6271,8 @@ async fn ck_broca_passes_the_llm_runner_conformance_suite() {
         "{}",
         report.render()
     );
+    // The subject owns the private broker, which opens files in the scratch directory.
+    drop(subject);
     broca_test_support::remove_rig_dir(&scratch);
 }
 

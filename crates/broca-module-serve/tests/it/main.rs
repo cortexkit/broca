@@ -48,7 +48,6 @@ mod anthropic_default_cache_render;
 mod anthropic_model_switch_live;
 mod anthropic_thinking_binding_live;
 mod anthropic_thinking_echo_live;
-#[cfg(unix)]
 mod cache_shared_prefix_render;
 mod captured_replay_e2e;
 mod chatgpt_websocket_live;

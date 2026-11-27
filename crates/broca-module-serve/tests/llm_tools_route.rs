@@ -94,7 +94,7 @@ async fn provider(state: Arc<Provider>) -> String {
 }
 
 struct Rig {
-    _daemon: broca_test_support::RigChild,
+    daemon: broca_test_support::RigChild,
     root: PathBuf,
     state: PathBuf,
     provider: Arc<Provider>,
@@ -214,7 +214,7 @@ impl Rig {
         })
         .unwrap();
         let rig = Self {
-            _daemon: broca_test_support::RigChild::new(child, &root, "daemon"),
+            daemon: broca_test_support::RigChild::new(child, &root, "daemon"),
             root,
             state,
             provider: provider_state,
@@ -528,33 +528,46 @@ fn registration_barrier_distinguishes_absence_missing_grant_and_warming() {
     assert_eq!(registered_for_bind(&[entry], "broca"), Ok(()));
 }
 
-/// Read the supervised PID from this rig's own roster. The late-results incarnation is a
-/// nonce-derived hash, not a process ID, so it cannot identify a child to signal.
-#[cfg(unix)]
-fn broca_pid(rig: &Rig) -> Result<u32, String> {
+/// Read the process identity from the roster written by this rig's daemon.
+fn broca_process_stamp(rig: &Rig) -> Result<(u32, u64), String> {
     let roster = rig.root.join("data/cortexkit/run/live-children.json");
     let record: Value =
         serde_json::from_slice(&std::fs::read(&roster).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
-    let pid = record["children"]
+    let child = record["children"]
         .as_array()
         .ok_or("live-child roster has no children array")?
         .iter()
         .find(|child| child["module_id"] == "broca")
-        .and_then(|child| child["pid"].as_u64())
         .ok_or("the rig daemon has no live broca child")?;
-    u32::try_from(pid).map_err(|error| error.to_string())
+    let pid = child["pid"].as_u64().ok_or("the roster has no broca PID")?;
+    let birth = child["start_time"]
+        .as_u64()
+        .ok_or("the roster has no broca start time")?;
+    Ok((
+        u32::try_from(pid).map_err(|error| error.to_string())?,
+        birth,
+    ))
 }
 
-#[cfg(unix)]
 async fn kill_broca(rig: &Rig) {
-    let pid = broca_pid(rig).expect("the rig daemon supervises a live broca");
-    sigkill(pid);
+    let (pid, birth) = broca_process_stamp(rig).expect("the rig daemon supervises a live broca");
+    let process = subc_os::Process::open(pid).unwrap().expect("broca is live");
+    assert_eq!(
+        subc_os::parent_pid(pid),
+        Some(rig.daemon.id().expect("rig daemon is live")),
+        "only terminate this rig's supervised broca"
+    );
+    assert_eq!(process.observe().expect("broca is live").start_time, birth);
+    #[cfg(unix)]
+    assert!(process.signal(subc_os::Signal::Kill).unwrap());
+    #[cfg(windows)]
+    assert!(process.force_stop(birth, Duration::from_secs(5)).unwrap());
     // The supervisor releases the old registration before spawning its replacement. Waiting
     // for a different child prevents the catalog barrier from accepting the dying process.
     broca_test_support::wait_until("replacement broca process", || async {
-        let next = broca_pid(rig)?;
-        if next == pid {
+        let next = broca_process_stamp(rig)?;
+        if next == (pid, birth) {
             Err(format!(
                 "broca has not respawned; the roster still names PID {pid}"
             ))
@@ -565,15 +578,7 @@ async fn kill_broca(rig: &Rig) {
     .await;
 }
 
-#[cfg(unix)]
-fn sigkill(pid: u32) {
-    assert!(std::process::Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
-        .status()
-        .unwrap()
-        .success());
-}
-
+// This fixture blocks a shell on a POSIX FIFO before it execs the replacement.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_route_waits_for_broca_registration() {
@@ -663,7 +668,6 @@ async fn restart_route_waits_for_broca_registration() {
     assert_eq!(rig.calls(), 1);
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_precedes_catalog_and_pricing_across_real_process_restarts() {
     let Some(rig) = Rig::start("catalog-replay", true, true, Some(42_000_000), 0, false).await
@@ -695,7 +699,6 @@ async fn replay_precedes_catalog_and_pricing_across_real_process_restarts() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_answer_crash_cut_retries_once_and_stores_one_outcome_and_fact() {
     let Some(rig) = Rig::start("answer-cut", true, true, Some(42_000_000), 0, true).await else {
@@ -882,7 +885,6 @@ async fn recorded_batch(key: &str) -> (String, broca_store::system_one::StoredBa
     (batch_id, recorded)
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn effective_subscription_override_is_unpriceable() {
     let Some(rig) = Rig::start("subscription", true, true, Some(42_000_000), 0, false).await else {

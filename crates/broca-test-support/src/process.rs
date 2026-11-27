@@ -11,29 +11,36 @@ struct ProcessInfo {
 }
 
 #[cfg(any(windows, test))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ProcessWaitOutcome {
-    Exited,
-    TimedOut,
-    OpenFailedInvalidParameter,
-    Failed(String),
-}
-
-#[cfg(any(windows, test))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ProcessWaitClassification {
-    Exited,
-    StillAlive,
-    Failed(String),
-}
-
-#[cfg(any(windows, test))]
-fn classify_process_wait(outcome: ProcessWaitOutcome) -> ProcessWaitClassification {
-    match outcome {
-        ProcessWaitOutcome::Exited => ProcessWaitClassification::Exited,
-        ProcessWaitOutcome::OpenFailedInvalidParameter => ProcessWaitClassification::Exited,
-        ProcessWaitOutcome::TimedOut => ProcessWaitClassification::StillAlive,
-        ProcessWaitOutcome::Failed(error) => ProcessWaitClassification::Failed(error),
+fn track_proven_descendants<T>(
+    root_pid: u32,
+    root_birth: u64,
+    mut candidates: Vec<ProcessInfo>,
+    mut capture: impl FnMut(&ProcessInfo) -> Option<(u64, T)>,
+) -> Vec<(ProcessInfo, T)> {
+    let mut births = std::collections::HashMap::from([(root_pid, root_birth)]);
+    let mut descendants = Vec::new();
+    loop {
+        let previous_len = births.len();
+        candidates.retain(|candidate| {
+            if births.contains_key(&candidate.pid) {
+                return false;
+            }
+            let Some(&parent_birth) = births.get(&candidate.parent_pid) else {
+                return true;
+            };
+            if let Some((birth, handle)) = capture(candidate) {
+                // A reused parent PID can point to a process born after its supposed child.
+                // An equal timestamp does not establish which process came first either.
+                if birth > parent_birth {
+                    births.insert(candidate.pid, birth);
+                    descendants.push((candidate.clone(), handle));
+                }
+            }
+            false
+        });
+        if previous_len == births.len() {
+            return descendants;
+        }
     }
 }
 
@@ -97,135 +104,39 @@ fn append_cleanup_diagnostic(message: &str) -> std::io::Result<()> {
 
 #[cfg(windows)]
 mod windows_processes {
-    use super::{classify_process_wait, Duration, Instant, ProcessInfo, ProcessWaitClassification};
-
-    // OpenProcess uses ERROR_INVALID_PARAMETER when the PID has already exited.
-    const ERROR_INVALID_PARAMETER_CODE: i32 = 87;
+    use super::{track_proven_descendants, Instant, ProcessInfo};
+    use subc_os::Process;
 
     pub(super) struct ProcessTreeDiagnostic {
-        pub root_pid: u32,
-        pub tree: Vec<ProcessInfo>,
-        pub tree_pids: Vec<u32>,
-        pub errors: Vec<String>,
+        root_pid: u32,
+        // Keep the root PID pinned even after Tokio reaps the child.
+        _root: Option<Process>,
+        descendants: Vec<(ProcessInfo, Process)>,
+        errors: Vec<String>,
     }
 
     pub(super) fn capture_before(root_pid: u32) -> ProcessTreeDiagnostic {
-        let mut errors = Vec::new();
-        let all_processes = process_snapshot(&mut errors);
-        let mut tree_pids = vec![root_pid];
-        loop {
-            let previous_len = tree_pids.len();
-            for process in &all_processes {
-                if tree_pids.contains(&process.parent_pid) && !tree_pids.contains(&process.pid) {
-                    tree_pids.push(process.pid);
-                }
-            }
-            if tree_pids.len() == previous_len {
-                break;
-            }
-        }
-        let mut tree: Vec<_> = all_processes
-            .into_iter()
-            .filter(|process| tree_pids.contains(&process.pid))
-            .collect();
-        for process in &mut tree {
-            match process_job_status(process.pid) {
-                Ok(in_job) => process.in_job = in_job,
-                Err(error) => errors.push(format!(
-                    "could not query job membership for {}: {error}",
-                    process.pid
-                )),
-            }
-        }
-        ProcessTreeDiagnostic {
+        let mut diagnostic = ProcessTreeDiagnostic {
             root_pid,
-            tree,
-            tree_pids,
-            errors,
-        }
-    }
-
-    pub(super) fn report_after(diagnostic: ProcessTreeDiagnostic) {
-        let mut errors = diagnostic.errors;
-        let tree_pids = diagnostic.tree_pids;
-        let tracked = tree_pids.len();
-        let observed = diagnostic.tree.len();
-        let root_pid = diagnostic.root_pid;
-        let processes = process_snapshot(&mut errors);
-        let candidates: Vec<_> = processes
-            .into_iter()
-            .filter(|process| {
-                tree_pids.contains(&process.pid) || tree_pids.contains(&process.parent_pid)
-            })
-            .collect();
-
-        // Share one deadline across every candidate so a large tree cannot multiply the wait.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut survivors = Vec::new();
-        for process in candidates {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
-            match classify_process_wait(process_wait_outcome(process.pid, timeout_ms)) {
-                ProcessWaitClassification::Exited => {}
-                ProcessWaitClassification::StillAlive => survivors.push(process),
-                ProcessWaitClassification::Failed(error) => {
-                    errors.push(format!(
-                        "could not wait for process {}: {error}",
-                        process.pid
-                    ));
-                }
+            _root: None,
+            descendants: Vec::new(),
+            errors: Vec::new(),
+        };
+        let root = match Process::open(root_pid) {
+            Ok(Some(root)) => root,
+            Ok(None) => return diagnostic,
+            Err(error) => {
+                diagnostic
+                    .errors
+                    .push(format!("could not open rig child: {error}"));
+                return diagnostic;
             }
-        }
-
-        let mut confirmed_survivors = Vec::new();
-        for mut process in survivors {
-            match process_job_status(process.pid) {
-                Ok(Some(in_job)) => {
-                    process.in_job = Some(in_job);
-                    confirmed_survivors.push(process);
-                }
-                // A process may exit between the wait and the job-membership query.
-                Ok(None) => {}
-                Err(error) => {
-                    errors.push(format!(
-                        "could not query job membership for {}: {error}",
-                        process.pid
-                    ));
-                    confirmed_survivors.push(process);
-                }
-            }
-        }
-        let survivors = confirmed_survivors;
-        if let Some(block) = super::format_survivor_block(diagnostic.root_pid, &survivors) {
-            super::report_cleanup_diagnostic(&block);
-        }
-        // Clean cleanup stays silent, including in the artifact directory.
-        if survivors.is_empty() && errors.is_empty() {
-            return;
-        }
-        let first_error = errors
-            .first()
-            .map(|error| format!(" first_error={error:?}"));
-        super::report_cleanup_diagnostic(&format!(
-            "test rig: process tree cleanup pid={} tracked={} records={} survivors={} errors={}{}",
-            root_pid,
-            tracked,
-            observed,
-            survivors.len(),
-            errors.len(),
-            first_error.unwrap_or_default()
-        ));
-    }
-
-    /// Skipping is routine (the child already exited, or never got a pid), so it stays inside
-    /// the harness's capture and only shows with a failing test's output.
-    pub(super) fn report_skipped(reason: &str) {
-        eprintln!("test rig: process tree cleanup skipped: {reason}");
-    }
-
-    fn process_snapshot(errors: &mut Vec<String>) -> Vec<ProcessInfo> {
-        match broca_owner_only::test_support::process_snapshot() {
-            Ok(processes) => processes
+        };
+        let Some(root_birth) = root.observe().map(|observation| observation.start_time) else {
+            return diagnostic;
+        };
+        let candidates = match broca_owner_only::test_support::process_snapshot() {
+            Ok(records) => records
                 .into_iter()
                 .map(|process| ProcessInfo {
                     image: process.image,
@@ -235,38 +146,74 @@ mod windows_processes {
                 })
                 .collect(),
             Err(error) => {
-                errors.push(format!("process snapshot failed: {error}"));
-                Vec::new()
+                diagnostic
+                    .errors
+                    .push(format!("process snapshot failed: {error}"));
+                return diagnostic;
+            }
+        };
+        diagnostic._root = Some(root);
+        diagnostic.descendants =
+            track_proven_descendants(root_pid, root_birth, candidates, |info| {
+                let child = Process::open(info.pid).ok().flatten()?;
+                let birth = child.observe()?.start_time;
+                // Recheck the parent with the child handle pinned; the snapshot's PID may
+                // have been reused between taking the snapshot and opening the handle.
+                (subc_os::parent_pid(info.pid) == Some(info.parent_pid)).then_some((birth, child))
+            });
+        for (info, _) in &mut diagnostic.descendants {
+            info.in_job = broca_owner_only::test_support::process_is_in_job(info.pid).ok();
+        }
+        diagnostic
+    }
+
+    impl ProcessTreeDiagnostic {
+        pub(super) fn terminate_descendants(&mut self) {
+            for (info, child) in &self.descendants {
+                // This is the handle opened while proving the child's ancestry. Never
+                // re-open its PID for termination or survivor reporting.
+                if let Err(error) = child.terminate_with_exit_code(1) {
+                    self.errors
+                        .push(format!("terminate pid {}: {error}", info.pid));
+                }
+            }
+        }
+
+        pub(super) fn report_after(self, deadline: Instant) {
+            let mut errors = self.errors;
+            let mut survivors = Vec::new();
+            let tracked = self.descendants.len();
+            for (info, child) in self.descendants {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match child.wait_for_exit(remaining) {
+                    Ok(true) => {}
+                    Ok(false) => survivors.push(info),
+                    Err(error) => errors.push(format!("wait for pid {}: {error}", info.pid)),
+                }
+            }
+            if let Some(block) = super::format_survivor_block(self.root_pid, &survivors) {
+                super::report_cleanup_diagnostic(&block);
+            }
+            if !survivors.is_empty() || !errors.is_empty() {
+                let first_error = errors
+                    .first()
+                    .map(|error| format!(" first_error={error:?}"));
+                super::report_cleanup_diagnostic(&format!(
+                    "test rig: process tree cleanup pid={} tracked={} survivors={} errors={}{}",
+                    self.root_pid,
+                    tracked,
+                    survivors.len(),
+                    errors.len(),
+                    first_error.unwrap_or_default()
+                ));
             }
         }
     }
 
-    fn process_wait_outcome(pid: u32, timeout_ms: u32) -> super::ProcessWaitOutcome {
-        use broca_owner_only::test_support::ProcessWaitError;
-
-        match broca_owner_only::test_support::process_wait_for_exit(pid, timeout_ms) {
-            Ok(true) => super::ProcessWaitOutcome::Exited,
-            Ok(false) => super::ProcessWaitOutcome::TimedOut,
-            Err(ProcessWaitError::Open(error))
-                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER_CODE) =>
-            {
-                super::ProcessWaitOutcome::OpenFailedInvalidParameter
-            }
-            Err(ProcessWaitError::Open(error)) => {
-                super::ProcessWaitOutcome::Failed(format!("OpenProcess failed: {error}"))
-            }
-            Err(ProcessWaitError::Wait(error)) => {
-                super::ProcessWaitOutcome::Failed(format!("WaitForSingleObject failed: {error}"))
-            }
-        }
-    }
-
-    fn process_job_status(pid: u32) -> Result<Option<bool>, std::io::Error> {
-        match broca_owner_only::test_support::process_is_in_job(pid) {
-            Ok(in_job) => Ok(Some(in_job)),
-            Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER_CODE) => Ok(None),
-            Err(error) => Err(error),
-        }
+    /// Skipping is routine (the child already exited, or never got a pid), so it stays inside
+    /// the harness's capture and only shows with a failing test's output.
+    pub(super) fn report_skipped(reason: &str) {
+        eprintln!("test rig: process tree cleanup skipped: {reason}");
     }
 }
 
@@ -283,12 +230,10 @@ pub(crate) fn describe_exit_status(status: ExitStatus) -> String {
 
 /// Stop a rig's child before removing its files or shutting down the Tokio runtime.
 ///
-/// On Windows, killing a supervisor does not kill its modules. Terminate its tree
-/// while the supervisor is still alive so grandchildren cannot retain CI output
-/// handles. The caller must also set `kill_on_drop(true)` when spawning, to cover
-/// startup failures before the child is installed in the rig.
-/// A pre- and post-kill process snapshot names descendants that remain alive, so
-/// leaked test processes can be identified from CI output.
+/// On Windows, record the rig's provable descendants while its supervisor is alive,
+/// then terminate and wait on their retained handles as well as the supervisor's.
+/// This keeps grandchildren from holding CI output handles open. The caller must set
+/// `kill_on_drop(true)` when spawning to cover failure before the rig takes ownership.
 ///
 /// Drop cannot await, so reap with bounded synchronous polling. This also works
 /// inside a current-thread runtime, where blocking on an async wait would deadlock.
@@ -296,6 +241,17 @@ pub(crate) fn describe_exit_status(status: ExitStatus) -> String {
 /// A child that failed before cleanup is reported with its exit status (and Unix signal),
 /// so a startup kill is not hidden behind the rig's readiness timeout.
 pub fn kill_and_reap(child: &mut tokio::process::Child) {
+    kill_and_reap_inner(
+        child,
+        #[cfg(windows)]
+        true,
+    );
+}
+
+fn kill_and_reap_inner(
+    child: &mut tokio::process::Child,
+    #[cfg(windows)] terminate_descendants: bool,
+) {
     if let Ok(Some(status)) = child.try_wait() {
         if !status.success() {
             eprintln!(
@@ -308,34 +264,13 @@ pub fn kill_and_reap(child: &mut tokio::process::Child) {
         return;
     }
     #[cfg(windows)]
-    let process_tree = child.id().map(windows_processes::capture_before);
-    #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        #[cfg(test)]
-        // The test uses a no-op taskkill so its detached grandchild survives until the post-kill snapshot.
-        let taskkill =
-            std::env::var_os("BROCA_TEST_SUPPORT_TASKKILL").unwrap_or_else(|| "taskkill".into());
-        #[cfg(not(test))]
-        let taskkill = std::ffi::OsString::from("taskkill");
-        let result = std::process::Command::new(taskkill)
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        match result {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!(
-                "test rig: taskkill could not terminate process tree {pid}: {}",
-                describe_exit_status(status)
-            ),
-            Err(error) => {
-                eprintln!("test rig: taskkill could not terminate process tree {pid}: {error}")
-            }
-        }
-    }
+    let mut process_tree = child.id().map(windows_processes::capture_before);
     if let Err(error) = child.start_kill() {
         eprintln!("test rig: could not kill child: {error}");
+    }
+    #[cfg(windows)]
+    if let (true, Some(tree)) = (terminate_descendants, &mut process_tree) {
+        tree.terminate_descendants();
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -352,7 +287,7 @@ pub fn kill_and_reap(child: &mut tokio::process::Child) {
     }
     #[cfg(windows)]
     match process_tree {
-        Some(diagnostic) => windows_processes::report_after(diagnostic),
+        Some(diagnostic) => diagnostic.report_after(deadline),
         None => windows_processes::report_skipped("child process id is unavailable"),
     }
 }
@@ -373,7 +308,7 @@ pub fn kill_and_reap(child: &mut tokio::process::Child) {
 /// than panicking, because this runs from `Drop`, often during another panic. A supervisor
 /// that already exited before cleanup leaves no tree to find; [`kill_and_reap`] reports it.
 ///
-/// On Windows [`kill_and_reap`] already ends the whole tree and waits for it.
+/// On Windows [`kill_and_reap`] also ends and waits for all provable descendants.
 pub fn kill_and_reap_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -711,7 +646,8 @@ mod tests {
         .await
         .expect("daemon must start its detached grandchild");
         let grandchild_pid = pid_line.split_once('=').unwrap().1.parse::<u32>().unwrap();
-        kill_and_reap(&mut daemon);
+        // Deliberately leave the proven descendant alive to test the survivor report.
+        kill_and_reap_inner(&mut daemon, false);
         println!("SURVIVOR_TEST_PID={grandchild_pid}");
         let _ = std::fs::write(&stop_file, b"stop");
     }
@@ -741,7 +677,6 @@ mod tests {
         let _remove_directory_on_drop = RemoveTestDirectory(directory.clone());
         let _stop_on_drop = StopSurvivor(directory.join("stop"));
         let executable = std::env::current_exe().unwrap();
-        std::fs::copy(&executable, directory.join("taskkill.exe")).unwrap();
         let output = tokio::time::timeout(
             Duration::from_secs(20),
             tokio::process::Command::new(&executable)
@@ -752,10 +687,6 @@ mod tests {
                 ])
                 .env("BROCA_TEST_SUPPORT_SURVIVOR_PARENT", "1")
                 .env("BROCA_TEST_SUPPORT_SURVIVOR_STOP", directory.join("stop"))
-                .env(
-                    "BROCA_TEST_SUPPORT_TASKKILL",
-                    directory.join("taskkill.exe"),
-                )
                 .kill_on_drop(true)
                 .output(),
         )
@@ -1021,43 +952,43 @@ mod tests {
     }
 
     #[test]
-    fn process_wait_classifies_signaled_process_as_exited() {
+    fn process_tree_rejects_a_reused_parent_pid_and_its_unproven_branch() {
+        let record = |pid, parent_pid| ProcessInfo {
+            image: format!("proc-{pid}.exe"),
+            pid,
+            parent_pid,
+            in_job: None,
+        };
+        // pid 20 was born before this incarnation of pid 10. Even a younger
+        // process that names pid 20 as its parent cannot establish a link to 10.
+        let candidates = vec![
+            record(31, 30),
+            record(20, 10),
+            record(21, 20),
+            record(30, 10),
+            record(40, 10),
+        ];
+        let births = [(20, 7), (21, 13), (30, 11), (31, 14), (40, 10)];
+        let tracked = track_proven_descendants(10, 10, candidates, |process| {
+            births
+                .iter()
+                .find(|(pid, _)| *pid == process.pid)
+                .map(|&(_, birth)| (birth, process.pid))
+        });
         assert_eq!(
-            classify_process_wait(ProcessWaitOutcome::Exited),
-            ProcessWaitClassification::Exited
-        );
-    }
-
-    #[test]
-    fn process_wait_classifies_open_failed_gone_process_as_exited() {
-        assert_eq!(
-            classify_process_wait(ProcessWaitOutcome::OpenFailedInvalidParameter),
-            ProcessWaitClassification::Exited
-        );
-    }
-
-    #[test]
-    fn process_wait_classifies_timeout_as_still_alive() {
-        assert_eq!(
-            classify_process_wait(ProcessWaitOutcome::TimedOut),
-            ProcessWaitClassification::StillAlive
-        );
-    }
-
-    #[test]
-    fn process_wait_preserves_unexpected_errors() {
-        assert_eq!(
-            classify_process_wait(ProcessWaitOutcome::Failed("access denied".to_owned())),
-            ProcessWaitClassification::Failed("access denied".to_owned())
+            tracked
+                .into_iter()
+                .map(|(info, handle)| (info.pid, handle))
+                .collect::<Vec<_>>(),
+            vec![(30, 30), (31, 31)]
         );
     }
 
     #[cfg(windows)]
     #[test]
     fn process_wait_times_out_for_the_current_process() {
-        let still_alive =
-            broca_owner_only::test_support::process_wait_for_exit(std::process::id(), 0).unwrap();
-        assert!(!still_alive);
+        let process = subc_os::Process::open(std::process::id()).unwrap().unwrap();
+        assert!(!process.wait_for_exit(Duration::ZERO).unwrap());
     }
 
     #[cfg(unix)]

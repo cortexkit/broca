@@ -117,16 +117,14 @@ impl BrocaSubject {
 
 impl BrocaSubject {
     /// Kills ck-broca at a retention deletion's recovery boundary: the session's expiry marker
-    /// durable and the session still whole. Deletion writes the marker before it removes the
-    /// session's head, so a head folder the daemon can't write holds the deletion there, with
-    /// the content intact, without cutting a log or fabricating a marker.
+    /// durable and the session still whole. Deletion writes the marker before it renames the
+    /// session head, so blocking that rename leaves the content intact without fabricating a marker.
     pub(super) async fn kill_retention(
         &self,
         mut handle: Live,
         point: &KillPoint,
         mut trigger: Trigger<'_>,
     ) -> Result<KillReport, HarnessError> {
-        use std::os::unix::fs::PermissionsExt;
         let session = self
             .shared
             .last_session
@@ -145,11 +143,18 @@ impl BrocaSubject {
             harness: key.harness.clone(),
             session: key.session.clone(),
         };
+        #[cfg(unix)]
         let set_mode = |mode| {
+            use std::os::unix::fs::PermissionsExt;
+
             std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(mode))
                 .map_err(|error| HarnessError::new(format!("{}: {error}", heads.display())))
         };
+        #[cfg(unix)]
         set_mode(0o500)?;
+        #[cfg(windows)]
+        let barrier = block_head_rename(&head)
+            .map_err(|error| HarnessError::new(format!("{}: {error}", head.display())))?;
         let reached = tokio::time::timeout(DELETION_WAIT, async {
             loop {
                 let markers = broca_session_store::expired::read(
@@ -177,7 +182,10 @@ impl BrocaSubject {
         };
         let killed = handle.kill_all();
         drop(handle);
+        #[cfg(unix)]
         set_mode(0o700)?;
+        #[cfg(windows)]
+        drop(barrier);
         result?;
         if !killed {
             return Err(HarnessError::new("no ck-broca process was found to kill"));
@@ -187,6 +195,35 @@ impl BrocaSubject {
             mechanism: KillMechanism::ProcessSignal,
         })
     }
+}
+
+#[cfg(windows)]
+fn block_head_rename(head: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Allow reads and writes but deny delete sharing, which Windows also requires for rename.
+    const SHARE_READ_WRITE: u32 = 0x01 | 0x02;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_WRITE)
+        .open(head)
+}
+
+#[cfg(windows)]
+#[test]
+fn head_rename_waits_until_the_windows_cut_barrier_is_released() {
+    let root = broca_test_support::scratch_root().join("retention-rename-barrier");
+    std::fs::create_dir(&root).unwrap();
+    let head = root.join("head");
+    let deleting = root.join("deleting");
+    std::fs::write(&head, b"session head").unwrap();
+    let barrier = block_head_rename(&head).unwrap();
+    assert!(std::fs::rename(&head, &deleting).is_err());
+    assert_eq!(std::fs::read(&head).unwrap(), b"session head");
+    drop(barrier);
+    std::fs::rename(&head, &deleting).unwrap();
+    assert_eq!(std::fs::read(&deleting).unwrap(), b"session head");
+    broca_test_support::remove_rig_dir(root);
 }
 
 /// Whether `key`'s session is gone from the session store: no class holds its head.

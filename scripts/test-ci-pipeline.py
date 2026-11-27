@@ -940,7 +940,7 @@ class ArchiveShards(unittest.TestCase):
             self.assertEqual(command[command.index('--extract-to')+1], str(extracted))
 
     def test_run_uses_archive_partition_and_original_selection_without_compiling(self):
-        result = self.run_mode('run', str(self.archive), '3/4')
+        result = self.run_mode('run', str(self.archive), '3/4', RUNNER_OS='Linux')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = self.commands()
         self.assertEqual(len(commands), 2)
@@ -953,6 +953,30 @@ class ArchiveShards(unittest.TestCase):
         shard = commands[1]
         self.assertEqual(shard[shard.index('--partition') + 1], 'hash:3/4')
         self.assertEqual(shard[shard.index('-E') + 1], 'kind(test) and not binary(=live)')
+
+    def test_hosted_windows_shard_keeps_the_full_integration_selection(self):
+        result = self.run_mode('run', str(self.archive), '3/4', RUNNER_OS='Windows')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        clock, shard = self.commands()
+        self.assertEqual(clock[clock.index('-E') + 1],
+                         'kind(test) and package(=broca-module) and '
+                         'test(=test_clock::test_clock_feature_is_enabled_for_retention_tests)')
+        self.assertEqual(shard[shard.index('-E') + 1], 'kind(test) and not binary(=live)')
+        self.assertEqual(shard[shard.index('--partition') + 1], 'hash:3/4')
+        self.assertEqual(shard.count('-E'), 1)
+        self.assertNotIn('--filterset', shard)
+
+    def test_only_the_windows_conformance_kit_has_a_per_test_timeout_override(self):
+        profiles = tomllib.loads((ROOT / '.config/nextest.toml').read_text())['profile']
+        self.assertEqual(profiles['ci']['slow-timeout'], {'period': '60s', 'terminate-after': 5})
+        overrides = [(profile, override) for profile, config in profiles.items()
+                     for override in config.get('overrides', []) if 'slow-timeout' in override]
+        self.assertEqual(overrides, [('ci', {
+            'platform': 'cfg(windows)',
+            'filter': 'package(=broca-module-serve) and binary(=llm_runner_conformance) and '
+                      'test(=ck_broca_passes_the_llm_runner_conformance_suite)',
+            'slow-timeout': {'period': '60s', 'terminate-after': 10},
+        })])
 
     def test_missing_clock_pass_refuses_shard(self):
         result = self.run_mode('run', str(self.archive), '1/4', NO_CLOCK_PASS='1')
@@ -1121,8 +1145,7 @@ class WorkflowGraph(unittest.TestCase):
         build = next(s for s in fixtures['steps'] if s.get('name') == 'Build fixtures once')
         self.assertIn('"subconscious/target/debug/ck$suffix"', build['run'])
         verify = next(s for s in fixtures['steps'] if s.get('name') == 'Verify and package fixtures')
-        self.assertIn('names="ck-subc fake-aft-stub ck ck-claustrum ck-auth"', verify['run'])
-        self.assertIn('if [[ "$RUNNER_OS" != Windows ]]; then names="$names fake-surface"; fi', verify['run'])
+        self.assertIn('names="ck-subc fake-aft-stub ck ck-claustrum ck-auth fake-surface"', verify['run'])
         nightly = next(s for s in fixtures['steps'] if s.get('name') == 'Resolve nightly sibling revisions')
         self.assertEqual(nightly['if'], "github.event_name == 'schedule'")
         self.assertEqual(nightly['run'].count('git ls-remote'), 2)
@@ -1131,13 +1154,10 @@ class WorkflowGraph(unittest.TestCase):
         fixtures = self.workflow('fixtures.yml')['jobs']['fixtures']
         build = next(s for s in fixtures['steps'] if s.get('name') == 'Build fixtures once')['run']
         self.assertIn('cargo build --locked --manifest-path broca/crates/broca-module-serve/tests/support/fake-surface/Cargo.toml --target-dir fake-surface-target', build)
-        self.assertIn('cp fake-surface-target/debug/fake-surface fixtures/bin/', build)
-        # The stand-in uses Unix descriptors and its tests run only on Linux and macOS, so the
-        # Windows fixture job must never try to compile it.
-        guard = build.index('if [[ "$RUNNER_OS" != Windows ]]; then')
-        self.assertLess(guard, build.index('fake-surface/Cargo.toml'))
+        self.assertIn('cp "fake-surface-target/debug/fake-surface$suffix" fixtures/bin/', build)
+        self.assertNotIn('"$RUNNER_OS" != Windows', build)
         cache = next(s for s in fixtures['steps'] if s.get('id') == 'binaries')['with']['key']
-        self.assertIn('fixtures-v3-', cache)
+        self.assertIn('fixtures-v4-', cache)
         self.assertIn("hashFiles('broca/crates/broca-module-serve/tests/support/fake-surface/**')", cache)
 
         def fixture_environments(node):
@@ -1303,6 +1323,39 @@ class ArtifactWait(unittest.TestCase):
         self.assertTrue(api.call_args.args[0].endswith('page=2'))
 
 
+class NativeReleaseLanes(unittest.TestCase):
+    def test_not_applicable_empty_and_failed_lanes_are_reported_separately(self):
+        with tempfile.TemporaryDirectory(prefix='broca-native-release-') as tmp:
+            root = Path(tmp)
+            cargo = root / 'cargo'
+            cargo.write_text(r'''#!/usr/bin/env bash
+[[ $1 == test && $2 == --no-fail-fast && ${*: -1} == --show-output ]] || exit 98
+case " $* " in
+    *" --features test-clock,test-hooks "*) exit 97 ;; # The Windows runner must not invoke the excluded lane.
+    *" --test scope_real_daemon_e2e "*) p=0; f=0; result=ok ;;
+    *" --test run_events_bus "*) p=1; f=2; result=FAILED ;;
+    *) p=3; f=0; result=ok ;;
+esac
+printf 'test result: %s. %d passed; %d failed; 1 ignored; 0 measured; 5 filtered out\r\n' "$result" "$p" "$f"
+[[ $result == ok ]] || exit 101
+''')
+            cargo.chmod(0o755)
+            result = subprocess.run(
+                ['bash', 'scripts/native-release-windows.sh', str(root / 'logs')],
+                cwd=ROOT, text=True, capture_output=True, timeout=15,
+                env={**os.environ, 'PATH': str(root) + os.pathsep + os.environ['PATH'],
+                     'GITHUB_STEP_SUMMARY': str(root / 'actions-summary')},
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            summary = (root / 'logs/summary.md').read_text()
+            self.assertEqual(summary, (root / 'actions-summary').read_text())
+            self.assertEqual(len(list((root / 'logs').glob('*.log'))), 12)
+            self.assertIn('| daemon-upgrade | — | — | — | — | — | — | NOT APPLICABLE: SUBC help:', summary)
+            self.assertRegex(summary, r'\| scope-real-daemon \| 0 \| 0 \| 0 \| 1 \| 5 \| \d+ \| NO TESTS RAN \|')
+            self.assertRegex(summary, r'\| run-events-bus \| 3 \| 1 \| 2 \| 1 \| 5 \| \d+ \| FAIL \(cargo 101\) \|')
+            self.assertRegex(summary, r'\| extractor-conformance \| 3 \| 3 \| 0 \| 1 \| 5 \| \d+ \| PASS \|')
+
+
 class NatsInstall(unittest.TestCase):
     def setUp(self):
         spec = importlib.util.spec_from_file_location('install_nats', ROOT / 'scripts/install-ci-nats.py')
@@ -1312,8 +1365,8 @@ class NatsInstall(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.destination = Path(self.tmp.name) / 'broker with spaces'
 
-    def archive(self, os_name, content=b'broker fixture'):
-        target = self.installer.ARCHIVES[os_name][0]
+    def archive(self, os_name, arch='x64', content=b'broker fixture'):
+        target = self.installer.ARCHIVES[os_name, arch][0]
         name = 'nats-server.exe' if os_name == 'Windows' else 'nats-server'
         data = io.BytesIO()
         with tarfile.open(fileobj=data, mode='w:gz') as package:
@@ -1323,17 +1376,21 @@ class NatsInstall(unittest.TestCase):
         return data.getvalue()
 
     def test_installs_each_platform_archive_and_checks_its_version(self):
-        for os_name in ('Linux', 'Windows'):
-            with self.subTest(os_name=os_name):
-                archive = self.archive(os_name)
-                target = self.installer.ARCHIVES[os_name][0]
+        for os_name, arch, machine, target in (
+            ('Linux', 'x64', 'x86_64', 'linux-amd64'),
+            ('Windows', 'x64', 'AMD64', 'windows-amd64'),
+            ('Windows', 'arm64', 'ARM64', 'windows-arm64'),
+        ):
+            with self.subTest(os_name=os_name, arch=arch):
+                self.assertEqual(self.installer.ARCHIVES[os_name, arch][0], target)
+                archive = self.archive(os_name, arch)
                 with patch.dict(self.installer.ARCHIVES, {
-                    os_name: (target, hashlib.sha256(archive).hexdigest())
+                    (os_name, arch): (target, hashlib.sha256(archive).hexdigest())
                 }), patch.object(self.installer.urllib.request, 'urlopen',
-                                 return_value=io.BytesIO(archive)), \
-                        patch.object(self.installer.subprocess, 'run', return_value=
-                                     subprocess.CompletedProcess([], 0, 'nats-server: v2.10.26\n')) as run:
-                    binary = self.installer.install(self.destination, os_name, 'AMD64')
+                                  return_value=io.BytesIO(archive)), \
+                         patch.object(self.installer.subprocess, 'run', return_value=
+                                      subprocess.CompletedProcess([], 0, 'nats-server: v2.10.26\n')) as run:
+                    binary = self.installer.install(self.destination, os_name, machine)
                 self.assertEqual(binary.read_bytes(), b'broker fixture')
                 self.assertEqual(binary.suffix, '.exe' if os_name == 'Windows' else '')
                 # install() returns the resolved path; compare resolved, since macOS temp dirs
@@ -1423,9 +1480,9 @@ class NatsInstall(unittest.TestCase):
         archive = self.archive('Windows')
         source = Path(self.tmp.name) / 'staged.tar.gz'
         source.write_bytes(archive)
-        target = self.installer.ARCHIVES['Windows'][0]
+        target = self.installer.ARCHIVES['Windows', 'x64'][0]
         with patch.dict(self.installer.ARCHIVES, {
-            'Windows': (target, hashlib.sha256(archive).hexdigest())
+            ('Windows', 'x64'): (target, hashlib.sha256(archive).hexdigest())
         }), patch.object(self.installer.urllib.request, 'urlopen') as download, \
                 patch.object(self.installer.subprocess, 'run', return_value=
                              subprocess.CompletedProcess([], 0, 'nats-server: v2.10.26\n')):
@@ -1704,7 +1761,7 @@ checksum = "''' + '2' * 64 + '''"
         output = self.root / 'inputs'
         output.mkdir()
         sources = {}
-        for name in ('subconscious', 'claustrum'):
+        for name in ('subconscious', 'claustrum', 'fake-surface'):
             source = self.root / name
             source.mkdir()
             shutil.copy(self.lock, source / 'Cargo.lock')
@@ -1726,7 +1783,7 @@ checksum = "''' + '2' * 64 + '''"
         output, entry, locks = self.stage()
         destination = self.root / 'extracted'
         self.helper.extract_cargo_vendor(output, destination, locks)
-        for name in ('subconscious', 'claustrum'):
+        for name in ('subconscious', 'claustrum', 'fake-surface'):
             config = tomllib.loads((destination / '.configs' / f'{name}.toml').read_text())
             self.assertEqual(config['source']['vendored-sources']['directory'], (destination / name).as_posix())
             self.assertEqual(len(entry['graphs'][name]['packages']), 3)

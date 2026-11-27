@@ -6,20 +6,14 @@
 
 use crate::common;
 
-#[cfg(unix)]
 use broca_core::ToolManifest;
-#[cfg(unix)]
 use broca_protocol::request::{ExecutionMode, Tool};
 use broca_protocol::BindIdentity;
-#[cfg(unix)]
 use broca_protocol::{content::ToolCall, ToolCallId};
 use broca_subc::SubcToolPlane;
 use common::{wait_for_aft, Rig};
-#[cfg(unix)]
 use serde_json::json;
 
-// Only the module-restart test, which needs Unix signals, dispatches a tool.
-#[cfg(unix)]
 fn tool(name: &str) -> Tool {
     Tool {
         name: name.into(),
@@ -188,9 +182,7 @@ async fn invalidated_route_is_dropped_and_reopens_fresh() {
 /// respawns it), which frees the daemon-side channel — a dispatch on the stale channel is
 /// rejected `unknown_channel`. The plane must evict the stale route, re-open against the
 /// respawned module, and complete the call, so a routine module restart never surfaces to
-/// the model. Unix-only: the kill helper uses `pgrep`/`kill` and is a no-op on Windows
-/// (the retry logic under test is platform-independent).
-#[cfg(unix)]
+/// the model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_restart_between_dispatches_is_one_transparent_retry() {
     use broca_core::{BatchCtx, DispatchResult, ToolPlane};
@@ -227,8 +219,7 @@ async fn module_restart_between_dispatches_is_one_transparent_retry() {
     // respawn is still in flight, so waiting on the catalog alone races a
     // `target_unavailable` re-open — wait until the respawned module is genuinely
     // BINDABLE (a probe route.open on a throwaway session succeeds).
-    let killed = rig.crash_supervised_modules().await;
-    assert!(killed >= 1, "the supervised fake-aft was killed");
+    rig.crash_supervised_module("aft");
     let probe_conn = rig.connect().await;
     let probe_bind = BindIdentity::new(&rig.dir, "tool-fault-spine", "restart-probe");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);

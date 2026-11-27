@@ -180,7 +180,8 @@ async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
     );
     assert_eq!(bind["scope"]["ref"], SCOPE_REF);
     assert_eq!(bind["scope"]["scope_epoch"], SCOPE_EPOCH);
-    assert_eq!(bind["scope"]["workdir"], json!(checkout));
+    let expected_workdir = stamped_workdir(&checkout);
+    assert_eq!(bind["scope"]["workdir"], json!(expected_workdir));
     assert_eq!(bind["roles"], json!({"compaction-provider":"v2"}));
     // Under compaction v2 the route's bind identity names the session; Setup itself carries
     // no session fields.
@@ -189,7 +190,7 @@ async fn scoped_worker_send_stamps_compaction_setup_with_scope_workdir() {
     assert_eq!(setup["params"]["preset"], "head");
     assert!(setup["params"].get("session").is_none());
     let mut stored = identity.clone();
-    stored.project_root = checkout;
+    stored.project_root = expected_workdir;
     assert!(rig
         .admissions(&stored)
         .await

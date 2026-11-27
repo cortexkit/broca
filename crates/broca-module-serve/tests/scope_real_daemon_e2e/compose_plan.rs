@@ -11,7 +11,7 @@ use subc_protocol::manifest::{
 };
 use tokio::io::AsyncWriteExt;
 
-use super::{Rig, OWNER, SCOPE_EPOCH, SCOPE_REF};
+use super::{stamped_workdir, Rig, OWNER, SCOPE_EPOCH, SCOPE_REF};
 
 #[derive(Default)]
 struct Seen {
@@ -153,7 +153,7 @@ async fn compose_plan_direct_carrier_fetches_catalog_on_scoped_bind() {
     );
     assert_eq!(bind["scope"]["ref"], SCOPE_REF);
     assert_eq!(bind["scope"]["scope_epoch"], SCOPE_EPOCH);
-    assert_eq!(bind["scope"]["workdir"], json!(checkout));
+    assert_eq!(bind["scope"]["workdir"], json!(stamped_workdir(&checkout)));
     assert_eq!(bind["roles"], json!({"tool-provider": "v1"}));
     assert_eq!(
         request["arguments"],

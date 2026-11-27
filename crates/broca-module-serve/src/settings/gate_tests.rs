@@ -366,6 +366,7 @@ async fn resume_acknowledges_an_applied_pending_view_after_the_old_ack_was_cut()
         calls: super::Calls::new(subc_protocol::PROTOCOL_VERSION),
         schema: crate::settings::schema(),
         user_file: Some("/config/broca.jsonc".into()),
+        startup_at: std::sync::Mutex::new(None),
         applied: std::sync::Mutex::new(Some(super::Applied {
             effective: json!({"chatgpt_force_https":false}),
             generation: 6,
@@ -462,12 +463,15 @@ async fn the_gate_makes_broca_ready_then_applies_only_in_place_changes() {
     let (tx, sent) = tokio::sync::mpsc::channel(8);
     let mut served = Served { gate, sent };
 
+    let startup_at = std::time::Instant::now();
+    served.gate.record_startup(startup_at);
     let ready = tokio::spawn({
         let gate = served.gate.clone();
         async move { gate.finish_start(tx.into(), Vec::new()).await }
     });
     let (corr, update) = served.request("catalog.update").await;
     assert_eq!(update["ready"], true, "{update}");
+    assert_eq!(*served.gate.startup_at.lock().unwrap(), Some(startup_at));
     served.answer(corr, json!({"op": "catalog.update"}));
     let (corr, applied) = served.request("config.applied").await;
     assert_eq!(
@@ -480,6 +484,7 @@ async fn the_gate_makes_broca_ready_then_applies_only_in_place_changes() {
     );
     served.answer(corr, json!({"op": "config.applied"}));
     ready.await.unwrap().unwrap();
+    assert_eq!(*served.gate.startup_at.lock().unwrap(), None);
 
     // Only the live field changes: applied in place, and the next attempt reads it.
     let mut live = started.clone();
@@ -828,6 +833,7 @@ fn an_older_view_never_overwrites_a_newer_one_taken_after_its_freshness_check() 
         calls: super::Calls::new(subc_protocol::PROTOCOL_VERSION),
         schema: crate::settings::schema(),
         user_file: None,
+        startup_at: std::sync::Mutex::new(None),
         applied: std::sync::Mutex::new(Some(super::Applied {
             effective: started.clone(),
             generation: 2,

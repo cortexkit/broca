@@ -1,19 +1,16 @@
 //! Native process cuts around the durable consent coordinator, plus the optional target
 //! Cingulate admission test. The latter requires real supervised module binaries.
 
-#![cfg(all(unix, debug_assertions))]
+#![cfg(debug_assertions)]
 
 use broca_module_serve::llm_tools::consent::{Consent, ConsentIo};
 use broca_protocol::SessionScope;
 use broca_store::grants::*;
 use broca_subc::{AnswersPage, ConsentError, ConsentRecord, ConsentState};
 use serde_json::{json, Value};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+#[cfg(unix)]
+use std::path::Path;
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 const KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -204,6 +201,7 @@ async fn native_kill_before_card_id_answered_while_down_adopts_answer() {
 /// like the Magic Context end-to-end test: `BROCA_REQUIRE_CINGULATE=1` turns a missing binary
 /// into a failure, and otherwise it skips loudly. `BROCA_REQUIRE_SUBC` alone must not, because
 /// CI requires the daemon fixtures but has no Cingulate build.
+#[cfg(unix)]
 fn required_binary(variable: &str) -> Option<PathBuf> {
     let path = std::env::var_os(variable)
         .map(PathBuf::from)
@@ -223,16 +221,21 @@ fn required_binary(variable: &str) -> Option<PathBuf> {
 /// CINGULATE_ARGS_JSON is the target owner's argv prefix (default []). The supervisor adds
 /// its normal module-id, connection and nonce arguments. CINGULATE_ENV_JSON adds target-only
 /// configuration; all writable XDG state remains under this test's scratch root.
+// This real-Cingulate fixture starts its companion modules through POSIX shell exec wrappers.
+#[cfg(unix)]
 #[tokio::test]
 async fn target_cingulate_admits_reserved_broca_with_private_content_card_scope() {
     target_cingulate_admission(false).await;
 }
 
+// The companion modules' POSIX shell wrappers are not executable on Windows.
+#[cfg(unix)]
 #[tokio::test]
 async fn target_cingulate_admits_always_option_for_an_attested_project() {
     target_cingulate_admission(true).await;
 }
 
+#[cfg(unix)]
 async fn target_cingulate_admission(project: bool) {
     let Some(cingulate) = required_binary("CINGULATE_BIN") else {
         return;
@@ -489,6 +492,7 @@ async fn target_cingulate_admission(project: bool) {
     broca_test_support::kill_and_reap_tree(&mut daemon);
 }
 
+#[cfg(unix)]
 fn hex_path(path: &Path) -> String {
     path.to_string_lossy()
         .as_bytes()

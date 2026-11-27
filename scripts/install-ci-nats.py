@@ -15,8 +15,9 @@ import urllib.request
 VERSION = '2.10.26'
 # From https://github.com/nats-io/nats-server/releases/download/v2.10.26/SHA256SUMS.
 ARCHIVES = {
-    'Linux': ('linux-amd64', '6cbac67107e69c9e5a352d6f1555027f9da6a6b3fa81cceafefa9598b4451512'),
-    'Windows': ('windows-amd64', 'fa5f29094dd2d25d42060e5c9df7d86a8b8c0820b319e9c6566a0bffa923f35f'),
+    ('Linux', 'x64'): ('linux-amd64', '6cbac67107e69c9e5a352d6f1555027f9da6a6b3fa81cceafefa9598b4451512'),
+    ('Windows', 'x64'): ('windows-amd64', 'fa5f29094dd2d25d42060e5c9df7d86a8b8c0820b319e9c6566a0bffa923f35f'),
+    ('Windows', 'arm64'): ('windows-arm64', 'c6c010ebd95826fec4df54f27c4a04f3ed683bd134be3e251301f319de1684ff'),
 }
 # GitHub's release download answers 5xx or drops the connection now and then; one such answer
 # used to fail every integration shard of a CI run. The archive is checksum-pinned, so a retry
@@ -67,9 +68,11 @@ def fetch(url, checksum, cache_dir, sleep=time.sleep):
 
 
 def install(destination, os_name, machine, archive_path=None, cache_dir=None):
-    if machine.lower() not in ('amd64', 'x86_64') or os_name not in ARCHIVES:
+    arch = machine.lower()
+    arch = {'amd64': 'x64', 'x86_64': 'x64', 'aarch64': 'arm64'}.get(arch, arch)
+    if (os_name, arch) not in ARCHIVES:
         raise RuntimeError(f'no pinned NATS archive for {os_name}/{machine}')
-    target, checksum = ARCHIVES[os_name]
+    target, checksum = ARCHIVES[os_name, arch]
     stem = f'nats-server-v{VERSION}-{target}'
     url = f'https://github.com/nats-io/nats-server/releases/download/v{VERSION}/{stem}.tar.gz'
     if archive_path is None:
@@ -100,9 +103,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--archive', help='read a pre-staged archive; still verify checksum and version')
     parser.add_argument('--cache-dir', help='reuse and refresh a checksum-verified archive copy here')
+    parser.add_argument('--machine', default=platform.machine(),
+                        help='runner architecture if Python is running under emulation')
     args = parser.parse_args()
     binary = install(Path(os.environ['RUNNER_TEMP']) / 'broca-nats',
-                     platform.system(), platform.machine(), args.archive, args.cache_dir)
+                     platform.system(), args.machine, args.archive, args.cache_dir)
     with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
         env.write(f'CK_NATS_SERVER_BIN={binary}\n')
     print(f'CK_NATS_SERVER_BIN={binary}')

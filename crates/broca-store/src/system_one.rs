@@ -364,8 +364,19 @@ impl SystemOneStore {
     fn dead_owner_proof(path: &Path) -> Option<File> {
         let mut options = broca_owner_only::OpenOptions::new();
         options.read(true).write(true);
-        let file = options.open(path).ok()?;
-        file.try_lock().ok()?;
+        let file = options
+            .open(path)
+            .inspect_err(|error| {
+                tracing::debug!(target: "system_one", marker = ?path.file_name(), %error,
+                    "could not open batch-owner marker during recovery");
+            })
+            .ok()?;
+        file.try_lock()
+            .inspect_err(|error| {
+                tracing::debug!(target: "system_one", marker = ?path.file_name(), %error,
+                    "could not acquire batch-owner lock during recovery");
+            })
+            .ok()?;
         Some(file)
     }
 

@@ -81,10 +81,17 @@ fn identity() -> Result<(String, String), String> {
         .and_then(|at| args.get(at + 1))
         .cloned()
         .ok_or("fake-surface needs FAKE_AFT_MODULE_ID or --module-id <id>")?;
+    #[cfg(unix)]
     let nonce = match std::env::var("SUBC_LAUNCH_NONCE") {
         Ok(nonce) => nonce,
         Err(_) => read_launch_nonce_descriptor()?,
     };
+    #[cfg(windows)]
+    let nonce = subc_os::launch_nonce()
+        .map_err(|error| format!("read the daemon's launch nonce: {error}"))?
+        .ok_or("fake-surface needs a launch nonce from the daemon")?
+        .value()
+        .to_owned();
     Ok((module_id, nonce))
 }
 
@@ -93,6 +100,7 @@ fn identity() -> Result<(String, String), String> {
 /// The environment variable names the descriptor holding it as `<fd>:<inode>`, so a process
 /// that inherited only the variable does not read and close whatever sits at that number. The
 /// descriptor is a one-shot pipe: it is read once, here.
+#[cfg(unix)]
 fn read_launch_nonce_descriptor() -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::io::FromRawFd;

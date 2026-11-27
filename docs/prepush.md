@@ -310,12 +310,11 @@ full portable-selection inventory require compiled test binaries and are not
 misrepresented as static checks: they run in the heavy lanes, described below.
 
 Fixture setup follows `fixtures.yml`: fetch the exact SHAs from
-`scripts/ci-fixture-revisions.conf`, build both siblings with `--locked`, build
-fake-surface on Linux only, verify binaries, package a tarball and use
-`unpack-fixtures.sh`. It does not substitute this Mac's `.test-rigs` or moving
-sibling checkouts. Windows deliberately does not require vault or fake-surface,
-exactly as in CI. Both platforms require subc, aimock and the bus testkit;
-Linux also requires vault. `npm ci` is run in the remote snapshot, not locally.
+`scripts/ci-fixture-revisions.conf`, build subconscious, claustrum and fake-surface
+with `--locked`, verify binaries, package a tarball and use `unpack-fixtures.sh`.
+It does not substitute this Mac's `.test-rigs` or moving sibling checkouts.
+Both platforms require subc, fake-surface, aimock and the bus testkit; Linux
+also requires vault. `npm ci` is run in the remote snapshot, not locally.
 
 ## Split dispatch with AFT
 

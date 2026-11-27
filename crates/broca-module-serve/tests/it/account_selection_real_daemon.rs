@@ -1221,6 +1221,7 @@ impl Rig {
                             "BROCA_CONFIG_PATH": broca_config_path,
                             "BROCA_AUTH_METHODS_PATH": methods,
                             "BROCA_TOOL_MODULE": "unused-tools",
+                            "CK_LOG": "info,broca.lifecycle=debug",
                         },
                         "enabled": true,
                     }
@@ -1370,7 +1371,12 @@ impl Rig {
                 ),
             )
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "route.open for {name}: {error}\n{}",
+                    self.log_diagnostics(name)
+                )
+            });
         let before = super::stored_log::stored_files(&self.state_root);
         let reply = conn
             .route_request_terminal(
@@ -1654,7 +1660,12 @@ impl Rig {
             broca_subc::RouteOpenRetry::within(Duration::from_secs(10), Duration::from_millis(200)),
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "route.open for {name}: {error}\n{}",
+                self.log_diagnostics(name)
+            )
+        });
         let identity =
             broca_test_support::resolve_session_address(&self.state_root, &self.session(name))
                 .unwrap_or_else(|error| {

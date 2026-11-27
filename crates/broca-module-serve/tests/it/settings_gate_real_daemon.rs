@@ -8,8 +8,6 @@
 //! reads its file as under any daemon that doesn't manage its settings. CI's fixtures don't build
 //! that daemon, so the test is required only where `BROCA_REQUIRE_SUBC_GATE` is set (the native
 //! release suites), not by `BROCA_REQUIRE_SUBC` alone.
-#![cfg(unix)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

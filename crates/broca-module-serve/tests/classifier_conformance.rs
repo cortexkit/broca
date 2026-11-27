@@ -262,7 +262,7 @@ fn seed_catalog(state_root: &Path, served: Served) {
 struct Rig {
     routed: Option<routed::Services>,
     // Dropping the rig stops the supervised process tree, including the scope owner.
-    _daemon: broca_test_support::RigChild,
+    daemon: broca_test_support::RigChild,
     served: Served,
     connection_file: PathBuf,
     project_root: PathBuf,
@@ -382,7 +382,11 @@ async fn start_rig_with_references(
                 "env": {
                     "BROCA_STATE_ROOT": state_root,
                     "XDG_DATA_HOME": data_home,
-                    "CK_LOG": "info",
+                    "CK_LOG": if name == "kill" {
+                        "info,broca.lifecycle=debug,broca.system_one=debug"
+                    } else {
+                        "info"
+                    },
                 },
                 "enabled": true
             }
@@ -463,7 +467,7 @@ async fn start_rig_with_references(
     }
     Some(Rig {
         routed: Some(routed::register(&connection_file, routing_state).await),
-        _daemon: daemon,
+        daemon,
         served,
         connection_file,
         project_root: project_root.canonicalize().unwrap(),
@@ -771,10 +775,6 @@ impl ClassifierSubject for Subject<'_> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    not(unix),
-    ignore = "the stand-in Cerebellum (fake-surface) uses Unix-only APIs and is not built on Windows"
-)]
 async fn classifier_image_reference_conformance_uses_stand_in_cerebellum() {
     let Some(surface) = std::env::var_os("FAKE_SURFACE_BIN")
         .map(PathBuf::from)
@@ -990,8 +990,7 @@ async fn route_roles_are_chosen_at_the_bind_through_the_real_daemon() {
 }
 
 /// Select broca alone from the daemon roster so crash tests leave the scope owner alive.
-#[cfg(unix)]
-fn children(state_root: &Path) -> Vec<u32> {
+fn children(state_root: &Path) -> Vec<(u32, u64)> {
     let path = state_root
         .parent()
         .unwrap()
@@ -1002,13 +1001,19 @@ fn children(state_root: &Path) -> Vec<u32> {
         .unwrap()
         .iter()
         .filter(|child| child["module_id"] == "broca")
-        .map(|child| u32::try_from(child["pid"].as_u64().unwrap()).unwrap())
+        .map(|child| {
+            (
+                u32::try_from(child["pid"].as_u64().unwrap()).unwrap(),
+                child["start_time"]
+                    .as_u64()
+                    .expect("roster child start time"),
+            )
+        })
         .collect()
 }
 
 /// The batch's `(state, owner)` and its recorded outcomes `(index, kind, body)`, read straight
 /// from broca's batch store file, read-only.
-#[cfg(unix)]
 fn store_view(
     state_root: &Path,
     batch_id: &str,
@@ -1041,13 +1046,47 @@ fn store_view(
     (state, owner, outcomes)
 }
 
-/// broca killed (SIGKILL, a real process kill) while a Clef batch is in flight, with its
+/// Boot must release the dead owner's claim before serving, but routing replay in the new
+/// process can temporarily hold the same batch while it reports the interrupted provider run.
+fn crash_batch_is_idle(
+    state: &str,
+    owner: Option<&str>,
+    dead_owner: &str,
+    replacement_pid: u32,
+) -> Result<bool, String> {
+    match (state, owner) {
+        ("idle", None) => Ok(true),
+        ("running", Some(owner))
+            if owner != dead_owner
+                && owner.split_once('-').and_then(|(pid, _)| pid.parse().ok())
+                    == Some(replacement_pid) =>
+        {
+            Ok(false)
+        }
+        _ => Err(format!(
+            "unexpected batch claim: state={state:?}, owner={owner:?}"
+        )),
+    }
+}
+
+#[test]
+fn only_the_replacement_process_may_temporarily_hold_a_released_batch() {
+    assert_eq!(crash_batch_is_idle("idle", None, "21-old", 42), Ok(true));
+    assert_eq!(
+        crash_batch_is_idle("running", Some("42-new"), "21-old", 42),
+        Ok(false)
+    );
+    assert!(crash_batch_is_idle("running", Some("21-old"), "21-old", 42).is_err());
+    assert!(crash_batch_is_idle("running", Some("42-old"), "42-old", 42).is_err());
+    assert!(crash_batch_is_idle("running", Some("99-other"), "21-old", 42).is_err());
+    assert!(crash_batch_is_idle("idle", Some("42-new"), "21-old", 42).is_err());
+}
+
+/// broca is force-killed while a Clef batch is in flight, with its
 /// second item's provider call held open at the stand-in. The daemon starts broca again; the
 /// new process releases the batch the dead one left running, before it serves anything; and a
 /// re-send of the batch calls the provider only for the two items that had no answer, serving
-/// the answered one byte for byte as the provider spelled it. Unix only: the kill is of the
-/// daemon's broca child found with `pgrep -P`.
-#[cfg(unix)]
+/// the answered one byte for byte as the provider spelled it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_batch_in_flight_when_broca_is_killed_is_released_and_resumed() {
     let Some(rig) = start_rig("kill", Served::WorkersAi).await else {
@@ -1102,7 +1141,15 @@ async fn a_batch_in_flight_when_broca_is_killed_is_released_and_resumed() {
     .await;
     let (state, owner, outcomes) = store_view(&rig.state_root, "killed");
     assert_eq!(state, "running");
-    assert!(owner.is_some());
+    let original_owner = owner.expect("the running batch has an owner");
+    let owner_marker = rig.state_root.join(format!(
+        "system-one.db.owner-{:x}.lock",
+        Sha256::digest(original_owner.as_bytes())
+    ));
+    assert!(
+        owner_marker.is_file(),
+        "claimed batch has no owner marker: {owner_marker:?}"
+    );
     assert_eq!(
         outcomes.len(),
         1,
@@ -1113,14 +1160,27 @@ async fn a_batch_in_flight_when_broca_is_killed_is_released_and_resumed() {
     let before_facts = system_one_facts(&rig.state_root, "killed");
     assert_eq!(before_facts.len(), 1);
     let broca = children(&rig.state_root);
-    assert!(!broca.is_empty(), "broca is supervised by the daemon");
-    for pid in &broca {
-        let killed = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status()
-            .unwrap();
-        assert!(killed.success(), "SIGKILL delivered to {pid}");
+    assert_eq!(broca.len(), 1, "the daemon supervises one broca: {broca:?}");
+    assert_eq!(
+        original_owner.split_once('-').unwrap().0,
+        broca[0].0.to_string(),
+        "the killed process owns the batch"
+    );
+    let cut_at = std::time::Instant::now();
+    for &(pid, birth) in &broca {
+        let process = subc_os::Process::open(pid).unwrap().expect("broca is live");
+        assert_eq!(
+            subc_os::parent_pid(pid),
+            Some(rig.daemon.id().expect("rig daemon is live")),
+            "only terminate children of this rig's daemon"
+        );
+        assert_eq!(process.observe().expect("broca is live").start_time, birth);
+        #[cfg(unix)]
+        assert!(process.signal(subc_os::Signal::Kill).unwrap());
+        #[cfg(windows)]
+        assert!(process.force_stop(birth, Duration::from_secs(5)).unwrap());
     }
+    let killed_in = cut_at.elapsed();
     // The call that was in flight never gets its reply.
     let lost = in_flight.await.unwrap();
     assert!(
@@ -1134,17 +1194,36 @@ async fn a_batch_in_flight_when_broca_is_killed_is_released_and_resumed() {
         .open()
         .await
         .expect("the restarted broca serves a route");
-    let after: Vec<u32> = children(&rig.state_root);
+    let after = children(&rig.state_root);
     assert!(
-        after.iter().all(|pid| !broca.contains(pid)),
+        after.len() == 1 && !broca.contains(&after[0]),
         "a new broca process serves: before {broca:?}, after {after:?}"
     );
-    let (state, owner, outcomes) = store_view(&rig.state_root, "killed");
-    assert_eq!(
-        (state.as_str(), owner),
-        ("idle", None),
-        "the batch was released"
-    );
+    let outcomes =
+        broca_test_support::wait_until("replacement routing replay releases the batch", || {
+            let (state, owner, outcomes) = store_view(&rig.state_root, "killed");
+            std::future::ready(match crash_batch_is_idle(
+                &state,
+                owner.as_deref(),
+                &original_owner,
+                after[0].0,
+            ) {
+                Ok(true) => Ok(outcomes),
+                Ok(false) => Err(format!("replacement is replaying routing reports: {owner:?}")),
+                Err(error) => panic!(
+                    "the dead owner's batch was not released before serving: {error}; \
+                     previous_owner={original_owner:?}, marker={:?}, processes={broca:?}->{after:?}, \
+                     killed_in={killed_in:?}, reopened_in={:?}\n{}",
+                    std::fs::metadata(&owner_marker),
+                    cut_at.elapsed(),
+                    broca_test_support::rig_log_diagnostics(
+                        &rig.state_root.parent().unwrap().join("data-home/cortexkit"),
+                        &rig.state_root,
+                    )
+                ),
+            })
+        })
+        .await;
     assert_eq!(outcomes.len(), 1);
 
     let Reply::Response(reply) = route.request("classify.run", &params).await.unwrap() else {
