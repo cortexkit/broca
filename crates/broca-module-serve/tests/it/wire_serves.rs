@@ -68,6 +68,11 @@ fn catalog(cache: &CatalogCache, version: i64, extra_provider: bool) {
     antigravity.insert("route.reasoning_default".into(), json!("low"));
     let mut batch = openai();
     batch.insert("model.kind".into(), json!("decision"));
+    // OpenCode Go's free models run through Thalamus, so broca lists them as exceptions.
+    let mut go_free = anthropic();
+    let zero = json!({"currency": "USD", "exponent": 9, "state": "priced", "units": 0});
+    go_free.insert("rate.input".into(), zero.clone());
+    go_free.insert("rate.output".into(), zero);
     let mut models = BTreeMap::from([
         ("anthropic/claude-fixture".into(), anthropic()),
         ("openai/gpt-fixture".into(), openai()),
@@ -81,6 +86,7 @@ fn catalog(cache: &CatalogCache, version: i64, extra_provider: bool) {
         ),
         ("opencode/hosted".into(), openai()),
         ("opencode-go/hosted".into(), anthropic()),
+        ("opencode-go/hosted-free".into(), go_free),
         ("meta/muse-fixture".into(), row("other-sdk", None)),
         ("mixed/fixture".into(), openai()),
         (
@@ -277,6 +283,7 @@ async fn role_describe_serves_tracks_complete_catalog_and_gateway_snapshots() {
     assert_eq!(capped[1].models, ServesModels::All);
     assert_eq!(capped[3].except.as_deref().unwrap(), ["no-endpoint"]);
     assert_eq!(capped[5].except.as_deref().unwrap(), ["unsupported"]);
+    assert_eq!(capped[7].except.as_deref().unwrap(), ["hosted-free"]);
     save_samples(&hello.body, &wire);
 
     catalog(&catalog_cache, 2, false);

@@ -120,8 +120,21 @@ fn capped_list(
             && (broca_catalog::family::credential_persona_route(provider, "oauth").is_some()
                 || (provider == "google"
                     && catalog.code_assist_route(provider, model, None).is_ok()));
-        record(&mut models, provider, model, catalog_route || login_route);
-        record(&mut api_key_models, provider, model, catalog_route);
+        // OpenCode's free models run through Thalamus (Third-Party Harnesses), not broca. On
+        // OpenCode Go they share the provider with its paid plan, so they go on its except list.
+        let served = !free_opencode_go(catalog, provider, model);
+        record(
+            &mut models,
+            provider,
+            model,
+            served && (catalog_route || login_route),
+        );
+        record(
+            &mut api_key_models,
+            provider,
+            model,
+            served && catalog_route,
+        );
     }
 
     let mut entries = BTreeMap::new();
@@ -177,6 +190,15 @@ fn capped_list(
     Ok(entries)
 }
 
+/// An OpenCode Go model the catalog prices at zero for both input and output. An absent price is
+/// unknown, not free, so such a model stays listed.
+fn free_opencode_go(catalog: &CatalogSnapshot, provider: &str, model: &str) -> bool {
+    provider == "opencode-go"
+        && catalog
+            .warm_cost_schedule(provider, model)
+            .is_some_and(|cost| cost.input == Some(0.0) && cost.output == Some(0.0))
+}
+
 fn record<'a>(models: &mut CatalogModels<'a>, provider: &'a str, model: &'a str, admitted: bool) {
     let lists = models.entry(provider).or_default();
     if admitted {
@@ -200,8 +222,9 @@ fn add_entry<'a>(
     provider: &'a str,
     models: &Models<'_>,
 ) -> Result<(), String> {
-    // ChatGPT logins are served only on the uncapped harness, and OpenCode's free models run
-    // through Thalamus (Third-Party Harnesses), not broca. OpenCode Go's paid plan is served.
+    // ChatGPT logins are listed only under the uncapped harness (`BROCA_UNCAPPED_HARNESS`, built
+    // in `snapshot` above). OpenCode Zen (`opencode`) runs through Thalamus (Third-Party
+    // Harnesses), not broca. OpenCode Go's paid models are served here.
     if matches!(provider, "openai" | "opencode") || models.admitted.is_empty() {
         return Ok(());
     }
