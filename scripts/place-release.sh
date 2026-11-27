@@ -398,6 +398,27 @@ PY
   fi
 }
 
+# broca's drain budget as `ck --json module list` reports it: "<budget ms> <pending>", where
+# <pending> is 1 when the daemon entry's `drain_timeout_ms` was edited but not yet applied. The
+# daemon applies such an edit only when it next launches broca or itself restarts, and a plain
+# `ck module restart` reuses the budget it holds, so a pending budget must be passed explicitly.
+# Prints nothing when the list can't be read.
+broca_drain_budget() {
+  "${PLACE_RELEASE_CK:-ck}" --json module list 2>/dev/null | python3 -c '
+import json, sys
+try:
+    modules = json.load(sys.stdin).get("modules") or []
+except (ValueError, AttributeError):
+    sys.exit(0)
+for module in modules:
+    if module.get("module_id") != "broca" or not isinstance(module.get("drain_timeout_ms"), int):
+        continue
+    pending = [change["value"] for change in module.get("pending") or []
+               if change.get("field") == "drain_timeout_ms" and isinstance(change.get("value"), int)]
+    print(pending[-1], 1) if pending else print(module["drain_timeout_ms"], 0)
+' 2>/dev/null || true
+}
+
 # Require a new process running the inode currently on disk, not just a new pid.
 restart_and_wait() {
   local expected_inode="$1" expected_sha="$2"
@@ -411,8 +432,14 @@ restart_and_wait() {
   save_health_before_restart "$old_pid"
   # Capture a lower bound before signalling: an uncertain cancel must still blame the drain.
   DRAIN_STARTED_MS="$(python3 -c 'import time; print(time.time_ns() // 1_000_000)')"
-  "${PLACE_RELEASE_CK:-ck}" module restart broca
-  wait_seconds="${PLACE_RELEASE_WAIT_SECONDS:-90}"
+  local drain_ms="" drain_pending="" restart_args=()
+  read -r drain_ms drain_pending <<< "$(broca_drain_budget)" || true
+  if [ "$drain_pending" = 1 ]; then
+    restart_args=(--drain-ms "$drain_ms")
+  fi
+  "${PLACE_RELEASE_CK:-ck}" module restart broca ${restart_args[@]+"${restart_args[@]}"}
+  # The new process can start only after the drain ends, so the wait covers the drain too.
+  wait_seconds="${PLACE_RELEASE_WAIT_SECONDS:-$((90 + ${drain_ms:-0} / 1000))}"
   poll_seconds="${PLACE_RELEASE_POLL_SECONDS:-1}"
   deadline=$((SECONDS + wait_seconds))
   new_pid=""

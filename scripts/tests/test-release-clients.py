@@ -178,6 +178,35 @@ class ClientPlacementTests(gate.GateBase):
                                    text=True, capture_output=True)
             self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
+    def restart_args_with_listed_broca(self, broca):
+        """The arguments of the restart, when `ck --json module list` lists `broca` as broca."""
+        listing = self.tmp / "modules.json"
+        listing.write_text(json.dumps({"modules": [
+            {"module_id": "other", "drain_timeout_ms": 5000,
+             "pending": [{"field": "drain_timeout_ms", "value": 7000}]},
+            dict(broca, module_id="broca")]}))
+        ck = self.fake_bin / "ck"
+        ck.write_text(f'''#!/bin/sh
+if [ "$*" = "--json module list" ]; then cat "{listing}"; exit 0; fi
+echo "$*" >> "{self.restart_log}"
+''')
+        result = self.place("--restart", PLACE_RELEASE_WAIT_SECONDS="0", BROCA_TEST_BIN=str(self.dest))
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        return [line for line in self.restart_log.read_text().splitlines()
+                if line.startswith("module restart")]
+
+    def test_a_pending_drain_budget_is_passed_to_the_restart(self):
+        # The daemon holds 30 s; the entry's 10 minutes applies only at its next launch of broca.
+        self.assertEqual(self.restart_args_with_listed_broca({
+            "drain_timeout_ms": 30000,
+            "pending": [{"applies": "with_next_launch_or_health_change",
+                         "field": "drain_timeout_ms", "value": 600000}]}),
+            ["module restart broca --drain-ms 600000"])
+
+    def test_an_applied_drain_budget_leaves_the_restart_plain(self):
+        self.assertEqual(self.restart_args_with_listed_broca({"drain_timeout_ms": 600000}),
+                         ["module restart broca"])
+
     def test_placement_keeps_only_the_newest_rollbacks_of_each_binary(self):
         rollback = self.rollback
         rollback.mkdir(parents=True, exist_ok=True)
