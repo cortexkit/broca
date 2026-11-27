@@ -1453,7 +1453,7 @@ async fn a_closed_sessions_withdrawal_retries_do_not_reload_its_view() {
     let mut records = held_records(call_key, "tools");
     cancelled_held(&mut records, &["a"]);
     let (root, runtime) = withdrawal_root("bounded-withdrawal", &bind, &records).await;
-    // No view fits, so retries cannot reuse the view from their first attempt.
+    // No view would fit, so a view-cache hit cannot hide a miss in the withdrawal memo.
     let runtime = Arc::new(
         Arc::into_inner(runtime)
             .unwrap()
@@ -1481,7 +1481,7 @@ async fn a_closed_sessions_withdrawal_retries_do_not_reload_its_view() {
 
     assert_eq!(counts(), (0, 0));
     service.withdraw(&held_reply(call_key)).await.unwrap();
-    assert_eq!(counts(), (1, 1));
+    assert_eq!(counts(), (0, 1));
     assert_eq!(runtime.views().usage().0, 0);
     withdrawals_settled(&service).await;
 
@@ -1490,7 +1490,7 @@ async fn a_closed_sessions_withdrawal_retries_do_not_reload_its_view() {
         store.withdrawal_state("tools", call_key).unwrap(),
         Some(("done".into(), 3))
     );
-    assert_eq!(counts(), (1, 1));
+    assert_eq!(counts(), (0, 1));
 }
 
 #[tokio::test]
@@ -1561,6 +1561,151 @@ async fn withdrawal_checks_read_a_sealed_run_start_and_do_not_memoize_plan_error
     );
     service.withdraw(&reply).await.unwrap();
     assert_eq!(*route.seen.lock().unwrap(), [call_key]);
+}
+
+#[tokio::test]
+async fn withdrawal_ledger_keeps_its_log_boundary_and_index_across_a_seal() {
+    use broca_protocol::content::{ContentBlock, Message, Role};
+    use broca_session_store::backend::{MemoryBackend, SessionAddr};
+    use broca_session_store::keys::DeploymentKey;
+    use broca_session_store::record::{Input, Placement};
+    use broca_session_store::session::StoredLedger;
+
+    let backend = MemoryBackend::default();
+    let bind = session("withdrawal-ledger-seal-race");
+    let addr = SessionAddr(broca_core::session_addr(&bind));
+    let triple = crate::store_open::triple(&bind);
+    let deployment = DeploymentKey::new(1, &[7; 32]);
+    let mut writer = Session::create(&backend, addr.clone(), triple.clone(), &deployment, true)
+        .await
+        .unwrap();
+    let mut records = held_records("lineage:4", "tools");
+    cancelled_held(&mut records, &["a"]);
+    writer.append(&records[..1], true).await.unwrap();
+    writer.seal(None, 0).await.unwrap();
+    let input = Record::Input(Input {
+        media: Vec::new(),
+        run_id: "run".into(),
+        placement: Placement::RunInput,
+        message: Arc::new(Message::new(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: "x".repeat(64 * 1024).into(),
+            }],
+        )),
+        written_at_ms: None,
+        submission_id: None,
+        notice: None,
+        tags_v1: None,
+        receipt_seq: None,
+        pruned: Vec::new(),
+    });
+    writer.append(&[input], true).await.unwrap();
+    writer.append(&records[1..], true).await.unwrap();
+
+    let pinned = StoredLedger::open(&backend, addr.clone(), &triple, &deployment)
+        .await
+        .unwrap()
+        .unwrap();
+    let position = pinned.position();
+    assert_eq!(position, writer.position());
+    let cipher = writer.head().cipher();
+
+    // The old log grows after the pin, then moves. The new head's sealed index contains a
+    // run that was not present in either the old index or the pinned prefix.
+    let future = run_start("after-pin");
+    writer
+        .append(std::slice::from_ref(&future), true)
+        .await
+        .unwrap();
+    writer.seal(None, 0).await.unwrap();
+    assert_ne!(writer.position().log, position.log);
+    assert_ne!(writer.position().version, position.version);
+    assert!(writer.find_run_start("after-pin").await.unwrap().is_some());
+
+    let before = (
+        backend.log_reads(),
+        backend.log_bytes_read(),
+        backend.object_reads(),
+        backend.object_bytes_read(),
+    );
+    let mut tail = pinned
+        .ledger_tail_until(|record| matches!(record, Record::ToolIntent(_)))
+        .await
+        .unwrap();
+    assert_eq!(tail.position(), position);
+    assert_eq!(tail.cipher(), cipher);
+    assert_eq!(
+        tail.records()
+            .iter()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>(),
+        records[2..].iter().rev().collect::<Vec<_>>()
+    );
+    assert_eq!(backend.log_reads() - before.0, 1);
+    assert_eq!(backend.log_bytes_read() - before.1, position.len as usize);
+    assert_eq!(
+        backend.object_reads() - before.2,
+        0,
+        "the intent was in the open log"
+    );
+
+    let Record::RunStart(original) = &records[0] else {
+        panic!("missing fixture run start")
+    };
+    assert_eq!(
+        tail.find_run_start("run").await.unwrap().as_ref(),
+        Some(original.as_ref())
+    );
+    let sealed_bytes = backend.object_bytes_read() - before.3;
+    let sealed_reads = backend.object_reads() - before.2;
+    assert!(sealed_reads > 0);
+    assert!(tail.find_run_start("after-pin").await.unwrap().is_none());
+    assert_eq!(
+        backend.log_reads() - before.0,
+        1,
+        "the indexed starts must not reread the log"
+    );
+    eprintln!("pinned withdrawal read: {} open-log bytes in one scan; {sealed_bytes} object bytes in {sealed_reads} reads for the sealed start", position.len);
+}
+
+#[tokio::test]
+async fn withdrawal_ledger_distinguishes_missing_sessions_and_damaged_logs() {
+    use broca_session_store::backend::{BackendError, MemoryBackend, SessionAddr, SessionBackend};
+    use broca_session_store::keys::DeploymentKey;
+    use broca_session_store::session::{SessionError, StoredLedger};
+
+    let backend = MemoryBackend::default();
+    let bind = session("withdrawal-damaged-log");
+    let addr = SessionAddr(broca_core::session_addr(&bind));
+    let triple = crate::store_open::triple(&bind);
+    let deployment = DeploymentKey::new(1, &[7; 32]);
+    let open = || StoredLedger::open(&backend, addr.clone(), &triple, &deployment);
+    assert!(open().await.unwrap().is_none());
+
+    let writer = Session::create(&backend, addr.clone(), triple.clone(), &deployment, true)
+        .await
+        .unwrap();
+    let position = writer.position();
+    backend.set_log(&addr, &position.log, vec![0]);
+    let ledger = open().await.unwrap().unwrap();
+    assert!(matches!(
+        ledger.ledger_tail_until(|_| false).await,
+        Err(SessionError::Corrupt { .. })
+    ));
+    let pinned = open().await.unwrap().unwrap();
+    backend
+        .delete_log(&addr, &position.log, position.version)
+        .await
+        .unwrap();
+    assert!(matches!(
+        open().await,
+        Err(SessionError::Backend(BackendError::NoSuchLog))
+    ));
+    assert!(matches!(
+        pinned.ledger_tail_until(|_| false).await,
+        Err(SessionError::Backend(BackendError::NoSuchLog))
+    ));
 }
 
 #[tokio::test]
@@ -1635,6 +1780,54 @@ async fn review_regression_completed_sibling_is_not_withdrawn_on_recovery() {
         *route.seen.lock().unwrap(),
         ["lineage:5"],
         "A completed; only B's cancellation authorizes withdrawal"
+    );
+}
+
+#[tokio::test]
+async fn withdrawal_recovery_checks_watching_rows_without_loading_views() {
+    let root = rig_root("withdrawal-recovery-without-views");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let runtime = session_store(&root).await;
+    let store = Arc::new(review_store(&root));
+    let mut expected = Vec::new();
+    for n in 0..3 {
+        let bind = session(&format!("held-{n}"));
+        let key = format!("lineage:{}", n + 4);
+        let mut records = held_records(&key, "tools");
+        if n != 1 {
+            cancelled_held(&mut records, &["a"]);
+            expected.push(key.clone());
+        }
+        seed_root(&root, &bind, &records).await;
+        store
+            .register_calls(&[registration(&key, "tools", &bind)])
+            .unwrap();
+        assert_eq!(
+            store.withdrawal_state("tools", &key).unwrap(),
+            Some(("watching".into(), 0))
+        );
+    }
+
+    let route = Arc::new(WithdrawalRoute {
+        seen: Mutex::default(),
+        mode: "ok",
+    });
+    let service = withdrawals(store.clone(), &runtime, route.clone(), Default::default());
+    service.recover().await.unwrap();
+    assert_eq!(*route.seen.lock().unwrap(), expected);
+    assert_eq!(
+        store.withdrawal_state("tools", "lineage:5").unwrap(),
+        Some(("watching".into(), 0))
+    );
+    let loads = runtime
+        .views()
+        .memory(|_| 0)
+        .loads_by_reason
+        .unwrap_or_default();
+    assert_eq!(
+        loads.get("held_withdrawals").map_or(0, |load| load.loads),
+        0
     );
 }
 

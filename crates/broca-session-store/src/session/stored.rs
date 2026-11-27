@@ -17,9 +17,10 @@ use crate::directory::Pages;
 use crate::fold::conversation::Conversation;
 use crate::frame::{FrameHeader, FrameKey, FrameRead, FrameStream};
 use crate::head::Head;
+use crate::idindex::{self, IdKind, IndexPages, IndexRoot};
 use crate::keys::DataKey;
 use crate::log::{LogReader, ReadLog};
-use crate::record::{Record, Stream};
+use crate::record::{Record, RunStart, Stream};
 use crate::segment::{SegmentLayout, FOOTER, OPEN_PREFIX};
 
 use super::{chain_base, log_bind, Session, SessionError};
@@ -265,6 +266,69 @@ impl<B: SessionBackend> Place<'_, B> {
         [&self.head.ledger_dir, &self.head.transcript_dir]
             .into_iter()
             .any(|dir| dir.as_ref().is_some_and(|root| root.last_seq >= first))
+    }
+
+    /// Read only the sealed ledger blocks the run-id index names. The hash is a candidate
+    /// selector, not proof that a record names this run. A dangling index entry is damage.
+    pub(super) async fn find_indexed_run_start(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunStart>, SessionError> {
+        let Some(root) = &self.head.id_index else {
+            return Ok(None);
+        };
+        let key = self.key.frame_key();
+        let index = IndexPages {
+            backend: self.backend,
+            addr: self.addr,
+            session: self.head.session_id,
+            key: &key,
+        };
+        let root: IndexRoot = index.read(root).await.map_err(SessionError::Index)?;
+        let hash = idindex::id_hash(&idindex::hash_key(self.key), IdKind::RunId, run_id);
+        let seqs = index
+            .lookup(&root, &hash)
+            .await
+            .map_err(SessionError::Index)?;
+        let pages = Pages {
+            backend: self.backend,
+            addr: self.addr,
+            session: self.head.session_id,
+            key: &key,
+            fanout: crate::directory::FANOUT,
+        };
+        let mut memo = Default::default();
+        let mut start = None;
+        let mut last_object = String::new();
+        let mut last_block = None;
+        let mut records = Vec::new();
+        for seq in seqs {
+            let damaged = || SessionError::Fold(format!("no sealed ledger record {seq}"));
+            let entry = pages
+                .find_in(self.head.ledger_dir.as_ref(), seq, &mut memo)
+                .await
+                .map_err(SessionError::Directory)?
+                .filter(|entry| entry.keeps(seq))
+                .ok_or_else(damaged)?;
+            let layout = self.layout(&entry.object, &key).await?;
+            let block = layout.block_for_seq(seq).ok_or_else(damaged)?;
+            if last_block != Some(block) || last_object != entry.object {
+                records = read_block(self.backend, self.addr, &entry.object, &layout, block, &key)
+                    .await?;
+                last_object = entry.object;
+                last_block = Some(block);
+            }
+            let (_, record) = records
+                .iter()
+                .find(|(at, record)| *at == seq && record.stream() == Stream::Ledger)
+                .ok_or_else(damaged)?;
+            if let Record::RunStart(candidate) = record {
+                if candidate.run_id == run_id && start.is_none() {
+                    start = Some((**candidate).clone());
+                }
+            }
+        }
+        Ok(start)
     }
 
     /// The layout of sealed segment `object` (see [`read_layout`]), from those the place keeps
