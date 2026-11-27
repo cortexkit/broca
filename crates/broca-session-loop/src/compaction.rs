@@ -767,7 +767,7 @@ pub async fn offline_prompt<W: Writer>(
 ) -> Result<broca_protocol::request::CallOptions, LoopError> {
     let records = writer.open_log_records().await?;
     let state = restore(&records, bind, writer.operations()).map_err(LoopError::Parts)?;
-    let view = state.view_for_step(step).cloned();
+    let view = state.shared_view_for_step(step);
     let session = Arc::new(v2::session::Session::default());
     *session.state.lock().await = state;
     let ctx = Ctx {
@@ -791,7 +791,7 @@ pub async fn offline_prompt<W: Writer>(
     )
     .map_err(LoopError::Parts)?;
     let media = view
-        .as_ref()
+        .as_deref()
         .map(v2::host::inserted_media)
         .unwrap_or_default();
     finish(&opts, prompt, media, admission).map_err(LoopError::Parts)

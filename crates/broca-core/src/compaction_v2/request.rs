@@ -176,7 +176,7 @@ pub async fn prepare_reading_back(
         let mut state = state.lock().await;
         let frozen = state.step_is_frozen(at.step);
         state.start_step(at.step);
-        (state.view_for_step(at.step).cloned(), frozen)
+        (state.shared_view_for_step(at.step), frozen)
     };
     let mut setup = conditions::setup_request(
         at.preset,
@@ -185,7 +185,7 @@ pub async fn prepare_reading_back(
         at.detects_cache_expired,
         at.after_page_entry_budget,
     );
-    setup.applied_view = view.as_ref().map(View::applied);
+    setup.applied_view = view.as_deref().map(View::applied);
     setup.newest = views::newest(at.entries);
     runtime.observe(at.entries);
     // With no view to fall back on, an unanswered Setup is waited out for a bounded time before
@@ -204,7 +204,7 @@ pub async fn prepare_reading_back(
     // Claimed only where the accepted Setup listed it.
     let cache_expired = at.cache_expired && runtime.detects_cache_expired().await;
     let (mut prompt, mut releasable) =
-        render_reading_back(&at, view.as_ref(), &mut restored, &mut image, read_back).await?;
+        render_reading_back(&at, view.as_deref(), &mut restored, &mut image, read_back).await?;
     let mut tokens = estimate(&prompt)?;
     let mut causes = if frozen {
         Vec::new()
@@ -241,9 +241,9 @@ pub async fn prepare_reading_back(
             (causes, ride_tokens),
         )
         .await?;
-        view = state.lock().await.view_for_step(at.step).cloned();
+        view = state.lock().await.shared_view_for_step(at.step);
         (prompt, releasable) =
-            render_reading_back(&at, view.as_ref(), &mut restored, &mut image, read_back).await?;
+            render_reading_back(&at, view.as_deref(), &mut restored, &mut image, read_back).await?;
         tokens = estimate(&prompt)?;
     }
     // A cache-rewrite ride can return a larger view. It still owes an over-limit
@@ -260,9 +260,9 @@ pub async fn prepare_reading_back(
         )
         .await?;
         rode_over_limit = true;
-        view = state.lock().await.view_for_step(at.step).cloned();
+        view = state.lock().await.shared_view_for_step(at.step);
         (prompt, releasable) =
-            render_reading_back(&at, view.as_ref(), &mut restored, &mut image, read_back).await?;
+            render_reading_back(&at, view.as_deref(), &mut restored, &mut image, read_back).await?;
         tokens = estimate(&prompt)?;
     }
     runtime
@@ -270,7 +270,7 @@ pub async fn prepare_reading_back(
             plane,
             &setup,
             at.conditions,
-            view.as_ref().map(View::applied).as_ref(),
+            view.as_deref().map(View::applied).as_ref(),
         )
         .await;
     if tokens > usable {
@@ -282,12 +282,12 @@ pub async fn prepare_reading_back(
     }
     Ok(Prepared::Ready {
         prompt,
-        applied: view.as_ref().map(View::applied),
+        applied: view.as_deref().map(View::applied),
         request_tokens: tokens,
         restored,
         releasable,
         media: view
-            .as_ref()
+            .as_deref()
             .map(super::host::inserted_media)
             .unwrap_or_default(),
     })

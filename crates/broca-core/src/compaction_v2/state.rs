@@ -1,6 +1,8 @@
 //! Accepted and applied views are separate durable facts. An acknowledgement
 //! confirms storage, not a change to a request already in progress.
 
+use std::sync::Arc;
+
 use cortexkit_compaction_view::rules::Floor;
 use cortexkit_role_compaction::{
     notice::Event,
@@ -13,13 +15,14 @@ use super::{received::ReceivedView, views};
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct State {
-    latest: Option<ReceivedView>,
-    applied: Option<ReceivedView>,
+    latest: Option<Arc<ReceivedView>>,
+    applied: Option<Arc<ReceivedView>>,
     marked_version: Option<u64>,
     #[serde(default)]
     step_id: Option<u64>,
+    // Share the decoded view without changing the serialized step snapshot to raw edits.
     #[serde(default)]
-    step_view: Option<View>,
+    step_view: Option<Arc<View>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latest_applied_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,16 +92,16 @@ impl State {
     }
 
     pub fn latest(&self) -> Option<&View> {
-        self.latest.as_ref().map(ReceivedView::view)
+        self.latest_received().map(ReceivedView::view)
     }
     pub fn latest_received(&self) -> Option<&ReceivedView> {
-        self.latest.as_ref()
+        self.latest.as_deref()
     }
     pub fn applied(&self) -> Option<&View> {
-        self.applied.as_ref().map(ReceivedView::view)
+        self.applied_received().map(ReceivedView::view)
     }
     pub fn applied_received(&self) -> Option<&ReceivedView> {
-        self.applied.as_ref()
+        self.applied.as_deref()
     }
     pub fn applied_identity(&self) -> Option<AppliedView> {
         self.applied().map(View::applied)
@@ -135,7 +138,7 @@ impl State {
     pub fn start_step(&mut self, step: u64) {
         if self.step_id != Some(step) {
             self.step_id = Some(step);
-            self.step_view = self.applied().cloned();
+            self.step_view = self.applied_received().map(ReceivedView::shared_view);
         }
     }
 
@@ -145,16 +148,25 @@ impl State {
 
     pub fn view_for_step(&self, step: u64) -> Option<&View> {
         if self.step_id == Some(step) {
-            self.step_view.as_ref()
+            self.step_view.as_deref()
         } else {
             self.applied()
+        }
+    }
+
+    /// Share the frozen view so request preparation can release the state lock without copying it.
+    pub fn shared_view_for_step(&self, step: u64) -> Option<Arc<View>> {
+        if self.step_is_frozen(step) {
+            self.step_view.clone()
+        } else {
+            self.applied_received().map(ReceivedView::shared_view)
         }
     }
 
     pub fn restore_applied_at(&mut self, step: u64, identity: &AppliedView) -> Result<(), String> {
         self.restore_applied(identity)?;
         if self.step_id == Some(step) {
-            self.step_view = self.applied().cloned();
+            self.step_view = self.applied_received().map(ReceivedView::shared_view);
         }
         Ok(())
     }
@@ -181,7 +193,7 @@ impl State {
                 view.version
             ));
         }
-        self.latest = Some(received);
+        self.latest = Some(Arc::new(received));
         self.latest_applied_by = None;
         Ok(())
     }
@@ -201,7 +213,8 @@ impl State {
             self.applied_by.clone()
         };
         let view = self
-            .latest_received()
+            .latest
+            .as_ref()
             .filter(|view| view.view().applied() == *identity)
             .or_else(|| {
                 self.applied
@@ -214,7 +227,7 @@ impl State {
                     identity.version, identity.checksum
                 )
             })?;
-        self.applied = Some(view.clone());
+        self.applied = Some(Arc::clone(view));
         self.applied_by = applied_by;
         Ok(())
     }
@@ -238,8 +251,8 @@ impl State {
         {
             return Ok(Err(refusal));
         }
-        journal.accepted(self.latest.as_ref(), &received).await?;
-        self.latest = Some(received);
+        journal.accepted(self.latest_received(), &received).await?;
+        self.latest = Some(Arc::new(received));
         self.latest_applied_by = None;
         Ok(Ok(()))
     }
@@ -277,7 +290,7 @@ impl State {
                     refusal,
                 }]);
             }
-            let previous = self.applied.as_ref().map(ReceivedView::view);
+            let previous = self.applied();
             journal
                 .applied(boundary.step, view, head_kept(&boundary, previous, view))
                 .await
@@ -287,10 +300,10 @@ impl State {
                         "internal_error",
                     );
                 })?;
-            self.applied = Some(received.clone());
+            self.applied = Some(Arc::clone(received));
             self.applied_by = self.latest_applied_by.clone();
             if self.step_id == Some(boundary.step) {
-                self.step_view = self.applied().cloned();
+                self.step_view = self.applied_received().map(ReceivedView::shared_view);
             }
         }
         self.recover_marker(journal, boundary).await
@@ -309,7 +322,6 @@ impl State {
         if self.marked_version == Some(view.version) {
             return Ok(vec![]);
         }
-        let view = view.clone();
         let mut events = Vec::new();
         if let Some(through) = view
             .edits
@@ -338,12 +350,11 @@ impl State {
                 |entry| entry.ordinal,
             );
             journal
-                .marker(&view, first_kept_mid, first_kept_ordinal, checkpoint)
+                .marker(view, first_kept_mid, first_kept_ordinal, checkpoint)
                 .await?;
-            self.marked_version = Some(view.version);
-            events.push(Event::MarkerWritten {
-                version: view.version,
-            });
+            let version = view.version;
+            self.marked_version = Some(version);
+            events.push(Event::MarkerWritten { version });
         }
         Ok(events)
     }

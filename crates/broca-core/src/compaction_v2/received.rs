@@ -1,13 +1,15 @@
 //! View validation uses the normalized contract types, while durable edit
 //! references compare the exact received JSON bytes, including unknown members.
 
+use std::sync::Arc;
+
 use cortexkit_role_compaction::view::{Edit, View};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
 #[derive(Clone, Debug)]
 pub struct ReceivedView {
-    view: View,
+    view: Arc<View>,
     edits: Vec<Box<RawValue>>,
 }
 
@@ -25,7 +27,7 @@ impl ReceivedView {
         let view = serde_json::from_str(raw.get())?;
         let raw_edits: RawEdits = serde_json::from_str(raw.get())?;
         Ok(Self {
-            view,
+            view: Arc::new(view),
             edits: raw_edits.edits,
         })
     }
@@ -56,7 +58,10 @@ impl ReceivedView {
                 "compaction view version {version} checksum mismatch"
             ));
         }
-        let received = Self { view, edits };
+        let received = Self {
+            view: Arc::new(view),
+            edits,
+        };
         received.check_size()?;
         Ok(received)
     }
@@ -66,6 +71,10 @@ impl ReceivedView {
     }
     pub fn view(&self) -> &View {
         &self.view
+    }
+
+    pub(super) fn shared_view(&self) -> Arc<View> {
+        Arc::clone(&self.view)
     }
 
     pub fn check_size(&self) -> Result<(), String> {
@@ -94,7 +103,10 @@ impl From<View> for ReceivedView {
             .iter()
             .map(|edit| serde_json::value::to_raw_value(edit).expect("contract edit serializes"))
             .collect();
-        Self { view, edits }
+        Self {
+            view: Arc::new(view),
+            edits,
+        }
     }
 }
 

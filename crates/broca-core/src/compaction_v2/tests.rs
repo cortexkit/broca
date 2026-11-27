@@ -911,6 +911,37 @@ async fn compaction_v2_recovery_finishes_marker_after_applied_barrier() {
 }
 
 #[test]
+fn compaction_v2_accepted_applied_and_frozen_share_one_view_version() {
+    let mut state = state::State::default();
+    let first = View::seal(1, vec![]);
+    let first_id = first.applied();
+    state.restore_accepted(first).unwrap();
+    state.restore_applied(&first_id).unwrap();
+    state.start_step(4);
+    assert!(std::ptr::eq(
+        state.latest_received().unwrap(),
+        state.applied_received().unwrap(),
+    ));
+    assert!(std::ptr::eq(
+        state.applied().unwrap(),
+        state.view_for_step(4).unwrap(),
+    ));
+
+    let second = View::seal(2, vec![]);
+    let second_id = second.applied();
+    state.restore_accepted(second).unwrap();
+    state.start_step(4);
+    assert_eq!(state.view_for_step(4).unwrap().applied(), first_id);
+    state.restore_applied_at(5, &second_id).unwrap();
+    assert_eq!(state.view_for_step(4).unwrap().applied(), first_id);
+    state.restore_applied_at(4, &second_id).unwrap();
+    assert!(std::ptr::eq(
+        state.view_for_step(4).unwrap(),
+        state.latest().unwrap(),
+    ));
+}
+
+#[test]
 fn compaction_v2_restore_checks_checksum_and_applied_identity() {
     let mut state = state::State::default();
     let mut view = View::seal(1, vec![]);
@@ -1167,6 +1198,18 @@ fn compaction_v2_received_edits_keep_unknown_members_and_exact_bytes() {
     )
     .unwrap();
     assert_eq!(rebuilt.edits()[0].get(), raw.get());
+    let mut state = state::State::default();
+    state.restore_accepted(rebuilt).unwrap();
+    state.restore_applied(&view.applied()).unwrap();
+    state.start_step(1);
+    let stored = serde_json::to_string(&state).unwrap();
+    assert_eq!(stored.matches(raw.get()).count(), 2);
+    let decoded = serde_json::to_string(&view).unwrap();
+    assert!(stored.contains(&format!("\"step_view\":{decoded}")));
+    assert_eq!(
+        serde_json::from_str::<state::State>(&stored).unwrap(),
+        state
+    );
     assert!(ReceivedView::rebuilt(
         view.version,
         "wrong".into(),
