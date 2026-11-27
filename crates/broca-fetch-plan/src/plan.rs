@@ -478,6 +478,8 @@ pub fn parse_plan_with(
         cortexkit_role_llm_runner::call_yield::check_plan(object, CALL_YIELD_GROUPS)
             .map_err(Refusal::invalid)?;
     }
+    cortexkit_role_llm_runner::upfront::check_plan(plan, false).map_err(Refusal::invalid)?;
+    cortexkit_role_llm_runner::tool_routes::check_plan(plan, false).map_err(Refusal::invalid)?;
     check_output_refs(plan, output_refs)?;
     let object = plan.as_object().ok_or_else(|| Refusal::invalid("plan"))?;
     let tool_items = items(object, "tool_items", true)?;

@@ -1079,6 +1079,50 @@ async fn text_only_and_hook_only_plan_refuses_before_fetch_or_write() {
     rig.finish().await;
 }
 
+async fn assert_undeclared_tool_member_refused(member: &str, value: Value) {
+    let (mut rig, admitter) = plan_rig(&format!("plan-undeclared-{member}")).await;
+    let plan = vector("plans/broca-head-no-compaction.json");
+    let mut invalid = plan.clone();
+    invalid["tool_items"][1][member] = value;
+    let before = rig.records().await;
+    let refused = send_plan(&mut rig, 7, "turn-1", "hi", Some(&invalid), json!({})).await;
+    let body = error_body(&refused);
+    assert_eq!(body["code"], "invalid_params");
+    assert_eq!(
+        body["detail"],
+        json!({"field": format!("plan.tool_items[1].{member}")})
+    );
+    assert_eq!(rig.records().await, before);
+    assert!(admitter.calls().is_empty());
+
+    rig.script.push(&[Step::Text("first")]);
+    result(&send_plan(&mut rig, 7, "turn-1", "hi", Some(&plan), json!({})).await);
+    rig.wait_for_finished(1).await;
+    let admissions = rig.admissions().await;
+    assert_eq!(
+        manifest_of(&admissions[0]).plan_identity,
+        broca_fetch_plan::plan_identity(&plan).unwrap()
+    );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn undeclared_tool_upfront_is_refused_before_fetch_or_write() {
+    assert_undeclared_tool_member_refused("upfront", json!(["ctx_memory"])).await;
+}
+
+#[tokio::test]
+async fn undeclared_tool_routes_is_refused_before_fetch_or_write() {
+    assert_undeclared_tool_member_refused(
+        "routes",
+        json!({
+            "argument": "target", "description": "Target provider",
+            "values": [{"value": "other", "provider": "aft"}]
+        }),
+    )
+    .await;
+}
+
 /// A second session with the same plan fetches again: nothing fetched for one session is
 /// reused for another.
 #[tokio::test]
