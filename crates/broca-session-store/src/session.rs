@@ -527,11 +527,11 @@ impl<B: SessionBackend> Session<B> {
         let (key, wrapped, cipher) = match deployment.new_sessions() {
             Cipher::XChaCha20Poly1305 => {
                 let key = DataKey::generate(DATA_KEY_ID);
-                let wrapped = keys::wrap(deployment, &session_id, &key)
+                let (deployment_id, wrapped) = keys::wrap_with_id(deployment, &session_id, &key)
                     .ok_or(SessionError::Head(HeadError::NotLoaded))?;
                 let wrapped = vec![WrappedKey {
                     id: key.id,
-                    deployment: deployment.id(),
+                    deployment: deployment_id,
                     wrapped: ByteBuf(wrapped),
                 }];
                 // An encrypted head leaves the field out, as every head did before plain mode.

@@ -21,7 +21,7 @@ impl KeyLoader {
         Fut: Future<Output = ()>,
     {
         let Some(source) = self.source.clone() else {
-            self.run(registry).await;
+            self.run_direct(registry).await;
             return;
         };
         let stopping = registry.stopping_signal();
@@ -89,19 +89,31 @@ impl KeyLoader {
         let mut left = Left::Everything;
         let mut changed = listing.watch();
         let mut retry = BTreeMap::<u16, (Instant, Duration)>::new();
+        let configured_id = self.slot.configured_key_id();
+        let mut selected = None;
+        let mut warned_no_grants = false;
         'load: while !stopping.is_cancelled() {
             let current = listing.get();
             let granted = current
                 .as_ref()
                 .map_or_else(BTreeSet::new, |(rows, _)| granted_keys(rows));
-            let runtime = self.slot.runtime();
+            if configured_id.is_none() && current.is_some() {
+                if granted.is_empty() && !warned_no_grants {
+                    warn_no_key(KeyUnavailable::NotFound);
+                }
+                warned_no_grants = granted.is_empty();
+            }
+            let mut runtime = self.slot.runtime();
             if let Some(runtime) = &runtime {
                 runtime.deployment().set_granted(granted.clone());
             }
+            if configured_id.is_none() {
+                log_selection_change(&mut selected, self.slot.key_id());
+            }
             // Keep the direct scoped read for the configured key so it can load even when
             // listing is unavailable. The vault still enforces its exact read grant.
-            let mut wanted = granted;
-            wanted.insert(self.slot.key_id());
+            let mut wanted = granted.clone();
+            wanted.extend(configured_id);
             wanted.retain(|id| {
                 !runtime
                     .as_ref()
@@ -117,9 +129,14 @@ impl KeyLoader {
                 .map(|id| async move { (id, read_key(source, id).await) })
                 .buffer_unordered(4));
             let mut loaded = false;
+            let mut listing_changed = false;
             while let Some((id, result)) = tokio::select! {
                 biased;
                 _ = stopping.cancelled() => break 'load,
+                _ = changed.changed(), if configured_id.is_none() => {
+                    listing_changed = true;
+                    None
+                }
                 read = reads.next() => read,
             } {
                 let result = match result {
@@ -134,8 +151,19 @@ impl KeyLoader {
                     Ok(()) => {
                         loaded = true;
                         retry.remove(&id);
-                        tracing::info!(target: "session_storage", key_id = id,
-                            "the session store's deployment key {id} has loaded");
+                        if runtime.is_none() {
+                            // Installing a key can open the runtime if it didn't open earlier.
+                            runtime = self.slot.runtime();
+                            if let Some(runtime) = &runtime {
+                                runtime.deployment().set_granted(granted.clone());
+                            }
+                        }
+                        if configured_id.is_some() {
+                            tracing::info!(target: "session_storage", key_id = id,
+                                "the session store's deployment key {id} has loaded");
+                        } else {
+                            log_selection_change(&mut selected, self.slot.key_id());
+                        }
                     }
                     Err(reason) => {
                         let wait = match retry.get(&id) {
@@ -167,6 +195,9 @@ impl KeyLoader {
                 self.reopen_refused(&registry).await;
                 on_keys_loaded().await;
             }
+            if listing_changed {
+                continue;
+            }
             let next = retry.values().map(|(at, _)| *at).min();
             tokio::select! {
                 biased;
@@ -197,4 +228,18 @@ impl KeyLoader {
             }
         }
     }
+}
+
+fn log_selection_change(previous: &mut Option<u16>, selected: Option<u16>) {
+    if *previous == selected {
+        return;
+    }
+    if let Some(key_id) = selected {
+        tracing::info!(target: "session_storage", key_id,
+            "new encrypted storage uses deployment key {key_id}");
+    } else {
+        tracing::info!(target: "session_storage", previous_key_id = *previous,
+            "no deployment key is selected for new encrypted storage");
+    }
+    *previous = selected;
 }

@@ -149,8 +149,8 @@
         "deployment_key_id": {
           "type": "integer",
           "title": "Storage key id",
-          "description": "The id of the storage key in the vault.",
-          "default": 1,
+          "description": "Pin the vault key for new encrypted storage. If omitted, broca follows the lowest readable deployment key in its scoped vault listing.",
+          "x-ck-required": false,
           "x-ck-apply": "module_restart",
           "x-ck-layers": [
             "user"

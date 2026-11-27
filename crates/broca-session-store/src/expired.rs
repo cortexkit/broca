@@ -192,9 +192,9 @@ pub fn write(
     if body.len() as u64 > MAX_BYTES - 64 {
         return Err(Error::TooLarge);
     }
-    let key = deployment.expiry_key(cipher).ok_or(Error::KeyUnavailable)?;
+    let (key_id, key) = deployment.expiry_key(cipher).ok_or(Error::KeyUnavailable)?;
     let mut bytes = vec![u8::from(cipher != Cipher::None)];
-    bytes.extend_from_slice(&deployment.id().to_le_bytes());
+    bytes.extend_from_slice(&key_id.to_le_bytes());
     let sealed = key.seal_unit(&aad(addr, &name, &bytes), &body);
     bytes.extend_from_slice(&sealed);
     broca_owner_only::create_dir_all(&dir)?;

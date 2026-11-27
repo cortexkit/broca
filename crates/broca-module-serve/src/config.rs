@@ -623,18 +623,18 @@ impl ImportConfig {
 
 /// How the session store is configured: `session_storage` in `broca.jsonc`.
 ///
-/// `deployment_key_id` names the deployment key used for new encrypted data, 1 when
-/// absent. The key itself is the vault record `opaque:broca-deployment:<id>` (see `store_key`).
-/// Keys form a ring: a rotation adds a record under a new id and names it here, and never
-/// rewrites an existing record.
+/// `deployment_key_id` pins the key for new encrypted data. When absent, the store uses the
+/// lowest readable deployment key in the scoped vault listing. Keys are vault records named
+/// `opaque:broca-deployment:<id>` (see `store_key`); rotation adds a record rather than rewriting
+/// one.
 ///
 /// `encryption`, `"on"` (the default) or `"off"`, chooses the mode of the sessions created from
 /// now on: encrypted, or plain, stored without encryption and served without the deployment key.
 /// A session keeps the mode it was created in, so changing it leaves existing sessions as they
 /// are, and a deployment can hold both kinds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionStorageConfig {
-    pub deployment_key_id: u16,
+    pub deployment_key_id: Option<u16>,
     pub encryption: Encryption,
 }
 
@@ -645,15 +645,6 @@ pub enum Encryption {
     #[default]
     On,
     Off,
-}
-
-impl Default for SessionStorageConfig {
-    fn default() -> Self {
-        Self {
-            deployment_key_id: crate::store_key::DEFAULT_KEY_ID,
-            encryption: Encryption::On,
-        }
-    }
 }
 
 impl SessionStorageConfig {
@@ -694,8 +685,7 @@ impl SessionStorageConfig {
         Ok(Self {
             deployment_key_id: section
                 .as_ref()
-                .and_then(|section| section.deployment_key_id)
-                .unwrap_or(defaults.deployment_key_id),
+                .and_then(|section| section.deployment_key_id),
             encryption: section
                 .and_then(|section| section.encryption)
                 .unwrap_or(defaults.encryption),
@@ -709,11 +699,11 @@ mod session_storage_config_tests {
     use broca_session_store::keys::Cipher;
 
     #[test]
-    fn the_deployment_key_id_defaults_to_1_and_is_named_by_session_storage() {
+    fn the_deployment_key_id_is_optional_and_can_be_pinned_by_session_storage() {
         assert_eq!(
             SessionStorageConfig::parse("{}").unwrap(),
             SessionStorageConfig {
-                deployment_key_id: 1,
+                deployment_key_id: None,
                 encryption: Encryption::On,
             }
         );
@@ -722,7 +712,7 @@ mod session_storage_config_tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(config.deployment_key_id, 2);
+        assert_eq!(config.deployment_key_id, Some(2));
         assert!(SessionStorageConfig::parse(r#"{"session_storage": {"key_id": 2}}"#).is_err());
         assert!(
             SessionStorageConfig::parse(r#"{"session_storage": {"deployment_key_id": -1}}"#)
@@ -747,7 +737,7 @@ mod session_storage_config_tests {
         assert_eq!(
             off,
             SessionStorageConfig {
-                deployment_key_id: 3,
+                deployment_key_id: Some(3),
                 encryption: Encryption::Off,
             }
         );

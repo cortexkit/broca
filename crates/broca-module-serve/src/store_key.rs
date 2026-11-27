@@ -4,7 +4,8 @@
 //! Each deployment key is a static vault record, `opaque:broca-deployment:<key-id>`. The
 //! operator grants `reserved:broca` an exact `read` on it. Its value is 32 random bytes written
 //! as 64 lowercase hex characters. `session_storage.deployment_key_id` in `broca.jsonc` names the
-//! key the module uses (see `config::SessionStorageConfig`).
+//! key the module uses for new encrypted data. Without it, the module follows the lowest
+//! readable key in its scoped vault listing (see `config::SessionStorageConfig`).
 //!
 //! The module starts without waiting for the key. Until the key loads, an encrypted session kept
 //! in the session store is refused `key_unavailable`, a transient refusal, while plain sessions
@@ -25,8 +26,6 @@ use broca_session_store::keys::DeploymentKey;
 
 mod follow;
 
-/// The key id the module uses when `broca.jsonc` names none.
-pub const DEFAULT_KEY_ID: u16 = 1;
 const CREDENTIAL_PREFIX: &str = "opaque:broca-deployment:";
 
 /// The vault record that holds deployment key `key_id`.
@@ -168,7 +167,7 @@ impl Default for Backoff {
     }
 }
 
-/// Loads the deployment key into `slot` and installs the session store's runtime there.
+/// Loads deployment keys into `slot` and installs the session store's runtime there.
 pub struct KeyLoader {
     /// `None` when the module reads no vault, so the key can't load.
     pub source: Option<Arc<dyn DeploymentKeySource>>,
@@ -178,13 +177,23 @@ pub struct KeyLoader {
 }
 
 impl KeyLoader {
+    /// Loads the configured key directly, or follows the scoped listing if no id was configured.
+    pub async fn run(self, registry: broca_module::LineageRegistry) {
+        if self.slot.configured_key_id().is_none() && self.source.is_some() {
+            self.run_following(registry, Arc::default(), || async {})
+                .await;
+        } else {
+            self.run_direct(registry).await;
+        }
+    }
+
     /// Reads the key, at once and then with backoff until it loads or the module stops. It logs
     /// one WARN while the key is missing and one INFO when it arrives, each naming the key id
     /// only. Once the key has loaded, every session refused meanwhile is opened, so the recovery
     /// its store actor runs on open (a crashed run sealed, an owed run billed, a queued send
     /// drained) runs then, not only at that session's next command.
-    pub async fn run(self, registry: broca_module::LineageRegistry) {
-        let key_id = self.slot.key_id();
+    async fn run_direct(self, registry: broca_module::LineageRegistry) {
+        let key_id = self.slot.configured_key_id();
         let stopping = registry.stopping_signal();
         let runtime_ready = match self.slot.open_without_key(&self.setup).await {
             Ok(()) => true,
@@ -207,24 +216,29 @@ impl KeyLoader {
         let loaded = async {
             if stopping.is_cancelled() {
                 stop_deferred();
-                return false;
+                return None;
             }
             let Some(source) = self.source.as_ref() else {
-                warn_missing(key_id, KeyUnavailable::NoVault);
-                return false;
+                if let Some(key_id) = key_id {
+                    warn_missing(key_id, KeyUnavailable::NoVault);
+                } else {
+                    warn_no_key(KeyUnavailable::NoVault);
+                }
+                return None;
             };
+            let key_id = key_id.expect("a direct vault read needs a configured key id");
             let mut wait = self.backoff.first;
             let mut warned = false;
             loop {
                 if stopping.is_cancelled() {
                     stop_deferred();
-                    return false;
+                    return None;
                 }
                 let read = tokio::select! {
                     biased;
                     _ = stopping.cancelled() => {
                         stop_deferred();
-                        return false;
+                        return None;
                     }
                     read = read_key(source.as_ref(), key_id) => read,
                 };
@@ -237,7 +251,7 @@ impl KeyLoader {
                     Err(reason) => Err(reason),
                 };
                 match loaded {
-                    Ok(()) => return true,
+                    Ok(()) => return Some(key_id),
                     Err(reason) if !warned => {
                         warn_missing(key_id, reason);
                         warned = true;
@@ -253,7 +267,7 @@ impl KeyLoader {
                     biased;
                     _ = stopping.cancelled() => {
                         stop_deferred();
-                        return false;
+                        return None;
                     },
                     _ = tokio::time::sleep(wait) => {}
                 }
@@ -269,9 +283,9 @@ impl KeyLoader {
         } else {
             Left::Everything
         };
-        if !loaded {
+        let Some(key_id) = loaded else {
             return;
-        }
+        };
         tracing::info!(
             target: "session_storage",
             key_id,
@@ -373,6 +387,11 @@ fn warn_missing(key_id: u16, reason: KeyUnavailable) {
     );
 }
 
+fn warn_no_key(reason: KeyUnavailable) {
+    tracing::warn!(target: "session_storage", reason = reason.as_str(),
+        "no deployment key is available; new encrypted sessions are refused key_unavailable");
+}
+
 /// The slot health reports on, once the module has published one.
 static PUBLISHED: OnceLock<RwLock<Option<Arc<StoreSlot>>>> = OnceLock::new();
 
@@ -385,7 +404,7 @@ pub fn publish(slot: Arc<StoreSlot>) {
 }
 
 /// `{key_id, loaded, new_sessions, phases}` for the published slot: which deployment key the session store
-/// opens encrypted sessions with, whether it has loaded, and the mode the sessions it creates
+/// uses for new encrypted data, whether it has loaded, and the mode the sessions it creates
 /// take (`"encrypted"` or `"plain"`), and process-lifetime storage/run-loop timings and seal
 /// statistics. Null in a process that published none.
 pub fn health() -> serde_json::Value {
@@ -397,9 +416,10 @@ pub fn health() -> serde_json::Value {
 
 /// Deployment-key state and process-lifetime storage/run-loop timings and seal statistics.
 pub fn health_of(slot: &StoreSlot) -> serde_json::Value {
+    let (key_id, loaded) = slot.write_key_state();
     serde_json::json!({
-        "key_id": slot.key_id(),
-        "loaded": slot.key_loaded(),
+        "key_id": key_id,
+        "loaded": loaded,
         "new_sessions": slot.new_sessions().label(),
         "phases": broca_session_store::metrics::snapshot(),
     })
@@ -465,7 +485,6 @@ mod tests {
     #[test]
     fn the_record_is_named_by_the_key_id() {
         assert_eq!(credential_id(1), "opaque:broca-deployment:1");
-        assert_eq!(credential_id(DEFAULT_KEY_ID), "opaque:broca-deployment:1");
         assert_eq!(credential_id(12), "opaque:broca-deployment:12");
     }
 

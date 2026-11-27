@@ -34,6 +34,7 @@ const NEW_SHAPES: [&str; 7] = [
 #[test]
 fn the_schema_defaults_are_the_readers_defaults() {
     let mut defaults = schema().defaults();
+    assert_eq!(defaults["session_storage"], json!({"encryption": "on"}));
     let object = defaults.as_object_mut().unwrap();
     for key in NEW_SHAPES {
         object

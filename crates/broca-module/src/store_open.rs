@@ -48,8 +48,6 @@ pub(crate) use expiry::ExpiryRead;
 /// the shared runtime as they arrive, so already-open sessions see new setup name spaces too.
 pub struct StoreRuntime {
     state_root: PathBuf,
-    /// The id of the deployment key used to create encrypted data.
-    key_id: u16,
     /// The mode of the sessions this runtime creates.
     new_sessions: Cipher,
     deployment: Arc<DeploymentKey>,
@@ -189,7 +187,7 @@ impl StoreRuntime {
     ) -> Result<Self, String> {
         let runtime = Self::open_without_key(
             state_root,
-            deployment.id(),
+            deployment.configured_id(),
             deployment.new_sessions(),
             executor,
             idle_ttl,
@@ -201,12 +199,12 @@ impl StoreRuntime {
         Ok(runtime)
     }
 
-    /// The runtime for the session store under `state_root` before deployment key `key_id` has
-    /// loaded. It serves plain sessions, whose setup parts it loads from each root, and creates
-    /// sessions in mode `new_sessions`, which it can do only for plain ones until the key loads.
+    /// The runtime for the session store under `state_root` before any deployment keys load.
+    /// `None` follows the read grants instead of pinning a key for encrypted writes. The runtime
+    /// serves plain sessions immediately and creates sessions in mode `new_sessions`.
     pub async fn open_without_key(
         state_root: &Path,
-        key_id: u16,
+        configured_id: impl Into<Option<u16>>,
         new_sessions: Cipher,
         executor: Arc<dyn RunExecutor>,
         idle_ttl: Duration,
@@ -215,7 +213,7 @@ impl StoreRuntime {
         crate::store_import_stage::clear_import_staging(state_root).map_err(|error| {
             format!("the new storage's import staging could not be cleared: {error}")
         })?;
-        let deployment = Arc::new(DeploymentKey::unloaded(key_id).creating(new_sessions));
+        let deployment = Arc::new(DeploymentKey::unloaded(configured_id).creating(new_sessions));
         let mut roots = Vec::with_capacity(StorageClass::ALL.len());
         for class in StorageClass::ALL {
             let backend = LocalBackend::new(class.store_root(state_root));
@@ -242,7 +240,6 @@ impl StoreRuntime {
             .unwrap_or_else(|_| unreachable!("one entry per class"));
         Ok(Self {
             state_root: state_root.to_path_buf(),
-            key_id,
             new_sessions,
             deployment,
             roots,
@@ -278,7 +275,7 @@ impl StoreRuntime {
         })
     }
 
-    /// Whether the configured deployment key has loaded, so new encrypted data can be written.
+    /// Whether a deployment key is available for new encrypted data.
     pub fn key_loaded(&self) -> bool {
         self.deployment.is_loaded()
     }
@@ -417,11 +414,6 @@ impl StoreRuntime {
     ) -> Self {
         self.send_states = Some(sink);
         self
-    }
-
-    /// The id of the deployment key configured for writes.
-    pub fn key_id(&self) -> u16 {
-        self.key_id
     }
 
     /// Whether the session `key` is kept in the session store: whether its head exists in one of
@@ -1387,17 +1379,16 @@ impl StoreRuntimeSetup {
         Ok(self.configured(runtime))
     }
 
-    /// The runtime this setup describes before deployment key `key_id` has loaded: it serves
-    /// plain sessions, and creates sessions in mode `new_sessions` (see
+    /// The runtime this setup describes before any keys load (see
     /// [`StoreRuntime::open_without_key`]).
     pub async fn open_without_key(
         &self,
-        key_id: u16,
+        configured_id: Option<u16>,
         new_sessions: Cipher,
     ) -> Result<StoreRuntime, String> {
         let runtime = StoreRuntime::open_without_key(
             &self.state_root,
-            key_id,
+            configured_id,
             new_sessions,
             Arc::clone(&self.executor),
             self.idle_ttl,
@@ -1429,7 +1420,7 @@ impl StoreRuntimeSetup {
 /// here is refused `key_unavailable`, a transient refusal.
 pub struct StoreSlot {
     state_root: PathBuf,
-    key_id: u16,
+    configured_id: Option<u16>,
     /// The mode of the sessions created here (`session_storage.encryption`).
     new_sessions: Cipher,
     runtime: OnceLock<Arc<StoreRuntime>>,
@@ -1440,12 +1431,12 @@ pub struct StoreSlot {
 }
 
 impl StoreSlot {
-    /// The session store under `state_root`, whose deployment key `key_id` hasn't loaded yet. It
-    /// creates encrypted sessions unless [`creating`](Self::creating) says otherwise.
-    pub fn awaiting_key(state_root: &Path, key_id: u16) -> Self {
+    /// The session store under `state_root`, before its deployment keys load. With no configured
+    /// id, it follows the read grants. It creates encrypted sessions unless told otherwise.
+    pub fn awaiting_key(state_root: &Path, configured_id: impl Into<Option<u16>>) -> Self {
         Self {
             state_root: state_root.to_path_buf(),
-            key_id,
+            configured_id: configured_id.into(),
             new_sessions: Cipher::XChaCha20Poly1305,
             runtime: OnceLock::new(),
             refused: Mutex::default(),
@@ -1460,15 +1451,29 @@ impl StoreSlot {
 
     /// The session store served by `runtime`, its key already loaded.
     pub fn loaded(runtime: Arc<StoreRuntime>) -> Self {
-        let slot = Self::awaiting_key(&runtime.state_root, runtime.key_id())
+        let slot = Self::awaiting_key(&runtime.state_root, runtime.deployment.configured_id())
             .creating(runtime.new_sessions());
         let _ = slot.runtime.set(runtime);
         slot
     }
 
-    /// The id of the deployment key the session store is opened with.
-    pub fn key_id(&self) -> u16 {
-        self.key_id
+    /// The configured write key, if the operator pinned one.
+    pub fn configured_key_id(&self) -> Option<u16> {
+        self.configured_id
+    }
+
+    /// The deployment key id for new encrypted data, if one is configured or selected.
+    pub fn key_id(&self) -> Option<u16> {
+        self.write_key_state().0
+    }
+
+    /// The write key's id and whether it is loaded, from the same snapshot.
+    pub fn write_key_state(&self) -> (Option<u16>, bool) {
+        self.runtime
+            .get()
+            .map_or((self.configured_id, false), |runtime| {
+                runtime.deployment().write_key_state()
+            })
     }
 
     /// The mode of the sessions created here.
@@ -1476,11 +1481,9 @@ impl StoreSlot {
         self.new_sessions
     }
 
-    /// Whether the deployment key has loaded, so every session kept here is served.
+    /// Whether a deployment key is available for new encrypted data.
     pub fn key_loaded(&self) -> bool {
-        self.runtime
-            .get()
-            .is_some_and(|runtime| runtime.key_loaded())
+        self.write_key_state().1
     }
 
     /// The runtime, once it is open: from the module's start, serving plain sessions, and every
@@ -1506,7 +1509,7 @@ impl StoreSlot {
             return Ok(());
         }
         let runtime = setup
-            .open_without_key(self.key_id, self.new_sessions)
+            .open_without_key(self.configured_id, self.new_sessions)
             .await?;
         let _ = self.runtime.set(Arc::new(runtime));
         Ok(())
@@ -1518,18 +1521,16 @@ impl StoreSlot {
         setup: &StoreRuntimeSetup,
         deployment: DeploymentKey,
     ) -> Result<(), String> {
-        if deployment.id() != self.key_id {
+        let offered = deployment.id();
+        if let Some(key_id) = self.configured_id.filter(|&key_id| offered != key_id) {
             return Err(format!(
-                "deployment key {} was offered for the new storage, which is opened with key {}",
-                deployment.id(),
-                self.key_id
+                "deployment key {offered} was offered for the new storage, which is opened with key {key_id}"
             ));
         }
         self.load_read_key(setup, deployment).await
     }
 
-    /// Installs a readable deployment key. The first value for an id stays; loading another
-    /// id does not enable new encrypted sessions.
+    /// Installs a readable deployment key. The first value for an id stays.
     pub async fn load_read_key(
         &self,
         setup: &StoreRuntimeSetup,
@@ -1572,7 +1573,7 @@ impl StoreSlot {
             return Ok(Some(Arc::clone(runtime)));
         }
         refused.insert(key.clone());
-        Err(key_unavailable(self.key_id))
+        Err(key_unavailable(self.configured_id))
     }
 
     /// The sessions refused since the last call because no key had loaded.
@@ -1600,12 +1601,17 @@ enum ByActor {
     Closed,
 }
 
-pub fn key_unavailable(key_id: u16) -> OpenError {
+pub fn key_unavailable(key_id: impl Into<Option<u16>>) -> OpenError {
     OpenError::Classified {
-        reason: format!(
-            "key_unavailable: the new storage's deployment key {key_id} has not loaded yet; \
-             retry once it has"
-        ),
+        reason: match key_id.into() {
+            Some(key_id) => format!(
+                "key_unavailable: the new storage's deployment key {key_id} has not loaded yet; \
+                 retry once it has"
+            ),
+            None => "key_unavailable: no deployment key is available for the new storage yet; \
+                     retry once one has loaded"
+                .into(),
+        },
         class: broca_protocol::ErrorClass::Transient,
     }
 }

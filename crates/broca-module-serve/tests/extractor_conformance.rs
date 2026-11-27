@@ -176,6 +176,7 @@ impl Subject {
         write_json(
             &config.join("cortexkit/broca.jsonc"),
             &json!({
+                "session_storage": {"deployment_key_id": 1},
                 "llm_tools": {"image_references": surface.is_some()},
                 "providers": {"cloudflare-workers-ai": {"base_url": base}},
             }),

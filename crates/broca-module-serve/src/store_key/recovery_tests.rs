@@ -9,6 +9,9 @@ use broca_session_store::record::{Pause, Record, Resumed, RunEnd, RunStart};
 use broca_session_store::session::Session;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "selection_tests.rs"]
+mod selection_tests;
+
 #[derive(Default)]
 struct Continuing(AtomicUsize);
 
@@ -101,6 +104,7 @@ impl DeploymentKeySource for DelayedKey {
 struct Rig {
     root: std::path::PathBuf,
     registry: broca_module::LineageRegistry,
+    opener: Arc<broca_module::DefaultOpener<broca_core::FileLeaseStore>>,
     slot: Arc<StoreSlot>,
     executor: Arc<Continuing>,
 }
@@ -113,21 +117,29 @@ impl Drop for Rig {
 
 impl Rig {
     async fn new(name: &str) -> Self {
+        Self::with_slot(name, |root| {
+            StoreSlot::awaiting_key(root, 1).creating(Cipher::None)
+        })
+        .await
+    }
+
+    async fn with_slot(name: &str, slot: impl FnOnce(&std::path::Path) -> StoreSlot) -> Self {
         let root = broca_test_support::scratch_root()
             .join(format!("key-recovery-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let executor = Arc::new(Continuing::default());
-        let slot = Arc::new(StoreSlot::awaiting_key(&root, 1).creating(Cipher::None));
-        let registry =
-            broca_module::LineageRegistry::new(Arc::new(broca_module::DefaultOpener::new(
-                Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
-                executor.clone(),
-                slot.clone(),
-            )));
+        let slot = Arc::new(slot(&root));
+        let opener = Arc::new(broca_module::DefaultOpener::new(
+            Arc::new(broca_core::FileLeaseStore::new(root.join("leases"))),
+            executor.clone(),
+            slot.clone(),
+        ));
+        let registry = broca_module::LineageRegistry::new(opener.clone());
         registry.enable_restart_resumes();
         let rig = Self {
             root,
             registry,
+            opener,
             slot,
             executor,
         };

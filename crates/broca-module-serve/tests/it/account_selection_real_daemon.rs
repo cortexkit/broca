@@ -4746,8 +4746,8 @@ async fn the_real_daemon_creating_plain_sessions_still_refuses_an_encrypted_one_
 }
 
 /// The real `ck-broca`, supervised by the real `ck-subc` with `session_storage.encryption` set to
-/// `encryption`, reads `opaque:broca-deployment:1` from the `claustrum` stand-in on its own when
-/// it starts.
+/// `encryption`, retries its pinned `opaque:broca-deployment:1` even while the `claustrum`
+/// stand-in does not list that record.
 ///
 /// Both held sessions are written at the identity the daemon itself recorded for them when their
 /// routes bound ([`Rig::served_identity`]), with each head checked at the path the daemon reads
@@ -4762,7 +4762,10 @@ async fn the_real_daemon_creating_plain_sessions_still_refuses_an_encrypted_one_
 /// session from the session store (its own incarnation, not today's empty answer), with no restart.
 /// The missing record is never reported to the vault as an auth failure.
 async fn held_sessions_across_the_deployment_key(encryption: &str) {
-    let Some(rig) = Rig::start_with(json!({"session_storage": {"encryption": encryption}})).await
+    let Some(rig) = Rig::start_with(json!({
+        "session_storage": {"encryption": encryption, "deployment_key_id": 1}
+    }))
+    .await
     else {
         return;
     };

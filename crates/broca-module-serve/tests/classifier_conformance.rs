@@ -328,6 +328,7 @@ async fn start_rig_with_references(
         &broca_config,
         serde_json::to_vec(
             &json!({"account_selection":{"routing_module":routed::ROUTER},
+                "session_storage":{"deployment_key_id":1},
                 "llm_tools":{"image_references":surface.is_some()},"providers": {
                 "typesafe": {"base_url": format!("{stand_in}/v1")},
                 "cloudflare-workers-ai": {"base_url": format!("{stand_in}/client/v4")},

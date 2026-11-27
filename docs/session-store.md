@@ -67,15 +67,19 @@ A session's cipher mode is chosen when it is created and recorded in its head.
   id, so a wrapped key copied into another head fails to unwrap. The head itself is readable and
   authenticated with the data key.
 - **Deployment keys** come from the vault (`opaque:broca-deployment:<key-id>`) and stay in
-  memory. `session_storage.deployment_key_id` chooses the key for new sessions and newly stored
-  encrypted setup parts. Existing session heads and expiry markers name the key that locked
-  them. Setup references name only a content digest, so broca tries the loaded keys' setup
-  names, configured first. A missing encrypted part is retryable while a granted key is still
-  loading; once all granted keys are loaded, a missing part is damage.
+  memory. `session_storage.deployment_key_id` pins the key for new encrypted data. If omitted,
+  broca uses the lowest-numbered readable key in its scoped vault listing. A listing refresh can
+  switch new writes to a lower key without a restart. On a single computer with key 1 as the
+  lowest readable key, nothing changes. Existing session heads and expiry markers name the key
+  that locked them. Setup references carry only a content digest. To find an encrypted setup part,
+  broca derives its storage name from the digest under each loaded key, starting with the key used
+  for new writes. A missing encrypted part is retryable while a granted key is still loading; once
+  all granted keys are loaded, a missing part is damage.
 - broca starts without waiting for keys and discovers new grants when its scoped listing
-  refreshes. An encrypted session whose key hasn't loaded is refused `key_unavailable`, which a
-  caller may retry. There is no fallback to plaintext. Pairing computers does not re-lock
-  existing data: keep the old key records and grant broca read access to each key it needs.
+  refreshes. When no key is available for new encrypted sessions, or an existing encrypted
+  session's key hasn't loaded, broca refuses with `key_unavailable`, which a caller may retry.
+  There is no fallback to plaintext. Pairing computers does not re-lock existing data: keep the
+  old key records and grant broca read access to each key it needs.
 - A **plain** session has no data key: each unit is its plaintext followed by an unkeyed check,
   which catches a torn or damaged unit but not a deliberate edit. New sessions are plain only when
   `session_storage.encryption` is `off` (the default is `on`), and a plain session opens without

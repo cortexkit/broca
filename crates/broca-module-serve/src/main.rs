@@ -682,8 +682,8 @@ async fn serve_main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let executor = Arc::new(executor_impl.with_clock(retention.clock.clone()));
     // The session store. Its runtime opens here, without the deployment key, and serves plain sessions from the
-    // start; encrypted sessions are served once the key has loaded from the vault (see
-    // `store_key`). `session_storage.encryption` chooses the mode of the sessions it creates.
+    // start; each encrypted session is served once its key loads from the vault. Without a
+    // configured id, `store_key` follows the scoped listing for new encrypted data.
     let session_storage =
         broca_module_serve::config::SessionStorageConfig::from_settings(&settings)
             .map_err(ServeIoError)?;

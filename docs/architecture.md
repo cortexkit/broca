@@ -33,8 +33,8 @@ afterward. Runs end with a durable `RunEnd`, or stop at a `Pause`.
 version), append-only logs and immutable parts, under a folder named by an address
 derived from the triple. An encrypted session has its own data key, protected by
 the deployment key that created it. broca loads the deployment keys it has read grants for
-and uses its configured key for new sessions. A random lineage id distinguishes a continued
-log from a recreated one. Only the
+and uses its configured key, or the lowest readable key from its scoped vault listing, for new
+sessions. A random lineage id distinguishes a continued log from a recreated one. Only the
 lease holder writes. History behind the compaction view is sealed into segments
 and read back on demand. See [the session store](session-store.md).
 

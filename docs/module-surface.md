@@ -588,16 +588,21 @@ sessions as they are, and a deployment can hold both kinds.
 broca loads every deployment key in its scoped vault listing that it can read. Each static
 record is `opaque:broca-deployment:<key_id>` and holds 32 bytes as 64 lowercase hex characters.
 Grant `reserved:broca` exact `read` on each record; the value is read with `credential.get_scoped`.
-The root `broca.jsonc` setting `"session_storage": {"deployment_key_id": 1}` names the key for
-new sessions and newly stored encrypted setup parts (1 when absent). A rotation adds a record
-under a new id and never rewrites one. Existing data stays locked with its original key.
+The root `broca.jsonc` setting `"session_storage": {"deployment_key_id": 1}` pins the key for
+new encrypted data, including new sessions and newly stored setup parts. If the setting is
+omitted, broca uses the lowest-numbered readable key in its scoped vault listing and switches
+without a restart when a lower key becomes readable. On a single computer with key 1 as the
+lowest readable key, nothing changes. A rotation adds a record under a new id and never rewrites
+one. Existing data stays locked with its original key.
 
-Startup never waits for or fails on a key. A session whose key hasn't loaded is refused
-`open_failed`, class `transient`, with a reason starting `key_unavailable:`. broca retries key
-reads with backoff and checks for new grants on listing refresh, so a grant can make existing
-sessions available without a restart. Plain sessions do not need a key. Key values stay in
-memory only and logs name only their ids. `health.check.metrics.store` reports
-`{key_id, loaded, new_sessions, phases}`. `key_id` and `loaded` refer to the configured key;
+Startup never waits for or fails on a key. When no key is available for new encrypted data, or
+a session's key hasn't loaded, broca refuses the open with `open_failed`, class `transient`, and
+a reason starting `key_unavailable:`. broca retries key reads with backoff and checks for new grants
+on listing refresh, so a grant can make existing sessions available without a restart. Plain
+sessions do not need a key. Key values stay in memory only and logs name only their ids.
+`health.check.metrics.store` reports `{key_id, loaded, new_sessions, phases}`. `key_id` names the
+pinned or automatically selected key for new encrypted data; `loaded` says whether that key is
+available. With no pinned or readable key, `key_id` is `null` and `loaded` is `false`.
 `new_sessions` is `"encrypted"` or `"plain"`.
 
 `phases` reports process-lifetime monotonic timings for `open`, `append`, `sync`, `seal`,

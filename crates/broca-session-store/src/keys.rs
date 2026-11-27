@@ -121,14 +121,14 @@ pub fn random_id() -> Id128 {
     Id128(id)
 }
 
-/// The configured deployment key and the other deployment keys available to this store.
-/// The configured id and creation mode select how new data is written; existing data selects
-/// the key that originally locked it.
+/// The deployment keys available to this store. New encrypted data uses the configured id,
+/// or the lowest loaded id in the current read grants if no id was configured. Existing data
+/// selects the key that originally locked it.
 ///
 /// Before the key has loaded from the vault, [`DeploymentKey::unloaded`] stands in for it: plain
 /// sessions open and are created with it, and every encrypted session refuses.
 pub struct DeploymentKey {
-    id: u16,
+    configured_id: Option<u16>,
     keys: RwLock<AvailableKeys>,
     /// The mode of sessions created with this key. Sessions that exist keep their own.
     new_sessions: Cipher,
@@ -150,7 +150,7 @@ impl DeploymentKey {
     /// Deployment key `id`, loaded. Sessions created with it are encrypted.
     pub fn new(id: u16, key: &[u8; 32]) -> Self {
         Self {
-            id,
+            configured_id: Some(id),
             keys: RwLock::new(AvailableKeys {
                 granted: BTreeSet::from([id]),
                 loaded: BTreeMap::from([(
@@ -170,11 +170,11 @@ impl DeploymentKey {
         }
     }
 
-    /// Deployment key `id` before it has loaded. Only plain sessions open with it, and the
-    /// sessions created with it are plain.
-    pub fn unloaded(id: u16) -> Self {
+    /// A ring without any loaded keys. With no configured id it follows the read grants.
+    /// Only plain sessions open with it at first, and the sessions created with it are plain.
+    pub fn unloaded(configured_id: impl Into<Option<u16>>) -> Self {
         Self {
-            id,
+            configured_id: configured_id.into(),
             keys: RwLock::default(),
             new_sessions: Cipher::None,
         }
@@ -185,7 +185,7 @@ impl DeploymentKey {
     pub fn duplicate_for_worker(&self) -> Self {
         let keys = self.keys.read().unwrap();
         Self {
-            id: self.id,
+            configured_id: self.configured_id,
             new_sessions: self.new_sessions,
             keys: RwLock::new(AvailableKeys {
                 granted: keys.granted.clone(),
@@ -201,13 +201,27 @@ impl DeploymentKey {
         self
     }
 
-    pub fn id(&self) -> u16 {
-        self.id
+    pub fn configured_id(&self) -> Option<u16> {
+        self.configured_id
     }
 
-    /// Whether the key itself has loaded, so encrypted sessions open with it.
+    /// The preferred id, or the plain key id when there is no choice yet. For reporting or
+    /// deciding whether new encrypted data can be written, use [`Self::write_key_state`].
+    pub fn id(&self) -> u16 {
+        self.write_key_state().0.unwrap_or(PLAIN_KEY_ID)
+    }
+
+    /// The write key's id and whether it is loaded, from the same snapshot. A configured id
+    /// is reported even if it has not loaded yet.
+    pub fn write_key_state(&self) -> (Option<u16>, bool) {
+        let keys = self.keys.read().unwrap();
+        let id = keys.write_id(self.configured_id);
+        (id, id.is_some_and(|id| keys.loaded.contains_key(&id)))
+    }
+
+    /// Whether the write key has loaded, so new encrypted data can be written.
     pub fn is_loaded(&self) -> bool {
-        self.has_key(self.id)
+        self.write_key_state().1
     }
 
     pub fn has_key(&self, id: u16) -> bool {
@@ -220,6 +234,12 @@ impl DeploymentKey {
 
     fn loaded_key(&self, id: u16) -> Option<Arc<LoadedKey>> {
         self.keys.read().unwrap().loaded.get(&id).cloned()
+    }
+
+    fn write_key(&self) -> Option<(u16, Arc<LoadedKey>)> {
+        let keys = self.keys.read().unwrap();
+        let id = keys.write_id(self.configured_id)?;
+        Some((id, Arc::clone(keys.loaded.get(&id)?)))
     }
 
     /// Records the latest scoped listing, including keys whose reads have not succeeded yet.
@@ -249,14 +269,14 @@ impl DeploymentKey {
             return (vec![Arc::new(crate::setup::SetupKey::plain())], false);
         }
         let keys = self.keys.read().unwrap();
-        let loaded = keys
-            .loaded
-            .get(&self.id)
+        let preferred = keys.write_id(self.configured_id);
+        let loaded = preferred
+            .and_then(|id| keys.loaded.get(&id))
             .into_iter()
             .chain(
                 keys.loaded
                     .iter()
-                    .filter_map(|(id, key)| (*id != self.id).then_some(key)),
+                    .filter_map(|(id, key)| (Some(*id) != preferred).then_some(key)),
             )
             .map(|key| Arc::clone(&key.setup))
             .collect();
@@ -274,7 +294,7 @@ impl DeploymentKey {
     pub fn setup_key_for(&self, cipher: Cipher) -> Option<crate::setup::SetupKey> {
         match cipher {
             Cipher::None => Some(crate::setup::SetupKey::plain()),
-            Cipher::XChaCha20Poly1305 => self.loaded_key(self.id).map(|key| (*key.setup).clone()),
+            Cipher::XChaCha20Poly1305 => self.write_key().map(|(_, key)| (*key.setup).clone()),
         }
     }
 
@@ -290,27 +310,43 @@ impl DeploymentKey {
     }
 
     /// The expiry sidecar's unit key, separate from the keys used for session content and setup.
-    pub(crate) fn expiry_key(&self, cipher: Cipher) -> Option<FrameKey> {
-        self.expiry_key_for(cipher, self.id)
+    pub(crate) fn expiry_key(&self, cipher: Cipher) -> Option<(u16, FrameKey)> {
+        match cipher {
+            Cipher::None => Some((self.id(), FrameKey::plain())),
+            Cipher::XChaCha20Poly1305 => self
+                .write_key()
+                .map(|(id, key)| (id, expiry_frame_key(id, &key))),
+        }
     }
 
     pub(crate) fn expiry_key_for(&self, cipher: Cipher, id: u16) -> Option<FrameKey> {
         match cipher {
             Cipher::None => Some(FrameKey::plain()),
-            Cipher::XChaCha20Poly1305 => self.loaded_key(id).map(|loaded| {
-                FrameKey::new(
-                    id,
-                    &crate::prune::keyed_digest(&loaded.bytes, b"broca-expired-encrypt-v1").0,
-                )
-            }),
+            Cipher::XChaCha20Poly1305 => self.loaded_key(id).map(|key| expiry_frame_key(id, &key)),
         }
     }
 }
 
 impl AvailableKeys {
+    fn write_id(&self, configured_id: Option<u16>) -> Option<u16> {
+        configured_id.or_else(|| {
+            self.granted
+                .iter()
+                .copied()
+                .find(|id| self.loaded.contains_key(id))
+        })
+    }
+
     fn has_pending(&self) -> bool {
         self.granted.iter().any(|id| !self.loaded.contains_key(id))
     }
+}
+
+fn expiry_frame_key(id: u16, key: &LoadedKey) -> FrameKey {
+    FrameKey::new(
+        id,
+        &crate::prune::keyed_digest(&key.bytes, b"broca-expired-encrypt-v1").0,
+    )
 }
 
 /// A session's data key in the clear, held only in memory. A plain session's "data key" names
@@ -426,7 +462,17 @@ fn wrap_aad(deployment_id: u16, session: &Id128, key_id: u16) -> Vec<u8> {
 /// Wraps `key` for session `session` under the deployment key: nonce, ciphertext and tag.
 /// `None` when the deployment key hasn't loaded.
 pub fn wrap(deployment: &DeploymentKey, session: &Id128, key: &DataKey) -> Option<Vec<u8>> {
-    let loaded = deployment.loaded_key(deployment.id)?;
+    wrap_with_id(deployment, session, key).map(|(_, wrapped)| wrapped)
+}
+
+/// Wraps the data key and returns the id of the deployment key that actually wrapped it.
+/// Reading the preferred id separately could race a change in the vault listing.
+pub(crate) fn wrap_with_id(
+    deployment: &DeploymentKey,
+    session: &Id128,
+    key: &DataKey,
+) -> Option<(u16, Vec<u8>)> {
+    let (deployment_id, loaded) = deployment.write_key()?;
     let mut nonce = [0u8; NONCE_LEN];
     random_bytes(&mut nonce);
     let mut buffer = key.bytes.to_vec();
@@ -434,14 +480,14 @@ pub fn wrap(deployment: &DeploymentKey, session: &Id128, key: &DataKey) -> Optio
         .cipher
         .encrypt_in_place_detached(
             XNonce::from_slice(&nonce),
-            &wrap_aad(deployment.id, session, key.id),
+            &wrap_aad(deployment_id, session, key.id),
             &mut buffer,
         )
         .expect("encrypting 32 bytes cannot fail");
     let mut out = nonce.to_vec();
     out.extend_from_slice(&buffer);
     out.extend_from_slice(&tag);
-    Some(out)
+    Some((deployment_id, out))
 }
 
 /// Unwraps a key [`wrap`] produced for this session and key id.
@@ -451,7 +497,11 @@ pub fn unwrap(
     key_id: u16,
     wrapped: &[u8],
 ) -> Result<DataKey, UnwrapError> {
-    unwrap_with_id(deployment, deployment.id, session, key_id, wrapped)
+    let id = deployment
+        .write_key_state()
+        .0
+        .ok_or(UnwrapError::NotLoaded)?;
+    unwrap_with_id(deployment, id, session, key_id, wrapped)
 }
 
 pub(crate) fn unwrap_with_id(
