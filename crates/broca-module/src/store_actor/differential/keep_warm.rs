@@ -32,12 +32,13 @@ mod resumed;
 /// How long after a request a warm of its cache is sent: short, so the tool wait sees one.
 const WARM_AFTER_MS: u64 = 200;
 
-/// The new loop, warming through a provider that answers the first warm and never answers a
-/// later one, so each run records exactly one warm however long its wait lasts.
+/// The new loop with a provider scripted to answer one warm. Its price makes that warm consume
+/// the entire `auto` budget, so a delayed tool release cannot start a second provider request.
 struct Loops {
     store: crate::store_actor::tests::LoopExecutor,
     /// The bytes of each warm sent.
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    quote_after_send: Arc<Notify>,
 }
 
 #[async_trait]
@@ -56,9 +57,12 @@ impl RunExecutor for Loops {
         _prefix_tokens: u64,
         _ttl_ms: u64,
     ) -> Result<broca_core::keep_warm::WarmCosts, String> {
+        if !self.sent.lock().unwrap().is_empty() {
+            self.quote_after_send.notify_one();
+        }
         Ok(broca_core::keep_warm::WarmCosts {
             warm: 0.01,
-            bust: 10.0,
+            bust: 0.01,
         })
     }
 
@@ -147,6 +151,7 @@ struct Side {
     runtime: Arc<crate::store_open::StoreRuntime>,
     key: BindIdentity,
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    quote_after_send: Arc<Notify>,
     /// Signalled when the tool call is dispatched, and what releases it.
     tool: (Arc<Notify>, Arc<Notify>),
 }
@@ -188,9 +193,11 @@ async fn side_events(cipher: Cipher, events: Option<Arc<crate::step_events::Step
     store_loop.provider.notes_sends = true;
     store_loop.planes = planes;
     let sent = Arc::default();
+    let quote_after_send = Arc::new(Notify::new());
     let executor: Arc<dyn RunExecutor> = Arc::new(Loops {
         store: store_loop,
         sent: Arc::clone(&sent),
+        quote_after_send: Arc::clone(&quote_after_send),
     });
     let runtime = Arc::new(
         crate::store_open::StoreRuntime::open(
@@ -219,6 +226,7 @@ async fn side_events(cipher: Cipher, events: Option<Arc<crate::step_events::Step
         registry,
         runtime,
         sent,
+        quote_after_send,
         tool,
     }
 }
@@ -241,8 +249,8 @@ fn hex(digest: &broca_session_store::codec::Digest) -> String {
 }
 
 impl Side {
-    /// Sends a keep-warm send, waits until its run warmed once while its tool call is held, then
-    /// releases the call and waits for the session to be idle.
+    /// Holds the tool until the first warm is durable and the next warm is due, then releases
+    /// the tool and waits for the session to be idle.
     async fn keep_warm_once(&self) {
         let mut first = request("hello");
         first.model = broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-8");
@@ -277,11 +285,22 @@ impl Side {
             }
         })
         .await;
+        // Exercise the next scheduling decision while the tool is still held, rather than
+        // counting on the test to release the tool before a second warm is due.
+        broca_test_support::wait_for(
+            "the scheduler prices a second warm",
+            self.quote_after_send.notified(),
+            || format!("{} warm attempts", self.sent.lock().unwrap().len()),
+        )
+        .await;
         self.tool.1.notify_one();
         broca_test_support::wait_until("the session is idle", || async {
             match self.registry.route_status(&self.key).await {
                 Ok(LineageStatus::Idle) => Ok(()),
-                other => Err(format!("{other:?}")),
+                other => Err(format!(
+                    "{other:?}; {} warm attempts",
+                    self.sent.lock().unwrap().len()
+                )),
             }
         })
         .await;
