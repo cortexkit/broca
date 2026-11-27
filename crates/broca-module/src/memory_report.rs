@@ -153,6 +153,7 @@ impl crate::LineageRegistry {
                 Some(broca_wire::KeptHeadCounts {
                     authorization: Some(store.authorization().memory()),
                     parked_pages: Some(store.parked_pages().memory()),
+                    parked_send_status: Some(store.parked_send_status_memory()),
                     ..store.heads().counts()
                 }),
             ),

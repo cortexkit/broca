@@ -976,7 +976,13 @@ impl StoreRuntime {
         }
         let slot = registry.slot_state(key);
         let served_at = slot.is_none().then(|| view.position());
-        if served_at.is_some() && request.parked_run().is_some() {
+        if served_at.is_some()
+            && (request.parked_run().is_some()
+                || matches!(
+                    &request,
+                    crate::store_reads::StoreReadRequest::SendStatus { .. }
+                ))
+        {
             self.keep_parked_status(key, class, &view);
         }
         let retained = served_at.map(|_| {
@@ -992,6 +998,11 @@ impl StoreRuntime {
             Some(reply) => reply,
             None => self.read_stored(key, class, &view, slot, &request).await,
         };
+        if let (Some(at), crate::store_reads::StoreReadReply::SendStatus(Ok(answer))) =
+            (served_at, &reply)
+        {
+            self.keep_parked_send_status(key, class, at, &request, answer);
+        }
         if let Some(served) = served {
             *served = Some(view);
         }

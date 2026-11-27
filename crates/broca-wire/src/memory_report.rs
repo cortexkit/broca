@@ -87,6 +87,9 @@ pub struct KeptHeadCounts {
     /// Position-checked facts used to serve sealed `session.read` pages without a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parked_pages: Option<ParkedPageCounts>,
+    /// Caller-specific send status replies kept for unchanged closed sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_send_status: Option<ParkedSendStatusCounts>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +99,16 @@ pub struct ParkedPageCounts {
     /// Parked page requests that went through the ordinary read path, by reason.
     pub misses: std::collections::BTreeMap<String, u64>,
     /// Page context entries and their byte cap, excluding transient per-read blocks.
+    pub held: MemoryCache,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedSendStatusCounts {
+    /// Requests answered from a kept reply after checking the session's position.
+    pub hits: u64,
+    /// Closed requests that checked for a reply but fell back to the ordinary read path.
+    pub misses: u64,
+    /// Kept replies and their byte and entry caps, including the request keys.
     pub held: MemoryCache,
 }
 

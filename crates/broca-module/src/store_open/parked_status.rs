@@ -11,6 +11,8 @@ use broca_session_store::session::{Position, Session};
 use super::StoreRuntime;
 use crate::store_reads::{StoreReadReply, StoreReadRequest};
 
+mod send_memo;
+
 const MAX_POSITIONS: usize = 1024;
 // Include the full bind identity, not only the store address, which is a short hash.
 const MAX_KEY_BYTES: usize = 512;
@@ -22,6 +24,7 @@ pub(super) struct ParkedStatus(Mutex<Positions>);
 struct Positions {
     entries: HashMap<BindIdentity, SafePosition>,
     order: VecDeque<BindIdentity>,
+    sends: send_memo::SendMemo,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,6 +39,7 @@ impl Positions {
     fn remove(&mut self, key: &BindIdentity) {
         if self.entries.remove(key).is_some() {
             self.order.retain(|older| older != key);
+            self.sends.remove_session(key);
         }
     }
 }
@@ -82,13 +86,36 @@ impl StoreRuntime {
         if cache.entries.len() == MAX_POSITIONS {
             if let Some(old) = cache.order.pop_front() {
                 cache.entries.remove(&old);
+                cache.sends.remove_session(&old);
             }
         }
         cache.entries.insert(key.clone(), position);
         cache.order.push_back(key.clone());
     }
 
-    /// After checking session expiry, use cached run facts without opening a whole view only
+    pub(super) fn keep_parked_send_status(
+        &self,
+        key: &BindIdentity,
+        class: StorageClass,
+        at: Position,
+        request: &StoreReadRequest,
+        reply: &broca_wire::SendReplyWire,
+    ) {
+        let mut cache = self.parked_status.lock();
+        if cache
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.class == class && entry.at == at)
+        {
+            cache.sends.keep(key, request, reply);
+        }
+    }
+
+    pub(crate) fn parked_send_status_memory(&self) -> broca_wire::ParkedSendStatusCounts {
+        self.parked_status.lock().sends.memory()
+    }
+
+    /// After checking session expiry, use cached run or send facts without opening a whole view
     /// if the closed session is still at the position known not to need recovery.
     pub(super) async fn read_parked_status(
         &self,
@@ -98,33 +125,28 @@ impl StoreRuntime {
         checked_at: Option<Position>,
         request: &StoreReadRequest,
     ) -> Option<(StoreReadReply, Position)> {
+        let send = matches!(request, StoreReadRequest::SendStatus { .. });
+        if (!send && request.parked_run().is_none()) || registry.slot_state(key).is_some() {
+            return None;
+        }
+        let position = self
+            .checked_status_position(registry, key, class, checked_at)
+            .await;
+        if send {
+            let reply = {
+                let mut cache = self.parked_status.lock();
+                let matches = position
+                    .as_ref()
+                    .is_some_and(|(_, checked)| cache.entries.get(key) == Some(checked));
+                cache.sends.get(key, request, matches)?
+            };
+            return Some((
+                StoreReadReply::SendStatus(Ok((*reply).clone())),
+                position?.1.at,
+            ));
+        }
+        let (addr, cached) = position?;
         let run = request.parked_run()?;
-        if registry.slot_state(key).is_some() {
-            return None;
-        }
-        let cached = *self.parked_status.lock().entries.get(key)?;
-        let addr = broca_core::session_addr(key);
-        let current = match checked_at {
-            Some(at) => Some(at),
-            None => Session::stored_position(
-                &self.backend(class),
-                &SessionAddr(addr.clone()),
-                self.deployment(),
-            )
-            .await
-            .ok()
-            .flatten(),
-        };
-        if cached.class != class || current != Some(cached.at) {
-            let mut cache = self.parked_status.lock();
-            if cache.entries.get(key) == Some(&cached) {
-                cache.remove(key);
-            }
-            return None;
-        }
-        if registry.slot_state(key).is_some() {
-            return None;
-        }
         let run_key = (
             addr,
             cached.incarnation,
@@ -150,5 +172,35 @@ impl StoreRuntime {
             _ => return None,
         };
         Some((reply, cached.at))
+    }
+
+    async fn checked_status_position(
+        &self,
+        registry: &crate::LineageRegistry,
+        key: &BindIdentity,
+        class: StorageClass,
+        checked_at: Option<Position>,
+    ) -> Option<(String, SafePosition)> {
+        let cached = *self.parked_status.lock().entries.get(key)?;
+        let addr = broca_core::session_addr(key);
+        let current = match checked_at {
+            Some(at) => Some(at),
+            None => Session::stored_position(
+                &self.backend(class),
+                &SessionAddr(addr.clone()),
+                self.deployment(),
+            )
+            .await
+            .ok()
+            .flatten(),
+        };
+        if cached.class != class || current != Some(cached.at) {
+            let mut cache = self.parked_status.lock();
+            if cache.entries.get(key) == Some(&cached) {
+                cache.remove(key);
+            }
+            return None;
+        }
+        registry.slot_state(key).is_none().then_some((addr, cached))
     }
 }

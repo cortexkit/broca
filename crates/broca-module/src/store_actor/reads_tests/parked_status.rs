@@ -113,3 +113,74 @@ async fn closed_run_status_provisional_ids_match_fresh_bytes() {
         }
     }
 }
+
+#[tokio::test]
+async fn closed_send_status_repeat_does_not_load_whole_view() {
+    let m = closed_run().await;
+    let request = StoreReadRequest::SendStatus {
+        own_run: RunId("r1".into()),
+        send_id: "first".into(),
+        principal: None,
+    };
+    let bytes = |reply| match reply {
+        StoreReadReply::SendStatus(Ok(status)) => serde_json::to_vec(&status).unwrap(),
+        _ => panic!("expected a send status"),
+    };
+    let fresh = bytes(m.fresh(&request).await);
+    assert_eq!(bytes(m.served(&request).await), fresh);
+    let runtime = m.runtime();
+    let before = runtime.views().memory(|_| 0).loads.unwrap();
+    assert_eq!(bytes(m.served(&request).await), fresh);
+    let after = runtime.views().memory(|_| 0).loads.unwrap();
+    assert_eq!(after, before, "repeat send status loaded the whole view");
+    let counts = m
+        .registry
+        .memory_report()
+        .await
+        .kept_heads
+        .unwrap()
+        .parked_send_status
+        .unwrap();
+    assert_eq!((counts.hits, counts.misses, counts.held.entries), (1, 1, 1));
+    assert!(counts.held.counted_bytes.unwrap() > 0);
+
+    let other_caller = StoreReadRequest::SendStatus {
+        own_run: RunId("r1".into()),
+        send_id: "first".into(),
+        principal: Some(broca_protocol::BindPrincipal::Reserved {
+            module_id: "other".into(),
+        }),
+    };
+    let is_unknown = |reply| {
+        matches!(
+            reply,
+            StoreReadReply::SendStatus(Err(crate::serve::ServeError::UnknownSend))
+        )
+    };
+    assert!(is_unknown(m.fresh(&other_caller).await));
+    assert!(is_unknown(m.served(&other_caller).await));
+    assert_eq!(runtime.parked_send_status_memory().hits, 1);
+
+    let mut writer = m.writer().await;
+    writer
+        .append(
+            &[Record::Retraction(
+                broca_session_store::record::Retraction {
+                    submission_id: "sub-unrelated".into(),
+                    failure: None,
+                },
+            )],
+            true,
+        )
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+    let fresh = bytes(m.fresh(&request).await);
+    let before = runtime.views().memory(|_| 0).loads.unwrap();
+    assert_eq!(bytes(m.served(&request).await), fresh);
+    assert_eq!(runtime.views().memory(|_| 0).loads.unwrap(), before + 1);
+    assert_eq!(bytes(m.served(&request).await), fresh);
+    assert_eq!(runtime.views().memory(|_| 0).loads.unwrap(), before + 1);
+    let counts = runtime.parked_send_status_memory();
+    assert_eq!((counts.hits, counts.misses, counts.held.entries), (2, 3, 1));
+}
