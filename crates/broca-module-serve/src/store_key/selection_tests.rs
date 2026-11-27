@@ -54,6 +54,9 @@ struct Selection {
     rig: Rig,
     listing: Arc<ListingCache>,
     loading: tokio::task::JoinHandle<()>,
+    /// Logs from this rig's key loader only. Other selection tests in the same process
+    /// log the same lines, so a global observer would see theirs too.
+    logs: broca_test_support::LogCapture,
 }
 
 impl Selection {
@@ -66,12 +69,17 @@ impl Selection {
         let listing = Arc::new(ListingCache::default());
         grant(&listing, grants);
         let loader = rig.loader(Some(Arc::new(ListedKeys(listing.clone()))));
-        let loading =
-            tokio::spawn(loader.run_following(rig.registry.clone(), listing.clone(), || async {}));
+        let logs = broca_test_support::LogCapture::new();
+        let loading = tokio::spawn(logs.scope_future(loader.run_following(
+            rig.registry.clone(),
+            listing.clone(),
+            || async {},
+        )));
         Self {
             rig,
             listing,
             loading,
+            logs,
         }
     }
 
@@ -141,13 +149,6 @@ async fn absent_id_uses_the_lowest_readable_key_not_key_one() {
 
 #[tokio::test]
 async fn absent_id_follows_the_listing_and_existing_sessions_keep_their_key() {
-    let logs = broca_test_support::LogCapture::observe(|event| {
-        event.target == "session_storage"
-            && event.level == tracing::Level::INFO
-            && event
-                .message()
-                .starts_with("new encrypted storage uses deployment key")
-    });
     let selection = Selection::start("switch-lowest", "{}", &[2]).await;
     selection.wait_for_keys(&[2]).await;
     let before = selection.create("before", 2).await;
@@ -167,10 +168,18 @@ async fn absent_id_follows_the_listing_and_existing_sessions_keep_their_key() {
     .await;
     selection.create("after-removal", 2).await;
     selection.rig.registry.actor_for(&after).await.unwrap();
+    let logs = selection.logs.clone();
     selection.stop().await;
     let choices: Vec<_> = logs
         .events()
         .into_iter()
+        .filter(|event| {
+            event.target == "session_storage"
+                && event.level == tracing::Level::INFO
+                && event
+                    .message()
+                    .starts_with("new encrypted storage uses deployment key")
+        })
         .map(|event| event.fields["key_id"].clone())
         .collect();
     assert_eq!(choices, ["2", "1", "2"]);
