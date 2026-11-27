@@ -555,13 +555,18 @@ impl ViewHead {
     }
 
     fn get(&self) -> Result<Option<broca_core::Cursor>, crate::serve::ServeError> {
-        self.0.as_ref().copied().map_err(|error| {
-            crate::serve::ServeError::Open(
-                format!("the session's control stream can't be projected: {error}"),
-                Some(broca_protocol::ErrorClass::Permanent),
-            )
-        })
+        self.0
+            .as_ref()
+            .copied()
+            .map_err(|error| stream_head_error(error))
     }
+}
+
+pub(crate) fn stream_head_error(error: &str) -> crate::serve::ServeError {
+    crate::serve::ServeError::Open(
+        format!("the session's control stream can't be projected: {error}"),
+        Some(broca_protocol::ErrorClass::Permanent),
+    )
 }
 
 /// What a reply takes besides the session: the media mode and the byte cap `req` asks for.

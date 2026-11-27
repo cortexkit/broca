@@ -350,6 +350,8 @@ pub(super) struct LoopExecutor {
     /// so a test can act after a step that called tools was appended and before its batch's
     /// intents make it durable.
     pub(super) approval_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    /// Holds the close hook until a test has started a read during teardown.
+    pub(super) close_gate: Option<Arc<Notify>>,
     /// What the `read` tool answers.
     pub(super) tool_text: String,
     /// Whether each model call first waits for the media the actor sends the run, as a run
@@ -499,6 +501,7 @@ pub(super) fn executor(
         drain_gate: None,
         planes: Planes::default(),
         approval_gate: None,
+        close_gate: None,
         tool_text: "file contents".into(),
         waits_for_media: false,
         steer_yields: Default::default(),
@@ -509,6 +512,12 @@ pub(super) fn executor(
 
 #[async_trait]
 impl RunExecutor for LoopExecutor {
+    async fn on_session_close(&self, _: &broca_protocol::BindIdentity) {
+        if let Some(release) = &self.close_gate {
+            release.notified().await;
+        }
+    }
+
     fn joining_temperature(
         &self,
         model: &broca_protocol::request::ModelHandle,

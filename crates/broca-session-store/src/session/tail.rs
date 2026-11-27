@@ -55,7 +55,7 @@ impl<B: SessionBackend> StoredLedger<B> {
         triple: &SessionTriple,
         deployment: &DeploymentKey,
     ) -> Result<Option<Self>, SessionError> {
-        Self::pin(backend, addr, triple, deployment, true).await
+        Self::pin(backend, addr, triple, deployment, true, None).await
     }
 
     /// Pin and replay the open log, including the fold checks a view makes. Only the ledger
@@ -66,7 +66,18 @@ impl<B: SessionBackend> StoredLedger<B> {
         triple: &SessionTriple,
         deployment: &DeploymentKey,
     ) -> Result<Option<ReplayedLedger<B>>, SessionError> {
-        let Some(ledger) = Self::pin(backend, addr, triple, deployment, false).await? else {
+        Self::replay_at(backend, addr, triple, deployment, None).await
+    }
+
+    /// Replay the ledger at the position recorded by the actor, excluding later appends.
+    pub async fn replay_at(
+        backend: B,
+        addr: SessionAddr,
+        triple: &SessionTriple,
+        deployment: &DeploymentKey,
+        at: Option<Position>,
+    ) -> Result<Option<ReplayedLedger<B>>, SessionError> {
+        let Some(ledger) = Self::pin(backend, addr, triple, deployment, false, at).await? else {
             return Ok(None);
         };
         let open = ledger.read_open(true).await?;
@@ -79,10 +90,14 @@ impl<B: SessionBackend> StoredLedger<B> {
         triple: &SessionTriple,
         deployment: &DeploymentKey,
         require_log: bool,
+        at: Option<Position>,
     ) -> Result<Option<Self>, SessionError> {
         let Some((stored, version)) = backend.read_head(&addr).await? else {
             return Ok(None);
         };
+        if at.is_some_and(|at| at.version != version) {
+            return Err(SessionError::Moved);
+        }
         let (head, key) = head::open(&stored, deployment).map_err(SessionError::Head)?;
         if require_log && &head.triple != triple {
             return Err(SessionError::TripleMismatch);
@@ -111,7 +126,11 @@ impl<B: SessionBackend> StoredLedger<B> {
             return Err(SessionError::TripleMismatch);
         }
         let log = open.change;
-        let len = backend.log_end(&addr, &log).await?;
+        let len = match at {
+            Some(at) if at.log != log => return Err(SessionError::Moved),
+            Some(at) => at.len,
+            None => backend.log_end(&addr, &log).await?,
+        };
         Ok(Some(Self {
             backend,
             addr,

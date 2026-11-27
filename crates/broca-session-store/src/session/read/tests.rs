@@ -1012,3 +1012,47 @@ fn ledger_tail_stops_before_older_segments_and_reads_the_open_log_once(cipher: C
             .is_err());
     });
 }
+
+#[test]
+fn replayed_ledger_at_an_actor_position_excludes_later_appends() {
+    use crate::session::{SessionError, StoredLedger};
+
+    block_on(async {
+        let backend = MemoryBackend::default();
+        let key = deployment(Cipher::XChaCha20Poly1305);
+        let mut writer = Session::create(&backend, addr(), triple(), &key, false)
+            .await
+            .unwrap();
+        for batch in round(0) {
+            writer.append(&batch, true).await.unwrap();
+        }
+        let at = writer.position();
+        let later = Record::Event(crate::record::Event {
+            name: "appended after the actor answered".into(),
+            run_id: Some("r".into()),
+            body: None,
+        });
+        let seq = writer
+            .append(std::slice::from_ref(&later), true)
+            .await
+            .unwrap();
+        let replay = StoredLedger::replay_at(&backend, addr(), &triple(), &key, Some(at))
+            .await
+            .unwrap()
+            .unwrap();
+        let records = replay.ledger_tail_until(|_| false).await.unwrap();
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|(old, _)| *old < seq));
+        let current = StoredLedger::open_replayed(&backend, addr(), &triple(), &key)
+            .await
+            .unwrap()
+            .unwrap();
+        let records = current.ledger_tail_until(|_| true).await.unwrap();
+        assert_eq!(records, vec![(seq, later)]);
+        writer.seal(None, 1).await.unwrap();
+        assert!(matches!(
+            StoredLedger::replay_at(&backend, addr(), &triple(), &key, Some(at)).await,
+            Err(SessionError::Moved)
+        ));
+    });
+}

@@ -828,6 +828,16 @@ async fn new_storage_ended_run_does_not_deliver_into_later_run(cipher: Cipher) {
         .unwrap();
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     side.idle().await;
+    assert!(side.registry.open_handle(&side.key).is_some());
+    let loads = || {
+        runtime
+            .views()
+            .memory(|_| 0)
+            .loads_by_reason
+            .and_then(|reasons| reasons.get("held_calls").map(|loads| loads.loads))
+            .unwrap_or_default()
+    };
+    let before = loads();
     rig.tick().await;
     assert_eq!(rig.delivery.calls.load(Ordering::SeqCst), 0);
     assert_eq!(rig.feed.acks.lock().unwrap().len(), 1);
@@ -847,6 +857,32 @@ async fn new_storage_ended_run_does_not_deliver_into_later_run(cipher: Cipher) {
         rig.key
     );
     assert_eq!(rig.intake.sweep_registrations().await.unwrap(), 1);
+    let keys = vec![rig.key.clone()];
+    let view = Session::view(
+        LocalBackend::new(class.store_root(&side.dir)),
+        SessionAddr(broca_core::session_addr(&side.key)),
+        &crate::store_open::triple(&side.key),
+        runtime.deployment(),
+    )
+    .await
+    .unwrap();
+    let expected = crate::late_results_puller::held_call_records(&view, &keys)
+        .await
+        .unwrap();
+    let request = crate::store_reads::StoreReadRequest::HeldCalls { call_keys: keys };
+    let Some(crate::store_reads::StoreReadReply::HeldCalls(Ok(held))) = runtime
+        .read_own(Some(&side.registry), &side.key, &request)
+        .await
+        .unwrap()
+    else {
+        panic!("the earlier held call can be read at the actor's position");
+    };
+    assert_eq!(format!("{held:?}"), format!("{expected:?}"));
+    assert_eq!(
+        loads(),
+        before,
+        "intake loaded a view for the earlier run's call"
+    );
     assert!(initial.registry.stop_and_seal().await);
     assert!(side.registry.stop_and_seal().await);
 }

@@ -71,12 +71,26 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             entry_speaks_for,
             class: self.class_placement.as_ref().map(|(class, _)| *class),
         };
-        let mut outcome = crate::store_reads::answer_in_memory(
+        if matches!(request, crate::store_reads::StoreReadRequest::Head) {
+            // The actor has the folded head facts already. Missing pieces come from the newest
+            // page, the latest run's records, or the cursor's log. Resolve those against this
+            // session, rather than making the caller reload and fold another copy of its view.
+            let reply = Box::pin(crate::store_reads::execute_head(
+                &self.session,
+                &context,
+                Self::head_cursor(&self.session, self.fanout.as_ref(), context.stream_head),
+            ))
+            .await;
+            return crate::store_reads::StoreReadOutcome::Served(Box::new(reply));
+        }
+        // Keep the generic read future off the actor stack while the head branch walks its
+        // cursor's log; it carries the state of all store read variants.
+        let mut outcome = Box::pin(crate::store_reads::answer_in_memory(
             &mut self.session,
             &context,
             request,
             Some(&self.compaction_session),
-        )
+        ))
         .await;
         if let crate::store_reads::StoreReadOutcome::Stored { compaction, .. } = &mut outcome {
             *compaction = Some(Arc::clone(&self.compaction_session));
@@ -88,11 +102,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// `store_head::KeptHeads`), as the actor closes idle. A head built after a close loads the
     /// session's whole view, and almost every closed head read follows a write the head was not
     /// yet built at (125 of 126 such loads in one 16-minute sample). The head is built from what
-    /// the actor holds in memory, the way a read of the closed session builds it: no live actor,
-    /// no live step. A head that needs storage, or records not yet durable, keeps nothing, and
-    /// the closed read builds the head as before.
-    pub(super) fn keep_closing_head(&self, registry: &crate::registry::RegistryHandle) {
-        use futures::FutureExt as _;
+    /// the actor holds, the way a read of the closed session builds it: no live actor or live
+    /// step. A head that needs records only reads the missing history before releasing its slot.
+    pub(super) async fn keep_closing_head(&mut self, registry: &crate::registry::RegistryHandle) {
         let Some(store) = registry.store_runtime() else {
             return;
         };
@@ -153,24 +165,30 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             entry_speaks_for: crate::store_entries::EntryAttribution::Known(false),
             class: Some(class),
         };
-        let memory = self.session.in_memory();
-        let reply = crate::store_reads::execute(
+        let reply = Box::pin(crate::store_reads::execute_head(
             &self.session,
             &context,
-            &crate::store_reads::StoreReadRequest::Head,
-        )
-        .now_or_never();
-        let from_memory = !memory.refused();
-        drop(memory);
-        match (reply, from_memory) {
-            (Some(crate::store_reads::StoreReadReply::Head(Ok(head))), true) => {
+            Self::head_cursor(&self.session, self.fanout.as_ref(), stream_head),
+        ))
+        .await;
+        match reply {
+            crate::store_reads::StoreReadReply::Head(Ok(head)) => {
                 store
                     .heads()
                     .keep(addr, self.session.position(), &head, "close");
             }
-            (_, false) => store.heads().count_not_kept("storage"),
-            (None, true) => store.heads().count_not_kept("pending"),
-            (Some(_), true) => store.heads().count_not_kept("failed"),
+            _ => store.heads().count_not_kept("failed"),
+        }
+    }
+
+    async fn head_cursor(
+        session: &Session<B>,
+        fanout: Option<&crate::store_fanout::StoreFanout<B>>,
+        known: Option<Option<broca_core::Cursor>>,
+    ) -> Result<Option<broca_core::Cursor>, crate::serve::ServeError> {
+        match (known, fanout) {
+            (None, Some(fanout)) => fanout.cursor_for_read(session).await,
+            (known, _) => Box::pin(crate::store_read::stream_head(session, known)).await,
         }
     }
 

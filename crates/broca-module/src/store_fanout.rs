@@ -480,6 +480,27 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreFanout<B> {
         self.publisher.lock().unwrap().head()
     }
 
+    /// Use the seeded projection if it is ready. Otherwise, compute just the cursor outside
+    /// the actor's stack from the same checkpoint and range as a stored view would use.
+    pub(crate) async fn cursor_for_read(
+        &self,
+        session: &Session<B>,
+    ) -> Result<Option<Cursor>, crate::serve::ServeError> {
+        if let Some(head) = self.head() {
+            return Ok(head);
+        }
+        let reader = session.stored_records((self.readers)());
+        let identity = CursorIdentity::of(session);
+        let through = session.next_seq().saturating_sub(1);
+        let read = tokio::runtime::Handle::current();
+        spawn_blocking(JobKind::Projection, move || {
+            read.block_on(last_unit(&reader, through + 1, through, &identity))
+        })
+        .await
+        .map_err(|error| crate::store_read::stream_head_error(&error.to_string()))?
+        .map_err(|error| crate::store_read::stream_head_error(&error))
+    }
+
     /// Attaches a subscriber from `from`, delivering to `sink`: registers its live receiver and
     /// takes the session's durable end as its barrier, then catches it up in a task of its own.
     pub(crate) fn attach(

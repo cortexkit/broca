@@ -427,6 +427,11 @@ async fn a_closed_sessions_head_reads_its_log_once_per_position() {
     let scope = broca_protocol::SendScope::default();
     runtime.log_reads.store(0, Ordering::Relaxed);
     let first = registry.head_for(&key, None, &scope).await.unwrap();
+    assert_eq!(
+        runtime.views().memory(|_| 0).loads_by_reason.unwrap()["session.head.cold"].loads,
+        1,
+        "a genuinely cold head still needs to replay the log"
+    );
     let read = runtime.log_reads.load(Ordering::Relaxed);
     assert!(read > 0, "the first head reads the log");
     assert_eq!(registry.head_for(&key, None, &scope).await.unwrap(), first);
@@ -956,6 +961,7 @@ async fn stored_read_future_stays_small() {
             crate::store_reads::StoreReadRequest::Page(Default::default()),
             None,
             None,
+            false,
         )
     });
     eprintln!("stored read future bytes={bytes}");

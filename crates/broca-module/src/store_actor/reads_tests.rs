@@ -1280,6 +1280,147 @@ async fn store_read_future_keeps_recovery_off_the_callers_stack() {
 }
 
 #[tokio::test]
+async fn an_open_paused_head_with_a_sealed_run_start_loads_no_view() {
+    use crate::serve::ServeHandler;
+    use broca_session_store::record::Pause;
+
+    let m = module(vec![text_step("a1", "seed")]).await;
+    active(m.send("r1", "seed").await);
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+    m.close().await;
+
+    let mut writer = m.writer().await;
+    let mut start = writer
+        .operations
+        .run
+        .as_ref()
+        .unwrap()
+        .start
+        .clone()
+        .unwrap();
+    start.run_id = "paused".into();
+    start.submission_id = None;
+    start.send_id = None;
+    writer
+        .append(
+            &[
+                Record::RunStart(Box::new(start)),
+                Record::Pause(Pause {
+                    run_id: "paused".into(),
+                    reason: broca_protocol::PauseReason::AuthRequired,
+                    ts_ms: Some(1),
+                    error: None,
+                    account_limit: None,
+                }),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    writer.seal(None, 1).await.unwrap();
+    writer.close().await.unwrap();
+    m.registry
+        .actor_for_mode(&m.key, None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(m.registry.slot_state(&m.key), Some("open"));
+
+    let StoreReadReply::Head(Ok(expected)) = m.fresh(&StoreReadRequest::Head).await else {
+        panic!("a fresh view can read the paused head");
+    };
+    let runtime = m.runtime();
+    let loads = || runtime.views().memory(|_| 0).loads;
+    let before = loads();
+    let mut reply = m
+        .registry
+        .head_for(&m.key, None, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(loads(), before, "the open actor's head loaded a whole view");
+    reply.sender = None;
+    reply.input = None;
+    reply.cache = None;
+    assert_eq!(
+        serde_json::to_vec(&reply).unwrap(),
+        serde_json::to_vec(&expected.reply).unwrap()
+    );
+    assert_eq!(reply.last_run_state.as_ref().unwrap().state, "paused");
+
+    m.close().await;
+    let mut parked = m
+        .registry
+        .head_for(&m.key, None, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        loads(),
+        before,
+        "parking did not keep the head of the sealed pause"
+    );
+    parked.sender = None;
+    parked.input = None;
+    parked.cache = None;
+    assert_eq!(
+        serde_json::to_vec(&parked).unwrap(),
+        serde_json::to_vec(&reply).unwrap()
+    );
+    assert!(m.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
+async fn a_head_racing_an_idle_close_loads_no_view() {
+    use crate::serve::ServeHandler;
+    use std::task::Poll;
+
+    let release = Arc::new(Notify::new());
+    let m = module_with(|gate| {
+        let mut executor = executor(vec![text_step("a1", "finished")], Some(gate));
+        executor.close_gate = Some(release.clone());
+        Arc::new(executor)
+    })
+    .await;
+    active(m.send("r1", "finish and close").await);
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+    let scope = Default::default();
+    let read = || m.registry.head_for(&m.key, None, &scope);
+    let open = read().await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(OPEN).await;
+    tokio::time::resume();
+    broca_test_support::wait_until("the head's actor is closing", || async {
+        match m.registry.slot_state(&m.key) {
+            Some("closing") => Ok(()),
+            state => Err(format!("{state:?}")),
+        }
+    })
+    .await;
+
+    let runtime = m.runtime();
+    let loads = || runtime.views().memory(|_| 0).loads;
+    let before = loads();
+    let mut racing = Box::pin(read());
+    let first_poll = futures::poll!(&mut racing);
+    release.notify_one();
+    let closed = match first_poll {
+        Poll::Pending => racing.await,
+        Poll::Ready(answer) => answer,
+    }
+    .unwrap();
+    assert_eq!(
+        loads(),
+        before,
+        "a head racing the close loaded a whole view"
+    );
+    assert_eq!(
+        serde_json::to_vec(&closed).unwrap(),
+        serde_json::to_vec(&open).unwrap()
+    );
+    assert!(m.registry.stop_and_seal().await);
+}
+
+#[tokio::test]
 async fn paused_session_reads_stay_in_the_view_without_opening_an_actor() {
     for reason in [
         broca_protocol::PauseReason::AuthRequired,

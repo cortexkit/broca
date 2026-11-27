@@ -2851,6 +2851,20 @@ impl LineageRegistry {
         }
     }
 
+    /// Waits until the actor now closing for `key` has finished, by which point it has stored
+    /// the session head it kept at close. A `session.head` read can then answer from that kept
+    /// head instead of opening a new actor or loading the whole session. Returns at once when no
+    /// actor for `key` is closing.
+    pub(crate) async fn wait_for_session_close(&self, key: &LineageKey) {
+        let done = match self.inner.slots.lock().unwrap().get(key) {
+            Some(Entry::Closing { done, .. }) => Some(done.subscribe()),
+            _ => None,
+        };
+        if let Some(mut done) = done {
+            let _ = done.recv().await;
+        }
+    }
+
     pub fn slot_state(&self, key: &LineageKey) -> Option<&'static str> {
         let slots = self.inner.slots.lock().unwrap();
         slots.get(key).map(|e| match e {

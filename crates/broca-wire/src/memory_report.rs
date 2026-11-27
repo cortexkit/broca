@@ -58,24 +58,21 @@ pub struct ParkedSubscriberCounts {
     pub subscriptions: u64,
 }
 
-/// `session.head` reads of sessions no actor holds since broca started: those a kept head
-/// answered, those that loaded the session's view, and why heads weren't kept; and the heads kept
-/// now.
+/// Kept-head lookups since broca started, why heads were not kept, and the heads kept now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptHeadCounts {
     /// Reads a kept head answered.
     pub hits: u64,
-    /// Reads that built the head from the session's view, by why no kept head answered:
-    /// `ephemeral` (a session that expires is never kept), `no_position` (the session's position
-    /// couldn't be read cheaply), `not_kept` (no head kept at the session's position).
+    /// Initial lookups that found no kept head: `ephemeral` (no eligible position in the
+    /// ephemeral root), `no_position` (no readable position elsewhere), `not_kept` (no head
+    /// cached at the position). An actor closing during a read may still supply the kept head.
     pub misses: std::collections::BTreeMap<String, u64>,
     /// Heads kept, by where they were built: `read` (by a head read of the closed session) or
     /// `close` (by its actor as it closed idle).
     pub kept: std::collections::BTreeMap<String, u64>,
     /// Heads an idle-closing actor or a read built and didn't keep, by why: `wait_too_large`,
     /// `ephemeral`, `unsynced` (records the actor appended were not yet
-    /// durable), `pending` (the head needed to wait on something), `storage` (it needed records
-    /// not in memory), `failed`.
+    /// durable), `failed`.
     pub not_kept: std::collections::BTreeMap<String, u64>,
     /// The heads kept now: how many, their cap, and their estimated bytes, walked when the
     /// report is asked for.
@@ -281,7 +278,10 @@ pub struct MemoryCache {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hits: Option<u64>,
     /// For the closed-session view cache: the same counts by the read or check that loaded each
-    /// view (`run.result`, `session.read`, `expiry` and so on). Absent for other caches.
+    /// view (`run.result`, `session.read`, `expiry` and so on). Head reads distinguish
+    /// `session.head.cold` (no actor or kept facts), `session.head.close_race` (an actor went
+    /// away without supplying a usable head), and `session.head.actor_stored` (an open actor
+    /// delegated the read to a stored view). Absent for other caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loads_by_reason: Option<std::collections::BTreeMap<String, ViewLoads>>,
     /// For the closed-session view cache: the sessions whose loads read the most bytes since
@@ -291,7 +291,8 @@ pub struct MemoryCache {
     /// For the closed-session view cache: how many reads an open session's actor couldn't
     /// answer from memory since broca started, by the read and the source line that needed
     /// storage (`session.read @ crates/.../read.rs:532`). Each such read is served from the
-    /// session as stored, which loads a view. Absent when there were none, and for other caches.
+    /// session as stored. A read of only the ledger, for example, need not load a view.
+    /// Absent when there were none, and for other caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stored_reads: Option<std::collections::BTreeMap<String, u64>>,
     /// For the kept-heads cache (the `session.head` answers broca keeps for closed sessions, so

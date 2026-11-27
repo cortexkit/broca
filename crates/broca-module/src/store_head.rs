@@ -246,7 +246,7 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
     retry: Option<&cortexkit_role_llm_runner::awaits::RunAwaits>,
 ) -> Result<StoreHead, StoreHeadError> {
     let operations = &session.operations;
-    let page = crate::store_read::read_page(session, None, Some(1))
+    let page = Box::pin(crate::store_read::read_page(session, None, Some(1)))
         .await
         .map_err(StoreHeadError::Read)?
         .page;
@@ -342,12 +342,15 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
             let (snapshot, kept) = wait.for_head(&labels, retry, None, live);
             last.awaits = snapshot.awaits;
             clock = kept;
-        } else if let Some(facts) =
-            crate::store_status::run_facts(session, parts, &last.run_id, live, None)
-                .await
-                .map_err(|error| {
-                    StoreHeadError::Setup(format!("the latest run's wait: {error:?}"))
-                })?
+        } else if let Some(facts) = Box::pin(crate::store_status::run_facts(
+            session,
+            parts,
+            &last.run_id,
+            live,
+            None,
+        ))
+        .await
+        .map_err(|error| StoreHeadError::Setup(format!("the latest run's wait: {error:?}")))?
         {
             let (wait, kept) = facts.wait.for_head(
                 &labels,
@@ -393,24 +396,10 @@ pub(crate) async fn serve_head(
 ) -> Result<broca_wire::HeadResponse, crate::serve::ServeError> {
     use crate::store_reads::{StoreReadReply, StoreReadRequest};
     let addr = broca_core::session_addr(key);
+    let saw_actor = matches!(registry.slot_state(key), Some("open" | "closing"));
     let closed = store.closed_position(registry, key).await;
-    let built = match closed.and_then(|(_, position)| store.heads().get(&addr, position)) {
-        Some(mut built) => {
-            store.heads().count_hit();
-            if let Some(awaits) = built
-                .reply
-                .last_run_state
-                .as_mut()
-                .and_then(|last| last.awaits.as_mut())
-            {
-                built.clock.refresh(
-                    awaits,
-                    &crate::store_awaits::Labels(Some(store.executor().clone())),
-                    crate::store_awaits::now_ms(),
-                );
-            }
-            built
-        }
+    let built = match closed.and_then(|(_, position)| kept_head(store, &addr, position)) {
+        Some(built) => built,
         None => {
             // An open actor answers the read itself, which loads nothing.
             if registry.open_handle(key).is_none() {
@@ -429,7 +418,7 @@ pub(crate) async fn serve_head(
             }
             // The read starts from this probe rather than probing the session again.
             let (reply, served_at) = match store
-                .read_probed(registry, key, StoreReadRequest::Head, closed)
+                .read_probed(registry, key, StoreReadRequest::Head, closed, saw_actor)
                 .await?
             {
                 Some(served) => served,
@@ -469,6 +458,28 @@ pub(crate) async fn serve_head(
             expiry_basis: broca_wire::EXPIRY_BASIS_ESTIMATED.into(),
         });
     Ok(reply)
+}
+
+pub(crate) fn kept_head(
+    store: &crate::store_open::StoreRuntime,
+    addr: &str,
+    position: broca_session_store::session::Position,
+) -> Option<StoreHead> {
+    let mut built = store.heads().get(addr, position)?;
+    store.heads().count_hit();
+    if let Some(awaits) = built
+        .reply
+        .last_run_state
+        .as_mut()
+        .and_then(|last| last.awaits.as_mut())
+    {
+        built.clock.refresh(
+            awaits,
+            &crate::store_awaits::Labels(Some(store.executor().clone())),
+            crate::store_awaits::now_ms(),
+        );
+    }
+    Some(built)
 }
 
 /// The heads of sessions no actor holds, by session address, each with the position it was built
@@ -617,8 +628,8 @@ impl KeptHeads {
         self.lock().counts.hits += 1;
     }
 
-    /// Counts a closed session's `session.head` that built its head from the session's view,
-    /// with why no kept head answered it (see `broca_wire::KeptHeadCounts::misses`).
+    /// Counts why the first lookup did not find a kept head. A closing actor can still publish
+    /// the head before the read needs to load a view.
     pub(crate) fn count_miss(&self, why: &'static str) {
         *self.lock().counts.misses.entry(why.to_owned()).or_default() += 1;
     }

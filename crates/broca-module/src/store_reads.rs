@@ -375,6 +375,44 @@ pub async fn execute<B: SessionBackend>(
     execute_with_actor(session, ctx, request, None).await
 }
 
+pub(crate) async fn execute_head<B: SessionBackend>(
+    session: &Session<B>,
+    ctx: &ReadContext<'_>,
+    cursor: impl std::future::Future<Output = Result<Option<broca_core::Cursor>, ServeError>>,
+) -> StoreReadReply {
+    StoreReadReply::Head(
+        async {
+            let mut head = crate::store_head::build_with_retry(
+                session,
+                ctx.parts,
+                ctx.open,
+                ctx.labels.clone(),
+                ctx.live_step
+                    .and_then(|live| live.step.as_ref())
+                    .and_then(|step| step.retry_awaits.as_deref()),
+            )
+            .await
+            .map_err(crate::store_head::head_failed)?;
+            // This is the cursor a page of the same session carries now, which a subscribe
+            // resumes from. A seeding actor can project it without making another session view.
+            head.reply.head = cursor.await?.map(broca_wire::CursorWire::from);
+            if let Some(class) = ctx.class {
+                crate::retention::policy::fill_head(
+                    &mut head.reply,
+                    &session.operations,
+                    class,
+                    session.open_log_activity_ms(),
+                )
+                .map_err(|error| {
+                    ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent))
+                })?;
+            }
+            Ok(Box::new(head))
+        }
+        .await,
+    )
+}
+
 async fn execute_with_actor<B: SessionBackend>(
     session: &Session<B>,
     ctx: &ReadContext<'_>,
@@ -407,39 +445,14 @@ async fn execute_with_actor<B: SessionBackend>(
                 .send_status(session, own_run.clone(), send_id, principal.as_ref())
                 .await,
         ),
-        StoreReadRequest::Head => StoreReadReply::Head(
-            async {
-                let mut head = crate::store_head::build_with_retry(
-                    session,
-                    ctx.parts,
-                    ctx.open,
-                    ctx.labels.clone(),
-                    ctx.live_step
-                        .and_then(|live| live.step.as_ref())
-                        .and_then(|step| step.retry_awaits.as_deref()),
-                )
-                .await
-                .map_err(crate::store_head::head_failed)?;
-                // The cursor a `session.read` page of the same session carries now, which a
-                // subscribe resumes from.
-                head.reply.head = crate::store_read::stream_head(session, ctx.stream_head)
-                    .await?
-                    .map(broca_wire::CursorWire::from);
-                if let Some(class) = ctx.class {
-                    crate::retention::policy::fill_head(
-                        &mut head.reply,
-                        &session.operations,
-                        class,
-                        session.open_log_activity_ms(),
-                    )
-                    .map_err(|error| {
-                        ServeError::Open(error, Some(broca_protocol::ErrorClass::Permanent))
-                    })?;
-                }
-                Ok(Box::new(head))
-            }
-            .await,
-        ),
+        StoreReadRequest::Head => {
+            Box::pin(execute_head(
+                session,
+                ctx,
+                Box::pin(crate::store_read::stream_head(session, ctx.stream_head)),
+            ))
+            .await
+        }
         StoreReadRequest::Page(page) => StoreReadReply::Page(
             crate::store_read::page(session, ctx.parts, page, ctx.stream_head).await,
         ),

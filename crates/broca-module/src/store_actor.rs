@@ -825,7 +825,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             self.retire_recovery();
         }
         if matches!(exit, Exit::Idle | Exit::Parked(_)) && !untouched {
-            self.keep_closing_head(&life.registry);
+            self.keep_closing_head(&life.registry).await;
         }
         let release_waiter = self.release_waiter.take();
         // Everything but the session is dropped here, before the lease, as the whole actor was.
