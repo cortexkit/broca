@@ -57,7 +57,8 @@ pub struct OwnershipChecks {
     pub(crate) first_plan_identity: Option<String>,
     pub(crate) requires_hooks: bool,
     pub(crate) requires_approval: bool,
-    // Upload standing uses the first plan, unlike interrupt grants after a plan refresh.
+    // Upload authorization uses the first plan's senders; interrupt grants follow the
+    // effective senders, which a plan refresh can change.
     pub(crate) first_senders: Vec<String>,
     pub(crate) interrupt_senders: Vec<String>,
 }

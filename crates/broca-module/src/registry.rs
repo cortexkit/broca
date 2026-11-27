@@ -1569,7 +1569,7 @@ impl LineageRegistry {
         Err(ServeError::ScopeRefused(refusal))
     }
 
-    /// Upload standing uses the session owner and the sender grants from the first plan.
+    /// Upload authorization uses the session owner and the sender grants from the first plan.
     pub(crate) async fn upload_ownership(
         &self,
         key: &LineageKey,

@@ -308,7 +308,8 @@ impl SettledRuns {
         self.admissions.lock().ok()?.answers.get(key).cloned()
     }
 
-    /// Admission from an immutable start already read at the verified incarnation and history.
+    /// The cached admission of a run, read from its RunStart (which never changes) at the
+    /// session incarnation and history version the caller verified.
     pub(crate) fn parked_admission(
         &self,
         key: &SettledKey,
