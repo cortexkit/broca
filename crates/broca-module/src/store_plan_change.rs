@@ -5,15 +5,15 @@
 //! the session's id index and read from that one record, so a lookup costs the same however
 //! many refreshes the session took.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use broca_fetch_plan::session_change::PendingState;
 use broca_session_loop::parts::Parts;
-use broca_session_store::backend::SessionBackend;
+use broca_session_store::backend::{BackendError, SessionBackend};
 use broca_session_store::fold::operations::ManifestRef;
 use broca_session_store::idindex::IdKind;
 use broca_session_store::record::Record;
-use broca_session_store::session::Session;
+use broca_session_store::session::{Session, SessionError};
 
 use crate::plan_change::{Accepted, ChangeFacts, EnrollmentFacts};
 
@@ -49,6 +49,7 @@ pub(crate) async fn facts<B: SessionBackend>(
         current_manifest,
         flushed: plan.flushed_since_accept,
         pending_note: plan.pending_note.clone(),
+        has_delivered_notes: crate::plan_notes::has_delivered_notes(&plan.notes),
         enrollment: Some(enrollment_facts(session, parts)?),
         ..ChangeFacts::default()
     };
@@ -92,6 +93,140 @@ pub(crate) async fn facts<B: SessionBackend>(
             });
     }
     Ok(facts)
+}
+
+/// A delivered system note names the refresh whose system text it described. The ledger still
+/// indexes that generation and its record names the frozen text, even after a newer refresh.
+pub(crate) async fn noted_system<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+    notes: &[broca_session_store::record::PlanNotes],
+) -> Result<Option<Arc<broca_records::record::PlanManifest>>, String> {
+    let Some((delivery, _)) = crate::plan_notes::last_system_note(notes) else {
+        return Ok(None);
+    };
+    let generation = delivery.generation;
+    let id = generation.to_string();
+    let Some(records) = plan_note_history(session, generation, || {
+        session.find_id(IdKind::RefreshGeneration, &id)
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+    let Some((_, Record::SessionRefresh(refresh))) = records.last() else {
+        warn_plan_note_history(session, generation, "refresh record is absent");
+        return Ok(None);
+    };
+    note_manifest(refresh, parts).map(Some)
+}
+
+/// An owner may resend the pending system text without a note. Until a run describes it to the
+/// model, it still needs the note carried by the acceptance that introduced that text.
+pub(crate) async fn inherited_system_note<B: SessionBackend>(
+    session: &Session<B>,
+    parts: &dyn Parts,
+    pending: &PendingState,
+) -> Result<Option<String>, String> {
+    let Some(records) = plan_note_history(session, pending.generation, || {
+        session.ledger_tail_until(|record| match record {
+            Record::SessionRefresh(refresh) => refresh.system_note.is_some(),
+            Record::RefreshApplied(_) => true,
+            _ => false,
+        })
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+    let Some((_, Record::SessionRefresh(refresh))) = records.last() else {
+        warn_plan_note_history(
+            session,
+            pending.generation,
+            "no earlier refresh carried the pending system note",
+        );
+        return Ok(None);
+    };
+    let manifest = note_manifest(refresh, parts)?;
+    Ok(refresh
+        .system_note
+        .clone()
+        .filter(|_| manifest.system_text == pending.manifest.system_text))
+}
+
+/// Historical note bookkeeping isn't required to start a run. Retry storage errors once;
+/// missing or unreadable records fall back to the applied plan without changing stored history.
+async fn plan_note_history<B: SessionBackend, T, F: Future<Output = Result<T, SessionError>>>(
+    session: &Session<B>,
+    generation: u64,
+    read: impl Fn() -> F,
+) -> Result<Option<T>, String> {
+    let result = match read().await {
+        Err(error) if !damaged_note_history(&error) => read().await,
+        result => result,
+    };
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if damaged_note_history(&error) => {
+            warn_plan_note_history(session, generation, error);
+            Ok(None)
+        }
+        Err(error) => Err(format!(
+            "reading plan-note history for refresh {generation}: {error:?}"
+        )),
+    }
+}
+
+fn damaged_note_history(error: &SessionError) -> bool {
+    use broca_session_store::{directory::DirectoryError, idindex::IndexError, log::LogError};
+    use SessionError::{Backend, Directory, Index, Log};
+
+    match error {
+        Backend(error)
+        | Directory(DirectoryError::Backend(error))
+        | Index(IndexError::Backend(error)) => {
+            matches!(error, BackendError::NoSuchLog | BackendError::Corrupt(_))
+        }
+        Directory(
+            DirectoryError::Missing(_) | DirectoryError::Corrupt(_) | DirectoryError::OutOfOrder,
+        )
+        | Index(IndexError::Missing(_) | IndexError::Corrupt(_))
+        | Log(
+            LogError::Frame(_)
+            | LogError::Undecodable { .. }
+            | LogError::Checkpoint(_)
+            | LogError::CheckpointNotFirst,
+        )
+        | SessionError::Segment(_)
+        | SessionError::Fold(_)
+        | SessionError::Damaged(_)
+        | SessionError::Corrupt { .. } => true,
+        _ => false,
+    }
+}
+
+fn warn_plan_note_history<B: SessionBackend>(
+    session: &Session<B>,
+    generation: u64,
+    cause: impl std::fmt::Debug,
+) {
+    tracing::warn!(
+        session = %broca_session_store::codec::hex(&session.head().session_id.0),
+        generation,
+        ?cause,
+        "plan-note refresh history is unavailable; comparing against the applied plan"
+    );
+}
+
+fn note_manifest(
+    refresh: &broca_session_store::record::SessionRefresh,
+    parts: &dyn Parts,
+) -> Result<Arc<broca_records::record::PlanManifest>, String> {
+    let manifest = ManifestRef::of_refresh(refresh);
+    // Setup objects are shared with ordinary plan reads. Their untyped read errors may be
+    // storage or key failures, so retry once and report them rather than assuming the plan-note
+    // history is damaged.
+    stored(&manifest, parts).or_else(|_| stored(&manifest, parts))
 }
 
 /// What a refresh that adds a compaction provider is checked against (see

@@ -24,6 +24,7 @@ fn manifest(tools: &[&str], system_text: &str) -> PlanManifest {
 fn facts<'a>(current: &'a PlanManifest, pending: &'a PlanManifest) -> Facts<'a> {
     Facts {
         current: Some(current),
+        noted_system: None,
         pending,
         generation: 2,
         system_note: Some("Answer in French."),
@@ -136,6 +137,7 @@ fn a_rendering_note_is_not_delivered_again_and_a_sealed_one_is() {
     )];
     let mut again = facts(&current, &pending);
     again.delivered = &earlier;
+    again.noted_system = Some(&pending);
     assert_eq!(at_start(&again), AtStart::Wait(None));
     // A cut sealed the history holding the anchor: the notes are delivered afresh.
     again.window_start = 5;
@@ -143,11 +145,16 @@ fn a_rendering_note_is_not_delivered_again_and_a_sealed_one_is() {
         texts(&at_start(&again)),
         vec!["Answer in French.".to_owned(), removal]
     );
-    // A newer note on the same change is a new note beside the old one.
+    // A new owner note on an unchanged noted surface is ignored.
     again.window_start = 1;
     again.system_note = Some("Answer in German.");
+    assert_eq!(at_start(&again), AtStart::Wait(None));
+    // A correction returning to the applied surface is a new note, not an early apply.
+    again.pending = &current;
     assert_eq!(
         texts(&at_start(&again)),
         vec!["Answer in German.".to_owned()]
     );
+    again.turn_system = false;
+    assert_eq!(at_start(&again), AtStart::Wait(None));
 }

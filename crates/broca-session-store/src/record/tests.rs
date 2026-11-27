@@ -456,6 +456,27 @@ fn plan_notes_keep_their_kind_number_and_bytes() {
 }
 
 #[test]
+fn plan_note_restoration_decodes_only_the_pinned_wording() {
+    let restoration = |text: &str| PlanNote {
+        kind: PlanNoteKind::ToolRestored,
+        text: text.into(),
+        form: "turn_system".into(),
+    };
+    let note = restoration("Tool \"a\"b\" is now available.");
+    let bytes = CodecMessage::encode(&note);
+    assert_eq!(bytes[..2], [0x10, 4]);
+    assert_eq!(
+        PlanNote::decode(&bytes).unwrap().restored_tool(),
+        Some("a\"b")
+    );
+    for text in ["Tool \"\" is now available.", "Tool \"read\" is available."] {
+        let error = PlanNote::decode(&CodecMessage::encode(&restoration(text))).unwrap_err();
+        assert_eq!(error.at, "PlanNote.text");
+        assert!(matches!(error.kind, DecodeErrorKind::BadValue(_)));
+    }
+}
+
+#[test]
 fn a_system_note_and_an_apply_reason_are_must_understand() {
     // A reader that skipped the note would render a session's runs without it, and one that
     // skipped the reason would report a forced apply as an ordinary one.

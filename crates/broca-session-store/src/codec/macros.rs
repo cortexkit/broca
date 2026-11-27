@@ -9,7 +9,7 @@
 //! - `map`: the field's type is a `BTreeMap<K, V>`, written in full; one entry per pair.
 //!
 //! `[must]` sets the must-understand bit (see the `codec` module). Numbers must ascend, which a
-//! compile-time assertion checks.
+//! compile-time assertion checks. An optional `=> validator` checks the decoded fields together.
 //!
 //! `oneof!` declares an enum where every variant carries one payload (use `()` for none). It
 //! encodes as a message holding exactly one field, numbered by the variant.
@@ -108,7 +108,7 @@ macro_rules! message {
                 $(#[$fattr:meta])*
                 $num:literal $card:ident $([$must:ident])? $field:ident : $ty:ty
             ),* $(,)?
-        }
+        } $(=> $validate:path)?
     ) => {
         $(#[$attr])*
         $vis struct $name {
@@ -164,7 +164,7 @@ macro_rules! message {
                         _ => $crate::codec::skip_unknown(field, at)?,
                     }
                 }
-                Ok(Self {
+                let decoded = Self {
                     $(
                         $field: $crate::__codec_finish!(
                             $card,
@@ -172,7 +172,9 @@ macro_rules! message {
                             concat!(stringify!($name), ".", stringify!($field))
                         ),
                     )*
-                })
+                };
+                $($validate(&decoded)?;)?
+                Ok(decoded)
             }
         }
 

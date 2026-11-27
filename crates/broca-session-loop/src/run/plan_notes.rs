@@ -43,6 +43,7 @@ fn record(delivery: &NotesDelivery, anchor: u64) -> PlanNotes {
                 kind: match note.kind {
                     NoteKind::System => PlanNoteKind::System,
                     NoteKind::ToolRemoval => PlanNoteKind::ToolRemoval,
+                    NoteKind::ToolRestored => PlanNoteKind::ToolRestored,
                 },
                 text: note.text.clone(),
                 form: note.form.clone(),
@@ -68,19 +69,21 @@ fn refresh_applied(
     }
 }
 
-/// The tools a pending plan change removes from the applied plan, which a run that delivered
-/// notes about the change, and every run after it until the change applies in full, refuses to
-/// call (llm-runner `plan_notes`). Read from the session's notes, so a resumed run refuses the
-/// same tools.
+/// The tools the newest delivery naming each tool says to refuse. Older removal notes still
+/// render after a correction, but their tools become callable again. Reading the deliveries in
+/// order keeps the gate the same on resume (llm-runner `plan_notes`).
 pub(super) fn removed_tools(
     operations: &broca_session_store::fold::operations::Operations,
 ) -> std::collections::BTreeSet<String> {
     operations
         .plan
-        .iter()
-        .flat_map(|plan| &plan.notes)
-        .flat_map(|delivered| delivered.refused_tools.iter().cloned())
-        .collect()
+        .as_ref()
+        .map_or_else(Default::default, |plan| {
+            PlanNotes::refusals(&plan.notes)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        })
 }
 
 /// `opts` with the plan notes the session delivered since its pending change was accepted

@@ -1263,7 +1263,35 @@ values! {
         1 System,
         /// A tool the pending plan no longer offers, in llm-runner's fixed removal wording.
         2 ToolRemoval,
+        /// A tool still in the applied plan whose earlier removal note was undone, so it may be
+        /// called again.
+        4 ToolRestored,
     }
+}
+
+impl PlanNote {
+    /// The tool that this undo makes callable again.
+    pub fn restored_tool(&self) -> Option<&str> {
+        if self.kind != PlanNoteKind::ToolRestored {
+            return None;
+        }
+        // The stored text is llm-runner's pinned string. Keep accepting these exact bytes
+        // when reading logs, even if later versions render the addition differently.
+        self.text
+            .strip_prefix("Tool \"")?
+            .strip_suffix("\" is now available.")
+            .filter(|name| !name.is_empty())
+    }
+}
+
+fn validate_plan_note(note: &PlanNote) -> Result<(), DecodeError> {
+    if note.kind == PlanNoteKind::ToolRestored && note.restored_tool().is_none() {
+        return Err(DecodeError::new(
+            "PlanNote.text",
+            DecodeErrorKind::BadValue("a restored tool note must use the fixed addition wording"),
+        ));
+    }
+    Ok(())
 }
 
 message! {
@@ -1274,7 +1302,7 @@ message! {
         1 req kind: PlanNoteKind,
         2 req text: String,
         3 req form: String,
-    }
+    } => validate_plan_note
 }
 
 message! {
@@ -1293,6 +1321,21 @@ message! {
         3 rep notes: PlanNote,
         4 rep refused_tools: String,
         5 req model_key: String,
+    }
+}
+
+impl PlanNotes {
+    /// The tools whose latest recorded change refuses calls. A correction renders alongside
+    /// a removal but allows calls to the tool again.
+    pub fn refusals(delivered: &[Self]) -> std::collections::BTreeSet<&str> {
+        let mut refused = std::collections::BTreeSet::new();
+        for delivery in delivered {
+            refused.extend(delivery.refused_tools.iter().map(String::as_str));
+            for name in delivery.notes.iter().filter_map(PlanNote::restored_tool) {
+                refused.remove(name);
+            }
+        }
+        refused
     }
 }
 

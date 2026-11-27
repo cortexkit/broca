@@ -3909,7 +3909,7 @@ impl ServeHandler for crate::LineageRegistry {
             });
         }
         crate::plan_change::check_system_note(
-            read.facts.current_manifest.as_deref(),
+            read.facts.latest_manifest(),
             &admitted.manifest,
             &policy,
             system_note.as_deref(),

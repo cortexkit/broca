@@ -538,7 +538,11 @@ mod records {
         ForkEvent::Billed,
     );
     variants!(RetentionEvent: RetentionEvent::Set, RetentionEvent::Released);
-    variants!(PlanNoteKind: PlanNoteKind::System, PlanNoteKind::ToolRemoval);
+    variants!(
+        PlanNoteKind: PlanNoteKind::System,
+        PlanNoteKind::ToolRemoval,
+        PlanNoteKind::ToolRestored,
+    );
     variants!(
         ChangeKind: ChangeKind::Cut,
         ChangeKind::LedgerSeal,
@@ -1103,7 +1107,21 @@ mod records {
         at_ms,
         policy
     });
-    crate::fuzzing::gen::fields!(PlanNote { kind, text, form });
+    impl Gen for PlanNote {
+        fn gen(g: &mut G<'_>) -> Self {
+            let kind = PlanNoteKind::gen(g);
+            let text = String::gen(g);
+            Self {
+                kind,
+                text: if kind == PlanNoteKind::ToolRestored {
+                    format!("Tool \"t{text}\" is now available.")
+                } else {
+                    text
+                },
+                form: String::gen(g),
+            }
+        }
+    }
     crate::fuzzing::gen::fields!(PlanNotes {
         generation,
         anchor,

@@ -273,6 +273,19 @@ impl SessionEvidence {
         for (at, event) in &self.model {
             let _ = writeln!(output, "  wall_ms={at} {event}");
         }
+        if plan_notes::model_for_session(session).is_some() {
+            if let Some(requests) = shared.bodies.lock().unwrap().get(session) {
+                for (index, request) in requests.iter().enumerate() {
+                    let observed = plan_notes::observe(request);
+                    let _ = writeln!(
+                        output,
+                        "plan-note request {}: {}",
+                        index + 1,
+                        bounded(&format!("{observed:?}"), FIELD_BYTES),
+                    );
+                }
+            }
+        }
         output.push_str("durable WAL (sequence order):\n");
         match self.wal().await {
             Ok(lines) => output.push_str(&lines),
@@ -340,13 +353,29 @@ impl SessionEvidence {
                     Record::Attempt(attempt) => (
                         &attempt.run_id,
                         format!(
-                            "Attempt step={} attempt={} outcome={} ts_ms={}",
+                            "Attempt step={} attempt={} outcome={} ts_ms={} sent_at_ms={:?} cache_ttl_ms={:?}",
                             attempt.step_id,
                             attempt.attempt,
                             bounded(&attempt.outcome, FIELD_BYTES),
-                            attempt.ts_ms
+                            attempt.ts_ms,
+                            attempt.sent_at_ms,
+                            attempt.requested_cache_ttl_ms,
                         ),
                     ),
+                    Record::PlanNotes(notes) => {
+                        return Some(format!(
+                            "  seq={seq} PlanNotes generation={} anchor={} notes={}\n",
+                            notes.generation,
+                            notes.anchor,
+                            notes.notes.len()
+                        ));
+                    }
+                    Record::RefreshApplied(applied) => {
+                        return Some(format!(
+                            "  seq={seq} RefreshApplied generation={} applied_by={} reason={:?}\n",
+                            applied.generation, applied.applied_by, applied.reason
+                        ));
+                    }
                     Record::RunEnd(end) => (
                         &end.run_id,
                         format!("RunEnd({:?}) ts_ms={:?}", end.reason, end.ts_ms),

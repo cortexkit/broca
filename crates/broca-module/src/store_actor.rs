@@ -2830,7 +2830,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// model-bearing items accept the run's model; otherwise the run is refused. When the
     /// pending refresh's manifest is used, the run start also records that it applied the
     /// refresh.
-    fn run_plan(
+    async fn run_plan(
         &self,
         model: &broca_protocol::ModelHandle,
         variant: Option<&str>,
@@ -2893,42 +2893,69 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // A change waiting under `notes_until_rebuild` (llm-runner `plan_notes`) follows rules of
         // its own (`crate::plan_notes`): a rebuild an earlier run already paid for is no reason
         // to apply it now, only a cache this run loses anyway is.
-        let notes = pending
+        let notes = if let Some(pending) = pending
             .as_ref()
             .filter(|pending| pending.policy == broca_core::plan_notes::NOTES_UNTIL_REBUILD)
-            .map(|pending| {
-                // No recorded rebuild counts here: `false` leaves the compaction provider joining
-                // and a proven lapse of the cache.
-                let cache_lost = plan.flushed_since_accept
-                    || effort_rebuild
-                    || plan
-                        .last_model
-                        .as_deref()
-                        .is_some_and(|last| last != model_key(model))
-                    || crate::plan_change::prefix_rebuilt(
-                        false,
-                        adds_compaction,
-                        last_cache,
-                        now_ms,
-                    );
-                let at_start = crate::plan_notes::at_start(&crate::plan_notes::Facts {
-                    current: current.as_deref(),
-                    pending: &pending.manifest,
-                    generation: pending.generation,
-                    system_note: plan.pending_note.as_deref(),
-                    delivered: &plan.notes,
-                    window_start: self.session.conversation().window_start(),
-                    pending_since_ms: plan.pending_since_ms,
-                    now_ms,
-                    cache_lost,
-                    turn_system: self
-                        .registry
-                        .as_ref()
-                        .is_some_and(|registry| registry.turn_system_form(model)),
-                    model_key: model_key(model),
-                });
-                (cache_lost, at_start)
+        {
+            // No recorded rebuild counts here: `false` leaves the compaction provider joining
+            // and a proven lapse of the cache.
+            let cache_lost = plan.flushed_since_accept
+                || effort_rebuild
+                || plan
+                    .last_model
+                    .as_deref()
+                    .is_some_and(|last| last != model_key(model))
+                || crate::plan_change::prefix_rebuilt(false, adds_compaction, last_cache, now_ms);
+            let mut noted_system = if cache_lost {
+                None
+            } else {
+                crate::store_plan_change::noted_system(&self.session, &self.parts, &plan.notes)
+                    .await
+                    .map_err(SendOutcome::Transient)?
+            };
+            let turn_system = self
+                .registry
+                .as_ref()
+                .is_some_and(|registry| registry.turn_system_form(model));
+            let inherited_note = if plan.pending_note.is_none()
+                && turn_system
+                && !cache_lost
+                && crate::plan_change::system_text_changed(
+                    noted_system.as_deref().or(current.as_deref()),
+                    &pending.manifest,
+                ) {
+                let inherited = crate::store_plan_change::inherited_system_note(
+                    &self.session,
+                    &self.parts,
+                    pending,
+                )
+                .await
+                .map_err(SendOutcome::Transient)?;
+                if inherited.is_none() {
+                    noted_system = None;
+                }
+                inherited
+            } else {
+                None
+            };
+            let at_start = crate::plan_notes::at_start(&crate::plan_notes::Facts {
+                current: current.as_deref(),
+                noted_system: noted_system.as_deref(),
+                pending: &pending.manifest,
+                generation: pending.generation,
+                system_note: plan.pending_note.as_deref().or(inherited_note.as_deref()),
+                delivered: &plan.notes,
+                window_start: self.session.conversation().window_start(),
+                pending_since_ms: plan.pending_since_ms,
+                now_ms,
+                cache_lost,
+                turn_system,
+                model_key: model_key(model),
             });
+            Some((cache_lost, at_start))
+        } else {
+            None
+        };
         let applying = match &notes {
             Some((_, crate::plan_notes::AtStart::Apply { .. })) => pending.as_ref(),
             Some((_, crate::plan_notes::AtStart::Wait(_))) => None,
@@ -2942,6 +2969,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         // A pending change that doesn't apply yet may still lend this run its newer rich UI
         // stamp, when the stamp was declared for the system text the run keeps.
+        let unchanged_without_notes = notes.is_some()
+            && !crate::plan_notes::has_delivered_notes(&plan.notes)
+            && applying
+                .zip(current.as_deref())
+                .is_some_and(|(pending, current)| {
+                    crate::plan_notes::unchanged_surface(current, &pending.manifest)
+                });
         let current = match applying {
             Some(_) => current,
             None => crate::plan_change::with_newer_stamp(current, pending.as_ref()),
@@ -2981,7 +3015,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             _ => None,
         };
         let operations = self.session.operations();
-        let rebuild_point = applies.is_some()
+        let rebuild_point = (applies.is_some() && (!unchanged_without_notes || adds_compaction))
             || effort_rebuild
             || crate::plan_change::run_rebuilds_prefix(
                 plan.last_model.as_deref(),
@@ -3000,14 +3034,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
     /// takes the manifest selected by [`Self::run_plan`]. Returns the refusal sent to the
     /// sender when freezing fails. Whether the send named tools of its own is noted first, for
     /// the run's start to record.
-    fn freeze_plan(&self, start: &mut Start) -> Result<(), SendOutcome> {
+    async fn freeze_plan(&self, start: &mut Start) -> Result<(), SendOutcome> {
         // Whether the send named tools as it arrived, before its plan's tools fill them in.
         let tools_were_omitted = start.request.tools.is_none();
         start.prepared.tools_were_omitted = tools_were_omitted;
         let first_run = self.session.operations().owner.needs_admission();
         if !first_run {
-            let (manifest, applies, rebuild_point, plan_notes) =
-                self.run_plan(&start.request.model, start.request.variant.as_deref())?;
+            let (manifest, applies, rebuild_point, plan_notes) = self
+                .run_plan(&start.request.model, start.request.variant.as_deref())
+                .await?;
             start.manifest = manifest;
             start.prepared.applies_refresh = applies;
             start.prepared.rebuild_point = rebuild_point;
@@ -3727,12 +3762,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // plain send), so it drains first.
         let own_admission = waiting.as_ref().is_some_and(|(id, _)| id.0 == first);
         match self.drained_start(&first, own_admission).await {
-            Ok((mut start, mut drained)) => match self
-                .session_class(start.session_class.as_deref())
-                .and_then(|class| {
-                    start.session_class = class;
-                    self.freeze_plan(&mut start)
-                }) {
+            Ok((mut start, mut drained)) => match async {
+                let class = self.session_class(start.session_class.as_deref())?;
+                start.session_class = class;
+                self.freeze_plan(&mut start).await
+            }
+            .await
+            {
                 Ok(()) => {
                     if self.is_accepting_drain() {
                         return;
@@ -4016,7 +4052,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         };
         // A note sent with system text that didn't change is ignored, as if absent.
         let system_note = system_note.filter(|_| {
-            crate::plan_change::system_text_changed(facts.current_manifest.as_deref(), &manifest)
+            crate::plan_change::system_text_changed(facts.latest_manifest(), &manifest)
         });
         let mut setup = Vec::new();
         let rest =

@@ -77,6 +77,8 @@ pub struct DeliveredNote {
 pub enum NoteKind {
     System,
     ToolRemoval,
+    /// An undo of a removal, for a tool still present in the applied plan.
+    ToolRestored,
 }
 
 /// The only form broca delivers notes in: a persistent system-role turn at the note's place in

@@ -25,6 +25,23 @@ const NOTE: &str = "Answer as a reviewer from now on.";
 /// catalog fact that decides whether plan notes can be delivered at all).
 struct Form(bool);
 
+struct Admitter;
+
+#[async_trait::async_trait]
+impl broca_fetch_plan::PlanAdmitter for Admitter {
+    async fn admit(
+        &self,
+        parsed: &broca_fetch_plan::Plan,
+        _: &BindIdentity,
+        _: Option<&broca_protocol::SessionScope>,
+    ) -> Result<broca_fetch_plan::Admitted, broca_fetch_plan::Refusal> {
+        let plan = serde_json::from_str(&parsed.text).unwrap();
+        Ok(broca_fetch_plan::Admitted {
+            manifest: manifest(&plan, &parsed.identity),
+        })
+    }
+}
+
 impl crate::cache::CacheDeclarer for Form {
     fn declare(
         &self,
@@ -365,4 +382,336 @@ async fn a_note_with_unchanged_system_text_is_accepted_and_ignored() {
     assert!(!shown(calls.last().unwrap())
         .iter()
         .any(|(_, _, text)| text == NOTE));
+}
+
+async fn note_refresh(
+    module: &Module,
+    generation: u64,
+    manifest: &broca_records::record::PlanManifest,
+    note: Option<&str>,
+) -> crate::actor::SessionRefreshOutcome {
+    let outcome = module
+        .registry
+        .route_session_refresh(
+            &module.key,
+            generation,
+            "notes_until_rebuild".into(),
+            Box::new(manifest.clone()),
+            Vec::new(),
+            note.map(str::to_owned),
+        )
+        .await
+        .unwrap();
+    module.closed().await;
+    outcome
+}
+
+fn assert_accepts(outcome: crate::actor::SessionRefreshOutcome, applies: bool) {
+    assert!(
+        matches!(outcome, crate::actor::SessionRefreshOutcome::Accepted {
+            applies_from_next_run, ..
+        } if applies_from_next_run == applies),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn restoring_applied_system_text_adds_a_correction_until_flush_after_restart() {
+    let original = manifest(&plan("You are a worker.", &["read"], None, None), "plan-1");
+    let changed = manifest(
+        &plan("You are a reviewer.", &["read"], None, None),
+        "plan-2",
+    );
+    let correction = "Go back to answering as a worker.";
+    let (module, executor) = module(
+        (1..=4).map(|n| text_step(&format!("a{n}"), "ok")).collect(),
+        true,
+    )
+    .await;
+    send(&module, "r1", Some(&original)).await;
+    assert_accepts(note_refresh(&module, 1, &changed, Some(NOTE)).await, false);
+    send(&module, "r2", None).await;
+    // Every send and refresh closes its actor before the next operation reopens the session.
+    let refusal = note_refresh(&module, 2, &original, None).await;
+    assert!(
+        matches!(refusal, crate::actor::SessionRefreshOutcome::Refused(
+        crate::serve::SessionChangeError::InvalidParams { field, .. }
+    ) if field == "system_note")
+    );
+    assert_accepts(
+        note_refresh(&module, 2, &original, Some(correction)).await,
+        false,
+    );
+    send(&module, "r3", None).await;
+    let calls = executor.provider.inner.calls();
+    let visible = shown(&calls[2]);
+    assert_eq!(
+        visible
+            .iter()
+            .filter(|(_, turn_system, _)| *turn_system)
+            .map(|(_, _, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        [NOTE, correction]
+    );
+    assert!(!records(&module)
+        .await
+        .iter()
+        .any(|r| matches!(r, Record::RefreshApplied(_))));
+    module
+        .registry
+        .session_flush_prefix(
+            &module.key,
+            Some(&core()),
+            &SendScope::default(),
+            "flush".into(),
+        )
+        .await
+        .unwrap();
+    send(&module, "r4", None).await;
+    let calls = executor.provider.inner.calls();
+    assert!(!shown(&calls[3]).iter().any(|(_, turn, _)| *turn));
+    assert!(records(&module)
+        .await
+        .iter()
+        .any(|r| matches!(r, Record::RefreshApplied(applied) if applied.generation == 2)));
+}
+
+#[tokio::test]
+async fn returning_to_the_applied_text_before_delivery_still_requires_a_note() {
+    let original = manifest(&plan("You are a worker.", &[], None, None), "plan-1");
+    let changed = manifest(&plan("You are a reviewer.", &[], None, None), "plan-2");
+    let (module, executor) = module(vec![text_step("a1", "ok"), text_step("a2", "ok")], true).await;
+    send(&module, "r1", Some(&original)).await;
+    assert_accepts(note_refresh(&module, 1, &changed, Some(NOTE)).await, false);
+    let refusal = note_refresh(&module, 2, &original, None).await;
+    assert!(
+        matches!(refusal, crate::actor::SessionRefreshOutcome::Refused(
+        crate::serve::SessionChangeError::InvalidParams { field, .. }
+    ) if field == "system_note")
+    );
+    assert_accepts(
+        note_refresh(&module, 2, &original, Some("Keep working.")).await,
+        true,
+    );
+    send(&module, "r2", None).await;
+    assert!(!shown(&executor.provider.inner.calls()[1])
+        .iter()
+        .any(|(_, turn, _)| *turn));
+    let log = records(&module).await;
+    assert!(!log.iter().any(|r| matches!(r, Record::PlanNotes(_))));
+    assert!(log
+        .iter()
+        .any(|r| matches!(r, Record::RefreshApplied(applied) if applied.generation == 2)));
+}
+
+#[tokio::test]
+async fn resending_the_pending_text_without_a_note_preserves_the_undelivered_note() {
+    let original = manifest(&plan("You are a worker.", &[], None, None), "plan-1");
+    let changed = manifest(&plan("You are a reviewer.", &[], None, None), "plan-2");
+    let (module, executor) = module(vec![text_step("a1", "ok"), text_step("a2", "ok")], true).await;
+    send(&module, "r1", Some(&original)).await;
+    assert_accepts(note_refresh(&module, 1, &changed, Some(NOTE)).await, false);
+    assert_accepts(note_refresh(&module, 2, &changed, None).await, false);
+    send(&module, "r2", None).await;
+    let calls = executor.provider.inner.calls();
+    assert!(shown(&calls[1])
+        .iter()
+        .any(|(_, turn, text)| *turn && text == NOTE));
+    assert!(records(&module)
+        .await
+        .iter()
+        .any(|r| matches!(r, Record::PlanNotes(delivery) if delivery.generation == 2)));
+}
+
+#[tokio::test]
+async fn a_dangling_system_note_uses_the_applied_plan_after_restart() {
+    use broca_session_store::record::{PlanNote, PlanNoteKind, PlanNotes};
+
+    let original = manifest(&plan("You are a worker.", &[], None, None), "plan-1");
+    let changed = manifest(&plan("You are a reviewer.", &[], None, None), "plan-2");
+    let (module, executor) = module(vec![text_step("a1", "ok"), text_step("a2", "ok")], true).await;
+    send(&module, "r1", Some(&original)).await;
+    assert_accepts(note_refresh(&module, 1, &changed, Some(NOTE)).await, false);
+    let orphan = "An earlier note without a recorded refresh.";
+    let mut session = module.load().await;
+    session
+        .append(
+            &[Record::PlanNotes(PlanNotes {
+                generation: 999,
+                anchor: 1,
+                notes: vec![PlanNote {
+                    kind: PlanNoteKind::System,
+                    text: orphan.into(),
+                    form: "turn_system".into(),
+                }],
+                refused_tools: Vec::new(),
+                model_key: "p:m".into(),
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+    send(&module, "r2", None).await;
+    let calls = executor.provider.inner.calls();
+    let visible = shown(&calls[1]);
+    let notes = visible
+        .iter()
+        .filter(|(_, turn, _)| *turn)
+        .map(|(_, _, text)| text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(notes, [orphan, NOTE]);
+    assert!(visible
+        .iter()
+        .any(|(_, _, text)| text.contains("You are a worker.")));
+    assert!(!visible
+        .iter()
+        .any(|(_, _, text)| text.contains("You are a reviewer.")));
+}
+
+#[tokio::test]
+async fn a_refresh_equal_to_the_noted_state_preserves_the_rendered_prefix_after_restart() {
+    let original = manifest(&plan("You are a worker.", &[], None, None), "plan-1");
+    let changed = plan("You are a reviewer.", &[], None, None);
+    let (module, executor) = module(
+        (1..=4).map(|n| text_step(&format!("a{n}"), "ok")).collect(),
+        true,
+    )
+    .await;
+    module.registry.set_plan_admitter(Arc::new(Admitter));
+    send(&module, "r1", Some(&original)).await;
+    let owner = core();
+    let scope = SendScope::default();
+    let refresh = |generation, plan: &serde_json::Value, note: Option<String>| {
+        module.registry.session_refresh(
+            &module.key,
+            Some(&owner),
+            &scope,
+            plan.as_object().unwrap().clone(),
+            "notes_until_rebuild".into(),
+            generation,
+            Vec::new(),
+            note,
+        )
+    };
+    let first = refresh(1, &changed, Some(NOTE.into())).await.unwrap();
+    assert!(!first.applies_from_next_run);
+    send(&module, "r2", None).await;
+    let original_plan = serde_json::from_str(original.plan.as_json_text()).unwrap();
+    assert!(matches!(refresh(2, &original_plan, None).await, Err(
+        crate::serve::SessionChangeError::InvalidParams { field, .. }
+    ) if field == "system_note"));
+    let repeat = refresh(2, &changed, None).await.unwrap();
+    assert_eq!(repeat.pending.generation, 2);
+    assert!(!repeat.applies_from_next_run);
+    let baseline = module
+        .registry
+        .baseline(&module.key, Some(&core()), &SendScope::default())
+        .await
+        .unwrap();
+    assert_eq!(baseline.baseline.unwrap().pending.unwrap().generation, 2);
+    send(&module, "r3", None).await;
+    let calls = executor.provider.inner.calls();
+    let before = &calls[1];
+    let after = &calls[2];
+    assert_eq!(
+        serde_json::to_vec(&before.prompt[..]).unwrap(),
+        serde_json::to_vec(&after.prompt[..before.prompt.len()]).unwrap(),
+        "only the new conversation suffix can extend the request"
+    );
+    let log = records(&module).await;
+    assert_eq!(
+        log.iter()
+            .filter(|r| matches!(r, Record::PlanNotes(_)))
+            .count(),
+        1
+    );
+    assert!(!log.iter().any(|r| matches!(r, Record::RefreshApplied(_))));
+    module
+        .registry
+        .session_flush_prefix(
+            &module.key,
+            Some(&core()),
+            &SendScope::default(),
+            "flush".into(),
+        )
+        .await
+        .unwrap();
+    send(&module, "r4", None).await;
+    assert!(records(&module)
+        .await
+        .iter()
+        .any(|r| matches!(r, Record::RefreshApplied(applied) if applied.generation == 2)));
+}
+
+#[tokio::test]
+async fn undoing_a_tool_removal_only_restores_calls_when_the_writer_is_enabled() {
+    use broca_session_store::record::PlanNoteKind;
+
+    let original = manifest(&plan("You are a worker.", &["read"], None, None), "plan-1");
+    let removed = manifest(&plan("You are a worker.", &[], None, None), "plan-2");
+    let mut steps = vec![text_step("first", "ok")];
+    for run in 2..=5 {
+        steps.push(read_step(&format!("call-{run}")));
+        steps.push(text_step(&format!("done-{run}"), "ok"));
+    }
+    let (module, executor) = module(steps, true).await;
+    send(&module, "r1", Some(&original)).await;
+    assert_accepts(note_refresh(&module, 1, &removed, None).await, false);
+    send(&module, "r2", None).await;
+    assert_accepts(note_refresh(&module, 2, &original, None).await, false);
+    send(&module, "r3", None).await;
+    // The next run reloads the notes, with no refresh or additional correction.
+    send(&module, "r4", None).await;
+    assert_accepts(note_refresh(&module, 3, &removed, None).await, false);
+    send(&module, "r5", None).await;
+
+    let enabled = crate::plan_notes::WRITE_TOOL_RESTORATIONS;
+    let calls = executor.provider.inner.calls();
+    let removal = broca_core::plan_notes::tool_removal("read");
+    let restoration = "Tool \"read\" is now available.";
+    for request in [&calls[3], &calls[5]] {
+        assert_eq!(request.tools[0].name, "read");
+        let visible = shown(request);
+        let texts = visible
+            .iter()
+            .filter(|(_, turn_system, _)| *turn_system)
+            .map(|(_, _, text)| text.as_str())
+            .collect::<Vec<_>>();
+        let expected = if enabled {
+            vec![removal.as_str(), restoration]
+        } else {
+            vec![removal.as_str()]
+        };
+        assert_eq!(texts, expected);
+    }
+    let log = records(&module).await;
+    let dispatches = log
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolIntent(intent) => Some(intent.run_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dispatches, if enabled { vec!["r3", "r4"] } else { vec![] });
+    let deliveries = log
+        .iter()
+        .filter_map(|record| match record {
+            Record::PlanNotes(delivery) => Some((delivery.generation, delivery.notes[0].kind)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = if enabled {
+        vec![
+            (1, PlanNoteKind::ToolRemoval),
+            (2, PlanNoteKind::ToolRestored),
+            (3, PlanNoteKind::ToolRemoval),
+        ]
+    } else {
+        vec![(1, PlanNoteKind::ToolRemoval)]
+    };
+    assert_eq!(deliveries, expected);
+    assert!(!log
+        .iter()
+        .any(|record| matches!(record, Record::RefreshApplied(_))));
 }

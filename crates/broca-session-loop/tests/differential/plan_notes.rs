@@ -10,6 +10,15 @@ const NOTE: &str = "Answer in French from now on.";
 /// from the session's records.
 #[tokio::test]
 async fn delivered_notes_render_after_the_input_and_gate_the_removed_tool() {
+    plan_note_gate_after_resume(false).await;
+}
+
+#[tokio::test]
+async fn a_restoration_after_a_removal_allows_the_tool_on_resume() {
+    plan_note_gate_after_resume(true).await;
+}
+
+async fn plan_note_gate_after_resume(restore: bool) {
     let scenario = Scenario {
         input: vec![user("read a")],
         tools: vec![tool("read", ExecutionMode::Sequential)],
@@ -38,24 +47,54 @@ async fn delivered_notes_render_after_the_input_and_gate_the_removed_tool() {
                         .iter()
                         .position(|record| matches!(record, Record::StepStart(_)))
                         .expect("the run starts a step");
-                    let mut records = source.records[..started].to_vec();
-                    records.push(Record::PlanNotes(PlanNotes {
+                    let mut start = source.cut(started);
+                    let mut deliveries = vec![Record::PlanNotes(PlanNotes {
                         generation: 1,
                         anchor: 1,
-                        notes: vec![PlanNote {
-                            kind: PlanNoteKind::System,
-                            text: NOTE.into(),
-                            form: "turn_system".into(),
-                        }],
+                        notes: vec![
+                            PlanNote {
+                                kind: PlanNoteKind::System,
+                                text: NOTE.into(),
+                                form: "turn_system".into(),
+                            },
+                            PlanNote {
+                                kind: PlanNoteKind::ToolRemoval,
+                                text: broca_core::plan_notes::tool_removal("read"),
+                                form: "turn_system".into(),
+                            },
+                        ],
                         refused_tools: vec!["read".into()],
                         model_key: "p:m".into(),
-                    }));
-                    let start = Start {
-                        records,
-                        parts: source.parts.clone(),
-                        converted: true,
-                        snapshot: None,
-                    };
+                    })];
+                    if restore {
+                        deliveries.push(Record::PlanNotes(PlanNotes {
+                            generation: 2,
+                            anchor: 1,
+                            notes: vec![PlanNote {
+                                kind: PlanNoteKind::ToolRestored,
+                                text: "Tool \"read\" is now available.".into(),
+                                form: "turn_system".into(),
+                            }],
+                            refused_tools: Vec::new(),
+                            model_key: "p:m".into(),
+                        }));
+                    }
+                    {
+                        let mut session = Session::load(
+                            start.snapshot.as_ref().expect("the cut has a log"),
+                            SessionAddr("0123456789abcdef".into()),
+                            &SessionTriple {
+                                project_root: "/project".into(),
+                                harness: "differential".into(),
+                                session: "s1".into(),
+                            },
+                            &DeploymentKey::new(1, &[7; 32]),
+                        )
+                        .await
+                        .unwrap();
+                        session.append(&deliveries, true).await.unwrap();
+                    }
+                    start.records.extend(deliveries);
                     let resumed =
                         Box::pin(new_source(&scenario, Some(start), scenario.steps.clone())).await;
                     let requests = &resumed.outcome.requests;
@@ -72,14 +111,35 @@ async fn delivered_notes_render_after_the_input_and_gate_the_removed_tool() {
                             "{layout:?}"
                         );
                     }
-                    // The removed tool never went out, and the model was told why.
-                    assert!(
-                        !resumed
+                    assert_eq!(
+                        resumed
                             .records
                             .iter()
                             .any(|record| matches!(record, Record::ToolIntent(_))),
-                        "{layout:?}: the removed tool was dispatched"
+                        restore,
+                        "{layout:?}: only a restored tool can be dispatched"
                     );
+                    if restore {
+                        for request in requests {
+                            let notes = request
+                                .prompt
+                                .iter()
+                                .filter(|message| message.turn_system)
+                                .map(text_of)
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                notes,
+                                [
+                                    NOTE.to_owned(),
+                                    broca_core::plan_notes::tool_removal("read"),
+                                    "Tool \"read\" is now available.".to_owned(),
+                                ],
+                                "{layout:?}"
+                            );
+                        }
+                        return;
+                    }
+                    // The removed tool never went out, and the model was told why.
                     let refusal = resumed
                         .records
                         .iter()

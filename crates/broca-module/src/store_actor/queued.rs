@@ -14,7 +14,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         mut reply: oneshot::Sender<SendOutcome>,
     ) {
         let outcome = async {
-            self.freeze_plan(&mut start)?;
+            self.freeze_plan(&mut start).await?;
             let staged = self.stage_media(&mut start.request, None).await?;
             for item in &staged {
                 self.held.hold(&item.reference, Arc::clone(&item.bytes));

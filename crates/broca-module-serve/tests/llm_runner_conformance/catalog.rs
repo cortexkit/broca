@@ -20,9 +20,17 @@ pub(super) fn catalog(request: &Value) -> Value {
             "reference_slots":[{"name":"data","kind":"token"},{"name":"program","kind":"source:rich-ui/1"}]}])
     };
     let mut answer = json!({"generation":"1","catalog_digest":"conformance", "composition_digest":digest,"tools":tools});
-    // A plan replaces system text, so its system-text item carries the scripted model's marker.
-    if let Some(session) = args["system_text"]["params"]["session"].as_str() {
-        let text = format!("{SESSION_MARKER}{session}");
+    // Most planned cases put their script marker in the catalog text. Plan-note cases instead
+    // identify their script by model so they can replace the text without relying on that marker.
+    let item = &args["system_text"];
+    let text = plan_notes::system_text(item)
+        .map(str::to_owned)
+        .or_else(|| {
+            item["params"]["session"]
+                .as_str()
+                .map(|session| format!("{SESSION_MARKER}{session}"))
+        });
+    if let Some(text) = text {
         answer["system_text"] = json!({
             "text":text,
             "item_digest":cortexkit_role_tool_provider::catalog::system_text_digest(&text),

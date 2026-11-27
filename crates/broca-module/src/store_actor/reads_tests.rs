@@ -1414,8 +1414,8 @@ async fn sealed_pages_after_a_paused_actor_closes_load_no_view_and_match_fresh_b
     assert_eq!(m.status("paused").await["state"], "paused");
     m.close().await;
     let runtime = m.runtime();
-    let loads = || runtime.views().memory(|_| 0).loads;
-    let before = loads();
+    let view_counts = || runtime.views().memory(|_| 0);
+    let before = view_counts();
     #[cfg(feature = "test-clock")]
     let log_reads = runtime.log_reads.load(Ordering::Relaxed);
     for (request, ordinal, count) in [
@@ -1456,7 +1456,15 @@ async fn sealed_pages_after_a_paused_actor_closes_load_no_view_and_match_fresh_b
         }
     }
     assert!(m.registry.slot_state(&m.key).is_none());
-    assert_eq!(loads(), before, "parked sealed pages loaded the whole view");
+    let after = view_counts();
+    assert_eq!(
+        after.loads,
+        before.loads,
+        "parked sealed pages loaded the whole view; before={:?}, after={:?}, parked={:?}",
+        before.loads_by_reason,
+        after.loads_by_reason,
+        runtime.parked_pages().memory(),
+    );
     #[cfg(feature = "test-clock")]
     assert_eq!(runtime.log_reads.load(Ordering::Relaxed), log_reads);
     let counts = m
@@ -1479,7 +1487,7 @@ async fn sealed_pages_after_a_paused_actor_closes_load_no_view_and_match_fresh_b
         shape(m.served(&through_window).await),
         shape(m.fresh(&through_window).await)
     );
-    assert!(loads() > before);
+    assert!(view_counts().loads > before.loads);
 
     // An append discards the old cursor and all other facts pinned to that position.
     let mut writer = m.writer().await;

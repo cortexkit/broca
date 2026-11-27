@@ -332,6 +332,8 @@ const MEDIA_FIXTURE_MODEL: &str = "conformance-media-blocks";
 mod bus;
 #[path = "llm_runner_conformance/catalog.rs"]
 mod catalog;
+#[path = "llm_runner_conformance/plan_notes.rs"]
+mod plan_notes;
 
 #[path = "llm_runner_conformance/boundary_cancel.rs"]
 mod boundary_cancel;
@@ -732,6 +734,7 @@ fn seed_structured_output_catalog(state_root: &Path) -> std::io::Result<()> {
         format!("{}/{}", output_refs::PROVIDER, output_refs::MODEL),
         output_refs::catalog_row(),
     );
+    models.extend(plan_notes::catalog_rows());
     #[cfg(feature = "test-clock")]
     models.extend(keep_warm::catalog_rows());
     let mut media = output_refs::catalog_row();
@@ -765,6 +768,30 @@ fn structured_output_catalogs_preserve_admission_decisions_without_a_daemon() {
     let cache = std::sync::Arc::new(broca_catalog::CatalogCache::empty());
     cache.refresh(response).unwrap();
     broca_catalog::install_global_catalog_cache(cache);
+    for (identity, _) in plan_notes::catalog_rows() {
+        let (provider, model) = identity.split_once('/').unwrap();
+        assert!(broca_catalog::catalog()
+            .unwrap()
+            .turn_system_form(provider, model));
+        let resolved = broca_catalog::live::resolve_provider_with_catalog_base_url(
+            &identity,
+            "http://127.0.0.1:1",
+            None,
+            None,
+            &broca_catalog::live::AuthMode::None,
+            &Default::default(),
+            broca_provider::build_provider_http_client(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.family_id,
+            broca_catalog::live::WireFamilyId::AnthropicMessages
+        );
+        assert_eq!(
+            resolved.provider.render_config_blob()["anthropic_turn_system"],
+            true
+        );
+    }
     let request = serde_json::from_value(json!({
         "mode":"final_text", "name":"answer",
         "schema":{"type":"object", "properties":{"answer":{"type":"string"}}, "required":["answer"], "additionalProperties":false}
@@ -924,7 +951,12 @@ async fn serve_model_request(
     let warm_session = keep_warm::session_for_model(&shared, model);
     #[cfg(not(feature = "test-clock"))]
     let warm_session: Option<String> = None;
-    let session = if let Some(session) = tier_session.or(warm_session) {
+    let plan_note_session = if model.starts_with(plan_notes::MODEL_PREFIX) {
+        plan_notes::session_for_model(model, shared.scripts.lock().unwrap().keys())
+    } else {
+        None
+    };
+    let session = if let Some(session) = tier_session.or(warm_session).or(plan_note_session) {
         Some(session)
     } else if let Some(session) = model.strip_prefix(PLAN_MODEL_PREFIX) {
         shared
@@ -1136,11 +1168,12 @@ async fn serve_model_request(
                 .is_some_and(|path| path.ends_with("/messages"))
         });
     let native_messages = messages_endpoint
-        && shared
-            .routed_account_peers
-            .lock()
-            .unwrap()
-            .contains_key(&session);
+        && (plan_notes::model_for_session(&session).is_some()
+            || shared
+                .routed_account_peers
+                .lock()
+                .unwrap()
+                .contains_key(&session));
     let code_assist = headers
         .lines()
         .next()
@@ -3440,8 +3473,7 @@ impl LlmRunnerSubject for BrocaSubject {
             // runs its cases. The host fixes no tool set, so the outside-host-set case
             // reports inapplicable by name.
             Capability::SessionChange,
-            // role.describe declares plan_notes. The adapter supplies no plan-note fixture (see
-            // `plan_notes_fixture`), so only the declaration's own case runs.
+            // Plan-note cases use a dedicated Messages route with a confirmed system-role turn.
             Capability::PlanNotes,
             // role.describe declares system_text_default (tool-provider 0.12), and the
             // adapter implements both of its hooks, so the kit runs those cases.
@@ -3655,6 +3687,9 @@ impl LlmRunnerSubject for BrocaSubject {
     /// the scripted provider the sessions apart) rides on the creating send, inside the plan
     /// when the send carries one, and later runs keep the key frozen from it.
     fn send_fields(&self, session: &str, first: bool) -> Map<String, Value> {
+        if let Some(model) = plan_notes::model_for_session(session) {
+            return plan_notes::send_fields(model, first);
+        }
         if first && cache_policy_session(session) {
             // A cache-policy case sends a refused creating send and then a corrected one under
             // the same send id, so every creating send carries the plan.
@@ -3771,16 +3806,10 @@ impl LlmRunnerSubject for BrocaSubject {
         false
     }
 
-    /// No plan-note fixture: broca delivers plan notes only as a system-role turn, and the kit's
-    /// scripted mock route (OpenAI Chat) has none, so a refresh changing the system text applies
-    /// in full there, recorded with the reason `no_note_form`, rather than as a note the cases
-    /// could observe. The note
-    /// path is tested in broca's own session tests on a route that has the form
-    /// (`store_actor::differential::plan_notes`).
     fn plan_notes_fixture(
         &self,
     ) -> Option<cortexkit_role_llm_runner_conformance::PlanNotesFixture> {
-        None
+        Some(plan_notes::fixture())
     }
 
     /// A plan for `session.refresh` of `session`. `ChangedTools` is a tool-free plan: the
@@ -4114,7 +4143,11 @@ impl LlmRunnerSubject for BrocaSubject {
             .map(|body| {
                 let request: Value = serde_json::from_slice(body)
                     .map_err(|e| HarnessError::new(format!("a model request is not JSON: {e}")))?;
-                let mut observation = observe_model_request(&request);
+                let mut observation = if plan_notes::model_for_session(session).is_some() {
+                    plan_notes::observe(&request)
+                } else {
+                    observe_model_request(&request)
+                };
                 observation.service_tier_applied = request
                     .get("service_tier")
                     .and_then(Value::as_str)
@@ -5195,6 +5228,7 @@ fn expected_native_case_pins() -> Vec<(&'static str, CaseOutcome)> {
         .lines()
         .chain(include_str!("golden/llm_runner_0828.applicability.txt").lines())
         .chain(include_str!("golden/llm_runner_0101.applicability.txt").lines())
+        .chain(include_str!("golden/llm_runner_0102.applicability.txt").lines())
         .map(|line| {
             let (status, row) = line.split_once(' ').unwrap();
             let (name, reason) = row.split_once(": ").unwrap_or((row, ""));
@@ -5346,7 +5380,7 @@ fn runner_contract_cases_pin_exact_native_outcomes() {
             }
         })
         .collect();
-    assert_eq!(cases.len(), 119);
+    assert_eq!(cases.len(), 122);
     check_native_case_pins(&cases).unwrap();
     for index in 0..cases.len() {
         for outcome in [

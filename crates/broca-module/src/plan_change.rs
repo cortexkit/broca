@@ -40,6 +40,8 @@ pub(crate) struct ChangeFacts {
     pub flushed: bool,
     /// The pending refresh's note on a changed system text, if it sent one.
     pub pending_note: Option<String>,
+    /// A full apply would clear a delivered note from the session's records.
+    pub has_delivered_notes: bool,
     /// The refresh accepted under the request's generation, if one was.
     pub accepted: Option<Accepted>,
     /// How the request's generation applied (`fold` or `append`), if it did.
@@ -223,37 +225,37 @@ pub(crate) fn accept_refresh(
             rung: policy.into(),
         });
     }
-    if let Err(field) = check_system_note(
-        facts.current_manifest.as_deref(),
-        manifest,
-        policy,
-        system_note,
-    ) {
+    if let Err(field) = check_system_note(facts.latest_manifest(), manifest, policy, system_note) {
         return RefreshAcceptance::Refused(field);
     }
     RefreshAcceptance::Accept {
         run_in_progress,
-        applies_from_next_run: policy == "immediately" || facts.flushed,
+        applies_from_next_run: policy == "immediately"
+            || facts.flushed
+            || (policy == broca_core::plan_notes::NOTES_UNTIL_REBUILD
+                && !facts.has_delivered_notes
+                && facts.current_manifest.as_deref().is_some_and(|current| {
+                    crate::plan_notes::unchanged_surface(current, manifest)
+                })),
     }
 }
 
-/// Whether `next`'s system text differs from the applied plan's, `current` (none applied reads as
-/// empty text).
-pub(crate) fn system_text_changed(current: Option<&PlanManifest>, next: &PlanManifest) -> bool {
-    current.map_or("", |current| current.system_text.as_str()) != next.system_text
+/// Whether `next` changes the system text of the last accepted owner plan.
+pub(crate) fn system_text_changed(last_sent: Option<&PlanManifest>, next: &PlanManifest) -> bool {
+    last_sent.map_or("", |plan| plan.system_text.as_str()) != next.system_text
 }
 
 /// llm-runner's check of a refresh's `system_note` against what it changes: under
-/// `notes_until_rebuild` a note is required when the fetched system text differs from the applied
-/// plan's, and at most 8,192 bytes; one sent when the text is unchanged is accepted and ignored
+/// `notes_until_rebuild` a note is required when the fetched system text differs from the plan
+/// the owner last sent, and at most 8,192 bytes; a note on unchanged text is accepted and ignored
 /// (the refresh is recorded with none). Under any other policy there is none.
 pub(crate) fn check_system_note(
-    current: Option<&PlanManifest>,
+    last_sent: Option<&PlanManifest>,
     next: &PlanManifest,
     policy: &str,
     system_note: Option<&str>,
 ) -> Result<(), SessionChangeError> {
-    let changed = system_text_changed(current, next);
+    let changed = system_text_changed(last_sent, next);
     cortexkit_role_llm_runner::plan_notes::check_refresh(
         policy,
         system_note,
@@ -263,8 +265,8 @@ pub(crate) fn check_system_note(
     .map_err(|field| SessionChangeError::InvalidParams {
         field: field.into(),
         message: if field == "system_note" {
-            "under notes_until_rebuild a system_note is required when the system text changes, \
-             and is at most 8192 bytes"
+            "under notes_until_rebuild a system_note is required when the system text differs \
+             from the plan last sent, and is at most 8192 bytes"
                 .into()
         } else {
             format!("policy {policy} is not accepted")
