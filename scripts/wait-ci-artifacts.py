@@ -11,8 +11,18 @@ import time
 
 
 class TransientQueryError(RuntimeError):
-    """A GitHub API failure that says nothing about the artifacts: a 5xx, a timeout, or a
-    reply cut short."""
+    """A GitHub API failure that says nothing about the artifacts: a 5xx, a timeout, a reply
+    cut short, or a connection that never got a reply."""
+
+
+# gh's messages for GitHub not answering this query: a server error, a reply body cut short ("unexpected end
+# of JSON input"), or a request that never got a response (Go's network errors, such as
+# `dial tcp ...: connectex: A connection attempt failed`, `i/o timeout`, a reset or refused
+# connection, a TLS handshake timeout, or an unresolved host).
+TRANSIENT = re.compile(
+    r"HTTP 5\d\d|unexpected end of JSON input|dial tcp|i/o timeout|connection reset|"
+    r"connection refused|TLS handshake timeout|no such host"
+)
 
 
 def api(path):
@@ -22,10 +32,9 @@ def api(path):
         raise TransientQueryError(f"GitHub artifact query timed out: {error}") from error
     if result.returncode:
         message = result.stderr.strip()
-        # A server error, or a reply body cut short (gh then reports "unexpected end of JSON
-        # input"), is GitHub failing to answer, not an answer about this run, so the poll
-        # retries it until the deadline. Every other failure (auth, 404) is final.
-        if re.search(r"HTTP 5\d\d|unexpected end of JSON input", message):
+        # GitHub failing to answer is not an answer about this run, so the poll retries it
+        # until the deadline. Every other failure (auth, 404) is final.
+        if TRANSIENT.search(message):
             raise TransientQueryError(f"GitHub artifact query failed: {message}")
         raise RuntimeError(f"GitHub artifact query failed: {message}")
     return json.loads(result.stdout)

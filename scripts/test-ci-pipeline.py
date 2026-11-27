@@ -1228,7 +1228,7 @@ class ArtifactWait(unittest.TestCase):
                              self.artifacts('fixtures-Windows', 'integration-windows')])
         self.assertEqual(api.call_count, 4)
 
-    def test_api_classifies_only_server_errors_cut_replies_and_timeouts_as_transient(self):
+    def test_api_classifies_only_server_errors_cut_replies_timeouts_and_lost_connections_as_transient(self):
         def failed(stderr):
             return subprocess.CompletedProcess(['gh'], 1, stdout='', stderr=stderr)
 
@@ -1239,6 +1239,16 @@ class ArtifactWait(unittest.TestCase):
         with patch.object(self.module.subprocess, 'run', return_value=failed('unexpected end of JSON input')):
             with self.assertRaises(self.module.TransientQueryError):
                 self.module.api('repos/x/actions/runs/1/artifacts')
+        # A connection that never got a reply: a Windows shard failed on it on 27 Nov 2026.
+        for stderr in (
+                'Get "https://api.github.com/repos/x/actions/runs/1/artifacts?per_page=100&page=1": '
+                'dial tcp 140.82.114.5:443: connectex: A connection attempt failed because the '
+                'connected party did not properly respond after a period of time',
+                'Get "https://api.github.com/x": read tcp 10.1.0.4:5000->140.82.114.5:443: i/o timeout',
+                'Get "https://api.github.com/x": net/http: TLS handshake timeout'):
+            with patch.object(self.module.subprocess, 'run', return_value=failed(stderr)):
+                with self.assertRaises(self.module.TransientQueryError, msg=stderr):
+                    self.module.api('repos/x/actions/runs/1/artifacts')
         with patch.object(self.module.subprocess, 'run', return_value=failed('gh: Not Found (HTTP 404)')):
             with self.assertRaises(RuntimeError) as raised:
                 self.module.api('repos/x/actions/runs/1/artifacts')
