@@ -2897,7 +2897,13 @@ async fn retract_own_send_uses_only_the_bound_daemon_principal_and_never_extends
             );
         }
         for method in [OP_RETRACT, OP_CANCEL] {
-            let params = serde_json::json!({"method":method,"params":{"submission_id":"pending","run_id":"running","sender":sender}});
+            // Retract params are strict, so a forged `sender` member could never reach it; the
+            // principal decides alone. Cancel params still ignore it.
+            let params = if method == OP_RETRACT {
+                serde_json::json!({"method":method,"params":{"submission_id":"pending"}})
+            } else {
+                serde_json::json!({"method":method,"params":{"run_id":"running","sender":sender}})
+            };
             write_frame(
                 &mut daemon,
                 &Frame::build(

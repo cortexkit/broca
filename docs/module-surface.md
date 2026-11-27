@@ -409,6 +409,8 @@ session.subscribe { from?: "start" | "live" | cursor } (dedicated route; §9)
 
 session.retract { session, submission_id }
     → { retracted: true } | { retracted: false, reason: "already_started" } (§11)
+    Any other params member (for example the caller's own send_id) refuses invalid_params:
+    a retract names only the submission id broca returned.
 
 run.cancel { run_id, at?: "now" | "step_boundary" } → "ack" | "not_active" (§13)
 run.status { run_id | session }

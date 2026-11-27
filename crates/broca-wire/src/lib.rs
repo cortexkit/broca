@@ -337,6 +337,10 @@ pub fn check_run_parameters(params: &serde_json::Value) -> Result<(), String> {
 #[path = "temperature_tests.rs"]
 mod temperature_tests;
 
+#[cfg(test)]
+#[path = "strict_params_tests.rs"]
+mod strict_params_tests;
+
 fn deserialize_account_route<'de, D>(
     deserializer: D,
 ) -> Result<Option<cortexkit_role_llm_runner::send::AccountRoute>, D::Error>
@@ -878,7 +882,13 @@ pub struct ModelParams {
 }
 
 /// `session.retract` params.
+///
+/// Unknown fields are refused. A retract names the submission by the id broca returned; a
+/// caller that also sends its own `send_id` (or any other key) may believe broca matches on it,
+/// and retracting the wrong send, or reporting a retract that matched nothing, is worse than a
+/// refusal it can see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetractParams {
     pub submission_id: String,
 }
@@ -4045,39 +4055,6 @@ mod status_params_strictness {
             serde_json::from_value(serde_json::json!({"input":[],"budget":{"max_input_tokens":1}}))
                 .unwrap();
         assert_eq!(send.budget.unwrap().max_input_tokens, Some(1));
-    }
-
-    /// A misspelled `run_id` must REFUSE rather than answer a different question.
-    ///
-    /// The camelCase arm is not hypothetical: a Swift or JS encoder emits the property name as
-    /// written, so a client whose field is `runId` sends `runId`. Before this was strict, that
-    /// decoded to `run_id: None` -- a valid request for SESSION status -- and the caller got a
-    /// well-formed answer about the wrong subject with nothing to signal it.
-    #[test]
-    fn a_misspelled_run_id_refuses_instead_of_selecting_session_status() {
-        let good: StatusParams = serde_json::from_str(r#"{"run_id":"r-1"}"#).unwrap();
-        assert_eq!(good.run_id.as_deref(), Some("r-1"));
-
-        for wrong in [
-            r#"{"runId":"r-1"}"#,
-            r#"{"run":"r-1"}"#,
-            r#"{"runID":"r-1"}"#,
-        ] {
-            let err = serde_json::from_str::<StatusParams>(wrong).unwrap_err();
-            assert!(
-                err.to_string().contains("unknown field"),
-                "{wrong} must be refused by name, got: {err}"
-            );
-        }
-    }
-
-    /// The legitimate absence still works: `{}` is "session status", which is the whole reason
-    /// the field is optional. Without this arm, strictness could be "fixed" by making the field
-    /// required, which would break every session-status caller.
-    #[test]
-    fn an_absent_run_id_still_selects_session_status() {
-        let p: StatusParams = serde_json::from_str("{}").unwrap();
-        assert!(p.run_id.is_none());
     }
 
     /// THE COUNTER-ARM: the growing structs must stay lenient, or a rolling upgrade breaks.
