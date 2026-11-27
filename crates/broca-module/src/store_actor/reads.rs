@@ -120,6 +120,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             parts,
             self.admission.known(),
         );
+        store.keep_parked_status(&self.key, class, &self.session);
         if class == broca_records::session_storage::StorageClass::Ephemeral {
             if let Some(retention) = registry.retention_service() {
                 let Some(deadline) = self.retention_timer.known(&self.session) else {

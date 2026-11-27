@@ -455,6 +455,13 @@ async fn module_with_retention(steps: Vec<Vec<NormalizedEvent>>) -> Module {
 }
 
 async fn module_with(make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecutor>) -> Module {
+    module_with_runtime(make_executor, |runtime| runtime).await
+}
+
+async fn module_with_runtime(
+    make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecutor>,
+    configure: impl FnOnce(crate::store_open::StoreRuntime) -> crate::store_open::StoreRuntime,
+) -> Module {
     use std::sync::atomic::AtomicU64;
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -477,7 +484,9 @@ async fn module_with(make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecu
         crate::opener::DefaultOpener::new(
             Arc::new(FileLeaseStore::new(dir.join("leases"))),
             executor,
-            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(runtime))),
+            std::sync::Arc::new(crate::store_open::StoreSlot::loaded(Arc::new(configure(
+                runtime,
+            )))),
         )
         .with_idle_ttl(OPEN),
     ));
@@ -490,6 +499,9 @@ async fn module_with(make_executor: impl FnOnce(Arc<Notify>) -> Arc<dyn RunExecu
         caller: Default::default(),
     }
 }
+
+#[cfg(feature = "test-clock")]
+mod parked_status;
 
 impl Module {
     fn runtime(&self) -> Arc<crate::store_open::StoreRuntime> {

@@ -308,6 +308,18 @@ impl SettledRuns {
         self.admissions.lock().ok()?.answers.get(key).cloned()
     }
 
+    /// Admission from an immutable start already read at the verified incarnation and history.
+    pub(crate) fn parked_admission(
+        &self,
+        addr: String,
+        incarnation: [u8; 16],
+        history_version: u64,
+        run: &RunId,
+    ) -> Option<broca_wire::RunAdmissionResponse> {
+        let key = (addr, incarnation, history_version, run.0.clone());
+        self.admission(&key).map(|answer| (*answer).clone())
+    }
+
     fn keep_admission(&self, key: SettledKey, answer: broca_wire::RunAdmissionResponse) {
         let Ok(mut kept) = self.admissions.lock() else {
             return;

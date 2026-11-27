@@ -42,6 +42,7 @@ const COMMANDS: usize = 64;
 
 #[path = "store_expiry.rs"]
 mod expiry;
+mod parked_status;
 pub(crate) use expiry::ExpiryRead;
 
 /// What the module needs to serve sessions kept in the session store. Keys are installed into
@@ -72,6 +73,7 @@ pub struct StoreRuntime {
     heads: crate::store_head::KeptHeads,
     authorization: crate::store_authorization::AuthorizationCache,
     parked_pages: crate::store_read::parked_page::ParkedPages,
+    parked_status: parked_status::ParkedStatus,
     /// Where each session's run events go once their records are durable; none in tests and
     /// while run events are off.
     run_events: Option<Arc<dyn crate::store_run_events::RunEventSink>>,
@@ -264,6 +266,7 @@ impl StoreRuntime {
             heads: Default::default(),
             authorization: Default::default(),
             parked_pages: Default::default(),
+            parked_status: Default::default(),
             #[cfg(all(test, feature = "test-clock"))]
             log_reads: Arc::default(),
             #[cfg(all(test, feature = "test-clock"))]
@@ -848,6 +851,14 @@ impl StoreRuntime {
         let Some(class) = class else {
             return Ok(None);
         };
+        if probed.is_none() {
+            if let Some((reply, at)) = self
+                .read_parked_status(registry, key, class, expiry.unexpired_position, &request)
+                .await
+            {
+                return Ok(Some((reply, Some(at))));
+            }
+        }
         if let crate::store_reads::StoreReadRequest::Page(page) = &request {
             if probed.is_none() && registry.slot_state(key).is_none() {
                 if let Some((answer, at)) = Box::pin(self.parked_pages.read(
@@ -965,6 +976,14 @@ impl StoreRuntime {
         }
         let slot = registry.slot_state(key);
         let served_at = slot.is_none().then(|| view.position());
+        if served_at.is_some()
+            && matches!(
+                &request,
+                crate::store_reads::StoreReadRequest::RunAdmission(_)
+            )
+        {
+            self.keep_parked_status(key, class, &view);
+        }
         let retained = served_at.map(|_| {
             self.authorization.learn(
                 key,
