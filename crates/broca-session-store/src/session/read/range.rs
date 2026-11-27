@@ -50,8 +50,22 @@ impl<'a, B: SessionBackend> SealedRange<'a, B> {
         limit: usize,
         memo: &mut PageMemo,
     ) -> Result<(Vec<StoredEntry>, u64), SessionError> {
+        let next = from.max(1);
+        if next >= self.window || limit == 0 {
+            return Ok((Vec::new(), next));
+        }
+        // Reading a sealed block retains its conversation state across awaits. Keep that state
+        // out of callers' futures, and allocate it only when the read reaches sealed history.
+        Box::pin(self.scan_blocks(next, limit, memo)).await
+    }
+
+    async fn scan_blocks(
+        &self,
+        mut next: u64,
+        limit: usize,
+        memo: &mut PageMemo,
+    ) -> Result<(Vec<StoredEntry>, u64), SessionError> {
         let mut out = Vec::new();
-        let mut next = from.max(1);
         let key = self.place.key.frame_key();
         let pages = Pages {
             backend: self.place.backend,

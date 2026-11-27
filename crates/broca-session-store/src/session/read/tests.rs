@@ -24,6 +24,23 @@ fn sealed_read_cache_keeps_provenance_state_on_the_heap() {
     );
 }
 
+#[test]
+fn sealed_block_scan_stays_out_of_the_entries_future() {
+    let backend = MemoryBackend::default();
+    let session = block_on(Session::create(
+        &backend,
+        addr(),
+        triple(),
+        &deployment(Cipher::None),
+        false,
+    ))
+    .unwrap();
+    let bytes = std::mem::size_of_val(&session.entries(1, 1));
+    // Awaiting entries inline must not reserve room for the conversation state used to read
+    // sealed blocks, even on reads that stay in the open window.
+    assert!(bytes <= 1024, "the entries future carries {bytes} bytes");
+}
+
 cipher_tests!(
     every_message_reads_back_by_ordinal_after_two_cuts,
     message_ids_resolve_in_the_window_and_sealed_history,
