@@ -4828,6 +4828,13 @@ mod scope_carrier {
 
     #[tokio::test(start_paused = true)]
     async fn an_upgrade_cut_does_not_drain_an_unsent_scoped_call() {
+        // The upgrade notice is process-wide and would change other tests' scope recovery.
+        if !crate::daemon_upgrade::run_in_test_child(
+            module_path!(),
+            "an_upgrade_cut_does_not_drain_an_unsent_scoped_call",
+        ) {
+            return;
+        }
         let (conn, plane, describer) = rig(vec![successful_tool_reply("must not be sent")]);
         describer.script(
             "head",
@@ -4858,6 +4865,13 @@ mod scope_carrier {
 
     #[tokio::test(start_paused = true)]
     async fn scope_describe_loss_can_race_the_upgrade_notice() {
+        // Expecting an upgrade notice is process-wide and would put other tests' scope reads on hold.
+        if !crate::daemon_upgrade::run_in_test_child(
+            module_path!(),
+            "scope_describe_loss_can_race_the_upgrade_notice",
+        ) {
+            return;
+        }
         let (conn, plane, describer) = rig(vec![successful_tool_reply("after resume")]);
         describer.script(
             "head",
@@ -4887,6 +4901,13 @@ mod scope_carrier {
 
     #[tokio::test(start_paused = true)]
     async fn an_upgrade_missing_sibling_stamp_is_not_scope_drained() {
+        // The recent upgrade deadline is process-wide and would change other tests' scope recovery.
+        if !crate::daemon_upgrade::run_in_test_child(
+            module_path!(),
+            "an_upgrade_missing_sibling_stamp_is_not_scope_drained",
+        ) {
+            return;
+        }
         let (conn, plane, describer) = rig(vec![]);
         describer.script("head", vec![live("head", 1, "agent-a")]);
         let (scoped, read) = started(&plane).await;

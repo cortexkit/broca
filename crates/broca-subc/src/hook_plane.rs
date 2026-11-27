@@ -122,6 +122,13 @@ async fn pre_tool_hook_reopens_after_a_daemon_upgrade_refusal() {
     use crate::daemon_upgrade;
     use serde_json::json;
 
+    // The upgrade notice is process-wide and would affect other tests' retry decisions.
+    if !daemon_upgrade::run_in_test_child(
+        module_path!(),
+        "pre_tool_hook_reopens_after_a_daemon_upgrade_refusal",
+    ) {
+        return;
+    }
     let (conn, _, mut daemon) = SubcConnection::in_process_for_test(7, 1);
     let conn = Arc::new(conn);
     let hook = SubcHookPlane {
@@ -193,6 +200,13 @@ async fn a_scoped_pre_tool_hook_waits_to_discover_scopes_on_the_replacement() {
     use crate::daemon_upgrade;
     use serde_json::json;
 
+    // The upgrade notice is process-wide and would affect other tests' scope discovery.
+    if !daemon_upgrade::run_in_test_child(
+        module_path!(),
+        "a_scoped_pre_tool_hook_waits_to_discover_scopes_on_the_replacement",
+    ) {
+        return;
+    }
     let (conn, _, _) = SubcConnection::in_process_for_test(7, 1);
     let (replacement, _, mut daemon) = SubcConnection::in_process_for_test(8, 2);
     conn.deactivate_for_test();

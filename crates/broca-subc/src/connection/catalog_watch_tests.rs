@@ -10,6 +10,13 @@ use super::super::{control_flags, PendingEntry, PendingMap, SubcConnection};
 
 #[tokio::test(start_paused = true)]
 async fn catalog_list_waits_for_the_replacement_during_daemon_upgrade() {
+    // The upgrade notice is process-wide and would delay other tests' catalog reads.
+    if !crate::daemon_upgrade::run_in_test_child(
+        module_path!(),
+        "catalog_list_waits_for_the_replacement_during_daemon_upgrade",
+    ) {
+        return;
+    }
     let (conn, _, _) = SubcConnection::in_process_for_test(7, 1);
     let (replacement, _, mut daemon) = SubcConnection::in_process_for_test(8, 2);
     conn.deactivate_for_test();

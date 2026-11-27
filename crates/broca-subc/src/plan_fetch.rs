@@ -709,10 +709,18 @@ mod carrier_catalog_tests {
             None,
         )
         .with_direct_carrier_scope(private_selector());
-        let (result, ()) = tokio::join!(fetcher.selector(), async {
-            let describe = daemon.next_request().await;
-            assert!(daemon.reply(&describe, capabilities(&[CAP_SCOPES_V1])));
-        });
+        let selector = fetcher.selector();
+        tokio::pin!(selector);
+        let describe = tokio::select! {
+            request = daemon.next_request() => request,
+            result = &mut selector => panic!("selector ended before server.describe: {result:?}"),
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&describe.body).unwrap()["op"],
+            "server.describe"
+        );
+        assert!(daemon.reply(&describe, capabilities(&[CAP_SCOPES_V1])));
+        let result = selector.await;
         assert!(
             matches!(result, Err(FetchError::Refused { code, retryable: false, .. }) if code == "scope_unsupported")
         );

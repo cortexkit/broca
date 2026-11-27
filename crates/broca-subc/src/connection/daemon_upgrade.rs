@@ -208,6 +208,13 @@ impl SubcConnection {
 #[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn route_open_waits_through_the_daemon_upgrade_refusal() {
+    // The upgrade notice is process-wide and would affect other tests' route opens.
+    if !crate::daemon_upgrade::run_in_test_child(
+        module_path!(),
+        "route_open_waits_through_the_daemon_upgrade_refusal",
+    ) {
+        return;
+    }
     let (conn, _, mut daemon) = SubcConnection::in_process_for_test(7, 1);
     let bind = BindIdentity::new("/project", "broca", "upgrade");
     let open = conn.route_open_management("target", &bind);
@@ -240,6 +247,13 @@ async fn route_open_waits_through_the_daemon_upgrade_refusal() {
 #[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn a_nonce_socket_keeps_its_wire_identity_after_the_module_resumes() {
+    // Resume installs a process-wide claim minter and module identity that other tests would use.
+    if !crate::daemon_upgrade::run_in_test_child(
+        module_path!(),
+        "a_nonce_socket_keeps_its_wire_identity_after_the_module_resumes",
+    ) {
+        return;
+    }
     struct NeverMint;
     #[async_trait::async_trait]
     impl crate::registration::ClaimMinter for NeverMint {

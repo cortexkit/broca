@@ -223,6 +223,34 @@ impl Retry {
 }
 
 #[cfg(test)]
+pub(crate) fn run_in_test_child(module: &str, name: &str) -> bool {
+    const CHILD: &str = "BROCA_SUBC_DAEMON_UPGRADE_TEST_CHILD";
+    // libtest names omit the crate prefix returned by module_path!().
+    let (_, module) = module.split_once("::").expect("unit test module path");
+    let test = format!("{module}::{name}");
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(&test)) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--color", "never", "--format", "pretty"])
+        .env(CHILD, &test)
+        .output()
+        .expect("run daemon upgrade test in a child process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // A filter that selects no tests also exits successfully.
+    assert!(
+        output.status.success()
+            && stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+        "child did not pass {test} ({}):\n{stdout}\n{stderr}",
+        output.status
+    );
+    false
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
