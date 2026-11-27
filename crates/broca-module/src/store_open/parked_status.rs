@@ -88,7 +88,7 @@ impl StoreRuntime {
         cache.order.push_back(key.clone());
     }
 
-    /// After checking session expiry, use a cached admission without opening a whole view only
+    /// After checking session expiry, use cached run facts without opening a whole view only
     /// if the closed session is still at the position known not to need recovery.
     pub(super) async fn read_parked_status(
         &self,
@@ -98,9 +98,7 @@ impl StoreRuntime {
         checked_at: Option<Position>,
         request: &StoreReadRequest,
     ) -> Option<(StoreReadReply, Position)> {
-        let StoreReadRequest::RunAdmission(run) = request else {
-            return None;
-        };
+        let run = request.parked_run()?;
         if registry.slot_state(key).is_some() {
             return None;
         }
@@ -127,12 +125,30 @@ impl StoreRuntime {
         if registry.slot_state(key).is_some() {
             return None;
         }
-        let answer = self.settled_runs().parked_admission(
+        let run_key = (
             addr,
             cached.incarnation,
             cached.history_version,
-            run,
-        )?;
-        Some((StoreReadReply::RunAdmission(Ok(Some(answer))), cached.at))
+            run.0.clone(),
+        );
+        let settled = self.settled_runs();
+        let reply = match request {
+            StoreReadRequest::RunAdmission(_) => {
+                StoreReadReply::RunAdmission(Ok(Some(settled.parked_admission(&run_key)?)))
+            }
+            StoreReadRequest::RunStatus(_) | StoreReadRequest::RunStatusReply(_) => {
+                let status = settled.parked_status(
+                    &run_key,
+                    crate::store_awaits::Labels(Some(self.executor.clone())),
+                )?;
+                if matches!(request, StoreReadRequest::RunStatus(_)) {
+                    StoreReadReply::RunStatus(status)
+                } else {
+                    StoreReadReply::RunStatusReply(status.map(Into::into))
+                }
+            }
+            _ => return None,
+        };
+        Some((reply, cached.at))
     }
 }

@@ -119,6 +119,14 @@ pub enum StoreReadRequest {
 }
 
 impl StoreReadRequest {
+    /// Reads that can reuse immutable run facts once a closed session's position is verified.
+    pub(crate) fn parked_run(&self) -> Option<&RunId> {
+        match self {
+            Self::RunAdmission(run) | Self::RunStatus(run) | Self::RunStatusReply(run) => Some(run),
+            _ => None,
+        }
+    }
+
     /// Authorization that can be answered by position-checked owner and plan facts alone.
     pub(crate) fn keeps_authorization(&self) -> bool {
         matches!(self, Self::AuthorizationChecks | Self::AuthorizationRead(_))

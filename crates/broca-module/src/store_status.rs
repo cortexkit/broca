@@ -268,7 +268,7 @@ fn state_heap_bytes(state: &ReconciledRunState) -> usize {
 }
 
 /// The session's address, its incarnation, its history version, and the run id.
-type SettledKey = (String, [u8; 16], u64, String);
+pub(crate) type SettledKey = (String, [u8; 16], u64, String);
 
 impl SettledRuns {
     /// How many runs' facts are kept.
@@ -311,13 +311,20 @@ impl SettledRuns {
     /// Admission from an immutable start already read at the verified incarnation and history.
     pub(crate) fn parked_admission(
         &self,
-        addr: String,
-        incarnation: [u8; 16],
-        history_version: u64,
-        run: &RunId,
+        key: &SettledKey,
     ) -> Option<broca_wire::RunAdmissionResponse> {
-        let key = (addr, incarnation, history_version, run.0.clone());
-        self.admission(&key).map(|answer| (*answer).clone())
+        self.admission(key).map(|answer| (*answer).clone())
+    }
+
+    /// Only finished runs have facts in this cache. An uncached id may still name a queued send.
+    pub(crate) fn parked_status(
+        &self,
+        key: &SettledKey,
+        labels: crate::store_awaits::Labels,
+    ) -> Option<Result<broca_wire::RunStatusResponse, crate::serve::ServeError>> {
+        let mut facts = self.get(key)?;
+        facts.wait.set_labels(labels);
+        Some(status_response(Some(facts), &key.3, None))
     }
 
     fn keep_admission(&self, key: SettledKey, answer: broca_wire::RunAdmissionResponse) {

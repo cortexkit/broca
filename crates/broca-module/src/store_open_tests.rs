@@ -722,6 +722,10 @@ const PAUSED_RESUME_MS: u64 = 4_000_000_000_000;
 mod authorization;
 
 #[cfg(feature = "test-clock")]
+#[path = "store_open_tests/parked_status.rs"]
+mod parked_status;
+
+#[cfg(feature = "test-clock")]
 async fn paused_closed_read_fixture(
     name: &str,
 ) -> (PathBuf, Arc<StoreRuntime>, LineageRegistry, BindIdentity) {
