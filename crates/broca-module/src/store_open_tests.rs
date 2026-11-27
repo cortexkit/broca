@@ -725,6 +725,14 @@ mod authorization;
 async fn paused_closed_read_fixture(
     name: &str,
 ) -> (PathBuf, Arc<StoreRuntime>, LineageRegistry, BindIdentity) {
+    paused_closed_read_fixture_until(name, PAUSED_RESUME_MS).await
+}
+
+#[cfg(feature = "test-clock")]
+async fn paused_closed_read_fixture_until(
+    name: &str,
+    resume_ms: u64,
+) -> (PathBuf, Arc<StoreRuntime>, LineageRegistry, BindIdentity) {
     use broca_records::record::AccountLimitPause;
     use broca_session_store::record::{Pause, Record};
 
@@ -749,21 +757,22 @@ async fn paused_closed_read_fixture(
     start.run_id = "paused".into();
     start.submission_id = None;
     start.send_id = None;
+    let paused_at_ms = FIXTURE_NOW_MS.min(resume_ms.saturating_sub(1));
     let limit = AccountLimitPause {
         failed_step: broca_protocol::StepId(1),
         failed_attempt_seq: 1,
         attempt_id: None,
         attempt: 1,
-        paused_at_ms: FIXTURE_NOW_MS,
-        observed_at_ms: FIXTURE_NOW_MS,
+        paused_at_ms,
+        observed_at_ms: paused_at_ms,
         auth_method: "oauth".into(),
         credential_id: "oauth:openai:fixture".into(),
         credential_ref: None,
         account_ref: None,
         disposition: broca_protocol::provider::AccountLimitDisposition::ACCOUNT,
-        resets_at_ms: Some(PAUSED_RESUME_MS),
+        resets_at_ms: Some(resume_ms),
         retry_after_secs: None,
-        resume_not_before_ms: PAUSED_RESUME_MS,
+        resume_not_before_ms: resume_ms,
         request_body_len: 0,
         request_body_sha256: String::new(),
         selection_round: 0,
@@ -776,7 +785,7 @@ async fn paused_closed_read_fixture(
                 Record::Pause(Pause {
                     run_id: "paused".into(),
                     reason: broca_protocol::PauseReason::AccountLimit,
-                    ts_ms: Some(FIXTURE_NOW_MS),
+                    ts_ms: Some(paused_at_ms),
                     error: None,
                     account_limit: Some(serde_json::to_value(limit).unwrap().into()),
                 }),
@@ -787,6 +796,74 @@ async fn paused_closed_read_fixture(
         .unwrap();
     session.close().await.unwrap();
     (root, runtime, registry, key)
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn repeated_closed_paused_heads_load_no_view_and_match_fresh_bytes() {
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    use std::sync::atomic::Ordering;
+
+    for (name, resume_ms, next_ms) in [
+        (
+            "paused-head-future",
+            PAUSED_RESUME_MS,
+            Some(PAUSED_RESUME_MS),
+        ),
+        ("paused-head-expired", 1_600_000_000_000, None),
+    ] {
+        let (root, runtime, registry, key) =
+            paused_closed_read_fixture_until(name, resume_ms).await;
+        let scope = broca_protocol::SendScope::default();
+        let read = || crate::store_head::serve_head(&registry, &runtime, &key, None, &scope);
+        let first = read().await.unwrap();
+        let last = first.last_run_state.as_ref().unwrap();
+        assert_eq!(last.state, "paused");
+        assert_eq!(last.reason.as_deref(), Some("account_limit"));
+        assert_eq!(last.resume_not_before_ms, Some(resume_ms));
+        assert_eq!(last.awaits.as_ref().unwrap().next_ms, next_ms);
+        assert!(registry.slot_state(&key).is_none());
+        let loads = || runtime.views().memory(|_| 0).loads;
+        let before = loads();
+        let log_reads = runtime.log_reads.load(Ordering::Relaxed);
+        let mut repeated = None;
+        for _ in 0..3 {
+            let reply = read().await.unwrap();
+            assert_eq!(
+                serde_json::to_vec(&reply).unwrap(),
+                serde_json::to_vec(&first).unwrap()
+            );
+            repeated = Some(reply);
+        }
+        assert_eq!(
+            loads(),
+            before,
+            "{name}: repeated heads loaded the whole view"
+        );
+        assert_eq!(runtime.log_reads.load(Ordering::Relaxed), log_reads);
+        let Some(StoreReadReply::Head(Ok(fresh))) = runtime
+            .read(&registry, &key, StoreReadRequest::Head)
+            .await
+            .unwrap()
+        else {
+            panic!("{name}: a fresh view must answer");
+        };
+        assert!(
+            loads() > before,
+            "the comparison must come from a whole view"
+        );
+        let mut repeated = repeated.unwrap();
+        repeated.sender = None;
+        repeated.input = None;
+        repeated.cache = None;
+        assert_eq!(
+            serde_json::to_vec(&repeated).unwrap(),
+            serde_json::to_vec(&fresh.reply).unwrap()
+        );
+        drop(registry);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(feature = "test-clock")]
@@ -843,8 +920,7 @@ async fn authorizing_a_read_of_a_closed_paused_session_reads_no_log() {
         "only the first cold authorization loads a view"
     );
     let kept = runtime.heads().counts();
-    assert_eq!(kept.not_kept.get("unsettled"), Some(&1));
-    assert_eq!(kept.held.entries, 0);
+    assert_eq!(kept.held.entries, 1);
     let authorization = registry
         .memory_report()
         .await
@@ -854,34 +930,6 @@ async fn authorizing_a_read_of_a_closed_paused_session_reads_no_log() {
         .unwrap();
     assert_eq!(authorization.entries, 1);
     assert!(authorization.estimated_bytes > 0);
-    drop(registry);
-    drop(runtime);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(feature = "test-clock")]
-#[tokio::test]
-async fn a_closed_paused_sessions_head_still_rebuilds_the_reply() {
-    use crate::serve::ServeHandler;
-    use std::sync::atomic::Ordering;
-
-    let (root, runtime, registry, key) = paused_closed_read_fixture("paused-head-reply").await;
-    let scope = broca_protocol::SendScope::default();
-    let first = registry.head_for(&key, None, &scope).await.unwrap();
-    let last = first.last_run_state.as_ref().unwrap();
-    assert_eq!(last.state, "paused");
-    assert_eq!(last.reason.as_deref(), Some("account_limit"));
-    assert_eq!(last.resume_not_before_ms, Some(PAUSED_RESUME_MS));
-    assert_eq!(
-        last.awaits.as_ref().unwrap().next_ms,
-        Some(PAUSED_RESUME_MS)
-    );
-
-    // Rebuild at the same position: the reply's wait may change even without a log append.
-    runtime.log_reads.store(0, Ordering::Relaxed);
-    assert_eq!(registry.head_for(&key, None, &scope).await.unwrap(), first);
-    assert!(runtime.log_reads.load(Ordering::Relaxed) > 0);
-    assert!(registry.open_handle(&key).is_none());
     drop(registry);
     drop(runtime);
     std::fs::remove_dir_all(root).unwrap();

@@ -1932,7 +1932,11 @@ async fn the_first_head_after_an_idle_close_reads_no_log() {
             reply.cache = None;
             reply
         };
-        assert_eq!(unadorned(served), unadorned(fresh.reply), "{run}");
+        assert_eq!(
+            serde_json::to_vec(&unadorned(served)).unwrap(),
+            serde_json::to_vec(&unadorned(fresh.reply)).unwrap(),
+            "{run}"
+        );
     }
 }
 

@@ -84,6 +84,7 @@ fn kept_heads_forget_the_least_recently_used_first() {
         input: InputSource::Unknown,
         ownership: serde_json::from_value(json!({})).unwrap(),
         senders: Vec::new(),
+        clock: Default::default(),
     };
     let at = |n: u64| Position {
         version: n,

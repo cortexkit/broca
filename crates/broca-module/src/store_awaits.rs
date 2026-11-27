@@ -2,8 +2,11 @@
 //! records here.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use broca_protocol::{PauseReason, RunFinishReason};
+use broca_records::record::AuthSelection;
 use broca_session_store::record::Record;
 use cortexkit_role_llm_runner::{
     awaits::{AwaitAction, AwaitParty, AwaitPerson, RunAwaits},
@@ -12,6 +15,12 @@ use cortexkit_role_llm_runner::{
 
 #[derive(Clone, Default)]
 pub struct Labels(pub(crate) Option<std::sync::Arc<dyn crate::executor::RunExecutor>>);
+
+impl Labels {
+    fn email(&self, selection: Option<&AuthSelection>) -> Option<String> {
+        self.0.as_ref()?.cached_account_email(selection?)
+    }
+}
 
 impl std::fmt::Debug for Labels {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +49,39 @@ pub(crate) struct Snapshot {
     pub awaits: Option<RunAwaits>,
 }
 
+/// Only the fields of a closed head's wait that can change without an append. Its other
+/// fields, including the oldest held call's time and deadline, are already in the reply.
+#[derive(Clone, Default)]
+pub(crate) struct HeadClock {
+    next: Option<NonZeroU64>,
+    selection: Option<Arc<AuthSelection>>,
+}
+
+impl HeadClock {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.selection.as_deref().map_or(0, |selection| {
+            std::mem::size_of::<AuthSelection>()
+                + 2 * std::mem::size_of::<usize>()
+                + broca_session_store::held::serde_heap_bytes(selection)
+        })
+    }
+
+    pub(crate) fn refresh(&self, awaits: &mut RunAwaits, labels: &Labels, now: u64) {
+        awaits.next_ms = self.next.map(NonZeroU64::get).filter(|next| *next > now);
+        if let (Some(selection), Some(person)) = (&self.selection, &mut awaits.person) {
+            let email = labels.email(Some(selection));
+            person.on = email.as_deref().and_then(visible_account_label);
+        }
+    }
+
+    pub(crate) fn clear(&self, awaits: &mut RunAwaits) {
+        awaits.next_ms = None;
+        if let (Some(_), Some(person)) = (&self.selection, &mut awaits.person) {
+            person.on = None;
+        }
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -48,6 +90,39 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl RunWait {
+    /// Snapshot the wait for a head. A closed head has no in-flight retry; capture the next
+    /// time before filtering it by the clock, and the selection only when the sign-in label
+    /// comes from the executor's cache rather than the records.
+    pub(crate) fn for_head(
+        mut self,
+        labels: &Labels,
+        retry: Option<&RunAwaits>,
+        deadline_ms: Option<u64>,
+        live: bool,
+    ) -> (Snapshot, HeadClock) {
+        let now = now_ms();
+        if live || retry.is_some() {
+            self.set_labels(labels.clone());
+            return (
+                self.snapshot(now, retry, deadline_ms, None),
+                HeadClock::default(),
+            );
+        }
+        let mut snapshot = self.snapshot(0, None, deadline_ms, None);
+        let Some(awaits) = &mut snapshot.awaits else {
+            return (snapshot, HeadClock::default());
+        };
+        let clock = HeadClock {
+            next: awaits.next_ms.and_then(NonZeroU64::new),
+            selection: self
+                .selection
+                .filter(|_| self.label.is_none() && awaits.person.is_some())
+                .map(Arc::new),
+        };
+        clock.refresh(awaits, labels, now);
+        (snapshot, clock)
+    }
+
     /// What the wait holds on the heap, estimated as `broca_session_store::held` walks values:
     /// its auth selection, await message and label, the held calls' keys, and the end's error.
     pub(crate) fn heap_bytes(&self) -> usize {
@@ -204,18 +279,11 @@ impl RunWait {
                 }
                 if reason == PauseReason::AuthRequired {
                     let mut person = AwaitPerson::new(AwaitAction::SignIn);
-                    let email = self
-                        .labels
-                        .0
-                        .as_ref()
-                        .zip(self.selection.as_ref())
-                        .and_then(|(executor, selection)| executor.cached_account_email(selection));
+                    let email = self.labels.email(self.selection.as_ref());
                     person.on = account_label
                         .or(self.label.as_deref())
                         .or(email.as_deref())
-                        .map(str::trim)
-                        .filter(|label| (1..=120).contains(&label.chars().count()))
-                        .map(str::to_owned);
+                        .and_then(visible_account_label);
                     wait.person = Some(person);
                 }
                 wait
@@ -247,6 +315,13 @@ impl RunWait {
             awaits,
         }
     }
+}
+
+fn visible_account_label(label: &str) -> Option<String> {
+    let label = label.trim();
+    (1..=120)
+        .contains(&label.chars().count())
+        .then(|| label.to_owned())
 }
 
 fn account_label(selection: &serde_json::Value) -> Option<String> {
@@ -286,6 +361,27 @@ mod tests {
             None
         );
         assert_eq!(wait.pause.unwrap().2, Some(2000));
+    }
+
+    #[test]
+    fn a_closed_heads_wait_matches_a_fresh_snapshot_across_its_deadline() {
+        let wait = RunWait {
+            pause: Some((PauseReason::AccountLimit, Some(1000), Some(2000))),
+            ..Default::default()
+        };
+        let labels = Labels::default();
+        let (snapshot, clock) = wait.clone().for_head(&labels, None, None, false);
+        let mut cached = snapshot.awaits.unwrap();
+        clock.clear(&mut cached);
+        for now in [1999, 2000, 2001, 1999] {
+            let mut served = cached.clone();
+            clock.refresh(&mut served, &labels, now);
+            let fresh = wait.snapshot(now, None, None, None).awaits.unwrap();
+            assert_eq!(
+                serde_json::to_vec(&served).unwrap(),
+                serde_json::to_vec(&fresh).unwrap()
+            );
+        }
     }
 
     #[test]

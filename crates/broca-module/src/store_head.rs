@@ -101,6 +101,7 @@ pub struct StoreHead {
     pub input: InputSource,
     ownership: broca_core::SessionOwnershipV1,
     senders: Vec<PlanSender>,
+    clock: crate::store_awaits::HeadClock,
 }
 
 /// The delivery modes a head's sender grants are drawn from: every mode the serve layer offers.
@@ -319,6 +320,7 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
             .and_then(|pause| pause.get("resume_not_before_ms"))
             .and_then(serde_json::Value::as_u64),
     });
+    let mut clock = crate::store_awaits::HeadClock::default();
     if let Some(last) = &mut reply.last_run_state {
         let finished = latest
             .filter(|run| run.run_id == last.run_id)
@@ -337,28 +339,27 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
                     wait.record(&record).map_err(StoreHeadError::Setup)?;
                 }
             }
-            wait.set_labels(labels);
-            last.awaits = wait
-                .snapshot(crate::store_awaits::now_ms(), retry, None, None)
-                .awaits;
-        } else if let Some(mut facts) =
+            let (snapshot, kept) = wait.for_head(&labels, retry, None, live);
+            last.awaits = snapshot.awaits;
+            clock = kept;
+        } else if let Some(facts) =
             crate::store_status::run_facts(session, parts, &last.run_id, live, None)
                 .await
                 .map_err(|error| {
                     StoreHeadError::Setup(format!("the latest run's wait: {error:?}"))
                 })?
         {
-            facts.wait.set_labels(labels);
-            let wait = facts.wait.snapshot(
-                crate::store_awaits::now_ms(),
+            let (wait, kept) = facts.wait.for_head(
+                &labels,
                 retry,
                 facts
                     .state
                     .ceiling_deadline_ms
                     .or(facts.state.ride_wait_deadline_ms),
-                None,
+                live,
             );
             last.awaits = wait.awaits;
+            clock = kept;
             if matches!(
                 facts.state.state,
                 broca_core::RunIndexState::Active | broca_core::RunIndexState::Paused
@@ -376,6 +377,7 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         input,
         ownership,
         senders,
+        clock,
     })
 }
 
@@ -393,8 +395,20 @@ pub(crate) async fn serve_head(
     let addr = broca_core::session_addr(key);
     let closed = store.closed_position(registry, key).await;
     let built = match closed.and_then(|(_, position)| store.heads().get(&addr, position)) {
-        Some(built) => {
+        Some(mut built) => {
             store.heads().count_hit();
+            if let Some(awaits) = built
+                .reply
+                .last_run_state
+                .as_mut()
+                .and_then(|last| last.awaits.as_mut())
+            {
+                built.clock.refresh(
+                    awaits,
+                    &crate::store_awaits::Labels(Some(store.executor().clone())),
+                    crate::store_awaits::now_ms(),
+                );
+            }
             built
         }
         None => {
@@ -461,9 +475,9 @@ pub(crate) async fn serve_head(
 /// at. A session left at a position keeps the same head, and apps ask for the heads of the same
 /// closed sessions again and again, while building one loads the session's whole view, a full
 /// read of its log: after one restart, every closed-session view broca loaded was for a head, 142
-/// MB of them kept. So the head is kept instead. A head whose latest run is still active, paused
-/// or waiting can change with time even without a write, so it isn't kept. Authorization
-/// facts are kept independently of the head reply. At
+/// MB of them kept. So the head is kept instead. For a waiting run the cached reply holds the
+/// recorded wait, and the next time and cached sign-in label are resolved again on each read.
+/// Authorization facts are kept independently of the head reply. At
 /// most [`HEADS_KEPT`] sessions, the least recently kept or read forgotten first, so a head
 /// polled all along stays however many others are kept after it.
 #[derive(Default)]
@@ -475,6 +489,9 @@ pub(crate) struct KeptHeads(std::sync::Mutex<KeptHeadsInner>);
 /// chats an app lists and polls at once, so polling never pushes a polled head out; the memory
 /// report's `kept_heads.held` shows what the kept heads hold.
 const HEADS_KEPT: usize = 4096;
+/// The wait adds two words inline. Bound the optional sign-in lookup, which can contain
+/// variable-length credential data, separately from the count of heads.
+const HEAD_CLOCK_HEAP_BYTES: usize = 1024;
 
 #[derive(Default)]
 struct KeptHeadsInner {
@@ -500,7 +517,7 @@ impl KeptHeads {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The full head kept for the session at `addr`, when it was built at `position`.
+    /// The head kept for the session at `addr` and `position`, before refreshing its wait.
     pub(crate) fn get(
         &self,
         addr: &str,
@@ -520,8 +537,7 @@ impl KeptHeads {
         Some(head)
     }
 
-    /// Keeps `head`, built at `position` for the session at `addr`, unless its reply can
-    /// change without a write.
+    /// Keeps `head`, built at `position` for the closed session at `addr`.
     /// `source` names what built it, for the memory report: `read` or `close`.
     pub(crate) fn keep(
         &self,
@@ -530,14 +546,18 @@ impl KeptHeads {
         head: &StoreHead,
         source: &'static str,
     ) {
-        let settled = head.reply.last_run_state.as_ref().is_none_or(|last| {
-            last.awaits.is_none()
-                && last.resume_not_before_ms.is_none()
-                && !matches!(last.state.as_str(), "active" | "paused")
-        });
-        if !settled {
-            self.count_not_kept("unsettled");
+        if head.clock.heap_bytes() > HEAD_CLOCK_HEAP_BYTES {
+            self.count_not_kept("wait_too_large");
             return;
+        }
+        let mut head = head.clone();
+        if let Some(awaits) = head
+            .reply
+            .last_run_state
+            .as_mut()
+            .and_then(|last| last.awaits.as_mut())
+        {
+            head.clock.clear(awaits);
         }
         let mut kept = self.lock();
         *kept.counts.kept.entry(source.to_owned()).or_default() += 1;
@@ -545,7 +565,7 @@ impl KeptHeads {
         let used = kept.clock;
         let entry = KeptHead {
             position,
-            head: Box::new(head.clone()),
+            head: Box::new(head),
             used,
         };
         if let Some(replaced) = kept.heads.insert(addr.clone(), entry) {
@@ -580,6 +600,7 @@ impl KeptHeads {
             add("reply", serde_heap_bytes(&head.reply));
             add("ownership", serde_heap_bytes(&head.ownership));
             add("senders", serde_heap_bytes(&head.senders));
+            add("wait_clock", head.clock.heap_bytes());
         }
         let estimated: u64 = parts.values().sum();
         broca_wire::MemoryCache {

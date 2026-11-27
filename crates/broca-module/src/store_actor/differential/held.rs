@@ -1090,6 +1090,62 @@ async fn a_parked_held_run_reads_without_opening_an_actor() {
     assert!(original.registry.stop_and_seal().await);
 }
 
+#[tokio::test]
+async fn heads_after_a_held_actor_closes_load_no_view_and_match_fresh_bytes() {
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    let side = Side::new(
+        true,
+        Cipher::None,
+        vec![super::super::tests::read_step("m1")],
+    )
+    .await;
+    side.send().await;
+    side.idle().await;
+    tokio::time::pause();
+    tokio::time::advance(IDLE).await;
+    tokio::time::resume();
+    broca_test_support::wait_until("the held actor closes", || async {
+        side.registry
+            .slot_state(&side.key)
+            .map_or(Ok(()), |state| Err(state.to_owned()))
+    })
+    .await;
+    let runtime = side.registry.store_runtime().unwrap();
+    let loads = || runtime.views().memory(|_| 0).loads;
+    let before = loads();
+    let scope = broca_protocol::SendScope::default();
+    let mut kept = Vec::new();
+    for _ in 0..3 {
+        kept.push(
+            side.registry
+                .head_for(&side.key, None, &scope)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(loads(), before, "polling a held run loaded the whole view");
+    assert!(side.registry.slot_state(&side.key).is_none());
+    let Some(StoreReadReply::Head(Ok(fresh))) = runtime
+        .read(&side.registry, &side.key, StoreReadRequest::Head)
+        .await
+        .unwrap()
+    else {
+        panic!("the stored view must build the held run's head");
+    };
+    let last = fresh.reply.last_run_state.as_ref().unwrap();
+    assert_eq!(last.state, "active");
+    assert_eq!(last.reason.as_deref(), Some("tool_held"));
+    assert!(last.awaits.is_some());
+    let bytes = serde_json::to_vec(&fresh.reply).unwrap();
+    for mut head in kept {
+        head.sender = None;
+        head.input = None;
+        head.cache = None;
+        assert_eq!(serde_json::to_vec(&head).unwrap(), bytes);
+    }
+    assert!(side.registry.stop_and_seal().await);
+}
+
 cipher_tests!(held_record_boundary_cuts_rejoin_without_redispatch);
 
 async fn held_record_boundary_cuts_rejoin_without_redispatch(cipher: Cipher) {
