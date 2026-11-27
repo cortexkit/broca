@@ -11,6 +11,10 @@ use tokio::net::{TcpStream, UnixListener, UnixStream};
 const WAIT_FOR_EXEC: Duration = Duration::from_secs(40);
 const AUTH: Duration = Duration::from_secs(2);
 const TARGET: &str = "BROCA_UPGRADE_SUBC_CORE_BIN";
+/// Set by the native release lane that names SUBC's signed test-support daemon. CI's
+/// `BROCA_REQUIRE_SUBC` can't require it: CI builds an ordinary ck-subc, and the daemon refuses an
+/// upgrade candidate signed by another team, so no CI-built daemon can stand in for it.
+const REQUIRE_TARGET: &str = "BROCA_REQUIRE_UPGRADE_SUBC";
 
 pub(crate) struct DaemonUpgradeRig {
     root: PathBuf,
@@ -30,9 +34,10 @@ impl DaemonUpgradeRig {
             .filter(|path| path.is_file())
         else {
             assert!(
-                !require_subc(),
+                std::env::var_os(REQUIRE_TARGET).is_none(),
                 "{TARGET} must name a ck-subc build with test hooks"
             );
+            eprintln!("skipping the daemon upgrade case: {TARGET} names no ck-subc test build");
             return None;
         };
         assert!(

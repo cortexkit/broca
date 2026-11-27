@@ -169,6 +169,11 @@ fn unsupported_models_keep_request_level_effort() {
 #[test]
 fn pre_change_session_and_new_append_keep_legacy_bytes() {
     let mut rows = records("gpt-6.1-sol", &["xhigh", "high"], false);
+    // These runs predate the admission choice, so they were also frozen before renderer v9
+    // added the output cap. Freeze them at v8, as a real session from then is.
+    for row in &mut rows {
+        row.frozen_config["renderer_version"] = json!(8);
+    }
     let old = render(&rows);
     assert_eq!(old, br#"{"include":["reasoning.encrypted_content"],"input":[{"content":"episode-xhigh","role":"user","type":"message"},{"content":"episode-high","role":"user","type":"message"}],"model":"gpt-6.1-sol","reasoning":{"effort":"high","summary":"auto"},"store":false,"stream":true}"#);
     // A run started before the admission choice existed stores a config without it.
