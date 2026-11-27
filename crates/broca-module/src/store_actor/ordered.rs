@@ -706,7 +706,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             && self.run.is_none()
             && !self.session.operations().owner.needs_admission()
         {
-            self.run_plan(&request.model, request.variant.as_deref())
+            self.run_plan(&request.model, request.variant.as_deref(), scope.is_some())
                 .await?;
         }
         let expired = order.expired_at(now_ms());

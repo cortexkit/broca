@@ -117,6 +117,36 @@ pub trait Writer {
         }
         Ok(removals)
     }
+    /// The newest model attempt and the run/config/apply/revert boundaries after it, oldest
+    /// first. A run from an older renderer also bounds the walk when no later attempt exists.
+    async fn cut_records(&self) -> Result<Vec<Record>, SessionError> {
+        Err(SessionError::NotInMemory)
+    }
+
+    /// Prove that the run has no model attempt without reading before its own start.
+    async fn run_has_attempt(&self, _run_id: &str) -> Result<bool, SessionError> {
+        Err(SessionError::NotInMemory)
+    }
+
+    /// A historical attempt owner's original start and last refreeze before its first step.
+    async fn signing_config(&self, _run_id: &str) -> Result<Option<SigningConfig>, SessionError> {
+        Err(SessionError::NotInMemory)
+    }
+
+    /// Whether a full apply might erase a previously delivered note. Missing evidence is
+    /// an error: only a known unchanged prefix can keep its earlier signed thinking.
+    async fn apply_may_erase_notes(&self, _generation: u64) -> Result<bool, SessionError> {
+        Err(SessionError::NotInMemory)
+    }
+
+    /// The exact attempt a historical request is rebuilt from, even if its run start is sealed.
+    fn replay_attempt(&self) -> Option<&broca_session_store::record::Attempt> {
+        None
+    }
+
+    async fn cut_ordinal(&self, mid: &str) -> Result<Option<u64>, SessionError> {
+        Ok(self.entry_by_mid(mid).await?.map(|entry| entry.ordinal))
+    }
 
     /// The current run's open-log tail, bounded by both its start and `first`. Message bodies
     /// may be released: this read is for ledger facts, not transcript reconstruction.
@@ -280,6 +310,97 @@ pub trait Writer {
 }
 
 impl<B: SessionBackend> Writer for Session<B> {
+    async fn apply_may_erase_notes(&self, generation: u64) -> Result<bool, SessionError> {
+        let (seq, _) = self.find_id(IdKind::AppliedGeneration, &generation.to_string()).await?
+            .into_iter().find(|(_, record)| matches!(record, Record::RefreshApplied(apply) if apply.generation == generation))
+            .ok_or(SessionError::Missing)?;
+        let prefix = self.from_log_holding(seq, seq - 1).await?;
+        let held = |delivery: &broca_session_store::record::PlanNotes| {
+            !delivery.notes.is_empty() && delivery.anchor >= self.conversation.window_start()
+        };
+        for (seq, record) in prefix.records.iter().rev() {
+            if *seq <= prefix.checkpoint.covers_through {
+                break;
+            }
+            match record {
+                Record::PlanNotes(delivery) if held(delivery) => return Ok(true),
+                Record::RefreshApplied(_) => return Ok(false),
+                _ => {}
+            }
+        }
+        Ok(prefix
+            .checkpoint
+            .operational
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.notes.iter().any(held)))
+    }
+
+    async fn cut_records(&self) -> Result<Vec<Record>, SessionError> {
+        let records = self
+            .ledger_tail_until(|record| {
+                is_cut_attempt(record)
+                    || matches!(record, Record::RunStart(start) if start.renderer_version < 4 && self.operations.run.as_ref().is_none_or(|run| run.run_id != start.run_id))
+            })
+            .await?;
+        Ok(records
+            .into_iter()
+            .rev()
+            .map(|(_, record)| record)
+            .filter(is_cut_record)
+            .collect())
+    }
+
+    async fn run_has_attempt(&self, run_id: &str) -> Result<bool, SessionError> {
+        let tail = self
+            .ledger_tail_until(|record| match record {
+                Record::RunStart(start) => start.run_id == run_id,
+                Record::Attempt(attempt) => attempt.run_id == run_id && is_cut_attempt(record),
+                _ => false,
+            })
+            .await?;
+        match tail.last().map(|(_, record)| record) {
+            Some(Record::RunStart(start)) if start.run_id == run_id => Ok(false),
+            Some(Record::Attempt(attempt)) if attempt.run_id == run_id => Ok(true),
+            _ => Err(SessionError::Missing),
+        }
+    }
+
+    async fn signing_config(&self, run_id: &str) -> Result<Option<SigningConfig>, SessionError> {
+        let Some((seq, start)) = self
+            .find_id(IdKind::RunId, run_id)
+            .await?
+            .into_iter()
+            .find_map(|(seq, record)| match record {
+                Record::RunStart(start) => Some((seq, start)),
+                _ => None,
+            })
+        else {
+            return Ok(None);
+        };
+        let mut refrozen = None;
+        // Refreezes that alter the renderer are only admitted before the first StepStart.
+        // Bound the read to that prefix, rather than walking back across a long tool loop.
+        let last = self.next_seq().saturating_sub(1);
+        let mut first = seq + 1;
+        while first <= last {
+            let through = first.saturating_add(15).min(last);
+            for (_, record) in self.records_between_released(first, through).await? {
+                match record {
+                    Record::ConfigRefrozen(config) if config.run_id == run_id => {
+                        refrozen = Some(config)
+                    }
+                    Record::StepStart(step) if step.run_id == run_id => {
+                        return Ok(Some(SigningConfig { start, refrozen }))
+                    }
+                    Record::RunStart(_) => return Ok(None),
+                    _ => {}
+                }
+            }
+            first = through + 1;
+        }
+        Ok(None)
+    }
     async fn caught_up(&mut self) -> Result<(), SessionError> {
         Ok(())
     }
@@ -534,4 +655,25 @@ pub fn ends_run(records: &[Record]) -> bool {
     records
         .iter()
         .any(|record| matches!(record, Record::RunEnd(_) | Record::Pause(_)))
+}
+
+pub struct SigningConfig {
+    pub start: Box<broca_session_store::record::RunStart>,
+    pub refrozen: Option<broca_session_store::record::ConfigRefrozen>,
+}
+
+/// A recorded model attempt, excluding reservations for cache warming.
+pub fn is_cut_attempt(record: &Record) -> bool {
+    matches!(record, Record::Attempt(attempt) if !attempt.billing.as_ref().is_some_and(|billing| billing.parse()["reservation"]["warm"] == true))
+}
+
+fn is_cut_record(record: &Record) -> bool {
+    matches!(
+        record,
+        Record::Attempt(_)
+            | Record::RunStart(_)
+            | Record::ConfigRefrozen(_)
+            | Record::RefreshApplied(_)
+            | Record::TranscriptReverted(_)
+    )
 }

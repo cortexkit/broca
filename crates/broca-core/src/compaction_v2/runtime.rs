@@ -621,7 +621,11 @@ impl Runtime {
                 self.tokens
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .notice(&mut notice, lane.notes_tokens_declared);
+                    .notice(
+                        &mut notice,
+                        conditions.notes_tokens,
+                        lane.notes_tokens_declared,
+                    );
                 notice
             };
             let answer: Result<NoticeAnswer, _> =

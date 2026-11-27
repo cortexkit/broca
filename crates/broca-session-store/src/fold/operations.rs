@@ -1328,7 +1328,66 @@ impl Plan {
         }
         state.settle(change);
     }
+
+    pub fn has_rendered_notes(&self) -> bool {
+        self.notes.iter().any(|delivery| !delivery.notes.is_empty())
+    }
+
+    /// A disclosed note follows its latest delivery. If a later view restores a cut entry,
+    /// it must not revive a copy that a subsequent run already delivered again.
+    pub fn latest_notes(&self) -> impl Iterator<Item = (u64, &crate::record::PlanNote)> {
+        latest_plan_notes(&self.notes)
+    }
+
+    /// Prefer the original when the view restores it. Unmarked deliveries keep their original
+    /// string-note placement rules regardless of later marked deliveries.
+    pub fn visible_notes(
+        &self,
+        legal: impl Fn(u64) -> bool,
+        held: impl Fn(u64) -> bool,
+    ) -> Vec<(&crate::record::PlanNotes, &crate::record::PlanNote)> {
+        self.visible_note_changes(legal, held)
+            .map(|(_, delivery, note)| (delivery, note))
+            .collect()
+    }
+
+    /// The visible deliveries and the identity of each change across alternate anchors.
+    pub fn visible_note_changes(
+        &self,
+        legal: impl Fn(u64) -> bool,
+        held: impl Fn(u64) -> bool,
+    ) -> impl Iterator<Item = (usize, &crate::record::PlanNotes, &crate::record::PlanNote)> {
+        let mut chosen = std::collections::BTreeSet::new();
+        note_copies::changes(&self.notes).filter(move |(change, delivery, _)| {
+            if delivery.blocks == Some(true) {
+                legal(delivery.anchor) && chosen.insert(*change)
+            } else {
+                held(delivery.anchor)
+            }
+        })
+    }
+
+    pub fn has_tool_additions(&self) -> bool {
+        self.notes
+            .iter()
+            .flat_map(|delivery| &delivery.notes)
+            .any(|note| note.kind == crate::record::PlanNoteKind::ToolAddition)
+    }
 }
+
+pub fn latest_plan_notes(
+    notes: &[crate::record::PlanNotes],
+) -> impl Iterator<Item = (u64, &crate::record::PlanNote)> {
+    let mut chosen = std::collections::BTreeSet::new();
+    note_copies::changes(notes)
+        .rev()
+        .filter_map(|(id, delivery, note)| chosen.insert(id).then_some((delivery.anchor, note)))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+}
+
+mod note_copies;
 
 /// Name retained by the first compaction protocol's applied view for a generic ledger event.
 /// The fold counts it as a prefix rebuild, as it does the current contract's applied event.

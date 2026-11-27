@@ -125,6 +125,12 @@ impl ScriptedProvider {
     /// The render config the run freezes: the stateless default, or a real config for a cache
     /// comparison, carrying the run's structured output, downgraded once refused.
     fn frozen_blob(&self) -> Value {
+        if let Ok(raw) = plan_notes::RAW_RENDER.try_with(Clone::clone) {
+            return raw;
+        }
+        if let Some((_, config)) = plan_notes::route() {
+            return serde_json::to_value(config).unwrap();
+        }
         let mut blob = self.frozen_blob_without_fallback();
         if let Some(script) = fallback() {
             blob["refusal_fallback"] = json!({ "model": script.model });
@@ -172,6 +178,16 @@ const GRAMMAR_REFUSED: &str = "scripted_grammar_too_large";
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn renderer_version(&self) -> u32 {
+        if plan_notes::route().is_none() && plan_notes::RAW_RENDER.try_with(|_| ()).is_err() {
+            return broca_core::render::CANONICAL_RENDERER_VERSION;
+        }
+        self.frozen_blob()["renderer_version"]
+            .as_u64()
+            .map_or(broca_core::render::CANONICAL_RENDERER_VERSION, |version| {
+                version as u32
+            })
+    }
     fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
         temperature::POLICY
             .try_with(|policy| policy.apply(requested))
@@ -2318,6 +2334,9 @@ impl Scenario {
         input: &[Message],
     ) -> Admission {
         let mut request = self.request_for(run_id, input);
+        if let Some((model, _)) = plan_notes::route() {
+            request.model = model;
+        }
         let mut admission = broca_session_loop::admit::admission(
             &mut request,
             &admission_control(self),
@@ -2344,7 +2363,10 @@ impl Scenario {
 /// The run control fields that decide a new run's admission. Every run of `broca_core::run` in
 /// this file is given them, and the new loop's admission is derived from the same values.
 fn admission_control(scenario: &Scenario) -> RunControl {
+    let (applies_refresh, plan_notes) = plan_notes::apply_at_start();
     RunControl {
+        applies_refresh,
+        plan_notes,
         display_message_marks: RECORDED_MARKS.try_with(|(marks, _)| marks.clone()).ok().flatten(),
         auth_selection: account_selection(),
         account_limit_pause: account().is_some(),
@@ -2450,6 +2472,51 @@ impl Recording<'_, '_> {
 }
 
 impl Writer for Recording<'_, '_> {
+    async fn run_has_attempt(&self, run_id: &str) -> Result<bool, SessionError> {
+        broca_session_loop::writer::Writer::run_has_attempt(&*self.session, run_id).await
+    }
+
+    async fn signing_config(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<broca_session_loop::writer::SigningConfig>, SessionError> {
+        if plan_notes::SIGNING_CONFIG_READ_FAILS
+            .try_with(|_| ())
+            .is_ok()
+        {
+            return Err(SessionError::Backend(
+                broca_session_store::backend::BackendError::Io(
+                    std::io::ErrorKind::Interrupted.into(),
+                ),
+            ));
+        }
+        broca_session_loop::writer::Writer::signing_config(&*self.session, run_id).await
+    }
+
+    async fn apply_may_erase_notes(&self, generation: u64) -> Result<bool, SessionError> {
+        if plan_notes::APPLY_NOTE_READ_FAILS.try_with(|_| ()).is_ok() {
+            return Err(SessionError::Backend(
+                broca_session_store::backend::BackendError::Io(
+                    std::io::ErrorKind::Interrupted.into(),
+                ),
+            ));
+        }
+        self.session.apply_may_erase_notes(generation).await
+    }
+
+    async fn cut_records(&self) -> Result<Vec<Record>, SessionError> {
+        if plan_notes::CUT_EVIDENCE_MISSING.try_with(|_| ()).is_ok() {
+            return Err(SessionError::Missing);
+        }
+        Writer::cut_records(&*self.session).await
+    }
+
+    async fn entry_mid_at(&self, ordinal: u64) -> Result<Option<String>, SessionError> {
+        if plan_notes::CUTOFF_INDEX_MISSING.try_with(|_| ()).is_ok() {
+            return Ok(None);
+        }
+        Writer::entry_mid_at(&*self.session, ordinal).await
+    }
     async fn responses_reasoning_removals(
         &self,
         run_id: &str,
@@ -2552,6 +2619,12 @@ impl Writer for Recording<'_, '_> {
         &self,
         ordinal: u64,
     ) -> Result<std::sync::Arc<broca_protocol::Message>, SessionError> {
+        if plan_notes::NOTE_ESTIMATE_READ_FAILURE
+            .try_with(|fault| !fault.replace(true))
+            .unwrap_or(false)
+        {
+            return Err(SessionError::OwnerGone);
+        }
         Writer::window_message_whole(&*self.session, ordinal).await
     }
 
@@ -2572,7 +2645,11 @@ impl Writer for Recording<'_, '_> {
         carry: &broca_session_store::session::Carry<'_>,
         now_ms: u64,
     ) -> Result<(), SessionError> {
-        Writer::seal_at_entry(&mut *self.session, ordinal, carry, now_ms).await
+        let result = Writer::seal_at_entry(&mut *self.session, ordinal, carry, now_ms).await;
+        if result.is_ok() {
+            let _ = plan_notes::DAMAGED_AFTER_SEAL.try_with(|(_, damaged)| damaged.set(true));
+        }
+        result
     }
 
     async fn seal_ledger(
@@ -2865,7 +2942,7 @@ async fn new_source(
         Some(cut) if reopened => {
             held = cut.records;
             parts.parts = cut.parts;
-            true
+            plan_notes::fresh_run().is_none()
         }
         Some(converted)
             if converted
@@ -2876,7 +2953,7 @@ async fn new_source(
             session.append(&converted.records, true).await.unwrap();
             held = converted.records;
             parts.parts = converted.parts;
-            true
+            plan_notes::fresh_run().is_none()
         }
         _ => false,
     };
@@ -2962,16 +3039,43 @@ async fn new_source(
     let sealing = SEALING.try_with(|cause| *cause).ok();
     // A crash-cut comparison nests this driver several frames deep. Heap-own the loop bodies,
     // as the production executor does for run and resume, rather than copying them there.
-    let result = through!(
-        writer,
-        |w| if let (true, Some(cause)) = (resuming, sealing) {
-            seal(w, &parts, &seams, cause).await
-        } else if resuming {
-            Box::pin(resume(w, &parts, &seams)).await
-        } else {
-            Box::pin(run(w, &mut parts, scenario.admission(&provider), &seams)).await
-        }
-    );
+    let result = {
+        let mut parts = plan_notes::revision14::FaultableParts(&mut parts);
+        through!(
+            writer,
+            |w| if let (true, Some(cause)) = (resuming, sealing) {
+                seal(w, &parts, &seams, cause).await
+            } else if resuming {
+                Box::pin(resume(w, &parts, &seams)).await
+            } else {
+                let admitted = plan_notes::fresh_run().map_or_else(
+                    || scenario.admission(&provider),
+                    |id| scenario.admission_for(&provider, id, &scenario.input),
+                );
+                Box::pin(run(w, &mut parts, admitted, &seams)).await
+            }
+        )
+    };
+    if result.is_err()
+        && (plan_notes::MISSING_RENDER_CONFIG.try_with(|_| ()).is_ok()
+            || plan_notes::DAMAGED_AFTER_SEAL.try_with(|_| ()).is_ok())
+    {
+        assert!(
+            matches!(result, Err(broca_session_loop::run::LoopError::Parts(_))),
+            "{result:?}"
+        );
+        return Source {
+            outcome: Outcome {
+                requests: sent_requests(&provider),
+                records: Vec::new(),
+                calls: Vec::new(),
+            },
+            records: writer.records,
+            batch_ends: writer.batch_ends,
+            snapshots: writer.snapshots,
+            parts: parts.parts,
+        };
+    }
     if EXPECT_UNSUPPORTED
         .try_with(|expected| *expected)
         .unwrap_or(false)

@@ -2458,6 +2458,7 @@ async fn paused_run(provider: &impl Provider, label: &str) -> Vec<Record> {
         model: ModelHandle::new("openai", "m"),
         input: vec![Message {
             turn_system: false,
+            tool_addition: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: "hi".into() }],
             cache_prefix_blocks: None,
@@ -3033,7 +3034,7 @@ fn tool_run_request(bind: &BindIdentity) -> RunRequest {
     input_written_at_ms: None, directives: None, session_class: None, retention: None, retention_policy: None, on_restart: None, keep_warm: None, send_id: None, request_identity_digest: None, title: None,
     project_id: None, principal: None, scope: None, run_id: RunId("ws-run".into()), session: bind.clone(),
     model: ModelHandle::new("openai", "m"),
-    input: vec![Message { turn_system: false, role: Role::User, content: vec![ContentBlock::Text { text: "lookup".into() }], cache_prefix_blocks: None, origin: None, ordinal: None, tags: Default::default() }],
+    input: vec![Message { turn_system: false, tool_addition: None, role: Role::User, content: vec![ContentBlock::Text { text: "lookup".into() }], cache_prefix_blocks: None, origin: None, ordinal: None, tags: Default::default() }],
     tools: vec![serde_json::from_value(serde_json::json!({"name":"lookup","description":"lookup","input_schema":{"type":"object","properties":{"x":{"type":"integer"}}},"execution_mode":"parallel"})).unwrap()],
     policy_allowed: std::collections::HashSet::from(["lookup".into()]), tool_choice: ToolChoice::Auto, generation: GenerationConfig::default(),
     cache: None, stop_when: vec![StopCondition::StepCount { n: 4 }], submission_id: None,

@@ -6,6 +6,8 @@ use broca_protocol::{CallOptions, ContentBlock, Role};
 
 use crate::{spec::WireFamilyId, wire::FrozenRenderConfig};
 
+pub mod tool_addition;
+
 /// Admission's single source of route support. Anthropic authority requires its own
 /// catalog's explicit published fact; compatible hosts and absent facts fail closed.
 pub fn catalog_support(
@@ -29,6 +31,30 @@ pub fn supported(frozen: &FrozenRenderConfig) -> bool {
         WireFamilyId::AnthropicMessages => frozen.anthropic_turn_system,
         _ => false,
     }
+}
+
+/// Places that can still carry an Anthropic note after the view and echo rules are applied.
+/// At a fresh run's boundary the new input follows the prompt, so its current end is not legal.
+pub fn rendering_anchors(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    end_is_legal: bool,
+) -> std::collections::BTreeSet<u64> {
+    let view = crate::families::compaction_view(frozen.family_id, opts);
+    let visible = crate::families::anthropic_messages::rendered_note_positions(frozen, &view);
+    visible
+        .iter()
+        .enumerate()
+        .filter_map(|(at, &index)| {
+            let entry = &view.prompt[index];
+            let ordinal = entry.ordinal?;
+            let next = visible.get(at + 1).map(|&next| &view.prompt[next]);
+            (matches!(entry.role, Role::User | Role::Tool)
+                && next.is_none_or(|message| message.ordinal != Some(ordinal))
+                && next.map_or(end_is_legal, |message| message.role == Role::Assistant))
+            .then_some(ordinal + 1)
+        })
+        .collect()
 }
 
 /// Whether a newly delivered template can end this request at system authority.
@@ -64,7 +90,10 @@ pub fn prepare<'a>(frozen: &FrozenRenderConfig, opts: &'a CallOptions) -> Cow<'a
     }
     let mut rendered = opts.clone();
     for message in &mut rendered.prompt {
-        if message.turn_system {
+        if message.turn_system
+            && (!message.tags.plan_note || message.tags.legacy_plan_note)
+            && message.tool_addition.is_none()
+        {
             message.role = Role::User;
             let text = text(message);
             message.content = vec![ContentBlock::Text {
@@ -112,6 +141,13 @@ pub fn place<'a>(
     let mut misplaced = Vec::new();
     for (position, &index) in conversation.iter().enumerate() {
         let message = &opts.prompt[index];
+        // Plan notes are validated against the request view before insertion, not rewritten.
+        if (message.tags.plan_note && !message.tags.legacy_plan_note)
+            || message.tool_addition.is_some()
+        {
+            after_user = false;
+            continue;
+        }
         if !is_template(message) {
             after_user = matches!(message.role, Role::User | Role::Tool);
             continue;

@@ -41,6 +41,7 @@ mod phase_metrics_tests;
 mod plan_change;
 mod plan_episode;
 mod plan_notes;
+pub use plan_notes::reconcile_note_route;
 pub mod reader_admission;
 pub mod registry;
 pub mod retention;

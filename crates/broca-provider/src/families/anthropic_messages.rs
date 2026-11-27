@@ -703,23 +703,15 @@ fn with_request_body<R>(
     render_placed(frozen, opts, name_map, media, provenance, use_body)
 }
 
-/// The rest of [`with_request_body`]. Templates are placed against the messages that render:
-/// when leaving out the messages that render empty puts a template next to something Anthropic
-/// refuses beside it, that template becomes a user note and the request is rendered from that.
-fn render_placed<R>(
+/// The conversation messages that actually reach the wire, including whether each reply has
+/// anything the renderer can send. Native-note placement uses the same visibility check.
+fn rendered_conversation<'a>(
     frozen: &FrozenRenderConfig,
-    opts: &CallOptions,
-    name_map: &crate::tool_name_alias::ToolNameMap,
-    media: Option<&crate::media_render::MediaRender<'_>>,
-    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
-    use_body: impl FnOnce(&Node<'_>) -> R,
-) -> R {
-    let marker_policy = anthropic_marker_policy(frozen);
-
-    // System: a required identity may lead (an OAuth requirement), then any system
-    // messages from the prompt.
-    let mut system = build_system(frozen, opts, marker_policy.is_some());
-
+    opts: &'a CallOptions,
+    id_map: &'a crate::tool_id_alias::ToolIdMap,
+    name_map: &'a crate::tool_name_alias::ToolNameMap,
+    media: Option<&'a crate::media_render::MediaRender<'_>>,
+) -> Vec<(Node<'a>, Option<u32>, usize)> {
     // Interleaved thinking: which assistant messages echo their signed thinking is decided by
     // the frozen `echo_scope` -- either just the last assistant message (the original rule,
     // kept so runs frozen under it resume with their recorded bytes) or every assistant
@@ -744,18 +736,11 @@ fn render_placed<R>(
         .iter()
         .filter(|m| m.role != Role::System || m.turn_system)
         .collect();
-    // Canonical tool-call ids that violate Anthropic's id grammar (^[a-zA-Z0-9_-]+$, ≤64) —
-    // e.g. an OpenAI 450-char `|` id carried in from a provider switch — are aliased to a
-    // deterministic Anthropic-valid id, applied to BOTH the tool_use and its tool_result so
-    // the arc still pairs. This is render-edge ONLY: the map is built from a read-only scan
-    // and the canonical id stays the sole persisted form.
-    let id_map = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
     // The index of the first message whose thinking may be echoed, computed in ONE place
     // (`first_echoed_message`) so the request body and the tests' reference renderer read the
     // same positional cutoff and cannot drift.
     let first_echoed = echo_scope.and_then(|scope| first_echoed_message(scope, &non_system));
-    let rendered_messages: Vec<(Node<'_>, Option<u32>, usize)> = opts
-        .prompt
+    opts.prompt
         .iter()
         .enumerate()
         .filter(|(_, m)| m.role != Role::System || m.turn_system)
@@ -777,7 +762,7 @@ fn render_placed<R>(
                     m,
                     positional && echo_safe,
                     frozen.server_side_fallback,
-                    &id_map,
+                    id_map,
                     name_map,
                     media,
                 ),
@@ -790,7 +775,41 @@ fn render_placed<R>(
         .filter(
             |(message, _, _)| !matches!(content_of(message), Some(content) if content.is_empty()),
         )
-        .collect();
+        .collect()
+}
+
+pub(crate) fn rendered_note_positions(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+) -> Vec<usize> {
+    let names = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
+    let ids = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
+    rendered_conversation(frozen, opts, &ids, &names, None)
+        .into_iter()
+        .map(|(_, _, position)| position)
+        .collect()
+}
+
+/// The rest of [`with_request_body`]. Templates are placed against the messages that render:
+/// when leaving out the messages that render empty puts a template next to something Anthropic
+/// refuses beside it, that template becomes a user note and the request is rendered from that.
+fn render_placed<R>(
+    frozen: &FrozenRenderConfig,
+    opts: &CallOptions,
+    name_map: &crate::tool_name_alias::ToolNameMap,
+    media: Option<&crate::media_render::MediaRender<'_>>,
+    mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
+    use_body: impl FnOnce(&Node<'_>) -> R,
+) -> R {
+    let marker_policy = anthropic_marker_policy(frozen);
+
+    // System: a required identity may lead (an OAuth requirement), then any system
+    // messages from the prompt.
+    let mut system = build_system(frozen, opts, marker_policy.is_some());
+
+    // Alias canonical tool-call IDs at the wire edge without changing their stored form.
+    let id_map = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
+    let rendered_messages = rendered_conversation(frozen, opts, &id_map, name_map, media);
     let mut renders = vec![false; opts.prompt.len()];
     for (_, _, prompt_index) in &rendered_messages {
         renders[*prompt_index] = true;
@@ -802,38 +821,31 @@ fn render_placed<R>(
         drop(rendered_messages);
         return render_placed(frozen, &replaced, name_map, media, provenance, use_body);
     }
-    // Each later run's effort change, when the run keeps the cache across it, goes in as an
-    // empty system message that sets the effort (see `effort_change`): after the run's first
-    // user message, before the first message positioned later. A message with no position (a
-    // transform's) never moves one.
     let effort_plan = crate::effort_change::anthropic_plan(frozen, opts);
-    let has_ordinals = opts.prompt.iter().any(|message| message.ordinal.is_some());
-    let mut efforts = effort_plan
+    let positions: Vec<_> = rendered_messages
         .iter()
-        .flat_map(|plan| &plan.messages)
-        .peekable();
+        .map(|(_, _, index)| *index)
+        .collect();
+    let mut efforts =
+        crate::effort_change::anthropic_slots(frozen, opts, &positions, effort_plan.as_ref())
+            .into_iter();
     let mut placed: Vec<(Node<'_>, Option<u32>, Option<usize>)> =
         Vec::with_capacity(rendered_messages.len());
-    for (message, prefix_blocks, prompt_index) in rendered_messages {
-        let position = opts.prompt[prompt_index]
-            .ordinal
-            .map(|ordinal| ordinal as usize)
-            .or_else(|| (!has_ordinals).then_some(prompt_index));
-        if let Some(position) = position {
-            while let Some(effort) = efforts.next_if(|effort| effort.after < position) {
-                placed.push((effort_message(&effort.effort), None, None));
-            }
-        }
+    for ((message, prefix_blocks, prompt_index), before) in
+        rendered_messages.into_iter().zip(&mut efforts)
+    {
+        placed.extend(
+            before
+                .into_iter()
+                .map(|effort| (effort_message(effort), None, None)),
+        );
         placed.push((message, prefix_blocks, Some(prompt_index)));
     }
-    placed.extend(efforts.map(|effort| (effort_message(&effort.effort), None, None)));
-    // A fork's ask that lowers its effort sets it after the whole prompt, so only its answer
-    // uses it (see `effort_change::answer_effort`).
-    if let Some(effort) = opts.render_episodes.answer_effort.as_deref() {
-        if crate::effort_change::per_message_effort(frozen) {
-            placed.push((effort_message(effort), None, None));
-        }
-    }
+    placed.extend(
+        efforts
+            .flatten()
+            .map(|effort| (effort_message(effort), None, None)),
+    );
 
     // Keep only surviving message identities. System messages are coalesced into the
     // separate system field, and an empty rendered message has no wire-message index.
@@ -867,7 +879,18 @@ fn render_placed<R>(
     if let Some((ttl, max_breakpoints, lookback_blocks, tail)) = marker_policy {
         // Marker positions are based on the rendered message blocks, not canonical
         // content, so stripped reasoning and empty text cannot move breakpoints.
-        let marker_view = anthropic_marker_view(&messages, &cache_prefix_blocks);
+        let note_indices: std::collections::BTreeSet<_> = opts
+            .prompt
+            .iter()
+            .zip(&rendered_indices)
+            .filter_map(|(message, wire_index)| {
+                (message.tool_addition.is_some()
+                    || (message.tags.plan_note && !message.tags.legacy_plan_note))
+                    .then_some(*wire_index)
+                    .flatten()
+            })
+            .collect();
+        let marker_view = anthropic_marker_view(&messages, &cache_prefix_blocks, &note_indices);
         debug_assert_eq!(marker_view.len(), messages.len());
         let system_tail_blocks = system_tail_block_count(frozen, &system);
         let declared: Vec<DeclaredMarker> = opts
@@ -936,7 +959,13 @@ fn render_placed<R>(
         .iter()
         .map(|tool| convert_tool(tool, name_map))
         .collect();
-    if !tools.is_empty() {
+    if !tools.is_empty()
+        || (*opts.tool_choice == ToolChoice::None
+            && opts
+                .prompt
+                .iter()
+                .any(|message| message.tool_addition.is_some()))
+    {
         rest["tool_choice"] = convert_tool_choice(&opts.tool_choice, name_map);
     }
     apply_generation_controls(
@@ -958,7 +987,7 @@ fn render_placed<R>(
     // flag and the version together (see `families::anthropic_renderer_version`), so a recorded
     // config never pairs an opt-in with a version that does not describe these bytes.
     if frozen.server_side_fallback {
-        rest["fallbacks"] = Value::String("default".to_string());
+        rest["fallbacks"] = Value::String("default".into());
     }
     if let Some(persona) = persona(frozen) {
         rest["metadata"] = json!({
@@ -1089,17 +1118,22 @@ fn system_tail_block_count(frozen: &FrozenRenderConfig, system: &[Node<'_>]) -> 
 fn anthropic_marker_view(
     messages: &[Node<'_>],
     cache_prefix_blocks: &[Option<u32>],
+    native_notes: &std::collections::BTreeSet<usize>,
 ) -> Vec<MarkerViewMessage> {
     messages
         .iter()
         .zip(cache_prefix_blocks)
-        .map(|(message, cache_prefix_blocks)| {
+        .enumerate()
+        .map(|(index, (message, cache_prefix_blocks))| {
             let role = match message.get("role").and_then(NodeRef::as_str) {
                 Some("user") => Role::User,
                 Some("assistant") => Role::Assistant,
                 _ => Role::Assistant,
             };
+            // Inline tool notes, like text-only system turns, must not move markers placed
+            // on the preexisting prefix.
             let block_count = content_of(message)
+                .filter(|_| !native_notes.contains(&index))
                 .map(|content| {
                     content
                         .iter()
@@ -1275,6 +1309,23 @@ fn convert_message<'a>(
     name_map: &'a crate::tool_name_alias::ToolNameMap,
     media: Option<&'a crate::media_render::MediaRender<'_>>,
 ) -> Node<'a> {
+    if let Some(addition) = &m.tool_addition {
+        return crate::turn_system::tool_addition::render(addition, name_map);
+    }
+    if m.turn_system && m.tags.plan_note && !m.tags.legacy_plan_note && m.role == Role::System {
+        let content = m
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentBlock::Text { text } => Some(text_block(Node::str(text))),
+                _ => None,
+            })
+            .collect();
+        return Node::object([
+            ("role", Node::str("system")),
+            ("content", Node::Array(content)),
+        ]);
+    }
     if m.turn_system {
         return Node::object([
             (
@@ -1538,6 +1589,31 @@ mod tests {
     use broca_protocol::{request::ModelHandle, StepContext};
 
     use super::*;
+
+    #[test]
+    fn the_marker_lookback_excludes_only_the_newly_inserted_note() {
+        let system = || {
+            Node::object([
+                ("role", Node::str("system")),
+                (
+                    "content",
+                    Node::Array(vec![text_block(Node::str("anchor"))]),
+                ),
+            ])
+        };
+        let counted = anthropic_marker_view(
+            &[system(), system()],
+            &[None, None],
+            &[1].into_iter().collect(),
+        );
+        assert_eq!(
+            counted
+                .iter()
+                .map(|message| message.block_count)
+                .collect::<Vec<_>>(),
+            [1, 0]
+        );
+    }
     use crate::families::{anthropic_apikey_frozen_config, anthropic_frozen_config};
     use broca_protocol::{content::ToolOutput, ToolCallId};
 
@@ -1694,6 +1770,7 @@ mod tests {
     fn system_message(text: &str) -> Message {
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1706,6 +1783,7 @@ mod tests {
     fn user_message(text: &str) -> Message {
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1893,6 +1971,7 @@ mod tests {
             ),
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,

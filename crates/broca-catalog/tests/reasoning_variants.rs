@@ -161,6 +161,7 @@ mod gated {
     fn request() -> CallOptions {
         let mut opts = CallOptions::new(vec![Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

@@ -1263,8 +1263,10 @@ values! {
         1 System,
         /// A tool the pending plan no longer offers, in llm-runner's fixed removal wording.
         2 ToolRemoval,
-        /// A tool still in the applied plan whose earlier removal note was undone, so it may be
-        /// called again.
+        /// A native declaration that makes a tool callable without replacing the tool list.
+        #[serde(rename = "tool_addition")]
+        3 ToolAddition,
+        /// A tool still in the applied plan whose earlier removal note was undone.
         4 ToolRestored,
     }
 }
@@ -1295,14 +1297,49 @@ fn validate_plan_note(note: &PlanNote) -> Result<(), DecodeError> {
 }
 
 message! {
-    /// One plan note: what it announces, the exact text the model sees, and the form it renders
-    /// in (`turn_system`, a system-role message at its place in the conversation).
+    /// One plan note: its text or native tool definition, and the form used to render it.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub struct PlanNote {
         1 req kind: PlanNoteKind,
         2 req text: String,
         3 req form: String,
+        /// Native declarations cannot be skipped by an older reader: they make a tool callable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        4 opt [must] tool: PlanNoteTool,
+        /// The delivering run's tool routing facts, not the latest pending plan's facts.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        5 opt [must] tool_dispatch: String,
     } => validate_plan_note
+}
+
+message! {
+    /// The model-facing part of a tool-addition note, independent of its dispatch route.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct PlanNoteTool {
+        1 req name: String,
+        2 req description: String,
+        3 req input_schema: String,
+    }
+}
+
+impl PlanNote {
+    pub fn is_anthropic_addition(&self) -> bool {
+        self.kind == PlanNoteKind::ToolAddition && self.form == "anthropic_tool_addition"
+    }
+
+    /// The tool named by the stored declaration or by llm-runner's fixed correction text.
+    pub(crate) fn named_tool(&self) -> Option<&str> {
+        match self.kind {
+            PlanNoteKind::System => None,
+            PlanNoteKind::ToolAddition => self.tool.as_ref().map(|tool| tool.name.as_str()),
+            PlanNoteKind::ToolRestored => self.restored_tool(),
+            PlanNoteKind::ToolRemoval => self
+                .text
+                .strip_prefix("Tool \"")?
+                .strip_suffix("\" is no longer available. Do not call it.")
+                .filter(|name| !name.is_empty()),
+        }
+    }
 }
 
 message! {
@@ -1321,6 +1358,10 @@ message! {
         3 rep notes: PlanNote,
         4 rep refused_tools: String,
         5 req model_key: String,
+        /// Encode the notes at an anchor as one system turn with content blocks on Claude,
+        /// rather than the original separate system turns with string content.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        6 opt [must] blocks: bool,
     }
 }
 

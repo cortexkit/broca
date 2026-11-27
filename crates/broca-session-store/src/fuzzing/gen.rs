@@ -538,11 +538,7 @@ mod records {
         ForkEvent::Billed,
     );
     variants!(RetentionEvent: RetentionEvent::Set, RetentionEvent::Released);
-    variants!(
-        PlanNoteKind: PlanNoteKind::System,
-        PlanNoteKind::ToolRemoval,
-        PlanNoteKind::ToolRestored,
-    );
+    variants!(PlanNoteKind: PlanNoteKind::System, PlanNoteKind::ToolRemoval, PlanNoteKind::ToolAddition, PlanNoteKind::ToolRestored);
     variants!(
         ChangeKind: ChangeKind::Cut,
         ChangeKind::LedgerSeal,
@@ -878,7 +874,7 @@ mod records {
         step_id,
         version,
         checksum,
-        head_kept
+        head_kept,
     });
     crate::fuzzing::gen::fields!(QueuedSend {
         submission_id,
@@ -1107,6 +1103,11 @@ mod records {
         at_ms,
         policy
     });
+    crate::fuzzing::gen::fields!(PlanNoteTool {
+        name,
+        description,
+        input_schema
+    });
     impl Gen for PlanNote {
         fn gen(g: &mut G<'_>) -> Self {
             let kind = PlanNoteKind::gen(g);
@@ -1119,6 +1120,8 @@ mod records {
                     text
                 },
                 form: String::gen(g),
+                tool: Option::gen(g),
+                tool_dispatch: Option::gen(g),
             }
         }
     }
@@ -1128,6 +1131,7 @@ mod records {
         notes,
         refused_tools,
         model_key,
+        blocks,
     });
     crate::fuzzing::gen::fields!(EnrollmentOverlayRef {
         log,

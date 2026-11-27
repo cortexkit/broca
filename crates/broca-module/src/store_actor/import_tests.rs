@@ -1829,7 +1829,7 @@ async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
     .await
     .unwrap();
     assert_eq!(as_read(&rebuilt.opts), as_read(&first));
-    // Read from the session as it stands now, the same step takes the later view.
+    // Both recorded request entry points use the historical view, not the session's current one.
     let current = Box::pin(super::recorded_warm::request(
         &session,
         &history,
@@ -1840,7 +1840,7 @@ async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
     ))
     .await
     .map(|request| as_read(&request.opts));
-    assert_ne!(current.ok(), Some(as_read(&first)));
+    assert_eq!(current.unwrap(), as_read(&first));
 
     // A view that cuts deeper seals the history through `msg_a3` at the next step.
     let mut session = session;

@@ -104,3 +104,16 @@ pub fn finalizing(operations: &Operations) -> bool {
         .as_ref()
         .is_some_and(|run| run.budget.finalize_pending)
 }
+
+/// Keep the tool list on the budget's last step and disable calls with `tool_choice: none`.
+/// Dropping the list would rewrite the cached prefix. Live requests and offline replay agree.
+pub(crate) fn finalize_tool_choice(
+    operations: &broca_session_store::fold::operations::Operations,
+    opts: &mut broca_protocol::CallOptions,
+) -> bool {
+    let finalizing = finalizing(operations);
+    if finalizing {
+        opts.tool_choice = std::sync::Arc::new(broca_protocol::request::ToolChoice::None);
+    }
+    finalizing
+}

@@ -35,6 +35,7 @@ fn request() -> CallOptions {
     broca_core::hooks::apply_message_ops(&mut content, &ops).unwrap();
     CallOptions::new(vec![Message {
         turn_system: false,
+        tool_addition: None,
         role: Role::Assistant,
         content,
         origin: None,
@@ -60,6 +61,7 @@ fn tool_call_only_request() -> CallOptions {
     assert_eq!(content, before);
     CallOptions::new(vec![Message {
         turn_system: false,
+        tool_addition: None,
         role: Role::Assistant,
         content,
         origin: None,

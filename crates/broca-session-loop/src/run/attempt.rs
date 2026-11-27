@@ -241,6 +241,7 @@ mod tests {
         use broca_protocol::content::{ContentBlock, Message, Role};
         let text = |role, text: &str| Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

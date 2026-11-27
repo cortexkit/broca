@@ -1011,6 +1011,7 @@ impl Value for Message {
             role,
             content,
             turn_system,
+            tool_addition: _,
             cache_prefix_blocks,
             origin,
             // Derived when a prompt is assembled; never stored.

@@ -192,7 +192,8 @@ fn observes_both_plan_notes_from_the_real_messages_renderer() {
     .unwrap();
     opts.tools = Arc::new(vec![tool]);
     let removal = broca_core::plan_notes::tool_removal(SCRIPTED_TOOL);
-    let opts = broca_core::plan_notes::view(&opts, [(4, NOTE), (4, removal.as_str())]).unwrap();
+    use broca_core::plan_notes::{view, Note::LegacyText};
+    let opts = view(&opts, [(4, LegacyText(NOTE)), (4, LegacyText(&removal))]).unwrap();
     let request: Value = serde_json::from_slice(&AnthropicMessages.render(&frozen, &opts)).unwrap();
 
     let messages = request["messages"].as_array().unwrap();

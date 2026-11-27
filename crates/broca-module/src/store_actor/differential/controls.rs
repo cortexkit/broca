@@ -33,7 +33,7 @@ cipher_tests!(
 /// about, as Magic Context's input transform does in production. Once `unavailable` is set, it
 /// can't be reached.
 #[derive(Default)]
-struct Noter {
+pub(super) struct Noter {
     calls: AtomicUsize,
     unavailable: AtomicBool,
 }
@@ -60,7 +60,7 @@ impl HookPlane for Noter {
 }
 
 impl Noter {
-    fn calls(&self) -> usize {
+    pub(super) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
 }
@@ -401,7 +401,7 @@ pub(super) fn manifest(plan: Value, declarations: Vec<FrozenDeclaration>) -> Arc
 
 /// A plan subscribing the provider `noter` to `pre_user`, with the `prepend` operation and the
 /// given `on_unavailable`, the shape the production subscriptions to `pre_user` have.
-fn noting_plan(on_unavailable: &str) -> Arc<PlanManifest> {
+pub(super) fn noting_plan(on_unavailable: &str) -> Arc<PlanManifest> {
     let subscription = json!({
         "hook": "pre_user",
         "ops": ["prepend"],

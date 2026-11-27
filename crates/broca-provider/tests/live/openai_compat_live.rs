@@ -68,6 +68,7 @@ async fn openai_chat_family_runs_live_against_a_compatible_provider() {
 
     let opts = CallOptions::new(vec![Message {
         turn_system: false,
+        tool_addition: None,
         cache_prefix_blocks: None,
         origin: None,
         ordinal: None,

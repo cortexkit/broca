@@ -93,6 +93,29 @@ pub(crate) fn anthropic_effort(frozen: &FrozenRenderConfig) -> Option<&str> {
     }
 }
 
+fn same_anthropic_thinking(before: &FrozenRenderConfig, after: &FrozenRenderConfig) -> bool {
+    before.family_id == after.family_id
+        && before.wire_model_id == after.wire_model_id
+        && thinking_mode(before) == thinking_mode(after)
+}
+
+/// Whether the next Anthropic config can keep the top-level thinking and effort and every
+/// earlier per-message effort. If it can, a different effort is appended at the new user turn.
+pub fn anthropic_keeps_effort_prefix(
+    before: &FrozenRenderConfig,
+    after: &FrozenRenderConfig,
+) -> bool {
+    same_anthropic_thinking(before, after) && {
+        let messages = per_message_effort(before);
+        messages == per_message_effort(after)
+            && match (anthropic_effort(before), anthropic_effort(after)) {
+                (Some(old), Some(new)) => old == new || messages,
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
 /// Reasoning efforts from least to most, as the providers spell them.
 const EFFORT_ORDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -170,12 +193,13 @@ pub(crate) fn anthropic_plan(
             plan = None;
             continue;
         };
-        let same_route = index > 0 && {
-            let before = &configs[index - 1];
-            config.family_id == before.family_id
-                && config.wire_model_id == before.wire_model_id
-                && thinking_mode(config) == thinking_mode(before)
-        };
+        let same_route = index > 0
+            && if frozen.renderer_version >= 4 {
+                anthropic_keeps_effort_prefix(&configs[index - 1], config)
+            } else {
+                // Older runs must reproduce their original effort projection.
+                same_anthropic_thinking(&configs[index - 1], config)
+            };
         match plan.as_mut() {
             Some(current) if same_route => {
                 let in_force = current
@@ -208,3 +232,50 @@ pub(crate) fn anthropic_plan(
 #[cfg(test)]
 #[path = "effort_change_tests.rs"]
 mod tests;
+
+pub(crate) fn has_plan_notes(opts: &CallOptions) -> bool {
+    opts.prompt.iter().any(|message| {
+        (message.tags.plan_note && !message.tags.legacy_plan_note)
+            || message.tool_addition.is_some()
+    })
+}
+
+/// Transcript ordinals stay stable as the window moves or the prompt inserts a note.
+/// When the caller supplies no ordinals, keep the original prompt-index fallback.
+pub(crate) fn positions(opts: &CallOptions) -> impl Fn(usize) -> Option<usize> + '_ {
+    let has_ordinals = opts.prompt.iter().any(|message| message.ordinal.is_some());
+    move |index| {
+        opts.prompt[index]
+            .ordinal
+            .map(|ordinal| ordinal as usize)
+            .or_else(|| (!has_ordinals).then_some(index))
+    }
+}
+
+/// The slot before each visible conversation message (plus the tail) receives the effort
+/// updates whose anchors the next positioned message has passed.
+pub(crate) fn anthropic_slots<'a>(
+    frozen: &FrozenRenderConfig,
+    opts: &'a CallOptions,
+    visible: &[usize],
+    plan: Option<&'a EffortPlan>,
+) -> Vec<Vec<&'a str>> {
+    let mut pending = plan.into_iter().flat_map(|plan| &plan.messages).peekable();
+    let mut slots = vec![Vec::new(); visible.len() + 1];
+    let position = positions(opts);
+    for (slot, &index) in visible.iter().enumerate() {
+        if let Some(position) = position(index) {
+            slots[slot].extend(std::iter::from_fn(|| {
+                pending
+                    .next_if(|effort| effort.after < position)
+                    .map(|effort| effort.effort.as_str())
+            }));
+        }
+    }
+    let tail = &mut slots[visible.len()];
+    tail.extend(pending.map(|effort| effort.effort.as_str()));
+    if per_message_effort(frozen) {
+        tail.extend(opts.render_episodes.answer_effort.as_deref());
+    }
+    slots
+}

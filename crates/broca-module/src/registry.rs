@@ -3020,6 +3020,10 @@ impl RegistryHandle {
         self.inner.cache.turn_system_form(model)
     }
 
+    pub(crate) fn writes_tool_addition_notes(&self) -> bool {
+        self.inner.cache.writes_tool_addition_notes()
+    }
+
     /// Remember the cache declaration of the episode that admitted the session, for the reply
     /// to the admitting send.
     pub(crate) fn note_admitted_cache(

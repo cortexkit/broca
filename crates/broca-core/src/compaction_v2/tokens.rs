@@ -16,6 +16,7 @@ pub struct Counts {
     tokenizer_time: std::time::Duration,
     facts: Option<Facts>,
     parts: HashMap<(String, String, String), Cached>,
+    note_estimate_unavailable: bool,
 }
 
 struct Facts {
@@ -35,6 +36,9 @@ struct Cached {
 }
 
 impl Counts {
+    pub fn note_estimate_unavailable(&mut self, unavailable: bool) {
+        self.note_estimate_unavailable = unavailable;
+    }
     pub fn family_id(&self) -> Option<&str> {
         self.facts.as_ref().map(|facts| facts.id.as_str())
     }
@@ -283,20 +287,54 @@ impl Counts {
         page
     }
 
-    pub fn notice(&self, notice: &mut NoticeRequest, notes_declared: bool) {
+    /// Estimate the persistent notes separately from the system text and tools that stay at
+    /// the top of the request. The provider's message framing is not counted by this tokenizer.
+    pub fn plan_notes<'a>(
+        &mut self,
+        texts: impl IntoIterator<Item = &'a str>,
+    ) -> Option<SurfaceTokens> {
+        let family = self.facts.as_ref()?.family;
+        let mut texts = texts.into_iter().peekable();
+        texts.peek()?;
+        let count = texts.fold(0u64, |total, text| {
+            total.saturating_add(
+                timed_count(family.family, text, &mut self.tokenizer_time)
+                    .unwrap_or_else(|| (text.len() as u64).div_ceil(4)),
+            )
+        });
+        Some(SurfaceTokens::new(count, false))
+    }
+
+    pub fn notice(
+        &self,
+        notice: &mut NoticeRequest,
+        next_notes: Option<SurfaceTokens>,
+        notes_declared: bool,
+    ) {
         notice.token_family = None;
         notice.token_family_exact = None;
         if let Some(facts) = &self.facts {
             notice.conditions.system_tokens = facts.system;
             notice.conditions.tools_tokens = facts.tools_count;
-            // Broca has no pending non-entry plan/tool notes: a refresh replaces the frozen
-            // surface. Its reminders and delivered notes are transcript parts, counted there,
-            // not persistent runner notes. Their separate surface is therefore known empty.
-            notice.conditions.notes_tokens =
-                notes_declared.then(|| SurfaceTokens::new(0, facts.family.exact));
+            // Persistent notes are not transcript entries. Report their count separately only
+            // to providers that declare it; everyone else accounts for them in system_tokens.
+            notice.conditions.notes_tokens = (notes_declared && !self.note_estimate_unavailable)
+                .then(|| next_notes.unwrap_or_else(|| SurfaceTokens::new(0, facts.family.exact)));
+            if !notes_declared && self.note_estimate_unavailable {
+                notice.conditions.system_tokens = None;
+            }
+            if let Some(notes) = next_notes.filter(|_| !notes_declared) {
+                notice.conditions.system_tokens = Some(SurfaceTokens::new(
+                    facts
+                        .system
+                        .map_or(0, |system| system.count)
+                        .saturating_add(notes.count),
+                    facts.system.is_some_and(|system| system.exact) && notes.exact,
+                ));
+            }
             if has_counts(&notice.entries)
                 || facts.system.is_some()
-                || facts.tools_count.is_some()
+                || notice.conditions.tools_tokens.is_some()
                 || notice.conditions.notes_tokens.is_some()
             {
                 notice.token_family = Some(facts.id.clone());
@@ -785,6 +823,88 @@ mod tests {
         );
         assert!(notice["entries"][0]["parts"][0]["tokens"].is_object());
         assert_eq!(notice["token_family"], "claude-v5/1");
+    }
+
+    #[tokio::test]
+    async fn notice_counts_persistent_notes_once_for_each_provider_declaration() {
+        use cortexkit_role_compaction::setup::ModelRef;
+        let texts = [
+            "Use the new instructions.",
+            "Tool \"read\" is no longer available. Do not call it.",
+        ];
+        let notes = texts.iter().map(|text| expected(text)).sum::<u64>();
+        let system = expected("system instructions");
+        assert!(notes > 0);
+        for declared in [true, false] {
+            let runtime = super::super::runtime::Runtime::default();
+            let plane = Plane(Default::default(), declared);
+            let mut conditions = super::super::conditions::conditions(
+                ModelRef::new("stub", "gpt-4o"),
+                200_000,
+                1000,
+                false,
+            );
+            {
+                let mut counts = runtime.tokens.lock().unwrap();
+                configure(&mut counts, "gpt-4o");
+                conditions.notes_tokens = counts.plan_notes(texts);
+            }
+            let setup =
+                super::super::conditions::setup_request("default", &conditions, 100, false, 64);
+            runtime.observe(&[text()]);
+            runtime.flush(&plane, &setup, &conditions, None).await;
+            let calls = plane.0.lock().unwrap();
+            let (_, notice) = calls
+                .iter()
+                .find(|(method, _)| method == "compaction.notice")
+                .unwrap();
+            let conditions = &notice["conditions"];
+            if declared {
+                assert_eq!(
+                    conditions["notes_tokens"],
+                    json!({"count": notes, "exact": false})
+                );
+                assert_eq!(conditions["system_tokens"]["count"], system);
+            } else {
+                assert!(conditions.get("notes_tokens").is_none());
+                assert_eq!(
+                    conditions["system_tokens"],
+                    json!({"count": system + notes, "exact": false})
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn notice_counts_notes_even_when_no_system_estimate_exists() {
+        use cortexkit_role_compaction::setup::ModelRef;
+        let runtime = super::super::runtime::Runtime::default();
+        let mut conditions = super::super::conditions::conditions(
+            ModelRef::new("stub", "gpt-4o"),
+            200_000,
+            1000,
+            false,
+        );
+        {
+            let mut counts = runtime.tokens.lock().unwrap();
+            configure(&mut counts, "gpt-4o");
+            counts.facts.as_mut().unwrap().system = None;
+            conditions.notes_tokens = counts.plan_notes(["An owner note is still shown."]);
+        }
+        let setup = super::super::conditions::setup_request("default", &conditions, 100, false, 64);
+        let plane = Plane::default();
+        runtime.observe(&[text()]);
+        runtime.flush(&plane, &setup, &conditions, None).await;
+        let calls = plane.0.lock().unwrap();
+        let notice = &calls
+            .iter()
+            .find(|(method, _)| method == "compaction.notice")
+            .unwrap()
+            .1;
+        assert_eq!(
+            notice["conditions"]["system_tokens"],
+            json!({"count": expected("An owner note is still shown."), "exact": false})
+        );
     }
 
     #[tokio::test]

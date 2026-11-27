@@ -3181,7 +3181,7 @@ impl LiveLoopExecutor {
         &self,
         req: &mut broca_core::RunRequest,
         auth: &Option<broca_protocol::AuthRequest>,
-        control: broca_core::run::RunControl,
+        mut control: broca_core::run::RunControl,
         writer: &mut broca_session_loop::shared::ActorWriter,
         parts: &mut dyn broca_session_loop::parts::Parts,
         mode: broca_module::executor::StoreRunMode,
@@ -3344,6 +3344,16 @@ impl LiveLoopExecutor {
                 "the store actor asked for a {mode:?} run, but the session's latest run says \
                      otherwise"
             ))));
+        }
+        if fresh_episode {
+            broca_module::reconcile_note_route(
+                &mut control,
+                req,
+                writer.operations().plan.as_ref(),
+                parts,
+                &resolved.provider.render_config_blob(),
+            )
+            .map_err(StoreRunError::Admission)?;
         }
         let holds_media = req
             .input
@@ -3520,7 +3530,10 @@ impl LiveLoopExecutor {
             &req.session,
         )
         .await;
-        finished.map_err(StoreRunError::Loop)
+        finished.map_err(|error| match error {
+            broca_session_loop::run::LoopError::Refused(error) => StoreRunError::Admission(error),
+            other => StoreRunError::Loop(other),
+        })
     }
 
     /// The catalog provider whose rows a fresh run on `provider` borrows: `None` when the

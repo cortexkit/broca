@@ -424,6 +424,7 @@ async fn family_e2e<F: WireFamily + 'static>(
         model: ModelHandle::new("mock", "mock-model"),
         input: vec![Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

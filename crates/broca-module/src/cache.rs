@@ -61,6 +61,12 @@ pub trait CacheDeclarer: Send + Sync {
         let _ = model;
         false
     }
+
+    /// A serving executor that can withhold proposed additions against its resolved renderer.
+    /// Without it, a new run applies the pending plan in full if it finds active additions.
+    fn writes_tool_addition_notes(&self) -> bool {
+        false
+    }
 }
 
 /// Target capacity for cache facts. Shared clocks may exceed this target because
@@ -148,6 +154,12 @@ impl CacheTable {
         self.declarer
             .get()
             .is_some_and(|declarer| declarer.turn_system_form(model))
+    }
+
+    pub(crate) fn writes_tool_addition_notes(&self) -> bool {
+        self.declarer
+            .get()
+            .is_some_and(|declarer| declarer.writes_tool_addition_notes())
     }
 
     /// Remove facts when the session's lineage is deleted.

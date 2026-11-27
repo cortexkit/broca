@@ -49,7 +49,7 @@ use {
 };
 
 mod control;
-pub use control::RunControl;
+pub use control::{NoteRouteApply, RunControl};
 
 /// The caller's request to start a run.
 #[derive(Clone, Debug, PartialEq)]

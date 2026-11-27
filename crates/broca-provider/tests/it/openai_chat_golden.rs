@@ -24,6 +24,7 @@ pub(super) fn fixed_request() -> CallOptions {
     let mut opts = CallOptions::new(vec![
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -35,6 +36,7 @@ pub(super) fn fixed_request() -> CallOptions {
         },
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -46,6 +48,7 @@ pub(super) fn fixed_request() -> CallOptions {
         },
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -61,6 +64,7 @@ pub(super) fn fixed_request() -> CallOptions {
         },
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

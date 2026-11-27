@@ -843,12 +843,15 @@ fn plan_notes_last_until_the_change_applies_and_survive_a_checkpoint() {
     };
     let notes = |generation, anchor| {
         Record::PlanNotes(PlanNotes {
+            blocks: None,
             generation,
             anchor,
             notes: vec![PlanNote {
                 kind: PlanNoteKind::ToolRemoval,
                 text: "t".into(),
                 form: "turn_system".into(),
+                tool: None,
+                tool_dispatch: None,
             }],
             refused_tools: vec!["t".into()],
             model_key: "p:m".into(),

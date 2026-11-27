@@ -476,6 +476,7 @@ impl HeldBytes for Message {
             role: _,
             content,
             turn_system: _,
+            tool_addition: _,
             cache_prefix_blocks: _,
             origin,
             ordinal: _,

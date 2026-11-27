@@ -81,6 +81,7 @@ pub(super) fn bind() -> BindIdentity {
 /// config into its runs, as a provider whose model takes media freezes its media profile. With
 /// `notes_sends`, each step notes the request it sends on the seal its run gives it, as a
 /// transport does, so a keep-warm can re-send those bytes.
+#[derive(Clone)]
 pub(super) struct Gated {
     pub(super) inner: StubProvider,
     pub(super) gate: Option<Arc<Notify>>,
@@ -113,6 +114,24 @@ pub(super) struct Hold {
 
 #[async_trait]
 impl broca_core::provider::Provider for Gated {
+    fn refusal_fallback_model(&self) -> Option<broca_protocol::ModelHandle> {
+        serde_json::from_value(
+            self.render_config
+                .as_ref()?
+                .get("refusal_fallback")?
+                .get("model")?
+                .clone(),
+        )
+        .ok()
+    }
+
+    fn refusal_fallback_context_limit(&self) -> Option<u64> {
+        self.render_config
+            .as_ref()?
+            .get("refusal_fallback")?
+            .get("context_limit")?
+            .as_u64()
+    }
     fn admit_temperature(&self, requested: Option<f64>) -> Option<f64> {
         match self.render_config.as_ref().and_then(|value| {
             serde_json::from_value::<broca_provider::wire::FrozenRenderConfig>(value.clone()).ok()
@@ -227,6 +246,15 @@ impl broca_core::provider::Provider for Gated {
         }
     }
 
+    fn renderer_version(&self) -> u32 {
+        if self.render_config.as_ref().is_some_and(|config| {
+            config["family_id"] == "anthropic_messages" && config["renderer_version"] == 4
+        }) {
+            return 4;
+        }
+        self.inner.renderer_version()
+    }
+
     fn render_config_blob_for_version(&self, renderer_version: u32) -> serde_json::Value {
         match &self.render_config {
             Some(config) => config.clone(),
@@ -308,6 +336,8 @@ impl broca_core::provider::Provider for Gated {
 /// Runs each store job through the new loop's admission and run, over a scripted provider.
 pub(super) struct LoopExecutor {
     pub(super) provider: Gated,
+    pub(super) next_render_config: std::sync::Mutex<Option<serde_json::Value>>,
+    pub(super) next_readiness_error: std::sync::Mutex<Option<broca_protocol::ProviderError>>,
     /// Override admission's stored run-start time, including an unknown historical time.
     pub(super) start_time: Option<Arc<std::sync::Mutex<Option<u64>>>>,
     /// When set, a run drained from the queue signals the first `Notify` and waits on the second
@@ -338,6 +368,15 @@ pub(super) struct LoopExecutor {
 
 /// Waits for the media the actor sends a run, without rendering any.
 struct MediaWait(tokio::sync::Mutex<Option<crate::store_media::StoreRunMediaWait>>);
+
+struct FailedReadiness(broca_protocol::ProviderError);
+
+#[async_trait]
+impl broca_session_loop::run::ModelCallReady for FailedReadiness {
+    async fn ready(&self) -> Result<(), broca_protocol::ProviderError> {
+        Err(self.0.clone())
+    }
+}
 
 #[async_trait]
 impl broca_session_loop::run::ModelCallReady for MediaWait {
@@ -446,6 +485,8 @@ pub(super) fn executor(
     gate: Option<Arc<Notify>>,
 ) -> LoopExecutor {
     LoopExecutor {
+        next_render_config: Default::default(),
+        next_readiness_error: Default::default(),
         start_time: None,
         provider: Gated {
             inner: StubProvider::new(steps),
@@ -500,10 +541,29 @@ impl RunExecutor for LoopExecutor {
             keep_warm,
             ..
         } = job;
+        let overridden = self
+            .next_render_config
+            .lock()
+            .unwrap()
+            .take()
+            .map(|config| Gated {
+                render_config: Some(config),
+                ..self.provider.clone()
+            });
+        let provider = overridden.as_ref().unwrap_or(&self.provider);
         let media_wait = media.filter(|_| self.waits_for_media).map(|media| {
             Arc::new(MediaWait(tokio::sync::Mutex::new(Some(media))))
                 as Arc<dyn broca_session_loop::run::ModelCallReady>
         });
+        let readiness = self
+            .next_readiness_error
+            .lock()
+            .unwrap()
+            .take()
+            .map(|error| {
+                Arc::new(FailedReadiness(error)) as Arc<dyn broca_session_loop::run::ModelCallReady>
+            })
+            .or(media_wait);
         // The module's executor admits a run's context limit from the caller's override when
         // the send names one.
         control.admitted_context_limit = control.admitted_context_limit.or(req.context_limit);
@@ -513,6 +573,20 @@ impl RunExecutor for LoopExecutor {
                 .unwrap()
                 .push(control.rebuild_point);
             control.auth_selection = self.auth_selection.clone().or(control.auth_selection);
+            if let Some(config) = &provider.render_config {
+                if let Err(error) = crate::reconcile_note_route(
+                    &mut control,
+                    &mut req,
+                    writer.operations().plan.as_ref(),
+                    parts.as_ref(),
+                    config,
+                ) {
+                    return StoreRunEnd {
+                        parts,
+                        result: Err(StoreRunError::Admission(error)),
+                    };
+                }
+            }
         }
         if let (Some((reached, release)), Some(_)) = (&self.drain_gate, &req.submission_id) {
             reached.notify_one();
@@ -526,7 +600,7 @@ impl RunExecutor for LoopExecutor {
                     broca_session_loop::admit::admission(
                         &mut req,
                         &control,
-                        &self.provider,
+                        provider,
                         writer.operations(),
                         self.start_time
                             .as_ref()
@@ -552,7 +626,7 @@ impl RunExecutor for LoopExecutor {
             *self.steer_yields.lock().unwrap() = control.steer_yields.clone();
             let seams = Seams {
                 steer_yields: control.steer_yields.clone(),
-                provider: &self.provider,
+                provider,
                 tools: &tools,
                 bind: req.session.clone(),
                 out: Some(&out),
@@ -576,7 +650,7 @@ impl RunExecutor for LoopExecutor {
                 auth_selection: None,
                 step_progress: control.step_progress.clone(),
                 accepting_drain: control.accepting_drain.clone(),
-                model_call_ready: media_wait,
+                model_call_ready: readiness,
                 pause_for_auth_at_start: None,
                 account_continue: None,
             };

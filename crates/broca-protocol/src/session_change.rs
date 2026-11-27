@@ -70,6 +70,8 @@ pub struct DeliveredNote {
     pub kind: NoteKind,
     pub text: String,
     pub form: String,
+    pub tool: Option<crate::tool_addition::ToolDefinition>,
+    pub tool_dispatch: Option<String>,
 }
 
 /// What a [`DeliveredNote`] announces.
@@ -77,12 +79,13 @@ pub struct DeliveredNote {
 pub enum NoteKind {
     System,
     ToolRemoval,
+    ToolAddition,
     /// An undo of a removal, for a tool still present in the applied plan.
     ToolRestored,
 }
 
-/// The only form broca delivers notes in: a persistent system-role turn at the note's place in
-/// the conversation, never one cleared at the next user turn.
+/// Text notes use a persistent system-role turn at their place in the conversation, never one
+/// cleared at the next user turn.
 pub const NOTE_FORM_TURN_SYSTEM: &str = "turn_system";
 
 /// The key a run's model is compared by when deciding whether the model switched between runs.

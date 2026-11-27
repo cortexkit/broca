@@ -324,3 +324,110 @@ fn a_fork_answer_effort_on_gpt6_is_an_update_before_the_question() {
         "{input:#?}"
     );
 }
+
+fn native_tool(
+    form: broca_protocol::tool_addition::ToolAdditionForm,
+) -> broca_core::plan_notes::Note<'static> {
+    broca_core::plan_notes::Note::ToolAddition(
+        form,
+        broca_protocol::tool_addition::ToolDefinition {
+            name: "find".into(),
+            description: "Find a place".into(),
+            input_schema: json!({"type":"object"}).into(),
+        },
+    )
+}
+
+#[test]
+fn a_view_gap_can_flush_an_effort_after_a_native_declaration() {
+    use broca_protocol::tool_addition::ToolAdditionForm::AnthropicToolAddition;
+    let frozen = opus("high");
+    let mut opts = request(&[opus("low"), frozen.clone()]);
+    opts.prompt = vec![
+        text(Role::User, "old note anchor"),
+        text(Role::Assistant, "reply kept past the cut"),
+    ];
+    opts.prompt[0].ordinal = Some(0);
+    opts.prompt[1].ordinal = Some(4);
+    std::sync::Arc::make_mut(&mut opts.render_episodes).raw_ordinals = true;
+    let view =
+        broca_core::plan_notes::view(&opts, [(1, native_tool(AnthropicToolAddition))]).unwrap();
+    let wire = AnthropicMessages.shape(&frozen, &view);
+    assert_eq!(wire["messages"][1]["content"][0]["type"], "tool_addition");
+    assert_eq!(wire["messages"][2]["output_config"]["effort"], "high");
+}
+
+#[test]
+fn older_notes_do_not_mix_prompt_indices_and_ordinals_for_effort() {
+    use broca_protocol::tool_addition::ToolAdditionForm::AnthropicToolAddition;
+    let frozen = opus("high");
+    let mut opts = request(&[opus("low"), frozen.clone()]);
+    broca_protocol::content::stamp_ordinals(&mut opts.prompt);
+    let view = broca_core::plan_notes::view(
+        &opts,
+        [
+            (1, broca_core::plan_notes::Note::Text("Earlier note")),
+            (3, native_tool(AnthropicToolAddition)),
+        ],
+    )
+    .unwrap();
+    let wire = AnthropicMessages.shape(&frozen, &view);
+    assert!(wire["messages"].to_string().contains("tool_addition"));
+    assert_eq!(
+        wire["messages"].as_array().unwrap().last().unwrap()["output_config"]["effort"],
+        "high"
+    );
+}
+
+#[test]
+fn responses_keeps_answer_effort_when_a_native_addition_ends_the_prompt() {
+    use crate::families::{openai_responses::OpenAiResponses, openai_responses_frozen_config};
+    use broca_protocol::tool_addition::ToolAdditionForm::ResponsesAdditionalTools;
+    let mut frozen = openai_responses_frozen_config("gpt-6-luna");
+    frozen.reasoning = crate::policy::ReasoningPolicy::OpenAiResponsesReasoning {
+        effort: "high".into(),
+        summary: Some("auto".into()),
+    };
+    frozen.effort_change_cache = true;
+    let mut opts = request(std::slice::from_ref(&frozen));
+    broca_protocol::content::stamp_ordinals(&mut opts.prompt);
+    std::sync::Arc::make_mut(&mut opts.render_episodes).answer_effort = Some("low".into());
+    let opts =
+        broca_core::plan_notes::view(&opts, [(1, native_tool(ResponsesAdditionalTools))]).unwrap();
+    let wire = OpenAiResponses.shape(&frozen, &opts);
+    let items = wire["input"].as_array().unwrap();
+    assert_eq!(items[0]["type"], "configuration_update");
+    assert_eq!(items[0]["reasoning"]["effort"], "low");
+    assert_eq!(items[1]["role"], "user");
+    assert_eq!(items[2]["type"], "additional_tools");
+}
+
+#[test]
+fn responses_keeps_a_native_addition_next_to_an_actual_configuration_update() {
+    use crate::families::OpenAiResponses;
+    use broca_protocol::tool_addition::ToolAdditionForm::ResponsesAdditionalTools;
+    let gpt = |effort: &str| {
+        let mut config = crate::families::openai_responses_frozen_config("gpt-6-luna");
+        config.reasoning = crate::policy::ReasoningPolicy::OpenAiResponsesReasoning {
+            effort: effort.into(),
+            summary: Some("auto".into()),
+        };
+        config.effort_change_cache = true;
+        config
+    };
+    let frozen = gpt("high");
+    let mut opts = request(&[gpt("low"), frozen.clone()]);
+    opts.prompt = vec![
+        text(Role::User, "old anchor"),
+        text(Role::Assistant, "reply kept past the view gap"),
+    ];
+    opts.prompt[0].ordinal = Some(0);
+    opts.prompt[1].ordinal = Some(4);
+    std::sync::Arc::make_mut(&mut opts.render_episodes).raw_ordinals = true;
+    let opts =
+        broca_core::plan_notes::view(&opts, [(1, native_tool(ResponsesAdditionalTools))]).unwrap();
+    let wire = OpenAiResponses.shape(&frozen, &opts);
+    let input = wire["input"].as_array().unwrap();
+    assert_eq!(input[1]["type"], "additional_tools");
+    assert_eq!(input[2]["type"], "configuration_update");
+}

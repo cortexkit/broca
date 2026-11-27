@@ -24,6 +24,7 @@ use broca_session_store::session::COMPACTION_PAGE_ENTRIES_IN_MEMORY;
 use crate::run::{Admission, LoopError, Seams};
 use crate::writer::Writer;
 
+mod notes;
 pub(crate) mod prompt;
 mod window;
 pub use window::{WeakWindow, WindowTranscript};
@@ -70,11 +71,12 @@ pub async fn earlier_context<W: Writer>(
     else {
         return Ok(None);
     };
-    let start = writer.run_start(&run).await?.ok_or_else(|| {
+    let missing = || {
         LoopError::Parts(format!(
             "the session names run {run} as its newest request's, but holds no start for it"
         ))
-    })?;
+    };
+    let start = writer.run_start(&run).await?.ok_or_else(missing)?;
     if start.compaction_plan_version.is_none() {
         return Ok(Some((run, None)));
     }
@@ -185,6 +187,7 @@ pub async fn restore_live<W: Writer>(writer: &W, bind: &BindIdentity) -> Result<
 pub struct StoreJournal<'w, W> {
     writer: tokio::sync::Mutex<&'w mut W>,
     bind: &'w BindIdentity,
+    note_route: Option<(&'w Admission, Option<u64>)>,
 }
 
 impl<'w, W: Writer> StoreJournal<'w, W> {
@@ -192,7 +195,13 @@ impl<'w, W: Writer> StoreJournal<'w, W> {
         Self {
             writer: tokio::sync::Mutex::new(writer),
             bind,
+            note_route: None,
         }
+    }
+
+    fn with_note_route(mut self, admission: &'w Admission, floor: Option<u64>) -> Self {
+        self.note_route = Some((admission, floor));
+        self
     }
 
     async fn commit(&self, record: Record) -> Result<(), String> {
@@ -251,6 +260,28 @@ impl<W: Writer> v2::request::ReadBack for StoredReadBack<'_, '_, W> {
 }
 
 impl<W: Writer> Journal for StoreJournal<'_, W> {
+    async fn check_restored_notes(
+        &self,
+        boundary: &v2::state::Boundary<'_>,
+        previous: Option<&cortexkit_role_compaction::view::View>,
+        next: &cortexkit_role_compaction::view::View,
+    ) -> Result<(), cortexkit_role_compaction::view::ViewRefusal> {
+        let writer = self.writer.lock().await;
+        let Some((admission, floor)) = self.note_route else {
+            return Ok(());
+        };
+        if !notes::has_marked_notes(writer.operations()) {
+            return Ok(());
+        }
+        let opts = notes::restore_options(&**writer, admission, floor).await;
+        notes::check_restore(
+            writer.operations(),
+            boundary,
+            previous,
+            next,
+            opts.as_ref().ok().map(|opts| (admission, opts)),
+        )
+    }
     /// A view a run's step accepted. No provider handed it over through `session.apply_view`,
     /// so it records no provider.
     async fn accepted(
@@ -765,9 +796,20 @@ pub async fn offline_prompt<W: Writer>(
     step: u64,
     opts: broca_protocol::request::CallOptions,
 ) -> Result<broca_protocol::request::CallOptions, LoopError> {
+    offline_prompt_with_view(writer, admission, bind, step, opts, false).await
+}
+
+pub(crate) async fn offline_prompt_with_view<W: Writer>(
+    writer: &W,
+    admission: &Admission,
+    bind: &BindIdentity,
+    step: u64,
+    opts: broca_protocol::request::CallOptions,
+    prospective: bool,
+) -> Result<broca_protocol::request::CallOptions, LoopError> {
     let records = writer.open_log_records().await?;
     let state = restore(&records, bind, writer.operations()).map_err(LoopError::Parts)?;
-    let view = state.shared_view_for_step(step);
+    let mut view = state.shared_view_for_step(step);
     let session = Arc::new(v2::session::Session::default());
     *session.state.lock().await = state;
     let ctx = Ctx {
@@ -778,6 +820,45 @@ pub async fn offline_prompt<W: Writer>(
         window: WindowTranscript::default(),
     };
     let transcript = transcript(writer, &ctx).await?;
+    if prospective {
+        let floor = floor_through(
+            writer,
+            &transcript.entries,
+            opts.render_episodes.signed_floor,
+        )
+        .await?;
+        if let Ok(conditions) = conditions_for(
+            writer,
+            admission,
+            &transcript.entries,
+            false,
+            floor.as_deref(),
+        ) {
+            let state = ctx.session.state.lock().await;
+            let next = v2::shown::next_request_view(&state, &transcript.entries, &conditions, None);
+            let boundary = v2::state::Boundary {
+                step,
+                entries: &transcript.entries,
+                rules: &conditions.rules,
+                floor: v2::host::view_floor(&conditions),
+                next_mid: "",
+            };
+            view = next
+                .filter(|next| {
+                    notes::check_restore(
+                        writer.operations(),
+                        &boundary,
+                        state.applied(),
+                        next,
+                        Some((admission, &opts)),
+                    )
+                    .is_ok()
+                })
+                .or_else(|| state.applied())
+                .cloned()
+                .map(Arc::new);
+        }
+    }
     let opts = with_sealed(opts, &transcript);
     let rides = placed_rides(&transcript.rides, admission);
     let prompt = v2::render::prompt_with_rides(
@@ -1117,7 +1198,12 @@ pub async fn floor_through<W: Writer>(
     if let Some(mid) = v2::host::floor_entry(Some(through), entries) {
         return Ok(Some(mid.to_owned()));
     }
-    Ok(writer.entry_mid_at(through).await?)
+    // A newer ID would exempt reasoning the wire can still echo. If this exact ID cannot
+    // be resolved, the compaction provider gets no signed-reasoning exemption.
+    Ok(match writer.entry_mid_at(through).await {
+        Ok(Some(mid)) => Some(mid),
+        _ => writer.entry_mid_at(through).await.ok().flatten(),
+    })
 }
 
 /// The version of the view under which the request whose usage `entry` reports was rendered,
@@ -1189,7 +1275,7 @@ pub async fn apply_boundary<W: Writer, P, T>(
         Ok(conditions) => conditions,
         Err(message) => return Ok(Err(message)),
     };
-    let journal = StoreJournal::new(writer, &seams.bind);
+    let journal = StoreJournal::new(writer, &seams.bind).with_note_route(admission, signed_floor);
     v2::request::apply_boundary(
         &ctx.session.state,
         &ctx.session.runtime,
@@ -1236,18 +1322,18 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
     let front = transcript.sealed.len();
     let window_start = writer.conversation().window_start();
     let stored = kept.stored(&transcript.sealed);
-    let entries = transcript.entries;
-    let transcript_rides = transcript.rides;
+    let entries = Arc::clone(&transcript.entries);
     let now = (seams.now_ms)();
     let last_cache = writer.operations().last_cache_send.clone();
     let chained = seams.provider.history_edit_cost()
         == Some(broca_core::compaction_provider::notice::HistoryEditCost::FullResend);
     // The request carries the session's signed floor, which the compaction calls report.
     let floor = floor_through(writer, &entries, opts.render_episodes.signed_floor).await?;
-    let conditions = match conditions_for(writer, admission, &entries, chained, floor.as_deref()) {
-        Ok(conditions) => conditions,
-        Err(message) => return Ok(Send::Unavailable(message)),
-    };
+    let mut conditions =
+        match conditions_for(writer, admission, &entries, chained, floor.as_deref()) {
+            Ok(conditions) => conditions,
+            Err(message) => return Ok(Send::Unavailable(message)),
+        };
     let current = send_context(admission);
     let previous = previous(writer, moved_from.unwrap_or(admission), ctx)?;
     let plane = v2::runtime::BoundPlane {
@@ -1256,10 +1342,9 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         bind: &seams.bind,
         scope: admission.send.scope.as_ref(),
     };
-    let journal = StoreJournal::new(writer, &seams.bind);
     // A ride renders by its envelope; text delivered before envelopes existed renders the way it
     // always did.
-    let rides = placed_rides(&transcript_rides, admission);
+    let rides = placed_rides(&transcript.rides, admission);
     #[cfg(test)]
     let rendered_before = rendered.rendered();
     ctx.session
@@ -1268,6 +1353,17 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .configure(&frozen(admission), admission.manifest.as_deref());
+    notes::count(
+        writer,
+        admission,
+        ctx,
+        &transcript,
+        &mut conditions,
+        notes::Next::Step(step, &opts, stored),
+    )
+    .await;
+    let journal = StoreJournal::new(writer, &seams.bind)
+        .with_note_route(admission, opts.render_episodes.signed_floor);
     let read_back = StoredReadBack {
         journal: &journal,
         front,
@@ -1327,13 +1423,13 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
             media,
             ..
         } => {
+            let request =
+                Box::new(finish(&opts, prompt, media, admission).map_err(LoopError::Parts)?);
             release_unread(writer, kept, &restored, &releasable, window_start).await?;
             seams
                 .provider
                 .set_cache_evidence_view(applied.map(|view| view.version));
-            Ok(Send::Ready(Box::new(
-                finish(&opts, prompt, media, admission).map_err(LoopError::Parts)?,
-            )))
+            Ok(Send::Ready(request))
         }
         v2::request::Prepared::CompactionUnavailable => Ok(Send::Unavailable(
             "compaction provider Setup is unavailable".into(),
@@ -1397,27 +1493,38 @@ pub async fn notice<W: Writer, P, T>(
     seams: &Seams<'_, P, T>,
     ctx: &Ctx,
     signed_floor: Option<u64>,
+    episodes: Option<&Arc<broca_protocol::request::RenderHistory>>,
 ) -> Result<(), LoopError> {
     // Without a frozen window no conditions can be stated, so nothing is announced; the next
     // step's boundary ends the run.
     if admission.context_limit.is_none() {
         return Ok(());
     }
-    let entries = transcript(writer, ctx).await?.entries;
+    let transcript = transcript(writer, ctx).await?;
+    let entries = &transcript.entries;
     ctx.session
         .runtime
         .tokens
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .configure(&frozen(admission), admission.manifest.as_deref());
-    let floor = floor_through(writer, &entries, signed_floor).await?;
+    let floor = floor_through(writer, entries, signed_floor).await?;
     // Conditions that can't be stated announce nothing either: the next step's boundary meets
     // the same failure and ends the run `compaction_unavailable` (`apply_boundary`), once the
     // step's tool batch has closed, rather than failing the run here with its tool turn open.
-    let Ok(conditions) = conditions_for(writer, admission, &entries, false, floor.as_deref())
+    let Ok(mut conditions) = conditions_for(writer, admission, entries, false, floor.as_deref())
     else {
         return Ok(());
     };
+    notes::count(
+        writer,
+        admission,
+        ctx,
+        &transcript,
+        &mut conditions,
+        notes::Next::Boundary(episodes),
+    )
+    .await;
     let applied = ctx.session.state.lock().await.applied_identity();
     let mut setup = v2::conditions::setup_request(
         &ctx.preset,
@@ -1427,8 +1534,8 @@ pub async fn notice<W: Writer, P, T>(
         COMPACTION_PAGE_ENTRIES_IN_MEMORY,
     );
     setup.applied_view = applied.clone();
-    setup.newest = v2::views::newest(&entries);
-    ctx.session.runtime.observe(&entries);
+    setup.newest = v2::views::newest(entries);
+    ctx.session.runtime.observe(entries);
     ctx.session
         .runtime
         .flush(
@@ -1459,6 +1566,10 @@ pub struct Changes<'a> {
 }
 
 impl<'a> Changes<'a> {
+    pub(crate) fn with_floor(mut self, floor: Option<u64>) -> Self {
+        self.signed_floor = floor;
+        self
+    }
     /// The changes a run of `admission` tells its compaction provider about, when the seams ask
     /// for them (`Seams::compaction_changes`) and the run is on the current compaction contract
     /// under a plan that names a compaction provider with a preset. They go through the
@@ -1500,7 +1611,24 @@ impl<'a> Changes<'a> {
     /// Tells the provider of every change since its last notice. A failure is left for the next
     /// notice to make up, as `compaction_v2::host::notice` leaves its own.
     pub async fn tell<W: Writer, P, T>(&self, writer: &W, seams: &Seams<'_, P, T>) {
-        let _ = notice(writer, self.admission, seams, &self.ctx, self.signed_floor).await;
+        self.tell_with_history(writer, seams, None).await;
+    }
+
+    pub(crate) async fn tell_with_history<W: Writer, P, T>(
+        &self,
+        writer: &W,
+        seams: &Seams<'_, P, T>,
+        episodes: Option<&Arc<broca_protocol::request::RenderHistory>>,
+    ) {
+        let _ = notice(
+            writer,
+            self.admission,
+            seams,
+            &self.ctx,
+            self.signed_floor,
+            episodes,
+        )
+        .await;
     }
 }
 

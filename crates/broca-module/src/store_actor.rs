@@ -2267,6 +2267,18 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         req.retention_policy = prepared.retention_policy;
         let step: broca_core::provider::LiveStepProgress = Arc::default();
         let (steer_yields, steer_yields_seen) = tokio::sync::watch::channel(Default::default());
+        let note_route = (prepared.applies_refresh.is_none()
+            && (prepared
+                .plan_notes
+                .as_ref()
+                .is_some_and(|delivery| !delivery.notes.is_empty())
+                || self
+                    .session
+                    .operations()
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.has_rendered_notes())))
+        .then(|| self.late_note_apply());
         let control = RunControl {
             steer_yields: Some(broca_core::tool_plane::SteerYields(steer_yields_seen)),
             clock: self.retention_clock.clone(),
@@ -2303,6 +2315,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             pre_model_error: prepared.pre_model_error,
             applies_refresh: prepared.applies_refresh,
             plan_notes: prepared.plan_notes,
+            note_route,
             rebuild_point: prepared.rebuild_point,
             ..Default::default()
         };
@@ -2834,6 +2847,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         &self,
         model: &broca_protocol::ModelHandle,
         variant: Option<&str>,
+        scoped: bool,
     ) -> Result<crate::plan_change::RunPlan, SendOutcome> {
         use broca_fetch_plan::session_change::{
             applies_at_run_start, model_key, Applying, EffectiveState, PendingState,
@@ -2893,6 +2907,34 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // A change waiting under `notes_until_rebuild` (llm-runner `plan_notes`) follows rules of
         // its own (`crate::plan_notes`): a rebuild an earlier run already paid for is no reason
         // to apply it now, only a cache this run loses anyway is.
+        let writes_additions = self
+            .registry
+            .as_ref()
+            .is_some_and(|registry| registry.writes_tool_addition_notes());
+        let rendering_anchors = if writes_additions
+            && plan
+                .notes
+                .iter()
+                .any(|delivery| delivery.blocks == Some(true))
+        {
+            let read = || {
+                Box::pin(broca_session_loop::run::next_note_anchors(
+                    &self.session,
+                    &self.parts,
+                    &self.key,
+                ))
+            };
+            Some(match read().await {
+                Ok(anchors) => anchors,
+                Err(_) => read().await.map_err(|error| {
+                    SendOutcome::Transient(format!(
+                        "the plan-note request preview could not read the session: {error:?}"
+                    ))
+                })?,
+            })
+        } else {
+            None
+        };
         let notes = if let Some(pending) = pending
             .as_ref()
             .filter(|pending| pending.policy == broca_core::plan_notes::NOTES_UNTIL_REBUILD)
@@ -2913,10 +2955,16 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                     .await
                     .map_err(SendOutcome::Transient)?
             };
-            let turn_system = self
-                .registry
+            let resolved = latest
                 .as_ref()
-                .is_some_and(|registry| registry.turn_system_form(model));
+                .map(|previous| previous.render_config.as_ref());
+            let turn_system = resolved
+                .and_then(crate::plan_notes::text_form)
+                .unwrap_or_else(|| {
+                    self.registry
+                        .as_ref()
+                        .is_some_and(|registry| registry.turn_system_form(model))
+                });
             let inherited_note = if plan.pending_note.is_none()
                 && turn_system
                 && !cache_lost
@@ -2951,6 +2999,12 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 cache_lost,
                 turn_system,
                 model_key: model_key(model),
+                rendering_anchors: rendering_anchors.as_ref(),
+                redelivery_enabled: writes_additions,
+                tool_addition_form: resolved
+                    .filter(|_| writes_additions)
+                    .and_then(|frozen| crate::plan_notes::frozen_addition_form(model, frozen)),
+                scoped,
             });
             Some((cache_lost, at_start))
         } else {
@@ -3028,6 +3082,15 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         Ok((manifest, applies, rebuild_point, delivery))
     }
 
+    fn late_note_apply(&self) -> broca_core::run::NoteRouteApply {
+        let family = self
+            .latest_admission()
+            .ok()
+            .flatten()
+            .and_then(|run| run.render_config["family_id"].as_str().map(str::to_owned));
+        broca_core::run::NoteRouteApply { family }
+    }
+
     /// Freezes the session's fetch plan into a run about to start according to
     /// `crate::plan_episode`: a plan that confines its tools needs a scope, and the run takes
     /// the manifest's tools and, on the session's first run, its system text first. A later run
@@ -3041,7 +3104,11 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let first_run = self.session.operations().owner.needs_admission();
         if !first_run {
             let (manifest, applies, rebuild_point, plan_notes) = self
-                .run_plan(&start.request.model, start.request.variant.as_deref())
+                .run_plan(
+                    &start.request.model,
+                    start.request.variant.as_deref(),
+                    start.scope.is_some(),
+                )
                 .await?;
             start.manifest = manifest;
             start.prepared.applies_refresh = applies;
@@ -3762,48 +3829,51 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         // plain send), so it drains first.
         let own_admission = waiting.as_ref().is_some_and(|(id, _)| id.0 == first);
         match self.drained_start(&first, own_admission).await {
-            Ok((mut start, mut drained)) => match async {
-                let class = self.session_class(start.session_class.as_deref())?;
-                start.session_class = class;
-                self.freeze_plan(&mut start).await
+            Ok((mut start, mut drained)) => {
+                let admitted = match self.session_class(start.session_class.as_deref()) {
+                    Ok(class) => {
+                        start.session_class = class;
+                        self.freeze_plan(&mut start).await
+                    }
+                    Err(refusal) => Err(refusal),
+                };
+                match admitted {
+                    Ok(()) => {
+                        if self.is_accepting_drain() {
+                            return;
+                        }
+                        start.prepared.hooks = crate::actor::pre_user::drained_hooks(
+                            drained.hooks.take(),
+                            &start.request.input,
+                        );
+                        let reply = waiting
+                            .take_if(|(id, _)| *id == drained.submission)
+                            .map(|(_, reply)| reply);
+                        // The run's input points at the media the queued record stored.
+                        self.held = std::mem::take(&mut drained.media);
+                        self.start_run(start, Some(drained), reply, StoreRunMode::Fresh)
+                            .await
+                    }
+                    Err(outcome) => {
+                        // The send can't start under the session's class or plan: it ends with the refusal,
+                        // as a drained send refused at admission ends, and the next one is tried.
+                        let error = broca_core::RunError::Config(format!("{outcome:?}"));
+                        match self
+                            .end_refused_drain(&drained.submission, &start.run_id, error)
+                            .await
+                        {
+                            Ok(()) => Box::pin(self.drain_once(waiting)).await,
+                            Err(error) => tracing::error!(
+                                target: "broca.store_actor",
+                                session = %self.key.session,
+                                submission_id = %drained.submission.0,
+                                error = %error,
+                                "a queued send refused by the session's plan could not be ended",
+                            ),
+                        }
+                    }
+                }
             }
-            .await
-            {
-                Ok(()) => {
-                    if self.is_accepting_drain() {
-                        return;
-                    }
-                    start.prepared.hooks = crate::actor::pre_user::drained_hooks(
-                        drained.hooks.take(),
-                        &start.request.input,
-                    );
-                    let reply = waiting
-                        .take_if(|(id, _)| *id == drained.submission)
-                        .map(|(_, reply)| reply);
-                    // The run's input points at the media the queued record stored.
-                    self.held = std::mem::take(&mut drained.media);
-                    self.start_run(start, Some(drained), reply, StoreRunMode::Fresh)
-                        .await
-                }
-                Err(outcome) => {
-                    // The send can't start under the session's class or plan: it ends with the refusal,
-                    // as a drained send refused at admission ends, and the next one is tried.
-                    let error = broca_core::RunError::Config(format!("{outcome:?}"));
-                    match self
-                        .end_refused_drain(&drained.submission, &start.run_id, error)
-                        .await
-                    {
-                        Ok(()) => Box::pin(self.drain_once(waiting)).await,
-                        Err(error) => tracing::error!(
-                            target: "broca.store_actor",
-                            session = %self.key.session,
-                            submission_id = %drained.submission.0,
-                            error = %error,
-                            "a queued send refused by the session's plan could not be ended",
-                        ),
-                    }
-                }
-            },
             Err(error) => self.end_unreadable_drain(first, error, waiting).await,
         }
     }

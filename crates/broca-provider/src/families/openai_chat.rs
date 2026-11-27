@@ -352,6 +352,12 @@ fn convert_messages_with_provenance<'a>(
         }
         let origin_start = provenance.as_ref().map(|_| out.len());
         match m.role {
+            Role::System if m.tool_addition.is_some() => {
+                out.push(crate::turn_system::tool_addition::render(
+                    m.tool_addition.as_ref().unwrap(),
+                    name_map,
+                ))
+            }
             Role::System => out.push(Node::object([
                 ("role", Node::str("system")),
                 ("content", text_content(&m.content)),

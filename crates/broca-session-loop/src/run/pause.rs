@@ -58,6 +58,7 @@ pub(super) async fn sign_in_at_start<W: Writer, P: Provider, T: ToolPlane>(
                 &admission,
                 &moved_seams,
                 compaction.or(moved_compaction.as_ref()),
+                None,
             )
             .await?;
             transport.finished(&finished);

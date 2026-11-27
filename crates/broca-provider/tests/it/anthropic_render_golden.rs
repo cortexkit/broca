@@ -37,6 +37,7 @@ mod gated {
         let mut opts = CallOptions::new(vec![
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -48,6 +49,7 @@ mod gated {
             },
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -62,6 +64,7 @@ mod gated {
             // cross-model signature (a different producing model) would be stripped.
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -79,6 +82,7 @@ mod gated {
             },
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -92,6 +96,7 @@ mod gated {
             // tool call.
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -114,6 +119,7 @@ mod gated {
             // The tool result turn.
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -213,6 +219,7 @@ mod gated {
         CallOptions::new(vec![
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -229,6 +236,7 @@ mod gated {
             },
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -240,6 +248,7 @@ mod gated {
             },
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -251,6 +260,7 @@ mod gated {
             },
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -262,6 +272,7 @@ mod gated {
             },
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -273,6 +284,7 @@ mod gated {
             },
             Message {
                 turn_system: false,
+                tool_addition: None,
                 cache_prefix_blocks: None,
                 origin: None,
                 ordinal: None,
@@ -378,6 +390,7 @@ mod gated {
     fn assistant_step(n: u32, thinking: &str) -> Message {
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -402,6 +415,7 @@ mod gated {
     fn tool_step(n: u32) -> Message {
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -423,6 +437,7 @@ mod gated {
     fn tool_loop_request() -> CallOptions {
         let text = |role: Role, text: &str| Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

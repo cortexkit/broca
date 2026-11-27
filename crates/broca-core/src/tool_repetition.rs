@@ -921,6 +921,7 @@ mod prompt_fold_tests {
     fn turn(role: Role, content: Vec<ContentBlock>) -> Message {
         Message {
             turn_system: false,
+            tool_addition: None,
             role,
             content,
             cache_prefix_blocks: None,

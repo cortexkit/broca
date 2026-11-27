@@ -841,6 +841,22 @@ pub trait WireFamily: Send + Sync {
         body: Vec<u8>,
     ) -> HttpRequest;
 
+    /// Attach the native-tool beta when the selected request view emitted declarations.
+    fn endpoint_with_tool_notes(
+        &self,
+        frozen: &FrozenRenderConfig,
+        auth: &AuthHandle,
+        body: Vec<u8>,
+        native_tools: bool,
+    ) -> HttpRequest {
+        let mut request = self.endpoint(frozen, auth, body);
+        crate::turn_system::tool_addition::add_anthropic_beta(
+            &mut request,
+            native_tools && frozen.family_id == WireFamilyId::AnthropicMessages,
+        );
+        request
+    }
+
     /// A fresh per-stream incremental normalizer (response bytes → canonical
     /// events). The wire framing (text/SSE vs binary event-stream) is the
     /// normalizer's internal concern.

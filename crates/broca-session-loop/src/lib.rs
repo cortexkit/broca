@@ -66,6 +66,7 @@ pub use writer::Writer;
 mod early_result_tests;
 #[cfg(test)]
 mod offline_plan_system_tests;
+pub mod recorded_request;
 #[cfg(test)]
 mod shared_text_tests;
 #[cfg(test)]

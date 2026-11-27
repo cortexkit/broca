@@ -738,6 +738,11 @@ pub(crate) fn render(
     let frozen: broca_provider::wire::FrozenRenderConfig =
         serde_json::from_value(config.frozen_render_config.clone())
             .map_err(|error| format!("the head's render config: {error}"))?;
+    let frozen = frozen
+        .refusal_fallback
+        .as_deref()
+        .filter(|fallback| opts.target_model.as_ref() == Some(&fallback.model))
+        .map_or(&frozen, |fallback| &fallback.frozen);
     let family = broca_provider::registry::wire_family(frozen.family_id)
         .ok_or("the head's wire family isn't known")?;
     Ok(family.render_with_provenance(&frozen.for_step(opts), opts, None))

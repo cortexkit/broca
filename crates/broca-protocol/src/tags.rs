@@ -189,7 +189,7 @@ impl From<&MessageTags> for PartTags {
 /// Equality always holds, so two messages with the same content compare equal whether or not
 /// their tags were attached. Tags are not content, and every equality check on messages in
 /// this workspace is a check of content.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct TagSlot {
     tags: Option<Arc<PartTags>>,
     /// Whether [`render_tags_into`] already prefixed this message's text, so that rendering
@@ -204,6 +204,24 @@ pub struct TagSlot {
     /// longer need rendering.
     /// Being outside the content, the texts take no part number and are never stored.
     pub(crate) rides_after_results: Option<Arc<Vec<String>>>,
+    /// Marks plan text that must stay a system message, never a user message.
+    pub plan_note: bool,
+    /// The note uses the original string template and placement rules.
+    pub legacy_plan_note: bool,
+}
+
+impl std::fmt::Debug for TagSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut slot = formatter.debug_struct("TagSlot");
+        slot.field("tags", &self.tags)
+            .field("rendered", &self.rendered)
+            .field("delivery", &self.delivery)
+            .field("rides_after_results", &self.rides_after_results);
+        if self.plan_note {
+            slot.field("plan_note", &true);
+        }
+        slot.finish()
+    }
 }
 
 /// Delivery metadata projected beside a message, never into its stored content. The
@@ -230,6 +248,8 @@ impl TagSlot {
             rendered: false,
             delivery: None,
             rides_after_results: None,
+            plan_note: false,
+            legacy_plan_note: false,
         }
     }
 

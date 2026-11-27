@@ -284,6 +284,24 @@ fn written_under(operations: &Operations) -> Option<ViewRef> {
 }
 
 impl<W: Writer> Writer for Placed<'_, W> {
+    async fn run_has_attempt(&self, run_id: &str) -> Result<bool, SessionError> {
+        crate::writer::Writer::run_has_attempt(&*self.inner, run_id).await
+    }
+
+    async fn signing_config(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::writer::SigningConfig>, SessionError> {
+        crate::writer::Writer::signing_config(&*self.inner, run_id).await
+    }
+
+    async fn apply_may_erase_notes(&self, generation: u64) -> Result<bool, SessionError> {
+        self.inner.apply_may_erase_notes(generation).await
+    }
+
+    async fn cut_records(&self) -> Result<Vec<Record>, SessionError> {
+        self.inner.cut_records().await
+    }
     async fn responses_reasoning_removals(
         &self,
         run_id: &str,

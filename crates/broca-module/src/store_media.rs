@@ -863,6 +863,25 @@ impl<B: SessionBackend> RunAppends<'_, B> {
 }
 
 impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
+    async fn run_has_attempt(&self, run_id: &str) -> Result<bool, SessionError> {
+        broca_session_loop::writer::Writer::run_has_attempt(&*self.session, run_id).await
+    }
+
+    async fn signing_config(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<broca_session_loop::writer::SigningConfig>, SessionError> {
+        broca_session_loop::writer::Writer::signing_config(&*self.session, run_id).await
+    }
+
+    async fn apply_may_erase_notes(&self, generation: u64) -> Result<bool, SessionError> {
+        self.session.apply_may_erase_notes(generation).await
+    }
+
+    async fn cut_records(&self) -> Result<Vec<Record>, SessionError> {
+        self.session.cut_records().await
+    }
+
     async fn responses_reasoning_removals(
         &self,
         run_id: &str,
@@ -1060,11 +1079,9 @@ impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
     }
 }
 
-/// The request a run of `session` sends for its step `step_id`, built offline: the prompt as the
-/// run loop builds it for a provider that renders media (`offline_media_request`), rendered
-/// through an index built from every record of `session` and its own media objects, read over
-/// `reader`, under `frozen` with `max_output_tokens` as the step's cap. It is used to check a
-/// session in the session store against the request rendered for it.
+/// Render a not-yet-sent request from the current session head, including media read over
+/// `reader`. The move snapshot supplies a synthetic run with cloned settings and a step start.
+/// After a reply commits, rebuild from the records through the provider's recorded attempt instead.
 #[allow(clippy::too_many_arguments)]
 pub async fn offline_render<B, R>(
     session: &Session<B>,
@@ -1080,9 +1097,10 @@ where
     B: SessionBackend,
     R: SessionBackend + Send + Sync + 'static,
 {
-    let mut opts = broca_session_loop::run::offline_media_request(session, parts, bind, step_id)
-        .await
-        .map_err(|error| format!("the new run loop's request: {error:?}"))?;
+    let mut opts =
+        broca_session_loop::run::offline_next_media_request(session, parts, bind, step_id)
+            .await
+            .map_err(|error| format!("the new run loop's request: {error:?}"))?;
     if let Some(context) = opts.step_context.as_mut() {
         context.max_output_tokens = max_output_tokens;
     }
@@ -1095,7 +1113,12 @@ where
     if let Some(reason) = index.broken() {
         return Err(reason);
     }
-    let config = serde_json::to_value(&*frozen.for_step(&opts))
+    let selected = frozen
+        .refusal_fallback
+        .as_deref()
+        .filter(|fallback| opts.target_model.as_ref() == Some(&fallback.model))
+        .map_or(frozen, |fallback| &fallback.frozen);
+    let config = serde_json::to_value(&*selected.for_step(&opts))
         .map_err(|error| format!("encode the frozen render config: {error}"))?;
     // As the transport hands a request to its media renderer: the frozen config with the step's
     // cap applied, and the run's tag choice.

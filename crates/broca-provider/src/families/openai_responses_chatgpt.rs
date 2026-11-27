@@ -81,6 +81,11 @@ pub fn episode_render_key(frozen_config: &serde_json::Value) -> serde_json::Valu
         "effort": effort,
         "chatgpt_effort_updates": config.chatgpt_effort_updates,
     });
+    if config.family_id == crate::spec::WireFamilyId::AnthropicMessages
+        && config.renderer_version >= crate::families::ANTHROPIC_RENDERER_VERSION
+    {
+        key["anthropic_history_floors"] = serde_json::Value::Bool(true);
+    }
     // Only a run with an Anthropic effort adds them, so the key of every other run keeps the
     // bytes it was recorded with. The thinking mode of a run without an effort never shapes a
     // request: the effort walk starts again at such a run whatever its thinking is.
@@ -515,6 +520,7 @@ mod tests {
     fn opts() -> CallOptions {
         CallOptions::new(vec![Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

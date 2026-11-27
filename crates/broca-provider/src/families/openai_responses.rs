@@ -345,7 +345,7 @@ fn render_prepared_body<'a>(
             synthetic_user: false,
         });
     let mut input = convert_input_items_with_provenance(
-        &opts.prompt,
+        opts,
         frozen.system_prompt.clone(),
         name_map,
         EffortUpdates {
@@ -414,7 +414,13 @@ fn render_prepared_body<'a>(
         .iter()
         .map(|tool| convert_tool(tool, name_map, frozen.responses_tools_non_strict))
         .collect();
-    if !tools.is_empty() {
+    if !tools.is_empty()
+        || (*opts.tool_choice == ToolChoice::None
+            && opts
+                .prompt
+                .iter()
+                .any(|message| message.tool_addition.is_some()))
+    {
         body["tool_choice"] = convert_tool_choice(&opts.tool_choice, name_map);
     }
     // `/v1/responses` accepts `temperature` + `top_p`, but no stop field, so
@@ -546,7 +552,7 @@ pub(crate) fn completed_output_as_input(
 }
 
 fn convert_input_items_with_provenance<'a>(
-    prompt: &'a [Message],
+    opts: &'a CallOptions,
     system_policy: SystemPromptPolicy,
     name_map: &crate::tool_name_alias::ToolNameMap,
     updates: EffortUpdates<'_>,
@@ -554,6 +560,7 @@ fn convert_input_items_with_provenance<'a>(
     media: Option<&crate::media_render::MediaRender<'_>>,
     mut provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>,
 ) -> Vec<Node<'a>> {
+    let prompt = &opts.prompt;
     let skip_system = matches!(
         system_policy,
         SystemPromptPolicy::InstructionsField | SystemPromptPolicy::DeveloperMessage
@@ -561,23 +568,32 @@ fn convert_input_items_with_provenance<'a>(
     let mut out = Vec::new();
     let answer_update = updates.answer;
     let mut updates = updates.per_run.iter().peekable();
-    let has_ordinals = prompt.iter().any(|message| message.ordinal.is_some());
+    let projected_notes = crate::effort_change::has_plan_notes(opts);
+    let position = crate::effort_change::positions(opts);
+    let answer_at = answer_update
+        .and_then(|_| {
+            if !projected_notes {
+                return prompt.len().checked_sub(1);
+            }
+            prompt.iter().rposition(|message| {
+                message.role == Role::User
+                    || (message.role != Role::System && message.tool_addition.is_none())
+            })
+        })
+        .filter(|&index| prompt[index].role == Role::User);
     for (index, message) in prompt.iter().enumerate() {
         // Synthetic transform rows have no durable position and must not move an episode update.
-        let ordinal = message
-            .ordinal
-            .or_else(|| (!has_ordinals).then_some(index as u64));
-        if let Some(ordinal) = ordinal {
+        if let Some(position) = position(index) {
             while updates
                 .peek()
-                .is_some_and(|update| update.before <= ordinal as usize)
+                .is_some_and(|update| update.before <= position)
             {
                 let update = updates.next().expect("peeked update");
                 let start = provenance.as_ref().map(|_| out.len());
                 append_effort_update(
                     &mut out,
                     update,
-                    message.role == Role::User && ordinal as usize == update.before,
+                    message.role == Role::User && position == update.before,
                 );
                 if let Some((sink, start)) = provenance.as_deref_mut().zip(start) {
                     sink.record_messages(start, out.len(), None);
@@ -587,9 +603,7 @@ fn convert_input_items_with_provenance<'a>(
         if skip_system && message.role == Role::System && !message.turn_system {
             continue;
         }
-        if let Some(update) =
-            answer_update.filter(|_| index + 1 == prompt.len() && message.role == Role::User)
-        {
+        if let Some(update) = answer_update.filter(|_| answer_at == Some(index)) {
             let start = provenance.as_ref().map(|_| out.len());
             append_effort_update(&mut out, update, true);
             if let Some((sink, start)) = provenance.as_deref_mut().zip(start) {
@@ -598,6 +612,12 @@ fn convert_input_items_with_provenance<'a>(
         }
         let start = provenance.as_ref().map(|_| out.len());
         match message.role {
+            Role::System if message.tool_addition.is_some() => {
+                out.push(crate::turn_system::tool_addition::render(
+                    message.tool_addition.as_ref().unwrap(),
+                    name_map,
+                ))
+            }
             Role::System | Role::User => out.push(convert_easy_message(message, media)),
             Role::Assistant => out.extend(convert_assistant_items(message, name_map, replay)),
             Role::Tool => out.extend(convert_tool_output_items(message, media)),

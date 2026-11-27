@@ -189,6 +189,7 @@ mod gated {
     fn message(role: Role, text: &str) -> Message {
         Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,

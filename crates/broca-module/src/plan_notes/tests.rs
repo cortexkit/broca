@@ -1,6 +1,8 @@
 use super::*;
 use broca_session_store::record::PlanNote;
 
+mod additions;
+
 fn manifest(tools: &[&str], system_text: &str) -> PlanManifest {
     serde_json::from_value(serde_json::json!({
         "plan": "{}",
@@ -29,17 +31,22 @@ fn facts<'a>(current: &'a PlanManifest, pending: &'a PlanManifest) -> Facts<'a> 
         generation: 2,
         system_note: Some("Answer in French."),
         delivered: &[],
+        rendering_anchors: None,
+        redelivery_enabled: true,
         window_start: 1,
         pending_since_ms: Some(1_000),
         now_ms: 2_000,
         cache_lost: false,
         turn_system: true,
+        tool_addition_form: None,
+        scoped: false,
         model_key: "p:m".into(),
     }
 }
 
 fn delivered(anchor: u64, notes: &[(PlanNoteKind, &str)], refused: &[&str]) -> PlanNotes {
     PlanNotes {
+        blocks: Some(true),
         generation: 1,
         anchor,
         notes: notes
@@ -48,6 +55,8 @@ fn delivered(anchor: u64, notes: &[(PlanNoteKind, &str)], refused: &[&str]) -> P
                 kind: *kind,
                 text: (*text).into(),
                 form: NOTE_FORM_TURN_SYSTEM.into(),
+                tool: None,
+                tool_dispatch: None,
             })
             .collect(),
         refused_tools: refused.iter().map(|name| (*name).into()).collect(),

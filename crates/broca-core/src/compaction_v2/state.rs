@@ -45,6 +45,14 @@ pub trait Journal {
     /// Called when a published view is refused, so the session's journal can log it; the
     /// refusal itself writes nothing. A journal with no log of its own keeps this no-op.
     fn view_refused(&self, _publication: &super::diagnostics::Publication, _code: &str) {}
+    async fn check_restored_notes(
+        &self,
+        _boundary: &Boundary<'_>,
+        _previous: Option<&View>,
+        _next: &View,
+    ) -> Result<(), ViewRefusal> {
+        Ok(())
+    }
     async fn accepted(
         &self,
         previous: Option<&ReceivedView>,
@@ -274,13 +282,22 @@ impl State {
             .as_ref()
             .is_some_and(|applied| applied.view().applied() == view.applied());
         if !already_applied {
-            if let Err(refusal) = self
+            let previous = self.applied();
+            let checked = self
                 .check_moved(journal, boundary.entries, view)
                 .await?
                 .and_then(|()| {
                     views::check_boundary(boundary.entries, view, boundary.rules, boundary.floor)
-                })
-            {
+                });
+            let checked = match checked {
+                Ok(()) => {
+                    journal
+                        .check_restored_notes(&boundary, previous, view)
+                        .await
+                }
+                Err(refusal) => Err(refusal),
+            };
+            if let Err(refusal) = checked {
                 journal.view_refused(
                     &super::diagnostics::Publication::from_view(view),
                     &super::diagnostics::refusal_code(&refusal),
@@ -290,7 +307,6 @@ impl State {
                     refusal,
                 }]);
             }
-            let previous = self.applied();
             journal
                 .applied(boundary.step, view, head_kept(&boundary, previous, view))
                 .await

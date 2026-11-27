@@ -345,6 +345,7 @@ pub async fn run_live<F: WireFamily + 'static>(
     let mut input = spec.seed_history.clone();
     input.push(Message {
         turn_system: false,
+        tool_addition: None,
         cache_prefix_blocks: None,
         role: Role::User,
         content: vec![ContentBlock::Text {
@@ -533,6 +534,7 @@ fn flush_tool_results(
     }
     history.push(Message {
         turn_system: false,
+        tool_addition: None,
         cache_prefix_blocks: None,
         role: Role::Tool,
         content: std::mem::take(pending)
@@ -612,6 +614,7 @@ impl LiveOutcome {
                     flush_tool_results(&mut history, &mut pending_results);
                     history.push(Message {
                         turn_system: false,
+                        tool_addition: None,
                         cache_prefix_blocks: None,
                         role: Role::Assistant,
                         content: message.content.clone(),

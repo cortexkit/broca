@@ -21,9 +21,11 @@ use crate::serve::ServeHandler;
 
 const NOTE: &str = "Answer as a reviewer from now on.";
 
+mod writer;
+
 /// Answers, for every model, whether its route has a system-role turn mid-conversation (the
 /// catalog fact that decides whether plan notes can be delivered at all).
-struct Form(bool);
+struct Form(bool, std::sync::atomic::AtomicBool);
 
 struct Admitter;
 
@@ -53,6 +55,10 @@ impl crate::cache::CacheDeclarer for Form {
     fn turn_system_form(&self, _: &broca_protocol::ModelHandle) -> bool {
         self.0
     }
+
+    fn writes_tool_addition_notes(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// A module over `steps` whose executor the test keeps, to read the requests its model saw.
@@ -60,6 +66,18 @@ async fn module(
     steps: Vec<Vec<broca_protocol::NormalizedEvent>>,
     form: bool,
 ) -> (Module, Arc<LoopExecutor>) {
+    module_with_executor(executor(steps, None), form, false).await
+}
+
+async fn module_with_executor(
+    executor: LoopExecutor,
+    form: bool,
+    writer: bool,
+) -> (Module, Arc<LoopExecutor>) {
+    module_with_form(executor, Arc::new(Form(form, writer.into()))).await
+}
+
+async fn module_with_form(executor: LoopExecutor, form: Arc<Form>) -> (Module, Arc<LoopExecutor>) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = broca_test_support::scratch_root().join(format!(
@@ -68,7 +86,7 @@ async fn module(
         N.fetch_add(1, Ordering::SeqCst)
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    let executor = Arc::new(executor(steps, None));
+    let executor = Arc::new(executor);
     let runtime = crate::store_open::StoreRuntime::open(
         &dir,
         broca_session_store::keys::DeploymentKey::new(1, &[7; 32]),
@@ -85,7 +103,7 @@ async fn module(
         )
         .with_idle_ttl(IDLE),
     ));
-    registry.set_cache_declarer(Arc::new(Form(form)));
+    registry.set_cache_declarer(form);
     let key = BindIdentity::new(dir.join("project"), "store-actor", "s1");
     let module = Module {
         dir,
@@ -98,15 +116,24 @@ async fn module(
 
 async fn send(module: &Module, run_id: &str, first: Option<&broca_records::record::PlanManifest>) {
     let mut request: SubmissionRequest = request(run_id);
+    send_request(module, run_id, first, &mut request).await;
+}
+
+async fn send_request(
+    module: &Module,
+    run_id: &str,
+    first: Option<&broca_records::record::PlanManifest>,
+    request: &mut SubmissionRequest,
+) {
     request.principal = Some(core());
     request.tools = None;
     request.policy_allowed = Default::default();
     let plan = SendPlan {
-        identity: "plan-1".into(),
+        identity: first.map_or_else(|| "plan-1".into(), |first| first.plan_identity.clone()),
         manifest: first.map(|first| Arc::new(first.clone())),
         model_check: None,
     };
-    let outcome = send_titled(module, run_id, request, None, Some(plan)).await;
+    let outcome = send_titled(module, run_id, request.clone(), None, Some(plan)).await;
     assert!(matches!(outcome, SendOutcome::Active { .. }), "{outcome:?}");
     module.closed().await;
 }
@@ -384,6 +411,106 @@ async fn a_note_with_unchanged_system_text_is_accepted_and_ignored() {
         .any(|(_, _, text)| text == NOTE));
 }
 
+#[tokio::test]
+async fn reader_new_run_preserves_a_writer_note_without_adding_new_tools() {
+    let first = manifest(&plan("same instructions", &["read"], None, None), "plan-1");
+    let added = manifest(
+        &plan("same instructions", &["read", "search"], None, None),
+        "plan-2",
+    );
+    let removed = manifest(&plan("same instructions", &["read"], None, None), "plan-3");
+    let form = Arc::new(Form(true, false.into()));
+    let (module, executor) = module_with_form(
+        writer::claude(vec![
+            writer::confirmed(text_step("a1", "first")),
+            writer::confirmed(text_step("a2", "declared")),
+            text_step("a3", "done"),
+        ]),
+        form.clone(),
+    )
+    .await;
+    writer::send_claude(&module, "r1", Some(&first)).await;
+    writer::refresh(&module, 1, added.clone(), None).await;
+    import_writer_note(&module, &added).await;
+    writer::send_claude(&module, "r2", None).await;
+    assert!(executor.provider.inner.calls()[1]
+        .prompt
+        .iter()
+        .any(|message| message.tool_addition.is_some()));
+    writer::refresh(&module, 2, removed, None).await;
+    writer::send_claude(&module, "r3", None).await;
+    let requests = executor.provider.inner.calls();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].tools, requests[1].tools);
+    assert_eq!(
+        requests[2]
+            .prompt
+            .iter()
+            .filter_map(|message| message.tool_addition.as_ref())
+            .collect::<Vec<_>>(),
+        requests[1]
+            .prompt
+            .iter()
+            .filter_map(|message| message.tool_addition.as_ref())
+            .collect::<Vec<_>>()
+    );
+    assert!(!records(&module)
+        .await
+        .iter()
+        .any(|record| matches!(record, Record::RefreshApplied(_))));
+}
+
+async fn import_writer_note(module: &Module, added: &broca_records::record::PlanManifest) {
+    module.closed().await;
+    // Supply the writer's PlanNotes record as fixture data. The reader must not create
+    // that tool-addition record itself, even if admission proposes the tool.
+    let mut session = module.load().await;
+    let anchor = session
+        .entries(session.conversation.window_start(), usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .rfind(|entry| entry.message.role == Role::User)
+        .unwrap()
+        .ordinal;
+    let tool = added
+        .tools
+        .iter()
+        .find(|tool| tool.name == "search")
+        .unwrap();
+    use broca_session_store::record::{PlanNote, PlanNoteKind, PlanNoteTool, PlanNotes};
+    session
+        .append(
+            &[Record::PlanNotes(PlanNotes {
+                generation: 1,
+                anchor,
+                blocks: Some(true),
+                model_key: "anthropic:claude-opus-5-5".into(),
+                refused_tools: vec![],
+                notes: vec![PlanNote {
+                    kind: PlanNoteKind::ToolAddition,
+                    text: String::new(),
+                    form: "anthropic_tool_addition".into(),
+                    tool: Some(PlanNoteTool {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        input_schema: tool.input_schema.text().into(),
+                    }),
+                    tool_dispatch: Some(
+                        serde_json::to_string(
+                            &broca_core::capability::AddedToolDispatch::from_plan(tool, added),
+                        )
+                        .unwrap(),
+                    ),
+                }],
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+    drop(session);
+}
+
 async fn note_refresh(
     module: &Module,
     generation: u64,
@@ -538,11 +665,14 @@ async fn a_dangling_system_note_uses_the_applied_plan_after_restart() {
         .append(
             &[Record::PlanNotes(PlanNotes {
                 generation: 999,
+                blocks: None,
                 anchor: 1,
                 notes: vec![PlanNote {
                     kind: PlanNoteKind::System,
                     text: orphan.into(),
                     form: "turn_system".into(),
+                    tool: None,
+                    tool_dispatch: None,
                 }],
                 refused_tools: Vec::new(),
                 model_key: "p:m".into(),
@@ -714,4 +844,72 @@ async fn undoing_a_tool_removal_only_restores_calls_when_the_writer_is_enabled()
     assert!(!log
         .iter()
         .any(|record| matches!(record, Record::RefreshApplied(_))));
+}
+
+async fn repeating_a_noted_plan_with_resolved_route(supports_note: bool) {
+    let original = manifest(
+        &plan("Original instructions.", &["read"], None, None),
+        "plan-1",
+    );
+    let pending = manifest(
+        &plan("Updated instructions.", &["read"], None, None),
+        "plan-2",
+    );
+    let (module, executor) = module_with_form(
+        writer::claude(vec![
+            writer::confirmed(text_step("first", "ok")),
+            writer::confirmed(text_step("noted", "ok")),
+            text_step("next", "ok"),
+        ]),
+        Arc::new(Form(true, false.into())),
+    )
+    .await;
+    writer::send_claude(&module, "r1", Some(&original)).await;
+    assert_accepts(note_refresh(&module, 1, &pending, Some(NOTE)).await, false);
+    writer::send_claude(&module, "r2", None).await;
+    assert!(shown(&executor.provider.inner.calls()[1])
+        .iter()
+        .any(|(_, turn, text)| *turn && text == NOTE));
+    assert_accepts(note_refresh(&module, 2, &pending, None).await, false);
+    if !supports_note {
+        let frozen = broca_provider::families::openai_chat_frozen_config("gpt-5");
+        *executor.next_render_config.lock().unwrap() = Some(serde_json::to_value(frozen).unwrap());
+    }
+    writer::send_claude(&module, "r3", None).await;
+    let requests = executor.provider.inner.calls();
+    assert_eq!(requests.len(), 3);
+    let visible = shown(&requests[2]);
+    assert_eq!(
+        visible.iter().any(|(_, turn, text)| *turn && text == NOTE),
+        supports_note
+    );
+    assert_eq!(
+        visible
+            .iter()
+            .any(|(_, turn, text)| !turn && text == "Updated instructions."),
+        !supports_note
+    );
+    let log = records(&module).await;
+    assert_eq!(
+        log.iter()
+            .filter(|record| matches!(record, Record::PlanNotes(_)))
+            .count(),
+        1
+    );
+    assert_eq!(log.iter().any(|record| matches!(record, Record::RefreshApplied(apply) if apply.generation == 2 && apply.reason.as_deref() == Some("no_note_form"))), !supports_note);
+    assert_eq!(
+        log.iter()
+            .any(|record| matches!(record, Record::RefreshApplied(_))),
+        !supports_note
+    );
+}
+
+#[tokio::test]
+async fn compatible_resolved_route_keeps_a_delivered_note_for_an_unchanged_noted_refresh() {
+    repeating_a_noted_plan_with_resolved_route(true).await;
+}
+
+#[tokio::test]
+async fn incompatible_resolved_route_applies_the_same_noted_refresh() {
+    repeating_a_noted_plan_with_resolved_route(false).await;
 }

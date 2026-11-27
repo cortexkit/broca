@@ -82,8 +82,8 @@ mod live_step;
 use dispatch::{dispatch_all, tool_open_guard, DispatchPlan, Dispatched};
 mod pause;
 use pause::{pause, sign_in_at_start, sign_in_refused, take_deposited};
-mod plan_notes;
-use plan_notes::{removed_tools, with_plan_notes, with_plan_system};
+pub(crate) mod plan_notes;
+use plan_notes::{removed_tools, with_plan_system};
 mod resolved;
 use resolved::{resolve, Resolved};
 mod stops;
@@ -409,6 +409,7 @@ pub struct Finished {
 pub enum LoopError {
     Session(SessionError),
     Parts(String),
+    FloorRead(String),
     /// A case this build of the loop doesn't handle yet.
     Unsupported(&'static str),
     /// The tool plane refused something the run can't go on without, such as registering a
@@ -507,7 +508,15 @@ where
     // The run numbers its messages' parts by its own computed rules, after the highest number
     // the session has shown, as its start freezes them. On the compaction contract, requests
     // show the projection's numbers instead, but the run's numbering rules are still recorded.
-    let checkpoint = shown_high(&*writer, &*parts).await?;
+    let previous_cut_run = signed_floor::new_abi(&admission.render_config)
+        .then(|| signed_floor::Prior::of(writer))
+        .flatten();
+    let checkpoint = shown_high(
+        writer,
+        parts,
+        signed_floor::new_abi(&admission.render_config),
+    )
+    .await?;
     // The enrolling run decides what the session serves about the messages placed before it,
     // numbered after the highest number any earlier request showed, and stores the decisions
     // before its start's batch names them.
@@ -585,18 +594,23 @@ where
                 )
                 .await?
             }
-            None => drive(&mut placed, parts, &admission, seams, compaction.as_ref()).await?,
+            None => {
+                Box::pin(drive(
+                    &mut placed,
+                    parts,
+                    &admission,
+                    seams,
+                    compaction.as_ref(),
+                    previous_cut_run,
+                ))
+                .await?
+            }
         },
     };
     // Every end a run writes is followed by a notice of the session's changes; a pause isn't
     // an end.
     if finished.paused.is_none() {
-        let floor = signed_floor(&placed, parts, &mut ToolSetCache::default()).await?;
-        if let Some(changes) = crate::compaction::Changes::of(&admission, seams, floor)
-            .map(|changes| changes.sharing(compaction.as_ref()))
-        {
-            changes.tell(&placed, seams).await;
-        }
+        tell_run_end(&placed, parts, &admission, seams, compaction.as_ref()).await;
     }
     transport.finished(&finished);
     Ok(finished)
@@ -693,10 +707,7 @@ where
             .as_ref()
             .map(|run| frozen_admission(run, parts))
         {
-            let floor = signed_floor(writer, parts, &mut ToolSetCache::default()).await?;
-            if let Some(changes) = crate::compaction::Changes::of(&admission, seams, floor) {
-                changes.tell(writer, seams).await;
-            }
+            tell_run_end(writer, parts, &admission, seams, None).await;
         }
     }
     transport.finished(&finished);
@@ -1063,19 +1074,24 @@ where
     }
     let compaction = compaction_ctx(writer, parts, &admission, seams, false).await?;
     let finished = match resolution {
-        Resolution::Resume => drive(writer, parts, &admission, seams, compaction.as_ref()).await,
         Resolution::Idle(reason) => finish_idle(writer, seams, &admission, reason).await,
         Resolution::Interrupted(_) => close_interrupted(writer, seams, &admission, None).await,
         // A held call's late result arrived: the run goes on from its open batch, waiting on
         // each held call again rather than sending it.
-        Resolution::ProviderHeld(_) => {
-            drive(writer, parts, &admission, seams, compaction.as_ref()).await
-        }
-        Resolution::Paused(PauseReason::AuthRequired | PauseReason::Restart) => {
-            drive(writer, parts, &admission, seams, compaction.as_ref()).await
-        }
-        Resolution::Paused(PauseReason::AccountLimit) => {
-            drive(writer, parts, &admission, seams, compaction.as_ref()).await
+        Resolution::Resume
+        | Resolution::ProviderHeld(_)
+        | Resolution::Paused(
+            PauseReason::AuthRequired | PauseReason::Restart | PauseReason::AccountLimit,
+        ) => {
+            Box::pin(drive(
+                writer,
+                parts,
+                &admission,
+                seams,
+                compaction.as_ref(),
+                None,
+            ))
+            .await
         }
         Resolution::Paused(_) => Err(LoopError::Unsupported("a paused run")),
     }?;
@@ -1928,74 +1944,20 @@ pub async fn offline_media_request<W: Writer>(
     offline_request_for(writer, parts, bind, step_id, true).await
 }
 
-async fn offline_request_for<W: Writer>(
-    writer: &W,
-    parts: &dyn Parts,
-    bind: &broca_protocol::BindIdentity,
-    step_id: u64,
-    defer_media_tags: bool,
-) -> Result<CallOptions, LoopError> {
-    refuse_first_protocol_compaction(writer)?;
-    let run = writer
-        .operations()
-        .run
-        .as_ref()
-        .ok_or(LoopError::Unsupported("a session with no run"))?;
-    let admission = frozen_admission(run, parts)?;
-    let compacted = match (
-        admission.compaction_plan_version,
-        admission.manifest.as_deref(),
-    ) {
-        (Some(_), Some(manifest)) => broca_core::compaction::item(manifest)
-            .map_err(LoopError::Parts)?
-            .is_some(),
-        _ => false,
-    };
-    let episodes = Arc::new(render_history(writer, parts, &mut ToolSetCache::default()).await?);
-    let run_rules = run_tag_rules(writer, &episodes, &mut TagRulesCache::default()).await?;
-    let tools = Arc::clone(&admission.tools);
-    let enrollment = writer.enrollment().await?;
-    let mut opts = call_options(
-        writer,
-        &admission,
-        &tools,
-        &episodes,
-        &run_rules,
-        None,
-        step_id,
-        compacted,
-        defer_media_tags,
-        enrollment.as_ref(),
-        None,
-        None,
-    )?;
-    if crate::responses_reasoning::ResponsesReasoningRemovals::applies(&admission.render_config) {
-        writer
-            .responses_reasoning_removals(&admission.run_id, None)
-            .await?
-            .apply(&mut opts, step_id);
-    }
-    finalize_tool_choice(writer, &mut opts);
-    if !compacted {
-        let durable_system: Vec<Message> = opts.prompt.first().cloned().into_iter().collect();
-        let opts = with_plan_system(writer, &admission, &durable_system, opts);
-        return Ok(with_plan_notes(writer, opts));
-    }
-    let opts = crate::compaction::offline_prompt(writer, &admission, bind, step_id, opts).await?;
-    Ok(with_plan_notes(writer, opts))
+/// Read the scheduled or refused route from the records through this attempt, before any later
+/// reply can change the schedule used to rebuild the request.
+pub fn offline_step_route(
+    operations: &broca_session_store::fold::operations::Operations,
+    config: &Value,
+    step: u64,
+    opts: &CallOptions,
+) -> Result<Option<broca_records::record::StepRoute>, LoopError> {
+    crate::refusal::recorded_route(operations, config, step, opts)
 }
 
-/// Disables tool calls on the budget's finalize step, and says whether the step is one. The step
-/// keeps the declared tools byte for byte and disables calls through the tool choice; dropping
-/// the tools would change the request's cached prefix on the run's last step. A step's live
-/// request and its offline rebuild both take it from here.
-fn finalize_tool_choice<W: Writer>(writer: &W, opts: &mut CallOptions) -> bool {
-    let finalizing = crate::budget::finalizing(writer.operations());
-    if finalizing {
-        opts.tool_choice = Arc::new(ToolChoice::None);
-    }
-    finalizing
-}
+mod preview;
+use preview::offline_request_for;
+pub use preview::{next_note_anchors, next_note_anchors_for, offline_next_media_request};
 
 /// Whether two render configs differ, and only in the Claude Code persona they freeze.
 fn differs_only_in_persona(current: &Value, frozen: &Value) -> bool {
@@ -2045,6 +2007,7 @@ async fn drive<W, P, T>(
     admission: &Admission,
     seams: &Seams<'_, P, T>,
     compaction: Option<&crate::compaction::Ctx>,
+    previous_cut_run: Option<Box<signed_floor::Prior>>,
 ) -> Result<Finished, LoopError>
 where
     W: Writer,
@@ -2052,6 +2015,7 @@ where
     T: ToolPlane,
 {
     let mut moving = None;
+    let mut tool_sets = ToolSetCache::with_previous(previous_cut_run);
     let finished = drive_from(
         writer,
         parts,
@@ -2060,6 +2024,7 @@ where
         compaction,
         None,
         &mut moving,
+        &mut tool_sets,
     )
     .await?;
     let Some(mut next) = moving.take() else {
@@ -2106,6 +2071,7 @@ where
             compaction,
             Some(reentry),
             &mut moving,
+            &mut tool_sets,
         )
         .await?;
         let Some(again) = moving.take() else {
@@ -2120,6 +2086,7 @@ where
 /// [`drive`], from the run's current state or, with `reentry`, from inside the step a move
 /// interrupted. A move at a wall puts what it made durable in `moving` and returns a placeholder
 /// the caller discards.
+#[allow(clippy::too_many_arguments)]
 async fn drive_from<W, P, T>(
     writer: &mut W,
     parts: &dyn Parts,
@@ -2128,6 +2095,7 @@ async fn drive_from<W, P, T>(
     compaction: Option<&crate::compaction::Ctx>,
     reentry: Option<crate::account_move::Reentry>,
     moving: &mut Option<crate::account_move::Moving<P>>,
+    tool_sets: &mut ToolSetCache,
 ) -> Result<Finished, LoopError>
 where
     W: Writer,
@@ -2145,6 +2113,7 @@ where
         reentry,
         moving,
         &mut live_display,
+        tool_sets,
     )
     .await;
     reset_live_display(seams.out, &mut live_display).await;
@@ -2173,6 +2142,7 @@ async fn drive_from_inner<W, P, T>(
     mut reentry: Option<crate::account_move::Reentry>,
     moving: &mut Option<crate::account_move::Moving<P>>,
     live_display: &mut bool,
+    tool_sets: &mut ToolSetCache,
 ) -> Result<Finished, LoopError>
 where
     W: Writer,
@@ -2190,8 +2160,10 @@ where
     // tools set. A run adds no episode once its input is placed, so these hold until a seal
     // inside the run moves runs out of the window, which replaces them (see below). Each request
     // shares the list.
-    let mut tool_sets = ToolSetCache::default();
-    let mut episodes = Arc::new(render_history(writer, parts, &mut tool_sets).await?);
+    let mut episodes = match render_history(writer, parts, tool_sets).await {
+        Ok(history) => Arc::new(history),
+        Err(error) => return signed_floor::finish_error(writer, seams, admission, error).await,
+    };
     let mut responses_removals = if crate::responses_reasoning::ResponsesReasoningRemovals::applies(
         &admission.render_config,
     ) {
@@ -2222,16 +2194,7 @@ where
     let mut kept_prompt = crate::compaction::prompt::KeptPrompt::default();
     let rendered = broca_core::compaction_v2::render::RenderCache::default();
     let tools = Arc::clone(&admission.tools);
-    // The run's frozen plan says which preset each tool provider's calls carry, which providers
-    // were fetched, and what they declared. A call without its preset is refused by a provider
-    // whose route is bound under a scope.
-    let mut manifest = ToolManifest::from_shared_tools(Arc::clone(&admission.tools));
-    if let Some(plan) = admission.manifest.as_deref() {
-        manifest = manifest
-            .with_plan_manifest(plan)
-            .map_err(|error| LoopError::Parts(format!("the run's frozen plan: {error}")))?;
-    }
-    manifest = manifest.with_run_transport(&admission.transport);
+    let manifest = plan_notes::dispatch_manifest(writer, admission)?;
     // Once per run, the run asks whether the provider's media renderer tags its own copy of each
     // request. If it does, the provider takes the run's tag choice here, and the run leaves
     // media-holding messages untagged, since preparing their media needs the parts where the
@@ -2646,7 +2609,7 @@ where
             context.credential_id = selection.map(|selection| selection.credential_id.clone());
             context.account_ref = selection.and_then(|selection| selection.account_ref.clone());
         }
-        let finalizing = finalize_tool_choice(writer, &mut opts);
+        let finalizing = crate::budget::finalize_tool_choice(writer.operations(), &mut opts);
         // The session's original system message, which a plan's system text takes the place of
         // in the provider view below.
         let durable_system: Vec<Message> = opts.prompt.first().cloned().into_iter().collect();
@@ -2660,16 +2623,17 @@ where
         let media_timing = broca_session_store::metrics::Phase::MediaWait
             .start()
             .with_session(|| Some(broca_core::session_addr(&seams.bind)));
-        let call_ready = match &seams.model_call_ready {
+        let readiness = match &seams.model_call_ready {
             Some(ready) => tokio::select! {
-                ready = ready.ready() => ready.is_ok(),
+                ready = ready.ready() => ready,
                 _ = seams.cancel.cancelled() => {
                     return finish(writer, seams, &admission.run_id, RunFinishReason::Cancelled)
                         .await;
                 }
             },
-            None => true,
+            None => Ok(()),
         };
+        let call_ready = readiness.is_ok();
         drop(media_timing);
         request_timing.resume();
         // The part numbers the step's request shows, recorded on each of its attempts so a
@@ -2744,21 +2708,40 @@ where
                     // bounded list rather than every run the history held when this run started.
                     // Every renderer gives the same bytes for both lists
                     // (`openai_responses_chatgpt::reduce_episodes`).
-                    episodes = Arc::new(render_history(writer, parts, &mut tool_sets).await?);
+                    episodes = match render_history(writer, parts, tool_sets).await {
+                        Ok(history) => Arc::new(history),
+                        Err(error) => {
+                            return signed_floor::finish_error(writer, seams, admission, error)
+                                .await
+                        }
+                    };
                 }
             }
         }
         let opts = with_plan_system(writer, admission, &durable_system, opts);
-        let opts = with_plan_notes(writer, opts);
+        let mut fallback_opts = plan_notes::for_fallback(writer, admission, seams.provider, &opts)?;
+        let opts = if call_ready {
+            plan_notes::project(writer, admission, opts)?
+        } else {
+            opts
+        };
         // Client-side refusal fallback: the step goes to the run's refusal-fallback model while
         // the session's schedule says so, or when it is a step already refused and re-sent.
-        let mut route = crate::refusal::Route::decide(writer, seams.provider, step_id)?;
-        // The step holds one copy of its request's options, which every attempt's call shares.
-        // Reserving the output cap changes only the target model and the step context, so a
-        // re-reserve for the fallback model starts from these again rather than from a second
-        // copy of the whole request kept for it.
-        let prepared = (opts.target_model.clone(), opts.step_context.clone());
-        let mut opts = Arc::new(reserve_for(writer, step_id, opts, &route));
+        let fallback_allowed = plan_notes::fallback_carries(writer, admission)
+            && crate::refusal::carries_notes(&admission.render_config, &opts)
+            && fallback_opts.as_ref().is_none_or(|fallback| {
+                crate::refusal::carries_notes(&admission.render_config, fallback)
+            });
+        let mut route =
+            crate::refusal::Route::decide(writer, seams.provider, step_id, fallback_allowed)?;
+        let target = route.fallback_target();
+        let opts = if target.is_some() {
+            fallback_opts.take().unwrap_or(opts)
+        } else {
+            opts
+        };
+        let opts = reserve_for(writer, step_id, opts, target);
+        let mut opts = Arc::new(opts);
         // A step resumed after a timed account pause is sent again only if it renders the request
         // the provider refused byte for byte; otherwise, the run ends interrupted rather than
         // sending a request the pause wasn't for.
@@ -2799,6 +2782,9 @@ where
         let mut refusal_retries = 0u32;
         drop(request_timing);
         let outcome = loop {
+            if let Err(error) = &readiness {
+                break Err(StepFailure::Error(Box::new(error.clone()), 0, None));
+            }
             let outcome = model_step(
                 writer,
                 seams,
@@ -2811,6 +2797,7 @@ where
                 run_selection(seams, admission),
                 live_display,
                 responses_removals.as_mut(),
+                tool_sets.through(),
             )
             .await?;
             // A failed call may be retried on a downgraded grammar or another account.
@@ -2857,42 +2844,42 @@ where
                         &fallback,
                         now,
                     );
-                    writer
-                        .append(
-                            &[Record::StepRefused(
-                                broca_session_store::record::StepRefused {
-                                    run_id: admission.run_id.clone(),
-                                    step_id,
-                                    usage: step.served.total(step.usage),
-                                    served_model: step.served.served_model.clone(),
-                                    usage_iterations: step
-                                        .served
-                                        .usage_iterations
-                                        .as_ref()
-                                        .map(serde_json::to_value)
-                                        .transpose()
-                                        .map_err(|e| LoopError::Parts(e.to_string()))?,
-                                    discarded_blocks: step.message.content.len() as u32,
-                                    schedule: serde_json::to_value(&schedule)
-                                        .map_err(|e| LoopError::Parts(e.to_string()))?,
-                                    ts_ms: now,
-                                    by_model: step.served.shares(
-                                        admission,
-                                        None,
-                                        step.served.total(step.usage),
-                                    ),
-                                },
-                            )],
-                            true,
-                        )
-                        .await?;
+                    let refused = Record::StepRefused(broca_session_store::record::StepRefused {
+                        run_id: admission.run_id.clone(),
+                        step_id,
+                        usage: step.served.total(step.usage),
+                        served_model: step.served.served_model.clone(),
+                        usage_iterations: step
+                            .served
+                            .usage_iterations
+                            .as_ref()
+                            .map(serde_json::to_value)
+                            .transpose()
+                            .map_err(|e| LoopError::Parts(e.to_string()))?,
+                        discarded_blocks: step.message.content.len() as u32,
+                        schedule: serde_json::to_value(&schedule)
+                            .map_err(|e| LoopError::Parts(e.to_string()))?,
+                        ts_ms: now,
+                        by_model: step.served.shares(
+                            admission,
+                            None,
+                            step.served.total(step.usage),
+                        ),
+                    });
+                    writer.append(&[refused], true).await?;
+                    let again = reserve_for(
+                        writer,
+                        step_id,
+                        fallback_opts
+                            .take()
+                            .unwrap_or_else(|| Arc::unwrap_or_clone(opts)),
+                        Some(fallback),
+                    );
+                    opts = Arc::new(again);
                     // The refused attempt's deltas already reached display subscribers.
                     reset_live_display(seams.out, live_display).await;
                     refusal_retries = step.retries_used;
                     route.reroute(seams.provider);
-                    let mut again = Arc::unwrap_or_clone(opts);
-                    (again.target_model, again.step_context) = prepared.clone();
-                    opts = Arc::new(reserve_for(writer, step_id, again, &route));
                     continue;
                 }
             }
@@ -3382,7 +3369,15 @@ where
             return limits::stop(writer, seams, &admission.run_id, output_limit).await;
         }
         if let Some(ctx) = compaction {
-            crate::compaction::notice(writer, admission, seams, ctx, episodes.signed_floor).await?;
+            crate::compaction::notice(
+                writer,
+                admission,
+                seams,
+                ctx,
+                episodes.signed_floor,
+                Some(&episodes),
+            )
+            .await?;
         }
         if calls.is_empty() {
             // A message steered in during the step makes the run take one more step, unless a
@@ -3740,71 +3735,8 @@ async fn admit<W: Writer>(
     Ok(first + position)
 }
 
-/// The highest part number the session's requests have shown, which a new run's numbering
-/// continues after: `high_after` over the prompt, with each message numbered under the rules
-/// of the run that placed it. Only a run that renders numbers counts anything, so a session
-/// that has never rendered stays at 0.
-///
-/// Counted over the window. A window that doesn't start at the session's first message has had
-/// numbers sealed out with the history before it, which isn't modelled yet.
-async fn shown_high<W: Writer>(writer: &W, parts: &dyn Parts) -> Result<u64, LoopError> {
-    let conversation = writer.conversation();
-    let start = conversation.window_start();
-    // History before the window was sealed at a compaction cut, whose marker records the highest
-    // number shown through it; numbers never change at a cut.
-    let sealed_high = match (start > 1, &conversation.marker) {
-        (false, _) => 0,
-        (true, Some(marker)) => marker.checkpoint,
-        (true, None) => {
-            return Err(LoopError::Unsupported(
-                "a new run after history was sealed without a compaction cut",
-            ))
-        }
-    };
-    // Each window run's frozen choices: whether it rendered numbers (its start's run config), and
-    // whether its replies were cleaned (that and its render config).
-    // A request lists the runs sealed before the window first; only the window's own place
-    // messages here.
-    let rendered = render_episodes(writer, parts)?;
-    let window_runs = &rendered[conversation.sealed_episodes.len()..];
-    let mut runs = Vec::new();
-    for (episode, render_input) in conversation.episodes.iter().zip(window_runs) {
-        let start_record = writer.run_start(&episode.run_id).await?.ok_or_else(|| {
-            LoopError::Parts(format!(
-                "the window names run {} but the session holds no start for it",
-                episode.run_id
-            ))
-        })?;
-        let choices = start_record.run_choices.unwrap_or(Value::Null);
-        let render = choices["config"]["render_tags"].as_bool().unwrap_or(false);
-        let clean =
-            broca_core::compaction_v2::metadata::clean_replies(render, &render_input.frozen_config);
-        runs.push(((episode.start - 1) as usize, render, clean));
-    }
-    let mut high = sealed_high;
-    // The run that placed a message is the last one starting at or before it. Runs are in the
-    // order they started and messages in the order they were placed, so one pass finds each.
-    let mut placing = (false, false);
-    let mut next_run = runs.iter().peekable();
-    for (index, message) in conversation.messages.iter().enumerate() {
-        if let Some(base) = conversation
-            .entries
-            .get(index)
-            .and_then(|entry| entry.facts.as_ref())
-            .and_then(|facts| facts.runner_tag_base)
-        {
-            high = high.max(base);
-        }
-        let index = index + (start - 1) as usize;
-        while let Some((_, render, clean)) = next_run.next_if(|(first, _, _)| *first <= index) {
-            placing = (*render, *clean);
-        }
-        let (render, clean) = placing;
-        high = crate::window_shape::runner_high(message, ComputedRules { render, clean }, high)
-            .map_err(|_| LoopError::Unsupported("part numbers past the numbering limit"))?;
-    }
-    Ok(high.max(writer.retired_tag_floor().saturating_sub(1)))
-}
+mod shown_tags;
+use shown_tags::shown_high;
 
 /// Every window run's place in the prompt (its first message's index, and its first user
 /// message's) and the render config it ran under, as requests carry them.
@@ -3835,68 +3767,20 @@ fn render_episodes<W: Writer>(
         .collect()
 }
 
-/// The request history every step of a run carries: [`render_episodes`], and the signed floor
-/// folded from the same runs' starts (`broca_core::signed_floor`), using their `RunStarted`
-/// records.
-///
-/// Past the window, the conversation keeps only the runs whose render key changes (what renderers
-/// read from a run's render config to render another run's messages: the wire family, model,
-/// reasoning effort and thinking mode; see `episode_render_key`), so a run that changed only the
-/// tool set can be missing there and the fold may find a different change point than one over
-/// every run. That never changes a request: such a point is below the window, where no message
-/// the request renders sits, so either floor drops the same reasoning.
+mod end_notice;
+use end_notice::tell_run_end;
+
+/// Each step reuses the run's cutoff even if a seal changes the visible episode list.
 async fn render_history<W: Writer>(
     writer: &W,
     parts: &dyn Parts,
     floors: &mut ToolSetCache,
 ) -> Result<RenderHistory, LoopError> {
-    let mut history = RenderHistory::from(render_episodes(writer, parts)?);
-    history.signed_floor = signed_floor(writer, parts, floors).await?;
-    Ok(history)
+    Box::pin(signed_floor::render_history(writer, parts, floors)).await
 }
 
-/// The session's signed floor (`broca_core::signed_floor::SignedFloor::floor`), folded from its
-/// runs' starts using `RunStarted` records. [`render_history`] says how far past the window that
-/// fold reaches.
-pub async fn signed_floor<W: Writer>(
-    writer: &W,
-    parts: &dyn Parts,
-    floors: &mut ToolSetCache,
-) -> Result<Option<u64>, LoopError> {
-    let conversation = writer.conversation();
-    let mut floor = broca_core::signed_floor::SignedFloor::default();
-    for episode in conversation
-        .sealed_episodes
-        .iter()
-        .chain(&conversation.episodes)
-    {
-        let digest = match floors.by_run.get(&episode.run_id) {
-            Some(digest) => digest.clone(),
-            None => {
-                let start = writer.run_start(&episode.run_id).await?.ok_or_else(|| {
-                    LoopError::Parts(format!(
-                        "the conversation names run {} but the session holds no start for it",
-                        episode.run_id
-                    ))
-                })?;
-                let digest = start_config::tool_set_of_start(&start, parts)?;
-                floors.by_run.insert(episode.run_id.clone(), digest.clone());
-                digest
-            }
-        };
-        if let Some(digest) = digest {
-            floor.observe_run(episode.start - 1, digest);
-        }
-    }
-    Ok(floor.floor())
-}
-
-/// Each run's tool-set digest as its start froze it, by run id, read once per run. `None` for a
-/// seeded run, which never sends a request.
-#[derive(Default)]
-pub struct ToolSetCache {
-    by_run: std::collections::HashMap<String, Option<String>>,
-}
+pub(crate) mod signed_floor;
+pub use signed_floor::{signed_floor, ToolSetCache};
 
 /// The request for step `step_id`: the conversation as the folds hold it, under the run's
 /// frozen settings, with the render inputs the run loop gives a request: each message's
@@ -4093,8 +3977,6 @@ struct Step {
     finish_reason: FinishReason,
     retries_used: u32,
     served: Served,
-    /// Calls whose arguments the provider cut: complete JSON followed by runaway whitespace.
-    /// They are answered with an error and never sent.
     cuts: Vec<broca_protocol::provider::ToolArgsTrailingGarbage>,
 }
 
@@ -4232,11 +4114,17 @@ async fn model_step<W: Writer, P: Provider, T>(
     selection: Option<&broca_records::record::AuthSelection>,
     live_display: &mut bool,
     mut responses_removals: Option<&mut crate::responses_reasoning::ResponsesReasoningRemovals>,
+    through: Option<&Option<String>>,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
     let mut in_flight = live_step::Model::new(seams.step_progress.as_ref());
-    let floor = crate::compaction::floor_through(writer, &[], opts.render_episodes.signed_floor);
-    let request = RequestFacts::of(&opts, floor.await?);
+    let floor = match through {
+        Some(through) => through.clone(),
+        None => {
+            crate::compaction::floor_through(writer, &[], opts.render_episodes.signed_floor).await?
+        }
+    };
+    let request = RequestFacts::of(&opts, floor);
     let context = AttemptContext {
         requested_ttl_ms,
         account_limit_pause,
@@ -5149,11 +5037,10 @@ fn reserve_for<W: Writer>(
     writer: &W,
     step_id: u64,
     mut opts: CallOptions,
-    route: &crate::refusal::Route,
+    fallback: Option<ModelHandle>,
 ) -> CallOptions {
-    if route.route == broca_core::refusal_fallback::StepRoute::Fallback {
-        // A fallback step tells the renderer which model it renders for.
-        opts.target_model = route.fallback.clone();
+    if let Some(fallback) = fallback {
+        opts.target_model = Some(fallback);
     }
     crate::output::reserve(writer.operations(), step_id, opts)
 }
@@ -5595,10 +5482,6 @@ async fn post_tool(
     }
 }
 
-/// The run's state as the operational fold holds it. Admission appended its start, so it
-/// exists for the whole run.
-/// Ends the run when its compaction provider can't serve it: an error with code
-/// `compaction_unavailable`, before any model call of the step.
 async fn compaction_unavailable<W: Writer, P, T>(
     writer: &mut W,
     seams: &Seams<'_, P, T>,
@@ -5614,7 +5497,7 @@ async fn compaction_unavailable<W: Writer, P, T>(
     if let Record::RunEnd(end) = &mut record {
         end.error = Some(
             serde_json::to_value(crate::compaction::unavailable_error(message))
-                .map_err(|e| LoopError::Parts(e.to_string()))?
+                .map_err(|error| LoopError::Parts(error.to_string()))?
                 .into(),
         );
     }

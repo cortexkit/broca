@@ -7,6 +7,12 @@ use tokio_util::sync::CancellationToken;
 
 use broca_protocol::ProviderError;
 
+/// A pending refresh the executor can apply if its final route cannot carry the old notes.
+#[derive(Clone)]
+pub struct NoteRouteApply {
+    pub family: Option<String>,
+}
+
 /// Cooperative run controls. Optional controls default to "off"; ordinary control-payload
 /// emission defaults to "on" so existing callers retain the complete output stream.
 #[derive(Clone)]
@@ -134,6 +140,7 @@ pub struct RunControl {
     /// records after the run's input in the batch of its start. `None` when the run delivers
     /// nothing new.
     pub plan_notes: Option<broca_protocol::session_change::NotesDelivery>,
+    pub note_route: Option<NoteRouteApply>,
     /// Whether a fresh run starts at a prefix rebuild of its session, or applies a pending
     /// plan change: the points where it takes a versioned tool's same-major definition
     /// (llm-runner `tool_versions`). Not frozen: a run read back from its start has none.
@@ -204,6 +211,7 @@ impl Default for RunControl {
             manifest_system_override: false,
             applies_refresh: None,
             plan_notes: None,
+            note_route: None,
             rebuild_point: false,
             account_reporter: None,
             keep_warm: None,

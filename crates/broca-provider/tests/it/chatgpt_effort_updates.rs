@@ -61,6 +61,7 @@ fn request(runs: &[Run]) -> (FrozenRenderConfig, CallOptions) {
         if let Some(role) = run.role {
             prompt.push(Message {
                 turn_system: false,
+                tool_addition: None,
                 role,
                 content: vec![ContentBlock::Text {
                     text: format!("episode-{}", run.effort).into(),

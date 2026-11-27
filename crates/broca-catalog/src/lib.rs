@@ -1737,6 +1737,7 @@ mod tests {
         .expect("bundled catalog models publish known capability flags");
         let opts = CallOptions::new(vec![Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -1825,6 +1826,7 @@ mod tests {
 
         let request = CallOptions::new(vec![Message {
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -2136,6 +2138,7 @@ mod tests {
             let mut opts = CallOptions::new(vec![
                 Message {
                     turn_system: false,
+                    tool_addition: None,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,
@@ -2147,6 +2150,7 @@ mod tests {
                 },
                 Message {
                     turn_system: false,
+                    tool_addition: None,
                     cache_prefix_blocks: None,
                     origin: None,
                     ordinal: None,

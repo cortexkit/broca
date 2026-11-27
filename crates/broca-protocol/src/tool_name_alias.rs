@@ -142,11 +142,45 @@ impl ToolNameMap {
         aliases: &BTreeMap<String, String>,
         grammar: NameGrammar,
     ) -> Self {
-        if aliases.is_empty() {
-            return Self::build_in(tools, prompt, grammar);
+        let first_inline = prompt
+            .iter()
+            .position(|message| message.tool_addition.is_some())
+            .unwrap_or(prompt.len());
+        fn calls(message: &Message) -> impl Iterator<Item = &str> {
+            message.content.iter().filter_map(|block| match block {
+                ContentBlock::ToolCall(call) => Some(call.tool_name.as_str()),
+                _ => None,
+            })
         }
-        let original = Self::build_in(tools, prompt, grammar);
-        let names: Vec<_> = original.canonical_to_wire.keys().cloned().collect();
+        let mut names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        for message in &prompt[..first_inline] {
+            names.extend(calls(message));
+        }
+        let original = Self::from_names_in(names, grammar);
+        let mut map = if aliases.is_empty() {
+            original
+        } else {
+            original.with_aliases(aliases, grammar)
+        };
+        // Keep names already on the wire. Once an inline declaration exists, later calls
+        // and declarations claim names in conversation order, without reallocating earlier ones.
+        for message in &prompt[first_inline..] {
+            if let Some(addition) = &message.tool_addition {
+                for part in &addition.parts {
+                    if let crate::tool_addition::AdditionPart::Tool(tool) = part {
+                        map.append_name(&tool.name, aliases, grammar);
+                    }
+                }
+            }
+            for call in calls(message) {
+                map.append_name(call, aliases, grammar);
+            }
+        }
+        map
+    }
+
+    fn with_aliases(self, aliases: &BTreeMap<String, String>, grammar: NameGrammar) -> Self {
+        let names: Vec<_> = self.canonical_to_wire.into_keys().collect();
         let mut reserved: BTreeSet<_> = names
             .iter()
             .cloned()
@@ -183,6 +217,34 @@ impl ToolNameMap {
             map.wire_to_canonical.insert(wire, canonical);
         }
         map
+    }
+
+    fn append_name(
+        &mut self,
+        canonical: &str,
+        aliases: &BTreeMap<String, String>,
+        grammar: NameGrammar,
+    ) {
+        if self.canonical_to_wire.contains_key(canonical) {
+            return;
+        }
+        let desired = aliases.get(canonical).map_or(canonical, String::as_str);
+        let wire = if is_valid_wire_name_in(desired, grammar)
+            && !self.wire_to_canonical.contains_key(desired)
+        {
+            desired.to_owned()
+        } else {
+            (0..)
+                .map(|attempt| alias_for_attempt_in(desired, attempt, grammar))
+                .find(|candidate| {
+                    !self.wire_to_canonical.contains_key(candidate)
+                        && !aliases.values().any(|alias| alias == candidate)
+                })
+                .expect("tool-name alias probe space exhausted")
+        };
+        self.canonical_to_wire
+            .insert(canonical.to_owned(), wire.clone());
+        self.wire_to_canonical.insert(wire, canonical.to_owned());
     }
 
     /// Build a map from the current tool manifest and any historical tool calls in the prompt.
@@ -363,6 +425,44 @@ mod tests {
             execution_mode: Default::default(),
             reply: None,
         }
+    }
+
+    #[test]
+    fn a_later_call_cannot_steal_an_inline_declarations_alias() {
+        use crate::{
+            tool_addition::{AdditionPart, ToolAddition, ToolAdditionForm, ToolDefinition},
+            Role,
+        };
+        let mut note = Message::new(Role::System, Vec::new());
+        note.tool_addition = Some(ToolAddition {
+            form: ToolAdditionForm::AnthropicToolAddition,
+            parts: vec![AdditionPart::Tool(ToolDefinition {
+                name: "mcp.a/search".into(),
+                description: String::new(),
+                input_schema: json!({"type":"object"}).into(),
+            })],
+        });
+        let map = |prompt: &[Message]| {
+            ToolNameMap::build_with_aliases_in(&[], prompt, &BTreeMap::new(), NameGrammar::Any)
+        };
+        let before = map(std::slice::from_ref(&note));
+        let collision = before.wire_name("mcp.a/search").to_owned();
+        let later = Message::new(
+            Role::Assistant,
+            vec![ContentBlock::ToolCall(ToolCall {
+                tool_name: collision.clone(),
+                tool_call_id: ToolCallId("later".into()),
+                input: json!({}).into(),
+                thought_signature: None,
+                provider_state: None,
+            })],
+        );
+        let after = map(&[note, later]);
+        assert_eq!(
+            before.wire_name("mcp.a/search"),
+            after.wire_name("mcp.a/search")
+        );
+        assert_ne!(after.wire_name("mcp.a/search"), after.wire_name(&collision));
     }
 
     fn legacy_from_names<I, S>(names: I) -> ToolNameMap

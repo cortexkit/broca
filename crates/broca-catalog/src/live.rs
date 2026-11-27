@@ -987,9 +987,7 @@ fn resolve_provider_inner(
         // The provider represents the current code. Core checks the family's compatibility table
         // before comparing a blob restamped to the recorded version.
         frozen.renderer_version = match family {
-            WireFamilyId::AnthropicMessages => {
-                broca_provider::families::anthropic_renderer_version(frozen.server_side_fallback)
-            }
+            WireFamilyId::AnthropicMessages => frozen.renderer_version,
             WireFamilyId::OpenAiChat => {
                 broca_provider::families::openai_chat_renderer_version(frozen.moonshot_schema_types)
             }
@@ -1466,10 +1464,7 @@ fn resolve_provider_inner(
     let auth_kind = provider_route_auth_kind(provider_id, family, &provider_spec.auth_kind);
     let (handle, auth_desc, auth_method) =
         resolve_auth(auth, &auth_kind, provider_id, opts.auth_method)?;
-    // The server-side fallback opt-in is decided BEFORE the render version, because the version
-    // records whether this config can render the opt-in's bytes at all: a config that does not
-    // opt in keeps freezing v2, so a later rollback still resumes it. Only an Anthropic config
-    // can opt in, so every other family's version is untouched.
+    // Fresh Anthropic admissions use the current renderer version, with or without fallback.
     let server_side_fallback = decide_server_side_fallback(
         provider_id,
         auth_method,
@@ -1479,10 +1474,6 @@ fn resolve_provider_inner(
         opts.anthropic_server_side_fallback,
         catalog.server_side_fallback(provider_id, model_id),
     );
-    if family == WireFamilyId::AnthropicMessages {
-        frozen.renderer_version =
-            broca_provider::families::anthropic_renderer_version(server_side_fallback);
-    }
     // Likewise an OpenAI Chat config freezes v6 only when it types tool schemas for Moonshot's
     // API, so every other OpenAI Chat run keeps recording v5.
     if family == WireFamilyId::OpenAiChat {
@@ -1537,7 +1528,7 @@ fn resolve_provider_inner(
         episode_render.claude_code_persona,
         opts.claude_code_persona,
     );
-    // Decided above, before the render version, so the two can never disagree.
+    // Keep the fallback setting in the run's frozen config.
     frozen.server_side_fallback = server_side_fallback;
     if provider_id == "opencode-go" && family == WireFamilyId::OpenAiChat {
         // Pi serves these Qwen ids through Chat Completions despite their Anthropic models.dev
@@ -1841,7 +1832,7 @@ fn freeze_refusal_fallback(
         &provider_spec,
         &model_spec,
         max_tokens,
-        broca_provider::families::anthropic_renderer_version(false),
+        source.renderer_version,
     )
     .map_err(|error| error.to_string())?;
     apply_auth_method_quirks(provider_id, auth_method, &mut fallback);
@@ -3316,11 +3307,7 @@ mod tests {
             );
             assert!(frozen.server_side_fallback);
             assert_eq!(body["fallbacks"], "default");
-            // The opt-in freezes the version whose bytes it renders.
-            assert_eq!(
-                frozen.renderer_version,
-                broca_provider::families::anthropic_renderer_version(true)
-            );
+            assert_eq!(frozen.renderer_version, 4);
 
             // The control: the same episode with the switch off renders exactly the bytes it
             // did before the field existed, and records no flag.
@@ -3331,9 +3318,7 @@ mod tests {
                 fresh(),
             );
             assert!(!off.server_side_fallback);
-            // And the switch being off means the episode records v2, so a build rolled back past
-            // v3 resumes it: nothing about this run moved.
-            assert_eq!(off.renderer_version, 2);
+            assert_eq!(off.renderer_version, 4);
             assert!(serde_json::to_value(&off)
                 .unwrap()
                 .get("server_side_fallback")
@@ -3783,10 +3768,7 @@ mod tests {
         assert_eq!(frozen.prompt_cache_key, source.prompt_cache_key);
         assert_eq!(frozen.base_url, source.base_url);
         assert_eq!(frozen.structured_output, source.structured_output);
-        assert_eq!(
-            frozen.renderer_version, 2,
-            "the un-opted fallback keeps the renderer used before server-side opt-in"
-        );
+        assert_eq!(frozen.renderer_version, 4);
         assert!(!frozen.server_side_fallback);
         // A fallback never carries a fallback of its own.
         assert!(frozen.refusal_fallback.is_none());

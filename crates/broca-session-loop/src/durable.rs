@@ -94,6 +94,24 @@ pub struct Durable<'a, W, S> {
 }
 
 impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
+    async fn run_has_attempt(&self, run_id: &str) -> Result<bool, SessionError> {
+        crate::writer::Writer::run_has_attempt(&*self.writer, run_id).await
+    }
+
+    async fn signing_config(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::writer::SigningConfig>, SessionError> {
+        crate::writer::Writer::signing_config(&*self.writer, run_id).await
+    }
+
+    async fn apply_may_erase_notes(&self, generation: u64) -> Result<bool, SessionError> {
+        self.writer.apply_may_erase_notes(generation).await
+    }
+
+    async fn cut_records(&self) -> Result<Vec<Record>, SessionError> {
+        self.writer.cut_records().await
+    }
     async fn responses_reasoning_removals(
         &self,
         run_id: &str,

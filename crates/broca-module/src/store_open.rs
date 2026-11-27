@@ -134,6 +134,27 @@ impl StoredParts for EncryptedSetupSource {
             }
         }
     }
+
+    fn read_checked(
+        &self,
+        digest: &broca_session_store::codec::Digest,
+    ) -> Result<Option<Arc<[u8]>>, broca_session_loop::parts::PartReadError> {
+        use broca_session_loop::parts::PartReadError;
+        use broca_session_store::setup::{LookupError, SetupReader};
+        use futures::FutureExt as _;
+        SetupReader::new(&self.backend, &self.deployment, Cipher::XChaCha20Poly1305)
+            .read(digest)
+            .now_or_never()
+            .ok_or_else(|| {
+                PartReadError::Transient("the setup store's backend can't be read inline".into())
+            })?
+            .map_err(|error| match error {
+                LookupError::KeyUnavailable => {
+                    PartReadError::Transient(SETUP_KEY_UNAVAILABLE.into())
+                }
+                LookupError::Store(error) => PartReadError::setup(error),
+            })
+    }
 }
 
 pub(crate) const SETUP_KEY_UNAVAILABLE: &str =
@@ -158,6 +179,13 @@ impl Parts for EncryptedParts {
                 error
             }
         })
+    }
+
+    fn get_checked(
+        &self,
+        part: &PartRef,
+    ) -> Result<serde_json::Value, broca_session_loop::parts::PartReadError> {
+        self.parts.get_checked(part)
     }
 
     fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {

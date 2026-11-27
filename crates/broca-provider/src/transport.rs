@@ -805,7 +805,12 @@ impl<F: WireFamily + 'static> RenderJob<F> {
                 &name_map,
             )
         };
-        let endpoint = self.family.endpoint(&self.frozen, &self.auth, body);
+        let endpoint = self.family.endpoint_with_tool_notes(
+            &self.frozen,
+            &self.auth,
+            body,
+            crate::turn_system::tool_addition::renders_native(&self.opts),
+        );
         self.credential_hosts.check(&self.auth, &endpoint.url)?;
         let mut request = PreparedHttpRequest::from(endpoint);
         request.ephemeral_session = self.opts.ephemeral_session;
@@ -1021,10 +1026,12 @@ impl<F: WireFamily + 'static> LiveProvider<F> {
             frozen.server_side_fallback = false;
             frozen
         });
-        let request = self.family.endpoint(
+        let native_tools = crate::turn_system::tool_addition::warm_has_native(&body);
+        let request = self.family.endpoint_with_tool_notes(
             endpoint_frozen.as_ref().unwrap_or(&warm_frozen),
             &served.auth,
             body,
+            native_tools,
         );
         served
             .hosts
@@ -3080,29 +3087,16 @@ fn spawn_transport_task<F: WireFamily + 'static>(
         // Rebuilds only the HTTP shape (url and headers) for a refreshed credential. The body is
         // reused as-is: auth attaches after render, so the bytes sent do not change.
         let rebuild = |auth: &AuthHandle, sent: &PreparedHttpRequest| {
-            let fresh = family.endpoint(frozen.as_ref(), auth, sent.body.to_vec());
+            let fresh = family.endpoint_with_tool_notes(
+                frozen.as_ref(),
+                auth,
+                sent.body.to_vec(),
+                crate::turn_system::tool_addition::has_beta(&sent.headers),
+            );
             PreparedHttpRequest {
-                quota_observer: sent.quota_observer.clone(),
-                cache_session: sent.cache_session.clone(),
-                cache_model: sent.cache_model.clone(),
-                cache_provenance: sent.cache_provenance.clone(),
-                attempt_hook: sent.attempt_hook.clone(),
-                ephemeral_session: sent.ephemeral_session,
-                codex_wire: sent.codex_wire,
-                auth_revision: sent.auth_revision,
-                completed_output: sent.completed_output.clone(),
                 url: fresh.url,
                 headers: fresh.headers,
-                body: sent.body.clone(),
-                family: sent.family,
-                subscription_auth: sent.subscription_auth,
-                service_tier: sent.service_tier.clone(),
-                session_address: sent.session_address.clone(),
-                run_id: sent.run_id.clone(),
-                credential_id: sent.credential_id.clone(),
-                account_ref: sent.account_ref.clone(),
-                wire_model_id: sent.wire_model_id.clone(),
-                speed_requested: sent.speed_requested.clone(),
+                ..sent.clone()
             }
         };
         let step_recovery = recovery.map(|recovery| StepAuthRecovery {

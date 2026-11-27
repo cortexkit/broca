@@ -1,0 +1,1 @@
+{"max_tokens":2048,"messages":[{"content":[{"text":"one","type":"text"}],"role":"user"},{"content":"<context-note>owner</context-note>","role":"user"},{"content":"removed","role":"system"},{"content":[{"text":"answer","type":"text"}],"role":"assistant"},{"content":[{"text":"two","type":"text"}],"role":"user"}],"model":"claude-opus-5-5","stream":true,"system":[]}

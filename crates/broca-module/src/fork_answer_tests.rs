@@ -73,3 +73,41 @@ fn an_ask_lowers_its_effort_from_the_base_runs_frozen_config() {
     assert_eq!(lowered_effort(&frozen, "high"), None);
     assert_eq!(lowered_effort(&Value::Null, "low"), None);
 }
+
+#[test]
+fn note_free_fork_matches_the_0149_primary_and_actual_fallback_bytes() {
+    use broca_protocol::{CallOptions, ContentBlock, Message, ModelHandle, Role};
+    use broca_provider::{
+        families::anthropic_apikey_frozen_config,
+        wire::{FrozenRenderConfig, RefusalFallbackConfig},
+    };
+    let mut primary = anthropic_apikey_frozen_config("claude-opus-5-5");
+    let mut fallback = anthropic_apikey_frozen_config("claude-opus-4-8");
+    primary.cache = None;
+    fallback.cache = None;
+    let source = ModelHandle::new("anthropic", "claude-opus-5-5");
+    let target = ModelHandle::new("anthropic", "claude-opus-4-8");
+    let mut opts = CallOptions::new(vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "fork question".into(),
+        }],
+    )]);
+    opts.target_model = Some(source.clone());
+    let config = |frozen: &FrozenRenderConfig| {
+        serde_json::from_value(json!({"model":source,"tools":[],"tool_choice":broca_protocol::request::ToolChoice::Auto,"generation":broca_protocol::request::GenerationConfig::default(),"response_format":broca_protocol::request::ResponseFormat::default(),"context_epoch":0,"renderer_version":2,"frozen_render_config":frozen})).unwrap()
+    };
+    let primary_pin = br#"{"max_tokens":2048,"messages":[{"content":[{"text":"fork question","type":"text"}],"role":"user"}],"model":"claude-opus-5-5","stream":true,"system":[]}"#;
+    assert_eq!(render(&config(&primary), &opts).unwrap(), primary_pin);
+    primary.refusal_fallback = Some(Box::new(RefusalFallbackConfig {
+        model: target.clone(),
+        context_limit: None,
+        frozen: fallback,
+    }));
+    assert_eq!(render(&config(&primary), &opts).unwrap(), primary_pin);
+    opts.target_model = Some(target);
+    // 0.4.149's no-media fork helper incorrectly selected the primary for a routed retry.
+    // The pin is the exact body its fallback renderer sent, not that incorrect reconstruction.
+    let fallback_pin = br#"{"max_tokens":2048,"messages":[{"content":[{"text":"fork question","type":"text"}],"role":"user"}],"model":"claude-opus-4-8","stream":true,"system":[]}"#;
+    assert_eq!(render(&config(&primary), &opts).unwrap(), fallback_pin);
+}

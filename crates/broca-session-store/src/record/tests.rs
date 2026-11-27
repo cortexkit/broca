@@ -425,12 +425,15 @@ fn plan_notes_keep_their_kind_number_and_bytes() {
     // change applies, including after a restart, so the kind number and encoding are pinned:
     // field numbers in order, each note a nested message with its kind as its declared number.
     let record = Record::PlanNotes(PlanNotes {
+        blocks: None,
         generation: 2,
         anchor: 7,
         notes: vec![PlanNote {
             kind: PlanNoteKind::System,
             text: "n".into(),
             form: "turn_system".into(),
+            tool: None,
+            tool_dispatch: None,
         }],
         refused_tools: vec!["t".into()],
         model_key: "p:m".into(),
@@ -461,6 +464,8 @@ fn plan_note_restoration_decodes_only_the_pinned_wording() {
         kind: PlanNoteKind::ToolRestored,
         text: text.into(),
         form: "turn_system".into(),
+        tool: None,
+        tool_dispatch: None,
     };
     let note = restoration("Tool \"a\"b\" is now available.");
     let bytes = CodecMessage::encode(&note);
@@ -474,6 +479,30 @@ fn plan_note_restoration_decodes_only_the_pinned_wording() {
         assert_eq!(error.at, "PlanNote.text");
         assert!(matches!(error.kind, DecodeErrorKind::BadValue(_)));
     }
+}
+
+#[test]
+fn tool_addition_is_a_must_understand_note_with_canonical_schema_text() {
+    use crate::codec::Message as _;
+    let note = PlanNote {
+        kind: PlanNoteKind::ToolAddition,
+        text: String::new(),
+        form: "responses_additional_tools".into(),
+        tool: Some(PlanNoteTool {
+            name: "read".into(),
+            description: "Read a file".into(),
+            input_schema: r#"{"type":"object"}"#.into(),
+        }),
+        tool_dispatch: Some(r#"{"module":"files"}"#.into()),
+    };
+    let bytes = note.encode();
+    let required: Vec<_> = crate::codec::Fields::new(&bytes, "plan note")
+        .map(Result::unwrap)
+        .filter(|field| field.must)
+        .map(|field| field.number)
+        .collect();
+    assert_eq!(required, [4, 5]);
+    assert_eq!(PlanNote::decode(&bytes).unwrap(), note);
 }
 
 #[test]

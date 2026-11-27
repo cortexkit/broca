@@ -3,6 +3,48 @@
 use crate::provider::Provider;
 use broca_protocol::{ErrorClass, ProviderError};
 
+pub const ANTHROPIC_ECHO_SCOPE: &str = "all_assistant_messages";
+pub const LEGACY_ANTHROPIC_ECHO: &str =
+    "the frozen Anthropic run uses the retired last-assistant thinking echo";
+
+/// Exact replays must examine the stored JSON, not a typed config read for metadata.
+/// A missing `echo_scope` meant only the last assistant. The current renderer may echo every
+/// retained reply's thinking, subject to its cross-model policy and compaction.
+pub fn legacy_anthropic_echo(frozen: &serde_json::Value) -> bool {
+    legacy_anthropic_echo_on_route(frozen)
+        || frozen
+            .get("refusal_fallback")
+            .and_then(|fallback| fallback.get("frozen"))
+            .is_some_and(legacy_anthropic_echo)
+}
+
+/// An exact rebuild needs the echo policy of the route that actually rendered the attempt.
+pub fn legacy_anthropic_echo_on_route(frozen: &serde_json::Value) -> bool {
+    let reasoning = &frozen["reasoning"];
+    reasoning["mode"] == "anthropic_interleaved"
+        && reasoning["last_turn_only"] == true
+        && (reasoning.get("echo_scope").is_none()
+            || reasoning["echo_scope"] == "last_assistant_message")
+}
+
+pub fn recorded_render_route<'a>(
+    frozen: &'a serde_json::Value,
+    model: Option<&broca_protocol::ModelHandle>,
+) -> &'a serde_json::Value {
+    frozen
+        .get("refusal_fallback")
+        .filter(|fallback| {
+            model.is_some_and(|model| {
+                serde_json::from_value::<broca_protocol::ModelHandle>(fallback["model"].clone())
+                    .as_ref()
+                    .ok()
+                    == Some(model)
+            })
+        })
+        .and_then(|fallback| fallback.get("frozen"))
+        .unwrap_or(frozen)
+}
+
 /// Why `provider` can't resume a run frozen with `renderer_version` and `frozen_render_config`
 /// byte for byte, if it can't: either config is null, the provider doesn't reproduce that
 /// renderer version, or it renders that version with another config. `None` when it can.

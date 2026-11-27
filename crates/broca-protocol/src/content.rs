@@ -19,7 +19,7 @@ pub enum Role {
 }
 
 /// One message in a `Prompt` (`Vec<Message>`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
@@ -27,6 +27,10 @@ pub struct Message {
     /// Unsupported routes render it at user authority without changing the stored entry.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub turn_system: bool,
+    /// A tool made callable by a mid-session plan change without rewriting the prefix tool list.
+    /// Only the request view carries the provider-native declaration.
+    #[serde(skip)]
+    pub tool_addition: Option<crate::tool_addition::ToolAddition>,
     /// Number of leading content blocks that form a caller-declared cacheable prefix.
     ///
     /// This render metadata stays beside the content it describes so queueing and replay retain
@@ -72,6 +76,26 @@ pub struct Message {
     pub tags: crate::tags::TagSlot,
 }
 
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut message = f.debug_struct("Message");
+        message
+            .field("role", &self.role)
+            .field("content", &self.content)
+            .field("turn_system", &self.turn_system);
+        // Requests without a tool addition retain the diagnostic shape used by replay comparisons.
+        if self.tool_addition.is_some() {
+            message.field("tool_addition", &self.tool_addition);
+        }
+        message
+            .field("cache_prefix_blocks", &self.cache_prefix_blocks)
+            .field("origin", &self.origin)
+            .field("ordinal", &self.ordinal)
+            .field("tags", &self.tags)
+            .finish()
+    }
+}
+
 impl Message {
     /// A message with no producing-model origin (user/tool/system input, or any message
     /// whose origin is not tracked). The common constructor for input + test messages.
@@ -80,6 +104,7 @@ impl Message {
             role,
             content,
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: None,
             ordinal: None,
@@ -95,6 +120,7 @@ impl Message {
             role: Role::Assistant,
             content,
             turn_system: false,
+            tool_addition: None,
             cache_prefix_blocks: None,
             origin: Some(origin),
             ordinal: None,
@@ -107,8 +133,12 @@ impl Message {
     /// stay.
     pub fn set_tags(&mut self, tags: Option<std::sync::Arc<crate::tags::PartTags>>) {
         let rides = self.tags.rides_after_results.take();
+        let plan_note = self.tags.plan_note;
+        let legacy_plan_note = self.tags.legacy_plan_note;
         self.tags = crate::tags::TagSlot::new(tags);
         self.tags.rides_after_results = rides;
+        self.tags.plan_note = plan_note;
+        self.tags.legacy_plan_note = legacy_plan_note;
     }
 
     /// This message's runner tags, when its session has them.

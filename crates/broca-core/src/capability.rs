@@ -10,6 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use broca_protocol::{ApprovalResponse, Tool, ToolCall};
 
+mod added_tool;
+pub use added_tool::{AddedToolDispatch, ProviderTransport};
+
 /// Default cap on a single tool call's serialized input (oversized-payload guard).
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 256 * 1024;
 

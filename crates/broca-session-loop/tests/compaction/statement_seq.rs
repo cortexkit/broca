@@ -258,7 +258,7 @@ async fn tell(session: &Session<&MemoryBackend>, spy: &CompactionSpy) {
         earlier: None,
         window: Default::default(),
     };
-    broca_session_loop::compaction::notice(session, &admission, &seams, &ctx, None)
+    broca_session_loop::compaction::notice(session, &admission, &seams, &ctx, None, None)
         .await
         .unwrap();
 }

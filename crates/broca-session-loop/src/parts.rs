@@ -24,6 +24,12 @@ pub trait Parts: Send + Sync {
     /// The value a part holds.
     fn get(&self, part: &PartRef) -> Result<Value, String>;
 
+    /// Read evidence for what signed thinking may be echoed, without conflating corrupt bytes
+    /// with an I/O failure. Implementations with only an opaque error fail transiently.
+    fn get_checked(&self, part: &PartRef) -> Result<Value, PartReadError> {
+        self.get(part).map_err(PartReadError::Transient)
+    }
+
     /// The parts put here that aren't durable yet, with their bytes. A writer stores each
     /// before it appends a record, so no record names a part only memory holds. A store that
     /// keeps nothing durable, such as one for tests, lists none.
@@ -44,6 +50,25 @@ pub trait Parts: Send + Sync {
     /// report. `None` for a store that doesn't count.
     fn usage(&self) -> Option<PartsUsage> {
         None
+    }
+}
+
+#[derive(Debug)]
+pub enum PartReadError {
+    Damaged(String),
+    Transient(String),
+}
+
+impl PartReadError {
+    pub fn setup(error: broca_session_store::setup::SetupError) -> Self {
+        use broca_session_store::{backend::BackendError, setup::SetupError};
+        let text = format!("a stored setup part can't be read: {error:?}");
+        match error {
+            SetupError::Backend(BackendError::Io(_) | BackendError::Fenced) => {
+                Self::Transient(text)
+            }
+            _ => Self::Damaged(text),
+        }
     }
 }
 
@@ -241,6 +266,10 @@ impl Parts for MemoryParts {
             .ok_or_else(|| "setup part missing".to_string())?;
         decode_bytes(bytes)
     }
+
+    fn get_checked(&self, part: &PartRef) -> Result<Value, PartReadError> {
+        self.get(part).map_err(PartReadError::Damaged)
+    }
 }
 
 /// One parts store shared by several holders: a session's actor and its run both store parts
@@ -278,6 +307,12 @@ impl Parts for SharedParts {
         self.lock()?.get(part)
     }
 
+    fn get_checked(&self, part: &PartRef) -> Result<Value, PartReadError> {
+        self.lock()
+            .map_err(PartReadError::Transient)?
+            .get_checked(part)
+    }
+
     fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {
         self.lock()
             .map(|parts| parts.unstored())
@@ -305,6 +340,10 @@ pub trait StoredParts: Send + Sync {
     /// The stored bytes of the part with `digest`, checked against it; `None` when no such part
     /// is stored.
     fn read(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, String>;
+
+    fn read_checked(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, PartReadError> {
+        self.read(digest).map_err(PartReadError::Transient)
+    }
 }
 
 /// A setup store's parts in one cipher mode, read on the caller's task, as the store's other
@@ -323,6 +362,17 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync> StoredParts 
             .now_or_never()
             .ok_or("the setup store's backend can't be read inline")?
             .map_err(|error| format!("a stored setup part can't be read: {error:?}"))
+    }
+
+    fn read_checked(&self, digest: &Digest) -> Result<Option<Arc<[u8]>>, PartReadError> {
+        use futures::FutureExt as _;
+        broca_session_store::setup::SetupStore::new(&self.backend, &self.key)
+            .read(digest)
+            .now_or_never()
+            .ok_or_else(|| {
+                PartReadError::Transient("the setup store's backend can't be read inline".into())
+            })?
+            .map_err(PartReadError::setup)
     }
 }
 
@@ -533,6 +583,24 @@ impl Parts for DeploymentParts {
             .decoded_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         decode_bytes(&bytes)
+    }
+
+    fn get_checked(&self, part: &PartRef) -> Result<Value, PartReadError> {
+        // Do not use a decoded or held cache entry as evidence that an old stored part
+        // can still be recovered by a cold reader.
+        let unstored = self
+            .lock()
+            .map_err(PartReadError::Transient)?
+            .unstored
+            .get(&part.digest)
+            .map(|(_, bytes)| Arc::clone(bytes));
+        let bytes = match (unstored, self.stored.as_ref()) {
+            (Some(bytes), _) => Some(bytes),
+            (None, Some(stored)) => stored.read_checked(&part.digest)?,
+            (None, None) => self.bytes(&part.digest).map_err(PartReadError::Transient)?,
+        }
+        .ok_or_else(|| PartReadError::Damaged("setup part missing".into()))?;
+        decode_bytes(&bytes).map_err(PartReadError::Damaged)
     }
 
     fn unstored(&self) -> Vec<(PartRef, Vec<u8>)> {

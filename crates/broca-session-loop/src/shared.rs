@@ -86,6 +86,21 @@ pub enum Request {
         before_seq: Option<u64>,
         reply: Reply<crate::responses_reasoning::ResponsesReasoningRemovals>,
     },
+    CutRecords {
+        reply: Reply<Vec<Record>>,
+    },
+    ApplyMayEraseNotes {
+        generation: u64,
+        reply: Reply<bool>,
+    },
+    RunHasAttempt {
+        run_id: String,
+        reply: Reply<bool>,
+    },
+    SigningConfig {
+        run_id: String,
+        reply: Reply<Option<crate::writer::SigningConfig>>,
+    },
     OpenRunTail {
         run_id: String,
         first: u64,
@@ -332,6 +347,33 @@ impl ActorWriter {
 }
 
 impl Writer for ActorWriter {
+    async fn cut_records(&self) -> Result<Vec<Record>, SessionError> {
+        self.ask(|reply| Request::CutRecords { reply }).await
+    }
+
+    async fn apply_may_erase_notes(&self, generation: u64) -> Result<bool, SessionError> {
+        self.ask(|reply| Request::ApplyMayEraseNotes { generation, reply })
+            .await
+    }
+
+    async fn run_has_attempt(&self, run_id: &str) -> Result<bool, SessionError> {
+        self.ask(|reply| Request::RunHasAttempt {
+            run_id: run_id.into(),
+            reply,
+        })
+        .await
+    }
+
+    async fn signing_config(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::writer::SigningConfig>, SessionError> {
+        self.ask(|reply| Request::SigningConfig {
+            run_id: run_id.into(),
+            reply,
+        })
+        .await
+    }
     async fn responses_reasoning_removals(
         &self,
         run_id: &str,
@@ -665,6 +707,19 @@ impl RunLink {
                         .responses_reasoning_removals(&run_id, before_seq)
                         .await,
                 );
+            }
+            Request::CutRecords { reply } => {
+                let _ = reply.send(crate::writer::Writer::cut_records(session).await);
+            }
+            Request::ApplyMayEraseNotes { generation, reply } => {
+                let _ = reply
+                    .send(crate::writer::Writer::apply_may_erase_notes(session, generation).await);
+            }
+            Request::RunHasAttempt { run_id, reply } => {
+                let _ = reply.send(crate::writer::Writer::run_has_attempt(session, &run_id).await);
+            }
+            Request::SigningConfig { run_id, reply } => {
+                let _ = reply.send(crate::writer::Writer::signing_config(session, &run_id).await);
             }
             Request::OpenRunTail {
                 run_id,

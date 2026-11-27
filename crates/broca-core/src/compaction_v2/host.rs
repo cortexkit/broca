@@ -95,17 +95,12 @@ pub fn conditions(
     )
 }
 
-/// The session's signed floor as the compaction contract names it (`signed_floor.through`): the
-/// entry it goes through, by its stable id. `through` is that entry's id. The floor itself is
-/// the ordinal of the first message whose signed reasoning requests still send
-/// ([`crate::signed_floor::SignedFloor::floor`]), so the floor goes through the message before
-/// it, whose entry's one-based ordinal is that same number; the caller finds that entry
-/// wherever the session holds it, sealed history included, so the floor is stated the same on
-/// every call, whatever entries the call has in hand. This is the one place broca turns its
-/// floor into what the compaction provider and the view checks read.
+/// The session's signed floor, expressed as the stable ID of the last entry through which
+/// requests drop signed reasoning. The caller resolves the entry whether it is in the window or
+/// sealed. The Anthropic v4 renderer can name the run's first input for a cut at run start,
+/// because that entry adds no signed reasoning.
 ///
-/// `None` when the session has no floor (no run changed the tool set, or the change came before
-/// any message, so there is no earlier reasoning to drop), or when `rules` say the model doesn't
+/// `None` when there is no cutoff, or when `rules` say the model doesn't
 /// bind signed parts to the request prefix (the floor then constrains nothing). An absent floor
 /// keeps every view check as strict as it was before floors existed.
 pub fn signed_floor(

@@ -200,6 +200,8 @@ pub async fn store_snapshot(
             let mut writer = Session::load(&memory, addr.clone(), triple, deployment)
                 .await
                 .map_err(|e| format!("{e:?}"))?;
+            // Compare the same synthetic request on both sides of the move. A real next run
+            // may apply a pending manifest before it starts; the snapshot does not admit it.
             start.run_id = NEXT_RUN.into();
             start.submission_id = None;
             start.send_id = None;
@@ -293,6 +295,175 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn snapshot_does_not_redeliver_an_unanswered_note_without_admission() {
+        use broca_session_store::{
+            backend::LocalBackend,
+            keys::Cipher,
+            record::{PlanNote, PlanNoteKind, PlanNoteTool, PlanNotes},
+            setup::SetupStore,
+        };
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/agent_data/fixtures/finished.json"
+        ))
+        .unwrap();
+        let parts: BTreeMap<Digest, Vec<u8>> = fixture["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| (Digest(unhex(&part[0]).try_into().unwrap()), unhex(&part[1])))
+            .collect();
+        let mut records: Vec<_> = fixture["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                Record::decode(
+                    record["kind"].as_u64().unwrap() as u32,
+                    &unhex(&record["body"]),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut end = records
+            .iter()
+            .find_map(|record| match record {
+                Record::RunEnd(end) => Some(end.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let start = records
+            .iter()
+            .find(|record| matches!(record, Record::RunStart(_)))
+            .cloned()
+            .unwrap();
+        records = vec![start];
+        let bind = BindIdentity::new("/project", "runner", "unanswered-snapshot");
+        let triple = SessionTriple {
+            project_root: "/project".into(),
+            harness: bind.harness.clone(),
+            session: bind.session.clone(),
+        };
+        let addr = SessionAddr(broca_core::session_addr(&bind));
+        let deployment = DeploymentKey::new(7, &[4; 32]);
+        let dir = broca_test_support::scratch_root()
+            .join(format!("unanswered-snapshot-{}", std::process::id()));
+        let store = LocalBackend::new(&dir);
+        let key = deployment.setup_key_for(Cipher::XChaCha20Poly1305).unwrap();
+        let setup = SetupStore::new(&store, &key);
+        let config = serde_json::to_vec(&broca_provider::families::anthropic_frozen_config(
+            "claude-opus-5-5",
+        ))
+        .unwrap();
+        for record in &mut records {
+            for part in named_parts(record) {
+                setup.put(part.kind, &parts[&part.digest]).await.unwrap();
+            }
+            if let Record::RunStart(start) = record {
+                end.run_id.clone_from(&start.run_id);
+                start.model = broca_protocol::ModelHandle::new("anthropic", "claude-opus-5-5");
+                start.render_identity = None;
+                start.compaction_plan_version = None;
+                start
+                    .setup
+                    .retain(|part| part.kind != PartKind::RenderConfig);
+                start
+                    .setup
+                    .push(setup.put(PartKind::RenderConfig, &config).await.unwrap().0);
+            }
+        }
+        let mut session = Session::create(&store, addr.clone(), triple, &deployment, false)
+            .await
+            .unwrap();
+        records.push(Record::Input(Input {
+            run_id: end.run_id.clone(),
+            placement: Placement::RunInput,
+            message: std::sync::Arc::new(broca_protocol::Message::new(
+                broca_protocol::Role::User,
+                vec![broca_protocol::ContentBlock::Text {
+                    text: "This turn never got a reply.".into(),
+                }],
+            )),
+            written_at_ms: Some(1),
+            submission_id: None,
+            notice: None,
+            tags_v1: None,
+            receipt_seq: None,
+            pruned: vec![],
+            media: vec![],
+        }));
+        let tags = broca_session_loop::entries::Tags::for_session(
+            false,
+            None,
+            &serde_json::from_slice(&config).unwrap(),
+        );
+        use broca_session_loop::Writer as _;
+        let records = broca_session_loop::entries::with_facts(
+            records,
+            &broca_session_loop::entries::Placing {
+                conversation: session.conversation(),
+                first_seq: session.next_seq(),
+                prefix: &session.message_id_prefix(),
+                session: &session.session_id(),
+                tags,
+                view: None,
+                operations: session.operations(),
+                calls: &Default::default(),
+                rich_ui: None,
+                runner: None,
+            },
+        )
+        .unwrap();
+        session.append(&records, true).await.unwrap();
+        assert_eq!(
+            session.conversation.newest().unwrap().role,
+            broca_protocol::Role::User
+        );
+        let (_, without_notes) = store.read_head(&addr).await.unwrap().unwrap();
+        let before = Export::pinned(&store, &addr, without_notes, "durable", &deployment)
+            .await
+            .unwrap();
+        let plain = store_snapshot(&before, &deployment).await.unwrap();
+        session
+            .append(
+                &[
+                    Record::PlanNotes(PlanNotes {
+                        blocks: Some(true),
+                        generation: 1,
+                        anchor: session.conversation.placed,
+                        notes: vec![PlanNote {
+                            kind: PlanNoteKind::ToolAddition,
+                            text: String::new(),
+                            form: "anthropic_tool_addition".into(),
+                            tool: Some(PlanNoteTool {
+                                name: "find".into(),
+                                description: "Find a place".into(),
+                                input_schema: r#"{"type":"object"}"#.into(),
+                            }),
+                            tool_dispatch: None,
+                        }],
+                        refused_tools: vec![],
+                        model_key: "anthropic:claude-opus-5-5".into(),
+                    }),
+                    Record::RunEnd(end),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        drop(session);
+        let (_, version) = store.read_head(&addr).await.unwrap().unwrap();
+        let export = Export::pinned(&store, &addr, version, "durable", &deployment)
+            .await
+            .unwrap();
+        let result = store_snapshot(&export, &deployment).await.unwrap();
+        assert_eq!(
+            result[NEXT_REQUEST], plain[NEXT_REQUEST],
+            "the synthetic request cannot deliver a note at a new anchor"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

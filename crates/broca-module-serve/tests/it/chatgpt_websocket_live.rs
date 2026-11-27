@@ -108,6 +108,7 @@ async fn chatgpt_websocket_live_full_input_cache_read() {
 fn message(role: Role, text: String) -> Message {
     Message {
         turn_system: false,
+        tool_addition: None,
         role,
         content: vec![ContentBlock::Text { text: text.into() }],
         origin: None,

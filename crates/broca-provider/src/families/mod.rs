@@ -366,6 +366,8 @@ pub fn earlier_renderer_versions(family: WireFamilyId) -> &'static [(u32, Earlie
             // v3's `fallbacks: "default"` is enabled only by a flag added to new frozen
             // configs; v2 configs omit it and keep their prior bytes.
             (2, Reproducible),
+            // v4 uses additional history floors only for runs frozen at v4 or later.
+            (3, Reproducible),
         ],
         WireFamilyId::OpenAiChat => &[
             (
@@ -706,20 +708,16 @@ pub fn resolve_frozen(
 /// v3: ask the runtime for server-side fallback (`fallbacks: "default"`) when the frozen
 /// config opts in.
 ///
-/// v3's change is reachable only from the frozen config's own `server_side_fallback` flag, so
-/// only a config that carries it freezes v3 (see [`anthropic_renderer_version`]). Every other
-/// Anthropic config freezes v2 and keeps rendering v2 bytes, and a build rolled back past v3
-/// still resumes every run that never opted in.
-pub const ANTHROPIC_RENDERER_VERSION: u32 = 3;
+/// v4: a fresh run can drop earlier signatures when it applies a pending plan or leaves
+/// last-assistant-only echo behind. v2 and v3 stay reproducible unless the particular attempt
+/// used the retired last-assistant echo mode.
+pub const ANTHROPIC_RENDERER_VERSION: u32 = 4;
 
-/// The Anthropic render ABI version a config with this opt-in freezes: v3 once the config asks
-/// for server-side fallback, v2 (the current version) otherwise.
-///
-/// The flag is the only way a v3 config differs from a v2 one, so recording v3 for a config
-/// without it would make a later rollback refuse to resume runs whose bytes are unchanged.
+/// The original Anthropic ABI choice used by fixtures and historical config builders.
+/// Live catalog admission freezes the current version independently of fallback.
 pub fn anthropic_renderer_version(server_side_fallback: bool) -> u32 {
     if server_side_fallback {
-        ANTHROPIC_RENDERER_VERSION
+        3
     } else {
         2
     }
