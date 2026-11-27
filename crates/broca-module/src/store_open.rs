@@ -42,6 +42,7 @@ const COMMANDS: usize = 64;
 
 #[path = "store_expiry.rs"]
 mod expiry;
+pub(crate) use expiry::ExpiryRead;
 
 /// What the module needs to serve sessions kept in the session store. Keys are installed into
 /// the shared runtime as they arrive, so already-open sessions see new setup name spaces too.
@@ -71,6 +72,7 @@ pub struct StoreRuntime {
     views: crate::store_reads::ViewCache<crate::store_read::StoredView<LocalBackend>>,
     /// Heads of sessions no actor holds, kept by position (see `store_head::KeptHeads`).
     heads: crate::store_head::KeptHeads,
+    authorization: crate::store_authorization::AuthorizationCache,
     /// Where each session's run events go once their records are durable; none in tests and
     /// while run events are off.
     run_events: Option<Arc<dyn crate::store_run_events::RunEventSink>>,
@@ -262,6 +264,7 @@ impl StoreRuntime {
                 crate::store_reads::ViewCache::MAX_BYTES,
             ),
             heads: Default::default(),
+            authorization: Default::default(),
             #[cfg(all(test, feature = "test-clock"))]
             log_reads: Arc::default(),
             #[cfg(all(test, feature = "test-clock"))]
@@ -634,6 +637,10 @@ impl StoreRuntime {
         &self.heads
     }
 
+    pub(crate) fn authorization(&self) -> &crate::store_authorization::AuthorizationCache {
+        &self.authorization
+    }
+
     /// Where the session `key` stands now, when no actor holds it: the root it is kept in, and
     /// the position a kept head is matched against, read from the session's head and its open
     /// log's length alone. `None` otherwise, and for anything this cheap read can't settle (a
@@ -669,21 +676,6 @@ impl StoreRuntime {
             }
         }
         Some((class, position))
-    }
-
-    /// Whether the read policy kept for the session `key` admits `access`, when the session is
-    /// closed at that position. Returns `None` when no policy is kept there or it can't decide
-    /// without the session's records. The policy can spare a view load even when the head reply
-    /// depends on the clock and isn't kept.
-    pub(crate) async fn admit_by_kept_head(
-        &self,
-        registry: &crate::LineageRegistry,
-        key: &BindIdentity,
-        access: &crate::reader_admission::ReadAccess,
-    ) -> Option<Result<(), crate::serve::ServeError>> {
-        let (_, position) = self.closed_position(registry, key).await?;
-        self.heads
-            .admit(&broca_core::session_addr(key), position, access)
     }
 
     /// The session `key`, kept in the root of `class`, as it stood at `position`: the kept view,
@@ -850,10 +842,11 @@ impl StoreRuntime {
             Some((class, _)) => Some(class),
             None => self.class_of(key)?,
         };
-        let position = probe.map(|(_, position)| position);
-        let mut probed = registry
+        let mut position = probe.map(|(_, position)| position);
+        let expiry = registry
             .check_expired_with_view(key, run, Some(class))
             .await?;
+        let mut probed = expiry.view;
         let Some(class) = class else {
             return Ok(None);
         };
@@ -907,6 +900,32 @@ impl StoreRuntime {
             }
             probed => probed,
         };
+        if request.keeps_authorization() && !reached_actor && registry.slot_state(key).is_none() {
+            let at = match (probed.as_ref(), expiry.unexpired_position) {
+                (Some(view), _) => Some(view.position()),
+                // Do not test authorization against a different position from the one checked
+                // by expiry when retention had to establish that it was not due.
+                (None, Some(at)) => Some(at),
+                (None, None) => Session::stored_position(
+                    &self.backend(class),
+                    &SessionAddr(broca_core::session_addr(key)),
+                    self.deployment(),
+                )
+                .await
+                .ok()
+                .flatten(),
+            };
+            position = at;
+            if let Some(at) = at.filter(|_| registry.slot_state(key).is_none()) {
+                if let Some(reply) = self
+                    .authorization
+                    .get(key, class, at)
+                    .and_then(|facts| facts.reply(&request))
+                {
+                    return Ok(Some((reply, Some(at))));
+                }
+            }
+        }
         let current = match probed {
             Some(view) => Some(view),
             None => self
@@ -929,7 +948,19 @@ impl StoreRuntime {
         }
         let slot = registry.slot_state(key);
         let served_at = slot.is_none().then(|| view.position());
-        let reply = self.read_stored(key, class, &view, slot, &request).await;
+        let retained = served_at.map(|_| {
+            self.authorization.learn(
+                key,
+                class,
+                &view,
+                self.parts_for(class, view.head().cipher()),
+                None,
+            )
+        });
+        let reply = match retained.and_then(|facts| facts.reply(&request)) {
+            Some(reply) => reply,
+            None => self.read_stored(key, class, &view, slot, &request).await,
+        };
         if let Some(served) = served {
             *served = Some(view);
         }

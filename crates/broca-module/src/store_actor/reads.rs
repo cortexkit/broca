@@ -112,6 +112,14 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             }
         };
         let addr = broca_core::session_addr(&self.key);
+        let parts = store.parts_for(class, self.session.head().cipher());
+        store.authorization().learn(
+            &self.key,
+            class,
+            &self.session,
+            parts,
+            self.admission.known(),
+        );
         if class == broca_records::session_storage::StorageClass::Ephemeral {
             if let Some(retention) = registry.retention_service() {
                 let Some(deadline) = self.retention_timer.known(&self.session) else {
@@ -128,7 +136,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let context = crate::store_reads::ReadContext {
             labels: crate::store_awaits::Labels(Some(self.executor.clone())),
             token_counts: None,
-            parts: store.parts_for(class, self.session.head().cipher()),
+            parts,
             held: false,
             open: false,
             settled: Some((store.settled_runs(), addr.as_str())),

@@ -150,7 +150,10 @@ impl crate::LineageRegistry {
                 store.views().memory(|view| view.held_bytes().total()),
                 store.settled_runs().memory(),
                 store.setup_store_usage(),
-                Some(store.heads().counts()),
+                Some(broca_wire::KeptHeadCounts {
+                    authorization: Some(store.authorization().memory()),
+                    ..store.heads().counts()
+                }),
             ),
             None => Default::default(),
         };

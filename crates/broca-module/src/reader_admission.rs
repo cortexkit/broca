@@ -135,8 +135,8 @@ impl ReadPlan {
 
 /// What a read's admission reads from a session: its ownership, the plan in force for reads
 /// (the latest run's, else the first run's) and the latest accepted plan, whose reader list
-/// governs. A kept head holds it too, so a closed session's read can be admitted without loading
-/// the session (see `store_head::KeptHeads`). Only the plan members used for admission are held;
+/// governs. The closed-session authorization cache can admit a read without loading the session.
+/// Only the plan members used for admission are held;
 /// tool composition, system text and other plan data aren't needed by a kept head.
 #[derive(Clone)]
 pub struct ReadPolicy {
@@ -208,7 +208,7 @@ impl ReadPolicy {
 }
 
 /// The read policy of `session`, as [`admit`] reads it.
-fn read_policy<B: SessionBackend>(
+pub(crate) fn read_policy<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
 ) -> Result<ReadPolicy, ServeError> {

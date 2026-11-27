@@ -718,6 +718,10 @@ async fn authorizing_a_read_of_a_kept_head_reads_no_log() {
 const PAUSED_RESUME_MS: u64 = 4_000_000_000_000;
 
 #[cfg(feature = "test-clock")]
+#[path = "store_open_tests/authorization.rs"]
+mod authorization;
+
+#[cfg(feature = "test-clock")]
 async fn paused_closed_read_fixture(
     name: &str,
 ) -> (PathBuf, Arc<StoreRuntime>, LineageRegistry, BindIdentity) {
@@ -835,16 +839,21 @@ async fn authorizing_a_read_of_a_closed_paused_session_reads_no_log() {
     let views = runtime.views().memory(|_| 0);
     assert_eq!(
         views.loads_by_reason.unwrap()["authorization.read"].loads,
-        accesses.len() as u64,
-        "only the cold authorization reads load views"
+        1,
+        "only the first cold authorization loads a view"
     );
     let kept = runtime.heads().counts();
-    assert_eq!(kept.kept.get("read_policy.read"), Some(&1));
-    assert!(kept.not_kept.is_empty());
-    assert_eq!(kept.held.entries, 1);
-    let parts = kept.held.estimated_by_part.unwrap();
-    assert!(parts["read_policy_only"] > 0);
-    assert!(!parts.contains_key("reply"));
+    assert_eq!(kept.not_kept.get("unsettled"), Some(&1));
+    assert_eq!(kept.held.entries, 0);
+    let authorization = registry
+        .memory_report()
+        .await
+        .kept_heads
+        .unwrap()
+        .authorization
+        .unwrap();
+    assert_eq!(authorization.entries, 1);
+    assert!(authorization.estimated_bytes > 0);
     drop(registry);
     drop(runtime);
     std::fs::remove_dir_all(root).unwrap();

@@ -117,6 +117,14 @@ pub enum StoreReadRequest {
 }
 
 impl StoreReadRequest {
+    /// Authorization that can be answered by position-checked owner and plan facts alone.
+    pub(crate) fn keeps_authorization(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthorizationOwnership | Self::AuthorizationRead(_)
+        )
+    }
+
     pub(crate) fn is_authorization(&self) -> bool {
         matches!(
             self,

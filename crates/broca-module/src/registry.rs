@@ -3288,9 +3288,9 @@ impl LineageRegistry {
         key: &LineageKey,
         run: Option<&str>,
         class: Option<Option<broca_records::session_storage::StorageClass>>,
-    ) -> Result<Option<crate::store_read::StoredLocalView>, OpenError> {
+    ) -> Result<crate::store_open::ExpiryRead, OpenError> {
         let Some(runtime) = self.store_runtime() else {
-            return Ok(None);
+            return Ok(Default::default());
         };
         let now_ms = self
             .inner
@@ -3298,8 +3298,8 @@ impl LineageRegistry {
             .get()
             .map_or(0, |service| service.clock.now_ms());
         let actor_open = self.open_handle(key).is_some();
-        let (expired_at_ms, view) = runtime
-            .expiry_with_view(
+        let read = runtime
+            .expiry_with_position(
                 key,
                 run,
                 now_ms,
@@ -3308,13 +3308,13 @@ impl LineageRegistry {
                 class,
             )
             .await?;
-        if let Some(expired_at_ms) = expired_at_ms {
+        if let Some(expired_at_ms) = read.deadline {
             return Err(crate::store_open::StoreRuntime::expired_refusal(
                 expired_at_ms,
-                view.as_deref(),
+                read.view.as_deref(),
             ));
         }
-        Ok(view)
+        Ok(read)
     }
 
     fn evict_retention_caches(&self, key: &LineageKey) -> bool {

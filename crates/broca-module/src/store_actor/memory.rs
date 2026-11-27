@@ -5,7 +5,6 @@
 
 use broca_core::FirstEpisodeV1;
 use broca_protocol::request::{CallOptions, Tool};
-use broca_records::record::FrozenFetchOutcome;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::held::{serde_heap_bytes, HeldBytes};
 use broca_wire::{MemoryHolders, MemorySession};
@@ -115,25 +114,8 @@ fn tools_held(tools: &std::sync::Arc<Vec<Tool>>) -> SetupHeld {
 fn first_episode_bytes(first: &FirstEpisodeV1) -> usize {
     first.run_id.0.heap_bytes()
         + first.tool_names.heap_bytes()
-        + first.plan.as_deref().map_or(0, |plan| {
-            2 * std::mem::size_of::<usize>()
-                + std::mem::size_of_val(plan)
-                + plan.plan.as_json_text().len()
-                + plan.plan_identity.heap_bytes()
-                + plan.composition_digest.heap_bytes()
-                + slots(&plan.fetches)
-                + plan
-                    .fetches
-                    .iter()
-                    .map(|fetch| {
-                        fetch.provider.heap_bytes()
-                            + match &fetch.outcome {
-                                FrozenFetchOutcome::Answered { catalog_digest } => {
-                                    catalog_digest.heap_bytes()
-                                }
-                                FrozenFetchOutcome::Absent { reason } => reason.heap_bytes(),
-                            }
-                    })
-                    .sum::<usize>()
-        })
+        + first
+            .plan
+            .as_deref()
+            .map_or(0, crate::store_authorization::frozen_plan_bytes)
 }

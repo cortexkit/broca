@@ -101,9 +101,6 @@ pub struct StoreHead {
     pub input: InputSource,
     ownership: broca_core::SessionOwnershipV1,
     senders: Vec<PlanSender>,
-    /// What admits a read of the session, as `reader_admission::admit` reads it; `None` when
-    /// it couldn't be read.
-    read_policy: Option<crate::reader_admission::ReadPolicy>,
 }
 
 /// The delivery modes a head's sender grants are drawn from: every mode the serve layer offers.
@@ -265,9 +262,8 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         .map(|latest| frozen_manifest(latest, parts))
         .transpose()?
         .flatten();
-    let accepted = broca_session_loop::plan::sender_manifest(operations, parts)
-        .map_err(StoreHeadError::Setup)?;
-    let senders = accepted
+    let senders = broca_session_loop::plan::sender_manifest(operations, parts)
+        .map_err(StoreHeadError::Setup)?
         .as_deref()
         .map(broca_core::head::head_senders)
         .unwrap_or_default();
@@ -275,17 +271,6 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         broca_session_loop::plan::selection(operations, parts).map_err(StoreHeadError::Setup)?;
     let ownership =
         broca_session_loop::owner::ownership(&operations.owner).map_err(StoreHeadError::Owner)?;
-    // What a read's admission reads, kept with the head so a kept head admits reads too. A
-    // policy that can't be read here leaves admission to a load of the session, which reports
-    // why.
-    let read_policy = crate::reader_admission::ReadPolicy::new(
-        session,
-        parts,
-        ownership.clone(),
-        latest_manifest.clone(),
-        accepted,
-    )
-    .ok();
     let interrupt_reason = match (latest, state.state) {
         (Some(run), SessionReadStateKind::Interrupted)
             if run.finished == Some(RunFinishReason::Interrupted) =>
@@ -391,7 +376,6 @@ pub(crate) async fn build_with_retry<B: SessionBackend>(
         input,
         ownership,
         senders,
-        read_policy,
     })
 }
 
@@ -478,7 +462,8 @@ pub(crate) async fn serve_head(
 /// closed sessions again and again, while building one loads the session's whole view, a full
 /// read of its log: after one restart, every closed-session view broca loaded was for a head, 142
 /// MB of them kept. So the head is kept instead. A head whose latest run is still active, paused
-/// or waiting can change with time even without a write, so only its read policy is kept. At
+/// or waiting can change with time even without a write, so it isn't kept. Authorization
+/// facts are kept independently of the head reply. At
 /// most [`HEADS_KEPT`] sessions, the least recently kept or read forgotten first, so a head
 /// polled all along stays however many others are kept after it.
 #[derive(Default)]
@@ -503,14 +488,9 @@ struct KeptHeadsInner {
 
 struct KeptHead {
     position: broca_session_store::session::Position,
-    data: KeptHeadData,
+    head: Box<StoreHead>,
     /// When it was last kept or read, its key in `order`.
     used: u64,
-}
-
-enum KeptHeadData {
-    Head(Box<StoreHead>),
-    ReadPolicy(Box<crate::reader_admission::ReadPolicy>),
 }
 
 impl KeptHeads {
@@ -526,18 +506,6 @@ impl KeptHeads {
         addr: &str,
         position: broca_session_store::session::Position,
     ) -> Option<StoreHead> {
-        self.get_at(addr, position, |data| match data {
-            KeptHeadData::Head(head) => Some(head.as_ref().clone()),
-            KeptHeadData::ReadPolicy(_) => None,
-        })
-    }
-
-    fn get_at<T>(
-        &self,
-        addr: &str,
-        position: broca_session_store::session::Position,
-        select: impl FnOnce(&KeptHeadData) -> Option<T>,
-    ) -> Option<T> {
         let mut kept = self.lock();
         kept.clock += 1;
         let clock = kept.clock;
@@ -545,15 +513,15 @@ impl KeptHeads {
             .heads
             .get_mut(addr)
             .filter(|entry| entry.position == position)?;
-        let selected = select(&entry.data)?;
+        let head = entry.head.as_ref().clone();
         let used = std::mem::replace(&mut entry.used, clock);
         kept.order.remove(&used);
         kept.order.insert(clock, addr.to_owned());
-        Some(selected)
+        Some(head)
     }
 
-    /// Keeps `head`, built at `position` for the session at `addr`, or just the read policy
-    /// when its reply can change without a write.
+    /// Keeps `head`, built at `position` for the session at `addr`, unless its reply can
+    /// change without a write.
     /// `source` names what built it, for the memory report: `read` or `close`.
     pub(crate) fn keep(
         &self,
@@ -567,27 +535,17 @@ impl KeptHeads {
                 && last.resume_not_before_ms.is_none()
                 && !matches!(last.state.as_str(), "active" | "paused")
         });
-        let (data, counted_as) = if settled {
-            (
-                KeptHeadData::Head(Box::new(head.clone())),
-                source.to_owned(),
-            )
-        } else if let Some(policy) = &head.read_policy {
-            (
-                KeptHeadData::ReadPolicy(Box::new(policy.clone())),
-                format!("read_policy.{source}"),
-            )
-        } else {
+        if !settled {
             self.count_not_kept("unsettled");
             return;
-        };
+        }
         let mut kept = self.lock();
-        *kept.counts.kept.entry(counted_as).or_default() += 1;
+        *kept.counts.kept.entry(source.to_owned()).or_default() += 1;
         kept.clock += 1;
         let used = kept.clock;
         let entry = KeptHead {
             position,
-            data,
+            head: Box::new(head.clone()),
             used,
         };
         if let Some(replaced) = kept.heads.insert(addr.clone(), entry) {
@@ -617,24 +575,11 @@ impl KeptHeads {
                     + std::mem::size_of::<(u64, String)>()
                     + 2 * addr.heap_bytes(),
             );
-            match &entry.data {
-                KeptHeadData::Head(head) => {
-                    add("head", std::mem::size_of_val(head.as_ref()));
-                    add("reply", serde_heap_bytes(&head.reply));
-                    add("ownership", serde_heap_bytes(&head.ownership));
-                    add("senders", serde_heap_bytes(&head.senders));
-                    add(
-                        "read_policy",
-                        head.read_policy
-                            .as_ref()
-                            .map_or(0, |policy| policy.heap_bytes()),
-                    );
-                }
-                KeptHeadData::ReadPolicy(policy) => add(
-                    "read_policy_only",
-                    std::mem::size_of_val(policy.as_ref()) + policy.heap_bytes(),
-                ),
-            }
+            let head = &entry.head;
+            add("head", std::mem::size_of_val(head.as_ref()));
+            add("reply", serde_heap_bytes(&head.reply));
+            add("ownership", serde_heap_bytes(&head.ownership));
+            add("senders", serde_heap_bytes(&head.senders));
         }
         let estimated: u64 = parts.values().sum();
         broca_wire::MemoryCache {
@@ -672,21 +617,6 @@ impl KeptHeads {
         let mut counts = self.lock().counts.clone();
         counts.held = self.memory();
         counts
-    }
-
-    /// Whether the read policy kept at `addr` and `position` admits `access`: `None` when no
-    /// policy is kept there, or it can't decide without the session's records.
-    pub(crate) fn admit(
-        &self,
-        addr: &str,
-        position: broca_session_store::session::Position,
-        access: &crate::reader_admission::ReadAccess,
-    ) -> Option<Result<(), crate::serve::ServeError>> {
-        let policy = self.get_at(addr, position, |data| match data {
-            KeptHeadData::Head(head) => head.read_policy.clone(),
-            KeptHeadData::ReadPolicy(policy) => Some(policy.as_ref().clone()),
-        })?;
-        crate::reader_admission::decide(&policy, access, None)
     }
 }
 

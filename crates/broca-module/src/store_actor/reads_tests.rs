@@ -1937,6 +1937,37 @@ async fn the_first_head_after_an_idle_close_reads_no_log() {
 }
 
 #[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn closed_authorization_ownership_after_idle_close_loads_no_view() {
+    let m = module(vec![text_step("a1", "one")]).await;
+    active(m.send("r1", "hello").await);
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+    m.close().await;
+
+    let request = StoreReadRequest::AuthorizationOwnership;
+    let StoreReadReply::AuthorizationOwnership(Ok(fresh)) = m.fresh(&request).await else {
+        panic!("the stored view must name the owner");
+    };
+    assert_eq!(
+        fresh
+            .first_episode
+            .as_ref()
+            .map(|first| first.run_id.0.as_str()),
+        Some("r1")
+    );
+    let runtime = m.runtime();
+    let before = runtime.views().memory(|_| 0).loads;
+    let ownership = m.registry.session_ownership_for_bind(&m.key).await;
+    assert_eq!(ownership, Some(fresh));
+    assert_eq!(
+        runtime.views().memory(|_| 0).loads,
+        before,
+        "ownership after idle close loaded a whole view"
+    );
+}
+
+#[cfg(feature = "test-clock")]
 async fn busy_session_operations_read_none_of_its_log(policy: bool) {
     use crate::serve::{ServeHandler, SessionReadRequest};
     let m = module_with_retention(vec![

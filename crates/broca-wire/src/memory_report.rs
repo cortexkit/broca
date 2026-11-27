@@ -81,6 +81,9 @@ pub struct KeptHeadCounts {
     /// report is asked for.
     #[serde(default)]
     pub held: MemoryCache,
+    /// Position-checked ownership and read policies kept independently of display heads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<MemoryCache>,
 }
 
 /// One session open in the session store (`broca-session-store`).
