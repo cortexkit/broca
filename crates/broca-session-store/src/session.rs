@@ -1415,7 +1415,7 @@ pub use read::{
 };
 mod stored;
 pub use stored::{replay_start, LogFrom, StoredRecords};
-pub use tail::{LedgerTail, StoredLedger};
+pub use tail::{LedgerTail, ReplayedLedger, StoredLedger};
 mod cold;
 pub use cold::Cold;
 mod recover;

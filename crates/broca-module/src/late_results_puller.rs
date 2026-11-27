@@ -37,11 +37,11 @@ use crate::late_results_store::{
 };
 
 mod stored;
-pub(crate) use stored::is_notice_send_id;
 use stored::StoredLineage;
 pub use stored::{
     held_call_records, notice_send_id, rebuild_store_from_sessions_with_progress, HeldCallRecords,
 };
+pub(crate) use stored::{held_call_records_replayed, is_notice_send_id};
 
 /// How often a started feed is pulled.
 pub const PULL_INTERVAL: Duration = Duration::from_secs(3);

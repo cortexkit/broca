@@ -4,7 +4,7 @@ use super::*;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::fold::operations::{Resolution, Run};
 use broca_session_store::record::{CallOutcome, Record, RunStart, ToolHeld, ToolIntent};
-use broca_session_store::session::{Session, SessionError};
+use broca_session_store::session::{ReplayedLedger, Session, SessionError};
 
 /// Extend a lost-database rebuild with every backup class's `broca-session-store` inventory.
 /// The latest open batch can still accept an answer; read its durable dispatch records back to
@@ -308,11 +308,7 @@ pub async fn held_call_records<B: SessionBackend>(
     let own = broca_session_store::codec::hex(&session.head().session_id.0);
     let converted = session.operations.source_lineage.as_deref();
     let mut foreign = Vec::new();
-    for key in call_keys {
-        let lineage = key.rsplit_once(':').map(|(lineage, _)| lineage);
-        if lineage.is_some_and(|lineage| lineage == own || Some(lineage) == converted) {
-            continue;
-        }
+    for key in keys_outside_lineage(call_keys, own, converted) {
         // A key this session's lineage didn't mint may still be its own: a converted session's
         // keys made before its source lineage was recorded name only the old log. Its intent
         // says so, found through the id index rather than the walk.
@@ -326,41 +322,88 @@ pub async fn held_call_records<B: SessionBackend>(
             foreign.push(key.clone());
         }
     }
+    let mut records = match held_call_stop(call_keys, &foreign) {
+        Some(stop) => session.ledger_tail_until(stop).await?,
+        None => Vec::new(),
+    };
+    records.reverse();
+    Ok(HeldCallRecords {
+        records,
+        run: session.operations.run.clone().map(Box::new),
+        foreign,
+    })
+}
+
+/// The same intake facts as [`held_call_records`], from one pinned log and its sealed history.
+pub(crate) async fn held_call_records_replayed<B: SessionBackend>(
+    mut ledger: ReplayedLedger<B>,
+    call_keys: &[String],
+) -> Result<HeldCallRecords, SessionError> {
+    let own = broca_session_store::codec::hex(&ledger.session_id().0);
+    let mut foreign = Vec::new();
+    {
+        let mut suspects = keys_outside_lineage(call_keys, own, ledger.source_lineage()).peekable();
+        if suspects.peek().is_some() {
+            let open: HashSet<_> = ledger.open_call_intents().collect();
+            for key in suspects {
+                let sealed = ledger.has_sealed_call_intent(key).await?;
+                if !sealed && !open.contains(key.as_str()) {
+                    foreign.push(key.clone());
+                }
+            }
+        }
+    }
+    let run = ledger.take_run();
+    let mut records = match held_call_stop(call_keys, &foreign) {
+        Some(stop) => ledger.ledger_tail_until(stop).await?,
+        None => Vec::new(),
+    };
+    records.reverse();
+    Ok(HeldCallRecords {
+        records,
+        run,
+        foreign,
+    })
+}
+
+fn keys_outside_lineage<'a>(
+    call_keys: &'a [String],
+    own: String,
+    converted: Option<&'a str>,
+) -> impl Iterator<Item = &'a String> {
+    call_keys.iter().filter(move |key| {
+        !key.rsplit_once(':')
+            .is_some_and(|(lineage, _)| lineage == own || Some(lineage) == converted)
+    })
+}
+
+fn held_call_stop<'a>(
+    call_keys: &'a [String],
+    foreign: &[String],
+) -> Option<impl FnMut(&Record) -> bool + 'a> {
     let mut keys: HashSet<&str> = call_keys
         .iter()
         .map(String::as_str)
         .filter(|key| !foreign.iter().any(|foreign| foreign == key))
         .collect();
     if keys.is_empty() {
-        return Ok(HeldCallRecords {
-            records: Vec::new(),
-            run: session.operations.run.clone().map(Box::new),
-            foreign,
-        });
+        return None;
     }
     let mut oldest_run = None;
-    let mut records = session
-        .ledger_tail_until(|record| match record {
-            Record::ToolIntent(intent) => {
-                if intent
-                    .call_key
-                    .as_deref()
-                    .is_some_and(|key| keys.remove(key))
-                    && keys.is_empty()
-                {
-                    oldest_run = Some(intent.run_id.clone());
-                }
-                false
+    Some(move |record: &Record| match record {
+        Record::ToolIntent(intent) => {
+            if intent
+                .call_key
+                .as_deref()
+                .is_some_and(|key| keys.remove(key))
+                && keys.is_empty()
+            {
+                oldest_run = Some(intent.run_id.clone());
             }
-            Record::RunStart(start) => oldest_run.as_ref() == Some(&start.run_id),
-            _ => false,
-        })
-        .await?;
-    records.reverse();
-    Ok(HeldCallRecords {
-        records,
-        run: session.operations.run.clone().map(Box::new),
-        foreign,
+            false
+        }
+        Record::RunStart(start) => oldest_run.as_ref() == Some(&start.run_id),
+        _ => false,
     })
 }
 
@@ -377,13 +420,7 @@ impl StoredLineage {
         let request = crate::store_reads::StoreReadRequest::HeldCalls { call_keys: keys };
         match runtime.read_own(registry, bind, &request).await {
             Ok(None) => None,
-            Ok(Some(crate::store_reads::StoreReadReply::HeldCalls(Ok(held)))) => {
-                Some(Self::Readable {
-                    records: held.records,
-                    run: held.run,
-                    foreign: held.foreign,
-                })
-            }
+            Ok(Some(crate::store_reads::StoreReadReply::HeldCalls(Ok(held)))) => Some(held.into()),
             Ok(Some(_)) | Err(_) => Some(Self::Unreadable),
         }
     }
@@ -600,6 +637,16 @@ impl StoredLineage {
                 Classified::Delivered
             }
             _ => Classified::Blocked("episode_unsettled".into()),
+        }
+    }
+}
+
+impl From<HeldCallRecords> for StoredLineage {
+    fn from(held: HeldCallRecords) -> Self {
+        Self::Readable {
+            records: held.records,
+            run: held.run,
+            foreign: held.foreign,
         }
     }
 }

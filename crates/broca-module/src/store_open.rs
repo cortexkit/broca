@@ -959,6 +959,23 @@ impl StoreRuntime {
                 return Ok(Some(*reply));
             }
         }
+        if let crate::store_reads::StoreReadRequest::HeldCalls { call_keys } = request {
+            let Some(ledger) = broca_session_store::session::StoredLedger::open_replayed(
+                self.backend(class),
+                SessionAddr(broca_core::session_addr(key)),
+                &triple(key),
+                self.deployment(),
+            )
+            .await
+            .map_err(view_error)?
+            else {
+                return Ok(None);
+            };
+            let held = crate::late_results_puller::held_call_records_replayed(ledger, call_keys)
+                .await
+                .map_err(|error| format!("{error:?}"));
+            return Ok(Some(crate::store_reads::StoreReadReply::HeldCalls(held)));
+        }
         let Some(view) = self
             .current_view_in(key, class, request.name())
             .await

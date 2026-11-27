@@ -268,14 +268,51 @@ impl<B: SessionBackend> Place<'_, B> {
             .any(|dir| dir.as_ref().is_some_and(|root| root.last_seq >= first))
     }
 
-    /// Read only the sealed ledger blocks the run-id index names. The hash is a candidate
-    /// selector, not proof that a record names this run. A dangling index entry is damage.
     pub(super) async fn find_indexed_run_start(
         &self,
         run_id: &str,
     ) -> Result<Option<RunStart>, SessionError> {
+        let mut start = None;
+        self.visit_indexed(IdKind::RunId, run_id, |seq, kept, record| {
+            if !kept || record.stream() != Stream::Ledger {
+                return Err(SessionError::Fold(format!("no sealed ledger record {seq}")));
+            }
+            if let Record::RunStart(candidate) = record {
+                if candidate.run_id == run_id && start.is_none() {
+                    start = Some((**candidate).clone());
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(start)
+    }
+
+    pub(super) async fn has_indexed_call_intent(
+        &self,
+        call_key: &str,
+    ) -> Result<bool, SessionError> {
+        let mut found = false;
+        self.visit_indexed(IdKind::CallKey, call_key, |_, _, record| {
+            // Like Session::find_id, verify the named id, even on a hash match.
+            found |= matches!(record, Record::ToolIntent(_))
+                && idindex::names(record, IdKind::CallKey, call_key);
+            Ok(())
+        })
+        .await?;
+        Ok(found)
+    }
+
+    /// Read only the sealed blocks the index names. A dangling index entry is damage, so visit
+    /// every candidate even if an earlier one matched the requested ID.
+    async fn visit_indexed(
+        &self,
+        kind: IdKind,
+        id: &str,
+        mut visit: impl FnMut(u64, bool, &Record) -> Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
         let Some(root) = &self.head.id_index else {
-            return Ok(None);
+            return Ok(());
         };
         let key = self.key.frame_key();
         let index = IndexPages {
@@ -285,7 +322,7 @@ impl<B: SessionBackend> Place<'_, B> {
             key: &key,
         };
         let root: IndexRoot = index.read(root).await.map_err(SessionError::Index)?;
-        let hash = idindex::id_hash(&idindex::hash_key(self.key), IdKind::RunId, run_id);
+        let hash = idindex::id_hash(&idindex::hash_key(self.key), kind, id);
         let seqs = index
             .lookup(&root, &hash)
             .await
@@ -298,7 +335,6 @@ impl<B: SessionBackend> Place<'_, B> {
             fanout: crate::directory::FANOUT,
         };
         let mut memo = Default::default();
-        let mut start = None;
         let mut last_object = String::new();
         let mut last_block = None;
         let mut records = Vec::new();
@@ -308,27 +344,22 @@ impl<B: SessionBackend> Place<'_, B> {
                 .find_in(self.head.ledger_dir.as_ref(), seq, &mut memo)
                 .await
                 .map_err(SessionError::Directory)?
-                .filter(|entry| entry.keeps(seq))
                 .ok_or_else(damaged)?;
             let layout = self.layout(&entry.object, &key).await?;
             let block = layout.block_for_seq(seq).ok_or_else(damaged)?;
             if last_block != Some(block) || last_object != entry.object {
                 records = read_block(self.backend, self.addr, &entry.object, &layout, block, &key)
                     .await?;
-                last_object = entry.object;
+                last_object.clone_from(&entry.object);
                 last_block = Some(block);
             }
             let (_, record) = records
                 .iter()
-                .find(|(at, record)| *at == seq && record.stream() == Stream::Ledger)
+                .find(|(at, _)| *at == seq)
                 .ok_or_else(damaged)?;
-            if let Record::RunStart(candidate) = record {
-                if candidate.run_id == run_id && start.is_none() {
-                    start = Some((**candidate).clone());
-                }
-            }
+            visit(seq, entry.keeps(seq), record)?;
         }
-        Ok(start)
+        Ok(())
     }
 
     /// The layout of sealed segment `object` (see [`read_layout`]), from those the place keeps

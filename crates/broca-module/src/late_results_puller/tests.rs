@@ -2944,16 +2944,19 @@ async fn a_registration_of_a_session_deleted_and_created_again_is_retired() {
     assert!(rig.store.registration("tools", call_key).unwrap().is_none());
 }
 
-/// A round of a running puller reads each registered session once, for both the check that the
-/// feed is still needed and the classification of the entries it pulls. A closed session is read
-/// as stored, and one too large for the view cache loads whole on every read, so a second read
-/// would load it twice every round.
+/// A round reads each registered session once, for both feed liveness and classification, without
+/// loading whole session views for closed sessions.
 #[cfg(feature = "test-clock")]
 #[tokio::test]
-async fn a_puller_round_reads_a_closed_session_once() {
+async fn a_puller_round_reads_closed_sessions_once_without_loading_views() {
     use broca_core::tool_plane::LateResultsIntake as _;
-    let call_key = "lineage:4";
-    let bind = session("one-read-a-round");
+    use std::sync::atomic::Ordering;
+
+    let calls = [
+        ("lineage:4", session("one-read-a-round-a"), "ev-1"),
+        ("lineage:5", session("one-read-a-round-b"), "ev-2"),
+        ("lineage:6", session("one-read-a-round-c"), "ev-3"),
+    ];
     let root = rig_root("one-read-a-round");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -2969,12 +2972,13 @@ async fn a_puller_round_reads_a_closed_session_once() {
         .unwrap()
         .with_view_bytes_for_test(1),
     );
-    seed_root(&root, &bind, &held_records(call_key, "tools")).await;
+    let mut registrations = Vec::new();
+    for (key, bind, _) in &calls {
+        seed_root(&root, bind, &held_records(key, "tools")).await;
+        registrations.push(registration(key, "tools", bind));
+    }
     let store = Arc::new(LateResultsStore::open(&root.join("late-results.db")).unwrap());
-    store
-        .register_group(&[registration(call_key, "tools", &bind)])
-        .await
-        .unwrap();
+    store.register_group(&registrations).await.unwrap();
     let feed = Arc::new(ScriptedFeed::default());
     let delivery = Arc::new(RecordedDelivery::default());
     let intake = LateResultsIntake::new(
@@ -2989,31 +2993,42 @@ async fn a_puller_round_reads_a_closed_session_once() {
             .views()
             .memory(|_| 0)
             .loads_by_reason
-            .unwrap()
-            .get("held_calls")
-            .map_or(0, |loads| loads.loads)
+            .and_then(|reasons| reasons.get("held_calls").map(|loads| loads.loads))
+            .unwrap_or(0)
     };
     feed.replies(vec![reply(
-        vec![entry(kinds::RESULT, call_key, "ev-1")],
-        1,
+        calls
+            .iter()
+            .map(|(key, _, event)| entry(kinds::RESULT, key, event))
+            .collect(),
+        3,
         false,
     )]);
     let before = loads();
+    let probes = runtime.class_probes.load(Ordering::Relaxed);
     assert!(
         intake.round("tools", &Puller::new()).await,
         "the held call needs the feed"
     );
     assert_eq!(
         *delivery.delivered.lock().unwrap(),
-        [(call_key.to_string(), "ev-1".to_string())],
-        "the round classified and delivered the entry"
+        calls.map(|(key, _, event)| (key.to_owned(), event.to_owned())),
+        "the round classified and delivered each held entry"
     );
     assert_eq!(
         loads() - before,
-        1,
-        "one load of the session for the whole round"
+        0,
+        "intake should not load a whole view for any closed session"
+    );
+    assert_eq!(
+        runtime.class_probes.load(Ordering::Relaxed) - probes,
+        3,
+        "one class probe per session for the whole round"
     );
 }
+
+#[path = "closed_read_tests.rs"]
+mod closed_read_tests;
 
 /// A provider that answers `withdraw_pending` for each of `pending` attempts, then withdraws the
 /// call, recording when each attempt arrived.
