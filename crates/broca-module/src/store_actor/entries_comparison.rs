@@ -133,7 +133,7 @@ impl<P: broca_core::provider::Provider + 'static> RunExecutor for Loops<P> {
                 now_ms: &now,
                 session_address: None,
                 compaction_plane: control.compaction_plane.as_deref(),
-                compaction_session: None,
+                compaction_session: control.compaction_session.clone(),
                 // As the module's store executor runs a store session's runs.
                 compaction_changes: true,
                 keep_warm: None,
@@ -1244,7 +1244,9 @@ async fn session_entries_pages_as_todays_paging_of_the_whole_transcript() {
 /// transcript for each page.
 #[tokio::test]
 async fn a_byte_capped_entries_read_projects_about_what_its_page_holds() {
-    const RUNS: usize = 20;
+    // Leave more than two batches in the transcript so the first bounded read (32 entries
+    // and a newest lookup) still costs less than half the remaining history.
+    const RUNS: usize = 36;
     let more = (0..RUNS)
         .map(|n| text_step(&format!("m{n}"), "more"))
         .collect();
@@ -3162,3 +3164,6 @@ mod message_ids;
 
 #[path = "entries_comparison/model_fallback.rs"]
 mod model_fallback;
+
+#[path = "entries_comparison/compaction_reads.rs"]
+mod compaction_reads;

@@ -2,7 +2,7 @@
 //! store (`broca_session_store`): the `compaction-runner/v1` route's operations and
 //! `session.history`.
 //!
-//! Every read loads the session read-only (`StoreRuntime::view`): no lease and no actor.
+//! Reads use the session's actor when it is open, or a read-only view of the store.
 //! Replies use the store's incarnation and history version and its message ids; they do not
 //! include a subscribe cursor.
 //!
@@ -17,9 +17,8 @@
 //!   own Setup when it starts.
 //! - `session.entries` serves the compaction entries `Session::entries` stores, projected by
 //!   `broca_session_loop::entries::project`.
-//! - `session.applied_view` serves the view the session's latest step applied, rebuilt from
-//!   the open log by the same fold the run loop restores its compaction state with, and the
-//!   provider that handed it over (`applied_by`).
+//! - `session.applied_view` serves the view the session's latest step applied and the provider
+//!   that handed it over (`applied_by`), from the actor's restored state or an open-log replay.
 //! - `session.apply_view` writes an accepted view, which only the session's writer may do.
 //!   The store actor doesn't take one yet, so it is refused by name
 //!   (`not_served_on_new_storage`).
@@ -40,6 +39,7 @@ use broca_core::compaction_v2::protocol::{
     view::{AppliedView, AppliedViewRequest},
     wire::{not_permitted_reasons, Refusal},
 };
+use broca_core::compaction_v2::{session::Session as CompactionSession, state::State};
 use broca_protocol::BindIdentity;
 use broca_session_loop::parts::Parts;
 use broca_session_store::backend::SessionBackend;
@@ -231,6 +231,33 @@ pub async fn serve_compaction<B: SessionBackend>(
     attribution: &EntryAttribution,
     token_counts: Option<&std::sync::Mutex<broca_core::compaction_v2::tokens::Counts>>,
 ) -> Result<Box<RawValue>, Refusal> {
+    serve_compaction_with_actor(
+        parts,
+        session,
+        key,
+        caller,
+        method,
+        params,
+        attribution,
+        token_counts,
+        None,
+    )
+    .await
+}
+
+/// An open actor can use its own compaction state and read bounded ordinal pages in batches.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_compaction_with_actor<B: SessionBackend>(
+    parts: &dyn Parts,
+    session: Option<&Session<B>>,
+    key: &BindIdentity,
+    caller: Option<&str>,
+    method: &str,
+    params: &RawValue,
+    attribution: &EntryAttribution,
+    token_counts: Option<&std::sync::Mutex<broca_core::compaction_v2::tokens::Counts>>,
+    actor: Option<&CompactionSession>,
+) -> Result<Box<RawValue>, Refusal> {
     let session = admit(parts, session, caller)?;
     match method {
         "bind" => to_raw_value(&serde_json::json!({})).map_err(|error| internal(error.to_string())),
@@ -268,6 +295,11 @@ pub async fn serve_compaction<B: SessionBackend>(
                 None => page,
             };
             let mut page = match (&request.select, request.max_bytes) {
+                (Select::After { .. }, _) if actor.is_some() => {
+                    page::after(session, &full_request, request.max_bytes.is_some(), finish)
+                        .await
+                        .map_err(internal)?
+                }
                 // With no count limit, only the byte cap bounds the page, and reading, projecting
                 // and counting every entry after the start to keep the few that fit cost the whole
                 // rest of the transcript per page. Read a growing prefix instead, until the page
@@ -314,25 +346,16 @@ pub async fn serve_compaction<B: SessionBackend>(
         "session.applied_view" => {
             let _: AppliedViewRequest = serde_json::from_str(params.get())
                 .map_err(|error| Refusal::invalid_params("", error.to_string()))?;
+            if let Some(answer) = actor.and_then(|actor| applied_from_actor(actor, session)) {
+                return answer;
+            }
             let records = session
                 .open_log_records()
                 .await
                 .map_err(|error| internal(format!("{error:?}")))?;
             let state = broca_session_loop::compaction::restore(&records, key, &session.operations)
                 .map_err(internal)?;
-            let answer = match state.applied_received() {
-                Some(view) => {
-                    let mut answer = serde_json::json!({ "view": view });
-                    // The provider that handed the applied view over, absent for a view a run's
-                    // step accepted.
-                    if let Some(module) = state.applied_by() {
-                        answer["applied_by"] = serde_json::json!(module);
-                    }
-                    answer
-                }
-                None => serde_json::json!({}),
-            };
-            to_raw_value(&answer).map_err(|error| internal(error.to_string()))
+            applied_answer(&state)
         }
         // Applied by the session's actor (`apply_view`): a caller that holds no actor, such as
         // the converter's check over a session built in memory, can't apply one.
@@ -344,6 +367,38 @@ pub async fn serve_compaction<B: SessionBackend>(
         _ => Err(Refusal::unknown_method(method)),
     }
 }
+
+fn applied_from_actor<B: SessionBackend>(
+    actor: &CompactionSession,
+    session: &Session<B>,
+) -> Option<Result<Box<RawValue>, Refusal>> {
+    let durable = &session.operations.view_applied.as_ref()?.view;
+    if !actor.is_initialized() {
+        return None;
+    }
+    // The run can hold the state while awaiting a compactor that is making this very read.
+    let state = actor.state.try_lock().ok()?;
+    let applied = state.applied()?;
+    (applied.version == durable.version && applied.checksum == durable.checksum.as_str())
+        .then(|| applied_answer(&state))
+}
+
+fn applied_answer(state: &State) -> Result<Box<RawValue>, Refusal> {
+    let answer = match state.applied_received() {
+        Some(view) => {
+            let mut answer = serde_json::json!({ "view": view });
+            // The provider is absent for a view a run's step accepted.
+            if let Some(module) = state.applied_by() {
+                answer["applied_by"] = serde_json::json!(module);
+            }
+            answer
+        }
+        None => serde_json::json!({}),
+    };
+    to_raw_value(&answer).map_err(|error| internal(error.to_string()))
+}
+
+mod page;
 
 /// How many entries a byte-capped `session.entries` read with no count limit reads first; each
 /// further read takes four times as many (see `serve_compaction`). Small in tests, so a short
@@ -477,11 +532,7 @@ pub async fn entries_page<B: SessionBackend>(
             limit,
         } => {
             let from = after_ordinal.unwrap_or(0).saturating_add(1);
-            let count = limit.map_or(usize::MAX, |limit| {
-                usize::try_from(limit)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(1)
-            });
+            let count = count_with_lookahead(*limit);
             crate::store_read::served_compaction_entries(session, from, count).await
         }
         Select::Mids { mids } => {
@@ -495,7 +546,26 @@ pub async fn entries_page<B: SessionBackend>(
     }
     .map_err(|error| format!("{error:?}"))?;
     let entries = stored.iter().map(project).collect::<Result<Vec<_>, _>>()?;
-    let newest = match entries.last() {
+    let head = entries_head(session, len, entries.last()).await?;
+    Ok(broca_core::compaction_v2::views::page(
+        &entries, request, head,
+    ))
+}
+
+fn count_with_lookahead(limit: Option<u64>) -> usize {
+    limit.map_or(usize::MAX, |limit| {
+        usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+    })
+}
+
+async fn entries_head<B: SessionBackend>(
+    session: &Session<B>,
+    len: u64,
+    last: Option<&Entry>,
+) -> Result<Head, String> {
+    let newest = match last {
         Some(last) if last.ordinal >= len => Some(cursor(last)),
         _ if len == 0 => None,
         _ => {
@@ -512,9 +582,7 @@ pub async fn entries_page<B: SessionBackend>(
         .view_applied
         .as_ref()
         .map(|applied| AppliedView::new(applied.view.version, &applied.view.checksum));
-    Ok(broca_core::compaction_v2::views::page(
-        &entries, request, head,
-    ))
+    Ok(head)
 }
 
 fn cursor(entry: &Entry) -> Cursor {

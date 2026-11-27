@@ -196,6 +196,10 @@ const SEALED_LOOKUP_IN_MEMORY: usize = 32;
 /// longer page refuses there, and is read from storage by the session's reader.
 const SEALED_ENTRIES_IN_MEMORY: usize = 32;
 
+/// Four of the store's 32-entry reads, including look-ahead. This caps work on the actor,
+/// not the wire page: the caller redoes the read from storage if it needs more entries.
+const COMPACTION_PAGE_ENTRIES_IN_MEMORY: usize = 4 * SEALED_ENTRIES_IN_MEMORY;
+
 /// How many directory pages a session keeps while open: enough for the transcript and ledger
 /// directories' paths that one page read walks.
 const DIRECTORY_PAGES_KEPT: usize = 32;
@@ -470,6 +474,23 @@ impl<B: SessionBackend> Session<B> {
     /// (see [`SEALED_ENTRIES_MAX_BYTES`]): read without walking them.
     pub fn sealed_entries_bytes(&self) -> usize {
         self.sealed_caches().entries.held_bytes()
+    }
+
+    /// The next ordinal batch for a compaction page, without exceeding a sealed read's limit.
+    /// `total` includes look-ahead when known; `None` probes one more batch for a byte-only
+    /// request. When the page exceeds the actor's work budget it is read from storage instead.
+    pub fn compaction_page_chunk_size(
+        &self,
+        examined: usize,
+        total: Option<usize>,
+    ) -> Result<usize, SessionError> {
+        let remaining = total.map_or(SEALED_ENTRIES_IN_MEMORY, |total| {
+            total.saturating_sub(examined)
+        });
+        if examined.saturating_add(remaining) > COMPACTION_PAGE_ENTRIES_IN_MEMORY {
+            self.storage_read()?;
+        }
+        Ok(remaining.min(SEALED_ENTRIES_IN_MEMORY))
     }
 
     /// Up to `limit` entries from ordinal `from` on (counting from 1), in order, over the whole

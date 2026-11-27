@@ -462,7 +462,7 @@ async fn measure(built: &Built, parts: &SharedParts, sealed: bool, written: Dura
                 Some(stream_head),
             );
             let started = Instant::now();
-            let outcome = answer_in_memory(&mut writer, &ctx, &request).await;
+            let outcome = answer_in_memory(&mut writer, &ctx, &request, None).await;
             let held_for = started.elapsed();
             if let StoreReadOutcome::Stored { position, .. } = outcome {
                 stored = true;

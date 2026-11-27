@@ -355,6 +355,15 @@ pub async fn execute<B: SessionBackend>(
     ctx: &ReadContext<'_>,
     request: &StoreReadRequest,
 ) -> StoreReadReply {
+    execute_with_actor(session, ctx, request, None).await
+}
+
+async fn execute_with_actor<B: SessionBackend>(
+    session: &Session<B>,
+    ctx: &ReadContext<'_>,
+    request: &StoreReadRequest,
+    compaction: Option<&broca_core::compaction_v2::session::Session>,
+) -> StoreReadReply {
     let reader = ctx.reader();
     match request {
         StoreReadRequest::RunAdmission(run_id) => {
@@ -442,7 +451,7 @@ pub async fn execute<B: SessionBackend>(
             method,
             params,
         } => StoreReadReply::Compaction(
-            crate::store_entries::serve_compaction(
+            crate::store_entries::serve_compaction_with_actor(
                 ctx.parts,
                 Some(session),
                 key,
@@ -451,6 +460,7 @@ pub async fn execute<B: SessionBackend>(
                 params,
                 &ctx.entry_speaks_for,
                 ctx.token_counts,
+                compaction,
             )
             .await,
         ),
@@ -603,6 +613,7 @@ pub async fn answer_in_memory<B: SessionBackend>(
     session: &mut Session<B>,
     ctx: &ReadContext<'_>,
     request: &StoreReadRequest,
+    compaction: Option<&broca_core::compaction_v2::session::Session>,
 ) -> StoreReadOutcome {
     use futures::FutureExt as _;
     // Authorization may inspect pending records without flushing them: an admitted operation
@@ -617,7 +628,7 @@ pub async fn answer_in_memory<B: SessionBackend>(
     let memory = session.in_memory();
     // From memory only, a read never waits: a read that would have waited on storage refused
     // instead, and is answered from storage by the caller.
-    let reply = execute(session, ctx, request).now_or_never();
+    let reply = execute_with_actor(session, ctx, request, compaction).now_or_never();
     let needs_storage = memory.refused();
     let refused_at = memory.refused_at();
     drop(memory);

@@ -71,8 +71,13 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             entry_speaks_for,
             class: self.class_placement.as_ref().map(|(class, _)| *class),
         };
-        let mut outcome =
-            crate::store_reads::answer_in_memory(&mut self.session, &context, request).await;
+        let mut outcome = crate::store_reads::answer_in_memory(
+            &mut self.session,
+            &context,
+            request,
+            Some(&self.compaction_session),
+        )
+        .await;
         if let crate::store_reads::StoreReadOutcome::Stored { compaction, .. } = &mut outcome {
             *compaction = Some(Arc::clone(&self.compaction_session));
         }
