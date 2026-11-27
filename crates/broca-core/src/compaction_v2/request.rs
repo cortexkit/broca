@@ -31,6 +31,8 @@ pub struct At<'a> {
     /// The session's current requests ask for a cache lifetime that can prove expiry, so Setup
     /// lists `cache_expired` as a cause broca detects.
     pub detects_cache_expired: bool,
+    /// How many entries the runner can read cheaply for an `after` page, including look-ahead.
+    pub after_page_entry_budget: usize,
     pub chain_reset: bool,
     pub now: u64,
     pub next_mid: &'a str,
@@ -176,8 +178,13 @@ pub async fn prepare_reading_back(
         state.start_step(at.step);
         (state.view_for_step(at.step).cloned(), frozen)
     };
-    let mut setup =
-        conditions::setup_request(at.preset, at.conditions, at.now, at.detects_cache_expired);
+    let mut setup = conditions::setup_request(
+        at.preset,
+        at.conditions,
+        at.now,
+        at.detects_cache_expired,
+        at.after_page_entry_budget,
+    );
     setup.applied_view = view.as_ref().map(View::applied);
     setup.newest = views::newest(at.entries);
     runtime.observe(at.entries);

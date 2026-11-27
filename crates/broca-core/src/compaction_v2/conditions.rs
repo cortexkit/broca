@@ -4,7 +4,7 @@
 use cortexkit_role_compaction::{
     notice::Conditions,
     ride::RideCause,
-    setup::{ModelRef, SetupRequest},
+    setup::{Limits, ModelRef, PageLimits, SetupRequest},
 };
 
 /// Evidence of the last accepted send, recovered from durable request facts.
@@ -104,6 +104,7 @@ pub fn setup_request(
     conditions: &Conditions,
     now: u64,
     detects_cache_expired: bool,
+    after_page_entry_budget: usize,
 ) -> SetupRequest {
     // Broca hosts the session and creates sessions on their first session.send.
     // Leave child_harness absent so provider children inherit the session's harness
@@ -127,6 +128,9 @@ pub fn setup_request(
     // when `new_signed` allows it instead of refusing the view. This one constructor covers
     // live and serving Setup.
     setup.view_anchor = Some(true);
+    // Keep providers' `after` reads on the cheap path, with one entry left for look-ahead.
+    let max_entries = (after_page_entry_budget - 1) as u64;
+    setup.limits = Some(Limits::new().with_page(PageLimits::new().with_max_entries(max_entries)));
     setup
 }
 

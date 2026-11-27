@@ -198,7 +198,7 @@ const SEALED_ENTRIES_IN_MEMORY: usize = 32;
 
 /// Four of the store's 32-entry reads, including look-ahead. This caps work on the actor,
 /// not the wire page: the caller redoes the read from storage if it needs more entries.
-const COMPACTION_PAGE_ENTRIES_IN_MEMORY: usize = 4 * SEALED_ENTRIES_IN_MEMORY;
+pub const COMPACTION_PAGE_ENTRIES_IN_MEMORY: usize = 4 * SEALED_ENTRIES_IN_MEMORY;
 
 /// How many directory pages a session keeps while open: enough for the transcript and ledger
 /// directories' paths that one page read walks.

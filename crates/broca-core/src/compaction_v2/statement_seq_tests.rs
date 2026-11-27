@@ -62,7 +62,7 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
     conditions.system_tokens = Some(SurfaceTokens::new(100, true));
     conditions.tools_tokens = Some(SurfaceTokens::new(50, true));
     conditions.notes_tokens = Some(SurfaceTokens::new(25, true));
-    let setup = conditions::setup_request("example", &conditions, 1700000000200, true);
+    let setup = conditions::setup_request("example", &conditions, 1700000000200, true, 64);
     let ride = RideRequest::new(vec![RideCause::OverLimit], 1500, conditions.clone());
     for _ in 0..3 {
         plane.inner.answers.lock().unwrap().extend([
@@ -111,7 +111,8 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
         let mut expected: serde_json::Value = serde_json::from_str(vector).unwrap();
         // The synthetic session has no applied view, newest entry, or signed floor. Broca
         // detects more causes than the example runner, explicitly names its default service
-        // tier, asks for view anchors on Setup, and this is its first notice.
+        // tier, asks for view anchors, and advertises a 63-entry page limit on Setup. The
+        // notice is its first.
         expected["params"]
             .as_object_mut()
             .unwrap()
@@ -125,6 +126,7 @@ async fn compaction_v2_statement_seq_gates_setup_notice_and_ride_and_matches_con
             expected["params"].as_object_mut().unwrap().remove("newest");
             expected["params"]["detects"] = serde_json::to_value(runtime::detects(true)).unwrap();
             expected["params"]["view_anchor"] = json!(true);
+            expected["params"]["limits"] = json!({"page": {"max_entries": 63}});
         } else {
             expected["params"]["conditions"]["model"]["service_tier"] = json!("standard");
             expected["params"]["conditions"]
@@ -183,7 +185,7 @@ async fn compaction_v2_each_setup_mints_a_new_statement_epoch() {
     };
     let runtime = runtime::Runtime::default();
     let conditions = stamped_conditions(7);
-    let setup = conditions::setup_request("example", &conditions, 1700000000200, true);
+    let setup = conditions::setup_request("example", &conditions, 1700000000200, true, 64);
     for _ in 0..2 {
         plane
             .inner

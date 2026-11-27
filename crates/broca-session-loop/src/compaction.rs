@@ -19,6 +19,7 @@ use broca_protocol::BindIdentity;
 use broca_session_store::fold::conversation::Delivered;
 use broca_session_store::fold::operations::{Estimate, Operations};
 use broca_session_store::record::{Marker, Record, View, ViewApplied};
+use broca_session_store::session::COMPACTION_PAGE_ENTRIES_IN_MEMORY;
 
 use crate::run::{Admission, LoopError, Seams};
 use crate::writer::Writer;
@@ -1295,6 +1296,7 @@ pub async fn prepare<W: Writer, P: broca_core::provider::Provider, T>(
                 now,
             ),
             detects_cache_expired: crate::run::requested_cache_ttl(admission).is_some(),
+            after_page_entry_budget: COMPACTION_PAGE_ENTRIES_IN_MEMORY,
             chain_reset: chained && seams.provider.prepare_chain_reset(),
             now,
             next_mid: NEXT_MID,
@@ -1417,8 +1419,13 @@ pub async fn notice<W: Writer, P, T>(
         return Ok(());
     };
     let applied = ctx.session.state.lock().await.applied_identity();
-    let mut setup =
-        v2::conditions::setup_request(&ctx.preset, &conditions, (seams.now_ms)(), false);
+    let mut setup = v2::conditions::setup_request(
+        &ctx.preset,
+        &conditions,
+        (seams.now_ms)(),
+        false,
+        COMPACTION_PAGE_ENTRIES_IN_MEMORY,
+    );
     setup.applied_view = applied.clone();
     setup.newest = v2::views::newest(&entries);
     ctx.session.runtime.observe(&entries);

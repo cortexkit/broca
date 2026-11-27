@@ -4,6 +4,27 @@ use broca_session_store::fold::operations::{AppliedView, Operations, ViewSlot};
 use broca_session_store::record::{Record, ViewApplied};
 use cortexkit_role_compaction::view::View;
 
+#[test]
+fn compaction_setup_advertises_only_the_after_page_entry_ceiling() {
+    use super::{v2::conditions, COMPACTION_PAGE_ENTRIES_IN_MEMORY};
+    use cortexkit_role_compaction::setup::ModelRef;
+    use serde_json::json;
+
+    let conditions = conditions::conditions(ModelRef::new("stub", "m"), 1000, 100, false);
+    let setup = conditions::setup_request(
+        "head",
+        &conditions,
+        1,
+        false,
+        COMPACTION_PAGE_ENTRIES_IN_MEMORY,
+    );
+    let body = serde_json::to_value(setup).unwrap();
+    assert_eq!(
+        body["limits"],
+        json!({"page": {"max_entries": COMPACTION_PAGE_ENTRIES_IN_MEMORY - 1}})
+    );
+}
+
 /// A view sealed with build metadata, which its checksum covers.
 fn built(version: u64, through: &str, new_signed: Option<&str>) -> ReceivedView {
     View::seal_with_policy(

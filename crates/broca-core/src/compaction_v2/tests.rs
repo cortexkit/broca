@@ -999,7 +999,7 @@ fn compaction_v2_rides_include_every_simultaneous_cause() {
         &conditions
     )
     .is_empty());
-    let setup = session_conditions::setup_request("unchanged-preset", &conditions, 100, true);
+    let setup = session_conditions::setup_request("unchanged-preset", &conditions, 100, true, 64);
     assert_eq!(setup.preset, "unchanged-preset");
     assert_eq!(setup.model, current.model);
     assert_eq!(setup.detects.len(), 8);

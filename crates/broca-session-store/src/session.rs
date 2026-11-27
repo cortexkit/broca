@@ -1411,7 +1411,8 @@ pub use enrollment::EnrollmentOverlay;
 mod read;
 mod tail;
 pub use read::{
-    served_window, window_entries, window_entries_with, StoredEntry, SEALED_ENTRIES_MAX_BYTES,
+    served_window, window_entries, window_entries_with, StoredEntry,
+    COMPACTION_PAGE_ENTRIES_IN_MEMORY, SEALED_ENTRIES_MAX_BYTES,
 };
 mod stored;
 pub use stored::{replay_start, LogFrom, StoredRecords};

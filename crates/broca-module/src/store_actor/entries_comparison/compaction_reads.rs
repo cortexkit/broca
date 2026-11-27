@@ -1,5 +1,7 @@
 use super::*;
+use broca_core::compaction_v2::protocol::read::ReadPage;
 use broca_core::compaction_v2::protocol::view::{Edit, EditOp, View};
+use broca_session_store::session::COMPACTION_PAGE_ENTRIES_IN_MEMORY;
 use serde_json::value::{to_raw_value, RawValue};
 
 async fn actor_reply(side: &Side, method: &str, params: &Value) -> Box<RawValue> {
@@ -81,14 +83,18 @@ async fn mid(side: &Side, ordinal: u64) -> String {
 }
 
 async fn sealed_session() -> Side {
-    let steps = (0..=64)
+    sealed_session_with(64, 72).await
+}
+
+async fn sealed_session_with(fill_runs: u64, seal_through: u64) -> Side {
+    let steps = (0..=fill_runs)
         .map(|n| text_step(&format!("seal-{n}"), "another answer"))
         .collect();
     let side = contract_sessions_with(false, steps, Duration::from_secs(60)).await;
-    for n in 0..64 {
+    for n in 0..fill_runs {
         run(&side, &format!("fill-{n}")).await;
     }
-    let through = mid(&side, 72).await;
+    let through = mid(&side, seal_through).await;
     accept(
         &side,
         &View::seal(1, vec![Edit::new(1, EditOp::Cut { through })]),
@@ -96,6 +102,79 @@ async fn sealed_session() -> Side {
     .await;
     run(&side, "after-cut").await;
     side
+}
+
+#[tokio::test]
+async fn compaction_page_at_the_advertised_limit_does_not_load_a_whole_view() {
+    let side = sealed_session().await;
+    let limit = (COMPACTION_PAGE_ENTRIES_IN_MEMORY - 1) as u64;
+    let before = view_reads(&side).await;
+    let reply = actor_reply(
+        &side,
+        "session.entries",
+        &json!({"select":{"by":"after","after_ordinal":2,"limit":limit},"detail":"compact"}),
+    )
+    .await;
+    let page: ReadPage = serde_json::from_str(reply.get()).unwrap();
+    assert_eq!(page.entries.len() as u64, limit);
+    assert_eq!(page.next_after, Some(limit + 2));
+    assert_eq!(
+        view_reads(&side).await,
+        before,
+        "the actor used a whole view"
+    );
+}
+
+#[tokio::test]
+async fn compaction_pages_walk_sealed_and_open_entries_without_loading_a_whole_view() {
+    let fill_runs = 200;
+    let seal_through = 270;
+    let side = sealed_session_with(fill_runs, seal_through).await;
+    // Six entries from the fixture's first two runs, then two per fill run and two after the cut.
+    let total = 6 + 2 * fill_runs + 2;
+    let limit = (COMPACTION_PAGE_ENTRIES_IN_MEMORY - 1) as u64;
+    let window_start = side
+        .registry
+        .store_runtime()
+        .unwrap()
+        .current_view(&side.key)
+        .await
+        .unwrap()
+        .unwrap()
+        .conversation
+        .window_start();
+    assert_eq!(window_start, seal_through + 1);
+
+    let before = view_reads(&side).await;
+    let mut after = 0;
+    loop {
+        let reply = actor_reply(
+            &side,
+            "session.entries",
+            &json!({
+                "select": {"by": "after", "after_ordinal": after, "limit": limit},
+                "detail": "compact",
+                "max_bytes": 1024 * 1024,
+            }),
+        )
+        .await;
+        let page: ReadPage = serde_json::from_str(reply.get()).unwrap();
+        let last = (after + limit).min(total);
+        assert_eq!(page.entries.len() as u64, last - after, "after {after}");
+        for (ordinal, entry) in (after + 1..=last).zip(&page.entries) {
+            assert_eq!(entry.ordinal, ordinal);
+        }
+        assert_eq!(page.next_after, (last < total).then_some(last));
+        match page.next_after {
+            Some(next_after) => after = next_after,
+            None => break,
+        }
+    }
+    assert_eq!(
+        view_reads(&side).await,
+        before,
+        "the actor used a whole view"
+    );
 }
 
 #[tokio::test]

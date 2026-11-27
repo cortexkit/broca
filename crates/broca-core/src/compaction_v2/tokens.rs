@@ -695,7 +695,7 @@ mod tests {
             1000,
             false,
         );
-        let setup = super::super::conditions::setup_request("default", &conditions, 100, false);
+        let setup = super::super::conditions::setup_request("default", &conditions, 100, false, 64);
         runtime.observe(&[text()]);
         runtime.flush(&plane, &setup, &conditions, None).await;
         let mut second = text();
@@ -760,7 +760,7 @@ mod tests {
             1000,
             false,
         );
-        let setup = super::super::conditions::setup_request("default", &conditions, 100, false);
+        let setup = super::super::conditions::setup_request("default", &conditions, 100, false, 64);
         runtime.observe(&[entry(
             "reminder",
             Role::User,
@@ -802,7 +802,7 @@ mod tests {
             1000,
             false,
         );
-        let setup = super::super::conditions::setup_request("default", &conditions, 100, false);
+        let setup = super::super::conditions::setup_request("default", &conditions, 100, false, 64);
         let plane = Plane::default();
         runtime.flush(&plane, &setup, &conditions, None).await;
         let calls = plane.0.lock().unwrap();
