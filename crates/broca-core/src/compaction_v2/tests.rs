@@ -239,6 +239,28 @@ fn compaction_v2_entries_merge_results_without_merging_delivered_text() {
 }
 
 #[test]
+fn compaction_v2_projection_shares_verbatim_tool_result_text() {
+    let output =
+        broca_protocol::text::Text::from("  exact tool result\nwith \"quotes\" and café\n");
+    let messages = [
+        call(),
+        result(ToolOutput::Text {
+            text: output.clone(),
+        }),
+    ];
+    let entries = project(&messages, &facts(2), &Deliveries::new(), true);
+    let part = &entries[0].parts[1];
+    let PartBody::Tool(tool) = &part.body else {
+        panic!("tool part missing");
+    };
+    let projected = tool.output.as_deref().unwrap();
+    assert_eq!(projected, output.as_str());
+    assert_eq!(tool.output_bytes, Some(output.len() as u64));
+    assert_eq!(part.digest, part.compact().digest);
+    assert_eq!(projected.as_ptr(), output.as_ptr());
+}
+
+#[test]
 fn compaction_v2_unfinished_tool_prevents_completed_at() {
     let entries = project(&[call()], &facts(1), &Deliveries::new(), true);
     assert_eq!(entries[0].completed_at, None);

@@ -267,10 +267,11 @@ pub fn project(
                         .get_mut(call.tool_call_id.0.as_str())
                         .and_then(VecDeque::pop_front)
                     {
-                        let (status, output, format, attachments) = tool_output(&result.output);
+                        let (status, output, format, attachments) =
+                            projected_output(&result.output);
                         tool.status = status;
                         tool.output_bytes = Some(output.len() as u64);
-                        tool.output = Some(output.into());
+                        tool.output = Some(output);
                         tool.output_format = format;
                         tool.set_attachments(attachments);
                     }
@@ -377,6 +378,21 @@ pub(super) fn file(media: &MediaRef) -> FileMedia {
     file.width = media.width.map(u64::from);
     file.height = media.height.map(u64::from);
     file
+}
+
+fn projected_output(output: &ToolOutput) -> (ToolStatus, Text, OutputFormat, Vec<Attachment>) {
+    // The neutral projection keeps plain tool text verbatim. The renderer can still
+    // get owned text from tool_output when it needs to edit the result.
+    if let ToolOutput::Text { text } = output {
+        return (
+            ToolStatus::Completed,
+            Text::from(text.shared()),
+            OutputFormat::Text,
+            vec![],
+        );
+    }
+    let (status, text, format, attachments) = tool_output(output);
+    (status, text.into(), format, attachments)
 }
 
 pub(super) fn tool_output(

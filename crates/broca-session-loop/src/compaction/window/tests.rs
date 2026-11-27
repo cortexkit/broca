@@ -394,7 +394,9 @@ fn a_kept_transcripts_estimate_matches_the_allocator_and_its_handle_keeps_nothin
         window
     });
     let handle = window.downgrade();
-    let estimated = handle.held_bytes().expect("the run holds its transcript");
+    let estimated = handle
+        .held_bytes(&session.conversation)
+        .expect("the run holds its transcript");
     let measured = built.held.max(0) as usize;
     eprintln!("a kept transcript: estimated {estimated}, measured {measured}");
     assert!(
@@ -403,7 +405,7 @@ fn a_kept_transcripts_estimate_matches_the_allocator_and_its_handle_keeps_nothin
     );
     let ((), dropped) = measure(|| drop(window));
     assert!(
-        handle.held_bytes().is_none(),
+        handle.held_bytes(&session.conversation).is_none(),
         "a dropped transcript is found"
     );
     let freed = dropped.held.unsigned_abs();

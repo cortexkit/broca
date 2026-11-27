@@ -22,12 +22,17 @@
 //! another session. The sealed entries the views name come in front of the window's, rebuilt
 //! when the views or the window's start change.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use broca_core::compaction_v2::entries::RideEnvelopes;
-use broca_protocol::content::Message;
-use broca_session_store::fold::conversation::{ChangeMark, Conversation, Delivered, EntryState};
+use broca_protocol::content::{ContentBlock, Message, ToolOutput};
+use broca_session_store::fold::conversation::{
+    BlockRef, ChangeMark, Conversation, Delivered, EntryState,
+};
+use broca_session_store::held::{serde_heap_bytes, HeldBytes};
 use broca_session_store::session::{EnrollmentOverlay, StoredEntry};
+use cortexkit_role_compaction::part::{Part, PartBody};
 use cortexkit_role_compaction::read::Entry;
 
 use super::{BuiltFor, Transcript};
@@ -179,45 +184,61 @@ pub struct WeakWindow(std::sync::Weak<Mutex<Kept>>);
 impl WeakWindow {
     /// What the run's kept transcript holds (see `broca_session_store::held`), or `None` once
     /// the run has dropped it. Holds it, and the lock each of the run's reads takes, only for
-    /// the length of the walk.
-    pub fn held_bytes(&self) -> Option<usize> {
+    /// the length of the walk. `conversation` is the actor's window, already counted separately.
+    pub fn held_bytes(&self, conversation: &Conversation) -> Option<usize> {
         let kept = self.0.upgrade()?;
-        let held = kept.lock().ok().map(|kept| kept.held_bytes());
+        let held = kept.lock().ok().map(|kept| kept.held_bytes(conversation));
         held
     }
 }
 
 impl Kept {
-    /// The compaction entries and what they were projected from. Entries are the compaction
-    /// contract's type, sized by their serialized walk (`held::serde_heap_bytes`); the sealed
-    /// entries' ride envelopes and what decided them count at their inline size.
-    fn held_bytes(&self) -> usize {
-        use broca_session_store::held::{serde_heap_bytes, HeldBytes};
-        // A tool part's input shares its text with the call in the session's message, which
-        // the session holds anyway, so the walk's count of that text is taken back out.
-        let shared_inputs: usize = self
-            .entries
+    /// The projected entries, retained sealed messages, and metadata for replaying delivered text.
+    fn held_bytes(&self, conversation: &Conversation) -> usize {
+        // Only subtract output bytes the native messages still hold. A released or rewritten
+        // result can leave the projected entry as the only holder of the old text.
+        let native_outputs: HashSet<_> = conversation
+            .messages
             .iter()
-            .flat_map(|entry| &entry.parts)
-            .map(|part| match &part.body {
-                cortexkit_role_compaction::part::PartBody::Tool(tool) => tool.input.as_str().len(),
-                _ => 0,
+            .flat_map(|message| message.blocks())
+            .filter_map(|block| match block {
+                BlockRef::Held(block) => Some(block),
+                BlockRef::Released(_) => None,
             })
-            .sum();
+            .chain(
+                self.sealed_messages
+                    .iter()
+                    .flat_map(|(_, message)| &message.content),
+            )
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult(result) => match &result.output {
+                    ToolOutput::Text { text } => Some(text.as_ptr()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
         let entries = 2 * std::mem::size_of::<usize>()
             + std::mem::size_of::<Vec<Entry>>()
             + self.entries.capacity() * std::mem::size_of::<Entry>()
             + self
                 .entries
                 .iter()
-                .map(serde_heap_bytes)
-                .sum::<usize>()
-                .saturating_sub(shared_inputs);
+                .map(|entry| entry_projection_heap(entry, &native_outputs))
+                .sum::<usize>();
         let states = self.states.capacity() * std::mem::size_of::<KeptMessage>()
             + self
                 .states
                 .iter()
-                .map(|kept| kept.state.heap_bytes())
+                .enumerate()
+                .map(|(index, kept)| {
+                    let native = self.key.as_ref().and_then(|key| {
+                        conversation
+                            .window_entry(key.window_start + index as u64)
+                            .map(|(_, state)| state)
+                    });
+                    entry_state_heap(&kept.state, native)
+                })
                 .sum::<usize>();
         let key = self.key.as_ref().map_or(0, |key| key.session.heap_bytes());
         let open = self.open.as_ref().map_or(0, |open| {
@@ -233,6 +254,65 @@ impl Kept {
             + 2 * std::mem::size_of::<usize>()
             + std::mem::size_of::<RideEnvelopes>()
     }
+}
+
+/// Cloning the entry state copies deliveries but shares fact records unless the actor's
+/// window has since restated or dropped them.
+fn entry_state_heap(state: &EntryState, native: Option<&EntryState>) -> usize {
+    fn unique<T: HeldBytes>(kept: &Option<Arc<T>>, native: Option<&Arc<T>>) -> usize {
+        kept.as_ref()
+            .filter(|kept| !native.is_some_and(|native| Arc::ptr_eq(kept, native)))
+            .map_or(0, HeldBytes::heap_bytes)
+    }
+
+    state.delivered.heap_bytes()
+        + unique(&state.facts, native.and_then(|state| state.facts.as_ref()))
+        + unique(&state.turn, native.and_then(|state| state.turn.as_ref()))
+}
+
+/// A part serializes as a flattened map, but owns no JSON object for that map. Count its vector's
+/// actual slots, strings and leaves rather than charging a JSON tree and serialized checksums.
+fn entry_projection_heap(entry: &Entry, native_outputs: &HashSet<*const u8>) -> usize {
+    entry.mid.capacity()
+        + serde_heap_bytes(&entry.notice)
+        + serde_heap_bytes(&entry.speaks_for)
+        + serde_heap_bytes(&entry.host_parts)
+        + serde_heap_bytes(&entry.host_frame)
+        + serde_heap_bytes(&entry.host_frames)
+        + serde_heap_bytes(&entry.reasoning_tokens)
+        + entry.parts.capacity() * std::mem::size_of::<Part>()
+        + entry
+            .parts
+            .iter()
+            .map(|part| part_projection_heap(part, native_outputs))
+            .sum::<usize>()
+}
+
+fn part_projection_heap(part: &Part, native_outputs: &HashSet<*const u8>) -> usize {
+    let text_heap = |text: &str| 2 * std::mem::size_of::<usize>() + text.len();
+    let body = match &part.body {
+        PartBody::Text { text, .. } => text_heap(text),
+        PartBody::Reasoning { text, .. } => text.as_deref().map_or(0, text_heap),
+        PartBody::Tool(tool) => {
+            // The tool input is the call's canonical text, already counted with the native
+            // message. Plain outputs count here only if they aren't counted with one too.
+            let output = tool
+                .output
+                .as_deref()
+                .filter(|text| !native_outputs.contains(&text.as_ptr()))
+                .map_or(0, text_heap);
+            tool.call_id.capacity()
+                + tool.name.capacity()
+                + output
+                + serde_heap_bytes(tool.attachments())
+                + serde_heap_bytes(&tool.approval())
+                + serde_heap_bytes(&tool.delivered())
+        }
+        PartBody::File(file) => serde_heap_bytes(file),
+        PartBody::Opaque(opaque) => serde_heap_bytes(opaque),
+        other => serde_heap_bytes(other),
+    };
+    part.id.capacity() + serde_heap_bytes(&part.tokens) + body
 }
 
 impl WindowTranscript {

@@ -21,7 +21,9 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
         let session = self.session.held_bytes();
         let run = self.run.as_ref();
         let window = run.and_then(|run| run.window.lock().ok().and_then(|slot| slot.clone()));
-        let compaction_entries = window.and_then(|window| window.held_bytes()).unwrap_or(0);
+        let compaction_entries = window
+            .and_then(|window| window.held_bytes(&self.session.conversation))
+            .unwrap_or(0);
         let request = run.and_then(|run| {
             let step = run.step.lock().ok()?;
             step.as_ref()?.request.upgrade()
