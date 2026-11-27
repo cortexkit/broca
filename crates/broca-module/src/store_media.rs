@@ -863,6 +863,16 @@ impl<B: SessionBackend> RunAppends<'_, B> {
 }
 
 impl<B: SessionBackend> broca_session_loop::Writer for RunAppends<'_, B> {
+    async fn responses_reasoning_removals(
+        &self,
+        run_id: &str,
+        before_seq: Option<u64>,
+    ) -> Result<broca_session_loop::responses_reasoning::ResponsesReasoningRemovals, SessionError>
+    {
+        broca_session_loop::Writer::responses_reasoning_removals(&*self.session, run_id, before_seq)
+            .await
+    }
+
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         let appended = self
             .tool_media

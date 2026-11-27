@@ -81,6 +81,11 @@ pub enum Request {
     OpenLogRecords {
         reply: Reply<Vec<(u64, Record)>>,
     },
+    ResponsesReasoningRemovals {
+        run_id: String,
+        before_seq: Option<u64>,
+        reply: Reply<crate::responses_reasoning::ResponsesReasoningRemovals>,
+    },
     OpenRunTail {
         run_id: String,
         first: u64,
@@ -327,6 +332,19 @@ impl ActorWriter {
 }
 
 impl Writer for ActorWriter {
+    async fn responses_reasoning_removals(
+        &self,
+        run_id: &str,
+        before_seq: Option<u64>,
+    ) -> Result<crate::responses_reasoning::ResponsesReasoningRemovals, SessionError> {
+        self.ask(|reply| Request::ResponsesReasoningRemovals {
+            run_id: run_id.into(),
+            before_seq,
+            reply,
+        })
+        .await
+    }
+
     async fn accepted_send(
         &self,
         account: &str,
@@ -636,6 +654,17 @@ impl RunLink {
             }
             Request::OpenLogRecords { reply } => {
                 let _ = reply.send(session.open_log_records().await);
+            }
+            Request::ResponsesReasoningRemovals {
+                run_id,
+                before_seq,
+                reply,
+            } => {
+                let _ = reply.send(
+                    session
+                        .responses_reasoning_removals(&run_id, before_seq)
+                        .await,
+                );
             }
             Request::OpenRunTail {
                 run_id,

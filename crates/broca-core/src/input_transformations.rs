@@ -61,6 +61,18 @@ pub fn report_input_transformations(
     step_id: StepId,
     attempt: &broca_protocol::ModelAttempt,
 ) {
+    report_input_transformations_filtered(session, run_id, step_id, attempt, |_| true);
+}
+
+/// Count the complete report, but log only entries selected by `warn_about`. The session loop
+/// uses this to avoid warning again about a Responses reasoning item already known to be removed.
+pub fn report_input_transformations_filtered(
+    session: &BindIdentity,
+    run_id: &RunId,
+    step_id: StepId,
+    attempt: &broca_protocol::ModelAttempt,
+    mut warn_about: impl FnMut(&broca_protocol::InputTransformation) -> bool,
+) {
     let entries = match TransformationReading::of(attempt) {
         TransformationReading::NotMeasured => {
             // Not measured is not "none": counted apart, so the reported total never reads a
@@ -76,6 +88,7 @@ pub fn report_input_transformations(
     INPUT_TRANSFORMATIONS.fetch_add(entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let reasons: Vec<String> = entries
         .iter()
+        .filter(|entry| warn_about(entry))
         .map(|entry| {
             // Anthropic places an entry by its path in the request; OpenAI by the item's id and
             // says what it did (`removed`).
@@ -92,13 +105,16 @@ pub fn report_input_transformations(
             )
         })
         .collect();
+    if reasons.is_empty() {
+        return;
+    }
     tracing::warn!(
         target: "provider",
         session = %session.session,
         run_id = %run_id.0,
         step = step_id.0,
         attempt = attempt.attempt,
-        count = entries.len(),
+        count = reasons.len(),
         transformations = ?reasons,
         "provider transformed the request input: an earlier part of the conversation changed"
     );

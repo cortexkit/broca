@@ -260,6 +260,7 @@ async fn rebuild<W: Writer>(
         conversation,
         operations,
         ledger,
+        request_seq: records[start_at].0,
     };
     let run = before
         .operations
@@ -454,6 +455,7 @@ async fn predecessor<W: Writer>(
             .map_err(|error| format!("the session's window: {error:?}"))?,
         operations,
         ledger: None,
+        request_seq: seq,
     };
     let request = request(
         &snapshot,
@@ -549,9 +551,23 @@ struct Before<'a, W> {
     /// The ledger records through the step, served in place of the writer's open log for a
     /// rebuild as of the step (see [`request_as_of`]).
     ledger: Option<Vec<(u64, Record)>>,
+    /// The step's start: reports on or after this request cannot affect its recorded bytes.
+    request_seq: u64,
 }
 
 impl<W: Writer> Writer for Before<'_, W> {
+    async fn responses_reasoning_removals(
+        &self,
+        run_id: &str,
+        before_seq: Option<u64>,
+    ) -> Result<broca_session_loop::responses_reasoning::ResponsesReasoningRemovals, SessionError>
+    {
+        let before = before_seq.map_or(self.request_seq, |seq| seq.min(self.request_seq));
+        self.writer
+            .responses_reasoning_removals(run_id, Some(before))
+            .await
+    }
+
     async fn append(&mut self, _: &[Record], _: bool) -> Result<u64, SessionError> {
         Err(SessionError::OwnerGone)
     }

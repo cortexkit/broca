@@ -280,7 +280,7 @@ pub fn attempt_evidence(records: &[(u64, Record)], run_id: &str) -> Vec<AttemptE
 /// names the provider's evidence gives them: `None` when the record has none, or when the
 /// request didn't ask for one (`input_transformations_unmeasured`), which is unknown rather
 /// than "no change".
-fn reported_input_transformations(
+pub(crate) fn reported_input_transformations(
     telemetry: &broca_protocol::json::Json,
 ) -> Option<Vec<broca_protocol::InputTransformation>> {
     #[derive(serde::Deserialize)]

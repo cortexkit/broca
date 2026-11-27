@@ -44,8 +44,16 @@ async fn serve_store_run(
     req: broca_core::RunRequest,
     mode: broca_module::executor::StoreRunMode,
 ) -> broca_module::executor::StoreRunEnd {
-    serve_store_run_with_control(executor, session, parts, req, mode, Default::default(), None)
-        .await
+    serve_store_run_with_control(
+        executor,
+        session,
+        parts,
+        req,
+        mode,
+        Default::default(),
+        None,
+    )
+    .await
 }
 
 async fn serve_store_run_with_control(
@@ -63,7 +71,10 @@ async fn serve_store_run_with_control(
     let backend: &'static broca_session_store::backend::MemoryBackend = session.backend();
     let mut index = broca_module::store_media::SessionIndex::new(&*session, Some(backend));
     index.open(session, parts).await;
-    assert!(index.ready(), "a session's image index is current once opened");
+    assert!(
+        index.ready(),
+        "a session's image index is current once opened"
+    );
     let (media_sent, media) = tokio::sync::oneshot::channel();
     let _ = media_sent.send(index.for_run());
     let (writer, mut link) = broca_session_loop::shared::ActorWriter::new(session, None);
@@ -103,7 +114,10 @@ async fn serve_store_run_with_control(
             link.serve(&mut writer, request).await;
         }
     };
-    match tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(run, actor).0 }).await
+    match tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(run, actor).0
+    })
+    .await
     {
         Ok(end) => end,
         Err(_) => panic!(
@@ -124,6 +138,7 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
         Request::OpenLogRecords { .. } => "open log records",
         Request::OpenRunTail { .. } => "open run tail",
         Request::AcceptedSend { .. } => "accepted send",
+        Request::ResponsesReasoningRemovals { .. } => "responses reasoning removals",
         Request::CachePredecessor { .. } => "cache predecessor",
         Request::RunStart { .. } => "run start",
         Request::WindowMessageWhole { .. } => "window message whole",
@@ -143,10 +158,8 @@ fn request_kind(request: &broca_session_loop::shared::Request) -> &'static str {
 
 /// A new store session for `root`'s test request.
 async fn store_session(
-) -> broca_session_store::session::Session<&'static broca_session_store::backend::MemoryBackend>
-{
-    let backend: &'static broca_session_store::backend::MemoryBackend =
-        Box::leak(Box::default());
+) -> broca_session_store::session::Session<&'static broca_session_store::backend::MemoryBackend> {
+    let backend: &'static broca_session_store::backend::MemoryBackend = Box::leak(Box::default());
     broca_session_store::session::Session::create(
         backend,
         broca_session_store::backend::SessionAddr("0123456789abcdef".into()),
@@ -312,7 +325,9 @@ async fn a_store_session_runs_through_the_production_executor() {
 #[tokio::test]
 async fn a_store_run_on_a_pool_key_keeps_the_provider_whose_rows_it_borrowed() {
     // It replaces the process-wide catalog, so it runs in a child process of its own.
-    if !run_catalog_drift_child("a_store_run_on_a_pool_key_keeps_the_provider_whose_rows_it_borrowed") {
+    if !run_catalog_drift_child(
+        "a_store_run_on_a_pool_key_keeps_the_provider_whose_rows_it_borrowed",
+    ) {
         return;
     }
     let server = resume_http_fixture().await;
@@ -349,7 +364,8 @@ async fn a_store_run_on_a_pool_key_keeps_the_provider_whose_rows_it_borrowed() {
     ));
     for (run, text) in [("pool-run-1", "hello"), ("pool-run-2", "again")] {
         let mut req = drift_request(&root);
-        req.model = broca_protocol::request::ModelHandle::new("anthropic-platform", "claude-haiku-4-5");
+        req.model =
+            broca_protocol::request::ModelHandle::new("anthropic-platform", "claude-haiku-4-5");
         req.generation.max_output_tokens = Some(1024);
         req.run_id = broca_protocol::RunId(run.into());
         req.input = vec![broca_protocol::Message::new(
@@ -376,13 +392,22 @@ async fn a_store_run_on_a_pool_key_keeps_the_provider_whose_rows_it_borrowed() {
             .expect("the session's latest run");
         assert_eq!(prior.run_id.0, run);
         assert_eq!(prior.config.model.provider_module_id, "anthropic-platform");
-        assert_eq!(prior.config.served_provider.as_deref(), Some("anthropic"), "{run}");
+        assert_eq!(
+            prior.config.served_provider.as_deref(),
+            Some("anthropic"),
+            "{run}"
+        );
         assert_eq!(prior.config.billed_provider(), "anthropic");
     }
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     for request in requests.iter() {
-        assert!(request.headers.lines().next().unwrap().contains("/messages "));
+        assert!(request
+            .headers
+            .lines()
+            .next()
+            .unwrap()
+            .contains("/messages "));
         assert!(request.headers.to_ascii_lowercase().contains("x-api-key:"));
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["model"], "claude-haiku-4-5");
@@ -433,7 +458,9 @@ async fn a_fresh_trial_folder_run_ignores_the_retired_selection_file() {
         req.run_id = broca_protocol::RunId(run.into());
         req.input = vec![broca_protocol::Message::new(
             broca_protocol::Role::User,
-            vec![broca_protocol::ContentBlock::Text { text: "hello".into() }],
+            vec![broca_protocol::ContentBlock::Text {
+                text: "hello".into(),
+            }],
         )];
         let end = serve_store_run(
             &executor,
@@ -443,7 +470,9 @@ async fn a_fresh_trial_folder_run_ignores_the_retired_selection_file() {
             broca_module::executor::StoreRunMode::Fresh,
         )
         .await;
-        let finished = end.result.unwrap_or_else(|error| panic!("{run}: {error:?}"));
+        let finished = end
+            .result
+            .unwrap_or_else(|error| panic!("{run}: {error:?}"));
         assert_eq!(finished.reason, RunFinishReason::Completed, "{run}");
         let (writer, _link) = broca_session_loop::shared::ActorWriter::new(&session, None);
         let history = store_history(&writer, &parts).await.unwrap();
@@ -547,12 +576,17 @@ async fn a_store_run_refused_by_routing_starts_then_ends_with_the_refusal() {
     let error = records
         .iter()
         .find_map(|(_, record)| match record {
-            broca_session_store::record::Record::RunEnd(end) => Some(end.error.as_ref().map(|error| error.parse())),
+            broca_session_store::record::Record::RunEnd(end) => {
+                Some(end.error.as_ref().map(|error| error.parse()))
+            }
             _ => None,
         })
         .expect("the run's end is written")
         .expect("the run's end carries routing's refusal");
-    assert_eq!(error["provider_code"], "routing_decision_refused", "{error}");
+    assert_eq!(
+        error["provider_code"], "routing_decision_refused",
+        "{error}"
+    );
     let start = records
         .iter()
         .find_map(|(seq, record)| {
@@ -561,10 +595,13 @@ async fn a_store_run_refused_by_routing_starts_then_ends_with_the_refusal() {
         .unwrap();
     let reads = session.backend().log_reads();
     let (writer, mut link) = broca_session_loop::shared::ActorWriter::new(&session, None);
-    let (reported, ()) = tokio::join!(store_terminal_error(&writer, "store-run-routed", start), async {
-        let request = link.next().await.unwrap();
-        link.serve(&mut session, request).await;
-    });
+    let (reported, ()) = tokio::join!(
+        store_terminal_error(&writer, "store-run-routed", start),
+        async {
+            let request = link.next().await.unwrap();
+            link.serve(&mut session, request).await;
+        }
+    );
     assert_eq!(
         reported.unwrap().provider_code.as_deref(),
         Some("routing_decision_refused")

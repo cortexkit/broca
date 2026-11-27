@@ -284,6 +284,16 @@ fn written_under(operations: &Operations) -> Option<ViewRef> {
 }
 
 impl<W: Writer> Writer for Placed<'_, W> {
+    async fn responses_reasoning_removals(
+        &self,
+        run_id: &str,
+        before_seq: Option<u64>,
+    ) -> Result<crate::responses_reasoning::ResponsesReasoningRemovals, SessionError> {
+        self.inner
+            .responses_reasoning_removals(run_id, before_seq)
+            .await
+    }
+
     async fn accepted_send(
         &self,
         account: &str,

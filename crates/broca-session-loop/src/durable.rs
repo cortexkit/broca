@@ -94,6 +94,16 @@ pub struct Durable<'a, W, S> {
 }
 
 impl<W: Writer, S: PartStore> Writer for Durable<'_, W, S> {
+    async fn responses_reasoning_removals(
+        &self,
+        run_id: &str,
+        before_seq: Option<u64>,
+    ) -> Result<crate::responses_reasoning::ResponsesReasoningRemovals, SessionError> {
+        self.writer
+            .responses_reasoning_removals(run_id, before_seq)
+            .await
+    }
+
     async fn accepted_send(
         &self,
         account: &str,

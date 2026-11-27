@@ -276,7 +276,7 @@ pub struct EpisodeRenderInput {
 
 /// Metadata used only when rendering a request. Keeping it behind the existing
 /// shared pointer avoids increasing the stack space needed by suspended agent runs.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct RenderHistory {
     pub episodes: Vec<EpisodeRenderInput>,
     /// Mode-3 episode boundaries use native transcript ordinals, excluding global
@@ -300,16 +300,38 @@ pub struct RenderHistory {
     /// own settings and every earlier byte alone, so the cached prefix holds. Absent for every
     /// other request.
     pub answer_effort: Option<String>,
+    /// Responses reasoning IDs the provider already removed. This is render-only state, carried
+    /// by the `serde(skip)` `CallOptions::render_episodes`, and is never stored. An empty set
+    /// leaves request bytes unchanged.
+    pub removed_responses_reasoning: std::collections::HashSet<String>,
+}
+
+impl std::fmt::Debug for RenderHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut history = f.debug_struct("RenderHistory");
+        history
+            .field("episodes", &self.episodes)
+            .field("raw_ordinals", &self.raw_ordinals)
+            .field("compaction_prefix_len", &self.compaction_prefix_len)
+            .field("signed_floor", &self.signed_floor)
+            .field("answer_effort", &self.answer_effort);
+        // Keep existing request diagnostics unchanged when nothing was removed. Otherwise show
+        // the count without dumping every provider item ID in the session's removal history.
+        if !self.removed_responses_reasoning.is_empty() {
+            history.field(
+                "removed_responses_reasoning",
+                &self.removed_responses_reasoning.len(),
+            );
+        }
+        history.finish()
+    }
 }
 
 impl From<Vec<EpisodeRenderInput>> for RenderHistory {
     fn from(episodes: Vec<EpisodeRenderInput>) -> Self {
         Self {
             episodes,
-            raw_ordinals: false,
-            compaction_prefix_len: None,
-            signed_floor: None,
-            answer_effort: None,
+            ..Self::default()
         }
     }
 }

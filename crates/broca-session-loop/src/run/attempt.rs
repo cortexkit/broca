@@ -3,11 +3,69 @@
 
 use serde_json::{json, Value};
 
-use broca_protocol::ModelAttempt;
+use broca_core::provider::Provider;
+use broca_protocol::{ModelAttempt, RunId, StepId};
 use broca_session_store::codec::Digest;
 use broca_session_store::record::{Attempt, Record};
 
-use super::LoopError;
+use crate::responses_reasoning::ResponsesReasoningRemovals;
+use crate::writer::Writer;
+
+use super::{event_id, FailedAccountLimitAttempt, LoopError, Seams};
+
+/// Records one attempt's evidence, around the hooks broca-core's run loop calls: keep-warm
+/// learns its send time and rate-limit headers, its input transformations are reported, and the
+/// provider adds its cache evidence before the record is written and learns which record holds
+/// it after. A failed attempt is durable at once (it may have been billed and no step's end will
+/// follow it); a completed one rides the step's end. Returns the attempt, with its record's seq,
+/// when the provider refused it for the account's limit.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn record_attempt<W: Writer, P: Provider, T>(
+    writer: &mut W,
+    seams: &Seams<'_, P, T>,
+    run_id: &str,
+    step_id: u64,
+    mut attempt: ModelAttempt,
+    context: &AttemptContext,
+    selection: Option<&broca_records::record::AuthSelection>,
+    mut responses_removals: Option<&mut ResponsesReasoningRemovals>,
+) -> Result<Option<Box<FailedAccountLimitAttempt>>, LoopError> {
+    if let Some(warm) = &seams.keep_warm {
+        warm.note_attempt(&attempt);
+    }
+    broca_core::input_transformations::report_input_transformations_filtered(
+        &seams.bind,
+        &RunId(run_id.into()),
+        StepId(step_id),
+        &attempt,
+        |entry| {
+            responses_removals
+                .as_deref_mut()
+                .is_none_or(|removals| removals.observe_live(step_id, entry))
+        },
+    );
+    seams.provider.annotate_cache_evidence(&mut attempt);
+    let durable = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
+    // The seq the record took, which a writer shared with the session actor knows only once it
+    // is appended.
+    let seq = writer
+        .append(
+            &[attempt_record(run_id, step_id, attempt.clone(), context)?],
+            durable,
+        )
+        .await?;
+    seams
+        .provider
+        .cache_attempt_recorded(Some(event_id(writer, seq)));
+    if let Some(reports) = &seams.account_reports {
+        reports.attempt_recorded_on(&event_id(writer, seq), seq, &attempt, selection);
+    }
+    Ok(attempt
+        .account_observation
+        .limit
+        .is_some()
+        .then(|| Box::new(FailedAccountLimitAttempt { seq, attempt })))
+}
 
 /// One HTTP attempt's record, from the provider's evidence. Billing and the session's folded
 /// state read the typed fields; every other field the provider measured is kept as diagnostics

@@ -1375,27 +1375,70 @@ async fn run_once<W: Writer>(
 
 /// The stub provider; when `.1` is set, it reports the attempt a transport would before the
 /// step's events, so the session records the step's request digest.
-struct Attempting<'a>(&'a broca_core::provider::StubProvider, bool);
+struct Attempting<'a>(
+    &'a broca_core::provider::StubProvider,
+    bool,
+    Option<ResponsesProbe>,
+);
+
+#[derive(Clone, Copy)]
+enum ResponsesProbe {
+    Seed,
+    NoReport,
+    Remove,
+}
+
+fn responses_bytes(options: &broca_protocol::CallOptions) -> Vec<u8> {
+    use broca_provider::families::{openai_responses_frozen_config, OpenAiResponses};
+    use broca_provider::wire::WireFamily as _;
+    OpenAiResponses.render(&openai_responses_frozen_config("gpt-5"), options)
+}
 
 #[async_trait::async_trait]
 impl broca_core::Provider for Attempting<'_> {
+    fn render_config_blob(&self) -> serde_json::Value {
+        if self.2.is_some() {
+            serde_json::to_value(broca_provider::families::openai_responses_frozen_config(
+                "gpt-5",
+            ))
+            .unwrap()
+        } else {
+            self.0.render_config_blob()
+        }
+    }
+
+    fn render_request(&self, options: &broca_protocol::CallOptions) -> Vec<u8> {
+        if self.2.is_some() {
+            responses_bytes(options)
+        } else {
+            self.0.render_request(options)
+        }
+    }
+
     async fn step(
         &self,
         step: broca_protocol::StepId,
         options: &broca_protocol::CallOptions,
     ) -> mpsc::Receiver<broca_protocol::NormalizedEvent> {
-        let digest = broca_core::render::request_digest_hex(&self.0.render_request(options));
+        let bytes = self.render_request(options);
+        let digest = broca_core::render::request_digest_hex(&bytes);
         let mut inner = self.0.step(step, options).await;
         if !self.1 {
             return inner;
         }
-        let attempt = serde_json::from_value(serde_json::json!({
-            "attempt": 0, "request_body_len": 10, "request_body_sha256": digest,
+        let mut evidence = serde_json::json!({
+            "attempt": 0, "request_body_len": if self.2.is_some() { bytes.len() } else { 10 },
+            "request_body_sha256": digest,
             "http_status": 200, "response_body_len": 0,
             "response_body_sha256": "0".repeat(64), "outcome": "complete",
             "ts_ms": 1, "sent_at_ms": 1,
-        }))
-        .unwrap();
+        });
+        if matches!(self.2, Some(ResponsesProbe::Remove)) {
+            evidence["input_transformations"] = serde_json::json!([{
+                "type": "reasoning", "id": "rs_prior", "action": "removed", "reason": "prefix_mismatch"
+            }]);
+        }
+        let attempt = serde_json::from_value(evidence).unwrap();
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             let _ = tx
@@ -1418,12 +1461,43 @@ async fn run_once_with<W: Writer>(
     writer: &mut W,
     parts: &mut MemoryParts,
     compactor: &Compactor,
-    (run_id, model): (&str, &str),
+    run: (&str, &str),
     text: &str,
     attempts: bool,
 ) -> broca_protocol::request::CallOptions {
-    let provider =
-        broca_core::provider::StubProvider::new(vec![reply_step(&format!("m-{run_id}"), text)]);
+    run_once_with_probe(writer, parts, compactor, run, text, attempts, None).await
+}
+
+async fn run_once_with_probe<W: Writer>(
+    writer: &mut W,
+    parts: &mut MemoryParts,
+    compactor: &Compactor,
+    (run_id, model): (&str, &str),
+    text: &str,
+    attempts: bool,
+    probe: Option<ResponsesProbe>,
+) -> broca_protocol::request::CallOptions {
+    let mut reply = reply_step(&format!("m-{run_id}"), text);
+    if matches!(probe, Some(ResponsesProbe::Seed)) {
+        let broca_protocol::NormalizedEvent::Control(
+            broca_protocol::ProviderControl::AssistantMessage { message },
+        ) = &mut reply[0]
+        else {
+            unreachable!()
+        };
+        message.content.insert(
+            0,
+            ContentBlock::RedactedReasoning {
+                data: r#"{"type":"reasoning","id":"rs_prior","encrypted_content":"cipher-prior"}"#
+                    .into(),
+                provider_format: Some(
+                    broca_protocol::content::EncryptedReasoningFormat::OpenAiResponses,
+                ),
+            },
+        );
+    }
+    let provider = broca_core::provider::StubProvider::new(vec![reply]);
+    let attempting = Attempting(&provider, attempts, probe);
     let mut submission = request(text);
     submission.tools = None;
     submission.policy_allowed = Default::default();
@@ -1436,23 +1510,24 @@ async fn run_once_with<W: Writer>(
     );
     let control = broca_core::RunControl {
         cancel: Some(Default::default()),
-        manifest: Some(Arc::new(compacted_manifest())),
+        manifest: probe.is_none().then(|| Arc::new(compacted_manifest())),
         admitted_context_limit: Some(200_000),
         // A new session starts on the current compaction contract; one that has run keeps its own.
-        new_log_compaction_plan_version: Some(cortexkit_compaction_view::PLAN_VERSION),
+        new_log_compaction_plan_version: probe
+            .is_none()
+            .then_some(cortexkit_compaction_view::PLAN_VERSION),
         ..Default::default()
     };
     let admission = broca_session_loop::admit::admission(
         &mut req,
         &control,
-        &provider,
+        &attempting,
         writer.operations(),
         Some(10_000),
     )
     .unwrap();
     let tools = broca_core::stub_plane::StubToolPlane::new();
     let now = || 10_000;
-    let attempting = Attempting(&provider, attempts);
     let seams = broca_session_loop::run::Seams {
         steer_yields: None,
         provider: &attempting,
@@ -1466,7 +1541,7 @@ async fn run_once_with<W: Writer>(
         hook_plane: None,
         now_ms: &now,
         session_address: None,
-        compaction_plane: Some(compactor),
+        compaction_plane: probe.is_none().then_some(compactor),
         compaction_session: None,
         compaction_changes: false,
         keep_warm: None,
@@ -1814,6 +1889,81 @@ async fn a_step_rebuilt_as_of_its_time_ignores_later_views() {
         .await
         .unwrap();
     assert_eq!(as_read(&rebuilt.opts), as_read(&third));
+}
+
+#[tokio::test]
+async fn responses_request_rebuild_uses_only_removals_known_when_it_was_sent() {
+    let backend: &'static MemoryBackend = Box::leak(Box::default());
+    let mut session = create(backend).await.unwrap();
+    let mut parts = MemoryParts::default();
+    let compactor = Compactor::default();
+    let mut sent = Vec::new();
+    for (id, probe) in [
+        ("seed", ResponsesProbe::Seed),
+        ("before", ResponsesProbe::NoReport),
+        ("remove", ResponsesProbe::Remove),
+    ] {
+        let opts = run_once_with_probe(
+            &mut session,
+            &mut parts,
+            &compactor,
+            (id, "gpt-5"),
+            id,
+            true,
+            Some(probe),
+        )
+        .await;
+        sent.push((id, responses_bytes(&opts)));
+    }
+    assert!(String::from_utf8_lossy(&sent[1].1).contains("cipher-prior"));
+    assert!(String::from_utf8_lossy(&sent[2].1).contains("cipher-prior"));
+
+    session.seal(None, 11_000).await.unwrap();
+    drop(session);
+    let mut session = load(backend).await.unwrap();
+    assert!(
+        !session
+            .open_log_records()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, record)| {
+                matches!(record, Record::Attempt(attempt) if attempt.run_id == "remove")
+            }),
+        "the removal report must be recovered from sealed history"
+    );
+    let opts = run_once_with_probe(
+        &mut session,
+        &mut parts,
+        &compactor,
+        ("after", "gpt-5"),
+        "after",
+        true,
+        Some(ResponsesProbe::NoReport),
+    )
+    .await;
+    let after = responses_bytes(&opts);
+    assert!(!String::from_utf8_lossy(&after).contains("cipher-prior"));
+    sent.push(("after", after));
+
+    let records = session.records_from(1).await.unwrap();
+    for (run, expected) in sent {
+        let rebuilt = Box::pin(super::recorded_warm::request_as_of(
+            &session,
+            &records,
+            &parts,
+            &bind(),
+            run,
+            1,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            responses_bytes(&rebuilt.opts),
+            expected,
+            "reconstructed {run}"
+        );
+    }
 }
 
 /// The compaction provider's view names imported messages by their source ids. Installed, it applies at

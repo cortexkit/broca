@@ -61,7 +61,7 @@ use crate::writer::Writer;
 mod account_limit;
 mod attempt;
 use account_limit::{account_limit_of, account_limit_pause, waited_for_routing};
-use attempt::{attempt_record, AttemptContext, RequestFacts};
+use attempt::{record_attempt, AttemptContext, RequestFacts};
 mod display;
 use display::restream;
 mod warming;
@@ -1969,6 +1969,12 @@ async fn offline_request_for<W: Writer>(
         None,
         None,
     )?;
+    if crate::responses_reasoning::ResponsesReasoningRemovals::applies(&admission.render_config) {
+        writer
+            .responses_reasoning_removals(&admission.run_id, None)
+            .await?
+            .apply(&mut opts, step_id);
+    }
     finalize_tool_choice(writer, &mut opts);
     if !compacted {
         let durable_system: Vec<Message> = opts.prompt.first().cloned().into_iter().collect();
@@ -2186,6 +2192,17 @@ where
     // shares the list.
     let mut tool_sets = ToolSetCache::default();
     let mut episodes = Arc::new(render_history(writer, parts, &mut tool_sets).await?);
+    let mut responses_removals = if crate::responses_reasoning::ResponsesReasoningRemovals::applies(
+        &admission.render_config,
+    ) {
+        Some(
+            writer
+                .responses_reasoning_removals(&admission.run_id, None)
+                .await?,
+        )
+    } else {
+        None
+    };
     // The changes a batch tells the compaction provider read the transcript the run's steps keep,
     // and report the signed floor the run's requests carry.
     let changes = crate::compaction::Changes::of(admission, seams, episodes.signed_floor)
@@ -2620,6 +2637,9 @@ where
             whole.as_ref(),
         )?;
         drop(whole);
+        if let Some(removals) = &mut responses_removals {
+            removals.apply(&mut opts, step_id);
+        }
         // The step names the account routing gives the run now.
         if let Some(context) = opts.step_context.as_mut() {
             let selection = run_selection(seams, admission);
@@ -2790,6 +2810,7 @@ where
                 first_attempt,
                 run_selection(seams, admission),
                 live_display,
+                responses_removals.as_mut(),
             )
             .await?;
             // A failed call may be retried on a downgraded grammar or another account.
@@ -4213,6 +4234,7 @@ async fn model_step<W: Writer, P: Provider, T>(
     first_attempt: u32,
     selection: Option<&broca_records::record::AuthSelection>,
     live_display: &mut bool,
+    mut responses_removals: Option<&mut crate::responses_reasoning::ResponsesReasoningRemovals>,
 ) -> Result<Result<Step, StepFailure>, LoopError> {
     let mut limited: Option<Box<FailedAccountLimitAttempt>> = None;
     let mut in_flight = live_step::Model::new(seams.step_progress.as_ref());
@@ -4353,9 +4375,17 @@ async fn model_step<W: Writer, P: Provider, T>(
                 retries_used,
             })) => break Err(StepFailure::Error(Box::new(error), retries_used, limited)),
             Some(NormalizedEvent::Control(ProviderControl::AttemptFinished { attempt })) => {
-                limited =
-                    record_attempt(writer, seams, run_id, step_id, attempt, &context, selection)
-                        .await?;
+                limited = record_attempt(
+                    writer,
+                    seams,
+                    run_id,
+                    step_id,
+                    attempt,
+                    &context,
+                    selection,
+                    responses_removals.as_deref_mut(),
+                )
+                .await?;
             }
             None => {
                 break Err(StepFailure::Error(
@@ -4387,7 +4417,14 @@ async fn model_step<W: Writer, P: Provider, T>(
                         event
                     {
                         record_attempt(
-                            writer, seams, run_id, step_id, attempt, &context, selection,
+                            writer,
+                            seams,
+                            run_id,
+                            step_id,
+                            attempt,
+                            &context,
+                            selection,
+                            responses_removals.as_deref_mut(),
                         )
                         .await?;
                     }
@@ -4406,54 +4443,6 @@ async fn model_step<W: Writer, P: Provider, T>(
         in_flight.keep_for_tools();
     }
     Ok(outcome)
-}
-
-/// Records one attempt's evidence, around the hooks broca-core's run loop calls: keep-warm
-/// learns its send time and rate-limit headers, its input transformations are reported, and the
-/// provider adds its cache evidence before the record is written and learns which record holds
-/// it after. A failed attempt is durable at once (it may have been billed and no step's end will
-/// follow it); a completed one rides the step's end. Returns the attempt, with its record's seq,
-/// when the provider refused it for the account's limit.
-#[allow(clippy::too_many_arguments)]
-async fn record_attempt<W: Writer, P: Provider, T>(
-    writer: &mut W,
-    seams: &Seams<'_, P, T>,
-    run_id: &str,
-    step_id: u64,
-    mut attempt: broca_protocol::ModelAttempt,
-    context: &AttemptContext,
-    selection: Option<&broca_records::record::AuthSelection>,
-) -> Result<Option<Box<FailedAccountLimitAttempt>>, LoopError> {
-    if let Some(warm) = &seams.keep_warm {
-        warm.note_attempt(&attempt);
-    }
-    broca_core::input_transformations::report_input_transformations(
-        &seams.bind,
-        &broca_protocol::RunId(run_id.into()),
-        StepId(step_id),
-        &attempt,
-    );
-    seams.provider.annotate_cache_evidence(&mut attempt);
-    let durable = attempt.outcome != broca_protocol::AttemptOutcome::Complete;
-    // The seq the record took, which a writer shared with the session actor knows only once it
-    // is appended.
-    let seq = writer
-        .append(
-            &[attempt_record(run_id, step_id, attempt.clone(), context)?],
-            durable,
-        )
-        .await?;
-    seams
-        .provider
-        .cache_attempt_recorded(Some(event_id(writer, seq)));
-    if let Some(reports) = &seams.account_reports {
-        reports.attempt_recorded_on(&event_id(writer, seq), seq, &attempt, selection);
-    }
-    Ok(attempt
-        .account_observation
-        .limit
-        .is_some()
-        .then(|| Box::new(FailedAccountLimitAttempt { seq, attempt })))
 }
 
 /// A call of a batch that already has an intent, from before the run paused or crashed: it is

@@ -142,6 +142,9 @@ impl ScriptedProvider {
         if let Some(route) = ride_placement::frozen_route() {
             return serde_json::to_value(route).expect("a frozen config serializes");
         }
+        if let Ok(config) = responses_reasoning::CONFIG.try_with(Clone::clone) {
+            return serde_json::to_value(config).expect("a frozen config serializes");
+        }
         let mut blob = json!({ "render_config": "stateless" });
         if let Some(structured) = structured() {
             blob["structured_output"] = structured;
@@ -2447,6 +2450,17 @@ impl Recording<'_, '_> {
 }
 
 impl Writer for Recording<'_, '_> {
+    async fn responses_reasoning_removals(
+        &self,
+        run_id: &str,
+        before_seq: Option<u64>,
+    ) -> Result<broca_session_loop::responses_reasoning::ResponsesReasoningRemovals, SessionError>
+    {
+        self.session
+            .responses_reasoning_removals(run_id, before_seq)
+            .await
+    }
+
     async fn append(&mut self, records: &[Record], barrier: bool) -> Result<u64, SessionError> {
         self.flush().await?;
         self.records.extend_from_slice(records);
@@ -3969,6 +3983,8 @@ async fn every_cut_of_a_text_answer_resumes_alike() {
     .await;
 }
 
+#[path = "differential/responses_reasoning.rs"]
+mod responses_reasoning;
 #[path = "differential/temperature.rs"]
 mod temperature;
 

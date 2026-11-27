@@ -101,6 +101,23 @@ pub trait Writer {
     /// whole when the folds keep only a summary of it, such as the compaction views.
     async fn open_log_records(&self) -> Result<Vec<(u64, Record)>, SessionError>;
 
+    /// Derive the session's Responses reasoning removals before `before_seq` (exclusive), or
+    /// through the current head when it is absent. A live session also reads attempts that a seal
+    /// moved from the open log into older, immutable ledger segments.
+    async fn responses_reasoning_removals(
+        &self,
+        run_id: &str,
+        before_seq: Option<u64>,
+    ) -> Result<crate::responses_reasoning::ResponsesReasoningRemovals, SessionError> {
+        let mut removals = crate::responses_reasoning::ResponsesReasoningRemovals::default();
+        for (seq, record) in self.open_log_records().await? {
+            if before_seq.is_none_or(|before| seq < before) {
+                removals.observe_record(run_id, &record);
+            }
+        }
+        Ok(removals)
+    }
+
     /// The current run's open-log tail, bounded by both its start and `first`. Message bodies
     /// may be released: this read is for ledger facts, not transcript reconstruction.
     async fn open_run_tail(
@@ -265,6 +282,20 @@ pub trait Writer {
 impl<B: SessionBackend> Writer for Session<B> {
     async fn caught_up(&mut self) -> Result<(), SessionError> {
         Ok(())
+    }
+
+    async fn responses_reasoning_removals(
+        &self,
+        run_id: &str,
+        before_seq: Option<u64>,
+    ) -> Result<crate::responses_reasoning::ResponsesReasoningRemovals, SessionError> {
+        let mut removals = crate::responses_reasoning::ResponsesReasoningRemovals::default();
+        for (seq, record) in self.ledger_tail_until(|_| false).await? {
+            if before_seq.is_none_or(|before| seq < before) {
+                removals.observe_record(run_id, &record);
+            }
+        }
+        Ok(removals)
     }
 
     async fn accepted_send(

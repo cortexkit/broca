@@ -50,6 +50,7 @@ pub mod plan_tools;
 pub mod queue;
 mod refusal;
 mod repetition;
+pub mod responses_reasoning;
 pub mod run;
 pub mod shared;
 mod transport;

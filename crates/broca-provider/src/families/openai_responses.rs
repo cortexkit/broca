@@ -357,6 +357,7 @@ fn render_prepared_body<'a>(
             target_family: frozen.family_id,
             provider_text_state: frozen.provider_text_state,
             stateless: frozen.static_options.get("store") == Some(&Value::Bool(false)),
+            removed_reasoning: Some(&opts.render_episodes.removed_responses_reasoning),
         },
         media,
         provenance.as_deref_mut(),
@@ -509,6 +510,7 @@ struct ReplayPolicy<'a> {
     target_family: WireFamilyId,
     provider_text_state: bool,
     stateless: bool,
+    removed_reasoning: Option<&'a std::collections::HashSet<String>>,
 }
 
 /// Convert a completed assistant message into the same input items used by full-history
@@ -531,6 +533,7 @@ pub(crate) fn completed_output_as_input(
             target_family: frozen.family_id,
             provider_text_state: frozen.provider_text_state,
             stateless,
+            removed_reasoning: None,
         },
     )
     .iter()
@@ -658,13 +661,23 @@ fn reasoning_format_matches_family(format: EncryptedReasoningFormat, family: Wir
 /// without that flag retain the previous shape: response ids and metadata are removed, summary
 /// and ciphertext are preserved, and `content:null` is added. Keeping that branch reproduces
 /// the input of runs recorded before stateless continuation was enabled.
-fn reasoning_request_item(raw_response_item: &str, stateless: bool) -> Option<Value> {
+fn reasoning_request_item(raw_response_item: &str, replay: &ReplayPolicy<'_>) -> Option<Value> {
     let response: Value = serde_json::from_str(raw_response_item).ok()?;
     if response.get("type").and_then(Value::as_str) != Some("reasoning") {
         return None;
     }
+    // The provider stripped this item before the model saw the prompt, so omitting its echo
+    // leaves the model's input unchanged. Keep the text flush at the call site: dropping a
+    // reasoning item must not join the text items on either side of it.
+    if replay.removed_reasoning.is_some_and(|removed| {
+        response["id"]
+            .as_str()
+            .is_some_and(|id| removed.contains(id))
+    }) {
+        return None;
+    }
     let encrypted_content = response.get("encrypted_content")?.as_str()?;
-    if stateless {
+    if replay.stateless {
         return Some(response);
     }
     let summary = response
@@ -834,7 +847,7 @@ fn convert_assistant_items<'a>(
                 && reasoning_format_matches_family(*provider_format, replay.target_family) =>
             {
                 flush_text(&mut out, &mut text);
-                if let Some(item) = reasoning_request_item(data, replay.stateless) {
+                if let Some(item) = reasoning_request_item(data, replay) {
                     out.push(Node::value(item));
                 }
             }
