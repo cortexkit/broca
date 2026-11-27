@@ -1463,7 +1463,7 @@ impl LineageRegistry {
             Ok(()) => {}
         }
         if let Some(store) = self.store_holding(key)? {
-            let ownership = store_session_ownership(self, &store, key).await?;
+            let ownership = store_ownership_checks(self, &store, key).await?.owner;
             return Ok((ownership.episodes > 0).then_some(ownership.first_principal));
         }
         Ok(None)
@@ -1476,7 +1476,7 @@ impl LineageRegistry {
         key: &LineageKey,
     ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
         self.check_authorization_expired(key).await?;
-        self.durable_session_ownership(key, false).await
+        Ok(self.durable_ownership_checks(key).await?.owner)
     }
 
     /// Read the submission's original sender even after delivery or retraction, so retries
@@ -1516,10 +1516,14 @@ impl LineageRegistry {
         module_id: &str,
     ) -> Result<bool, OpenError> {
         self.check_authorization_expired(key).await?;
-        let ownership = self.sender_ownership_for_authorization(key).await?;
-        Ok(crate::sender_admission::interrupt_granted(
-            &ownership, module_id,
-        ))
+        let Some(store) = self.store_holding(key)? else {
+            return Ok(false);
+        };
+        let checks = store_ownership_checks(self, &store, key).await?;
+        Ok(checks
+            .interrupt_senders
+            .iter()
+            .any(|sender| broca_protocol::same_module(sender, module_id)))
     }
 
     /// The checks a cancel's authorization makes before its ownership lookup: an expired
@@ -1565,42 +1569,28 @@ impl LineageRegistry {
         Err(ServeError::ScopeRefused(refusal))
     }
 
-    /// Read existing durable policy without opening an actor or advancing a live writer.
-    /// Older policy may be repaired in memory, never published for an unadmitted caller.
-    async fn sender_ownership_for_authorization(
-        &self,
-        key: &LineageKey,
-    ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
-        if let Some(store) = self.store_holding(key)? {
-            return store_session_ownership(self, &store, key).await;
-        }
-        Ok(broca_core::SessionOwnershipV1::default())
-    }
-
-    /// Upload standing includes every current plan-named sender, not just session owners.
-    /// Read the frozen first manifest without retaining its contents in owner caches.
+    /// Upload standing uses the session owner and the sender grants from the first plan.
     pub(crate) async fn upload_ownership(
         &self,
         key: &LineageKey,
-    ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+    ) -> Result<crate::store_authorization::OwnershipChecks, OpenError> {
         self.check_authorization_expired(key).await?;
-        self.durable_session_ownership(key, true).await
+        self.durable_ownership_checks(key).await
     }
 
-    async fn durable_session_ownership(
+    async fn durable_ownership_checks(
         &self,
         key: &LineageKey,
-        _for_bind: bool,
-    ) -> Result<broca_core::SessionOwnershipV1, OpenError> {
+    ) -> Result<crate::store_authorization::OwnershipChecks, OpenError> {
         match self.check_move(key, true) {
             // A move freezes sends, not reads: who owns a moving session is still read from it.
             Err(OpenError::SessionMoving { .. } | OpenError::SessionMoved { .. }) | Ok(()) => {}
             Err(error) => return Err(error),
         }
         match self.store_holding(key)? {
-            Some(store) => store_session_ownership(self, &store, key).await,
+            Some(store) => store_ownership_checks(self, &store, key).await,
             // A session no send created has no run, so no owner yet.
-            None => Ok(broca_core::SessionOwnershipV1::default()),
+            None => Ok(Default::default()),
         }
     }
 
@@ -1645,21 +1635,56 @@ impl LineageRegistry {
         }
     }
 
+    /// Bind and send prechecks need only the decisions derived from the full ownership summary.
+    pub(crate) async fn bind_checks(
+        &self,
+        key: &LineageKey,
+    ) -> Result<crate::store_authorization::OwnershipChecks, String> {
+        let mut checks = match self.bind_ownership_store(key).await? {
+            Some(store) => store_ownership_checks(self, &store, key)
+                .await
+                .map_err(|error| error.to_string())?,
+            None => Default::default(),
+        };
+        checks.owner = self.with_scope_reservation(key, checks.owner).await?;
+        Ok(checks)
+    }
+
+    pub(crate) async fn optional_bind_checks(
+        &self,
+        key: &LineageKey,
+    ) -> Option<crate::store_authorization::OwnershipChecks> {
+        match self.bind_checks(key).await {
+            Ok(checks) => Some(checks),
+            Err(error) => {
+                tracing::warn!(target: "scope", "route.bind ownership unknown, history unreadable: {error}");
+                None
+            }
+        }
+    }
+
     async fn bind_history_ownership(&self, key: &LineageKey) -> BindOwnership {
+        match self.bind_ownership_store(key).await {
+            Ok(Some(store)) => match store_session_ownership(self, &store, key).await {
+                Ok(ownership) => BindOwnership::Known(ownership),
+                Err(error) => BindOwnership::Unreadable(error.to_string()),
+            },
+            Ok(None) => BindOwnership::Known(broca_core::SessionOwnershipV1::default()),
+            Err(error) => BindOwnership::Unreadable(error),
+        }
+    }
+
+    async fn bind_ownership_store(
+        &self,
+        key: &LineageKey,
+    ) -> Result<Option<Arc<crate::store_open::StoreRuntime>>, String> {
         if matches!(
             self.check_expired(key, None).await,
             Err(OpenError::Expired { .. })
         ) {
-            return BindOwnership::Known(broca_core::SessionOwnershipV1::default());
+            return Ok(None);
         }
-        // A stored session's ownership comes from the owner summary it keeps
-        // (`Operations::owner`), so nothing is replayed to find it.
-        match self.store_holding(key) {
-            Ok(Some(store)) => store_bind_ownership(self, &store, key).await,
-            // A session no send created has no run, so no owner yet.
-            Ok(None) => BindOwnership::Known(broca_core::SessionOwnershipV1::default()),
-            Err(error) => BindOwnership::Unreadable(error.to_string()),
-        }
+        self.store_holding(key).map_err(|error| error.to_string())
     }
 
     pub(crate) fn handle(&self) -> RegistryHandle {
@@ -1669,24 +1694,30 @@ impl LineageRegistry {
     }
 }
 
-/// The ownership of a session kept in the session store, from a read-only view of it. A session
-/// whose creation never committed holds no run, so it has no owner yet.
-async fn store_bind_ownership(
+async fn store_ownership_checks(
     registry: &LineageRegistry,
     store: &crate::store_open::StoreRuntime,
     key: &LineageKey,
-) -> BindOwnership {
-    match store_session_ownership(registry, store, key).await {
-        Ok(ownership) => BindOwnership::Known(ownership),
-        Err(error) => BindOwnership::Unreadable(error.to_string()),
-    }
+) -> Result<crate::store_authorization::OwnershipChecks, OpenError> {
+    use crate::store_reads::{StoreReadReply, StoreReadRequest};
+    let checks = match store
+        .read(registry, key, StoreReadRequest::AuthorizationChecks)
+        .await
+        .map_err(crate::store_reads::open_error)?
+    {
+        None => Default::default(),
+        Some(StoreReadReply::AuthorizationChecks(checks)) => *checks.map_err(OpenError::Open)?,
+        Some(_) => {
+            return Err(crate::store_reads::open_error(
+                crate::store_reads::mismatched(),
+            ))
+        }
+    };
+    registry.note_owner(key, &checks.owner);
+    Ok(checks)
 }
 
-/// The ownership of a session kept in the session store, as every authorization path reads it:
-/// the owner summary the stored session keeps (`Operations::owner`), with the first run's tools
-/// and plan read back from the deployment's setup parts. It records the same facts
-/// `durable_session_ownership` gathers from a log. A session whose creation never committed
-/// holds no run, so it has no owner yet.
+/// The full ownership summary for callers that need the first run's tools and frozen plan.
 async fn store_session_ownership(
     registry: &LineageRegistry,
     store: &crate::store_open::StoreRuntime,
@@ -2005,14 +2036,9 @@ impl LineageRegistry {
             // Refuse invalid marks before opening a writer, including its new-WAL header.
             // Ownership replay is large; carrying it inline multiplies the send future's stack
             // footprint at every await site, overflowing unoptimized lifecycle tests.
-            let ownership = match Box::pin(self.bind_ownership(key)).await {
-                BindOwnership::Known(ownership) => ownership,
-                BindOwnership::NoHistorySource => {
-                    return Ok(SendOutcome::Error(
-                        "message marks require an ownership history reader".into(),
-                    ));
-                }
-                BindOwnership::Unreadable(error) => return Ok(SendOutcome::Error(error)),
+            let ownership = match Box::pin(self.bind_checks(key)).await {
+                Ok(checks) => checks.owner,
+                Err(error) => return Ok(SendOutcome::Error(error)),
             };
             let marks = match broca_core::scope_admission::admit_message_marks(
                 &request.message_marks,

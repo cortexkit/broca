@@ -14,7 +14,8 @@ pub(crate) async fn upload(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, ServeError> {
-    let ownership = registry.upload_ownership(session).await?;
+    let checks = registry.upload_ownership(session).await?;
+    let ownership = checks.owner;
     if ownership.episodes == 0 {
         return Err(ServeError::Upload(UploadError::new(
             "unknown_session",
@@ -26,22 +27,10 @@ pub(crate) async fn upload(
         let BindPrincipal::Reserved { module_id } = principal else {
             return false;
         };
-        ownership
-            .first_episode
-            .as_ref()
-            .and_then(|episode| episode.plan.as_ref())
-            .and_then(|frozen| {
-                serde_json::from_str::<serde_json::Value>(frozen.plan.as_json_text()).ok()
-            })
-            .and_then(|plan| {
-                plan.as_object()
-                    .and_then(|plan| broca_fetch_plan::plan_senders(plan).ok())
-            })
-            .is_some_and(|senders| {
-                senders
-                    .iter()
-                    .any(|sender| broca_protocol::same_module(&sender.module, module_id))
-            })
+        checks
+            .first_senders
+            .iter()
+            .any(|sender| broca_protocol::same_module(sender, module_id))
     });
     if !named {
         owner.map_err(ServeError::ScopeRefused)?;

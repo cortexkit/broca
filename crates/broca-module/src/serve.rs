@@ -3004,7 +3004,8 @@ impl ServeHandler for crate::LineageRegistry {
         if broca_core::scope_admission::AGENT_RUN_SCOPES_WRITER_ENABLED
             && matches!(&req.request.scope, broca_protocol::SendScope::Stamped(bind) if bind.scope.run_id.is_some())
         {
-            if let Some(ownership) = self.session_ownership_for_bind(&req.session).await {
+            if let Some(checks) = self.optional_bind_checks(&req.session).await {
+                let ownership = checks.owner;
                 if ownership.episodes == 0 {
                     if let Some(field) = broca_core::scope_admission::model_only_scope_tool_field(
                         &req.request.scope,
@@ -3042,7 +3043,8 @@ impl ServeHandler for crate::LineageRegistry {
                 .as_ref()
                 .is_some_and(|tools| !tools.is_empty())
         {
-            if let Some(ownership) = self.session_ownership_for_bind(&req.session).await {
+            if let Some(checks) = self.optional_bind_checks(&req.session).await {
+                let ownership = checks.owner;
                 if ownership.episodes == 0 {
                     let decision = broca_core::decide_scope(
                         &ownership,
@@ -3226,24 +3228,21 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn plan_state(&self, session: &LineageKey) -> PlanState {
-        match self.session_ownership_for_bind(session).await {
+        match self.optional_bind_checks(session).await {
             None => PlanState::Unknown,
-            Some(ownership) if ownership.episodes == 0 || ownership.first_episode.is_none() => {
+            Some(checks) if checks.owner.episodes == 0 || !checks.has_first_episode => {
                 PlanState::NotAdmitted
             }
-            Some(ownership) => PlanState::Admitted {
-                frozen: ownership
-                    .first_episode
-                    .and_then(|first| first.plan)
-                    .map(|plan| plan.plan_identity.clone()),
+            Some(checks) => PlanState::Admitted {
+                frozen: checks.first_plan_identity,
             },
         }
     }
 
     async fn frozen_scope(&self, session: &LineageKey) -> Option<broca_protocol::SessionScope> {
-        self.session_ownership_for_bind(session)
+        self.optional_bind_checks(session)
             .await
-            .and_then(|ownership| ownership.scope)
+            .and_then(|checks| checks.owner.scope)
     }
 
     fn plan_admitter(&self) -> Option<std::sync::Arc<dyn broca_fetch_plan::PlanAdmitter>> {
@@ -3255,40 +3254,15 @@ impl ServeHandler for crate::LineageRegistry {
     }
 
     async fn frozen_plan_requires_hooks(&self, session: &LineageKey) -> bool {
-        self.session_ownership_for_bind(session)
+        self.optional_bind_checks(session)
             .await
-            .and_then(|ownership| ownership.first_episode)
-            .and_then(|first| first.plan)
-            .is_some_and(|plan| broca_core::hooks::has_transforms(&plan.plan))
+            .is_some_and(|checks| checks.requires_hooks)
     }
 
     async fn frozen_plan_requires_approval(&self, session: &LineageKey) -> bool {
-        self.session_ownership_for_bind(session)
+        self.optional_bind_checks(session)
             .await
-            .and_then(|ownership| ownership.first_episode)
-            .and_then(|first| first.plan)
-            .and_then(|frozen| {
-                serde_json::from_str::<serde_json::Value>(frozen.plan.as_json_text()).ok()
-            })
-            .and_then(|plan| {
-                plan.get("step_transform_items")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-            })
-            .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item.get("subscriptions")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|subscriptions| {
-                            subscriptions.iter().any(|subscription| {
-                                subscription
-                                    .get("phase")
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some("approve")
-                            })
-                        })
-                })
-            })
+            .is_some_and(|checks| checks.requires_approval)
     }
 
     async fn bind_adoption_refusal(
@@ -3297,12 +3271,11 @@ impl ServeHandler for crate::LineageRegistry {
         principal: Option<&broca_protocol::BindPrincipal>,
         scope: &broca_protocol::BindScope,
     ) -> Result<Option<broca_core::AdoptionRefusal>, ServeError> {
-        let ownership = match self.bind_ownership(session).await {
-            crate::registry::BindOwnership::Known(ownership) => ownership,
-            crate::registry::BindOwnership::NoHistorySource => return Ok(None),
+        let ownership = match self.bind_checks(session).await {
+            Ok(checks) => checks.owner,
             // Unknown history must not read as "nothing refuses the stamp": that would let a
             // bind adopt a scope its history forbids whenever the history could not be read.
-            crate::registry::BindOwnership::Unreadable(reason) => {
+            Err(reason) => {
                 return Err(ServeError::Open(
                     format!("route.bind adoption check: session history unreadable: {reason}"),
                     Some(broca_protocol::ErrorClass::Transient),
@@ -3477,17 +3450,16 @@ impl ServeHandler for crate::LineageRegistry {
         // session with no episode it meets the scope reservation exactly as a first send does,
         // before the session is opened.
         if req.scope != broca_protocol::SendScope::Internal {
-            match self.bind_ownership(&req.session).await {
-                crate::registry::BindOwnership::Known(ownership) => {
+            match self.bind_checks(&req.session).await {
+                Ok(checks) => {
                     broca_core::scope_admission::check_scope_reservation(
-                        &ownership,
+                        &checks.owner,
                         req.principal.as_ref(),
                         &req.scope,
                     )
                     .map_err(ServeError::ScopeRefused)?;
                 }
-                crate::registry::BindOwnership::NoHistorySource => {}
-                crate::registry::BindOwnership::Unreadable(reason) => {
+                Err(reason) => {
                     return Err(ServeError::Open(
                         format!("session.import owner check: session history unreadable: {reason}"),
                         Some(broca_protocol::ErrorClass::Transient),

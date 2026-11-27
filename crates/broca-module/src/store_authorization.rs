@@ -15,16 +15,15 @@ use broca_session_store::{
     held::{serde_heap_bytes, HeldBytes},
     session::{Position, Session},
 };
+use serde_json::Value;
 
 use crate::reader_admission::{self, ReadPolicy};
 use crate::store_reads::{StoreReadReply, StoreReadRequest};
 
 const MAX_ENTRIES: usize = 4096;
-// The exact ownership answer may contain an opaque plan, so bound the total, not just the count.
-// An entry is about 50 KB for a mason and 80 KB for a head, so 4 MiB keeps roughly the 50 to 80
-// sessions checked again soonest. The memory report's hit count under
-// `kept_heads.authorization` shows whether that covers the closed sessions checked repeatedly.
-const MAX_BYTES: usize = 4 * 1024 * 1024;
+// Budget 8 KiB each for 1,024 closed sessions. Most entries are smaller; sessions with many
+// principals, senders or readers can still exceed the budget for one entry.
+const MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 pub(crate) struct AuthorizationCache(Mutex<Kept>);
@@ -46,19 +45,84 @@ struct Entry {
 }
 
 pub(crate) struct AuthorizationFacts {
-    ownership: Option<SessionOwnershipV1>,
+    ownership: Option<OwnershipChecks>,
     read_policy: Option<ReadPolicy>,
+}
+
+/// Ownership as the authorization checks see it, without the first episode's tools or plan JSON.
+#[derive(Debug, Clone, Default)]
+pub struct OwnershipChecks {
+    pub(crate) owner: SessionOwnershipV1,
+    pub(crate) has_first_episode: bool,
+    pub(crate) first_plan_identity: Option<String>,
+    pub(crate) requires_hooks: bool,
+    pub(crate) requires_approval: bool,
+    // Upload standing uses the first plan, unlike interrupt grants after a plan refresh.
+    pub(crate) first_senders: Vec<String>,
+    pub(crate) interrupt_senders: Vec<String>,
+}
+
+impl OwnershipChecks {
+    pub(crate) fn project(ownership: SessionOwnershipV1) -> Self {
+        let first = ownership.first_episode.as_ref();
+        let frozen = first.and_then(|first| first.plan.as_deref());
+        let first_senders = frozen
+            .map(|frozen| {
+                broca_core::admission::plan_senders(&frozen.plan)
+                    .into_iter()
+                    .map(|sender| sender.module)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let plan = frozen
+            .and_then(|frozen| serde_json::from_str::<Value>(frozen.plan.as_json_text()).ok());
+        let transforms = plan
+            .as_ref()
+            .and_then(|plan| plan.get("step_transform_items"))
+            .and_then(Value::as_array);
+        let requires_approval = transforms.is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("subscriptions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|subscriptions| {
+                        subscriptions.iter().any(|subscription| {
+                            subscription.get("phase").and_then(Value::as_str) == Some("approve")
+                        })
+                    })
+            })
+        });
+        let mut owner = ownership.for_owner_access();
+        owner.reservation = ownership.reservation.clone();
+        Self {
+            owner,
+            has_first_episode: first.is_some(),
+            first_plan_identity: frozen.map(|frozen| frozen.plan_identity.clone()),
+            requires_hooks: transforms.is_some_and(|items| !items.is_empty()),
+            requires_approval,
+            first_senders,
+            interrupt_senders: ownership
+                .effective_senders()
+                .into_iter()
+                .filter(|sender| sender.interrupt)
+                .map(|sender| sender.module)
+                .collect(),
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        serde_heap_bytes(&self.owner)
+            + self.first_plan_identity.heap_bytes()
+            + self.first_senders.heap_bytes()
+            + self.interrupt_senders.heap_bytes()
+    }
 }
 
 impl AuthorizationFacts {
     pub(crate) fn reply(&self, request: &StoreReadRequest) -> Option<StoreReadReply> {
         match request {
-            StoreReadRequest::AuthorizationOwnership => {
-                Some(StoreReadReply::AuthorizationOwnership(Ok(self
-                    .ownership
-                    .as_ref()?
-                    .clone())))
-            }
+            StoreReadRequest::AuthorizationChecks => Some(StoreReadReply::AuthorizationChecks(Ok(
+                Box::new(self.ownership.as_ref()?.clone()),
+            ))),
             StoreReadRequest::AuthorizationRead(access) => {
                 let decision = reader_admission::decide(self.read_policy.as_ref()?, access, None)?;
                 Some(StoreReadReply::AuthorizationRead(decision))
@@ -70,14 +134,10 @@ impl AuthorizationFacts {
     fn estimated_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + 2 * std::mem::size_of::<usize>()
-            + self.ownership.as_ref().map_or(0, |ownership| {
-                serde_heap_bytes(ownership)
-                    + ownership
-                        .first_episode
-                        .as_ref()
-                        .and_then(|first| first.plan.as_deref())
-                        .map_or(0, frozen_plan_bytes)
-            })
+            + self
+                .ownership
+                .as_ref()
+                .map_or(0, OwnershipChecks::heap_bytes)
             + self.read_policy.as_ref().map_or(0, ReadPolicy::heap_bytes)
     }
 }
@@ -133,7 +193,11 @@ impl AuthorizationCache {
             ownership: previous
                 .as_ref()
                 .and_then(|facts| facts.ownership.clone())
-                .or_else(|| ownership(session, parts, first).ok()),
+                .or_else(|| {
+                    ownership(session, parts, first)
+                        .ok()
+                        .map(OwnershipChecks::project)
+                }),
             read_policy: previous
                 .as_ref()
                 .and_then(|facts| facts.read_policy.clone())
@@ -152,14 +216,10 @@ impl AuthorizationCache {
         position: Position,
         facts: Arc<AuthorizationFacts>,
     ) {
-        let key_bytes =
-            key.project_root.capacity() + key.harness.capacity() + key.session.capacity();
-        let key_bytes = 2 * key_bytes
-            + std::mem::size_of::<(BindIdentity, Entry)>()
-            + std::mem::size_of::<(u64, BindIdentity)>();
+        let key_bytes = Self::key_bytes(key);
         let facts =
             if key_bytes + facts.estimated_bytes() > MAX_BYTES && facts.read_policy.is_some() {
-                // An oversized first-episode plan need not displace the much smaller read policy.
+                // An oversized ownership summary need not displace the smaller read policy.
                 Arc::new(AuthorizationFacts {
                     ownership: None,
                     read_policy: facts.read_policy.clone(),
@@ -200,6 +260,14 @@ impl AuthorizationCache {
                 .expect("each order key has an entry");
             kept.bytes -= old.bytes;
         }
+    }
+
+    fn key_bytes(key: &BindIdentity) -> usize {
+        let key_bytes =
+            key.project_root.capacity() + key.harness.capacity() + key.session.capacity();
+        2 * key_bytes
+            + std::mem::size_of::<(BindIdentity, Entry)>()
+            + std::mem::size_of::<(u64, BindIdentity)>()
     }
 
     pub(crate) fn memory(&self) -> broca_wire::MemoryCache {

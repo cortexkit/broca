@@ -48,7 +48,8 @@ fn manifest(provider_count: usize, tools_per_provider: usize) -> PlanManifest {
     let plan = json!({
         "composition": {"providers": composition, "step_transform_items": []},
         "system_text_items": [{"provider": "prefrontal", "preset": "worker"}],
-        "readers": ["prefrontal"], "senders": [{"module": "prefrontal"}],
+        "step_transform_items": [{"subscriptions": [{"phase": "approve"}]}],
+        "readers": ["prefrontal"], "senders": [{"module": "prefrontal", "interrupt": true}],
         "compaction_item": {"provider": "ck-mc", "preset": "worker", "params": {}}
     })
     .to_string();
@@ -61,12 +62,15 @@ fn manifest(provider_count: usize, tools_per_provider: usize) -> PlanManifest {
 }
 
 #[test]
-fn closed_authorization_estimates_mason_and_head_fixtures_without_decoded_setup() {
+fn closed_authorization_compacts_mason_and_head_fixtures() {
+    struct PreviousFacts {
+        _ownership: Option<SessionOwnershipV1>,
+        _read_policy: Option<ReadPolicy>,
+    }
     // Model two compositions: six providers with 80 tool references each for the mason,
     // and eight providers with 100 references each for the head.
     for (name, providers, tools) in [("mason", 6, 80), ("head", 8, 100)] {
         let manifest = Arc::new(manifest(providers, tools));
-        let opaque_bytes = manifest.plan.as_json_text().len();
         let first =
             FirstEpisodeV1::new(broca_protocol::RunId("first".into()), &[], Some(&manifest));
         let tool_names = first.tool_names.len();
@@ -83,20 +87,51 @@ fn closed_authorization_estimates_mason_and_head_fixtures_without_decoded_setup(
             policy.heap_bytes(),
             2 * projection_bytes + serde_heap_bytes(&SessionOwnershipV1::default())
         );
-        let weak = Arc::downgrade(&manifest);
-        drop(manifest);
         let cache = AuthorizationCache::default();
         let key = BindIdentity::new("/repo", "broca", name);
         let class = StorageClass::Ordinary;
+        let mut full = SessionOwnershipV1 {
+            episodes: 1,
+            first_episode: Some(first),
+            ..Default::default()
+        };
+        let first_grants = OwnershipChecks::project(full.clone());
+        assert_eq!(first_grants.interrupt_senders, ["prefrontal"]);
+        assert!(crate::sender_admission::interrupt_granted(
+            &full,
+            "prefrontal"
+        ));
+        full.sender_admission = Some(broca_core::admission::SenderAdmissionV1 {
+            version: 1,
+            accepted_senders: Some(broca_core::admission::plan_senders(
+                &broca_records::record::OpaqueJson::from_json_text(
+                    r#"{"senders":[{"module":"refreshed","interrupt":true}]}"#,
+                )
+                .unwrap(),
+            )),
+        });
+        let before = AuthorizationCache::key_bytes(&key)
+            + std::mem::size_of::<PreviousFacts>()
+            + 2 * std::mem::size_of::<usize>()
+            + serde_heap_bytes(&full)
+            + frozen_plan_bytes(&plan.upgrade().unwrap())
+            + policy.heap_bytes();
+        let projected = OwnershipChecks::project(full.clone());
+        assert_eq!(projected.first_senders, ["prefrontal"]);
+        assert_eq!(projected.interrupt_senders, ["refreshed"]);
+        assert!(
+            projected.has_first_episode && projected.requires_hooks && projected.requires_approval
+        );
+        assert_eq!(projected.first_plan_identity.as_deref(), Some("plan"));
+        assert_eq!(projected.owner, full.for_owner_access());
+        let weak = Arc::downgrade(&manifest);
+        drop((full, manifest));
         cache.keep(
             &key,
             class,
             position(),
             Arc::new(AuthorizationFacts {
-                ownership: Some(SessionOwnershipV1 {
-                    first_episode: Some(first),
-                    ..Default::default()
-                }),
+                ownership: Some(projected),
                 read_policy: Some(policy),
             }),
         );
@@ -105,66 +140,61 @@ fn closed_authorization_estimates_mason_and_head_fixtures_without_decoded_setup(
             "the cache must not retain the manifest"
         );
         let kept = cache.get(&key, class, position()).unwrap();
-        let StoreReadReply::AuthorizationOwnership(Ok(ownership)) = kept
-            .reply(&StoreReadRequest::AuthorizationOwnership)
-            .unwrap()
+        let StoreReadReply::AuthorizationChecks(Ok(checks)) =
+            kept.reply(&StoreReadRequest::AuthorizationChecks).unwrap()
         else {
             panic!("ownership is retained");
         };
-        assert!(Arc::ptr_eq(
-            ownership.first_episode.unwrap().plan.as_ref().unwrap(),
-            &plan.upgrade().unwrap()
-        ));
+        assert!(checks.owner.first_episode.is_none());
+        assert!(
+            plan.upgrade().is_none(),
+            "the cache must not retain the opaque plan"
+        );
         let memory = cache.memory();
         assert_eq!(memory.entries, 1);
-        assert!(memory.estimated_bytes > opaque_bytes as u64);
-        assert!(memory.estimated_bytes < opaque_bytes as u64 + (tool_names as u64 * 64) + 4_096);
+        assert!(memory.estimated_bytes < (before / 8) as u64);
+        assert!(memory.estimated_bytes * 1_024 <= memory.max_bytes.unwrap());
         eprintln!(
-            "{name} fixture: {opaque_bytes} opaque plan bytes, {tool_names} tool names, {} estimated auth entry bytes",
+            "{name} fixture: {tool_names} tool names; {before} -> {} counted auth entry bytes",
             memory.estimated_bytes
         );
+        for n in 1..1_024 {
+            let key = BindIdentity::new("/repo", "broca", format!("{name}-{n}"));
+            cache.keep(&key, class, position(), Arc::clone(&kept));
+        }
+        assert_eq!(cache.memory().entries, 1_024);
     }
 }
 
 #[test]
 fn closed_authorization_evicts_by_bytes_and_skips_oversized_ownership() {
-    let facts_with_plan = |bytes: usize| {
-        let mut manifest = manifest(1, 1);
-        manifest.plan = broca_records::record::OpaqueJson::from_json_text(format!(
-            "{{\"padding\":\"{}\"}}",
-            "x".repeat(bytes)
-        ))
-        .unwrap();
+    let facts_with_senders = |bytes: usize| {
         Arc::new(AuthorizationFacts {
-            ownership: Some(SessionOwnershipV1 {
-                first_episode: Some(FirstEpisodeV1::new(
-                    broca_protocol::RunId("first".into()),
-                    &[],
-                    Some(&manifest),
-                )),
+            ownership: Some(OwnershipChecks {
+                first_senders: vec!["x".repeat(bytes)],
                 ..Default::default()
             }),
-            read_policy: Some(ReadPolicy::with_manifest(&manifest)),
+            read_policy: Some(ReadPolicy::with_manifest(&manifest(1, 1))),
         })
     };
     let cache = AuthorizationCache::default();
     let class = StorageClass::Ordinary;
     let keys = ["old", "recent", "large"].map(|name| BindIdentity::new("/repo", "broca", name));
-    let half = facts_with_plan(MAX_BYTES / 2);
+    let half = facts_with_senders(MAX_BYTES / 2);
     for key in &keys[..2] {
         cache.keep(key, class, position(), Arc::clone(&half));
     }
     assert!(cache.get(&keys[0], class, position()).is_none());
     assert!(cache.get(&keys[1], class, position()).is_some());
-    cache.keep(&keys[2], class, position(), facts_with_plan(MAX_BYTES));
+    cache.keep(&keys[2], class, position(), facts_with_senders(MAX_BYTES));
     let kept = cache.get(&keys[2], class, position()).unwrap();
     assert!(
         kept.ownership.is_none(),
-        "the opaque plan alone is over the bound"
+        "the ownership summary alone is over the bound"
     );
     assert!(
         kept.read_policy.is_some(),
-        "the policy fits without the opaque plan"
+        "the policy fits without the ownership summary"
     );
     let memory = cache.memory();
     assert_eq!(memory.entries, 2);

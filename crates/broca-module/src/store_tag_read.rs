@@ -184,16 +184,15 @@ pub(crate) async fn check_owner(
     scope: &broca_protocol::SendScope,
 ) -> Result<(), ServeError> {
     use cortexkit_role_llm_runner::scope_admission::ScopeKind;
-    let owner = match registry.bind_ownership(session).await {
-        crate::registry::BindOwnership::Known(ownership) => ownership
-            .scope
-            .map(|scope| scope.owner)
-            .or(ownership.first_principal),
-        crate::registry::BindOwnership::NoHistorySource => None,
-        crate::registry::BindOwnership::Unreadable(error) => {
-            return Err(damaged(format!("the session's owner: {error}")))
-        }
-    };
+    let ownership = registry
+        .bind_checks(session)
+        .await
+        .map_err(|error| damaged(format!("the session's owner: {error}")))?
+        .owner;
+    let owner = ownership
+        .scope
+        .map(|scope| scope.owner)
+        .or(ownership.first_principal);
     let stamped = match scope {
         broca_protocol::SendScope::Stamped(stamp) => Some(&stamp.scope),
         _ => None,

@@ -897,6 +897,7 @@ fn shape(reply: StoreReadReply) -> String {
         StoreReadReply::Position(position) => format!("{position:?}"),
         StoreReadReply::Entries(entries) => format!("{entries:?}"),
         StoreReadReply::AuthorizationOwnership(ownership) => format!("{ownership:?}"),
+        StoreReadReply::AuthorizationChecks(checks) => format!("{checks:?}"),
         StoreReadReply::AuthorizationRead(admitted) => format!("{admitted:?}"),
         StoreReadReply::AuthorizationSubmissionSender(sender) => format!("{sender:?}"),
         StoreReadReply::RunResult(reply) => match reply {
@@ -954,6 +955,7 @@ fn reads(runs: &[&str]) -> Vec<StoreReadRequest> {
             limit: 200,
         },
         StoreReadRequest::AuthorizationOwnership,
+        StoreReadRequest::AuthorizationChecks,
     ]);
     reads
 }
@@ -2135,12 +2137,17 @@ async fn closed_authorization_ownership_after_idle_close_loads_no_view() {
     );
     let runtime = m.runtime();
     let before = runtime.views().memory(|_| 0).loads;
-    let ownership = m.registry.session_ownership_for_bind(&m.key).await;
-    assert_eq!(ownership, Some(fresh));
+    let checks = m.registry.bind_checks(&m.key).await.unwrap();
+    assert_eq!(checks.owner, fresh.for_owner_access());
+    assert!(checks.has_first_episode);
     assert_eq!(
         runtime.views().memory(|_| 0).loads,
         before,
         "ownership after idle close loaded a whole view"
+    );
+    assert_eq!(
+        m.registry.session_ownership_for_bind(&m.key).await,
+        Some(fresh)
     );
 }
 

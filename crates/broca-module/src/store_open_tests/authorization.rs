@@ -59,10 +59,14 @@ async fn assert_stored_answers(
     let ownership =
         broca_session_loop::owner::ownership_with_plan(&stored.operations, parts).unwrap();
     assert!(ownership.episodes > 0);
+    assert_eq!(
+        registry.session_ownership_for_bind(key).await.as_ref(),
+        Some(&ownership)
+    );
     for _ in 0..2 {
         assert_eq!(
-            registry.session_ownership_for_bind(key).await.as_ref(),
-            Some(&ownership)
+            registry.bind_checks(key).await.unwrap().owner,
+            ownership.for_owner_access()
         );
         for access in accesses() {
             let expected = crate::reader_admission::admit(&stored, parts, &access).await;
@@ -161,12 +165,9 @@ async fn closed_authorization_matches_stored_expiring_released_and_paused_answer
 async fn closed_authorization_never_uses_a_stale_position() {
     let (root, runtime, registry, key) =
         closed_read_fixture("authorization-moved-position", 1).await;
-    let initial = registry.session_ownership_for_bind(&key).await.unwrap();
+    let initial = registry.bind_checks(&key).await.unwrap().owner;
     assert!(initial.scope.is_none());
-    assert_eq!(
-        registry.session_ownership_for_bind(&key).await,
-        Some(initial.clone())
-    );
+    assert_eq!(registry.bind_checks(&key).await.unwrap().owner, initial);
 
     let class = StorageClass::Ordinary;
     let addr = SessionAddr(broca_core::session_addr(&key));
@@ -220,14 +221,11 @@ async fn closed_authorization_never_uses_a_stale_position() {
 
     let loads = || runtime.views().memory(|_| 0).loads.unwrap();
     let before = loads();
-    let updated = registry.session_ownership_for_bind(&key).await.unwrap();
+    let updated = registry.bind_checks(&key).await.unwrap().owner;
     assert_eq!(updated.episodes, initial.episodes + 1);
     assert_eq!(updated.scope.as_ref(), Some(&scope));
     assert_eq!(loads(), before + 1, "the new position is read once");
-    assert_eq!(
-        registry.session_ownership_for_bind(&key).await,
-        Some(updated)
-    );
+    assert_eq!(registry.bind_checks(&key).await.unwrap().owner, updated);
     assert_eq!(loads(), before + 1, "the new position is now retained");
     drop(registry);
     drop(runtime);

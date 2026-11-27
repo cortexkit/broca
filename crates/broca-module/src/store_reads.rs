@@ -61,6 +61,8 @@ pub enum StoreReadRequest {
     Entries { from: u64, limit: usize },
     /// Internal authorization only: ownership without forcing pending records durable.
     AuthorizationOwnership,
+    /// The smaller ownership projection used by authorization checks.
+    AuthorizationChecks,
     /// Internal reader-policy admission, without page work or an actor recovery.
     AuthorizationRead(crate::reader_admission::ReadAccess),
     /// Internal authorization only: the immutable sender of a queued submission.
@@ -119,16 +121,14 @@ pub enum StoreReadRequest {
 impl StoreReadRequest {
     /// Authorization that can be answered by position-checked owner and plan facts alone.
     pub(crate) fn keeps_authorization(&self) -> bool {
-        matches!(
-            self,
-            Self::AuthorizationOwnership | Self::AuthorizationRead(_)
-        )
+        matches!(self, Self::AuthorizationChecks | Self::AuthorizationRead(_))
     }
 
     pub(crate) fn is_authorization(&self) -> bool {
         matches!(
             self,
             Self::AuthorizationOwnership
+                | Self::AuthorizationChecks
                 | Self::AuthorizationSubmissionSender(_)
                 | Self::AuthorizationRead(_)
         )
@@ -151,7 +151,7 @@ impl StoreReadRequest {
             Self::Head => "session.head",
             Self::Page(_) => "session.read",
             Self::Entries { .. } => "session.entries",
-            Self::AuthorizationOwnership => "authorization.ownership",
+            Self::AuthorizationOwnership | Self::AuthorizationChecks => "authorization.ownership",
             Self::AuthorizationRead(_) => "authorization.read",
             Self::AuthorizationSubmissionSender(_) => "authorization.sender",
             Self::Compaction { .. } => "compaction",
@@ -222,6 +222,7 @@ pub enum StoreReadReply {
     Page(Result<PageAnswer, ServeError>),
     Entries(Result<Vec<StoredEntry>, ServeError>),
     AuthorizationOwnership(Result<broca_core::SessionOwnershipV1, String>),
+    AuthorizationChecks(Result<Box<crate::store_authorization::OwnershipChecks>, String>),
     AuthorizationRead(Result<(), ServeError>),
     AuthorizationSubmissionSender(Result<Option<BindPrincipal>, ServeError>),
     Compaction(
@@ -441,6 +442,12 @@ async fn execute_with_actor<B: SessionBackend>(
         ),
         StoreReadRequest::AuthorizationOwnership => StoreReadReply::AuthorizationOwnership(
             broca_session_loop::owner::ownership_with_plan(&session.operations, ctx.parts)
+                .map_err(|error| format!("the session's stored owner can't be read: {error}")),
+        ),
+        StoreReadRequest::AuthorizationChecks => StoreReadReply::AuthorizationChecks(
+            broca_session_loop::owner::ownership_with_plan(&session.operations, ctx.parts)
+                .map(crate::store_authorization::OwnershipChecks::project)
+                .map(Box::new)
                 .map_err(|error| format!("the session's stored owner can't be read: {error}")),
         ),
         StoreReadRequest::AuthorizationRead(access) => StoreReadReply::AuthorizationRead(
