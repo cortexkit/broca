@@ -689,8 +689,8 @@ pub fn render_prepared_with_provenance(
     let render =
         |candidate: &PreparedBundle,
          provenance: Option<&mut broca_protocol::render_provenance::RenderProvenance>| {
-            let mut options = opts.clone();
-            options.prompt = tagged_prepared_prompt(&opts.prompt, &candidate.prompt, render_tags);
+            let prompt = tagged_prepared_prompt(&opts.prompt, &candidate.prompt, render_tags);
+            let options = opts.with_prompt(prompt);
             let payloads: Vec<_> = candidate
                 .media
                 .iter()

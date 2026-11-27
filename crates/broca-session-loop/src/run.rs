@@ -4083,11 +4083,8 @@ fn call_options<W: Writer>(
         crate::enroll::without_suppressed(&mut prompt, enrollment);
     }
     let opts = broca_core::compaction_v2::render::options(&opts, prompt);
-    Ok(
-        broca_core::compaction_v2::systems::view(&opts, &admission.global_system)
-            .map_err(LoopError::Parts)?
-            .unwrap_or(opts),
-    )
+    broca_core::compaction_v2::systems::view(opts, &admission.global_system)
+        .map_err(LoopError::Parts)
 }
 
 struct Step {

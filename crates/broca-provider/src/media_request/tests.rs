@@ -13,6 +13,38 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "test-attachments")]
 mod render_tests;
 
+#[test]
+fn prepared_render_does_not_clone_the_original_prompt() {
+    use crate::families::{frozen_config_for_family, AnthropicMessages};
+    use crate::wire::WireFamily;
+
+    let text = broca_protocol::text::Text::from("question in the prepared prompt");
+    let shared = text.shared();
+    let opts = broca_protocol::CallOptions::new(vec![Message::new(
+        Role::User,
+        vec![ContentBlock::Text { text }],
+    )]);
+    let mut bundle = PreparedBundle {
+        prompt: opts.prompt.clone(),
+        media: Vec::new(),
+    };
+    let mut frozen = frozen_config_for_family(WireFamilyId::AnthropicMessages, "model");
+    frozen.media = Some(profile());
+    let owners = Arc::strong_count(&shared);
+    let rendered = render_prepared(
+        &AnthropicMessages,
+        &frozen,
+        &opts,
+        Some(&mut bundle),
+        &|prompt| {
+            assert_eq!(Arc::strong_count(&shared), owners);
+            prompt.to_vec()
+        },
+    )
+    .unwrap();
+    assert_eq!(rendered, AnthropicMessages.render(&frozen, &opts));
+}
+
 /// A session's media objects held in memory, by digest. A read returns an object's bytes only
 /// when their size and SHA-256 match the `MediaRef` asked for, as the session store checks its
 /// media objects.

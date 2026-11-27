@@ -1165,7 +1165,7 @@ fn finish(
     admission: &Admission,
 ) -> Result<broca_protocol::request::CallOptions, String> {
     let opts = v2::render::options(boundary, prompt);
-    let mut opts = v2::systems::view(&opts, &admission.global_system)?.unwrap_or(opts);
+    let mut opts = v2::systems::view(opts, &admission.global_system)?;
     opts.view_media = std::sync::Arc::new(media);
     Ok(opts)
 }

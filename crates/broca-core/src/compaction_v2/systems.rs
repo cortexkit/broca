@@ -35,7 +35,7 @@ pub fn from_manifest(manifest: &broca_records::record::PlanManifest) -> Vec<Mess
     )]
 }
 
-pub fn view(opts: &CallOptions, global: &[Message]) -> Result<Option<CallOptions>, String> {
+pub fn view(mut opts: CallOptions, global: &[Message]) -> Result<CallOptions, String> {
     if global.iter().any(|message| !is_global(message)) {
         return Err("global_system configuration contains a transcript message".into());
     }
@@ -43,17 +43,14 @@ pub fn view(opts: &CallOptions, global: &[Message]) -> Result<Option<CallOptions
         return Err("mode-3 transcript contains a global system message".into());
     }
     if global.is_empty() && opts.render_episodes.raw_ordinals {
-        return Ok(None);
+        return Ok(opts);
     }
-    let mut prompt = Vec::with_capacity(global.len() + opts.prompt.len());
-    prompt.extend(global.iter().cloned());
-    prompt.extend(opts.prompt.iter().cloned());
-    let mut view = opts.with_prompt(prompt);
-    view.render_episodes = super::render::raw_ordinals(&opts.render_episodes);
-    for marker in &mut view.declared_markers {
+    opts.prompt.splice(..0, global.iter().cloned());
+    opts.render_episodes = super::render::raw_ordinals(&opts.render_episodes);
+    for marker in &mut opts.declared_markers {
         marker.message_index += global.len();
     }
-    Ok(Some(view))
+    Ok(opts)
 }
 
 #[cfg(test)]
@@ -91,8 +88,17 @@ mod tests {
         let mut transcript = legacy.clone();
         let globals = take_globals(&mut transcript);
         assert_eq!(transcript, [turn, user]);
-        let opts = CallOptions::new(transcript);
-        let rendered = view(&opts, &globals).unwrap().unwrap();
+        let mut opts = CallOptions::new(transcript);
+        opts.declared_markers = vec![broca_protocol::request::DeclaredMessageMarker {
+            message_index: 1,
+            rank: 2,
+        }];
+        let user_blocks = opts.prompt[1].content.as_ptr();
+        let rendered = view(opts, &globals).unwrap();
         assert_eq!(rendered.prompt, legacy);
+        assert!(rendered.render_episodes.raw_ordinals);
+        assert_eq!(rendered.declared_markers[0].message_index, 3);
+        assert_eq!(rendered.declared_markers[0].rank, 2);
+        assert_eq!(rendered.prompt[3].content.as_ptr(), user_blocks);
     }
 }
