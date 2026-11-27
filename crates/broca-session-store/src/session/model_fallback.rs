@@ -144,6 +144,12 @@ impl HeldBytes for ReplyFallbacks {
 }
 
 impl<B: SessionBackend> Session<B> {
+    /// Whether the open log identified replies written by a fallback model. A sealed message
+    /// records which model answered, but not which model the runner originally requested.
+    pub fn has_reply_model_fallbacks(&self) -> bool {
+        !self.reply_fallbacks.by_mid.is_empty()
+    }
+
     /// A reply fact already proved by folded records, with no storage lookup. A checkpoint or
     /// sealed transcript alone contains no route evidence, so unavailable facts remain absent.
     pub fn reply_model_fallback(&self, mid: &str) -> Option<&ReplyModelFallback> {

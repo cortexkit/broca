@@ -1409,6 +1409,7 @@ mod enrollment;
 pub use enrollment::EnrollmentOverlay;
 
 mod read;
+pub use read::SealedConversation;
 mod tail;
 pub use read::{
     served_window, window_entries, window_entries_with, StoredEntry,

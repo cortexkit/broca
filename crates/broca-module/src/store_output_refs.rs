@@ -23,11 +23,31 @@ pub async fn run_rules<B: SessionBackend>(
     run_id: &str,
 ) -> Result<Option<broca_protocol::tags::ComputedRules>, String> {
     use broca_session_loop::writer::Writer;
-    let key = (session.head().session_id, run_id.to_owned());
+    run_rules_from(
+        session.head().session_id,
+        parts,
+        run_id,
+        Writer::run_start(session, run_id),
+    )
+    .await
+}
+
+pub(crate) async fn run_rules_from(
+    session_id: broca_session_store::codec::Id128,
+    parts: &dyn Parts,
+    run_id: &str,
+    start: impl std::future::Future<
+        Output = Result<
+            Option<broca_session_store::record::RunStart>,
+            broca_session_store::session::SessionError,
+        >,
+    >,
+) -> Result<Option<broca_protocol::tags::ComputedRules>, String> {
+    let key = (session_id, run_id.to_owned());
     if let Some(rules) = RUN_RULES.get(&key) {
         return Ok(rules);
     }
-    let rules = match Writer::run_start(session, run_id)
+    let rules = match start
         .await
         .map_err(|error| format!("run {run_id}'s start: {error:?}"))?
     {

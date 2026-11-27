@@ -157,8 +157,8 @@ async fn open_call<B: SessionBackend>(
 /// Fills each message's `tool_calls`, and the carrier call's key of a tool result delivered as a
 /// send. `turns` says, per message in order, what its calls are served
 /// from ([`crate::store_read::StorePage::turns`]).
-pub async fn attribute_tool_calls<B: SessionBackend>(
-    session: &Session<B>,
+pub(crate) async fn attribute_tool_calls<B: SessionBackend>(
+    source: &crate::store_read::parked_page::PageSource<'_, B>,
     response: &mut SessionReadResponse,
     turns: &[TurnOf],
 ) -> Result<(), SessionError> {
@@ -178,6 +178,9 @@ pub async fn attribute_tool_calls<B: SessionBackend>(
                     .count();
                 calls.push(match turns.get(index) {
                     Some(TurnOf::Open(turn)) => {
+                        let session = source.folded().ok_or_else(|| {
+                            SessionError::Fold("an open tool call needs the open window".into())
+                        })?;
                         let mut call = open_call(session, id, copy).await?;
                         // A copy answered without an intent whose key the open batch lost to
                         // its id's intent (see `open_call`) takes the key its turn's facts name.
@@ -223,7 +226,7 @@ pub async fn attribute_tool_calls<B: SessionBackend>(
                 Some(TurnOf::Placed(turn)) => turn.clone(),
                 _ => None,
             },
-            None => session
+            None => source
                 .entries(assistant, 1)
                 .await?
                 .into_iter()

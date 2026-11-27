@@ -32,6 +32,9 @@ use crate::segment::SegmentLayout;
 
 use super::{Session, SessionError};
 
+mod range;
+use range::SealedRange;
+
 /// One message as `session.entries` reads it. A window entry shares its message and facts with
 /// the conversation, so serving it copies no content.
 #[derive(Debug, Clone, PartialEq)]
@@ -295,13 +298,34 @@ impl SealedEntryCache {
 /// entries between them decodes blocks that one read per entry would decode anyway.
 const READ_TOGETHER: u64 = 64;
 
+/// The conversation rules a sealed block uses when folded on its own. They can change in the
+/// open log, so a stored reader uses the rules the closing actor observed at its exact position.
+#[derive(Clone, Copy)]
+pub struct SealedConversation {
+    appends: bool,
+    enrolled_through: Option<u64>,
+}
+
+impl SealedConversation {
+    fn empty(self) -> Conversation {
+        let mut conversation = Conversation::new(self.appends);
+        conversation.enrolled(self.enrolled_through);
+        conversation
+    }
+}
+
 impl<B: SessionBackend> Session<B> {
     /// An empty conversation that folds a sealed block of this session's history as the session
     /// folded it: joining delivered text into results exactly where the session does.
     fn block_conversation(&self) -> Conversation {
-        let mut conversation = Conversation::new(self.conversation.appends_in_conversation);
-        conversation.enrolled(self.operations.enrolled_through());
-        conversation
+        self.sealed_conversation().empty()
+    }
+
+    pub fn sealed_conversation(&self) -> SealedConversation {
+        SealedConversation {
+            appends: self.conversation.appends_in_conversation,
+            enrolled_through: self.operations.enrolled_through(),
+        }
     }
 
     /// The layout of sealed segment `object`: its header and index, read by ranges (the leading
@@ -509,35 +533,9 @@ impl<B: SessionBackend> Session<B> {
     /// when `entries` stops before it.
     async fn join_split_turns(
         &self,
-        mut entries: Vec<StoredEntry>,
+        entries: Vec<StoredEntry>,
     ) -> Result<Vec<StoredEntry>, SessionError> {
-        let window = self.conversation.window_start();
-        for index in 0..entries.len() {
-            let entry = &entries[index];
-            if entry.open
-                || entry.next.is_some()
-                || entry.ordinal >= window
-                || !called_tools(&entry.message)
-            {
-                continue;
-            }
-            let ordinal = entry.ordinal + 1;
-            let next = match entries
-                .get(index + 1)
-                .filter(|next| next.ordinal == ordinal)
-            {
-                Some(next) => Some(Arc::clone(&next.message)),
-                None => self
-                    .unjoined_entries(ordinal, 1)
-                    .await?
-                    .into_iter()
-                    .find(|next| next.ordinal == ordinal)
-                    .map(|next| next.message),
-            };
-            entries[index].next =
-                next.filter(|next| next.role == broca_protocol::content::Role::Tool);
-        }
-        Ok(entries)
+        SealedRange::folded(self).join_split_turns(entries).await
     }
 
     async fn unjoined_entries(
@@ -545,73 +543,16 @@ impl<B: SessionBackend> Session<B> {
         from: u64,
         limit: usize,
     ) -> Result<Vec<StoredEntry>, SessionError> {
-        let mut out = Vec::new();
-        let mut next = from.max(1);
-        let key = self.key.frame_key();
-        let pages = Pages {
-            backend: &self.backend,
-            addr: &self.addr,
-            session: self.head.session_id,
-            key: &key,
-            fanout: crate::directory::FANOUT,
-        };
         let window = self.conversation.window_start();
         // Directory pages come from those the session keeps, so a page of entries after the first
         // reads only its blocks. A read that fails hands none back; the next starts with none.
         let mut memo = self.take_pages();
-        if next < window && limit > SEALED_ENTRIES_IN_MEMORY {
+        if from.max(1) < window && limit > SEALED_ENTRIES_IN_MEMORY {
             self.storage_read()?;
         }
-        while next < window && out.len() < limit {
-            let damaged = || SessionError::Fold(format!("no sealed segment places message {next}"));
-            let sought = next;
-            let entry = pages
-                .find_ordinal_in(self.head.transcript_dir.as_ref(), next, &mut memo)
-                .await
-                .map_err(SessionError::Directory)?
-                .ok_or_else(damaged)?;
-            let segment = self
-                .sealed_layout(&entry.object, &key)
-                .await?
-                .ok_or_else(damaged)?;
-            let mut position = segment.block_for_ordinal(next).ok_or_else(damaged)?;
-            // Read on through the segment's blocks while the page wants more.
-            while position < segment.index.blocks.len() && next < window && out.len() < limit {
-                let first = segment.index.blocks[position]
-                    .first_ordinal
-                    .expect("block_for_ordinal only answers when every block has an ordinal");
-                let mut conversation = self.block_conversation();
-                conversation.placed = first - 1;
-                for (_, record) in self
-                    .sealed_block(&entry.object, &segment, position, &key)
-                    .await?
-                    .into_iter()
-                    .filter(|(seq, _)| entry.keeps(*seq))
-                {
-                    conversation
-                        .apply(&record)
-                        .map_err(|e| SessionError::Fold(format!("conversation: {e:?}")))?;
-                }
-                let wanted = limit - out.len();
-                // A conversation folded from one sealed block holds all its content.
-                let read = window_entries(&conversation, next, wanted).map_err(not_held)?;
-                if let Some(last) = read.last() {
-                    next = last.ordinal + 1;
-                }
-                out.extend(read);
-                position += 1;
-                // A block that places nothing past `next` (its messages are all earlier) moves
-                // on to the next block.
-                next = next.max(conversation.placed + 1);
-            }
-            // The directory named this segment for `sought`, yet none of its blocks placed it: the
-            // directory and the segment disagree, and finding the segment again would loop forever.
-            if next == sought {
-                return Err(SessionError::Fold(format!(
-                    "no sealed segment places message {sought}"
-                )));
-            }
-        }
+        let (mut out, next) = SealedRange::folded(self)
+            .scan(from, limit, &mut memo)
+            .await?;
         self.keep_pages(memo);
         if out.len() < limit {
             out.extend(self.window_entries_whole(next, limit - out.len()).await?);
@@ -905,50 +846,7 @@ impl<B: SessionBackend> Session<B> {
         if let Some(ordinal) = self.window.facts.get(&seq) {
             return Ok(Some(*ordinal));
         }
-        let key = self.key.frame_key();
-        let pages = Pages {
-            backend: &self.backend,
-            addr: &self.addr,
-            session: self.head.session_id,
-            key: &key,
-            fanout: crate::directory::FANOUT,
-        };
-        let mut read = 0;
-        for entry in pages
-            .entries_from(self.head.transcript_dir.as_ref(), seq)
-            .await
-            .map_err(SessionError::Directory)?
-        {
-            let damaged =
-                || SessionError::Fold(format!("directory names a missing segment for {seq}"));
-            let segment = self
-                .sealed_layout(&entry.object, &key)
-                .await?
-                .ok_or_else(damaged)?;
-            // Blocks before the one holding `seq` hold nothing at or after it.
-            let start = segment.block_for_seq(seq).unwrap_or(0);
-            for position in start..segment.index.blocks.len() {
-                for (at, record) in self
-                    .sealed_block(&entry.object, &segment, position, &key)
-                    .await?
-                {
-                    let Record::EntryFacts(facts) = record else {
-                        continue;
-                    };
-                    if at < seq || !entry.keeps(at) {
-                        continue;
-                    }
-                    if at == seq || facts.mid == mid {
-                        return Ok(Some(facts.ordinal));
-                    }
-                    read += 1;
-                    if read == ANNOUNCED_FACTS_READ {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-        Ok(None)
+        SealedRange::folded(self).facts_ordinal(seq, mid).await
     }
 
     /// The message with `ordinal` (counting from 1 over the whole conversation), or `None` when

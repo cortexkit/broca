@@ -662,8 +662,8 @@ pub async fn history_head_of<B: SessionBackend>(
 /// wherever its run cleans, so every exposure (`broca_protocol::tags::exposed_message`)
 /// cleans tag notation out of the reply text exactly where that run cleans. A message no run
 /// wrote (an import) is neither numbered nor cleaned.
-pub async fn attach_part_tags<B: SessionBackend>(
-    session: &Session<B>,
+pub(crate) async fn attach_part_tags<B: SessionBackend>(
+    source: &crate::store_read::parked_page::PageSource<'_, B>,
     parts: &dyn Parts,
     messages: &mut [broca_core::SessionReadMessage],
     numbering: &std::collections::BTreeMap<u64, (String, u64)>,
@@ -683,7 +683,7 @@ pub async fn attach_part_tags<B: SessionBackend>(
             _ => continue,
         };
         if !runs.contains_key(run_id) {
-            let rules = crate::store_output_refs::run_rules(session, parts, run_id).await?;
+            let rules = source.run_rules(parts, run_id).await?;
             runs.insert(run_id.clone(), rules);
         }
         let Some(rules) = runs[run_id] else {

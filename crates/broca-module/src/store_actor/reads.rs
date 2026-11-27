@@ -133,6 +133,10 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
                 retention.keep_deadline(&addr, self.session.position(), deadline);
             }
         }
+        let stream_head = self.fanout.as_ref().and_then(|fanout| fanout.head());
+        store
+            .parked_pages()
+            .keep(&addr, class, &self.session, stream_head.flatten());
         let context = crate::store_reads::ReadContext {
             labels: crate::store_awaits::Labels(Some(self.executor.clone())),
             token_counts: None,
@@ -144,7 +148,7 @@ impl<B: SessionBackend + Send + Sync + 'static> StoreActor<B> {
             live_step: None,
             // The cursor the actor's subscribers stand at, which a read of the same records
             // projects again.
-            stream_head: self.fanout.as_ref().and_then(|fanout| fanout.head()),
+            stream_head,
             entry_speaks_for: crate::store_entries::EntryAttribution::Known(false),
             class: Some(class),
         };

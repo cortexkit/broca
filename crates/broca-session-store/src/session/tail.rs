@@ -126,7 +126,7 @@ impl<B: SessionBackend> StoredLedger<B> {
         self.position
     }
 
-    fn place(&self) -> Place<'_, B> {
+    pub(super) fn place(&self) -> Place<'_, B> {
         Place {
             backend: &self.backend,
             addr: &self.addr,

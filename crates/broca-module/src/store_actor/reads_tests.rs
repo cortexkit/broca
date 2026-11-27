@@ -1323,6 +1323,179 @@ async fn paused_session_reads_stay_in_the_view_without_opening_an_actor() {
     }
 }
 
+#[tokio::test]
+async fn sealed_pages_after_a_paused_actor_closes_load_no_view_and_match_fresh_bytes() {
+    let m = module(vec![
+        read_step("a1"),
+        text_step("a2", "first reply"),
+        text_step("b1", "second reply"),
+        text_step("c1", "third reply"),
+    ])
+    .await;
+    active(m.send("r1", "first").await);
+    m.in_step("r1", 1).await;
+    m.gate.notify_one();
+    m.in_step("r1", 2).await;
+    m.gate.notify_one();
+    m.ended("r1", "completed").await;
+    for (run, text) in [("r2", "second"), ("r3", "third")] {
+        active(m.send(run, text).await);
+        m.gate.notify_one();
+        m.ended(run, "completed").await;
+    }
+    m.close().await;
+
+    let mut writer = m.writer().await;
+    let (_, first_mid) = entry_of(&writer, "first").await;
+    let cut = input_of(&writer, "r3").await;
+    let (ordinal, mid) = entry_of(&writer, "third").await;
+    writer
+        .append(
+            &[Record::Marker(Marker {
+                view_version: 0,
+                first_kept_mid: mid,
+                first_kept_ordinal: ordinal,
+                checkpoint: 0,
+                harness: Some(m.key.harness.clone()),
+                session: Some(m.key.session.clone()),
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+    writer.seal(Some(cut), 1).await.unwrap();
+    let mut start = writer
+        .operations
+        .run
+        .as_ref()
+        .unwrap()
+        .start
+        .clone()
+        .unwrap();
+    start.run_id = "paused".into();
+    start.submission_id = None;
+    start.send_id = None;
+    writer
+        .append(
+            &[
+                Record::RunStart(Box::new(start)),
+                Record::Pause(broca_session_store::record::Pause {
+                    run_id: "paused".into(),
+                    reason: broca_protocol::PauseReason::AccountLimit,
+                    ts_ms: Some(1),
+                    error: None,
+                    account_limit: None,
+                }),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    m.registry
+        .actor_for_mode(&m.key, None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(m.status("paused").await["state"], "paused");
+    m.close().await;
+    let runtime = m.runtime();
+    let loads = || runtime.views().memory(|_| 0).loads;
+    let before = loads();
+    #[cfg(feature = "test-clock")]
+    let log_reads = runtime.log_reads.load(Ordering::Relaxed);
+    for (request, ordinal, count) in [
+        (
+            PageRequest {
+                from_ordinal: Some(1),
+                limit: Some(1),
+                ..Default::default()
+            },
+            1,
+            1,
+        ),
+        (
+            opted(PageRequest {
+                after_mid: Some(first_mid),
+                limit: Some(3),
+                ..Default::default()
+            }),
+            2,
+            3,
+        ),
+    ] {
+        let request = StoreReadRequest::Page(request);
+        let StoreReadReply::Page(Ok(fresh)) = m.fresh(&request).await else {
+            panic!("the view serves the sealed page");
+        };
+        assert_eq!(fresh.response.messages.len(), count);
+        assert_eq!(fresh.response.messages[0].ordinal, ordinal);
+        if ordinal == 2 {
+            assert_eq!(fresh.response.messages[0].tool_calls.len(), 1);
+        }
+        let bytes = serde_json::to_vec(&fresh.response).unwrap();
+        for _ in 0..3 {
+            let StoreReadReply::Page(Ok(served)) = m.served(&request).await else {
+                panic!("the parked session serves the sealed page");
+            };
+            assert_eq!(serde_json::to_vec(&served.response).unwrap(), bytes);
+        }
+    }
+    assert!(m.registry.slot_state(&m.key).is_none());
+    assert_eq!(loads(), before, "parked sealed pages loaded the whole view");
+    #[cfg(feature = "test-clock")]
+    assert_eq!(runtime.log_reads.load(Ordering::Relaxed), log_reads);
+    let counts = m
+        .registry
+        .memory_report()
+        .await
+        .kept_heads
+        .unwrap()
+        .parked_pages
+        .unwrap();
+    assert_eq!(counts.hits, 6);
+    assert_eq!(counts.held.entries, 1);
+    assert!(counts.misses.is_empty());
+    assert!(counts.held.estimated_bytes < 8 * 1024, "{counts:?}");
+    println!("parked page context: {} bytes", counts.held.estimated_bytes);
+
+    // A page with an open-window look-ahead still uses the whole view.
+    let through_window = StoreReadRequest::Page(PageRequest::default());
+    assert_eq!(
+        shape(m.served(&through_window).await),
+        shape(m.fresh(&through_window).await)
+    );
+    assert!(loads() > before);
+
+    // An append discards the old cursor and all other facts pinned to that position.
+    let mut writer = m.writer().await;
+    writer
+        .append(
+            &[Record::Pause(broca_session_store::record::Pause {
+                run_id: "paused".into(),
+                reason: broca_protocol::PauseReason::AccountLimit,
+                ts_ms: Some(2),
+                error: None,
+                account_limit: None,
+            })],
+            true,
+        )
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+    let page = StoreReadRequest::Page(PageRequest {
+        from_ordinal: Some(1),
+        limit: Some(1),
+        ..Default::default()
+    });
+    assert_eq!(shape(m.served(&page).await), shape(m.fresh(&page).await));
+    let counts = runtime.parked_pages().memory();
+    assert_eq!(counts.hits, 6);
+    assert_eq!(counts.held.entries, 0);
+    assert_eq!(counts.misses.get("position_changed"), Some(&1));
+    assert!(m.registry.stop_and_seal().await);
+}
+
 /// A session deleted and created again with the same history reads as the new session: its kept
 /// view is never served for it, though the new session's head versions and log length can equal
 /// the old one's, since the new session's log is another log.

@@ -72,8 +72,8 @@ pub struct KeptHeadCounts {
     /// Heads kept, by where they were built: `read` (by a head read of the closed session) or
     /// `close` (by its actor as it closed idle).
     pub kept: std::collections::BTreeMap<String, u64>,
-    /// Heads an idle-closing actor or a read built and didn't keep, by why: `unsettled` (a run
-    /// active, paused or waiting), `ephemeral`, `unsynced` (records the actor appended were not yet
+    /// Heads an idle-closing actor or a read built and didn't keep, by why: `wait_too_large`,
+    /// `ephemeral`, `unsynced` (records the actor appended were not yet
     /// durable), `pending` (the head needed to wait on something), `storage` (it needed records
     /// not in memory), `failed`.
     pub not_kept: std::collections::BTreeMap<String, u64>,
@@ -84,6 +84,19 @@ pub struct KeptHeadCounts {
     /// Position-checked ownership and read policies kept independently of display heads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization: Option<MemoryCache>,
+    /// Position-checked facts used to serve sealed `session.read` pages without a view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_pages: Option<ParkedPageCounts>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedPageCounts {
+    /// Parked pages served by range reads.
+    pub hits: u64,
+    /// Parked page requests that went through the ordinary read path, by reason.
+    pub misses: std::collections::BTreeMap<String, u64>,
+    /// Page context entries and their byte cap, excluding transient per-read blocks.
+    pub held: MemoryCache,
 }
 
 /// One session open in the session store (`broca-session-store`).

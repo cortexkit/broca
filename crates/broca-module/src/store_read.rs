@@ -18,11 +18,12 @@ use broca_protocol::content::Role;
 use broca_session_loop::parts::Parts;
 use broca_session_store::backend::SessionBackend;
 use broca_session_store::fold::conversation::BlockKind;
-use broca_session_store::fold::operations::Run;
-use broca_session_store::record::Record;
+use broca_session_store::record::{Record, RunStart};
 use broca_session_store::session::{Session, SessionError, StoredEntry};
 
 mod model_fallback;
+pub(crate) mod parked_page;
+use parked_page::PageSource;
 
 /// Why a store read refused.
 #[derive(Debug)]
@@ -203,32 +204,37 @@ pub async fn read_page<B: SessionBackend>(
     from_ordinal: Option<u64>,
     limit: Option<u64>,
 ) -> Result<StorePage, StoreReadError> {
-    read_page_with_facts(session, from_ordinal, limit).await
+    read_page_with_facts(&PageSource::Folded(session), from_ordinal, limit).await
 }
 
-async fn read_page_with_facts<B: SessionBackend>(
-    session: &Session<B>,
-    from_ordinal: Option<u64>,
-    limit: Option<u64>,
-) -> Result<StorePage, StoreReadError> {
+fn page_bounds(prompt_len: u64, from_ordinal: Option<u64>, limit: Option<u64>) -> (u64, u64) {
     let capped_limit = limit
         .unwrap_or(broca_core::SESSION_READ_DEFAULT_LIMIT)
         .clamp(1, broca_core::SESSION_READ_MAX_LIMIT);
-    let prompt_len = transcript_len(session);
     let start = match from_ordinal {
         Some(from) => from.min(prompt_len),
         None => prompt_len.saturating_sub(capped_limit),
     };
     let end = start.saturating_add(capped_limit).min(prompt_len);
+    (start, end)
+}
+
+async fn read_page_with_facts<B: SessionBackend>(
+    source: &PageSource<'_, B>,
+    from_ordinal: Option<u64>,
+    limit: Option<u64>,
+) -> Result<StorePage, StoreReadError> {
+    let prompt_len = source.prompt_len();
+    let (start, end) = page_bounds(prompt_len, from_ordinal, limit);
     // One entry past the page, to tell whether the page's last message ends its run.
     let wanted = usize::try_from(end - start)
         .unwrap_or(usize::MAX)
         .saturating_add(1);
-    let mut entries = served_entries(session, start + 1, wanted).await?;
+    let mut entries = source.served_entries(start + 1, wanted).await?;
     let after = (entries.len() as u64 > end - start)
         .then(|| entries.pop())
         .flatten();
-    let latest = session.operations.run.as_ref();
+    let latest = source.latest();
     let mut messages = Vec::with_capacity(entries.len());
     let mut mids = Vec::with_capacity(entries.len());
     let mut turns = Vec::with_capacity(entries.len());
@@ -245,7 +251,7 @@ async fn read_page_with_facts<B: SessionBackend>(
         let mut served = display_facts(entry).served();
         served.notices.extend(
             imported_notices(
-                session,
+                source,
                 entry,
                 index.checked_sub(1).and_then(|at| entries.get(at)),
             )
@@ -259,6 +265,9 @@ async fn read_page_with_facts<B: SessionBackend>(
         // A turn whose results are placed has its facts, though reads still serve it as running
         // until its batch closes (`results_await_close`).
         if entry.open && entry.state.turn.is_none() {
+            let session = source.folded().ok_or_else(|| {
+                SessionError::Fold("an open tool turn needs the open window".into())
+            })?;
             served.tool_times = open_turn_times(session, &entry.message).await?;
         }
         facts.insert(entry.ordinal - 1, served);
@@ -311,7 +320,7 @@ async fn read_page_with_facts<B: SessionBackend>(
         messages,
         next_from_ordinal,
         head: None,
-        lineage_state: lineage_state(session),
+        lineage_state: source.lineage(),
         prompt_len,
     };
     Ok(StorePage {
@@ -330,7 +339,7 @@ async fn read_page_with_facts<B: SessionBackend>(
 /// Imports keep riding sends beside the assistant call. Readers attach those notices to
 /// the corresponding result part, including when a page starts at the results message.
 async fn imported_notices<B: SessionBackend>(
-    session: &Session<B>,
+    source: &PageSource<'_, B>,
     entry: &StoredEntry,
     previous: Option<&StoredEntry>,
 ) -> Result<Vec<cortexkit_role_llm_runner::read::NoticeFact>, SessionError> {
@@ -348,7 +357,7 @@ async fn imported_notices<B: SessionBackend>(
     let previous = match previous {
         Some(previous) => previous,
         None => {
-            loaded = session.entries(entry.ordinal - 1, 1).await?;
+            loaded = source.entries(entry.ordinal - 1, 1).await?;
             let Some(previous) = loaded.first() else {
                 return Ok(Vec::new());
             };
@@ -612,8 +621,23 @@ pub(crate) async fn page<B: SessionBackend>(
     request: &crate::store_reads::PageRequest,
     stream_head: Option<Option<broca_core::Cursor>>,
 ) -> Result<crate::store_reads::PageAnswer, crate::serve::ServeError> {
+    Box::pin(page_from(
+        &PageSource::Folded(session),
+        parts,
+        request,
+        stream_head,
+    ))
+    .await
+}
+
+async fn page_from<B: SessionBackend>(
+    source: &PageSource<'_, B>,
+    parts: &dyn Parts,
+    request: &crate::store_reads::PageRequest,
+    stream_head: Option<Option<broca_core::Cursor>>,
+) -> Result<crate::store_reads::PageAnswer, crate::serve::ServeError> {
     use crate::serve::ServeError;
-    let head = session.head();
+    let head = source.head();
     let served_version = crate::store_exposure::served_history_version(head.history_version);
     if request
         .history_version
@@ -622,7 +646,7 @@ pub(crate) async fn page<B: SessionBackend>(
         return Err(ServeError::HistoryChanged);
     }
     let from_ordinal = match &request.after_mid {
-        Some(mid) => match session.find_message(mid).await.map_err(read_failed)? {
+        Some(mid) => match source.find_message(mid).await.map_err(read_failed)? {
             // The 1-based ordinal of the message named, which is the 0-based start after it.
             Some(ordinal) => Some(ordinal),
             None => return Err(ServeError::UnknownMid(mid.clone())),
@@ -639,10 +663,10 @@ pub(crate) async fn page<B: SessionBackend>(
         stamps,
         numbering,
         clean_replies,
-    } = read_page_with_facts(session, from_ordinal, request.limit)
+    } = read_page_with_facts(source, from_ordinal, request.limit)
         .await
         .map_err(refused)?;
-    crate::store_entries::attach_part_tags(session, parts, &mut page.messages, &numbering)
+    crate::store_entries::attach_part_tags(source, parts, &mut page.messages, &numbering)
         .await
         .map_err(|error| {
             // A backend failure and a damaged start read alike here, so no class is claimed.
@@ -664,7 +688,7 @@ pub(crate) async fn page<B: SessionBackend>(
         .include_display_facts
         .then(|| crate::serve::DisplayTimes::of(&page));
     let tools = if request.include_tools {
-        latest_tools(session, parts).map_err(refused)?
+        latest_tools_from(source.latest_start(), parts).map_err(refused)?
     } else {
         None
     };
@@ -672,7 +696,8 @@ pub(crate) async fn page<B: SessionBackend>(
     response.history_version = served_version;
     response.incarnation = broca_session_store::codec::hex(&head.incarnation.0);
     // The cursor at the read's durable end (see `stream_head`).
-    response.head = self::stream_head(session, stream_head)
+    response.head = source
+        .stream_head(stream_head)
         .await?
         .map(broca_wire::CursorWire::from);
     for (entry, mid) in response.messages.iter_mut().zip(mids) {
@@ -701,9 +726,11 @@ pub(crate) async fn page<B: SessionBackend>(
         crate::serve::apply_rich_ui(&mut response, &stamps);
     }
     if request.include_display_facts {
-        model_fallback::attach(session, &mut response, &withheld);
+        if let Some(session) = source.folded() {
+            model_fallback::attach(session, &mut response, &withheld);
+        }
     }
-    crate::store_calls::attribute_tool_calls(session, &mut response, &turns)
+    crate::store_calls::attribute_tool_calls(source, &mut response, &turns)
         .await
         .map_err(read_failed)?;
     Ok(crate::store_reads::PageAnswer {
@@ -842,13 +869,17 @@ pub fn latest_tools<B: SessionBackend>(
     session: &Session<B>,
     parts: &dyn Parts,
 ) -> Result<Option<crate::registry::SessionReadTools>, StoreReadError> {
-    let Some(run) = session.operations.run.as_ref() else {
+    latest_tools_from(PageSource::Folded(session).latest_start(), parts)
+}
+
+fn latest_tools_from(
+    latest: Option<(&str, Option<&RunStart>)>,
+    parts: &dyn Parts,
+) -> Result<Option<crate::registry::SessionReadTools>, StoreReadError> {
+    let Some((run_id, start)) = latest else {
         return Ok(None);
     };
-    let start = run
-        .start
-        .as_ref()
-        .ok_or_else(|| StoreReadError::Setup(format!("run {} has no start", run.run_id)))?;
+    let start = start.ok_or_else(|| StoreReadError::Setup(format!("run {run_id} has no start")))?;
     let (config, _) = broca_session_loop::run::run_config_members(
         start,
         broca_session_loop::run::SetupParts::Config,
@@ -871,7 +902,7 @@ pub fn latest_tools<B: SessionBackend>(
 fn page_message(
     entry: &StoredEntry,
     next: Option<&StoredEntry>,
-    latest: Option<&Run>,
+    latest: Option<(&str, bool)>,
 ) -> Result<SessionReadMessage, StoreReadError> {
     let facts = entry.state.facts.as_ref().ok_or(StoreReadError::NoFacts {
         ordinal: entry.ordinal,
@@ -893,7 +924,7 @@ fn page_message(
         // share. It is final once the run has ended: every run before the latest one has, since
         // a run starts only after the one before it ends.
         let ended = match latest {
-            Some(run) if run.run_id == run_id => run.finished.is_some(),
+            Some((id, ended)) if id == run_id => ended,
             _ => true,
         };
         RunAttribution {

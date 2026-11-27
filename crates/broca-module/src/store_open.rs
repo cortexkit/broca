@@ -71,6 +71,7 @@ pub struct StoreRuntime {
     /// Heads of sessions no actor holds, kept by position (see `store_head::KeptHeads`).
     heads: crate::store_head::KeptHeads,
     authorization: crate::store_authorization::AuthorizationCache,
+    parked_pages: crate::store_read::parked_page::ParkedPages,
     /// Where each session's run events go once their records are durable; none in tests and
     /// while run events are off.
     run_events: Option<Arc<dyn crate::store_run_events::RunEventSink>>,
@@ -262,6 +263,7 @@ impl StoreRuntime {
             ),
             heads: Default::default(),
             authorization: Default::default(),
+            parked_pages: Default::default(),
             #[cfg(all(test, feature = "test-clock"))]
             log_reads: Arc::default(),
             #[cfg(all(test, feature = "test-clock"))]
@@ -520,7 +522,7 @@ impl StoreRuntime {
     }
 
     /// The store of the root of `class`.
-    fn backend(&self, class: StorageClass) -> LocalBackend {
+    pub(crate) fn backend(&self, class: StorageClass) -> LocalBackend {
         let backend = LocalBackend::new(class.store_root(&self.state_root));
         #[cfg(all(test, feature = "test-clock"))]
         let backend = backend
@@ -631,6 +633,10 @@ impl StoreRuntime {
 
     pub(crate) fn authorization(&self) -> &crate::store_authorization::AuthorizationCache {
         &self.authorization
+    }
+
+    pub(crate) fn parked_pages(&self) -> &crate::store_read::parked_page::ParkedPages {
+        &self.parked_pages
     }
 
     /// Where the session `key` stands now, when no actor holds it: the root it is kept in, and
@@ -842,6 +848,25 @@ impl StoreRuntime {
         let Some(class) = class else {
             return Ok(None);
         };
+        if let crate::store_reads::StoreReadRequest::Page(page) = &request {
+            if probed.is_none() && registry.slot_state(key).is_none() {
+                if let Some((answer, at)) = Box::pin(self.parked_pages.read(
+                    self,
+                    registry,
+                    key,
+                    class,
+                    expiry.unexpired_position,
+                    page,
+                ))
+                .await
+                {
+                    return Ok(Some((
+                        crate::store_reads::StoreReadReply::Page(Ok(answer)),
+                        Some(at),
+                    )));
+                }
+            }
+        }
         if !request.is_authorization() && registry.open_handle(key).is_none() {
             let current = match probed.take() {
                 Some(view) => Ok(Some(view)),
