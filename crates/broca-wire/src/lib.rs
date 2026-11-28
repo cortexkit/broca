@@ -4535,7 +4535,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.credit_insufficient_openrouter.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "990411488c11dbe4e8ae47d36db3c663c80a656257a89caec8eec56f920c389b"
+            "3325d0cda9acab9acf2e97cfee451ee2dbaf081527f69ee8bad0463508693be9"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4548,7 +4548,7 @@ mod tests {
         assert_eq!(value["error"]["provider_code"], "credit_insufficient");
         assert_eq!(value["error"]["status"], 402);
         assert_eq!(value["error"]["credential_id"], "apikey:openrouter");
-        assert_eq!(value["error"]["affordable_max_tokens"], 97335);
+        assert_eq!(value["error"]["affordable_max_tokens"], 41250);
         assert_eq!(value["retries_used"], 0);
     }
 
@@ -4671,7 +4671,7 @@ mod tests {
             include_bytes!("../tests/golden/run_status.account_limit_exhausted_code_assist.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
-            "727d64c8b28f7215d38c74e0b89cca5294c4fbaedeea248fdb1aa31e15761ef5"
+            "c470d60c4e6662f3324b5548ef5f59ba997f1880687d03e7c0fca48157529e33"
         );
         let status: RunStatusResponse = serde_json::from_slice(bytes).unwrap();
         assert_eq!(
@@ -4685,7 +4685,7 @@ mod tests {
         assert_eq!(value["error"]["status"], 429);
         assert_eq!(value["error"]["account_ref"], "acct-g");
         assert_eq!(value["error"]["credential_id"], "antigravity:google");
-        assert_eq!(value["error"]["resets_at_ms"], 1_800_294_489_199_u64);
+        assert_eq!(value["error"]["resets_at_ms"], 1_800_169_950_500_u64);
         // Google's structured RPC details ride along as an optional, additive field.
         assert_eq!(
             value["error"]["provider_details"]["errorInfo"]["reason"],

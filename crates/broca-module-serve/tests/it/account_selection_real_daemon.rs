@@ -664,7 +664,7 @@ const ANTHROPIC_CREDIT_BALANCE_BODY: &str = r#"{"type":"error","error":{"type":"
 /// OpenRouter's 402 for a request its credit cannot pay for. RECONSTRUCTED from a production
 /// refusal: the message is verbatim, but the production `metadata` held more fields than the one
 /// kept here, and those were not recorded.
-const OPENROUTER_CREDIT_402_BODY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only afford 97335. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#;
+const OPENROUTER_CREDIT_402_BODY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 64000 tokens, but can only afford 41250. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#;
 
 /// Captured from Meta's Muse Responses endpoint: the reset is an absolute epoch timestamp.
 const META_SUBSCRIPTION_QUOTA_429_BODY: &str = r#"{"error":{"code":"rate_limit_exceeded","message":"Subscription quota exhausted. Your usage window resets at 2026-10-26T00:00:00Z.","param":null,"resets_at":1792972800,"type":"rate_limit_error"}}"#;
@@ -887,7 +887,7 @@ async fn serve_upstream(upstream: Arc<Upstream>) -> String {
                     .account_limit_exhausted_code_assist
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    let body = br#"{"error":{"code":429,"message":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 81h48m9s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"uiMessage":"true","model":"gemini-3.8-flash-high","quotaResetDelay":"81h48m9.198441001s"}}]}}"#;
+                    let body = br#"{"error":{"code":429,"message":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 47h12m30s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"uiMessage":"true","model":"gemini-3.8-flash-high","quotaResetDelay":"47h12m30.500000000s"}}]}}"#;
                     let reply = format!("HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
                     socket.write_all(reply.as_bytes()).await.unwrap();
                     socket.write_all(body).await.unwrap();
@@ -4345,7 +4345,7 @@ async fn credit_insufficient_openrouter_status_matches_golden_through_real_serve
     assert_eq!(value["error"]["provider_code"], "credit_insufficient");
     assert_eq!(value["error"]["status"], 402);
     assert_eq!(value["error"]["credential_id"], "apikey:openrouter");
-    assert_eq!(value["error"]["affordable_max_tokens"], 97335);
+    assert_eq!(value["error"]["affordable_max_tokens"], 41250);
     assert!(value["error"].get("resets_at_ms").is_none());
     assert_eq!(value["retries_used"], 0);
     // An unaffordable request says nothing about whether the key is valid.
@@ -4604,7 +4604,7 @@ async fn account_limit_exhausted_code_assist_status_matches_golden_through_real_
     assert_eq!(value["error"]["status"], 429);
     assert_eq!(value["error"]["account_ref"], "acct-g");
     assert_eq!(value["error"]["credential_id"], "antigravity:google");
-    assert_eq!(value["error"]["resets_at_ms"], 1_800_294_489_199_u64);
+    assert_eq!(value["error"]["resets_at_ms"], 1_800_169_950_500_u64);
     assert_eq!(value["retries_used"], 0);
     let bytes = serde_json::to_vec(&status).unwrap();
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -5759,10 +5759,10 @@ pub(crate) fn chatgpt_frame_window(frame: &Value) -> Option<&'static str> {
 
 /// OpenRouter's refusal of a request its credential's remaining credit cannot pay for: HTTP 402
 /// whose `error.metadata.limit_source` is `openrouter_credits`. The structured field decides,
-/// never the message wording. A production refusal read: `{"error":{"message":"This request
-/// requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only
-/// afford 97335. To increase, visit https://openrouter.ai/settings/credits and add more
-/// credits","code":402,"metadata":{"limit_source":"openrouter_credits", ...}}}`.
+/// never the message wording; the same shape, with synthetic numbers, reads: `{"error":{
+/// "message":"This request requires more credits, or fewer max_tokens. You requested up to
+/// 64000 tokens, but can only afford 41250. To increase, visit https://openrouter.ai/settings/
+/// credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits", ...}}}`.
 ///
 /// It becomes a permanent `credit_insufficient`, not `billing_exhausted`: the balance is not
 /// gone, this request is just too expensive for it, and the same request re-sent within the run
@@ -5968,9 +5968,9 @@ fn kimi_usage_limit_reached(
 /// Google's account quota wall: a 429 whose body's `error.details[]` holds a
 /// `google.rpc.ErrorInfo` with `reason: "QUOTA_EXHAUSTED"`.
 ///
-/// Taken from production traffic: an Antigravity (Code Assist) run on 2026-10-03 got this 429
+/// Shaped like production traffic: an Antigravity (Code Assist) run gets this 429
 /// with `status: "RESOURCE_EXHAUSTED"`, an ErrorInfo of reason `QUOTA_EXHAUSTED` from domain
-/// `cloudcode-pa.googleapis.com`, and metadata `quotaResetDelay: "21m0.959250039s"` plus a
+/// `cloudcode-pa.googleapis.com`, and metadata `quotaResetDelay: "15m0.250000000s"` plus a
 /// `quotaResetTimeStamp`. Retrying it six times over a minute changed nothing, because the
 /// quota refills only after the stated reset.
 ///
@@ -5980,7 +5980,7 @@ fn kimi_usage_limit_reached(
 /// ErrorInfo reason is the machine-readable field Google defines for this distinction.
 ///
 /// `resets_at_ms` comes from `quotaResetTimeStamp` (RFC 3339, source `body`), else from now plus
-/// `quotaResetDelay` (a Go duration such as `21m0.959250039s`, source `retry_after`, the same
+/// `quotaResetDelay` (a Go duration such as `15m0.250000000s`, source `retry_after`, the same
 /// label the ChatGPT path gives its relative `resets_in_seconds`), else it is left empty. A
 /// malformed value is skipped rather than failing the classification: the wall is still a wall
 /// even when its reset time cannot be read. `limit_window` is left empty because Google does not
@@ -6170,7 +6170,7 @@ fn bounded_google_string_map(
         .collect()
 }
 
-/// Parse a non-negative Go `time.Duration` string (`21m0.959250039s`, `1h30m`, `500ms`, `0`)
+/// Parse a non-negative Go `time.Duration` string (`15m0.250000000s`, `1h30m`, `500ms`, `0`)
 /// into whole milliseconds, rounding a fractional millisecond UP so a reset computed from it is
 /// never earlier than the one Google stated. Returns `None` for anything Go would reject, and for
 /// a negative duration, which cannot describe a future reset.

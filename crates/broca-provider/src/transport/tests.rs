@@ -3964,7 +3964,7 @@ fn xai_subscription_spending_limit_is_an_untimed_account_wall() {
 /// OpenRouter's 402 for a request its credit cannot pay for. RECONSTRUCTED from a production
 /// refusal: the message is verbatim, but the production `metadata` held more fields than the
 /// one kept here, and those were not recorded.
-const OPENROUTER_CREDIT_402_BODY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 128000 tokens, but can only afford 97335. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#;
+const OPENROUTER_CREDIT_402_BODY: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 64000 tokens, but can only afford 41250. To increase, visit https://openrouter.ai/settings/credits and add more credits","code":402,"metadata":{"limit_source":"openrouter_credits"}}}"#;
 
 fn classify_openrouter(status: u16, body: &str) -> ProviderError {
     let headers = crate::wire::ResponseHeaders::new(std::iter::empty::<(&str, &str)>());
@@ -4000,14 +4000,14 @@ fn openrouter_credit_402_is_credit_insufficient_with_the_affordable_max_tokens()
         "an unaffordable request is not an exhausted balance"
     );
     assert!(error.is_credential_scoped());
-    assert_eq!(error.affordable_max_tokens, Some(97_335));
+    assert_eq!(error.affordable_max_tokens, Some(41_250));
     assert_eq!(error.status, Some(402));
     assert_eq!(error.resets_at_ms, None);
     assert_eq!(error.retry_after_secs, None);
     assert!(crate::safe_provider_code(CREDIT_INSUFFICIENT));
 
     // The number is optional: a refusal whose message does not state it keeps the code.
-    let unnumbered = OPENROUTER_CREDIT_402_BODY.replace("can only afford 97335", "cannot");
+    let unnumbered = OPENROUTER_CREDIT_402_BODY.replace("can only afford 41250", "cannot");
     let error = classify_openrouter(402, &unnumbered);
     assert!(error.is_credit_insufficient());
     assert_eq!(error.affordable_max_tokens, None);
@@ -4556,16 +4556,14 @@ async fn an_ordinary_chatgpt_429_retries_only_on_the_server_retry_time() {
     assert!(waits.lock().unwrap().is_empty());
 }
 
-/// An Antigravity (Code Assist) quota-wall 429 body. Everything up to and including
-/// `"quotaResetTimeStamp": "2026-` is copied byte for byte from the terminal error recorded
-/// in broca's log for a production run on 2026-10-03 (log file `5224d2a1d3c2f34b.wal`); the
-/// log's message cap cut the body there. The rest is COMPLETED
-/// by hand: the timestamp `2026-10-03T03:40:39Z` (the last 429 at 03:19:38Z plus the stated
-/// 21m0.96s delay) and the closing brackets. The real timestamp value is unknown.
+/// An Antigravity (Code Assist) quota-wall 429 body. SYNTHETIC, kept in the shape of a
+/// production refusal: the numbers below are invented, with the stated delay (15m0.25s) plus
+/// the closing brackets completed by hand from the last 429 at 03:19:38Z to the timestamp
+/// `2026-10-03T03:34:39Z` (the ceiling of now plus the delay).
 const CODE_ASSIST_QUOTA_EXHAUSTED_BODY: &str = r#"{
   "error": {
 "code": 429,
-"message": "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 21m0s.",
+"message": "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 15m0s.",
 "status": "RESOURCE_EXHAUSTED",
 "details": [
   {
@@ -4574,20 +4572,20 @@ const CODE_ASSIST_QUOTA_EXHAUSTED_BODY: &str = r#"{
     "domain": "cloudcode-pa.googleapis.com",
     "metadata": {
       "model": "gemini-3.8-flash-high",
-      "quotaResetDelay": "21m0.959250039s",
-      "quotaResetTimeStamp": "2026-10-03T03:40:39Z"
+      "quotaResetDelay": "15m0.250000000s",
+      "quotaResetTimeStamp": "2026-10-03T03:34:39Z"
     }
   }
 ]
   }
 }"#;
-/// `2026-10-03T03:40:39Z` in epoch milliseconds.
-const CODE_ASSIST_QUOTA_RESET_MS: u64 = 1_790_998_839_000;
+/// `2026-10-03T03:34:39Z` in epoch milliseconds.
+const CODE_ASSIST_QUOTA_RESET_MS: u64 = 1_790_998_479_000;
 
 /// The captured body with only the relative `quotaResetDelay` in its metadata.
-const CODE_ASSIST_QUOTA_DELAY_ONLY_BODY: &str = r#"{"error":{"code":429,"message":"Individual quota reached.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"model":"gemini-3.8-flash-high","quotaResetDelay":"21m0.959250039s"}}]}}"#;
-/// 21m0.959250039s, rounded up to the next whole millisecond.
-const CODE_ASSIST_QUOTA_DELAY_MS: u64 = 1_260_960;
+const CODE_ASSIST_QUOTA_DELAY_ONLY_BODY: &str = r#"{"error":{"code":429,"message":"Individual quota reached.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"model":"gemini-3.8-flash-high","quotaResetDelay":"15m0.250000000s"}}]}}"#;
+/// 15m0.250000000s, rounded up to the next whole millisecond.
+const CODE_ASSIST_QUOTA_DELAY_MS: u64 = 900_250;
 
 /// The captured body with neither reset field in its metadata.
 const CODE_ASSIST_QUOTA_NO_RESET_BODY: &str = r#"{"error":{"code":429,"message":"Individual quota reached.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"model":"gemini-3.8-flash-high"}}]}}"#;
@@ -4619,8 +4617,8 @@ fn google_rpc_quota_details_survive_error_message_truncation() {
                     "domain": "cloudcode-pa.googleapis.com",
                     "metadata": {
                         "model": "gemini-3.8-flash-high",
-                        "quotaResetDelay": "21m0.959250039s",
-                        "quotaResetTimeStamp": "2026-10-03T03:40:39Z"
+                        "quotaResetDelay": "15m0.250000000s",
+                        "quotaResetTimeStamp": "2026-10-03T03:34:39Z"
                     }
                 },
                 {
@@ -4637,7 +4635,7 @@ fn google_rpc_quota_details_survive_error_message_truncation() {
                 },
                 {
                     "@type": GOOGLE_RPC_RETRY_INFO_TYPE,
-                    "retryDelay": "21m0.959250039s"
+                    "retryDelay": "15m0.250000000s"
                 }
             ]
         }
@@ -4659,8 +4657,8 @@ fn google_rpc_quota_details_survive_error_message_truncation() {
             details["errorInfo"]["metadata"],
             serde_json::json!({
                 "model": "gemini-3.8-flash-high",
-                "quotaResetDelay": "21m0.959250039s",
-                "quotaResetTimeStamp": "2026-10-03T03:40:39Z"
+                "quotaResetDelay": "15m0.250000000s",
+                "quotaResetTimeStamp": "2026-10-03T03:34:39Z"
             })
         );
         assert_eq!(
@@ -4675,7 +4673,7 @@ fn google_rpc_quota_details_survive_error_message_truncation() {
                 "futureQuotaValue": "2000"
             })
         );
-        assert_eq!(details["retryInfo"]["retryDelay"], "21m0.959250039s");
+        assert_eq!(details["retryInfo"]["retryDelay"], "15m0.250000000s");
     }
 }
 
@@ -4755,7 +4753,7 @@ fn google_rpc_quota_details_are_bounded_and_malformed_details_do_not_break_class
 
 #[test]
 fn captured_code_assist_quota_429_resets_at_its_stated_timestamp() {
-    // Now = the last 429 of the recorded run (2026-10-03T03:19:38Z). The body also carries a
+    // Now = the last 429 of the synthetic run (2026-10-03T03:19:38Z). The body also carries a
     // delay; the absolute timestamp wins over it.
     let now = UNIX_EPOCH + Duration::from_secs(1_790_997_578);
     for family in [WireFamilyId::GoogleCodeAssist, WireFamilyId::Gemini] {
@@ -4802,7 +4800,7 @@ fn a_code_assist_quota_429_without_any_reset_is_still_an_account_wall() {
 #[test]
 fn a_malformed_quota_reset_delay_leaves_the_reset_unknown_but_still_classifies_the_wall() {
     let now = UNIX_EPOCH + Duration::from_secs(1_790_997_578);
-    let body = CODE_ASSIST_QUOTA_DELAY_ONLY_BODY.replace("21m0.959250039s", "21 minutes");
+    let body = CODE_ASSIST_QUOTA_DELAY_ONLY_BODY.replace("15m0.250000000s", "15 minutes");
     let error = classify_google_429(WireFamilyId::GoogleCodeAssist, &body, now);
     assert!(error.is_account_limit_exhausted());
     assert_eq!(error.resets_at_ms, None);
@@ -4812,7 +4810,7 @@ fn a_malformed_quota_reset_delay_leaves_the_reset_unknown_but_still_classifies_t
 #[test]
 fn go_durations_parse_to_whole_milliseconds_rounding_up() {
     let parse = super::parse_go_duration_millis;
-    assert_eq!(parse("21m0.959250039s"), Some(1_260_960));
+    assert_eq!(parse("15m0.250000000s"), Some(900_250));
     assert_eq!(parse("1h30m"), Some(5_400_000));
     assert_eq!(parse("500ms"), Some(500));
     assert_eq!(parse("1.5s"), Some(1_500));
@@ -4820,7 +4818,7 @@ fn go_durations_parse_to_whole_milliseconds_rounding_up() {
     assert_eq!(parse("1500us"), Some(2));
     assert_eq!(parse("1ns"), Some(1));
     assert_eq!(parse("0"), Some(0));
-    for malformed in ["", "21", "21 minutes", "-5s", "1.2.3s", "s", ".s", "5d"] {
+    for malformed in ["", "15", "15 minutes", "-5s", "1.2.3s", "s", ".s", "5d"] {
         assert_eq!(parse(malformed), None, "{malformed:?}");
     }
 }

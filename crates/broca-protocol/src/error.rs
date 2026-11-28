@@ -490,7 +490,7 @@ mod tests {
             r#"{"class":"permanent","message":"400: credit","status":400,"provider_code":"billing_exhausted","credential_id":"apikey:anthropic:work"}"#,
             r#"{"class":"transient","message":"429: limit","status":429,"provider_code":"account_limit_exhausted","account_ref":"acct-a","credential_id":"oauth:anthropic:work"}"#,
             r#"{"class":"transient","message":"429: slow down","status":429,"retry_after_secs":30.0,"provider_code":"rate_limited","credential_id":"apikey:anthropic"}"#,
-            r#"{"class":"permanent","message":"402: credits","status":402,"provider_code":"credit_insufficient","credential_id":"apikey:openrouter","affordable_max_tokens":97335}"#,
+            r#"{"class":"permanent","message":"402: credits","status":402,"provider_code":"credit_insufficient","credential_id":"apikey:openrouter","affordable_max_tokens":41250}"#,
         ] {
             let error: ProviderError = serde_json::from_str(bytes).unwrap();
             assert!(error.credential_id.is_some());
