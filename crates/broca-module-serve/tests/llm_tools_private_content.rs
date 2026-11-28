@@ -454,13 +454,17 @@ impl Drop for Rig {
                 eprintln!("{logs}");
             }
             broca_test_support::kill_and_reap_tree(&mut self._daemon);
-            for child in &self.orphaned_standins {
-                if let Err(error) = child.force_stop() {
-                    if std::thread::panicking() {
-                        eprintln!("stand-in cleanup: {error}");
-                    } else {
-                        panic!("stand-in cleanup: {error}");
-                    }
+            let failures: Vec<_> = self
+                .orphaned_standins
+                .iter()
+                .filter_map(|child| child.force_stop().err())
+                .collect();
+            if !failures.is_empty() {
+                let message = format!("stand-in cleanup: {}", failures.join("; "));
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
                 }
             }
         }

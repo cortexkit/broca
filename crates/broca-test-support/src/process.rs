@@ -52,18 +52,34 @@ impl SupervisedChild {
     }
 
     pub fn force_stop(&self) -> Result<(), String> {
-        match self
-            .process
-            .force_stop(self.stamp.1, Duration::from_secs(5))
-        {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(format!("could not force-stop {:?}", self.stamp)),
-            Err(error) => Err(format!("could not force-stop {:?}: {error}", self.stamp)),
-        }
+        confirm_supervised_exit(
+            self.stamp,
+            self.process.terminate_with_exit_code(1),
+            |timeout| self.process.wait_for_exit(timeout),
+        )
     }
 
     pub fn has_exited(&self) -> std::io::Result<bool> {
         self.process.wait_for_exit(Duration::ZERO)
+    }
+}
+
+#[cfg(windows)]
+fn confirm_supervised_exit(
+    stamp: (u32, u64),
+    termination: std::io::Result<bool>,
+    wait_for_exit: impl FnOnce(Duration) -> std::io::Result<bool>,
+) -> Result<(), String> {
+    // TerminateProcess may report access denied when termination is already underway,
+    // before the process handle is signaled. Wait on the captured handle either way.
+    let problem = match wait_for_exit(Duration::from_secs(5)) {
+        Ok(true) => return Ok(()),
+        Ok(false) => "survived the 5-second cleanup deadline".to_owned(),
+        Err(error) => format!("could not confirm exit: {error}"),
+    };
+    match termination {
+        Ok(_) => Err(format!("process {stamp:?} {problem}")),
+        Err(error) => Err(format!("process {stamp:?} {problem}; termination: {error}")),
     }
 }
 
@@ -1055,6 +1071,60 @@ mod tests {
     fn process_wait_times_out_for_the_current_process() {
         let process = subc_os::Process::open(std::process::id()).unwrap().unwrap();
         assert!(!process.wait_for_exit(Duration::ZERO).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn supervised_exit_waits_after_a_denied_termination() {
+        use std::process::Stdio;
+
+        const HOLD_STDIN: &str = "BROCA_TEST_SUPPORT_HOLD_EXIT";
+        if std::env::var_os(HOLD_STDIN).is_some() {
+            std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).unwrap();
+            return;
+        }
+
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process::tests::supervised_exit_waits_after_a_denied_termination",
+            ])
+            .env(HOLD_STDIN, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let process = subc_os::Process::open(pid).unwrap().unwrap();
+        let stamp = (pid, process.observe().unwrap().start_time);
+        let denied = std::io::Error::from_raw_os_error(5);
+        let result = confirm_supervised_exit(stamp, Err(denied), |timeout| {
+            // Hold the real process unsignaled until cleanup reaches the bounded wait.
+            assert!(!process.wait_for_exit(Duration::ZERO).unwrap());
+            assert_eq!(timeout, Duration::from_secs(5));
+            drop(child.stdin.take().unwrap());
+            process.wait_for_exit(timeout)
+        });
+        result.expect("termination denial must not bypass exit confirmation");
+        assert!(process.wait_for_exit(Duration::ZERO).unwrap());
+        assert!(child.try_wait().unwrap().unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supervised_exit_reports_a_survivor_after_the_bound() {
+        let denied = std::io::Error::from_raw_os_error(5);
+        let termination_error = denied.to_string();
+        let result = confirm_supervised_exit((42, 123), Err(denied), |timeout| {
+            assert_eq!(timeout, Duration::from_secs(5));
+            Ok(false)
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            format!("process (42, 123) survived the 5-second cleanup deadline; termination: {termination_error}")
+        );
     }
 
     #[cfg(unix)]
