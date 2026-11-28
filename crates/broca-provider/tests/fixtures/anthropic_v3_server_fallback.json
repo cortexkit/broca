@@ -1,0 +1,43 @@
+[
+  {
+    "body": "{\"fallbacks\":\"default\",\"max_tokens\":2048,\"messages\":[{\"content\":[{\"text\":\"question\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"text\":\"commentary\",\"type\":\"text\"},{\"text\":\"answer\",\"type\":\"text\"}],\"role\":\"assistant\"}],\"model\":\"claude-opus-5-5\",\"stream\":true,\"system\":[{\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"type\":\"text\"}],\"thinking\":{\"budget_tokens\":1024,\"type\":\"enabled\"},\"tool_choice\":{\"type\":\"auto\"},\"tools\":[{\"description\":\"Read a text file.\",\"input_schema\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"name\":\"read_file\"}]}",
+    "frozen": {
+      "family_id": "anthropic_messages",
+      "max_output_tokens": 2048,
+      "reasoning": {
+        "budget_tokens": 1024,
+        "cross_model": "any_anthropic_model",
+        "echo_scope": "all_assistant_messages",
+        "last_turn_only": true,
+        "mode": "anthropic_interleaved"
+      },
+      "renderer_version": 3,
+      "server_side_fallback": true,
+      "system_prompt": {
+        "identity": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "mode": "required_identity_lead"
+      },
+      "token_limit_field": "max_tokens",
+      "tool_id": "passthrough",
+      "usage": "anthropic_usage",
+      "wire_model_id": "claude-opus-5-5"
+    },
+    "tools": [
+      {
+        "description": "Read a text file.",
+        "input_schema": {
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "read_file"
+      }
+    ]
+  }
+]

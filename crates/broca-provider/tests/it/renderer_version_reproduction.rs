@@ -242,6 +242,14 @@ fn every_reproducible_declaration_renders_its_pinned_old_bytes() {
         serde_json::from_str::<Vec<Value>>(include_str!("../fixtures/pre_native_media.json"))
             .expect("Anthropic v2 pins are JSON"),
     );
+    // Anthropic v3 opted into the server's default fallback. The archived request exercises
+    // that opt-in with a tool declaration, so a replay that loses either field fails.
+    pins.extend(
+        serde_json::from_str::<Vec<Value>>(include_str!(
+            "../fixtures/anthropic_v3_server_fallback.json"
+        ))
+        .expect("Anthropic v3 pins are JSON"),
+    );
     let legacy_opts = legacy_call_options();
     let chat_v4_opts = openai_chat_v4_call_options();
     let mut proven = BTreeSet::new();
@@ -655,8 +663,7 @@ fn an_anthropic_config_with_the_opt_in_freezes_v3() {
     let body: Value =
         serde_json::from_slice(&AnthropicMessages.render(&frozen, &legacy_call_options())).unwrap();
     assert_eq!(body["fallbacks"], "default");
-    // Both versions a recorded Anthropic run can name are accepted on resume: the current one
-    // and the reproducible v2 predecessor.
+    // Configs frozen at renderer version 2 or 3 remain reproducible.
     assert!(reproduces_renderer_version(
         WireFamilyId::AnthropicMessages,
         frozen.renderer_version
