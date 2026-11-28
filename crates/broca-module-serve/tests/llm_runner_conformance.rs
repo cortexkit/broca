@@ -2841,9 +2841,14 @@ impl RunnerRoute for BrocaRoute {
                 if method == "session.head" && error.code == "open_failed" {
                     eprintln!("conformance session.head open_failed: {}", error.message);
                 }
-                #[cfg(windows)]
                 if method == "session.read" && error.code == "open_failed" {
                     eprintln!("conformance session.read open_failed: {}", error.message);
+                    self.subject
+                        .shared
+                        .case_evidence
+                        .lock()
+                        .unwrap()
+                        .store_open_failed(&self.logs_dir);
                 }
                 Ok(Reply::Error(error))
             }

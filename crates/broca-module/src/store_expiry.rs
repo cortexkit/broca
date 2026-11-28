@@ -12,6 +12,19 @@ pub(crate) struct ExpiryRead {
 }
 
 impl StoreRuntime {
+    /// Rechecks a failed read that may have used a head retention removed before the read could
+    /// open its log or objects. A marker is written before the head is removed and can outlive
+    /// the session it names, so also check that no root has a live head. An I/O error on either
+    /// check does not prove deletion.
+    pub(crate) fn policy_deleted_without_head(&self, key: &BindIdentity) -> bool {
+        self.expiry_markers(key).is_ok_and(|markers| {
+            markers
+                .iter()
+                .max_by_key(|marker| marker.seq)
+                .is_some_and(|marker| marker.policy_deleted == Some(true))
+        }) && matches!(self.class_of(key), Ok(None))
+    }
+
     pub(crate) fn expiry_markers(&self, key: &BindIdentity) -> Result<Vec<Marker>, OpenError> {
         expired::read(
             &StorageClass::Ephemeral.store_root(&self.state_root),

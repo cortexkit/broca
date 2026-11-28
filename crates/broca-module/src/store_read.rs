@@ -410,6 +410,14 @@ pub async fn serve_read(
     store: &crate::store_open::StoreRuntime,
     req: crate::serve::SessionReadRequest,
 ) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
+    serve_read_ref(registry, store, &req).await
+}
+
+pub(crate) async fn serve_read_ref(
+    registry: &crate::LineageRegistry,
+    store: &crate::store_open::StoreRuntime,
+    req: &crate::serve::SessionReadRequest,
+) -> Result<broca_wire::SessionReadResponse, crate::serve::ServeError> {
     let _timing = broca_session_store::metrics::Phase::Read
         .start()
         .with_session(|| Some(broca_core::session_addr(&req.session)));
@@ -422,7 +430,7 @@ pub async fn serve_read(
             message: refusal.message,
         });
     }
-    let request = StoreReadRequest::Page(PageRequest::of(&req));
+    let request = StoreReadRequest::Page(PageRequest::of(req));
     let answer = match store.read(registry, &req.session, request).await? {
         Some(StoreReadReply::Page(answer)) => answer?,
         Some(_) => return Err(crate::store_reads::mismatched()),
@@ -433,7 +441,7 @@ pub async fn serve_read(
             return Ok(response);
         }
     };
-    finish(answer, &req)
+    finish(answer, req)
 }
 
 /// The `session.read` reply for a session no send created: an empty transcript. A late cursor

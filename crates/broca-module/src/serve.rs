@@ -3574,15 +3574,24 @@ impl ServeHandler for crate::LineageRegistry {
 
     async fn read(&self, req: SessionReadRequest) -> Result<SessionReadResponse, ServeError> {
         crate::registry::count_session_read();
-        match self.store_holding(&req.session)? {
-            Some(store) => crate::store_read::serve_read(self, &store, req).await,
-            None => {
-                // Retention deletes an expired session and leaves only its expiry marker, so
-                // the address must still read as expired, not as never written.
-                self.check_expired(&req.session, None).await?;
-                crate::store_read::serve_unwritten(&req)
-            }
+        let reply = match self.store_holding(&req.session) {
+            Ok(Some(store)) => crate::store_read::serve_read_ref(self, &store, &req).await,
+            // An address with only an expiry marker is not an unwritten session.
+            Ok(None) => self
+                .check_expired(&req.session, None)
+                .await
+                .map_err(ServeError::from)
+                .and_then(|()| crate::store_read::serve_unwritten(&req)),
+            Err(error) => Err(error.into()),
+        };
+        if matches!(&reply, Err(ServeError::Open(..)))
+            && self
+                .store_runtime()
+                .is_some_and(|store| store.policy_deleted_without_head(&req.session))
+        {
+            return Err(ServeError::UnknownSession);
         }
+        reply
     }
 
     async fn store_history_head(

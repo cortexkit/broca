@@ -13,6 +13,8 @@ const WAL_WINDOW: u64 = 128;
 const WAL_LINES: usize = 32;
 const FIELD_BYTES: usize = 768;
 const SESSION_BYTES: usize = 16 * 1024;
+const STORE_LINES: usize = 12;
+const STORE_LINE_BYTES: usize = 2 * 1024;
 
 pub(super) fn wall_ms() -> u128 {
     SystemTime::now()
@@ -54,6 +56,7 @@ pub(super) struct Cases {
 struct Case {
     name: &'static str,
     sessions: BTreeMap<String, SessionEvidence>,
+    store_log_dirs: BTreeSet<PathBuf>,
 }
 
 #[derive(Default)]
@@ -83,6 +86,7 @@ impl Cases {
                 self.active = Some(Case {
                     name: case,
                     sessions: BTreeMap::new(),
+                    store_log_dirs: BTreeSet::new(),
                 });
             }
             SuiteProgress::CaseFinished { case, outcome, .. } => {
@@ -96,6 +100,12 @@ impl Cases {
                 }
             }
             _ => {}
+        }
+    }
+
+    pub(super) fn store_open_failed(&mut self, logs_dir: &Path) {
+        if let Some(case) = &mut self.active {
+            case.store_log_dirs.insert(logs_dir.to_owned());
         }
     }
 
@@ -414,12 +424,73 @@ impl BrocaSubject {
         let mut output = String::from("=== llm-runner conformance failure evidence ===\n");
         for case in failed {
             let _ = writeln!(output, "=== failed case {} ===", case.name);
+            for dir in case.store_log_dirs {
+                let _ = writeln!(output, "broca store warnings from {}:", dir.display());
+                match store_open_refusals(&dir) {
+                    Ok(lines) if lines.is_empty() => output.push_str("  none recorded\n"),
+                    Ok(lines) => {
+                        for line in lines {
+                            let _ = writeln!(output, "  {line}");
+                        }
+                    }
+                    Err(error) => {
+                        let _ = writeln!(output, "  unavailable: {error}");
+                    }
+                }
+            }
             for (session, evidence) in case.sessions {
                 output.push_str(&evidence.render(&session, &self.shared).await);
             }
         }
         output
     }
+}
+
+/// Read the segments rather than just their tail: the suite can run more cases after the refusal.
+/// Keep only the warnings that log the cause omitted from the wire refusal.
+fn store_open_refusals(dir: &Path) -> std::io::Result<VecDeque<String>> {
+    use std::io::{BufRead as _, BufReader};
+
+    let mut segments: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+        .collect();
+    segments.sort();
+    let mut warnings = VecDeque::new();
+    for segment in segments {
+        for line in BufReader::new(std::fs::File::open(segment)?).lines() {
+            let line = line?;
+            let mut columns = line.split_whitespace().skip(1);
+            if columns.next() == Some("WARN")
+                && columns.next() == Some("broca.store:")
+                && line.contains("open_failed refusal")
+            {
+                keep_last(
+                    &mut warnings,
+                    bounded(&line, STORE_LINE_BYTES).to_owned(),
+                    STORE_LINES,
+                );
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+#[test]
+fn store_refusal_evidence_keeps_the_os_cause_from_a_rotated_segment() {
+    let dir = broca_test_support::scratch_root().join("conformance-store-refusal-evidence");
+    std::fs::create_dir_all(&dir).unwrap();
+    let warning = "2026-01-01T00:00:00.000Z WARN  broca.store: open_failed refusal channel=1 epoch=1 corr=5 cause=\"the new storage's head of this session could not be checked: Access is denied. (os error 5)\"";
+    std::fs::write(dir.join("broca-2026-01-01.log"), format!("{warning}\n")).unwrap();
+    std::fs::write(
+        dir.join("broca-2026-01-02.log"),
+        "2026-01-02T00:00:00.000Z WARN  broca.wire: open_failed refusal\n\
+         2026-01-02T00:00:00.001Z INFO  broca.store: unrelated write\n",
+    )
+    .unwrap();
+    assert_eq!(store_open_refusals(&dir).unwrap(), [warning]);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

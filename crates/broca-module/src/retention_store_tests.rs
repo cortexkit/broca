@@ -402,6 +402,111 @@ async fn an_expired_session_in_the_new_storage_is_deleted_with_everything_it_own
     assert!(view.operations.owner.first_start.is_none(), "a new session");
 }
 
+#[cfg(feature = "test-clock")]
+async fn read_across_log_removal(
+    deleting: bool,
+) -> Result<crate::serve::SessionReadResponse, crate::serve::ServeError> {
+    use broca_session_store::expired::{self, Marker};
+    use broca_session_store::record::{Retention, RetentionEvent};
+    use cortexkit_role_llm_runner::session_retention::{Keep, RetentionPolicy};
+
+    use crate::serve::{ServeHandler, SessionReadRequest};
+
+    let rig = Rig::new(
+        if deleting {
+            "read-deleting"
+        } else {
+            "read-live-io-error"
+        },
+        Duration::from_secs(600),
+    )
+    .await;
+    let key = rig.key("retained");
+    let class = StorageClass::Durable;
+    rig.seed_in(
+        class,
+        &key,
+        &[
+            Record::Retention(Retention {
+                event: RetentionEvent::Set,
+                at_ms: STARTED_MS,
+                policy: Some(
+                    serde_json::to_value(RetentionPolicy::new(Keep::days(1), 0, true, false))
+                        .unwrap(),
+                ),
+            }),
+            store_start("r1", None, STARTED_MS),
+            store_end("r1", ENDED_MS),
+            store_billed("r1"),
+        ],
+        false,
+    )
+    .await;
+    let view = rig.runtime.current_view(&key).await.unwrap().unwrap();
+    let session_id = view.head().session_id;
+    let cipher = view.head().cipher();
+    let history_version = view.head().history_version;
+    drop(view);
+
+    // The reader has the live head in hand. Reproduce the sweeper's marker, head rename and
+    // log removal before the reader can open the log. Leave the head in place for the control:
+    // a marker alone is not proof that deletion reached the head rename.
+    let addr = addr(&key);
+    let root = class.store_root(&rig.root);
+    let heads = root.join("heads").join(&addr.0);
+    let logs = root.join("logs").join(&addr.0);
+    let ephemeral = rig.ephemeral();
+    let triple = triple(&key);
+    broca_session_store::backend::after_next_head_read_for_test(move || {
+        expired::write(
+            &ephemeral,
+            &addr,
+            &session_id,
+            Marker {
+                format: 1,
+                triple,
+                expired_at_ms: ENDED_MS + 86_400_000,
+                seq: 0,
+                next_tag: 1,
+                next_notice_seq: 1,
+                runs: vec!["r1".into()],
+                history_version: Some(history_version),
+                policy_deleted: Some(true),
+            },
+            cipher,
+            &deployment(),
+        )
+        .unwrap();
+        if deleting {
+            std::fs::rename(heads.join("head"), heads.join("head.deleting")).unwrap();
+        }
+        std::fs::remove_dir_all(logs).unwrap();
+    });
+    rig.registry
+        .read(SessionReadRequest::new(key, None, None))
+        .await
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn session_read_racing_committed_retention_deletion_is_unknown_session() {
+    let read = read_across_log_removal(true).await;
+    assert!(
+        matches!(read, Err(crate::serve::ServeError::UnknownSession)),
+        "{read:?}"
+    );
+}
+
+#[cfg(feature = "test-clock")]
+#[tokio::test]
+async fn session_read_with_a_live_head_preserves_a_log_open_failure() {
+    let read = read_across_log_removal(false).await;
+    assert!(
+        matches!(&read, Err(crate::serve::ServeError::Open(reason, None)) if reason.contains("NoSuchLog")),
+        "{read:?}"
+    );
+}
+
 /// An executor that notes, for each transport it is told to retire, whether the session's lease
 /// was held at that moment.
 struct RetiresTransports {

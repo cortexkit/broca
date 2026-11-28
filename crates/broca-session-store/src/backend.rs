@@ -1187,6 +1187,17 @@ impl HeadStamp {
 
 thread_local! {
     static HEAD_FILE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg(feature = "fs-override")]
+    static AFTER_HEAD_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `cut` after the next successful backend head read on this thread, before the caller
+/// can open any file named by the head.
+#[cfg(feature = "fs-override")]
+pub fn after_next_head_read_for_test(cut: impl FnOnce() + 'static) {
+    AFTER_HEAD_READ.with(|pending| {
+        assert!(pending.borrow_mut().replace(Box::new(cut)).is_none());
+    });
 }
 
 /// How many head files this thread has opened and read. A test bounds with it what a pass over
@@ -1332,6 +1343,10 @@ impl SessionBackend for LocalBackend {
         let head = self.read_head_file(s)?;
         if let Some((_, version)) = &head {
             self.fences.lock().unwrap().insert(s.clone(), *version);
+            #[cfg(feature = "fs-override")]
+            if let Some(cut) = AFTER_HEAD_READ.with(|pending| pending.borrow_mut().take()) {
+                cut();
+            }
         }
         Ok(head)
     }
