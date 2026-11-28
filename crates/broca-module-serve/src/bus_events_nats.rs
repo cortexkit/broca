@@ -365,6 +365,7 @@ pub struct CredentialHolder {
     route: Arc<dyn CredentialRoute>,
     state: Mutex<HolderState>,
     warnings: WarnOnce,
+    reconnect_log: Arc<ReconnectLog>,
 }
 
 impl CredentialHolder {
@@ -386,6 +387,7 @@ impl CredentialHolder {
                 reissued_for: None,
             }),
             warnings: WarnOnce::default(),
+            reconnect_log: Arc::new(ReconnectLog::default()),
         })
     }
 
@@ -496,6 +498,7 @@ impl CredentialHolder {
                 if error.generation_not_live() {
                     self.stop(state);
                 } else {
+                    self.reconnect_log.credential_issue_failed();
                     state.issue_after = Some(tokio::time::Instant::now() + state.issue_backoff);
                     state.issue_backoff = (state.issue_backoff * 2).min(ISSUE_BACKOFF_CAP);
                 }
@@ -608,13 +611,15 @@ impl NatsPublisher {
     async fn connect(
         holder: Arc<CredentialHolder>,
         credential: &Credential,
-        reconnect_log: &Arc<ReconnectLog>,
     ) -> Result<Self, String> {
         let config = ConnectConfig::new(&credential.credential_public)
             .map_err(|_| "invalid ckbus credential public key")?;
         if config.inbox_prefix() != credential.inbox_prefix {
             return Err("ckbus inbox prefix does not match credential".into());
         }
+        let account =
+            AccountNames::derive(&credential.acct).map_err(|_| "invalid ckbus account")?;
+        let observe = holder.reconnect_log.observe_dial();
         let options = async_nats::ConnectOptions::with_auth_callback(move |nonce| {
             let holder = holder.clone();
             // async-nats requires a Sync future; a JoinHandle wraps the Send-only subc RPC future.
@@ -631,9 +636,6 @@ impl NatsPublisher {
             }
         })
         .connection_timeout(Duration::from_secs(5));
-        let account =
-            AccountNames::derive(&credential.acct).map_err(|_| "invalid ckbus account")?;
-        let observe = reconnect_log.observe_dial();
         let conn = NatsConnection::connect_observed(
             &credential.server_url,
             options,
@@ -703,8 +705,7 @@ impl Link for NatsLink {
     }
 }
 
-#[derive(Default)]
-struct NatsDialer(Arc<ReconnectLog>);
+struct NatsDialer;
 #[async_trait]
 impl Dialer for NatsDialer {
     async fn dial(
@@ -713,7 +714,7 @@ impl Dialer for NatsDialer {
         credential: &Credential,
     ) -> Result<Box<dyn Link>, String> {
         Ok(Box::new(NatsLink {
-            publisher: NatsPublisher::connect(holder.clone(), credential, &self.0).await?,
+            publisher: NatsPublisher::connect(holder.clone(), credential).await?,
             credential_public: credential.credential_public.clone(),
         }))
     }
@@ -730,9 +731,15 @@ impl NatsConnector {
     pub fn new(holder: Arc<CredentialHolder>) -> Self {
         Self {
             holder,
-            dialer: Arc::new(NatsDialer::default()),
+            dialer: Arc::new(NatsDialer),
             publisher: Mutex::new(None),
         }
+    }
+
+    /// The event publisher and `m_broca` pull consumer share this NATS link. The late-results
+    /// feed uses SUBC provider routes, not a bus connection.
+    pub(crate) fn bus_unreachable(&self) -> bool {
+        self.holder.reconnect_log.bus_unreachable()
     }
 
     /// The one shared publisher, made by `connect` when there is none yet.
@@ -973,10 +980,13 @@ impl BusPublisher for LazyPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::{bus_health_tests::probe, VaultGauge};
+    use async_nats::{ClientError, ConnectError, ConnectErrorKind, Event};
     use broca_store::{
         bus_events::{DrainResult, RunEventStore as _},
         SqliteStore,
     };
+    use cortexkit_bus_nats::NatsConnectionEvent;
     use serde_json::json;
     use std::{
         collections::VecDeque,
@@ -985,6 +995,7 @@ mod tests {
             Mutex as StdMutex,
         },
     };
+    use subc_protocol::session::HealthStatus;
     type ExpectedCall = (
         &'static str,
         serde_json::Value,
@@ -1016,6 +1027,133 @@ mod tests {
             message: format!("fixture refusal {code}"),
         }
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn bus_health_degrades_at_sixty_seconds_and_recovers() {
+        let connector = NatsConnector::new(CredentialHolder::with_route(Arc::new(FakeRoute(
+            StdMutex::default(),
+        ))));
+        let vault = VaultGauge::not_in_use();
+        assert_eq!(probe(&connector, &vault).await, (HealthStatus::Ok, None));
+
+        let observe = connector.holder.reconnect_log.observe_dial();
+        observe(NatsConnectionEvent::Event(&Event::Connected));
+        observe(NatsConnectionEvent::Event(&Event::Disconnected));
+        let failure = Event::ClientError(ClientError::Other(ConnectErrorKind::Io.to_string()));
+        observe(NatsConnectionEvent::Event(&failure));
+        tokio::time::advance(Duration::from_secs(59)).await;
+        observe(NatsConnectionEvent::Event(&failure));
+        assert_eq!(probe(&connector, &vault).await, (HealthStatus::Ok, None));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            probe(&connector, &vault).await,
+            (HealthStatus::Degraded, Some("bus_unreachable".into()))
+        );
+        let vault_disconnected = VaultGauge::disconnected();
+        assert_eq!(
+            probe(&connector, &vault_disconnected).await,
+            (
+                HealthStatus::Degraded,
+                Some("vault: credentials module not catalog-live; bus_unreachable".into()),
+            )
+        );
+
+        observe(NatsConnectionEvent::Event(&Event::Connected));
+        assert_eq!(probe(&connector, &vault).await, (HealthStatus::Ok, None));
+        assert_eq!(
+            probe(&connector, &vault_disconnected).await,
+            (
+                HealthStatus::Degraded,
+                Some("vault: credentials module not catalog-live".into()),
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bus_health_counts_failed_credential_issues_before_the_first_dial() {
+        let vault = VaultGauge::not_in_use();
+        let method = "ckbus.credential";
+        for error in [
+            CkbusError::TimedOut { method },
+            refused(method, "authorization_violation"),
+        ] {
+            let issued = json!({
+                "jwt": "fixture-jwt", "exp": 4102444800u64, "acct": "box_test",
+                "inbox_prefix": "_INBOX.U_fixture", "server_url": "nats://127.0.0.1:4222",
+                "credential_public": "U_fixture"
+            });
+            let route = Arc::new(FakeRoute(StdMutex::new(VecDeque::from([
+                (method, json!({}), Err(error.clone())),
+                (method, json!({}), Err(error)),
+                (method, json!({}), Ok(issued)),
+            ]))));
+            let connector = NatsConnector::new(CredentialHolder::with_route(route));
+            assert!(connector.connect().await.is_err());
+            tokio::time::advance(Duration::from_secs(59)).await;
+            assert!(connector.connect().await.is_err());
+            assert_eq!(probe(&connector, &vault).await, (HealthStatus::Ok, None));
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let degraded = (HealthStatus::Degraded, Some("bus_unreachable".into()));
+            assert_eq!(probe(&connector, &vault).await, degraded);
+
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(connector.connect().await.is_ok());
+            assert_eq!(probe(&connector, &vault).await, degraded);
+            let observe = connector.holder.reconnect_log.observe_dial();
+            observe(NatsConnectionEvent::Event(&Event::Connected));
+            assert_eq!(probe(&connector, &vault).await, (HealthStatus::Ok, None));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bus_health_ignores_a_deliberately_closed_link() {
+        let connector = NatsConnector::new(CredentialHolder::with_route(Arc::new(FakeRoute(
+            StdMutex::default(),
+        ))));
+        let old = connector.holder.reconnect_log.observe_dial();
+        old(NatsConnectionEvent::Event(&Event::Connected));
+        let replacement = connector.holder.reconnect_log.observe_dial();
+        replacement(NatsConnectionEvent::Event(&Event::Connected));
+        // The publisher installs the replacement before closing the old connection.
+        old(NatsConnectionEvent::Event(&Event::Disconnected));
+        old(NatsConnectionEvent::Event(&Event::ClientError(
+            ClientError::Other(ConnectErrorKind::Io.to_string()),
+        )));
+        replacement(NatsConnectionEvent::Event(&Event::Draining));
+        replacement(NatsConnectionEvent::Event(&Event::Closed));
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            probe(&connector, &VaultGauge::not_in_use()).await,
+            (HealthStatus::Ok, None)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bus_health_counts_broker_authorization_failures() {
+        for automatic_reconnect in [false, true] {
+            let connector = NatsConnector::new(CredentialHolder::with_route(Arc::new(FakeRoute(
+                StdMutex::default(),
+            ))));
+            let observe = connector.holder.reconnect_log.observe_dial();
+            let kind = ConnectErrorKind::AuthorizationViolation;
+            if automatic_reconnect {
+                observe(NatsConnectionEvent::Event(&Event::Connected));
+                observe(NatsConnectionEvent::Event(&Event::Disconnected));
+                observe(NatsConnectionEvent::Event(&Event::ClientError(
+                    ClientError::Other(kind.to_string()),
+                )));
+            } else {
+                observe(NatsConnectionEvent::ConnectFailed(&ConnectError::new(kind)));
+            }
+            tokio::time::advance(Duration::from_secs(60)).await;
+            assert_eq!(
+                probe(&connector, &VaultGauge::not_in_use()).await,
+                (HealthStatus::Degraded, Some("bus_unreachable".into()))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn bus_credentials_issue_sign_and_renew_documented_ckbus_shapes() {
         let issued = json!({"jwt":"fixture-initial-jwt","exp":1900000900u64,"acct":"box_test","account_public":"A_fixture","inbox_prefix":"_INBOX.U_fixture","server_url":"nats://127.0.0.1:4222","credential_public":"U_fixture","user_jwt_id":"j1","spawn_generation":"g1","credential_epoch":1});
@@ -1812,7 +1950,7 @@ mod tests {
         ]))));
         let connector = NatsConnector {
             holder: CredentialHolder::with_route(route.clone()),
-            dialer: Arc::new(NatsDialer::default()),
+            dialer: Arc::new(NatsDialer),
             publisher: Mutex::new(None),
         };
         let connection = connector.connect().await.unwrap();

@@ -118,6 +118,7 @@ impl FlowFrames {
             &self.handler,
             &self.registry,
             &VaultGauge::not_in_use(),
+            None,
             &Default::default(),
             &self.cancel,
             &Arc::new(Semaphore::new(4)),

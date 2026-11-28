@@ -1043,7 +1043,7 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
         config: bus_event_config,
         store: event_store,
         registry: registry.as_ref().clone(),
-        connector: Some(bus_connector),
+        connector: Some(bus_connector.clone()),
         store_events: store_run_events,
         stop: bus_stop,
     }
@@ -1171,6 +1171,7 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
         registry.clone(),
         registry.clone(),
         vault_gauge,
+        Some(bus_connector),
         Some(catalog_cache),
         consumer_routes,
         vault_auditor,

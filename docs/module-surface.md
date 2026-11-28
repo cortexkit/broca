@@ -501,6 +501,12 @@ message and field; it does not invent a `preset_missing` difference for a nonexi
 
 ### Health counters and per-request diagnostics
 
+`health.check` adds `bus_unreachable` to its degradation detail after 60 seconds of failed
+connection attempts and removes that reason on the next successful connection. A credential
+issue failure or an authorization refusal that prevents connecting counts; an intentional
+close does not. This covers the NATS link shared by event publishing and the `m_broca`
+compaction consumer, not the late-results feed, which uses provider routes over SUBC.
+
 `health.check.metrics.tool_routes` is an in-memory census of the shared tool-provider route
 cache. It reports `open_session_actors`, `cached_routes`, `cached_routes_per_provider`,
 `oldest_route_idle_secs` (null for an empty cache), `routes_for_closed_sessions` (normally zero),

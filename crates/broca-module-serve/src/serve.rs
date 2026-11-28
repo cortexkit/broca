@@ -34,6 +34,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::bus_events_nats::NatsConnector;
 use crate::serves::trace_describe;
 use crate::stall::{self, Phase};
 use broca_diagnostics::{Receiver as EgressReceiver, Sender as EgressSender};
@@ -1038,6 +1039,7 @@ async fn handle_frame<H>(
     handler: &Arc<H>,
     health_registry: &LineageRegistry,
     vault_gauge: &VaultGauge,
+    bus_connector: Option<&NatsConnector>,
     serves: &Arc<crate::serves::Source>,
     conn_cancel: &CancellationToken,
     request_slots: &Arc<Semaphore>,
@@ -1131,6 +1133,7 @@ where
                 routes,
                 health_registry,
                 vault_gauge,
+                bus_connector,
                 serves.catalog.as_deref(),
             )
             .await?;
@@ -1563,6 +1566,7 @@ async fn handle_control_request(
     routes: &mut Routes,
     health_registry: &LineageRegistry,
     vault_gauge: &VaultGauge,
+    bus_connector: Option<&NatsConnector>,
     catalog_cache: Option<&broca_catalog::CatalogCache>,
 ) -> Result<(), ServeIoError> {
     let request: ModuleControlRequest = match serde_json::from_slice(&frame.body) {
@@ -1835,6 +1839,9 @@ async fn handle_control_request(
             }
             if retention_unreadable > 0 {
                 details.push(format!("{retention_unreadable} retained logs blocked by unreadability without a current projection"));
+            }
+            if bus_connector.is_some_and(NatsConnector::bus_unreachable) {
+                details.push("bus_unreachable".into());
             }
             let status = health_status(&details);
             let detail = (!details.is_empty()).then(|| details.join("; "));
@@ -4514,6 +4521,10 @@ mod queued_admission_tests;
 #[cfg(test)]
 #[path = "serve_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "serve_bus_health_tests.rs"]
+pub(crate) mod bus_health_tests;
 
 #[cfg(test)]
 #[path = "serve_open_failed_wire_classes.rs"]

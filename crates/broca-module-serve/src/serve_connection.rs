@@ -7,6 +7,7 @@ pub(super) struct Services<H> {
     pub handler: Arc<H>,
     pub health_registry: Arc<LineageRegistry>,
     pub vault_gauge: Arc<VaultGauge>,
+    pub bus_connector: Option<Arc<NatsConnector>>,
     pub serves: Arc<crate::serves::Source>,
     pub consumer_routes: crate::consumer_routes::ConsumerRoutes,
     pub vault_auditor: Option<Arc<dyn crate::vault_audit::VaultAuditor>>,
@@ -46,6 +47,7 @@ where
         handler,
         health_registry,
         vault_gauge,
+        bus_connector: None,
         serves: Arc::new(crate::serves::Source {
             catalog: catalog_cache,
             vault: gateway_listing,
@@ -364,6 +366,7 @@ where
                     &services.handler,
                     health_registry,
                     &services.vault_gauge,
+                    services.bus_connector.as_deref(),
                     &services.serves,
                     &conn_cancel,
                     &request_slots,

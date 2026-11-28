@@ -8,8 +8,9 @@ use cortexkit_bus_nats::NatsConnectionEvent;
 use tokio::time::Instant;
 
 const OUTAGE_ERROR_AFTER: Duration = Duration::from_secs(5 * 60);
+const OUTAGE_DEGRADED_AFTER: Duration = Duration::from_secs(60);
 
-/// Logs one outage across automatic retries and explicit redials by the shared publisher.
+/// Tracks one outage across credential issue, automatic retries, and explicit redials.
 #[derive(Default)]
 pub(super) struct ReconnectLog(Mutex<State>);
 
@@ -19,19 +20,51 @@ struct State {
     outage: Option<Outage>,
 }
 
+#[derive(Default)]
 struct Outage {
+    // A disconnect can start the transport log before the first failed connect.
+    failed_since: Option<Instant>,
+    transport: Option<TransportOutage>,
+}
+
+struct TransportOutage {
     started: Instant,
     failed_attempts: u64,
     alarm: tokio::task::AbortHandle,
 }
 
-impl Drop for Outage {
+impl Drop for TransportOutage {
     fn drop(&mut self) {
         self.alarm.abort();
     }
 }
 
+impl State {
+    fn note_connect_failure(&mut self) {
+        self.outage
+            .get_or_insert_with(Outage::default)
+            .failed_since
+            .get_or_insert_with(Instant::now);
+    }
+}
+
 impl ReconnectLog {
+    // A failed credential issue prevents the dial itself. Its existing diagnostics are separate
+    // from the transport outage lines, but only a successful broker connection clears health.
+    pub(super) fn credential_issue_failed(&self) {
+        self.0.lock().unwrap().note_connect_failure();
+    }
+
+    pub(super) fn bus_unreachable(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .outage
+            .as_ref()
+            .and_then(|outage| outage.failed_since)
+            .is_some_and(|since| since.elapsed() >= OUTAGE_DEGRADED_AFTER)
+    }
+
     pub(super) fn observe_dial(
         self: &Arc<Self>,
     ) -> impl Fn(NatsConnectionEvent<'_>) + Send + Sync + 'static {
@@ -53,6 +86,9 @@ impl ReconnectLog {
         match event {
             NatsConnectionEvent::ConnectFailed(error) => {
                 let kind = error.kind();
+                if dial == state.dial {
+                    state.note_connect_failure();
+                }
                 if is_transport_failure(kind) {
                     if dial == state.dial {
                         self.failed_attempt(&mut state, &kind.to_string());
@@ -62,6 +98,9 @@ impl ReconnectLog {
                 }
             }
             NatsConnectionEvent::Event(Event::ClientError(ClientError::Other(reason))) => {
+                if dial == state.dial {
+                    state.note_connect_failure();
+                }
                 // async-nats sends ConnectErrorKind's Display text, not the source error,
                 // for failures inside its automatic reconnect loop.
                 let kind = [
@@ -77,7 +116,11 @@ impl ReconnectLog {
                     }
                 } else {
                     if dial == state.dial {
-                        if let Some(outage) = &mut state.outage {
+                        if let Some(outage) = state
+                            .outage
+                            .as_mut()
+                            .and_then(|outage| outage.transport.as_mut())
+                        {
                             outage.failed_attempts += 1;
                         }
                     }
@@ -85,13 +128,14 @@ impl ReconnectLog {
                 }
             }
             NatsConnectionEvent::Event(Event::Disconnected) if dial == state.dial => {
-                if state.outage.is_none() {
+                let outage = state.outage.get_or_insert_with(Outage::default);
+                if outage.transport.is_none() {
                     tracing::warn!(target: "bus", "ck-bus connection lost; reconnecting");
-                    state.outage = Some(self.start_outage(0));
+                    outage.transport = Some(self.start_transport_outage(0));
                 }
             }
             NatsConnectionEvent::Event(Event::Connected) if dial == state.dial => {
-                if let Some(outage) = state.outage.take() {
+                if let Some(outage) = state.outage.take().and_then(|outage| outage.transport) {
                     tracing::info!(target: "bus", downtime_ms = outage.started.elapsed().as_millis() as u64,
                         attempts = outage.failed_attempts + 1, "ck-bus connection restored");
                 }
@@ -110,17 +154,18 @@ impl ReconnectLog {
     }
 
     fn failed_attempt(self: &Arc<Self>, state: &mut State, reason: &str) {
-        if let Some(outage) = &mut state.outage {
-            outage.failed_attempts += 1;
-            tracing::debug!(target: "bus", reason, attempts = outage.failed_attempts,
+        let outage = state.outage.get_or_insert_with(Outage::default);
+        if let Some(transport) = &mut outage.transport {
+            transport.failed_attempts += 1;
+            tracing::debug!(target: "bus", reason, attempts = transport.failed_attempts,
                 "ck-bus connection retry failed");
         } else {
             tracing::warn!(target: "bus", reason, "ck-bus connection attempt failed; reconnecting");
-            state.outage = Some(self.start_outage(1));
+            outage.transport = Some(self.start_transport_outage(1));
         }
     }
 
-    fn start_outage(self: &Arc<Self>, failed_attempts: u64) -> Outage {
+    fn start_transport_outage(self: &Arc<Self>, failed_attempts: u64) -> TransportOutage {
         let started = Instant::now();
         let log = Arc::downgrade(self);
         // A quiet publisher may have no more callers to check the outage deadline.
@@ -128,13 +173,15 @@ impl ReconnectLog {
             tokio::time::sleep_until(started + OUTAGE_ERROR_AFTER).await;
             if let Some(log) = log.upgrade() {
                 let state = log.0.lock().unwrap();
-                if let Some(outage) = state.outage.as_ref().filter(|outage| outage.started == started) {
+                if let Some(outage) = state.outage.as_ref()
+                    .and_then(|outage| outage.transport.as_ref())
+                    .filter(|outage| outage.started == started) {
                     tracing::error!(target: "bus", downtime_ms = started.elapsed().as_millis() as u64,
                         attempts = outage.failed_attempts, "ck-bus connection is still down");
                 }
             }
         }).abort_handle();
-        Outage {
+        TransportOutage {
             started,
             failed_attempts,
             alarm,
