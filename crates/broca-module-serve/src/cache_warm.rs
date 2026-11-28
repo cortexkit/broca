@@ -41,6 +41,10 @@ impl broca_module::CacheDeclarer for ProviderCacheDeclarer {
             catalog.turn_system_form(&model.provider_module_id, &model.model_id)
         })
     }
+
+    fn writes_tool_addition_notes(&self) -> bool {
+        true
+    }
 }
 
 fn frozen_render_config(

@@ -96,7 +96,7 @@ pub(crate) fn refresh_applied(
 }
 
 // Enable new ledger fields only after deployed readers understand them.
-const WRITE_NOTE_FIELDS: bool = false;
+const WRITE_NOTE_FIELDS: bool = true;
 
 /// The tools the newest delivery naming each tool says to refuse. Older removal notes still
 /// render after a correction, but their tools become callable again. Reading the deliveries in

@@ -1114,15 +1114,30 @@ rebuild. A flush is a durable rebuild boundary; with nothing pending it does not
 bytes or promise a provider cache miss.
 
 broca also declares `plan_notes`: a refresh may wait under the policy `notes_until_rebuild`,
-with a short `system_note` exactly when it changes the system text. The applied plan's system
-text and tools keep rendering, and each run tells the model of the change in notes: the system
-note and the fixed wording for each removed tool, as system-role turns right after the run's
-user turn. A call to a removed tool is refused with that wording. Notes are runner records, so
+with a short `system_note` when it changes the requested system text. The applied plan's system
+text and tools keep rendering, and the next run tells the model about changes from the applied
+plan plus the notes already delivered. A correction goes in a new note rather than replacing
+the earlier one. The system note and the fixed wording for each removed tool appear as
+system-role turns right after the run's user turn. A call to a removed tool is refused with that
+wording. Notes are runner records, so
 reads and history never show them. The change applies in full at the first run that loses the
-prompt cache anyway (a flush, a model change, an effort change that loses the cache, a lapsed
-cache, a refresh adding a compaction provider), once the oldest pending change is six hours old, or at
-once when it changes the system text on a route with no system-role turn (`no_note_form`). Tool
-additions and changed definitions get no note; they wait for that full apply.
+prompt cache anyway (a flush, a model or route change, an effort change that loses the cache,
+a lapsed cache, a refresh adding a compaction provider), once the oldest pending change is six
+hours old, or at once when the resolved route cannot carry the note. The
+OpenAI Responses API, Kimi, and supported Anthropic Messages models can also receive a native
+declaration for a new tool without changing the prefix tool list. The tool is callable from the
+run that delivers it. Changed definitions, and tools that would change the transport settings of
+an already-used provider, wait for the full apply. A delivered note keeps its place and bytes
+until the full apply. If compaction removes the anchor of a native declaration or a text note
+stored for rendering as a content block, the next run can deliver it after its own user turn.
+The same applies when the anchor remains but its position violates the provider's placement rules.
+Older deliveries without the content-block marker keep their original string encoding. A later
+compaction view may restore a note to its original position. But if that view
+keeps a thinking block the provider signed after seeing the redelivered note, moving it back would
+change the prefix covered by that signature, so broca refuses the view.
+When a provider's content filter triggers a retry on another model, broca uses the notes' original
+request format and checks which replies that model would render at their anchors. Notes do not change
+the provider's server-side fallback setting.
 
 With `notice_yield`, the scope owner may mark its own or another module's plan sender
 `yields: true`. An unscoped session refuses the plan member, even if it is false.

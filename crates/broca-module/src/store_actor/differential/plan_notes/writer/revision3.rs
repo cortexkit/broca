@@ -1,6 +1,50 @@
 use super::*;
 
 #[tokio::test]
+async fn an_unanswered_anchor_redelivers_the_notes_in_place_at_next_run() {
+    let first = manifest(&plan("before", &["read"], None, None), "plan-1");
+    let pending = manifest(&plan("after", &["read", "search"], None, None), "plan-2");
+    let (module, executor) = module_with_executor(
+        claude(vec![
+            text_step("a1", "ready"),
+            failed_without_reply(),
+            text_step("a3", "done"),
+        ]),
+        true,
+        true,
+    )
+    .await;
+    send_claude(&module, "r1", Some(&first)).await;
+    refresh(&module, 1, pending, Some(NOTE)).await;
+    send_claude(&module, "r2", None).await;
+    send_claude(&module, "r3", None).await;
+    let requests = executor.provider.inner.calls();
+    assert!(requests[1]
+        .prompt
+        .iter()
+        .any(|message| message.tool_addition.is_some()));
+    assert_eq!(names(&requests[2]), ["read"]);
+    assert_eq!(
+        requests[2].prompt.last().unwrap().tool_addition,
+        requests[1].prompt.last().unwrap().tool_addition
+    );
+    assert!(
+        records(&module)
+            .await
+            .iter()
+            .filter(
+                |record| matches!(record, Record::PlanNotes(delivery) if !delivery.notes.is_empty())
+            )
+            .count()
+            == 2
+    );
+    assert!(!records(&module)
+        .await
+        .iter()
+        .any(|record| matches!(record, Record::RefreshApplied(_))));
+}
+
+#[tokio::test]
 async fn last_resolved_text_form_takes_precedence_over_the_catalog() {
     let first = manifest(&plan("before", &["read"], None, None), "plan-1");
     let pending = manifest(&plan("after", &["read"], None, None), "plan-2");
@@ -115,7 +159,7 @@ async fn no_note_ordered_idle_start_keeps_masters_wire_and_queued_input() {
     assert_eq!(
         normalized,
         serde_json::json!([
-             {"start":"r2"}, {"input":[{"type":"text", "text":"second"}]}, {"apply":1},
+            {"start":"r2"}, {"input":[{"type":"text", "text":"second"}]}, {"apply":1},
         ])
         .as_array()
         .unwrap()
