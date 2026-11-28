@@ -1,0 +1,26 @@
+index|sqlite_autoindex_feeds_1|feeds|
+index|sqlite_autoindex_receipts_1|receipts|
+index|sqlite_autoindex_registrations_1|registrations|
+table|feeds|feeds|CREATE TABLE feeds (
+                 module TEXT PRIMARY KEY,
+                 provider_incarnation TEXT,
+                 seq INTEGER,
+                 ack_owed INTEGER NOT NULL DEFAULT 0
+             )
+table|receipts|receipts|CREATE TABLE receipts (
+                 provider TEXT NOT NULL,
+                 custodian TEXT NOT NULL,
+                 call_key TEXT NOT NULL,
+                 event_id TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 disposition TEXT NOT NULL,
+                 PRIMARY KEY (provider, custodian, call_key, event_id)
+             )
+table|registrations|registrations|CREATE TABLE registrations (
+                 module TEXT NOT NULL,
+                 call_key TEXT NOT NULL,
+                 lineage TEXT NOT NULL,
+                 registration TEXT NOT NULL,
+                 state TEXT NOT NULL DEFAULT 'registered',
+                 PRIMARY KEY (module, call_key)
+             )

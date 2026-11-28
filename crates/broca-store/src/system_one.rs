@@ -220,6 +220,7 @@ fn to_u64(value: Option<i64>) -> Option<u64> {
 impl SystemOneStore {
     /// Open (creating when absent) the store file, owner-only.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let opened_at = std::time::Instant::now();
         let path = path.as_ref();
         #[cfg(windows)]
         super::prepare_private_sqlite(path).map_err(|e| SystemOneStoreError(e.to_string()))?;
@@ -231,6 +232,7 @@ impl SystemOneStore {
                 .open(path)
                 .map_err(|e| SystemOneStoreError(format!("create {}: {e}", path.display())))?;
         }
+        let prepared_at = std::time::Instant::now();
         super::sqlite_open_observed();
         let conn = Connection::open(path)?;
         let canonical = path
@@ -242,6 +244,10 @@ impl SystemOneStore {
             .expect("a canonical path has a parent")
             .to_path_buf();
         let owner_prefix = format!("{}.owner-", name.to_string_lossy());
+        tracing::debug!(target: "lifecycle",
+            prepare_ms = prepared_at.duration_since(opened_at).as_millis() as u64,
+            sqlite_open_and_canonicalize_ms = prepared_at.elapsed().as_millis() as u64,
+            "startup classifier schema begin");
         Self::from_connection(conn, Some((owner_dir, owner_prefix)))
     }
 
@@ -250,14 +256,32 @@ impl SystemOneStore {
     }
 
     fn from_connection(
-        conn: Connection,
+        mut conn: Connection,
         owner_location: Option<(PathBuf, String)>,
     ) -> Result<Self> {
         crate::busy::configure_writer_connection(&conn)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=DELETE;
-             PRAGMA synchronous=FULL;
-             CREATE TABLE IF NOT EXISTS batch (
+        Self::initialize_schema(&mut conn)?;
+        let (owner_dir, owner_prefix) = match owner_location {
+            Some((dir, prefix)) => (Some(dir), prefix),
+            None => (None, String::new()),
+        };
+        Ok(Self {
+            conn: Mutex::new(conn),
+            fact_generation: AtomicU64::new(0),
+            owner_dir,
+            owner_prefix,
+            owner_lifetimes: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn initialize_schema(conn: &mut Connection) -> Result<()> {
+        let schema_at = std::time::Instant::now();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+        // CREATE and all column checks and additions share one durable commit. Keep
+        // the checks inside the transaction so they describe the schema being changed.
+        let schema = conn.transaction()?;
+        schema.execute_batch(
+            "CREATE TABLE IF NOT EXISTS batch (
                  role TEXT NOT NULL,
                  batch_id TEXT NOT NULL,
                  model TEXT NOT NULL,
@@ -290,9 +314,12 @@ impl SystemOneStore {
                   spend_nanos INTEGER NOT NULL
               );",
         )?;
-        let has_scope = conn.prepare("SELECT scope_json FROM batch").is_ok();
+        let migrations_at = std::time::Instant::now();
+        tracing::debug!(target: "lifecycle", elapsed_ms = migrations_at.duration_since(schema_at).as_millis() as u64,
+            "startup classifier schema create complete");
+        let has_scope = schema.prepare("SELECT scope_json FROM batch").is_ok();
         if !has_scope {
-            conn.execute("ALTER TABLE batch ADD COLUMN scope_json TEXT", [])?;
+            schema.execute("ALTER TABLE batch ADD COLUMN scope_json TEXT", [])?;
         }
         for column in [
             "routing_choice TEXT",
@@ -300,21 +327,20 @@ impl SystemOneStore {
             "routing_pending INTEGER",
         ] {
             let name = column.split_once(' ').expect("a column has a type").0;
-            if conn.prepare(&format!("SELECT {name} FROM batch")).is_err() {
-                conn.execute(&format!("ALTER TABLE batch ADD COLUMN {column}"), [])?;
+            if schema
+                .prepare(&format!("SELECT {name} FROM batch"))
+                .is_err()
+            {
+                schema.execute(&format!("ALTER TABLE batch ADD COLUMN {column}"), [])?;
             }
         }
-        let (owner_dir, owner_prefix) = match owner_location {
-            Some((dir, prefix)) => (Some(dir), prefix),
-            None => (None, String::new()),
-        };
-        Ok(Self {
-            conn: Mutex::new(conn),
-            fact_generation: AtomicU64::new(0),
-            owner_dir,
-            owner_prefix,
-            owner_lifetimes: Mutex::new(HashMap::new()),
-        })
+        tracing::debug!(target: "lifecycle", elapsed_ms = migrations_at.elapsed().as_millis() as u64,
+            "startup classifier schema migrations complete");
+        let commit_at = std::time::Instant::now();
+        schema.commit()?;
+        tracing::debug!(target: "lifecycle", elapsed_ms = commit_at.elapsed().as_millis() as u64,
+            "startup classifier schema commit complete");
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {

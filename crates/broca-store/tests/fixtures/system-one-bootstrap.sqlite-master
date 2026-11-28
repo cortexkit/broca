@@ -1,0 +1,35 @@
+index|batch_admitted|batch|CREATE INDEX batch_admitted ON batch (admitted_at_ms)
+index|sqlite_autoindex_batch_1|batch|
+index|sqlite_autoindex_item_outcome_1|item_outcome|
+index|sqlite_autoindex_usage_outbox_1|usage_outbox|
+table|batch|batch|CREATE TABLE batch (
+                 role TEXT NOT NULL,
+                 batch_id TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 identity TEXT NOT NULL,
+                 body_digest TEXT NOT NULL,
+                 frozen_row TEXT NOT NULL,
+                 ceiling_nanos INTEGER,
+                 spent_nanos INTEGER NOT NULL DEFAULT 0,
+                 state TEXT NOT NULL CHECK (state IN ('idle', 'running')),
+                 owner TEXT,
+                 started_at_ms INTEGER,
+                 admitted_at_ms INTEGER NOT NULL, scope_json TEXT, routing_choice TEXT, routing_runs TEXT, routing_pending INTEGER,
+                 PRIMARY KEY (role, batch_id)
+             )
+table|item_outcome|item_outcome|CREATE TABLE item_outcome (
+                 role TEXT NOT NULL,
+                 batch_id TEXT NOT NULL,
+                 item_index INTEGER NOT NULL,
+                 kind TEXT NOT NULL CHECK (kind IN ('answered', 'failed')),
+                 body TEXT NOT NULL,
+                 input_tokens INTEGER,
+                 output_tokens INTEGER,
+                 recorded_at_ms INTEGER NOT NULL,
+                 PRIMARY KEY (role, batch_id, item_index)
+              )
+table|usage_outbox|usage_outbox|CREATE TABLE usage_outbox (
+                  fact_id TEXT PRIMARY KEY,
+                  fact_json TEXT NOT NULL,
+                  spend_nanos INTEGER NOT NULL
+              )

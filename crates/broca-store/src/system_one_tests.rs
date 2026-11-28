@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
 use super::*;
 
 const ROLE: &str = "classifier";
@@ -15,6 +17,59 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("system-one.db")
+}
+
+fn bootstrap_path(name: &str) -> PathBuf {
+    let root = broca_test_support::scratch_root().join(name);
+    broca_owner_only::create_dir_all(&root).unwrap();
+    root.join("system-one.db")
+}
+
+#[test]
+fn classifier_cold_bootstrap_matches_legacy_schema() {
+    let path = bootstrap_path("classifier-bootstrap-schema");
+    drop(SystemOneStore::open(&path).unwrap());
+    let conn = Connection::open(path).unwrap();
+    let actual: String = conn
+        .query_row(
+            "SELECT group_concat(type || '|' || name || '|' || tbl_name || '|' || coalesce(sql, ''), char(10))
+             FROM (SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let legacy = include_str!("../tests/fixtures/system-one-bootstrap.sqlite-master");
+    assert_eq!(
+        actual.lines().collect::<Vec<_>>(),
+        legacy.lines().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn interrupted_classifier_cold_bootstrap_leaves_no_schema() {
+    let path = bootstrap_path("classifier-bootstrap-interrupted");
+    crate::create_private_sqlite(&path).unwrap();
+    let mut conn = Connection::open(&path).unwrap();
+    conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+        AuthAction::AlterTable {
+            table_name: "batch",
+            ..
+        } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }));
+    let error = SystemOneStore::initialize_schema(&mut conn).unwrap_err();
+    assert!(error.0.contains("not authorized"), "{error}");
+    drop(conn);
+    let conn = Connection::open(&path).unwrap();
+    let objects: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        objects, 0,
+        "an interrupted column migration must roll back earlier CREATEs"
+    );
+    drop(conn);
+    SystemOneStore::open(&path).unwrap();
 }
 
 fn claim<'a>(

@@ -214,12 +214,21 @@ impl GrantsStore {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
+    fn from_connection(mut conn: Connection) -> Result<Self> {
         crate::busy::configure_writer_connection(&conn)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=DELETE;
-             PRAGMA synchronous=FULL;
-             CREATE TABLE IF NOT EXISTS grants (
+        Self::initialize_schema(&mut conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            terminal_listeners: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn initialize_schema(conn: &mut Connection) -> Result<()> {
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+        // The tables and their indexes need one durable commit, not a flush per statement.
+        let schema = conn.transaction()?;
+        schema.execute_batch(
+            "CREATE TABLE IF NOT EXISTS grants (
                  id TEXT PRIMARY KEY, holder TEXT NOT NULL, project TEXT, provider TEXT NOT NULL,
                  kind TEXT NOT NULL, scope TEXT, source_card_id TEXT NOT NULL UNIQUE,
                  created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER, body TEXT NOT NULL
@@ -254,10 +263,8 @@ impl GrantsStore {
                  principal TEXT PRIMARY KEY, seq INTEGER NOT NULL
              );",
         )?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            terminal_listeners: Mutex::new(Vec::new()),
-        })
+        schema.commit()?;
+        Ok(())
     }
 
     fn write<T>(&self, action: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
@@ -1017,6 +1024,65 @@ fn finalize(
     tx.execute("INSERT INTO late_cursors VALUES (?1,?2) ON CONFLICT(principal) DO UPDATE SET seq=excluded.seq", params![principal, seq])?;
     terminal.push((row.batch_id, row.admitted_at_ms));
     Ok(true)
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::path::PathBuf;
+
+    fn path(name: &str) -> PathBuf {
+        let root = broca_test_support::scratch_root().join(name);
+        broca_owner_only::create_dir_all(&root).unwrap();
+        root.join("grants.db")
+    }
+
+    #[test]
+    fn grants_cold_bootstrap_matches_legacy_schema() {
+        let path = path("grants-bootstrap-schema");
+        drop(GrantsStore::open(&path).unwrap());
+        let conn = Connection::open(path).unwrap();
+        let actual: String = conn
+            .query_row(
+                "SELECT group_concat(type || '|' || name || '|' || tbl_name || '|' || coalesce(sql, ''), char(10))
+                 FROM (SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy = include_str!("../tests/fixtures/grants-bootstrap.sqlite-master");
+        assert_eq!(
+            actual.lines().collect::<Vec<_>>(),
+            legacy.lines().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn interrupted_grants_cold_bootstrap_leaves_no_schema() {
+        let path = path("grants-bootstrap-interrupted");
+        crate::create_private_sqlite(&path).unwrap();
+        let mut conn = Connection::open(&path).unwrap();
+        conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::CreateTable {
+                table_name: "late_cursors",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }));
+        let error = GrantsStore::initialize_schema(&mut conn).unwrap_err();
+        assert!(error.0.contains("not authorized"), "{error}");
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let objects: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            objects, 0,
+            "an interrupted final CREATE must roll back earlier objects"
+        );
+        drop(conn);
+        GrantsStore::open(&path).unwrap();
+    }
 }
 
 #[cfg(test)]

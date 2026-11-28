@@ -949,11 +949,13 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
             llm_tools_identity.clone(),
         )),
     ));
+    let grants_store = Arc::new(
+        broca_store::grants::GrantsStore::open(state_root.join("grants.db"))
+            .map_err(|error| ServeIoError(format!("open grants store: {error}")))?,
+    );
+    startup.finished("llm_tools_store_open");
     let held_calls = Arc::new(broca_module_serve::llm_tools::held::HeldCalls::new(
-        Arc::new(
-            broca_store::grants::GrantsStore::open(state_root.join("grants.db"))
-                .map_err(|error| ServeIoError(format!("open grants store: {error}")))?,
-        ),
+        grants_store,
         broca_module_serve::serve::process_launch_id().into(),
     ));
     held_calls
@@ -990,7 +992,7 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
     llm_tools
         .recover_consent()
         .map_err(|error| ServeIoError(format!("recover consent cards: {error}")))?;
-    startup.finished("llm_tools_store_and_recovery");
+    startup.finished("llm_tools_recovery");
     let door = Arc::new(broca_subc::session_door::SessionDoorClient::new(
         plan_conn.clone(),
         broca_protocol::BindIdentity::new(state_root.clone(), "broca", "agent-data"),

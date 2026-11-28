@@ -1,0 +1,44 @@
+index|held_calls_card|held_calls|CREATE INDEX held_calls_card ON held_calls(dedup_key, admitted_at_ms)
+index|held_calls_due|held_calls|CREATE INDEX held_calls_due ON held_calls(state, deadline_at_ms)
+index|late_results_principal|late_results|CREATE INDEX late_results_principal ON late_results(principal, seq)
+index|sqlite_autoindex_cards_1|cards|
+index|sqlite_autoindex_cursors_1|cursors|
+index|sqlite_autoindex_denies_1|denies|
+index|sqlite_autoindex_generations_1|generations|
+index|sqlite_autoindex_grants_1|grants|
+index|sqlite_autoindex_grants_2|grants|
+index|sqlite_autoindex_held_calls_1|held_calls|
+index|sqlite_autoindex_late_cursors_1|late_cursors|
+index|sqlite_autoindex_late_results_1|late_results|
+table|cards|cards|CREATE TABLE cards (
+                 dedup_key TEXT PRIMARY KEY, body TEXT NOT NULL
+             )
+table|cursors|cursors|CREATE TABLE cursors (
+                 scope TEXT PRIMARY KEY, cursor TEXT NOT NULL
+             )
+table|denies|denies|CREATE TABLE denies (
+                 agent_id TEXT NOT NULL, scope TEXT NOT NULL, provider TEXT NOT NULL,
+                 source_card_id TEXT NOT NULL, PRIMARY KEY(agent_id, scope, provider)
+             )
+table|generations|generations|CREATE TABLE generations (
+                 agent_id TEXT NOT NULL, provider TEXT NOT NULL, generation INTEGER NOT NULL,
+                 PRIMARY KEY(agent_id, provider)
+             )
+table|grants|grants|CREATE TABLE grants (
+                 id TEXT PRIMARY KEY, holder TEXT NOT NULL, project TEXT, provider TEXT NOT NULL,
+                 kind TEXT NOT NULL, scope TEXT, source_card_id TEXT NOT NULL UNIQUE,
+                 created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER, body TEXT NOT NULL
+             )
+table|held_calls|held_calls|CREATE TABLE held_calls (
+                 batch_id TEXT PRIMARY KEY, principal TEXT NOT NULL, dedup_key TEXT NOT NULL,
+                 state TEXT NOT NULL, admitted_at_ms INTEGER NOT NULL,
+                 deadline_at_ms INTEGER NOT NULL, body TEXT NOT NULL
+             )
+table|late_cursors|late_cursors|CREATE TABLE late_cursors (
+                 principal TEXT PRIMARY KEY, seq INTEGER NOT NULL
+             )
+table|late_results|late_results|CREATE TABLE late_results (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL UNIQUE,
+                 principal TEXT NOT NULL, expires_at_ms INTEGER NOT NULL
+             )
+table|sqlite_sequence|sqlite_sequence|CREATE TABLE sqlite_sequence(name,seq)

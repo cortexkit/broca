@@ -213,6 +213,7 @@ impl LateResultsStore {
     /// journal: the frames there are the projection's last transaction, and replaying them
     /// over the replaced file would resurrect content the rebuild exists to regenerate.
     pub fn open_with_wal_recovery(path: &Path, replay_journal: bool) -> Result<Self, String> {
+        let opened_at = std::time::Instant::now();
         let path = path.to_path_buf();
         if !path.try_exists().map_err(|error| error.to_string())? {
             let root = path.parent().ok_or("intake store has no state root")?;
@@ -237,16 +238,47 @@ impl LateResultsStore {
         // process umask.
         broca_store::create_private_sqlite(&path)
             .map_err(|error| format!("create {} owner-only: {error}", path.display()))?;
+        let prepared_at = std::time::Instant::now();
         #[cfg(test)]
         boot_io::record(|counts| counts.opens += 1);
-        let connection = Connection::open(&path).map_err(|error| error.to_string())?;
+        let mut connection = Connection::open(&path).map_err(|error| error.to_string())?;
+        let schema_at = std::time::Instant::now();
+        tracing::debug!(target: "lifecycle",
+            prepare_ms = prepared_at.duration_since(opened_at).as_millis() as u64,
+            sqlite_open_ms = schema_at.duration_since(prepared_at).as_millis() as u64,
+            "startup late-results schema begin");
         #[cfg(test)]
         boot_io::record(|counts| counts.schema_batches += 1);
+        Self::initialize_schema(&mut connection)?;
+        tracing::debug!(target: "lifecycle", elapsed_ms = schema_at.elapsed().as_millis() as u64,
+            "startup late-results schema complete");
+        let store = Self {
+            connection: Mutex::new(connection),
+            path,
+            held_history: std::sync::atomic::AtomicBool::new(false),
+        };
+        // Backfill the rows Broca needs to send cancellation requests to providers after
+        // a crash. Databases without call registrations need no writes for this.
+        let calls: Vec<_> = store
+            .unpruned_registration_rows()?
+            .into_iter()
+            .map(|row| row.call)
+            .collect();
+        store.register_calls(&calls)?;
+        Ok(store)
+    }
+
+    fn initialize_schema(connection: &mut Connection) -> Result<(), String> {
         connection
+            .execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;")
+            .map_err(|error| error.to_string())?;
+        // Commit the fresh schema once without weakening the sync policy.
+        let schema = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        schema
             .execute_batch(
-                "PRAGMA journal_mode = DELETE;
-             PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS registrations (
+                "CREATE TABLE IF NOT EXISTS registrations (
                  module TEXT NOT NULL,
                  call_key TEXT NOT NULL,
                  lineage TEXT NOT NULL,
@@ -271,20 +303,11 @@ impl LateResultsStore {
              );",
             )
             .map_err(|error| error.to_string())?;
-        let store = Self {
-            connection: Mutex::new(connection),
-            path,
-            held_history: std::sync::atomic::AtomicBool::new(false),
-        };
-        // Older projections may have registrations but no withdrawal outbox yet. Backfill
-        // only those rows; ordinary roots with no registration history remain write-free.
-        let calls: Vec<_> = store
-            .unpruned_registration_rows()?
-            .into_iter()
-            .map(|row| row.call)
-            .collect();
-        store.register_calls(&calls)?;
-        Ok(store)
+        #[cfg(test)]
+        if boot_io::INTERRUPT_SCHEMA.with(|pending| pending.replace(false)) {
+            return Err("interrupted before committing the late-results schema".into());
+        }
+        schema.commit().map_err(|error| error.to_string())
     }
 
     pub fn path(&self) -> &Path {
@@ -936,6 +959,50 @@ mod tests {
         broca_test_support::scratch_root().join(name)
     }
 
+    #[test]
+    fn late_results_cold_bootstrap_matches_legacy_schema() {
+        let root = scratch("late-results-bootstrap-schema");
+        broca_owner_only::create_dir_all(&root).unwrap();
+        let path = root.join("late-results.db");
+        drop(LateResultsStore::open(&path).unwrap());
+        let conn = Connection::open(path).unwrap();
+        let actual: String = conn
+            .query_row(
+                "SELECT group_concat(type || '|' || name || '|' || tbl_name || '|' || coalesce(sql, ''), char(10))
+                 FROM (SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy = include_str!("../tests/fixtures/late-results-bootstrap.sqlite-master");
+        assert_eq!(
+            actual.lines().collect::<Vec<_>>(),
+            legacy.lines().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn interrupted_late_results_cold_bootstrap_leaves_no_schema() {
+        let root = scratch("late-results-bootstrap-interrupted");
+        broca_owner_only::create_dir_all(&root).unwrap();
+        let path = root.join("late-results.db");
+        boot_io::INTERRUPT_SCHEMA.with(|pending| pending.set(true));
+        assert_eq!(
+            LateResultsStore::open(&path).err().as_deref(),
+            Some("interrupted before committing the late-results schema")
+        );
+        let conn = Connection::open(&path).unwrap();
+        let objects: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            objects, 0,
+            "first open must not leave partial tables or indexes"
+        );
+        drop(conn);
+        LateResultsStore::open(&path).unwrap();
+    }
+
     struct NoWithdrawal;
     #[async_trait::async_trait]
     impl crate::held_withdrawals::WithdrawTransport for NoWithdrawal {
@@ -1372,6 +1439,7 @@ mod boot_io {
         pub schema_batches: usize,
     }
     thread_local! { static COUNTS: std::cell::Cell<Counts> = const { std::cell::Cell::new(Counts { opens: 0, reads: 0, writes: 0, schema_batches: 0 }) }; }
+    thread_local! { pub static INTERRUPT_SCHEMA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     pub fn record(update: impl FnOnce(&mut Counts)) {
         COUNTS.with(|counts| {
             let mut value = counts.get();
