@@ -57,7 +57,16 @@ fn frozen_render_config(
 /// The frozen render config of a session that can be warmed, or why it cannot.
 pub fn warmable_config(
     config: &broca_records::record::RunConfig,
+    used_fallback: bool,
 ) -> Result<FrozenRenderConfig, WarmError> {
+    if broca_core::provider_errors::legacy_anthropic_echo_on_attempt(
+        &config.frozen_render_config,
+        used_fallback,
+    ) {
+        return Err(WarmError::Unsupported(
+            broca_core::provider_errors::LEGACY_ANTHROPIC_ECHO.into(),
+        ));
+    }
     let frozen = frozen_render_config(config).map_err(WarmError::Unsupported)?;
     broca_provider::cache_warm::cache_declaration(
         &config.model.provider_module_id,

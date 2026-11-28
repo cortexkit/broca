@@ -75,7 +75,6 @@ async fn a_full_apply_does_not_treat_already_projected_system_text_as_the_origin
     frozen.reasoning = ReasoningPolicy::AnthropicInterleaved {
         budget_tokens: 1024,
         last_turn_only: true,
-        echo_scope: broca_provider::policy::ThinkingEchoScope::AllAssistantMessages,
         cross_model: CrossModelThinking::SameModelOnly,
     };
     ROUTE

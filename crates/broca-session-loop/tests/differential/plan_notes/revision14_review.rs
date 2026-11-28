@@ -313,42 +313,6 @@ async fn compaction_notice_names_the_new_input_without_retaining_earlier_thinkin
 }
 
 #[tokio::test]
-async fn the_reader_can_rebuild_an_attempt_using_the_still_supported_legacy_echo() {
-    let target = route(OPUS, 2);
-    let mut raw = serde_json::to_value(&target.1).unwrap();
-    raw["reasoning"]
-        .as_object_mut()
-        .unwrap()
-        .remove("echo_scope");
-    let scenario = reader_scenario(vec![signed("legacy", false)]);
-    let source = RAW_RENDER
-        .scope(
-            raw,
-            ROUTE.scope(
-                target,
-                Box::pin(new_source(&scenario, None, scenario.steps.clone())),
-            ),
-        )
-        .await;
-    let stored = historical::session_at(&source.records).await;
-    let parts = MemoryParts {
-        parts: source.parts,
-    };
-    let records = stored.open_log_records().await.unwrap();
-    let replay = broca_session_loop::recorded_request::rebuild(
-        &stored,
-        &records,
-        &parts,
-        &bind(),
-        "r1",
-        Some(1),
-        broca_session_loop::recorded_request::Through::Request,
-    )
-    .await;
-    assert!(replay.is_ok(), "{replay:?}");
-}
-
-#[tokio::test]
 async fn an_intact_presend_resume_of_run_two_keeps_the_existing_prefix() {
     let config = route(OPUS, 4);
     let first = send("r1", config.clone(), None, vec![signed("old", false)]).await;

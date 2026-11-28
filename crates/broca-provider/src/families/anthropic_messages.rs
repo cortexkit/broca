@@ -19,7 +19,7 @@ use crate::cache_markers::{
 use crate::claude_code_persona as persona_rules;
 use crate::families::apply_generation_controls;
 use crate::normalize::AnthropicNormalizer;
-use crate::policy::{ReasoningPolicy, SystemPromptPolicy, ThinkingEchoScope};
+use crate::policy::{ReasoningPolicy, SystemPromptPolicy};
 use crate::sse::SseDecoder;
 use crate::wire::{
     AuthHandle, CacheClass, CacheTail, CacheTtl, ClaudeCodePersona, FrozenRenderConfig, HttpMethod,
@@ -712,18 +712,13 @@ fn rendered_conversation<'a>(
     name_map: &'a crate::tool_name_alias::ToolNameMap,
     media: Option<&'a crate::media_render::MediaRender<'_>>,
 ) -> Vec<(Node<'a>, Option<u32>, usize)> {
-    // Interleaved thinking: which assistant messages echo their signed thinking is decided by
-    // the frozen `echo_scope` -- either just the last assistant message (the original rule,
-    // kept so runs frozen under it resume with their recorded bytes) or every assistant
-    // message (what current runs freeze). `last_turn_only: false` echoes no reasoning at all.
-    let echo_scope = match frozen.reasoning {
+    let echo = matches!(
+        frozen.reasoning,
         ReasoningPolicy::AnthropicInterleaved {
             last_turn_only: true,
-            echo_scope,
             ..
-        } => Some(echo_scope),
-        _ => None,
-    };
+        }
+    );
     // Whose signed thinking may be echoed to the request's model is frozen too (see
     // `CrossModelThinking`). A config recorded before that rule existed reads back as the
     // original same-model-only rule, so a resumed run keeps its recorded bytes.
@@ -731,27 +726,13 @@ fn rendered_conversation<'a>(
         ReasoningPolicy::AnthropicInterleaved { cross_model, .. } => cross_model,
         _ => crate::policy::CrossModelThinking::SameModelOnly,
     };
-    let non_system: Vec<&Message> = opts
-        .prompt
-        .iter()
-        .filter(|m| m.role != Role::System || m.turn_system)
-        .collect();
-    // The index of the first message whose thinking may be echoed, computed in ONE place
-    // (`first_echoed_message`) so the request body and the tests' reference renderer read the
-    // same positional cutoff and cannot drift.
-    let first_echoed = echo_scope.and_then(|scope| first_echoed_message(scope, &non_system));
     opts.prompt
         .iter()
         .enumerate()
         .filter(|(_, m)| m.role != Role::System || m.turn_system)
-        .enumerate()
-        .map(|(i, (prompt_index, m))| {
-            // Echo signed thinking back only when BOTH: the message is in the current turn
-            // (the interleaved-thinking positional rule above) AND the frozen cross-model rule
-            // lets its producing model's thinking reach the CURRENT model. Both rules fail
-            // closed on an unknown origin. Only assistant content renders thinking, so other
-            // roles in the range are unaffected.
-            let positional = first_echoed.is_some_and(|first| i >= first);
+        .map(|(prompt_index, m)| {
+            // Echo each retained reply's signed thinking while its origin fits the run's
+            // cross-model policy. Compaction, not reply position, prunes older thinking.
             let echo_safe = crate::families::anthropic_thinking_is_echo_safe(
                 cross_model,
                 m.origin.as_ref(),
@@ -760,7 +741,7 @@ fn rendered_conversation<'a>(
             (
                 convert_message(
                     m,
-                    positional && echo_safe,
+                    echo && echo_safe,
                     frozen.server_side_fallback,
                     id_map,
                     name_map,
@@ -1271,28 +1252,6 @@ fn convert_tool_choice(tc: &ToolChoice, name_map: &crate::tool_name_alias::ToolN
 /// violates it is aliased (see [`crate::tool_id_alias`]).
 fn id_grammar() -> crate::tool_id_alias::IdGrammar {
     crate::tool_id_alias::IdGrammar::anthropic()
-}
-
-/// The index of the first non-system message whose assistant thinking is echoed under
-/// `scope`, or `None` when no assistant message qualifies. Every assistant message at or
-/// after this index echoes its signed thinking (still subject to the cross-model
-/// echo-safety gate applied per message); assistant messages before it are stripped.
-///
-/// This is the ONE place the echo scope becomes a positional cutoff. Both the request body
-/// and the tests' reference renderer call it, so they cannot disagree about which messages
-/// keep their thinking.
-fn first_echoed_message(scope: ThinkingEchoScope, non_system: &[&Message]) -> Option<usize> {
-    match scope {
-        // Keep every assistant message's thinking: the cutoff is the first message, so no
-        // assistant message is ever stripped by position. Recency pruning of stale thinking
-        // belongs to the reduction transform, not here.
-        ThinkingEchoScope::AllAssistantMessages => Some(0),
-        // Only the last assistant message. Its index is the cutoff, and nothing after it is
-        // an assistant message, so exactly that one message echoes.
-        ThinkingEchoScope::LastAssistantMessage => {
-            non_system.iter().rposition(|m| m.role == Role::Assistant)
-        }
-    }
 }
 
 /// Convert one canonical message to an Anthropic message. A `Tool` role becomes a
@@ -1806,52 +1765,8 @@ mod tests {
         opts
     }
 
-    /// Render the messages under the legacy last-assistant-message rule, without the
-    /// empty-message filter `build_request_body` applies. It reads the positional cutoff from
-    /// the SAME `first_echoed_message` the request body uses, pinned to the legacy scope, so
-    /// the two can never disagree about which messages echo -- only the filter differs.
-    fn legacy_unfiltered_messages(frozen: &FrozenRenderConfig, opts: &CallOptions) -> Vec<Value> {
-        let echo_scope = match frozen.reasoning {
-            ReasoningPolicy::AnthropicInterleaved {
-                last_turn_only: true,
-                ..
-            } => Some(ThinkingEchoScope::LastAssistantMessage),
-            _ => None,
-        };
-        let non_system = opts
-            .prompt
-            .iter()
-            .filter(|message| message.role != Role::System)
-            .collect::<Vec<_>>();
-        let id_map = crate::tool_id_alias::ToolIdMap::build(&opts.prompt, &id_grammar());
-        let name_map = crate::tool_name_alias::map_for(frozen, &opts.tools, &opts.prompt);
-        let first_echoed = echo_scope.and_then(|scope| first_echoed_message(scope, &non_system));
-
-        non_system
-            .iter()
-            .enumerate()
-            .map(|(index, message)| {
-                let positional = first_echoed.is_some_and(|first| index >= first);
-                let echo_safe = crate::families::signed_reasoning_is_echo_safe(
-                    message.origin.as_ref(),
-                    opts.target_model.as_ref(),
-                );
-                // The reference renderer mirrors the request's handoff echo rule.
-                convert_message(
-                    message,
-                    positional && echo_safe,
-                    frozen.server_side_fallback,
-                    &id_map,
-                    &name_map,
-                    None,
-                )
-                .to_value()
-            })
-            .collect()
-    }
-
     #[test]
-    fn cross_model_reasoning_only_turn_contrasts_with_legacy_empty_message() {
+    fn cross_model_reasoning_only_turn_does_not_render_an_empty_message() {
         let frozen = anthropic_frozen_config("claude-opus-4-8");
         let mut opts = opts(vec![
             user_message("first question"),
@@ -1866,9 +1781,6 @@ mod tests {
         ]);
         opts.target_model = Some(ModelHandle::new("anthropic", "claude-opus-4-8"));
 
-        let legacy = legacy_unfiltered_messages(&frozen, &opts);
-        assert!(legacy[1]["content"].as_array().unwrap().is_empty());
-
         let fixed = build_request_body(&frozen, &opts);
         let messages = fixed["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
@@ -1877,31 +1789,6 @@ mod tests {
                 .as_array()
                 .is_some_and(|content| !content.is_empty())
         }));
-    }
-
-    #[test]
-    fn nonempty_prompt_is_byte_identical_to_legacy_unfiltered_renderer() {
-        let frozen = anthropic_frozen_config("claude-opus-4-8");
-        let mut opts = opts(vec![
-            user_message("first question"),
-            Message::assistant_from(
-                vec![ContentBlock::Text {
-                    text: "visible answer".into(),
-                }],
-                ModelHandle::new("anthropic", "claude-opus-4-8"),
-            ),
-            user_message("continue"),
-        ]);
-        opts.target_model = Some(ModelHandle::new("anthropic", "claude-opus-4-8"));
-
-        let fixed = build_request_body(&frozen, &opts);
-        let mut legacy = fixed.clone();
-        legacy["messages"] = Value::Array(legacy_unfiltered_messages(&frozen, &opts));
-
-        assert_eq!(
-            serde_json::to_vec(&fixed).unwrap(),
-            serde_json::to_vec(&legacy).unwrap()
-        );
     }
 
     #[test]
@@ -2029,10 +1916,7 @@ mod tests {
         let frozen = anthropic_frozen_config("claude-opus-4-8");
         assert!(matches!(
             frozen.reasoning,
-            ReasoningPolicy::AnthropicInterleaved {
-                echo_scope: ThinkingEchoScope::AllAssistantMessages,
-                ..
-            }
+            ReasoningPolicy::AnthropicInterleaved { .. }
         ));
         let requests = tool_loop_requests(&frozen, 6);
         for (k, pair) in requests.windows(2).enumerate() {
@@ -2074,25 +1958,6 @@ mod tests {
         assert!(serde_json::to_string(last)
             .unwrap()
             .contains("earlier turn thinking"));
-    }
-
-    /// The legacy scope still strips thinking from every assistant message but the last, which
-    /// is why its step prefixes change: this pins the behaviour recorded runs resume with.
-    #[test]
-    fn legacy_echo_scope_still_strips_all_but_the_last_assistant_message() {
-        let mut frozen = anthropic_frozen_config("claude-opus-4-8");
-        frozen.reasoning = ReasoningPolicy::AnthropicInterleaved {
-            budget_tokens: 1024,
-            last_turn_only: true,
-            echo_scope: ThinkingEchoScope::LastAssistantMessage,
-            cross_model: crate::policy::CrossModelThinking::SameModelOnly,
-        };
-        let requests = tool_loop_requests(&frozen, 3);
-        let this = requests[1]["messages"].as_array().unwrap();
-        let next = requests[2]["messages"].as_array().unwrap();
-        let last_assistant = this.iter().rposition(|m| m["role"] == "assistant").unwrap();
-        assert_eq!(this[last_assistant]["content"][0]["type"], "thinking");
-        assert_ne!(next[last_assistant]["content"][0]["type"], "thinking");
     }
 
     /// Render every request of a conversation with TWO user turns, each followed by a tool
@@ -2162,10 +2027,7 @@ mod tests {
         let frozen = anthropic_frozen_config("claude-opus-4-8");
         assert!(matches!(
             frozen.reasoning,
-            ReasoningPolicy::AnthropicInterleaved {
-                echo_scope: ThinkingEchoScope::AllAssistantMessages,
-                ..
-            }
+            ReasoningPolicy::AnthropicInterleaved { .. }
         ));
         let requests = two_user_turn_requests(&frozen, 4, 4);
         // The final request must carry both loops' assistant messages, so the comparison
@@ -2189,25 +2051,6 @@ mod tests {
             first_unstable_prefix(&requests),
             None,
             "every request's prefix through its last assistant message is byte-stable"
-        );
-    }
-
-    /// The legacy last-assistant-message scope strips every assistant message but the last, so
-    /// an earlier step's prefix does NOT survive into a later request: this is the instability
-    /// the keep-all scope removes, pinned here so the positive test above is not vacuous.
-    #[test]
-    fn legacy_scope_prefix_is_not_stable_across_a_tool_loop() {
-        let mut frozen = anthropic_frozen_config("claude-opus-4-8");
-        frozen.reasoning = ReasoningPolicy::AnthropicInterleaved {
-            budget_tokens: 1024,
-            last_turn_only: true,
-            echo_scope: ThinkingEchoScope::LastAssistantMessage,
-            cross_model: crate::policy::CrossModelThinking::SameModelOnly,
-        };
-        let requests = two_user_turn_requests(&frozen, 4, 4);
-        assert!(
-            first_unstable_prefix(&requests).is_some(),
-            "the legacy scope must break prefix stability by stripping earlier thinking"
         );
     }
 

@@ -537,7 +537,6 @@ pub fn default_quirks(family: WireFamilyId) -> Quirks {
             reasoning: ReasoningPolicy::AnthropicInterleaved {
                 budget_tokens: 1024,
                 last_turn_only: true,
-                echo_scope: crate::policy::ThinkingEchoScope::AllAssistantMessages,
                 cross_model: crate::policy::CrossModelThinking::AnyAnthropicModel,
             },
             tool_id: ToolIdPolicy::Passthrough,

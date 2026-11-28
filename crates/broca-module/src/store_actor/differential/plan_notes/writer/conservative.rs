@@ -34,7 +34,6 @@ fn config() -> FrozenRenderConfig {
     frozen.reasoning = ReasoningPolicy::AnthropicInterleaved {
         budget_tokens: 1024,
         last_turn_only: true,
-        echo_scope: broca_provider::policy::ThinkingEchoScope::AllAssistantMessages,
         cross_model: CrossModelThinking::SameModelOnly,
     };
     frozen
@@ -205,6 +204,50 @@ async fn text_apply_off_route_strips_old_signatures_when_claude_returns() {
 }
 
 #[tokio::test]
+async fn a_fork_declines_a_legacy_head_then_accepts_the_next_fresh_head() {
+    let mut plan_body = plan("same", &["read"], None, None);
+    plan_body["fork_callers"] = serde_json::json!(["colliculus"]);
+    let first = manifest(&plan_body, "plan-1");
+    let frozen = config();
+    let mut legacy = serde_json::to_value(&frozen).unwrap();
+    legacy["reasoning"]
+        .as_object_mut()
+        .unwrap()
+        .remove("echo_scope");
+    let mut exec = on_route(
+        vec![
+            confirmed(text_step("legacy", "ready")),
+            confirmed(text_step("fresh", "done")),
+        ],
+        &frozen,
+    );
+    let rendering = frozen.clone();
+    exec.provider.attempt_digest = Some(Arc::new(move |opts| {
+        broca_core::render::request_digest_hex(&AnthropicMessages.render(&rendering, opts))
+    }));
+    let (module, executor) = module_with_executor(exec, true, true).await;
+    *executor.next_render_config.lock().unwrap() = Some(legacy);
+    send_claude(&module, "r1", Some(&first)).await;
+    let caller = broca_protocol::BindPrincipal::Reserved {
+        module_id: "colliculus".into(),
+    };
+    let old = module
+        .registry
+        .fork_prepare(&module.key, Some(&caller))
+        .await;
+    assert!(
+        matches!(old, Err(crate::fork_answer::ForkError::BaseUnavailable(ref reason)) if reason.contains("cannot be reproduced") && reason.contains("retired last-assistant")),
+        "{old:?}"
+    );
+    send_claude(&module, "r2", None).await;
+    let fresh = module
+        .registry
+        .fork_prepare(&module.key, Some(&caller))
+        .await;
+    assert!(fresh.is_ok(), "{fresh:?}");
+}
+
+#[tokio::test]
 async fn a_plain_full_apply_derives_a_floor_without_a_new_ledger_field() {
     let first = manifest(&plan("before", &["read"], None, None), "plan-1");
     let pending = manifest(&plan("after", &["read"], None, None), "plan-2");
@@ -241,4 +284,34 @@ async fn a_plain_full_apply_derives_a_floor_without_a_new_ledger_field() {
         .await
         .iter()
         .any(|record| matches!(record, Record::RefreshApplied(apply) if apply.generation == 1)));
+}
+
+#[tokio::test]
+async fn fork_base_ignores_the_retired_mode_of_an_unused_fallback() {
+    let mut plan_body = plan("same", &["read"], None, None);
+    plan_body["fork_callers"] = serde_json::json!(["colliculus"]);
+    let first = manifest(&plan_body, "plan-1");
+    let frozen = config();
+    let mut raw = serde_json::to_value(&frozen).unwrap();
+    let mut fallback = raw.clone();
+    fallback["reasoning"]
+        .as_object_mut()
+        .unwrap()
+        .remove("echo_scope");
+    raw["refusal_fallback"] = serde_json::json!({"model": ModelHandle::new("anthropic", "claude-opus-4-8"), "context_limit":100000, "frozen":fallback});
+    let mut exec = on_route(vec![confirmed(text_step("primary", "done"))], &frozen);
+    exec.provider.attempt_digest = Some(Arc::new(move |opts| {
+        broca_core::render::request_digest_hex(&AnthropicMessages.render(&frozen, opts))
+    }));
+    let (module, executor) = module_with_executor(exec, true, true).await;
+    *executor.next_render_config.lock().unwrap() = Some(raw);
+    send_claude(&module, "r1", Some(&first)).await;
+    let caller = broca_protocol::BindPrincipal::Reserved {
+        module_id: "colliculus".into(),
+    };
+    let result = module
+        .registry
+        .fork_prepare(&module.key, Some(&caller))
+        .await;
+    assert!(result.is_ok(), "{result:?}");
 }

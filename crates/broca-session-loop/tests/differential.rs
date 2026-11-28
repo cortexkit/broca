@@ -128,6 +128,9 @@ impl ScriptedProvider {
         if let Ok(raw) = plan_notes::RAW_RENDER.try_with(Clone::clone) {
             return raw;
         }
+        if let Some(legacy) = plan_notes::legacy_echo_blob() {
+            return legacy;
+        }
         if let Some((_, config)) = plan_notes::route() {
             return serde_json::to_value(config).unwrap();
         }

@@ -75,15 +75,26 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
         let prepared = match self.prepare_warm(lineage_id, idle_auto).await {
             Ok(prepared) => prepared,
             Err(outcome) => {
+                let retired_echo = matches!(outcome.as_ref(), WarmOutcome::Refused(broca_wire::WarmRefusal {
+                    detail: broca_wire::WarmRefusalDetail::WarmUnsupported { reason }, ..
+                }) if reason == broca_core::provider_errors::LEGACY_ANTHROPIC_ECHO);
                 if idle_auto {
                     // The stop line names only the outcome; what refused the warm is here.
-                    if let WarmOutcome::Refused(refusal) = outcome.as_ref() {
+                    if let (WarmOutcome::Refused(refusal), false) = (outcome.as_ref(), retired_echo)
+                    {
                         tracing::info!(session = %broca_core::session_addr(&self.key),
                             code = %refusal.code, "idle cache warm refused: {}", refusal.message);
                     }
                     if let Some(registry) = &self.registry {
-                        registry.stop_idle_warm(&self.key, "warm_refused");
+                        let reason = if retired_echo {
+                            broca_core::provider_errors::LEGACY_ANTHROPIC_ECHO
+                        } else {
+                            "warm_refused"
+                        };
+                        registry.stop_idle_warm(&self.key, reason);
                     }
+                } else if retired_echo {
+                    tracing::info!(target: "cache_warm", session = %broca_core::session_addr(&self.key), reason = broca_core::provider_errors::LEGACY_ANTHROPIC_ECHO, "cache warm skipped");
                 }
                 let _ = reply.send(*outcome);
                 return;
@@ -164,6 +175,13 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             )))
         };
         let config = run_config(run, start, &self.parts).map_err(error)?;
+        let rebuild = || Box::pin(self.recorded_warm_classified());
+        let early_request =
+            if broca_core::provider_errors::legacy_anthropic_echo(&config.frozen_render_config) {
+                Some(rebuild().await.map_err(warm_rebuild_failure)?)
+            } else {
+                None
+            };
 
         // What the session's frozen config allows, before its clock is read.
         let declaration = self
@@ -209,18 +227,14 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> St
             }
         }
 
-        let unavailable = |reason: String| {
-            Box::new(WarmOutcome::Refused(broca_wire::WarmRefusal::new(
-                Refusal::WarmPrefixUnavailable {
-                    request_body_sha256: None,
-                    reason,
-                },
-            )))
-        };
+        let unavailable = |reason: String| warm_rebuild_failure(reason.into());
         // The session's most recent real request, rebuilt from its records with the digest its
         // attempt recorded: the executor sends it only if it renders to those bytes. A session
         // with no recorded attempt for its latest run has nothing to re-send.
-        let request = self.recorded_warm_request().await.map_err(unavailable)?;
+        let request = match early_request {
+            Some(request) => request,
+            None => rebuild().await.map_err(warm_rebuild_failure)?,
+        };
         if idle_auto {
             let records = self.idle_warm_records().await.map_err(unavailable)?;
             let headers = records
@@ -518,4 +532,21 @@ pub(super) fn sha256_digest(hex: &str) -> Option<broca_session_store::codec::Dig
         *byte = u8::from_str_radix(hex.get(at * 2..at * 2 + 2)?, 16).ok()?;
     }
     Some(broca_session_store::codec::Digest(bytes))
+}
+
+fn warm_rebuild_failure(
+    error: broca_session_loop::recorded_request::RebuildError,
+) -> Box<WarmOutcome> {
+    use broca_session_loop::recorded_request::RebuildError;
+    use broca_wire::WarmRefusalDetail as Refusal;
+    let refusal = match error {
+        RebuildError::RetiredEcho => Refusal::WarmUnsupported {
+            reason: broca_core::provider_errors::LEGACY_ANTHROPIC_ECHO.into(),
+        },
+        RebuildError::Unavailable(reason) => Refusal::WarmPrefixUnavailable {
+            request_body_sha256: None,
+            reason,
+        },
+    };
+    Box::new(WarmOutcome::Refused(broca_wire::WarmRefusal::new(refusal)))
 }

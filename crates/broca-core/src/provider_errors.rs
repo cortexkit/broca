@@ -27,6 +27,14 @@ pub fn legacy_anthropic_echo_on_route(frozen: &serde_json::Value) -> bool {
             || reasoning["echo_scope"] == "last_assistant_message")
 }
 
+pub fn legacy_anthropic_echo_on_attempt(frozen: &serde_json::Value, used_fallback: bool) -> bool {
+    legacy_anthropic_echo_on_route(if used_fallback {
+        &frozen["refusal_fallback"]["frozen"]
+    } else {
+        frozen
+    })
+}
+
 pub fn recorded_render_route<'a>(
     frozen: &'a serde_json::Value,
     model: Option<&broca_protocol::ModelHandle>,
@@ -45,6 +53,33 @@ pub fn recorded_render_route<'a>(
         .unwrap_or(frozen)
 }
 
+fn equivalent_echo_config(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    fn normalize(frozen: &mut serde_json::Value, old_unused_fallback: bool) {
+        if frozen["reasoning"]["mode"] == "anthropic_interleaved"
+            && (old_unused_fallback || frozen["reasoning"]["last_turn_only"] == false)
+        {
+            if let Some(reasoning) = frozen["reasoning"].as_object_mut() {
+                reasoning.remove("echo_scope");
+            }
+        }
+    }
+    let old_fallback = legacy_anthropic_echo_on_route(&right["refusal_fallback"]["frozen"]);
+    let mut left = left.clone();
+    let mut right = right.clone();
+    for config in [&mut left, &mut right] {
+        normalize(config, false);
+        if let Some(fallback) = config
+            .get_mut("refusal_fallback")
+            .and_then(|fallback| fallback.get_mut("frozen"))
+        {
+            // A rebuilt provider serializes the retired marker using its current schema.
+            // When that route is selected its recorded policy is checked separately.
+            normalize(fallback, old_fallback);
+        }
+    }
+    left == right
+}
+
 /// Why `provider` can't resume a run frozen with `renderer_version` and `frozen_render_config`
 /// byte for byte, if it can't: either config is null, the provider doesn't reproduce that
 /// renderer version, or it renders that version with another config. `None` when it can.
@@ -54,6 +89,10 @@ pub fn render_identity_error<P: Provider + ?Sized>(
     frozen_render_config: &serde_json::Value,
 ) -> Option<ProviderError> {
     let current = provider.render_config_blob();
+    let reproduces_config = || {
+        let current = provider.render_config_blob_for_version(renderer_version);
+        current == *frozen_render_config || equivalent_echo_config(&current, frozen_render_config)
+    };
     let (message, provider_code) = if current.is_null() || frozen_render_config.is_null() {
         (
             "resume refused: the current provider or the recorded log has a null frozen render \
@@ -61,13 +100,15 @@ pub fn render_identity_error<P: Provider + ?Sized>(
              were never resume-safe and must be discarded",
             "frozen_render_config_unverifiable",
         )
+    } else if legacy_anthropic_echo_on_route(frozen_render_config) {
+        (LEGACY_ANTHROPIC_ECHO, "frozen_render_config_unverifiable")
     } else if !provider.reproduces_renderer_version(renderer_version) {
         (
             "resume refused: the provider renderer version differs from the version recorded at \
              run start, and the provider does not reproduce the recorded version's bytes",
             "renderer_version_drift",
         )
-    } else if provider.render_config_blob_for_version(renderer_version) != *frozen_render_config {
+    } else if !reproduces_config() {
         (
             "resume refused: the provider frozen render config differs from the config recorded \
              at run start",

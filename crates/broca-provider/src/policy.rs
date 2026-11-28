@@ -132,28 +132,19 @@ impl TokenLimitField {
 }
 
 /// How a provider wants reasoning ("thinking") requested + echoed back.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ReasoningPolicy {
     /// No reasoning support.
     #[default]
     None,
-    /// Anthropic interleaved thinking: a `thinking: {type: enabled, budget_tokens}`
-    /// request field, plus echoing the previous turn's signed thinking blocks back
-    /// byte-verbatim. `last_turn_only` echoes reasoning only for the current turn, and
-    /// `echo_scope` says what the current turn is; reasoning from earlier turns is stripped.
-    /// With `last_turn_only: false` no reasoning is echoed at all.
+    /// Anthropic interleaved thinking. When the historical `last_turn_only` switch is on,
+    /// every retained assistant reply may echo its signed thinking if the target model accepts
+    /// it and the earlier request content covered by its signature is unchanged. When off, none
+    /// is echoed.
     AnthropicInterleaved {
         budget_tokens: u32,
         last_turn_only: bool,
-        /// Which assistant messages count as the current turn. Absent from configs frozen
-        /// before this field existed, which read back as `LastAssistantMessage` and
-        /// serialize without it, so those runs keep their recorded bytes on resume.
-        #[serde(
-            default,
-            skip_serializing_if = "ThinkingEchoScope::is_last_assistant_message"
-        )]
-        echo_scope: ThinkingEchoScope,
         /// Which model's signed thinking may be echoed to the request's model. Absent from
         /// configs frozen before this field existed, which read back as `SameModelOnly` and
         /// serialize without it, so those runs keep their recorded bytes on resume.
@@ -173,30 +164,48 @@ pub enum ReasoningPolicy {
     },
 }
 
-/// Which assistant messages get their signed thinking echoed back under Anthropic
-/// interleaved thinking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThinkingEchoScope {
-    /// Only the last assistant message. The original rule, kept for runs frozen under it.
-    /// Once an assistant message stops being last its thinking is stripped, so its bytes
-    /// change and the prompt-cache entry written while it was last can never be read again.
-    #[default]
-    LastAssistantMessage,
-    /// Every assistant message, at any depth of the conversation: each one's signed thinking
-    /// is echoed back, subject only to the cross-model echo-safety gate. This is what the
-    /// current runs freeze. It keeps every assistant message byte-stable from one request to
-    /// the next -- across user-turn boundaries too -- so the prompt cache written at one step
-    /// is read at every later step. Pruning stale thinking out of an old conversation is the
-    /// reduction transform's job on its cache-bust cycles, never the renderer's: the renderer
-    /// echoes whatever thinking survives in the prompt and strips none of it by position.
-    AllAssistantMessages,
-}
-
-impl ThinkingEchoScope {
-    /// Serde helper: the legacy default is left out of serialized configs.
-    pub fn is_last_assistant_message(&self) -> bool {
-        *self == ThinkingEchoScope::LastAssistantMessage
+impl Serialize for ReasoningPolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self {
+            Self::None => {
+                let mut state = serializer.serialize_struct("ReasoningPolicy", 1)?;
+                state.serialize_field("mode", "none")?;
+                state.end()
+            }
+            Self::AnthropicInterleaved {
+                budget_tokens,
+                last_turn_only,
+                cross_model,
+            } => {
+                let include_cross_model = !cross_model.is_same_model_only();
+                let mut state = serializer
+                    .serialize_struct("ReasoningPolicy", 4 + usize::from(include_cross_model))?;
+                state.serialize_field("mode", "anthropic_interleaved")?;
+                state.serialize_field("budget_tokens", budget_tokens)?;
+                state.serialize_field("last_turn_only", last_turn_only)?;
+                // Record all-assistant echo explicitly. An omitted marker means the old
+                // behavior echoed only the last assistant reply's thinking.
+                state.serialize_field(
+                    "echo_scope",
+                    broca_core::provider_errors::ANTHROPIC_ECHO_SCOPE,
+                )?;
+                if include_cross_model {
+                    state.serialize_field("cross_model", cross_model)?;
+                }
+                state.end()
+            }
+            Self::OpenAiResponsesReasoning { effort, summary } => {
+                let mut state = serializer
+                    .serialize_struct("ReasoningPolicy", 2 + usize::from(summary.is_some()))?;
+                state.serialize_field("mode", "open_ai_responses_reasoning")?;
+                state.serialize_field("effort", effort)?;
+                if let Some(summary) = summary {
+                    state.serialize_field("summary", summary)?;
+                }
+                state.end()
+            }
+        }
     }
 }
 

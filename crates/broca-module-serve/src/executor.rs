@@ -4527,7 +4527,10 @@ impl RunExecutor for LiveLoopExecutor {
         use broca_module::WarmError;
         let config = &job.config;
         let provider_id = config.model.provider_module_id.as_str();
-        let mut frozen = broca_module_serve::cache_warm::warmable_config(config)?;
+        let mut frozen = broca_module_serve::cache_warm::warmable_config(
+            config,
+            job.base.uses_refusal_fallback(),
+        )?;
         if provider_id == "opencode-go" {
             frozen.opencode_go_session_id = Some(
                 broca_module_serve::opencode_go_identity::for_session(&job.session),

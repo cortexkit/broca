@@ -313,6 +313,15 @@ impl StoreWarmer {
             },
         };
         let digest = base.request_body_sha256().to_owned();
+        if broca_core::provider_errors::legacy_anthropic_echo_on_attempt(
+            &job_config.frozen_render_config,
+            base.uses_refusal_fallback(),
+        ) {
+            return stop(
+                "unsupported",
+                broca_core::provider_errors::LEGACY_ANTHROPIC_ECHO.into(),
+            );
+        }
         let job = WarmJob {
             session: self.session.clone(),
             config: job_config,

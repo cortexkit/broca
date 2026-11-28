@@ -205,7 +205,22 @@ async fn registry_at(
     sent: &Arc<Mutex<Vec<Vec<u8>>>>,
     cipher: Cipher,
 ) -> LineageRegistry {
-    let render_config = config.map(|config| serde_json::to_value(config).unwrap());
+    let render_config = config.map(|config| {
+        let mut stored = serde_json::to_value(config).unwrap();
+        if LEGACY_ECHO.try_with(|_| ()).is_ok() {
+            stored["reasoning"]
+                .as_object_mut()
+                .unwrap()
+                .remove("echo_scope");
+        }
+        if UNUSED_LEGACY_FALLBACK.try_with(|_| ()).is_ok() {
+            let mut fallback = stored.clone();
+            fallback["wire_model_id"] = "claude-opus-4-5".into();
+            fallback["reasoning"].as_object_mut().unwrap().remove("echo_scope");
+            stored["refusal_fallback"] = json!({"model": broca_protocol::ModelHandle::new("anthropic", "claude-opus-4-5"), "frozen": fallback});
+        }
+        stored
+    });
     let mut store_loop = super::executor(steps, None);
     store_loop.provider.render_config = render_config;
     // Each attempt records the digest the real transport gives its request, as it would.
@@ -613,4 +628,101 @@ async fn a_warm_resends_the_next_request_and_dates_the_cache(cipher: Cipher) {
     assert_eq!(again.request_body_sha256, reply.request_body_sha256);
     assert!(again.expires_at_ms >= reply.expires_at_ms);
     assert!(restarted.stop_and_seal().await);
+}
+
+tokio::task_local! { static LEGACY_ECHO: (); }
+
+#[tokio::test]
+async fn legacy_echo_warm_is_skipped_without_sending() {
+    let now = crate::actor::epoch_ms();
+    let config = warmable();
+    let store = LEGACY_ECHO
+        .scope(
+            (),
+            Box::pin(side(
+                true,
+                true,
+                Some(&config),
+                vec![attempted_step("a1", "old prefix", now - 60_000)],
+                Cipher::XChaCha20Poly1305,
+            )),
+        )
+        .await;
+    let outcome = store.warm(None).await;
+    let WarmOutcome::Refused(refusal) = outcome else {
+        panic!("legacy warm should be unsupported, got {outcome:?}")
+    };
+    assert!(
+        matches!(refusal.detail, broca_wire::WarmRefusalDetail::WarmUnsupported { reason }
+        if reason.contains("retired last-assistant thinking echo"))
+    );
+    assert!(store.sent.lock().unwrap().is_empty());
+}
+
+tokio::task_local! { static UNUSED_LEGACY_FALLBACK: (); }
+
+#[tokio::test]
+async fn a_primary_attempt_can_warm_with_an_unused_retired_fallback() {
+    let now = crate::actor::epoch_ms();
+    let config = warmable();
+    let store = UNUSED_LEGACY_FALLBACK
+        .scope(
+            (),
+            Box::pin(side(
+                true,
+                true,
+                Some(&config),
+                vec![attempted_step("a1", "primary reply", now - 60_000)],
+                Cipher::XChaCha20Poly1305,
+            )),
+        )
+        .await;
+    let outcome = store.warm(None).await;
+    assert!(matches!(outcome, WarmOutcome::Warmed(_)), "{outcome:?}");
+    assert_eq!(store.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_error_ended_fallback_attempt_is_warmed_using_its_actual_route() {
+    use broca_protocol::{FinishReason, ModelHandle, ProviderControl};
+    use broca_provider::wire::RefusalFallbackConfig;
+    let now = crate::actor::epoch_ms();
+    let mut config = warmable();
+    let mut fallback = config.clone();
+    fallback.wire_model_id = "claude-opus-4-5".into();
+    config.refusal_fallback = Some(Box::new(RefusalFallbackConfig {
+        model: ModelHandle::new("anthropic", "claude-opus-4-5"),
+        frozen: fallback,
+        context_limit: Some(100_000),
+    }));
+    let mut rejected = crate::store_actor::tests::text_step("refused", "no primary answer");
+    for event in &mut rejected {
+        if let NormalizedEvent::Control(ProviderControl::Finished { finish_reason, .. }) = event {
+            *finish_reason = FinishReason::ContentFilter;
+        }
+    }
+    let mut fallback = attempted_step("fallback", "no completed answer", now - 30_000);
+    fallback.truncate(1);
+    fallback.push(NormalizedEvent::Control(ProviderControl::Error {
+        error: serde_json::from_value(
+            json!({"class":"permanent", "message":"stream stopped after the attempt"}),
+        )
+        .unwrap(),
+        retries_used: 0,
+    }));
+    let store = LEGACY_ECHO
+        .scope(
+            (),
+            Box::pin(side(
+                true,
+                true,
+                Some(&config),
+                vec![rejected, fallback],
+                Cipher::XChaCha20Poly1305,
+            )),
+        )
+        .await;
+    let outcome = store.warm(None).await;
+    assert!(matches!(outcome, WarmOutcome::Warmed(_)), "{outcome:?}");
+    assert_eq!(store.sent.lock().unwrap().len(), 1);
 }

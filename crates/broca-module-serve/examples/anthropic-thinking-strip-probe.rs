@@ -35,7 +35,6 @@ use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
 
 use broca_catalog::live::{
     resolve_catalog_episode_with_client, AuthMethod, AuthMode, EpisodeRenderConfig, ResolveOptions,
-    ThinkingEchoScope,
 };
 use broca_module_serve::{
     claude_code_identity, vault_config::load_devtools_handle, CacheTtlTable, CredentialId,
@@ -382,7 +381,6 @@ fn resolve_provider(
         &options,
         broca_provider::build_provider_http_client(),
         EpisodeRenderConfig {
-            thinking_echo_scope: Some(ThinkingEchoScope::AllAssistantMessages),
             variant: frozen_variant,
             ..EpisodeRenderConfig::default()
         },

@@ -287,7 +287,6 @@ mod gated {
                     max_output_tokens: restored,
                     variant: None,
                     service_tier: None,
-                    thinking_echo_scope: None,
                     thinking_cross_model: None,
                     responses_tools_non_strict: None,
                     chatgpt_effort_updates: None,

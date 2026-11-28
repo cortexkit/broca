@@ -68,7 +68,17 @@ pub async fn offline_next_media_request<W: Writer>(
     step: u64,
 ) -> Result<CallOptions, LoopError> {
     let (opts, admission) = base_request(writer, parts, bind, step, true, true, None).await?;
-    project_step(writer, &admission, step, opts)
+    let opts = project_step(writer, &admission, step, opts)?;
+    let route = broca_core::provider_errors::recorded_render_route(
+        &admission.render_config,
+        opts.target_model.as_ref(),
+    );
+    if broca_core::provider_errors::legacy_anthropic_echo_on_route(route) {
+        return Err(LoopError::Unsupported(
+            broca_core::provider_errors::LEGACY_ANTHROPIC_ECHO,
+        ));
+    }
+    Ok(opts)
 }
 
 pub(super) async fn offline_request_for<W: Writer>(
@@ -80,7 +90,17 @@ pub(super) async fn offline_request_for<W: Writer>(
 ) -> Result<CallOptions, LoopError> {
     let (opts, admission) =
         base_request(writer, parts, bind, step_id, defer_media_tags, false, None).await?;
-    project_step(writer, &admission, step_id, opts)
+    let opts = project_step(writer, &admission, step_id, opts)?;
+    let route = broca_core::provider_errors::recorded_render_route(
+        &admission.render_config,
+        opts.target_model.as_ref(),
+    );
+    if broca_core::provider_errors::legacy_anthropic_echo_on_route(route) {
+        return Err(LoopError::Unsupported(
+            broca_core::provider_errors::LEGACY_ANTHROPIC_ECHO,
+        ));
+    }
+    Ok(opts)
 }
 
 fn project_step<W: Writer>(

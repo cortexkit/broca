@@ -521,6 +521,14 @@ pub enum WarmBase {
 }
 
 impl WarmBase {
+    pub fn uses_refusal_fallback(&self) -> bool {
+        match self {
+            Self::InFlight(sent) => sent.route == broca_core::refusal_fallback::StepRoute::Fallback,
+            Self::Recorded(request) | Self::RecordedMedia { request, .. } => {
+                request.route.is_some()
+            }
+        }
+    }
     /// The digest of the request this base stands for.
     pub fn request_body_sha256(&self) -> &str {
         match self {

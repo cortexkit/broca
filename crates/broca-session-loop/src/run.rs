@@ -2782,8 +2782,8 @@ where
         let mut refusal_retries = 0u32;
         drop(request_timing);
         let outcome = loop {
-            if let Err(error) = &readiness {
-                break Err(StepFailure::Error(Box::new(error.clone()), 0, None));
+            if let Some(error) = signed_floor::ready(&readiness, seams.provider, admission, &opts) {
+                break Err(StepFailure::Error(Box::new(error), 0, None));
             }
             let outcome = model_step(
                 writer,

@@ -595,6 +595,33 @@ pub(super) fn new_abi(config: &Value) -> bool {
             .is_some_and(|version| version >= 4)
 }
 
+pub(super) fn ready(
+    readiness: &Result<(), ProviderError>,
+    provider: &impl Provider,
+    admission: &Admission,
+    opts: &CallOptions,
+) -> Option<ProviderError> {
+    use broca_core::provider_errors::{
+        legacy_anthropic_echo_on_route, recorded_render_route, render_identity_error,
+    };
+    if let Some(error) = readiness.as_ref().err() {
+        return Some(error.clone());
+    }
+    if opts
+        .target_model
+        .as_ref()
+        .is_none_or(|model| model == &admission.model)
+    {
+        return None;
+    }
+    let route = recorded_render_route(&admission.render_config, opts.target_model.as_ref());
+    if legacy_anthropic_echo_on_route(route) {
+        render_identity_error(provider, admission.renderer_version, route)
+    } else {
+        None
+    }
+}
+
 pub(super) fn before_start(error: LoopError) -> LoopError {
     match error {
         LoopError::FloorRead(detail) => LoopError::Refused(broca_core::RunError::Transient(detail)),

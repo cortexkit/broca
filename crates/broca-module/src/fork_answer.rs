@@ -730,6 +730,13 @@ pub(crate) fn render(
     config: &broca_records::record::RunConfig,
     opts: &broca_protocol::request::CallOptions,
 ) -> Result<Vec<u8>, String> {
+    let route = broca_core::provider_errors::recorded_render_route(
+        &config.frozen_render_config,
+        opts.target_model.as_ref(),
+    );
+    if broca_core::provider_errors::legacy_anthropic_echo_on_route(route) {
+        return Err("the head's last request cannot be reproduced: it used the retired last-assistant thinking echo".into());
+    }
     // A provider with no render state of its own renders the shared canonical bytes, and froze
     // only a marker saying so (`broca_core::Provider::render_config_blob`).
     if config.frozen_render_config == json!({ "render_config": "stateless" }) {

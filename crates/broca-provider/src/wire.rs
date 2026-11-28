@@ -1519,7 +1519,6 @@ mod output_cap_tests {
         anthropic.reasoning = ReasoningPolicy::AnthropicInterleaved {
             budget_tokens: 31_999,
             last_turn_only: true,
-            echo_scope: crate::policy::ThinkingEchoScope::AllAssistantMessages,
             cross_model: crate::policy::CrossModelThinking::AnyAnthropicModel,
         };
         assert_eq!(anthropic.output_limits().unwrap().floor, 32_000);

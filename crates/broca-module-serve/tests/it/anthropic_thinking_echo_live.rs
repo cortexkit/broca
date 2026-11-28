@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use broca_catalog::live::{
     resolve_catalog_episode_with_client, AuthMethod, AuthMode, EpisodeRenderConfig, ResolveOptions,
-    ThinkingEchoScope,
 };
 use broca_module_serve::vault_config::load_devtools_handle;
 use broca_module_serve::{CacheTtlTable, CredentialId};
@@ -237,7 +236,6 @@ async fn run_conversation(token: &str, model: &str, run_label: &str) -> Outcome 
         broca_provider::build_provider_http_client(),
         // The family default; named explicitly so the measurement pins the keep-all scope.
         EpisodeRenderConfig {
-            thinking_echo_scope: Some(ThinkingEchoScope::AllAssistantMessages),
             ..EpisodeRenderConfig::default()
         },
     )

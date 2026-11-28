@@ -107,7 +107,6 @@ mod gated {
             max_output_tokens: None,
             variant: restored.and_then(|config| config.variant.as_ref()),
             service_tier: None,
-            thinking_echo_scope: None,
             thinking_cross_model: None,
             responses_tools_non_strict: None,
             chatgpt_effort_updates: None,
@@ -847,20 +846,9 @@ mod gated {
         assert_eq!(resumed.wire_model_id, "gemini-3.8-flash-high");
     }
 
-    /// Resolve an Anthropic OAuth episode the way a resume does, restoring a recorded
-    /// thinking-echo scope and optionally a recorded variant.
+    /// Resolve an Anthropic OAuth episode, optionally restoring its cross-model thinking rule
+    /// and variant.
     fn resume_anthropic_oauth(
-        scope: Option<broca_catalog::live::ThinkingEchoScope>,
-        variant: Option<&FrozenVariant>,
-    ) -> serde_json::Value {
-        resume_anthropic_oauth_with(scope, None, variant)
-    }
-
-    /// Resolve an Anthropic OAuth episode the way a resume does, restoring a recorded
-    /// thinking-echo scope, a recorded cross-model thinking rule and a recorded variant, each
-    /// only when given.
-    fn resume_anthropic_oauth_with(
-        scope: Option<broca_catalog::live::ThinkingEchoScope>,
         cross_model: Option<broca_catalog::live::CrossModelThinking>,
         variant: Option<&FrozenVariant>,
     ) -> serde_json::Value {
@@ -877,7 +865,6 @@ mod gated {
             broca_provider::build_provider_http_client(),
             EpisodeRenderConfig {
                 variant,
-                thinking_echo_scope: scope,
                 thinking_cross_model: cross_model,
                 ..EpisodeRenderConfig::default()
             },
@@ -886,61 +873,10 @@ mod gated {
         resolved.provider.render_config_blob()
     }
 
-    /// A fresh Anthropic episode freezes the tool-loop echo scope. An episode recorded before
-    /// the scope existed has no `echo_scope` key; restoring its scope on resume reproduces that
-    /// recorded blob exactly (so the drift guard passes and the old bytes render), with or
-    /// without a frozen variant. Without the restore the blob differs, which the guard refuses.
-    #[test]
-    fn a_resume_restores_the_recorded_thinking_echo_scope() {
-        use broca_catalog::live::ThinkingEchoScope;
-
-        let fresh = resume_anthropic_oauth(None, None);
-        assert_eq!(
-            fresh["reasoning"]["echo_scope"],
-            json!("all_assistant_messages")
-        );
-
-        let mut recorded_legacy = fresh.clone();
-        recorded_legacy["reasoning"]
-            .as_object_mut()
-            .unwrap()
-            .remove("echo_scope");
-        let recorded_scope = serde_json::from_value::<FrozenRenderConfig>(recorded_legacy.clone())
-            .map(|frozen| match frozen.reasoning {
-                broca_provider::policy::ReasoningPolicy::AnthropicInterleaved {
-                    echo_scope,
-                    ..
-                } => echo_scope,
-                other => panic!("expected interleaved thinking, got {other:?}"),
-            })
-            .unwrap();
-        assert_eq!(recorded_scope, ThinkingEchoScope::LastAssistantMessage);
-
-        assert_eq!(
-            resume_anthropic_oauth(Some(recorded_scope), None),
-            recorded_legacy
-        );
-        assert_ne!(resume_anthropic_oauth(None, None), recorded_legacy);
-
-        let admitted = resolved(
-            "anthropic/claude-sonnet-4-5",
-            AuthMethod::Oauth,
-            Some("high"),
-        );
-        let variant = admitted.variant.clone().expect("the variant is frozen");
-        let with_variant = resume_anthropic_oauth(Some(recorded_scope), Some(&variant));
-        assert!(with_variant["reasoning"].get("echo_scope").is_none());
-        assert!(with_variant.get("variant").is_some());
-    }
-
-    /// A fresh Anthropic episode freezes the rule that echoes thinking across Anthropic's own
-    /// models. An episode recorded before the rule existed has neither `cross_model` nor (if it
-    /// is older still) `echo_scope`; restoring both on resume reproduces that recorded blob
-    /// exactly, with or without a frozen variant, and without the restore the blob differs,
-    /// which the drift guard refuses.
+    /// The recorded cross-model rule is restored independently of the model's current default.
     #[test]
     fn a_resume_restores_the_recorded_cross_model_thinking_rule() {
-        use broca_catalog::live::{CrossModelThinking, ThinkingEchoScope};
+        use broca_catalog::live::CrossModelThinking;
 
         let fresh = resume_anthropic_oauth(None, None);
         assert_eq!(
@@ -965,25 +901,10 @@ mod gated {
         assert_eq!(recorded_rule, CrossModelThinking::SameModelOnly);
 
         assert_eq!(
-            resume_anthropic_oauth_with(None, Some(recorded_rule), None),
+            resume_anthropic_oauth(Some(recorded_rule), None),
             recorded_legacy
         );
         assert_ne!(resume_anthropic_oauth(None, None), recorded_legacy);
-
-        // The oldest blobs lack both keys; both restores together reproduce them.
-        let mut recorded_oldest = recorded_legacy.clone();
-        recorded_oldest["reasoning"]
-            .as_object_mut()
-            .unwrap()
-            .remove("echo_scope");
-        assert_eq!(
-            resume_anthropic_oauth_with(
-                Some(ThinkingEchoScope::LastAssistantMessage),
-                Some(recorded_rule),
-                None
-            ),
-            recorded_oldest
-        );
 
         let admitted = resolved(
             "anthropic/claude-sonnet-4-5",
@@ -991,7 +912,7 @@ mod gated {
             Some("high"),
         );
         let variant = admitted.variant.clone().expect("the variant is frozen");
-        let with_variant = resume_anthropic_oauth_with(None, Some(recorded_rule), Some(&variant));
+        let with_variant = resume_anthropic_oauth(Some(recorded_rule), Some(&variant));
         assert!(with_variant["reasoning"].get("cross_model").is_none());
         assert!(with_variant.get("variant").is_some());
     }

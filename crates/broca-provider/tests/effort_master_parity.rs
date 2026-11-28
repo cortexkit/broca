@@ -94,7 +94,6 @@ fn first_plan_note_keeps_adaptive_effort_before_the_reply_signed_after_it() {
         frozen.reasoning = ReasoningPolicy::AnthropicInterleaved {
             budget_tokens: 1024,
             last_turn_only: true,
-            echo_scope: broca_provider::policy::ThinkingEchoScope::AllAssistantMessages,
             cross_model: CrossModelThinking::SameModelOnly,
         };
         frozen

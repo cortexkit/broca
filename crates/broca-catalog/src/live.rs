@@ -18,7 +18,7 @@ use broca_provider::families::{
     apply_anthropic_apikey_quirks, frozen_config_for_family, openai_chat_frozen_config,
     renderer_version_for, resolve_frozen,
 };
-pub use broca_provider::policy::{CrossModelThinking, ThinkingEchoScope};
+pub use broca_provider::policy::CrossModelThinking;
 use broca_provider::policy::{ReasoningPolicy, SystemPromptPolicy};
 pub use broca_provider::service_tier::ServiceTier;
 use broca_provider::spec::{AuthKind, CapabilityFlag, ReasoningOptions};
@@ -628,13 +628,6 @@ pub struct EpisodeRenderConfig<'a> {
     /// without re-checking the catalog's rates: a rate withdrawn since admission must not move a
     /// resumed run's request bytes or refuse its resume.
     pub service_tier: Option<ServiceTier>,
-    /// The Anthropic thinking-echo scope this episode froze at start, fed back on resume. The
-    /// family default moved from echoing only the last assistant message to echoing the whole
-    /// current tool loop; an episode admitted under the old default must keep rendering the
-    /// old bytes, and re-deriving the default would also make the frozen-config drift guard
-    /// refuse its resume. Ignored unless the resolved config uses Anthropic interleaved
-    /// thinking.
-    pub thinking_echo_scope: Option<ThinkingEchoScope>,
     /// The Anthropic cross-model thinking rule this episode froze at start, fed back on resume.
     /// The family default moved from echoing signed thinking only to the model that produced it
     /// to echoing it across Anthropic's own models; an episode admitted under the old default
@@ -770,11 +763,6 @@ impl EpisodeRenderConfig<'_> {
         }
         if let Some(base_url) = self.base_url {
             config.base_url = Some(base_url.to_string());
-        }
-        if let (Some(restored), ReasoningPolicy::AnthropicInterleaved { echo_scope, .. }) =
-            (self.thinking_echo_scope, &mut config.reasoning)
-        {
-            *echo_scope = restored;
         }
         if let (Some(restored), ReasoningPolicy::AnthropicInterleaved { cross_model, .. }) =
             (self.thinking_cross_model, &mut config.reasoning)
@@ -1162,7 +1150,6 @@ fn resolve_provider_inner(
         max_output_tokens: episode_render.max_output_tokens,
         variant: episode_render.variant,
         service_tier: episode_render.service_tier,
-        thinking_echo_scope: episode_render.thinking_echo_scope,
         thinking_cross_model: episode_render.thinking_cross_model,
         responses_tools_non_strict: episode_render.responses_tools_non_strict,
         chatgpt_effort_updates: episode_render.chatgpt_effort_updates,

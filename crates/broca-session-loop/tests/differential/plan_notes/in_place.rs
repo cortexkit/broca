@@ -256,7 +256,6 @@ async fn fallback_projection_uses_its_own_reply_visibility() {
     frozen.reasoning = ReasoningPolicy::AnthropicInterleaved {
         budget_tokens: 1024,
         last_turn_only: true,
-        echo_scope: broca_provider::policy::ThinkingEchoScope::AllAssistantMessages,
         cross_model: CrossModelThinking::SameModelOnly,
     };
     let target = frozen.refusal_fallback.as_mut().unwrap();

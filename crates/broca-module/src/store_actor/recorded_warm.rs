@@ -2,8 +2,8 @@
 
 use broca_core::RecordedRequest;
 use broca_protocol::BindIdentity;
-use broca_session_loop::recorded_request::rebuild;
 pub(crate) use broca_session_loop::recorded_request::Through;
+use broca_session_loop::recorded_request::{rebuild, RebuildError};
 use broca_session_loop::{parts::Parts, writer::Writer};
 use broca_session_store::record::Record;
 use std::sync::Arc;
@@ -77,6 +77,26 @@ where
     B: broca_session_store::backend::SessionBackend,
     R: broca_session_store::backend::SessionBackend,
 {
+    Box::pin(recorded_request_classified(
+        session, readers, parts, bind, run_id, step, through,
+    ))
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn recorded_request_classified<B, R>(
+    session: &broca_session_store::session::Session<B>,
+    readers: Option<R>,
+    parts: &dyn Parts,
+    bind: &BindIdentity,
+    run_id: &str,
+    step: Option<u64>,
+    through: Through,
+) -> Result<RequestReplay, RebuildError>
+where
+    B: broca_session_store::backend::SessionBackend,
+    R: broca_session_store::backend::SessionBackend,
+{
     let mut records = session
         .open_log_records()
         .await
@@ -139,8 +159,7 @@ where
     let request = Box::pin(broca_session_loop::recorded_request::rebuild_at(
         session, &records, parts, bind, run_id, step, through, checkpoint,
     ))
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     let media = if request
         .opts
         .prompt
@@ -224,6 +243,12 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
     }
 
     pub(super) async fn recorded_warm_request(&self) -> Result<RecordedRequest, String> {
+        Box::pin(self.recorded_warm_classified())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) async fn recorded_warm_classified(&self) -> Result<RecordedRequest, RebuildError> {
         let run_id = self
             .session
             .operations
@@ -232,7 +257,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
             .ok_or("no recorded run")?
             .run_id
             .clone();
-        recorded_request(
+        Box::pin(recorded_request_classified(
             &self.session,
             self.readers.as_ref().map(|readers| readers()),
             &self.parts,
@@ -240,7 +265,7 @@ impl<B: broca_session_store::backend::SessionBackend + Send + Sync + 'static> su
             &run_id,
             None,
             Through::Request,
-        )
+        ))
         .await
         .map(|replay| replay.request)
     }

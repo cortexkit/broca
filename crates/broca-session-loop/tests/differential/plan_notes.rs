@@ -562,6 +562,10 @@ mod historical;
 #[path = "plan_notes/in_place.rs"]
 mod in_place;
 
+#[path = "plan_notes/legacy_echo.rs"]
+mod legacy_echo;
+pub(super) use legacy_echo::legacy_echo_blob;
+
 #[path = "plan_notes/revision14.rs"]
 pub(super) mod revision14;
 

@@ -4,7 +4,7 @@ use broca_protocol::{
 };
 use broca_provider::families::{anthropic_frozen_config, bedrock_frozen_config_with_region};
 use broca_provider::families::{AnthropicMessages, BedrockConverse};
-use broca_provider::policy::{ReasoningPolicy, ThinkingEchoScope};
+use broca_provider::policy::ReasoningPolicy;
 use broca_provider::wire::{
     CacheClass, CachePolicy, CacheTail, CacheTtl, FrozenRenderConfig, MarkerSyntax, WireFamily,
 };
@@ -487,7 +487,6 @@ fn anthropic_leading_reasoning_keeps_marker_on_following_text() {
     frozen.reasoning = ReasoningPolicy::AnthropicInterleaved {
         budget_tokens: 1024,
         last_turn_only: true,
-        echo_scope: ThinkingEchoScope::LastAssistantMessage,
         cross_model: broca_provider::policy::CrossModelThinking::SameModelOnly,
     };
     opts.target_model = Some(ModelHandle::new("anthropic", "claude-opus-4-8"));
@@ -500,45 +499,6 @@ fn anthropic_leading_reasoning_keeps_marker_on_following_text() {
     assert_eq!(assistant_parts[1]["type"], json!("text"));
     assert!(anthropic_block_has_marker(&assistant_parts[1]));
 }
-
-/// The keep-all counterpart: under the family default (every assistant message echoes its
-/// thinking) the leading reasoning block is rendered here too -- the assistant is the only
-/// assistant, so keep-all and the legacy last-assistant scope render it identically -- and the
-/// marker must still land on the following text, never on the thinking block.
-#[test]
-fn anthropic_leading_reasoning_keeps_marker_on_following_text_under_keep_all() {
-    let mut opts = CallOptions::new(vec![
-        msg(Role::User, vec![text("m0")]),
-        assistant_from(
-            "claude-opus-4-8",
-            vec![reasoning("private"), text("visible answer")],
-        ),
-        msg(Role::User, vec![text("latest")]),
-    ]);
-
-    let mut frozen = anthropic_frozen_config("claude-opus-4-8");
-    frozen.cache = Some(marker_policy(MarkerSyntax::AnthropicCacheControl, 20));
-    assert!(
-        matches!(
-            frozen.reasoning,
-            ReasoningPolicy::AnthropicInterleaved {
-                echo_scope: ThinkingEchoScope::AllAssistantMessages,
-                ..
-            }
-        ),
-        "the family default freezes the keep-all scope"
-    );
-    opts.target_model = Some(ModelHandle::new("anthropic", "claude-opus-4-8"));
-    let body = AnthropicMessages.shape(&frozen, &opts);
-    let assistant_parts = body["messages"][1]["content"]
-        .as_array()
-        .expect("assistant content array");
-    assert_eq!(assistant_parts[0]["type"], json!("thinking"));
-    assert!(!anthropic_block_has_marker(&assistant_parts[0]));
-    assert_eq!(assistant_parts[1]["type"], json!("text"));
-    assert!(anthropic_block_has_marker(&assistant_parts[1]));
-}
-
 #[test]
 fn anthropic_volatile_tail_withholds_the_final_message_marker_across_a_resume() {
     let opts = split_prefix_and_tail_request();

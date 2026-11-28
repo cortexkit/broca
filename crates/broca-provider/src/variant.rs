@@ -501,12 +501,6 @@ pub fn freeze_variant(
                             _ => ANTHROPIC_DEFAULT_BUDGET,
                         }),
                     last_turn_only: true,
-                    // A variant changes how thinking is requested, not which messages echo it,
-                    // so the scope already frozen for this run carries over.
-                    echo_scope: match frozen.reasoning {
-                        ReasoningPolicy::AnthropicInterleaved { echo_scope, .. } => echo_scope,
-                        _ => crate::policy::ThinkingEchoScope::AllAssistantMessages,
-                    },
                     // Nor does it change whose signed thinking is echoed across a model switch,
                     // so the cross-model rule already frozen for this run carries over.
                     cross_model: match frozen.reasoning {

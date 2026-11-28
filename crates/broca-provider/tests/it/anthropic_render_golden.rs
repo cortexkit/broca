@@ -365,28 +365,6 @@ mod gated {
         );
     }
 
-    /// A render config exactly as a run admitted by renderer version 2 recorded it, before the
-    /// thinking-echo scope existed. A resumed run renders from this blob, so its bytes must never
-    /// move: the golden below pins them.
-    const LEGACY_ECHO_FROZEN_CONFIG: &str = r#"{
-        "family_id": "anthropic_messages",
-        "renderer_version": 2,
-        "wire_model_id": "claude-opus-4-8",
-        "max_output_tokens": 2048,
-        "reasoning": {"mode": "anthropic_interleaved", "budget_tokens": 1024, "last_turn_only": true},
-        "tool_id": "passthrough",
-        "system_prompt": {
-            "mode": "required_identity_lead",
-            "identity": "You are Claude Code, Anthropic's official CLI for Claude."
-        },
-        "usage": "anthropic_usage",
-        "cache": {
-            "version": 1, "class": "markers", "syntax": "anthropic_cache_control",
-            "ttl": "1h", "max_breakpoints": 4, "lookback_blocks": 20
-        },
-        "token_limit_field": "max_tokens"
-    }"#;
-
     fn assistant_step(n: u32, thinking: &str) -> Message {
         Message {
             turn_system: false,
@@ -481,56 +459,6 @@ mod gated {
         .into();
         opts.tool_choice = ToolChoice::Auto.into();
         opts
-    }
-
-    const LEGACY_ECHO_TOOL_LOOP_GOLDEN: &str =
-        include_str!("../fixtures/anthropic_legacy_echo_tool_loop_render_golden.json");
-    const LEGACY_ECHO_TOOL_LOOP_GOLDEN_VERSION: &str =
-        include_str!("../fixtures/anthropic_legacy_echo_tool_loop_render_golden.json.version");
-
-    /// A run recorded before the thinking-echo scope existed must keep rendering exactly the
-    /// bytes it rendered when it was admitted: only the last assistant message echoes its
-    /// thinking. The recorded blob must also re-serialize unchanged, because resume compares it
-    /// with the provider's config and refuses on any difference.
-    #[test]
-    fn anthropic_legacy_echo_tool_loop_render_matches_golden() {
-        let recorded: serde_json::Value =
-            serde_json::from_str(LEGACY_ECHO_FROZEN_CONFIG).expect("legacy blob is JSON");
-        let frozen: broca_provider::wire::FrozenRenderConfig =
-            serde_json::from_value(recorded.clone()).expect("legacy blob deserializes");
-        assert_eq!(
-            serde_json::to_value(&frozen).expect("serialize legacy config"),
-            recorded,
-            "a recorded legacy config must re-serialize to the same blob"
-        );
-        let bytes = AnthropicMessages.render(&frozen, &tool_loop_request());
-        let rendered = String::from_utf8(bytes).expect("rendered bytes are UTF-8");
-
-        if render_golden_support::update_if_requested(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/anthropic_legacy_echo_tool_loop_render_golden.json"
-            ),
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/anthropic_legacy_echo_tool_loop_render_golden.json.version"
-            ),
-            rendered.as_bytes(),
-            LEGACY_ECHO_TOOL_LOOP_GOLDEN.as_bytes(),
-            LEGACY_ECHO_TOOL_LOOP_GOLDEN_VERSION,
-            ANTHROPIC_RENDERER_VERSION,
-            "Anthropic legacy-echo tool loop",
-        ) {
-            return;
-        }
-
-        render_golden_support::assert_matches_or_requires_bump(
-            rendered.as_bytes(),
-            LEGACY_ECHO_TOOL_LOOP_GOLDEN.as_bytes(),
-            LEGACY_ECHO_TOOL_LOOP_GOLDEN_VERSION,
-            ANTHROPIC_RENDERER_VERSION,
-            "Anthropic legacy-echo tool loop",
-        );
     }
 
     const TOOL_LOOP_GOLDEN: &str =

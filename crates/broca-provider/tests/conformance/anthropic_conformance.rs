@@ -11,9 +11,7 @@ use broca_provider::conformance::{
     check_freeze_against_mutation, check_render_determinism, normalize_recorded,
 };
 use broca_provider::families::{anthropic_frozen_config, resolve_frozen, AnthropicMessages};
-use broca_provider::policy::{
-    Quirks, ReasoningPolicy, SystemPromptPolicy, ThinkingEchoScope, UsagePolicy,
-};
+use broca_provider::policy::{Quirks, ReasoningPolicy, SystemPromptPolicy, UsagePolicy};
 use broca_provider::spec::{
     AuthKind, Capabilities, CapabilityFlag, CostSchedule, Limits, ModelSpec, Overlay, ProviderSpec,
     WireFamilyId,
@@ -112,7 +110,6 @@ fn anthropic_spec() -> (ProviderSpec, ModelSpec) {
             reasoning: ReasoningPolicy::AnthropicInterleaved {
                 budget_tokens: 1024,
                 last_turn_only: true,
-                echo_scope: ThinkingEchoScope::AllAssistantMessages,
                 cross_model: broca_provider::policy::CrossModelThinking::AnyAnthropicModel,
             },
             tool_id: Default::default(),
@@ -172,7 +169,6 @@ fn anthropic_freeze_survives_catalog_mutation() {
             p.quirks.reasoning = ReasoningPolicy::AnthropicInterleaved {
                 budget_tokens: 9999,
                 last_turn_only: true,
-                echo_scope: ThinkingEchoScope::LastAssistantMessage,
                 cross_model: broca_provider::policy::CrossModelThinking::SameModelOnly,
             };
             p.static_options = json!({"injected": "after-freeze"});
