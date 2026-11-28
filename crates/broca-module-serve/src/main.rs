@@ -19,6 +19,7 @@ use subc_protocol::SUBC_MODULE_ID_ENV;
 use subc_transport::{authenticate_client, connection_file};
 use tokio::net::TcpStream;
 
+mod log_crate_policy;
 mod state_format;
 
 const DEFAULT_MODULE_ID: &str = "broca";
@@ -156,7 +157,10 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
     //
     // The guard is bound for the whole of `main`: dropping it stops logging, so this must not
     // become a `let _ =`.
-    let _log = cortexkit_log::init(cortexkit_log::Config::for_module(&module_id))?;
+    let _log = cortexkit_log::init_with_crates(
+        cortexkit_log::Config::for_module(&module_id),
+        log_crate_policy::for_broca(),
+    )?;
     let mut startup = StartupPhases {
         started: startup_at,
         phase_started: startup_at,

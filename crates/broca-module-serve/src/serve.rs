@@ -152,6 +152,11 @@ fn request_operation(body: &[u8]) -> String {
         .unwrap_or_else(|_| "<invalid>".into())
 }
 
+fn is_slow_request(phase: &str, elapsed_us: u64) -> bool {
+    // The close phase measures the stream's lifetime, not request latency.
+    matches!(phase, "open" | "reply") && elapsed_us > 2_000_000
+}
+
 async fn log_served_request<F: std::future::Future>(
     operation: &str,
     session: &BrocaBindIdentity,
@@ -174,7 +179,7 @@ async fn log_served_request<F: std::future::Future>(
             }
             let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
             // Compute the session-address hash only when a line will be emitted; log the hash rather than the raw session path or request body.
-            if elapsed_us > 2_000_000
+            if is_slow_request(phase, elapsed_us)
                 || tracing::enabled!(target: "requests", tracing::Level::DEBUG)
             {
                 REQUEST_OUTCOME.with(|outcome| {
@@ -204,7 +209,7 @@ fn emit_request_log(
     elapsed_us: u64,
 ) {
     let elapsed_ms = elapsed_us / 1000;
-    if elapsed_us > 2_000_000 {
+    if is_slow_request(phase, elapsed_us) {
         tracing::warn!(target: "requests", operation, session, caller_module_id, outcome, phase, actor_opened, elapsed_us, elapsed_ms, "served management request");
     } else {
         tracing::debug!(target: "requests", operation, session, caller_module_id, outcome, phase, actor_opened, elapsed_us, elapsed_ms, "served management request");

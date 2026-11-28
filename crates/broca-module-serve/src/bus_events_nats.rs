@@ -18,6 +18,9 @@ use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
+mod reconnect_log;
+use reconnect_log::ReconnectLog;
+
 /// ck-bus's answer when the named key is no longer the module's current one.
 pub const CODE_SUPERSEDED: &str = "ckbus_credential_superseded";
 /// ck-bus's renewal answer for a key it has revoked.
@@ -605,6 +608,7 @@ impl NatsPublisher {
     async fn connect(
         holder: Arc<CredentialHolder>,
         credential: &Credential,
+        reconnect_log: &Arc<ReconnectLog>,
     ) -> Result<Self, String> {
         let config = ConnectConfig::new(&credential.credential_public)
             .map_err(|_| "invalid ckbus credential public key")?;
@@ -629,9 +633,16 @@ impl NatsPublisher {
         .connection_timeout(Duration::from_secs(5));
         let account =
             AccountNames::derive(&credential.acct).map_err(|_| "invalid ckbus account")?;
-        let conn = NatsConnection::connect(&credential.server_url, options, config)
-            .await
-            .map_err(|_| "ckbus connect failed")?;
+        let observe = reconnect_log.observe_dial();
+        let conn = NatsConnection::connect_observed(
+            &credential.server_url,
+            options,
+            config,
+            None,
+            observe,
+        )
+        .await
+        .map_err(|_| "ckbus connect failed")?;
         Ok(Self {
             stream: conn.stream(account.streams().event.clone()),
             account,
@@ -692,7 +703,8 @@ impl Link for NatsLink {
     }
 }
 
-struct NatsDialer;
+#[derive(Default)]
+struct NatsDialer(Arc<ReconnectLog>);
 #[async_trait]
 impl Dialer for NatsDialer {
     async fn dial(
@@ -701,7 +713,7 @@ impl Dialer for NatsDialer {
         credential: &Credential,
     ) -> Result<Box<dyn Link>, String> {
         Ok(Box::new(NatsLink {
-            publisher: NatsPublisher::connect(holder.clone(), credential).await?,
+            publisher: NatsPublisher::connect(holder.clone(), credential, &self.0).await?,
             credential_public: credential.credential_public.clone(),
         }))
     }
@@ -718,7 +730,7 @@ impl NatsConnector {
     pub fn new(holder: Arc<CredentialHolder>) -> Self {
         Self {
             holder,
-            dialer: Arc::new(NatsDialer),
+            dialer: Arc::new(NatsDialer::default()),
             publisher: Mutex::new(None),
         }
     }
@@ -1800,7 +1812,7 @@ mod tests {
         ]))));
         let connector = NatsConnector {
             holder: CredentialHolder::with_route(route.clone()),
-            dialer: Arc::new(NatsDialer),
+            dialer: Arc::new(NatsDialer::default()),
             publisher: Mutex::new(None),
         };
         let connection = connector.connect().await.unwrap();

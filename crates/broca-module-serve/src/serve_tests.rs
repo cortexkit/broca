@@ -265,13 +265,15 @@ fn management_request_at_two_seconds_remains_debug() {
     assert_eq!(logs[0].fields["outcome"], "ok");
 }
 
-#[tokio::test(start_paused = true)]
-async fn subscription_logs_open_and_close_not_frames() {
+async fn cancelled_subscription_logs(
+    filter: &str,
+    lifetime: std::time::Duration,
+) -> Vec<CapturedRequestLog> {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::prelude::*;
     let events = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("requests=debug"))
+        .with(tracing_subscriber::EnvFilter::new(filter))
         .with(RequestLogCapture(events.clone()));
     let (sink_tx, mut sink_rx) = mpsc::channel(1);
     let handler = Arc::new(MockSubscribeHandler {
@@ -317,16 +319,38 @@ async fn subscription_logs_open_and_close_not_frames() {
             FrameType::StreamData
         );
     }
+    tokio::time::advance(lifetime).await;
     cancel.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(1), sink.closed())
         .await
         .unwrap();
-    let logs = events.lock().unwrap();
+    let logs = events.lock().unwrap().clone();
+    logs
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscription_logs_open_and_close_not_frames() {
+    let logs = cancelled_subscription_logs("requests=debug", std::time::Duration::ZERO).await;
     assert_eq!(logs.len(), 2, "{logs:?}");
     assert_eq!(logs[0].fields["phase"], "open");
     assert_eq!(logs[1].fields["phase"], "close");
     assert_eq!(logs[1].fields["outcome"], "cancelled");
     assert_eq!(logs[0].fields["session"], logs[1].fields["session"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn long_subscription_close_remains_debug() {
+    let lifetime = std::time::Duration::from_secs(30 * 60);
+    let default_logs = cancelled_subscription_logs("info", lifetime).await;
+    assert!(default_logs.is_empty(), "{default_logs:?}");
+
+    let debug_logs = cancelled_subscription_logs("requests=debug", lifetime).await;
+    assert_eq!(debug_logs.len(), 2, "{debug_logs:?}");
+    let close = &debug_logs[1];
+    assert_eq!(close.level, tracing::Level::DEBUG);
+    assert_eq!(close.fields["phase"], "close");
+    assert_eq!(close.fields["outcome"], "cancelled");
+    assert_eq!(close.fields["elapsed_ms"], "1800000");
 }
 
 #[tokio::test]
