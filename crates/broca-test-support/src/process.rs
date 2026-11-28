@@ -1,6 +1,72 @@
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
+/// A Windows module launched by an owned test supervisor. The retained process handle
+/// pins its identity across exit, so a recorded PID is never itself a kill target.
+#[cfg(windows)]
+pub struct SupervisedChild {
+    process: subc_os::Process,
+    stamp: (u32, u64),
+}
+
+#[cfg(windows)]
+impl SupervisedChild {
+    pub fn capture(
+        supervisor: &tokio::process::Child,
+        pid: u32,
+        start_time: u64,
+    ) -> Result<Self, String> {
+        let parent = supervisor.id().ok_or("supervisor has exited")?;
+        Self::capture_with_parent(parent, pid, start_time)
+    }
+
+    pub fn capture_descendant(&self, pid: u32, start_time: u64) -> Result<Self, String> {
+        if self.has_exited().map_err(|error| error.to_string())? {
+            return Err(format!("parent {:?} has exited", self.stamp));
+        }
+        Self::capture_with_parent(self.stamp.0, pid, start_time)
+    }
+
+    fn capture_with_parent(parent: u32, pid: u32, start_time: u64) -> Result<Self, String> {
+        let process = subc_os::Process::open(pid)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("PID {pid} has exited"))?;
+        if subc_os::parent_pid(pid) != Some(parent)
+            || process.observe().map(|observation| observation.start_time) != Some(start_time)
+            || process
+                .wait_for_exit(Duration::ZERO)
+                .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "PID {pid} is not the live child recorded by supervisor {parent}"
+            ));
+        }
+        Ok(Self {
+            process,
+            stamp: (pid, start_time),
+        })
+    }
+
+    pub fn stamp(&self) -> (u32, u64) {
+        self.stamp
+    }
+
+    pub fn force_stop(&self) -> Result<(), String> {
+        match self
+            .process
+            .force_stop(self.stamp.1, Duration::from_secs(5))
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!("could not force-stop {:?}", self.stamp)),
+            Err(error) => Err(format!("could not force-stop {:?}: {error}", self.stamp)),
+        }
+    }
+
+    pub fn has_exited(&self) -> std::io::Result<bool> {
+        self.process.wait_for_exit(Duration::ZERO)
+    }
+}
+
 #[cfg(any(windows, test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProcessInfo {

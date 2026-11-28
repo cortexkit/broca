@@ -302,18 +302,37 @@ async fn connection_eof_does_not_drop_prepare_between_freeze_and_cover() {
     prepare_survives_closed_route(true).await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
+#[cfg(any(unix, windows))]
 async fn boot_error_names_its_step_when_the_state_root_is_missing() {
     let rig = Rig::new("boot-missing-root", Arc::new(FakeDoor::default())).await;
-    std::fs::rename(&rig.root, rig.root.with_extension("moved")).unwrap();
-    let error = rig.service.reconcile_boot().await.unwrap_err();
-    assert!(
-        error.message.starts_with("rebuild_fence_index: ")
-            && error.message.contains("No such file or directory"),
-        "{}",
-        error.message
-    );
+    #[cfg(unix)]
+    {
+        std::fs::rename(&rig.root, rig.root.with_extension("moved")).unwrap();
+        let error = rig.service.reconcile_boot().await.unwrap_err();
+        assert!(
+            error.message.starts_with("rebuild_fence_index: ")
+                && error.message.contains("No such file or directory"),
+            "{}",
+            error.message
+        );
+    }
+    #[cfg(windows)]
+    {
+        // SQLite keeps the rig directory open. Give the service a missing root instead
+        // of renaming the open directory, and compare the localized Win32 diagnostic.
+        let missing = rig.root.join("missing");
+        let cause = missing.canonicalize().unwrap_err();
+        assert_eq!(cause.kind(), std::io::ErrorKind::NotFound);
+        let service = AgentDataService::new(missing, (*rig.registry).clone(), rig.index, rig.door);
+        let error = service.reconcile_boot().await.unwrap_err();
+        assert!(
+            error.message.starts_with("rebuild_fence_index: ")
+                && error.message.contains(&cause.to_string()),
+            "{}",
+            error.message
+        );
+    }
 }
 
 #[tokio::test]

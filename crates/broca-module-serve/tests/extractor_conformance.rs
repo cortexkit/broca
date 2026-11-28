@@ -120,12 +120,11 @@ struct Subject {
     image_fixtures: Option<PathBuf>,
 }
 
-fn image_surface(path: PathBuf, windows: bool) -> Option<PathBuf> {
+fn image_surface(path: PathBuf, optional: bool) -> Option<PathBuf> {
     if path.is_file() {
         return Some(path);
     }
-    // The stand-in uses Unix APIs and the Windows fixture build omits it.
-    assert!(windows, "extractor image rig needs {}", path.display());
+    assert!(optional, "extractor image rig needs {}", path.display());
     None
 }
 
@@ -147,9 +146,12 @@ impl Subject {
             "extractor scoped rig needs {}",
             stub.display()
         );
+        // The release suites (BROCA_REQUIRE_SUBC set) stage the Windows fake-surface stand-in,
+        // so they must run the full image-reference checks. Only a developer run on Windows
+        // without that variable may skip resolving image references through the stand-in.
         let surface = image_surface(
             broca_test_support::subc_bin("fake-surface", "FAKE_SURFACE_BIN"),
-            cfg!(windows),
+            cfg!(windows) && std::env::var_os("BROCA_REQUIRE_SUBC").is_none(),
         );
         let scratch = broca_test_support::scratch_root();
         let root = scratch.join(format!("extractor-conformance-{}", std::process::id()));

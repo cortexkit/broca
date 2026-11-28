@@ -28,6 +28,8 @@ use broca_session_store::record::Record;
 #[path = "../common/account_continue.rs"]
 mod account_continue;
 use account_continue::{Continuations, ContinuePlan};
+#[path = "../common/broca_catalog_readiness.rs"]
+mod broca_catalog_readiness;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -353,7 +355,7 @@ impl subc_client_rs::ModuleHandler for RoutingModule {
 // ---- the stand-in credentials vault -----------------------------------------------------------
 
 struct Vault {
-    continuation_accounts: std::sync::atomic::AtomicBool,
+    continuation_accounts: bool,
     requests: Mutex<Vec<(String, Value)>>,
     /// Credential ids whose scoped reads answer `not_found`.
     not_found: Mutex<HashSet<String>>,
@@ -363,12 +365,10 @@ struct Vault {
     account_ids: Mutex<std::collections::HashMap<String, String>>,
     /// Once set, the listing has dropped `oauth:anthropic:work` and carries a new digest.
     relisted: std::sync::atomic::AtomicBool,
-    /// Once set, the listing also carries the labelled Anthropic API key `apikey:anthropic:work`.
-    anthropic_apikey_listed: std::sync::atomic::AtomicBool,
-    /// Once set, the listing also carries the OpenAI API key `apikey:openai`.
-    openai_apikey_listed: std::sync::atomic::AtomicBool,
-    /// Once set, the listing also carries the OpenRouter API key `apikey:openrouter`.
-    openrouter_listed: std::sync::atomic::AtomicBool,
+    /// Optional rows configured before broca can cache the vault's first listing.
+    anthropic_apikey_listed: bool,
+    openai_apikey_listed: bool,
+    openrouter_listed: bool,
     /// The value of the session store's deployment-key record (`opaque:broca-deployment:<id>`).
     /// `None` answers `not_found`, as a vault without the record or its grant does.
     deployment_key: Mutex<Option<Vec<u8>>>,
@@ -509,19 +509,13 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "account_id": "acct-g",
                     }),
                 ];
-                if self
-                    .continuation_accounts
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
+                if self.continuation_accounts {
                     rows.extend([
                         listed("oauth:anthropic:acct1", "acct1"),
                         listed("oauth:anthropic:acct2", "acct2"),
                     ]);
                 }
-                if self
-                    .openai_apikey_listed
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
+                if self.openai_apikey_listed {
                     rows.push(json!({
                         "id": "apikey:openai",
                         "categories": ["llm-provider"],
@@ -534,10 +528,7 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                         "operations": ["read"],
                     }));
                 }
-                if self
-                    .anthropic_apikey_listed
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
+                if self.anthropic_apikey_listed {
                     rows.push(json!({
                         "id": "apikey:anthropic:work",
                         "categories": ["llm-provider"],
@@ -551,10 +542,7 @@ impl subc_client_rs::ModuleHandler for VaultModule {
                     }));
                 }
                 let relisted = self.relisted.load(std::sync::atomic::Ordering::SeqCst);
-                if self
-                    .openrouter_listed
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
+                if self.openrouter_listed {
                     rows.push(json!({
                         "id": "apikey:openrouter",
                         "categories": ["llm-provider"],
@@ -1074,6 +1062,21 @@ impl Rig {
     }
 
     async fn start_with_routing_id(broca_config: Value, routing_id: &str) -> Option<Rig> {
+        Self::start_configured(broca_config, routing_id, None, |_, _, _| {}).await
+    }
+
+    async fn start_with_vault(configure: impl FnOnce(&mut Vault)) -> Option<Rig> {
+        Self::start_configured(json!({}), ROUTING, None, |_, vault, _| configure(vault)).await
+    }
+
+    /// Write the clock before spawning broca, and set fixture answers before the stand-ins
+    /// register with the daemon. Broca reads the clock at boot and can cache listings before READY.
+    async fn start_configured(
+        broca_config: Value,
+        routing_id: &str,
+        clock_ms: Option<u64>,
+        configure: impl FnOnce(&Routing, &mut Vault, &Upstream),
+    ) -> Option<Rig> {
         let daemon_bin = sibling_bin("ck-subc", "SUBC_CORE_BIN");
         if !daemon_bin.exists() {
             assert!(
@@ -1107,6 +1110,13 @@ impl Rig {
             &state_root.join("catalog"),
         ] {
             std::fs::create_dir_all(dir).unwrap();
+        }
+        if let Some(now_ms) = clock_ms {
+            std::fs::write(
+                state_root.join("test-clock"),
+                json!({ "now_ms": now_ms }).to_string(),
+            )
+            .unwrap();
         }
         // ck-broca carries no compiled-in model catalog. Seed the catalog file it saves and
         // falls back to when the catalog module is unreachable, as on a cold start.
@@ -1263,7 +1273,7 @@ impl Rig {
             requests: Mutex::new(Vec::new()),
             admissions: Mutex::new(Default::default()),
         });
-        let vault = Arc::new(Vault {
+        let mut vault = Vault {
             continuation_accounts: Default::default(),
             requests: Mutex::new(Vec::new()),
             not_found: Mutex::new(HashSet::new()),
@@ -1278,7 +1288,9 @@ impl Rig {
             openrouter_listed: Default::default(),
             deployment_key: Mutex::new(None),
             antigravity_without_project: Default::default(),
-        });
+        };
+        configure(&routing, &mut vault, &upstream);
+        let vault = Arc::new(vault);
         let routing_task = register(
             &connection_file,
             routing_id,
@@ -1298,7 +1310,7 @@ impl Rig {
             VaultModule(Arc::clone(&vault)),
         )
         .await;
-        Some(Rig {
+        let rig = Rig {
             daemon,
             connection_file,
             state_root,
@@ -1309,7 +1321,33 @@ impl Rig {
             vault,
             vault_task,
             upstream,
-        })
+        };
+        rig.wait_for_initial_ready().await;
+        Some(rig)
+    }
+
+    async fn wait_for_initial_ready(&self) {
+        let catalog = SubcConnection::connect(&self.connection_file)
+            .await
+            .expect("connect to the account rig's daemon");
+        // HELLO gives broca a catalog entry before its stores and recovery are ready.
+        // Wait for the daemon to report ready before starting the route.open timeout.
+        broca_test_support::wait_for(
+            "broca ready to bind account rig routes",
+            async {
+                loop {
+                    let entries = catalog.catalog_list().await.unwrap_or_else(|error| {
+                        panic!("catalog.list: {error}\n{}", self.log_diagnostics("startup"))
+                    });
+                    if broca_catalog_readiness::registered_for_bind(&entries, "broca").is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            },
+            || self.log_diagnostics("startup"),
+        )
+        .await;
     }
 
     /// Broca refuses a send with the retryable `transient` until it has loaded the vault's
@@ -1800,24 +1838,25 @@ impl Rig {
         }
     }
 
-    fn script_continuation_wall(&self, answer: ContinuePlan, resume_current_account: bool) {
-        self.routing.continuations.declare(true);
-        self.routing
-            .continuations
-            .declare_resume(resume_current_account);
-        self.routing.continuations.script_next(answer);
-        self.routing.set(RoutingMode::Choose {
+    fn script_continuation_wall(
+        routing: &Routing,
+        vault: &mut Vault,
+        upstream: &Upstream,
+        answer: ContinuePlan,
+    ) {
+        routing.continuations.declare(true);
+        routing.continuations.declare_resume(true);
+        routing.continuations.script_next(answer);
+        routing.set(RoutingMode::Choose {
             account_id: "acct1",
             credential_id: "oauth:anthropic:acct1",
         });
-        self.vault
-            .continuation_accounts
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.vault.account_ids.lock().unwrap().extend([
+        vault.continuation_accounts = true;
+        vault.account_ids.lock().unwrap().extend([
             ("oauth:anthropic:acct1".into(), "acct1".into()),
             ("oauth:anthropic:acct2".into(), "acct2".into()),
         ]);
-        *self.upstream.quota_wall_credential.lock().unwrap() = Some("oauth:anthropic:acct1".into());
+        *upstream.quota_wall_credential.lock().unwrap() = Some("oauth:anthropic:acct1".into());
     }
 
     async fn continue_requests(&self) -> Vec<Vec<u8>> {
@@ -2044,23 +2083,31 @@ async fn account_continue_request_bytes_and_offered_account_observations_through
         parse_continue_request, ContinueAnswer, ContinueOffer, ContinueRequest, ExhaustedAccount,
     };
 
-    let rig = Rig::start_with(json!({"session_storage":{"encryption":"off"}}))
-        .await
-        .expect("account continuation requires the real daemon");
     let valid_until_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
         + 300_000;
-    rig.script_continuation_wall(
-        ContinuePlan::Answer(ContinueAnswer::Offer(ContinueOffer::new(
-            "oauth:anthropic:acct2",
-            "acct2",
-            "decision-acct2",
-            valid_until_ms,
-        ))),
-        true,
-    );
+    let rig = Rig::start_configured(
+        json!({"session_storage":{"encryption":"off"}}),
+        ROUTING,
+        None,
+        |routing, vault, upstream| {
+            Rig::script_continuation_wall(
+                routing,
+                vault,
+                upstream,
+                ContinuePlan::Answer(ContinueAnswer::Offer(ContinueOffer::new(
+                    "oauth:anthropic:acct2",
+                    "acct2",
+                    "decision-acct2",
+                    valid_until_ms,
+                ))),
+            );
+        },
+    )
+    .await
+    .expect("account continuation requires the real daemon");
     let name = "continue-wire-contract";
     let identity = rig.served_identity(name).await;
     let plain = broca_session_store::keys::DeploymentKey::unloaded(1);
@@ -2190,23 +2237,13 @@ async fn capture_concurrency_full_reader_replies() {
         );
         return;
     }
-    let Some(rig) = Rig::start().await else {
-        assert!(samples.is_none(), "sample capture requires the real daemon");
-        return;
-    };
     let now_ms = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
     };
-    let set_clock = |now_ms| {
-        let temp = rig.state_root.join("test-clock.capacity.tmp");
-        std::fs::write(&temp, json!({"now_ms": now_ms}).to_string()).unwrap();
-        std::fs::rename(temp, rig.state_root.join("test-clock")).unwrap();
-    };
     let paused_at_ms = now_ms();
-    set_clock(paused_at_ms);
     let plain = broca_session_store::keys::DeploymentKey::unloaded(1);
 
     // Advertise continuation and list both credentials before broca can cache either answer.
@@ -2217,11 +2254,33 @@ async fn capture_concurrency_full_reader_replies() {
         message: CONCURRENCY_FULL_MESSAGE,
         detail: concurrency_full_detail(reset),
     };
-    rig.script_continuation_wall(concurrency_full(routing_reset), true);
     let second_reset = routing_reset + 120_000;
-    rig.routing
-        .continuations
-        .script_next(concurrency_full(second_reset));
+    let Some(rig) = Rig::start_configured(
+        json!({}),
+        ROUTING,
+        Some(paused_at_ms),
+        |routing, vault, upstream| {
+            Rig::script_continuation_wall(
+                routing,
+                vault,
+                upstream,
+                concurrency_full(routing_reset),
+            );
+            routing
+                .continuations
+                .script_next(concurrency_full(second_reset));
+        },
+    )
+    .await
+    else {
+        assert!(samples.is_none(), "sample capture requires the real daemon");
+        return;
+    };
+    let set_clock = |now_ms| {
+        let temp = rig.state_root.join("test-clock.capacity.tmp");
+        std::fs::write(&temp, json!({"now_ms": now_ms}).to_string()).unwrap();
+        std::fs::rename(temp, rig.state_root.join("test-clock")).unwrap();
+    };
 
     let reset_at_ms = now_ms() + 30_000;
     rig.routing
@@ -2507,13 +2566,14 @@ async fn explicit_routing_id_selects_accounts_and_receives_reports_through_the_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_served_attempt_reports_a_typed_success_on_the_admitted_account_through_the_real_daemon()
 {
-    let Some(rig) = Rig::start().await else {
+    let Some(rig) = Rig::start_configured(json!({}), ROUTING, None, |routing, vault, _| {
+        routing.continuations.declare_success(true);
+        vault.anthropic_apikey_listed = true;
+    })
+    .await
+    else {
         return;
     };
-    rig.routing.continuations.declare_success(true);
-    rig.vault
-        .anthropic_apikey_listed
-        .store(true, std::sync::atomic::Ordering::SeqCst);
     let client = rig.client("served-success").await;
     let run_id = send(
         &client,
@@ -3302,9 +3362,8 @@ async fn account_not_authorized_refuses_permanently_without_pausing_or_writing()
 /// fresh login), broca is killed, and the resend of the same send resumes that run on exactly
 /// the selection it froze: the vault's opaque credential id `work-claude`, read verbatim, and
 /// the `oauth` method from the vault metadata, frozen beside it. The resume asks routing
-/// nothing even though routing would now pick another account. Unix only, like the crash
-/// subcase above: the kill is a SIGKILL of the daemon's broca child.
-#[cfg(unix)]
+/// nothing even though routing would now pick another account.
+#[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_routed_run_killed_before_its_first_step_resumes_on_its_frozen_selection() {
     let Some(rig) = Rig::start().await else {
@@ -3353,13 +3412,27 @@ async fn a_routed_run_killed_before_its_first_step_resumes_on_its_frozen_selecti
     .await;
     drop(client);
 
-    let broca_pids = children(rig.daemon.id().unwrap());
-    assert!(!broca_pids.is_empty(), "broca is supervised by the daemon");
-    for pid in &broca_pids {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+    #[cfg(unix)]
+    {
+        let broca_pids = children(rig.daemon.id().unwrap());
+        assert!(!broca_pids.is_empty(), "broca is supervised by the daemon");
+        for pid in &broca_pids {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
     }
+    #[cfg(windows)]
+    let old = {
+        let broca = super::windows_supervisor::live_child(
+            &rig.daemon,
+            &rig.root.join("data-home"),
+            "broca",
+        )
+        .expect("the rig supervises a live broca");
+        broca.force_stop().unwrap();
+        broca
+    };
     // The login is repaired, and routing would now choose another account for a new admission.
     rig.vault.needs_reauth.lock().unwrap().clear();
     rig.routing.set(RoutingMode::Choose {
@@ -3367,6 +3440,14 @@ async fn a_routed_run_killed_before_its_first_step_resumes_on_its_frozen_selecti
         credential_id: "oauth:anthropic:acct-b",
     });
 
+    #[cfg(windows)]
+    super::windows_supervisor::wait_for_replacement(
+        &rig.daemon,
+        &rig.root.join("data-home"),
+        "broca",
+        old.stamp(),
+    )
+    .await;
     let reopened = rig.client("frozen").await;
     let resumed = send(&reopened, "send-frozen", None).await;
     assert_eq!(resumed, run_id, "the resend resumes the admitted run");
@@ -4148,12 +4229,9 @@ async fn billing_exhausted_xai_status_matches_golden_through_real_serve() {
 /// BROCA_UPDATE_GOLDEN=1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_invalid_openai_status_matches_golden_through_real_serve() {
-    let rig = Rig::start()
+    let rig = Rig::start_with_vault(|vault| vault.openai_apikey_listed = true)
         .await
         .expect("the request-invalid golden requires the real daemon");
-    rig.vault
-        .openai_apikey_listed
-        .store(true, std::sync::atomic::Ordering::SeqCst);
     rig.upstream
         .request_invalid_openai
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4219,14 +4297,11 @@ async fn request_invalid_openai_status_matches_golden_through_real_serve() {
 /// Regenerate only from the daemon's real reply with BROCA_UPDATE_GOLDEN=1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn credit_insufficient_openrouter_status_matches_golden_through_real_serve() {
-    let rig = Rig::start()
+    let rig = Rig::start_with_vault(|vault| vault.openrouter_listed = true)
         .await
         .expect("the credit-insufficient golden requires the real daemon");
     rig.upstream
         .credit_insufficient_openrouter
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    rig.vault
-        .openrouter_listed
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let client = rig.client("credit-insufficient-openrouter").await;
     let mut openrouter_spec = spec("send-credit-insufficient-openrouter", None);
@@ -4293,9 +4368,6 @@ async fn credit_insufficient_openrouter_status_matches_golden_through_real_serve
 /// Send on the labelled Anthropic API key `apikey:anthropic:work`, pinned the way routing pins a
 /// pooled key, and return the run's terminal `run.status` once it reports an error.
 async fn pinned_anthropic_apikey_error_status(rig: &Rig, name: &str) -> (Value, Vec<u8>) {
-    rig.vault
-        .anthropic_apikey_listed
-        .store(true, std::sync::atomic::Ordering::SeqCst);
     let client = rig.client(name).await;
     let run_id = send(
         &client,
@@ -4397,7 +4469,7 @@ fn without_awaits(bytes: &[u8], golden: &[u8]) -> Vec<u8> {
 /// Regenerate only from the daemon's real reply with BROCA_UPDATE_GOLDEN=1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn billing_exhausted_anthropic_apikey_status_matches_golden_through_real_serve() {
-    let rig = Rig::start()
+    let rig = Rig::start_with_vault(|vault| vault.anthropic_apikey_listed = true)
         .await
         .expect("the Anthropic billing-exhausted golden requires the real daemon");
     rig.upstream
@@ -4426,7 +4498,7 @@ async fn billing_exhausted_anthropic_apikey_status_matches_golden_through_real_s
 /// BROCA_UPDATE_GOLDEN=1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transient_rate_limited_credential_status_matches_golden_through_real_serve() {
-    let rig = Rig::start()
+    let rig = Rig::start_with_vault(|vault| vault.anthropic_apikey_listed = true)
         .await
         .expect("the rate-limited golden requires the real daemon");
     rig.upstream
@@ -4486,14 +4558,9 @@ async fn an_antigravity_sign_in_without_a_project_is_refused_at_admission() {
 /// Regenerate only from the daemon's real reply with BROCA_UPDATE_GOLDEN=1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn account_limit_exhausted_code_assist_status_matches_golden_through_real_serve() {
-    let rig = Rig::start()
+    let rig = Rig::start_configured(json!({}), ROUTING, Some(1_800_000_000_000), |_, _, _| {})
         .await
         .expect("the Code Assist quota golden requires the real daemon");
-    std::fs::write(
-        rig.state_root.join("test-clock"),
-        r#"{"now_ms":1800000000000}"#,
-    )
-    .unwrap();
     rig.upstream
         .account_limit_exhausted_code_assist
         .store(true, std::sync::atomic::Ordering::SeqCst);

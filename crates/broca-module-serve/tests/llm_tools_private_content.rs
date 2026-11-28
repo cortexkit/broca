@@ -9,9 +9,16 @@
 //! `fake-aft-stub`, which declares no management surface, so the daemon refuses a request
 //! aimed at either of them.
 
-// The handoff uses /bin/sh and records kernel process identities for cleanup.
-// Those identity helpers are implemented only on Linux and macOS.
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(any(target_os = "linux", target_os = "macos", windows))]
+
+#[cfg(windows)]
+#[path = "llm_tools_private_content/windows.rs"]
+mod windows;
+#[cfg(windows)]
+use windows::cleanup_probe;
+#[cfg(debug_assertions)]
+#[path = "common/retained_card.rs"]
+mod retained_card;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -108,6 +115,8 @@ enum Stub {
 enum StandInHold {
     None,
     Handoff,
+    #[cfg(windows)]
+    LateHandoff,
     BasalNoncePublication,
 }
 
@@ -116,6 +125,8 @@ struct Rig {
     root: PathBuf,
     state: PathBuf,
     provider: Arc<Provider>,
+    #[cfg(windows)]
+    orphaned_standins: Vec<Arc<broca_test_support::SupervisedChild>>,
 }
 
 impl Rig {
@@ -156,6 +167,10 @@ impl Rig {
             std::fs::write(root.join("basal.hold"), b"").unwrap();
             // A new stand-in must retire the preceding launch's ready credential.
             std::fs::write(root.join("basal.nonce"), b"previous-launch").unwrap();
+        }
+        #[cfg(windows)]
+        if hold == StandInHold::LateHandoff {
+            std::fs::write(root.join("hold-standin-publication"), b"hold").unwrap();
         }
         let state = root.join("state");
         let priced = |units| json!({"currency":"USD","exponent":9,"state":"priced","units":units,"unit_provenance":{"kind":"stated"}});
@@ -212,8 +227,14 @@ impl Rig {
                 Stub::Unreachable => Vec::new(),
             };
             std::fs::write(&fixture, serde_json::to_string(&lines).unwrap()).unwrap();
-            let handoff = root.join(format!("{module_id}.handoff.sh"));
-            std::fs::write(
+            #[cfg(windows)]
+            {
+                modules[module_id] = windows::module_config(&root, module_id, &fixture, hold);
+            }
+            #[cfg(unix)]
+            {
+                let handoff = root.join(format!("{module_id}.handoff.sh"));
+                std::fs::write(
                 &handoff,
                 format!(
                     "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --subc) SUBC_CONNECTION=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\nexport SUBC_CONNECTION\nexport PRIVATE_CONTENT_ROOT='{root}'\nexport PRIVATE_CONTENT_HOLD_HANDOFF={hold}\nexport SURFACE_MODULE_ID={module_id}\nexport PRIVATE_CONTENT_SURFACE='{surface}'\nexport PRIVATE_CONTENT_FIXTURES={fixtures}\nexport PRIVATE_CONTENT_REQUESTS={requests}\nexec '{helper}' --exact private_content_handoff --nocapture >> '{ready}' 2>> '{stderr}'\n",
@@ -231,17 +252,18 @@ impl Rig {
                 ),
             )
             .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&handoff, std::fs::Permissions::from_mode(0o755)).unwrap();
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&handoff, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                modules[module_id] = json!({
+                    "program": handoff,
+                    "args": [],
+                    "reserved": true,
+                    "enabled": true,
+                });
             }
-            modules[module_id] = json!({
-                "program": handoff,
-                "args": [],
-                "reserved": true,
-                "enabled": true,
-            });
         }
         let env = json!({"BROCA_STATE_ROOT":state,"BROCA_CONFIG_PATH":config,"BROCA_PROVIDER_BASE_URL":format!("{url}/v1"),"CK_LOG":"info"});
         modules["broca"] = json!({"program":broca_test_support::ckdev_binary(Path::new(env!("CARGO_BIN_EXE_ck-broca")), broca_test_support::scratch_root()),"args":[],"reserved":true,"enabled":true,"env":env});
@@ -274,6 +296,8 @@ impl Rig {
             root,
             state,
             provider: provider_state,
+            #[cfg(windows)]
+            orphaned_standins: Vec::new(),
         };
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -357,6 +381,7 @@ impl Rig {
     /// Restart the daemon's broca over the same state and open a fresh route to the new
     /// process. Only one broca may serve a state root at a time, so the running one is killed
     /// first, and the daemon starts it again with the config as it is now.
+    #[cfg(unix)]
     async fn restart(&self) -> Route {
         let roster = self.root.join("data/cortexkit/run/live-children.json");
         let record: Value = serde_json::from_slice(&std::fs::read(&roster).unwrap()).unwrap();
@@ -385,6 +410,12 @@ impl Rig {
         self.open_to("broca", "run", false).await
     }
 
+    #[cfg(windows)]
+    async fn restart(&self) -> Route {
+        windows::restart_broca(self).await;
+        self.open_to("broca", "run", false).await
+    }
+
     /// How many `private_content.query` requests reached cerebellum.
     fn cerebellum_queries(&self) -> usize {
         requests(self, "cerebellum", "private_content.query")
@@ -408,11 +439,35 @@ impl Drop for Rig {
                 }
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        broca_test_support::kill_and_reap(&mut self._daemon);
+        #[cfg(windows)]
+        {
+            if std::thread::panicking() {
+                let data = self.root.join("data/cortexkit");
+                let mut logs = broca_test_support::rig_log_diagnostics(&data, &self.state);
+                for module in ["owner", "cerebellum", "basal", "cingulate"] {
+                    broca_test_support::append_file_tail(
+                        &mut logs,
+                        &format!("supervised {module} stderr"),
+                        &data.join(format!("run/logs/{module}.stderr.log")),
+                    );
+                }
+                eprintln!("{logs}");
+            }
+            broca_test_support::kill_and_reap_tree(&mut self._daemon);
+            for child in &self.orphaned_standins {
+                if let Err(error) = child.force_stop() {
+                    if std::thread::panicking() {
+                        eprintln!("stand-in cleanup: {error}");
+                    } else {
+                        panic!("stand-in cleanup: {error}");
+                    }
+                }
+            }
+        }
     }
 }
 
+#[cfg(unix)]
 fn reap_daemon(child: &mut tokio::process::Child) -> std::io::Result<()> {
     use std::time::Instant;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -499,6 +554,7 @@ fn cleanup_recorded_processes(
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn private_content_rig_cleans_up_a_module_published_before_daemon_reap() {
     use broca_test_support::RecordedProcess;
@@ -533,6 +589,12 @@ async fn private_content_rig_cleans_up_a_module_published_before_daemon_reap() {
     );
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn private_content_rig_cleans_up_a_module_published_before_daemon_reap() {
+    windows::cleanup_late_standin().await;
+}
+
 async fn consumer_nonce(path: &Path) -> String {
     broca_test_support::wait_until("caller nonce", || async {
         let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
@@ -544,6 +606,12 @@ async fn consumer_nonce(path: &Path) -> String {
         }
     })
     .await
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn private_content_handoff() {
+    windows::handoff().await;
 }
 
 #[tokio::test]
@@ -664,7 +732,9 @@ fn fake_surface_bin() -> PathBuf {
         "required private-content stand-in missing: set FAKE_SURFACE_BIN to a prebuilt fake-surface binary; strict runs never compile fixtures"
     );
     let stand_in = build_dir("fake-surface");
-    let built = stand_in.join("debug/fake-surface");
+    let built = stand_in
+        .join("debug")
+        .join(format!("fake-surface{}", std::env::consts::EXE_SUFFIX));
     let ready = stand_in.join("fake-surface.ready");
     if !(ready.exists() && built.exists() && built_after_source(&built)) {
         let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-surface");
@@ -1088,6 +1158,12 @@ async fn always_grant_uses_the_daemon_project_not_the_workdir() {
             1,
         )
         .unwrap();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let at = i64::try_from(at).unwrap();
+    retained_card::retain_card(&store, "seed", identity, at);
     assert!(admitted_with_retry(&rig, &first, "first-a").await["cost_usd"].is_number());
     let later = rig
         .open_with_held("broca", "project-a-later", false, false)
@@ -1102,6 +1178,13 @@ async fn always_grant_uses_the_daemon_project_not_the_workdir() {
     assert_eq!(rig.calls(), 2, "a shared workdir must not match");
     assert!(store.revoke("always-card").unwrap());
     assert_eq!(store.generation("agent", "typesafe").unwrap(), 1);
+    let before = artifacts(&rig);
+    assert_eq!(store.sweep(at).unwrap(), 0);
+    assert_eq!(
+        artifacts(&rig),
+        before,
+        "the seeded card must outlive its grant"
+    );
     let error = refused_once_the_route_is_served(&rig, &later, "revoked-a").await;
     assert_eq!(error["detail"]["consent"], "consent_required");
     assert_eq!(rig.calls(), 2);
@@ -1516,7 +1599,6 @@ fn private_content_handoff() {
 /// [`cleanup_recorded_processes`] can end it.
 /// A stand-in that cleanup missed exits on its own after [`HELD_STANDIN_LIMIT`], far longer
 /// than any probe runs, so a cleanup defect fails its probe without leaving processes for days.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn private_content_held_standin() {
     if std::env::var_os("PRIVATE_CONTENT_HELD_STANDIN").is_some() {
@@ -1527,7 +1609,6 @@ fn private_content_held_standin() {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 const HELD_STANDIN_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1671,19 +1752,16 @@ async fn cleanup_probe(name: &str, timeout: bool, orphan: bool) {
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn private_content_rig_cleans_up_on_panic_and_preserves_lookalikes() {
     cleanup_probe("cleanup-panic", false, false).await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn private_content_rig_cleans_up_after_wait_until_times_out() {
     cleanup_probe("cleanup-timeout", true, false).await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn private_content_rig_cleans_up_standins_orphaned_before_drop() {
     cleanup_probe("cleanup-orphan", false, true).await;

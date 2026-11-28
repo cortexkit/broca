@@ -39,6 +39,8 @@ PREFLIGHT_FEATURES = {flag.split("/", 1)[1] for flag in PREFLIGHT_FEATURE_FLAGS}
 FEATURE_GATE = re.compile(r'^\s*cfg\s*\(\s*feature\s*=\s*"([^"]+)"\s*\)\s*$')
 ALL_GATE = re.compile(r'^\s*cfg\s*\(\s*all\s*\((.*)\)\s*\)\s*$', re.S)
 FEATURE_MEMBER = re.compile(r'\bfeature\s*=\s*"([^"]+)"')
+WINDOWS_MEMBER = re.compile(r'\s*(?:windows|target_os\s*=\s*"windows")\s*')
+WINDOWS_GATE = re.compile(r'^\s*cfg\s*\(\s*(' + WINDOWS_MEMBER.pattern + r')\)\s*$')
 # A file's inner attributes, before its first item: `#![cfg(...)]` gates the whole file.
 INNER_ATTRIBUTE = re.compile(r'#!\s*\[([^\]]*)\]')
 GENERIC_HELPERS = {
@@ -230,13 +232,18 @@ def _body_open(mask: str, match: re.Match[str], pairs: dict[int, int]) -> int | 
 
 
 def _compiled_out(attr: str) -> bool:
-    """Whether the cfg attribute `attr` needs a feature the preflight does not enable."""
+    """Whether `attr` excludes this item from the Linux preflight inventory."""
+    if WINDOWS_GATE.fullmatch(attr):
+        return True
     gate = FEATURE_GATE.match(attr)
     if gate:
         return gate.group(1) not in PREFLIGHT_FEATURES
     every = ALL_GATE.match(attr)
     if every and "(" not in every.group(1):
-        return any(name not in PREFLIGHT_FEATURES for name in FEATURE_MEMBER.findall(every.group(1)))
+        members = every.group(1)
+        return any(WINDOWS_MEMBER.fullmatch(member) for member in members.split(",")) or any(
+            name not in PREFLIGHT_FEATURES for name in FEATURE_MEMBER.findall(members)
+        )
     return False
 
 
@@ -263,9 +270,8 @@ def _is_test_attribute(mask: str, scope_start: int, item_start: int, source: str
     boundary = max(prefix.rfind("}"), prefix.rfind(";"))
     preamble = prefix[boundary + 1:]
     attributes = re.findall(r"#\s*\[([^\]]*)\]", preamble)
-    # A test gated on a feature the preflight does not enable is never compiled there, so it cannot
-    # be selected and is absent from the inventory by construction. The mask blanks string
-    # literals, so the feature name is read from the source.
+    # A test compiled out on this preflight is absent from its inventory by construction.
+    # The mask blanks string literals, so read the gate from the source.
     unmasked = source[scope_start + boundary + 1:item_start]
     for attr in re.findall(r"#\s*\[([^\]]*)\]", unmasked):
         if _compiled_out(attr):

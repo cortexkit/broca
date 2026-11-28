@@ -77,6 +77,21 @@ fn seed(store: &GrantsStore, key: &str, run: &str, decision: Decision, at: i64) 
         .unwrap()
 }
 
+#[path = "common/retained_card.rs"]
+mod retained_card;
+
+#[test]
+fn answered_fixture_card_survives_the_revoke_sweep() {
+    let store = GrantsStore::open_in_memory().unwrap();
+    let at = now();
+    let grant = seed(&store, "native", "a", Decision::Allow24h, at);
+    retained_card::retain_card(&store, "native", identity("a"), at);
+    let answered = store.card("native").unwrap().unwrap();
+    assert!(store.revoke(&grant.id).unwrap());
+    assert_eq!(store.sweep(at).unwrap(), 0);
+    assert_eq!(store.card("native").unwrap(), Some(answered));
+}
+
 fn request(name: &str, arguments: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({"name":name,"arguments":arguments})).unwrap()
 }
@@ -449,7 +464,9 @@ async fn native_manifest_and_operator_calls_are_sessionless_and_role_isolated() 
                 .any(|op| op["name"] == name && op["kind"] == kind))));
     }
     let store = GrantsStore::open(rig.state.join("grants.db")).unwrap();
-    let grant = seed(&store, "native", "a", Decision::Allow24h, now());
+    let at = now();
+    let grant = seed(&store, "native", "a", Decision::Allow24h, at);
+    retained_card::retain_card(&store, "native", identity("a"), at);
     let before = artifacts(&rig);
     assert_eq!(
         wire(&direct, &route, "permissions.list", json!({}))
@@ -482,6 +499,8 @@ async fn native_manifest_and_operator_calls_are_sessionless_and_role_isolated() 
         .unwrap(),
         json!({"outcome":"revoked"})
     );
+    // Run the same sweep as the deadline timer so the test does not depend on its next tick.
+    assert_eq!(store.sweep(at).unwrap(), 0);
     let after = artifacts(&rig);
     assert_eq!(after["sessions"], 0);
     for file in ["system-one.db", "run-index.db"] {

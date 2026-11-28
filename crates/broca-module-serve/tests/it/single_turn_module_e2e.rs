@@ -39,12 +39,9 @@ use broca_session_store::record::Record;
 use broca_subc::SubcConnection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(unix)]
 use tokio::net::TcpListener;
 use tokio::process::Command;
-#[cfg(unix)]
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
@@ -206,13 +203,11 @@ struct AiMock {
     dir: PathBuf,
 }
 
-#[cfg(unix)]
 struct ResponsesCapture {
     base_url: String,
     task: Option<JoinHandle<Vec<u8>>>,
 }
 
-#[cfg(unix)]
 impl ResponsesCapture {
     async fn start() -> Self {
         Self::start_replying(concat!(
@@ -290,7 +285,6 @@ impl ResponsesCapture {
     }
 }
 
-#[cfg(unix)]
 impl Drop for ResponsesCapture {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
@@ -559,8 +553,6 @@ enum VaultSeedOrder {
     /// handle, production's shape after a provider refused the key.
     InvalidateThenMint,
     /// Mints a handle and revokes it: a live credential whose handle is gone.
-    // Used only by the unix-only aimock tests.
-    #[cfg_attr(not(unix), allow(dead_code))]
     MintThenRevokeHandle,
 }
 
@@ -577,8 +569,6 @@ const RIG_ACCOUNT: &str = "acct1";
 /// Both variants use the module's operator endpoint override (`providers.<id>.base_url` in the
 /// file named by `BROCA_CONFIG_PATH`), never `BROCA_PROVIDER_BASE_URL`: that mock override
 /// skips credential resolution, and the arms using these routes exist to exercise it.
-// Only the unix-gated vault arms construct a route; elsewhere the enum is matched but unbuilt.
-#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
 enum ProviderRoute<'a> {
     /// Meta and Anthropic go to a capture server; the URL is its `http://host:port/v1` base.
@@ -701,8 +691,6 @@ impl Daemon {
 
     /// Boot the rig with a real credentials vault holding one LIVE credential, with
     /// `atomic-chat` traffic sent to the aimock at `aimock_base_url`.
-    // Only the unix-gated provider-401 arm uses this: it needs make_vault_unavailable.
-    #[cfg(unix)]
     async fn start_with_live_vault_credential(
         tag: &str,
         credential_id: &str,
@@ -717,7 +705,6 @@ impl Daemon {
         .await
     }
 
-    #[cfg(unix)]
     async fn start_with_live_vault_credential_and_provider_override(
         tag: &str,
         credential_id: &str,
@@ -1258,8 +1245,6 @@ impl Daemon {
             .expect("probe broca health")
     }
 
-    // Used only by the unix-only aimock tests.
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn ck_auth_command(&self) -> std::process::Command {
         let mut command =
             broca_test_support::ckdev_command(ck_auth_bin(), broca_test_support::scratch_root());
@@ -1285,8 +1270,6 @@ impl Daemon {
     /// That is also how a real re-login writes, so the resume under test is reached the way
     /// production reaches it. A failed repair is asserted here rather than left to surface
     /// later as a resume that did not happen.
-    // Used only by the unix-only aimock tests.
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn repair_vault_credential(&self, credential_id: &str) {
         let payload = self.dir.join("repaired.payload");
         std::fs::write(&payload, "sk-repaired").expect("write the repaired credential's payload");
@@ -1316,7 +1299,6 @@ impl Daemon {
     /// The cache eviction happens before that report is sent, so this vault-side state change is
     /// also a barrier proving the first run completed its post-run credential handling before the
     /// test removes vault connectivity.
-    #[cfg(unix)]
     async fn wait_for_vault_needs_reauth(&self) -> bool {
         broca_test_support::wait_until("vault applies provider auth failure", || async {
             let output = broca_test_support::retry_executable_file_busy(|| {
@@ -1352,6 +1334,26 @@ impl Daemon {
         // The wrapper execs the vault. Signal its published PID rather than
         // depending on a process listing's executable name and parent matching.
         unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
+    }
+
+    #[cfg(windows)]
+    async fn make_vault_unavailable(&self) -> bool {
+        // The control pipe's acknowledged disable keeps only the vault down; broca's
+        // process-local credential cache must survive the outage.
+        let consumer = subc_client_rs::SubcConsumer::connect_local(
+            &self.connection_file,
+            subc_client_rs::ConsumerOptions {
+                call_timeout: broca_test_support::EVENT_HANG_GUARD,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect to the rig daemon's control pipe");
+        let ack = consumer
+            .supervisor_set_enabled("claustrum", false)
+            .await
+            .expect("disable the vault without restarting broca");
+        ack.module_id == "claustrum" && ack.applied
     }
 
     /// The state root the rig gives the module (its BROCA_STATE_ROOT).
@@ -1528,8 +1530,6 @@ impl ConcurrencyProbe {
     }
 }
 
-// Used only by the unix-only aimock tests.
-#[cfg_attr(not(unix), allow(dead_code))]
 /// Run the broca-session client binary to completion against the daemon.
 /// Poll a module's session store until every marker appears in one file, or time out.
 ///
@@ -1569,8 +1569,6 @@ async fn stored_session(daemon: &Daemon, session: &str) -> Vec<Record> {
 }
 
 /// Whether `records` hold a pause for re-authentication.
-// Used only by the unix-only aimock tests.
-#[cfg_attr(not(unix), allow(dead_code))]
 fn paused_for_sign_in(records: &[Record]) -> bool {
     records.iter().any(|record| {
         matches!(record, Record::Pause(pause) if matches!(pause.reason, PauseReason::AuthRequired))
@@ -1903,7 +1901,6 @@ async fn single_client_single_turn_through_the_real_module() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
     let server = ResponsesCapture::start().await;
@@ -2050,7 +2047,6 @@ async fn meta_muse_oauth_uses_responses_bearer_and_subscription_billing() {
 /// `metadata.user_id`, goes to `?beta=true`, and has the Claude Code headers, with the session id
 /// header equal to `metadata.user_id.session_id`. This is the executor's own admission path
 /// (install id loaded at boot, persona built and frozen at admission), not a hand-built config.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn anthropic_oauth_run_through_the_module_sends_the_claude_code_persona() {
     let server = ResponsesCapture::start_replying(concat!(
@@ -2645,7 +2641,6 @@ async fn a_lone_dead_api_key_is_refused_before_any_run() {
 }
 
 /// The loopback address the shipped catalog overlay gives the `atomic-chat` provider.
-#[cfg(unix)]
 const ATOMIC_CHAT_CATALOG_ADDR: &str = "127.0.0.1:1337";
 
 /// Make sure something is listening on [`ATOMIC_CHAT_CATALOG_ADDR`] for as long as the
@@ -2653,7 +2648,6 @@ const ATOMIC_CHAT_CATALOG_ADDR: &str = "127.0.0.1:1337";
 ///
 /// Returns the listener when this test bound the port, or `None` when another process
 /// already holds it, which leaves the port just as occupied.
-#[cfg(unix)]
 fn occupy_atomic_chat_catalog_port() -> Option<std::net::TcpListener> {
     match std::net::TcpListener::bind(ATOMIC_CHAT_CATALOG_ADDR) {
         Ok(listener) => Some(listener),
@@ -2671,7 +2665,6 @@ fn occupy_atomic_chat_catalog_port() -> Option<std::net::TcpListener> {
     }
 }
 
-#[cfg(unix)]
 const VAULT_REJECTION_FIXTURES: &str = r#"{
   "fixtures": [
     {
@@ -2699,7 +2692,6 @@ const VAULT_REJECTION_FIXTURES: &str = r#"{
 /// served by the real vault. A stale race requires run A to retain version N while a rotation caches
 /// N+1 before A's late 401, and that interleave cannot be scheduled deterministically from outside
 /// the process. The version-mismatch arm therefore remains unit-covered.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_provider_401_evicts_the_current_real_vault_credential_from_process_cache() {
     // The rig's synthetic catalog points `atomic-chat` at this loopback port, and real desktop apps
@@ -2799,7 +2791,6 @@ async fn a_provider_401_evicts_the_current_real_vault_credential_from_process_ca
 
 /// aimock's replies for the repair arm: the first request is refused as a bad key, and every
 /// later one answers.
-#[cfg(unix)]
 const REFUSE_ONCE_FIXTURES: &str = r#"{
   "fixtures": [
     {
@@ -2824,7 +2815,6 @@ const REFUSE_ONCE_FIXTURES: &str = r#"{
 /// re-login writes it, and the same send is sent again. A resume and a fresh run both report
 /// `state=active` on the wire, so the assertions are on the stored records: a model step after
 /// the pause (the run re-entered its loop) and exactly one run start (the same run continued).
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repaired_credential_resumes_the_paused_run() {
     let aimock = AiMock::start("vault-resume", REFUSE_ONCE_FIXTURES).await;
@@ -2924,7 +2914,6 @@ async fn a_repaired_credential_resumes_the_paused_run() {
 }
 
 /// aimock's reply for the handle arm: every request answers.
-#[cfg(unix)]
 const ANSWER_FIXTURES: &str =
     r#"{ "fixtures": [ { "match": {}, "response": { "content": "GRANT-READ-ANSWER." } } ] }"#;
 
@@ -2933,7 +2922,6 @@ const ANSWER_FIXTURES: &str =
 ///
 /// While broca read by handle, a revoked handle failed admission with "credential handle not
 /// found". The run here reaching aimock and finishing shows the daemon consults no handle.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_handle_does_not_change_a_grant_read() {
     let aimock = AiMock::start("vault-revoked-handle", ANSWER_FIXTURES).await;

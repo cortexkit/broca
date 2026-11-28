@@ -102,6 +102,14 @@ struct Rig {
     registration_pending: Option<Arc<tokio::sync::Notify>>,
 }
 
+enum Launch {
+    Default,
+    #[cfg(unix)]
+    Program(PathBuf),
+    #[cfg(all(windows, feature = "test-clock"))]
+    HoldRegistration,
+}
+
 impl Rig {
     async fn start(
         name: &str,
@@ -111,7 +119,7 @@ impl Rig {
         output: u64,
         cut: bool,
     ) -> Option<Self> {
-        Self::start_with_program(name, tags, trusted, input, output, cut, None).await
+        Self::start_with_program(name, tags, trusted, input, output, cut, Launch::Default).await
     }
 
     async fn start_with_program(
@@ -121,7 +129,7 @@ impl Rig {
         input: Option<u64>,
         output: u64,
         cut: bool,
-        program: Option<PathBuf>,
+        launch: Launch,
     ) -> Option<Self> {
         let subc = broca_test_support::subc_bin("ck-subc", "SUBC_CORE_BIN");
         if !subc.exists() {
@@ -182,12 +190,22 @@ impl Rig {
         if cut {
             env["BROCA_TEST_SYSTEM_ONE_ANSWER_GATE"] = json!(root.join("answer-cut"));
         }
-        let program = program.unwrap_or_else(|| {
+        #[cfg(all(windows, feature = "test-clock"))]
+        if matches!(launch, Launch::HoldRegistration) {
+            env["BROCA_TEST_REGISTRATION_GUARD_MS"] =
+                json!(broca_test_support::EVENT_HANG_GUARD.as_millis().to_string());
+        }
+        let test_binary = || {
             broca_test_support::ckdev_binary(
                 Path::new(env!("CARGO_BIN_EXE_ck-broca")),
                 broca_test_support::scratch_root(),
             )
-        });
+        };
+        let program = match launch {
+            #[cfg(unix)]
+            Launch::Program(path) => path,
+            _ => test_binary(),
+        };
         modules["broca"] = json!({"program":program,"args":[],"enabled":true,"env":env});
         std::fs::write(
             root.join("config/cortexkit/subc.jsonc"),
@@ -486,25 +504,9 @@ async fn reported_overrun_is_returned_and_missing_input_cost_is_a_durable_failur
     assert!(unknown.get("cost_usd").is_none());
 }
 
-fn registered_for_bind(entries: &[subc_control::CatalogEntry], target: &str) -> Result<(), String> {
-    let entry = entries
-        .iter()
-        .find(|entry| entry.module_id == target)
-        .ok_or_else(|| format!("{target} has not registered in catalog.list"))?;
-    if !entry.control_ops.iter().any(|op| op == "route.bind") {
-        return Err(format!(
-            "{target} registered without the route.bind grant: {:?}",
-            entry.control_ops
-        ));
-    }
-    if !entry.ready {
-        return Err(format!(
-            "{target} registered with route.bind but is not ready: {:?}",
-            entry.not_ready
-        ));
-    }
-    Ok(())
-}
+#[path = "common/broca_catalog_readiness.rs"]
+mod broca_catalog_readiness;
+use broca_catalog_readiness::registered_for_bind;
 
 #[test]
 fn registration_barrier_distinguishes_absence_missing_grant_and_warming() {
@@ -578,21 +580,22 @@ async fn kill_broca(rig: &Rig) {
     .await;
 }
 
-// This fixture blocks a shell on a POSIX FIFO before it execs the replacement.
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "test-clock")))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_route_waits_for_broca_registration() {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    let launch = {
+        use std::os::unix::fs::PermissionsExt;
 
-    let script = broca_test_support::scratch_root()
-        .join(format!("broca-registration-hold-{}.sh", std::process::id()));
-    let binary = broca_test_support::ckdev_binary(
-        Path::new(env!("CARGO_BIN_EXE_ck-broca")),
-        broca_test_support::scratch_root(),
-    );
-    // Hold the replacement before exec, so its PID exists but it cannot send HELLO until
-    // the test has observed the registration barrier waiting. No scheduler delay is assumed.
-    std::fs::write(
+        let script = broca_test_support::scratch_root()
+            .join(format!("broca-registration-hold-{}.sh", std::process::id()));
+        let binary = broca_test_support::ckdev_binary(
+            Path::new(env!("CARGO_BIN_EXE_ck-broca")),
+            broca_test_support::scratch_root(),
+        );
+        // Hold the replacement before exec, so its PID exists but it cannot send HELLO until
+        // the test has observed the registration barrier waiting. No scheduler delay is assumed.
+        std::fs::write(
         &script,
         format!(
             "#!/bin/sh\nif [ -p \"$BROCA_STATE_ROOT/hold-registration\" ]; then\n  : > \"$BROCA_STATE_ROOT/registration-held\"\n  read -r release < \"$BROCA_STATE_ROOT/hold-registration\"\nfi\nexec '{}' \"$@\"\n",
@@ -600,7 +603,11 @@ async fn restart_route_waits_for_broca_registration() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Launch::Program(script)
+    };
+    #[cfg(windows)]
+    let launch = Launch::HoldRegistration;
     let Some(mut rig) = Rig::start_with_program(
         "registration-barrier",
         true,
@@ -608,7 +615,7 @@ async fn restart_route_waits_for_broca_registration() {
         Some(42_000_000),
         0,
         false,
-        Some(script),
+        launch,
     )
     .await
     else {
@@ -628,11 +635,14 @@ async fn restart_route_waits_for_broca_registration() {
     let pending = Arc::new(tokio::sync::Notify::new());
     rig.registration_pending = Some(pending.clone());
     let hold = rig.state.join("hold-registration");
+    #[cfg(unix)]
     assert!(std::process::Command::new("mkfifo")
         .arg(&hold)
         .status()
         .unwrap()
         .success());
+    #[cfg(windows)]
+    std::fs::write(&hold, b"hold").unwrap();
     let reopen = async {
         kill_broca(&rig).await;
         rig.open(true, false).await
@@ -659,7 +669,10 @@ async fn restart_route_waits_for_broca_registration() {
             .any(|entry| entry.module_id == "broca"),
         "the held replacement must not have registered"
     );
+    #[cfg(unix)]
     tokio::fs::write(hold, b"continue\n").await.unwrap();
+    #[cfg(windows)]
+    std::fs::remove_file(hold).unwrap();
     let restarted = reopen.await;
     restarted
         .call(args(), Some("after-registration"))

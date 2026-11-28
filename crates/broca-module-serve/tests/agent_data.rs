@@ -256,8 +256,8 @@ impl Rig {
         out
     }
     /// Appends a record to `session` as later work on this computer would, so its copy is
-    /// ahead of any cut taken before. Only the two-daemon test, which runs on Unix, uses it.
-    #[cfg(unix)]
+    /// ahead of any cut taken before. Only the two-daemon test uses it.
+    #[cfg(any(unix, windows))]
     async fn extend(&self, session: &BindIdentity) {
         use broca_session_store::{
             backend::{LocalBackend, SessionAddr},
@@ -1102,7 +1102,7 @@ async fn session_ref_v2_ambiguous_roots_refuse_through_serve() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[path = "agent_data/real_daemon.rs"]
 mod real_daemon;
 

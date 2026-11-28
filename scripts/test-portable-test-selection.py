@@ -195,6 +195,14 @@ async fn gated_daemon_test() {{
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("cannot classify rig-dependent test", problems[0])
 
+    def test_windows_only_rig_tests_are_absent_from_linux_preflight(self) -> None:
+        for cfg in ('cfg(windows)', 'cfg(all(target_os = "windows", feature = "test-clock"))'):
+            with self.subTest(cfg=cfg):
+                self.assertEqual(self._file_gated_rig_test(cfg), [])
+        problems = self._file_gated_rig_test('cfg(any(windows, unix))')
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("cannot classify rig-dependent test", problems[0])
+
     def test_a_test_behind_a_feature_the_preflight_lacks_is_not_compiled_there(self) -> None:
         self.assertEqual(self._feature_gated_rig_test("test-attachments"), [])
 

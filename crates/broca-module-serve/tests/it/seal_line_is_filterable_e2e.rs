@@ -12,15 +12,9 @@
 //! and the seal arm in `main` runs. Nothing in this test writes a log record itself; it only
 //! reads the segment the module wrote under the rig's own data home.
 //!
-//! UNIX ONLY, because on Windows killing the daemon no longer lets a module seal at all. Since
-//! subc c5e2fb60 (2026-09-25, issue #109) every module runs inside a job object with
-//! JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so when the daemon dies the kernel TerminateProcesses
-//! broca before its `serve` can return, and no seal line is ever written. That is subc's
-//! deliberate trade (containment on a crash over graceful teardown on a Windows stop, recorded
-//! at the job field in subc-daemon/src/supervise.rs), not a broca defect. Measured: the first
-//! Windows run after it logged broca's three boot records and no seal. REVISIT when subc ships
-//! a Windows stop path that drains before exiting; this file should then run there again.
-#![cfg(unix)]
+//! On Windows, killing the daemon closes the job and terminates its modules before they can
+//! seal. Use an operator restart over the control pipe to reach the serve-return seal path.
+#![cfg(any(unix, windows))]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -270,6 +264,7 @@ async fn a_sigterm_seals_and_the_module_is_respawned_rather_than_left_down() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_shutdown_seal_line_carries_a_component_so_a_filter_can_reach_it() {
     let Some(mut rig) = Rig::start("component").await else {
@@ -280,6 +275,20 @@ async fn the_shutdown_seal_line_carries_a_component_so_a_filter_can_reach_it() {
     // socket closing is what makes broca's `serve` return, and the seal hangs off that return.
     rig.child.start_kill().expect("kill the daemon");
 
+    assert_filterable_seal(&rig).await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_operator_drain_seal_line_carries_a_component_so_a_filter_can_reach_it() {
+    let Some(rig) = Rig::start("component").await else {
+        return;
+    };
+    super::windows_supervisor::restart_broca(&rig.connection_file, None).await;
+    assert_filterable_seal(&rig).await;
+}
+
+async fn assert_filterable_seal(rig: &Rig) {
     let logs_dir = rig.logs_dir();
     let line = broca_test_support::wait_until("shutdown seal log record", || async {
         let segment = read_segment(&logs_dir);
@@ -317,9 +326,6 @@ async fn the_shutdown_seal_line_carries_a_component_so_a_filter_can_reach_it() {
 /// The send carries a tool schema, as `scripts/acceptance-turn.sh` does, so the tool-bearing
 /// send path runs: it spawns a detached warm bind to the tool module (absent from this rig).
 ///
-/// Unix-only because its one caller is: SIGTERM has no Windows equivalent, and an ungated helper
-/// is dead code there, which `-D warnings` turns into a compile error on that leg alone.
-#[cfg(unix)]
 async fn time_first_send(
     rig: &Rig,
     session: &str,
@@ -398,6 +404,16 @@ async fn time_first_send(
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_first_send_after_a_sigterm_respawn_is_admitted() {
+    first_send_after_replacement_is_admitted().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_send_after_a_forced_respawn_is_admitted() {
+    first_send_after_replacement_is_admitted().await;
+}
+
+async fn first_send_after_replacement_is_admitted() {
     let Some(rig) = Rig::start("respawn-admission").await else {
         return;
     };
@@ -410,36 +426,91 @@ async fn the_first_send_after_a_sigterm_respawn_is_admitted() {
         "the control send on the first boot was not admitted ({control_took:?}): {control:?}"
     );
 
-    let daemon_pid = rig.child.id().expect("daemon pid");
-    let first = broca_children(daemon_pid);
-    assert_eq!(
-        first.len(),
-        1,
-        "expected one supervised ck-broca: {first:?}"
-    );
-    let old = first[0];
-    let status = std::process::Command::new("kill")
-        .args(["-TERM", &old.to_string()])
-        .status()
-        .expect("run kill");
-    assert!(status.success(), "kill -TERM {old} failed");
-    let deadline = Instant::now() + Duration::from_secs(40);
-    while !broca_children(daemon_pid).iter().any(|pid| *pid != old) {
-        assert!(
-            Instant::now() < deadline,
-            "broca was not respawned after SIGTERM"
+    #[cfg(unix)]
+    {
+        let daemon_pid = rig.child.id().expect("daemon pid");
+        let first = broca_children(daemon_pid);
+        assert_eq!(
+            first.len(),
+            1,
+            "expected one supervised ck-broca: {first:?}"
         );
-        sleep(Duration::from_millis(20)).await;
+        let old = first[0];
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &old.to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -TERM {old} failed");
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while !broca_children(daemon_pid).iter().any(|pid| *pid != old) {
+            assert!(
+                Instant::now() < deadline,
+                "broca was not respawned after SIGTERM"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let old = live_broca(&rig);
+        old.force_stop().unwrap();
+        wait_for_replacement(&rig, &old).await;
     }
 
     let (took, outcome) = time_first_send(&rig, "after-respawn").await;
-    println!("admission: first boot {control_took:?}, after SIGTERM respawn {took:?}");
+    println!("admission: first boot {control_took:?}, after replacement {took:?}");
     assert!(
         matches!(
             outcome,
             Ok(broca_module_serve::client::SendOutcome::Active { .. })
         ),
-        "the first send after a SIGTERM respawn was not admitted ({took:?}; first-boot control \
+        "the first send after replacement was not admitted ({took:?}; first-boot control \
          took {control_took:?}): {outcome:?}"
+    );
+}
+
+#[cfg(windows)]
+fn live_broca(rig: &Rig) -> broca_test_support::SupervisedChild {
+    super::windows_supervisor::live_child(&rig.child, &rig.data_home, "broca")
+        .expect("the rig supervises a live broca")
+}
+
+#[cfg(windows)]
+async fn wait_for_replacement(rig: &Rig, old: &broca_test_support::SupervisedChild) {
+    tokio::time::timeout(
+        Duration::from_secs(40),
+        super::windows_supervisor::wait_for_replacement(
+            &rig.child,
+            &rig.data_home,
+            "broca",
+            old.stamp(),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        let state = rig.data_home.join("cortexkit/broca");
+        panic!(
+            "broca was not replaced; {}",
+            broca_test_support::rig_log_diagnostics(&rig.data_home.join("cortexkit"), &state)
+        );
+    });
+    assert!(old.has_exited().unwrap(), "the old broca must have exited");
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_restart_seals_and_replaces_the_module() {
+    let Some(rig) = Rig::start("operator-restart").await else {
+        return;
+    };
+    let old = live_broca(&rig);
+    super::windows_supervisor::restart_broca(&rig.connection_file, None).await;
+    wait_for_replacement(&rig, &old).await;
+    let segment = read_segment(&rig.logs_dir());
+    assert!(
+        segment
+            .lines()
+            .any(|line| line.contains("shutdown seal complete on serve return")),
+        "the old broca did not complete its seal before replacement:\n{segment}"
     );
 }

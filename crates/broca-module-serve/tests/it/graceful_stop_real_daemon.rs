@@ -8,8 +8,9 @@
 //! `Cancelled` and with nothing left `outcome_unknown`.
 //!
 //! Also exercises `ck module restart`: the channel-0 drain must start the boundary stop before
-//! GOODBYE starts the final grace. Unix only: the signal cases and process census use Unix tools.
-#![cfg(unix)]
+//! GOODBYE starts the final grace. Windows checks the supported operator restart and owned
+//! process-cut paths instead of delivering POSIX signals.
+#![cfg(any(unix, windows))]
 
 use broca_session_store::record::Record;
 use std::path::{Path, PathBuf};
@@ -115,6 +116,7 @@ struct Rig {
     dir: PathBuf,
     connection_file: PathBuf,
     events: PathBuf,
+    #[cfg(unix)]
     ck_cli: PathBuf,
     last_wait: std::sync::Mutex<String>,
 }
@@ -171,12 +173,17 @@ impl Rig {
                 return None;
             }
         }
+        #[cfg(unix)]
         let ck_source = subc_source.with_file_name(format!("ck{}", std::env::consts::EXE_SUFFIX));
+        #[cfg(unix)]
         let (subc_core, ck_cli) = broca_test_support::ckdev_binary_with_companion(
             &subc_source,
             &ck_source,
             broca_test_support::scratch_root(),
         );
+        #[cfg(windows)]
+        let subc_core =
+            broca_test_support::ckdev_binary(&subc_source, broca_test_support::scratch_root());
         std::env::remove_var("SUBC_MODULE_ID");
         std::env::remove_var("SUBC_LAUNCH_NONCE");
 
@@ -252,6 +259,7 @@ impl Rig {
             dir,
             connection_file,
             events,
+            #[cfg(unix)]
             ck_cli,
             last_wait: std::sync::Mutex::new("waiting for the daemon connection file".into()),
         };
@@ -312,7 +320,10 @@ impl Rig {
     }
 
     async fn restart(&self) {
+        #[cfg(unix)]
         self.restart_with_args(&[]).await;
+        #[cfg(windows)]
+        super::windows_supervisor::restart_broca(&self.connection_file, None).await;
     }
 
     /// Restart with an explicit drain ceiling. Returns how many restart drains of broca the
@@ -321,11 +332,17 @@ impl Rig {
     /// drain can't end before the restart is asked for.
     async fn restart_with_drain(&self, drain: Duration) -> usize {
         let earlier = self.restart_drain_lines().len();
-        let drain_ms = drain.as_millis().to_string();
-        self.restart_with_args(&["--drain-ms", &drain_ms]).await;
+        #[cfg(unix)]
+        {
+            let drain_ms = drain.as_millis().to_string();
+            self.restart_with_args(&["--drain-ms", &drain_ms]).await;
+        }
+        #[cfg(windows)]
+        super::windows_supervisor::restart_broca(&self.connection_file, Some(drain)).await;
         earlier
     }
 
+    #[cfg(unix)]
     async fn restart_with_args(&self, extra: &[&str]) {
         // Use the CLI beside the daemon so the request and its drain policy are real, not
         // a test's imitation of module control frames. The CLI acknowledges initiation only.
@@ -352,6 +369,18 @@ impl Rig {
         .await
         .expect("run ck module restart broca");
         assert!(output.status.success(), "ck restart failed: {output:?}");
+    }
+
+    #[cfg(windows)]
+    fn force_stop_broca(&self) {
+        super::windows_supervisor::live_child(
+            &self.daemon,
+            &self.dir.join("runtime/data-home"),
+            "broca",
+        )
+        .expect("the rig supervises a live broca")
+        .force_stop()
+        .unwrap();
     }
 
     async fn health(&self) -> Value {
@@ -613,6 +642,7 @@ fn last_end(records: &[Record]) -> Option<&broca_session_store::record::RunEnd> 
 }
 
 /// The live `ck-broca` pids the daemon supervises.
+#[cfg(unix)]
 fn broca_children(daemon_pid: u32) -> Vec<u32> {
     let out = std::process::Command::new("pgrep")
         .args(["-P", &daemon_pid.to_string(), "-x", "ckdev-broca"])
@@ -636,8 +666,19 @@ fn client_deadline_diagnostics(rig: &mut Rig, client: &mut Child, session: &str)
     output
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sigterm_during_a_tool_call_lets_it_finish_and_ends_the_run_interrupted() {
+    stop_during_tool_ends_the_run_interrupted().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_operator_drain_during_a_tool_call_lets_it_finish_and_ends_the_run_interrupted() {
+    stop_during_tool_ends_the_run_interrupted().await;
+}
+
+async fn stop_during_tool_ends_the_run_interrupted() {
     let requests = Arc::new(AtomicUsize::new(0));
     let model_url = serve_model(Arc::clone(&requests)).await;
     let Some(mut rig) = Rig::start(&model_url).await else {
@@ -687,14 +728,19 @@ async fn a_sigterm_during_a_tool_call_lets_it_finish_and_ends_the_run_interrupte
         sleep(Duration::from_millis(25)).await;
     }
 
-    let daemon_pid = rig.daemon.id().expect("daemon pid");
-    let broca = broca_children(daemon_pid);
-    assert_eq!(broca.len(), 1, "one supervised ck-broca: {broca:?}");
-    let status = std::process::Command::new("kill")
-        .args(["-TERM", &broca[0].to_string()])
-        .status()
-        .expect("run kill");
-    assert!(status.success(), "kill -TERM {} failed", broca[0]);
+    #[cfg(unix)]
+    {
+        let daemon_pid = rig.daemon.id().expect("daemon pid");
+        let broca = broca_children(daemon_pid);
+        assert_eq!(broca.len(), 1, "one supervised ck-broca: {broca:?}");
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &broca[0].to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -TERM {} failed", broca[0]);
+    }
+    #[cfg(windows)]
+    rig.restart().await;
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let records = loop {
@@ -806,6 +852,7 @@ async fn wait_records(
     }
 }
 
+#[cfg(unix)]
 async fn signal_during_tool(rig: &Rig, signal: &str) {
     rig.wait_for_tool().await;
     let children = broca_children(rig.daemon.id().unwrap());
@@ -999,8 +1046,19 @@ async fn module_restart_interrupt_policy_finishes_long_tool_at_boundary() {
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_resume_continues_same_episode_and_request_bytes() {
+    planned_resume_continues_same_episode_and_request_bytes().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_drain_resume_continues_same_episode_and_request_bytes() {
+    planned_resume_continues_same_episode_and_request_bytes().await;
+}
+
+async fn planned_resume_continues_same_episode_and_request_bytes() {
     let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
     let requests = Arc::new(AtomicUsize::new(0));
     let url = serve_recording_model(requests.clone(), bodies.clone(), 3000).await;
@@ -1008,7 +1066,13 @@ async fn restart_resume_continues_same_episode_and_request_bytes() {
         return;
     };
     let run_id = start_keyed_run(&rig, Some("resume")).await;
+    #[cfg(unix)]
     signal_during_tool(&rig, "-TERM").await;
+    #[cfg(windows)]
+    {
+        rig.wait_for_tool().await;
+        rig.restart().await;
+    }
     let records = wait_records(&rig, "resumed run completion", |records| {
         records.iter().any(|record| {
             matches!(
@@ -1086,15 +1150,32 @@ async fn restart_resume_continues_same_episode_and_request_bytes() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_interrupt_preserves_graceful_terminal() {
+    planned_interrupt_preserves_graceful_terminal().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_drain_explicit_interrupt_preserves_graceful_terminal() {
+    planned_interrupt_preserves_graceful_terminal().await;
+}
+
+async fn planned_interrupt_preserves_graceful_terminal() {
     let requests = Arc::new(AtomicUsize::new(0));
     let url = serve_model(requests.clone()).await;
     let Some(rig) = Rig::start(&url).await else {
         return;
     };
     start_keyed_run(&rig, Some("interrupt")).await;
+    #[cfg(unix)]
     signal_during_tool(&rig, "-TERM").await;
+    #[cfg(windows)]
+    {
+        rig.wait_for_tool().await;
+        rig.restart().await;
+    }
     let records = wait_records(&rig, "explicit-interrupt terminal", |records| {
         records
             .iter()
@@ -1123,7 +1204,13 @@ async fn resume_policy_with_tool_past_drain_is_interrupted_unknown_never_paused(
         return;
     };
     start_keyed_run(&rig, Some("resume")).await;
+    #[cfg(unix)]
     signal_during_tool(&rig, "-TERM").await;
+    #[cfg(windows)]
+    {
+        rig.wait_for_tool().await;
+        rig.restart_with_drain(Duration::ZERO).await;
+    }
     let records = wait_records(&rig, "interrupted run with unresolved tool", |records| {
         records
             .iter()
@@ -1143,15 +1230,32 @@ async fn resume_policy_with_tool_past_drain_is_interrupted_unknown_never_paused(
         .any(|record| matches!(record, Record::Pause(_))));
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigkill_with_resume_policy_still_seals_crash_orphan() {
+    process_cut_with_resume_policy_still_seals_crash_orphan().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_stop_with_resume_policy_still_seals_crash_orphan() {
+    process_cut_with_resume_policy_still_seals_crash_orphan().await;
+}
+
+async fn process_cut_with_resume_policy_still_seals_crash_orphan() {
     let url = serve_model(Arc::new(AtomicUsize::new(0))).await;
     let Some(rig) = Rig::start(&url).await else {
         return;
     };
     let run_id = start_keyed_run(&rig, Some("resume")).await;
     let launch = rig.health().await["launch_id"].clone();
+    #[cfg(unix)]
     signal_during_tool(&rig, "-KILL").await;
+    #[cfg(windows)]
+    {
+        rig.wait_for_tool().await;
+        rig.force_stop_broca();
+    }
     rig.wait_for_replacement(&launch).await;
     let records = wait_records(&rig, "crash-orphan terminal", |records| {
         records
@@ -1288,7 +1392,10 @@ async fn interrupt_reasons_survive_real_kill_cuts_and_pin_serve_replies() {
         if planned {
             rig.restart().await;
         } else {
+            #[cfg(unix)]
             signal_during_tool(&rig, "-KILL").await;
+            #[cfg(windows)]
+            rig.force_stop_broca();
         }
         rig.wait_for_replacement(&launch).await;
         let expected = if planned {
@@ -1310,13 +1417,18 @@ async fn interrupt_reasons_survive_real_kill_cuts_and_pin_serve_replies() {
         let before = format!("{:?}", last_end(&records).unwrap());
         // Cut after the terminal's sync, then boot again: recovery must not overwrite its cause.
         let launch = rig.health().await["launch_id"].clone();
-        let children = broca_children(rig.daemon.id().unwrap());
-        assert_eq!(children.len(), 1);
-        assert!(std::process::Command::new("kill")
-            .args(["-KILL", &children[0].to_string()])
-            .status()
-            .unwrap()
-            .success());
+        #[cfg(unix)]
+        {
+            let children = broca_children(rig.daemon.id().unwrap());
+            assert_eq!(children.len(), 1);
+            assert!(std::process::Command::new("kill")
+                .args(["-KILL", &children[0].to_string()])
+                .status()
+                .unwrap()
+                .success());
+        }
+        #[cfg(windows)]
+        rig.force_stop_broca();
         rig.wait_for_replacement(&launch).await;
         let after = wait_records(&rig, "durable terminal after second kill", |records| {
             records

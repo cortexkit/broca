@@ -84,4 +84,7 @@ mod state_root_lock;
 mod step_transforms;
 mod store_ops_serve;
 mod structured_output;
+#[cfg(windows)]
+#[path = "../support/windows_supervisor.rs"]
+mod windows_supervisor;
 mod wire;

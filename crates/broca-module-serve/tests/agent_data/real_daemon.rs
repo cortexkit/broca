@@ -7,7 +7,7 @@
 use super::*;
 use broca_subc::{RouteHandle, RouteOpenRetry, SubcConnection};
 use broca_test_support::{event_timeout, wait_until, EVENT_HANG_GUARD};
-use std::{io::Write, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{io::Write, path::Path, time::Duration};
 use subc_control::ConsumerIdentity;
 use subc_protocol::manifest::{InternalTransport, ModuleManifest, ProviderRole};
 
@@ -236,16 +236,33 @@ impl Live {
         }
         let connection = runtime.join("subc-connection.json");
         let nonce = root.join("entorhinal.nonce");
-        let script = root.join("fake-engram.sh");
         // The build directory may be on removable storage, where macOS can block exec
         // before the fake module can register or write any diagnostics.
         let executable = broca_test_support::ckdev_binary(
             std::env::current_exe().unwrap(),
             broca_test_support::scratch_root(),
         );
-        let quoted = executable.to_string_lossy().replace('\'', "'\\''");
-        std::fs::write(&script,format!("#!/bin/sh\nexec '{quoted}' --exact real_daemon::supervised_fake_session_door --ignored --nocapture\n")).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        let (door_program, door_args) = {
+            use std::os::unix::fs::PermissionsExt;
+            let script = root.join("fake-engram.sh");
+            let quoted = executable.to_string_lossy().replace('\'', "'\\''");
+            std::fs::write(&script,format!("#!/bin/sh\nexec '{quoted}' --exact real_daemon::supervised_fake_session_door --ignored --nocapture\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            (script, Vec::<&str>::new())
+        };
+        #[cfg(windows)]
+        let (door_program, door_args) = (
+            executable,
+            vec![
+                "--exact",
+                "real_daemon::supervised_fake_session_door",
+                "--ignored",
+                "--nocapture",
+                // The daemon appends `--subc <path>`; the helper gets its path from env.
+                "--",
+            ],
+        );
         std::fs::create_dir_all(config.join("cortexkit/broca")).unwrap();
         std::fs::write(
             config.join("cortexkit/broca/broca.jsonc"),
@@ -264,7 +281,7 @@ impl Live {
                 "BROCA_STATE_ROOT":rig.root,"BROCA_PROVIDER_BASE_URL":"http://127.0.0.1:9","XDG_DATA_HOME":data}},
             "entorhinal":{"program":fake_bin,"args":[],"enabled":true,"reserved":true,"env":{
                 "FAKE_AFT_MODULE_ID":"entorhinal","FAKE_AFT_LAUNCH_NONCE_PATH":nonce}},
-            "engram":{"program":script,"args":[],"enabled":true,"reserved":true,"env":{
+            "engram":{"program":door_program,"args":door_args,"enabled":true,"reserved":true,"env":{
                 "BROCA_TEST_CONNECTION_FILE":connection,"BROCA_TEST_DOOR_STATE":door}}
         }})).unwrap()).unwrap();
         let child = broca_test_support::tokio_rig_command(daemon_bin, &root, "daemon")
@@ -344,7 +361,10 @@ impl Live {
     }
     async fn stop(mut self) {
         let _ = self.conn.route_close(&self.route).await;
+        #[cfg(unix)]
         self.daemon.kill().await.unwrap();
+        #[cfg(windows)]
+        broca_test_support::kill_and_reap_tree(&mut self.daemon);
     }
 }
 fn seal_door(door: &Path, cut: &str, reference: &str) {

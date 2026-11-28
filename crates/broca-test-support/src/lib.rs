@@ -63,6 +63,8 @@ pub use ckdev::{
     retry_executable_file_busy,
 };
 pub use cortexkit_test_support::{cargo_profile_bin, cargo_profile_dir, cargo_profile_dir_of};
+#[cfg(windows)]
+pub use process::SupervisedChild;
 pub use process::{kill_and_reap, kill_and_reap_tree, remove_rig_dir};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use recorded_process::RecordedProcess;

@@ -195,6 +195,8 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
     // nothing.
     let state_root = broca_module_serve::state_root::resolve_state_root()
         .map_err(|e| ServeIoError(e.to_string()))?;
+    #[cfg(all(windows, feature = "test-clock"))]
+    hold_test_registration(&state_root).await?;
     // broca's settings, read once: every component they shape reads its own section from here.
     // broca registers first, and takes the daemon's settings when the daemon manages them;
     // then it never reads the file. Under a daemon that doesn't, it reads broca.jsonc.
@@ -391,6 +393,7 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
             .await
             .map_err(|e| ServeIoError(format!("late-results consumer connect: {e}")))?,
     );
+    startup.finished("late_results_consumer_connect");
     feed_conn.follow_catalog();
     let held_resumer = Arc::new(broca_module_serve::held_runtime::LateBoundResumer::default());
     let held_routes = Arc::new(broca_module_serve::held_runtime::FeedRoutes::new(
@@ -408,6 +411,7 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
         held_resumer.clone(),
     )
     .map_err(|e| ServeIoError(format!("open late-results store: {e}")))?;
+    startup.finished("late_results_store_open");
     held_runtime.publish_for_health();
     let plane =
         plane.with_provider_held_support(held_runtime.store.clone(), held_runtime.slots.clone());
@@ -417,7 +421,7 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
     // serve loop below attaches the describer once that connection has registered.
     let scope_describer = Arc::new(broca_subc::ModuleScopeDescriber::new());
     plane.set_scope_describer(scope_describer.clone());
-    startup.finished("late_results_consumer_and_store");
+    startup.finished("late_results_io_install");
     let index = Arc::new(
         broca_store::SqliteStore::open(state_root.join("run-index.db"))
             .map_err(|error| ServeIoError(format!("open run index: {error}")))?,
@@ -840,6 +844,7 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
             broca_store::SystemOneStore::open(state_root.join("system-one.db"))
                 .map_err(|e| ServeIoError(format!("open System One batch store: {e}")))?,
         );
+        startup.finished("classifier_store_open");
         let config = broca_module_serve::system_one::Config::default();
         let openai_decisions =
             broca_module_serve::system_one::openai_decisions::OpenAiDecisions::new(
@@ -908,7 +913,7 @@ async fn serve_main(startup_at: Instant) -> Result<(), Box<dyn std::error::Error
                 .with_export(run_index.as_ref().unwrap().clone(), charge_basis_table)
                 .with_clairic(clairic),
         );
-        startup.finished("classifier_store_and_providers");
+        startup.finished("classifier_providers");
         // The previous process may still be closing its files, so the release waits a little
         // for a batch owner that holds its lock (see `release_abandoned_within`).
         let (released, held) = {
@@ -1589,6 +1594,36 @@ fn die_as_signalled() -> ! {
     // Unreachable on unix unless re-raising itself failed. 128 + SIGTERM is the conventional
     // "terminated by signal" status, so even that fallback does not read as a deliberate stop.
     std::process::exit(143)
+}
+
+#[cfg(all(windows, feature = "test-clock"))]
+async fn hold_test_registration(state_root: &std::path::Path) -> std::io::Result<()> {
+    let Ok(guard_ms) = std::env::var("BROCA_TEST_REGISTRATION_GUARD_MS") else {
+        return Ok(());
+    };
+    let hold = state_root.join("hold-registration");
+    if !hold.try_exists()? {
+        return Ok(());
+    }
+    let guard_ms = guard_ms
+        .parse()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    // Keep the daemon-launched PID and its authenticated handoff while the test checks
+    // the route barrier. A Windows launcher cannot exec broca into its own process.
+    std::fs::write(state_root.join("registration-held"), b"held")?;
+    tokio::time::timeout(std::time::Duration::from_millis(guard_ms), async {
+        while hold.try_exists()? {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "test registration hold expired before release",
+        )
+    })?
 }
 
 /// The SIGTERM trigger for the seal. Not a backstop: until subc gives modules their own process

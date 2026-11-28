@@ -3550,6 +3550,11 @@ async fn send_serve_error(
     err: &ServeError,
 ) -> Result<(), ServeIoError> {
     if let Some(refusal) = broca_module::serve::admission_refusal::admission_refusal(err) {
+        #[cfg(windows)]
+        if matches!(err, ServeError::Open(..)) {
+            // The cause includes the failed store operation and, for an I/O error, its OS code.
+            tracing::warn!(target: "store", channel, epoch, corr, cause = %err, "open_failed refusal");
+        }
         let body = serde_json::to_vec(&refusal).map_err(|error| ServeIoError(error.to_string()))?;
         return send_error_bytes(writer, ver, channel, epoch, corr, body).await;
     }
